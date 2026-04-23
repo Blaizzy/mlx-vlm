@@ -4,6 +4,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import (
     ArraysCache,
+    BatchKVCache,
+    BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
@@ -11,51 +13,6 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     _BaseCache,
 )
-from mlx_lm.models.cache import BatchKVCache as _UpstreamBatchKVCache
-from mlx_lm.models.cache import BatchRotatingKVCache as _UpstreamBatchRotatingKVCache
-
-
-# TODO(Prince):  rewrite each VLM's __call__ to use self._idx instead of cache.offset for Mrope Delta calculation
-class _ScalarOffsetMixin:
-    """Collapse ``offset`` to a Python int when uniform across the batch.
-
-    Every VLM's decode ``__call__`` already has an ``isinstance(offset, int)``
-    fast path (used by plain ``KVCache``); keeping the offset as ``int`` when
-    it's effectively scalar makes that path win for batch caches too —
-    avoiding a ``.item()`` GPU sync per decode step. ``left_padding`` stays
-    as ``mx.array`` because it feeds into ``create_causal_mask`` etc.
-    """
-
-    def __init__(self, left_padding, *args, **kwargs):
-        super().__init__(left_padding, *args, **kwargs)
-        if left_padding and all(lp == left_padding[0] for lp in left_padding):
-            self.offset = -int(left_padding[0])
-
-    def _inflate(self):
-        if isinstance(self.offset, int):
-            self.offset = mx.array([self.offset])
-
-    def prepare(self, *args, **kwargs):
-        self._inflate()
-        return super().prepare(*args, **kwargs)
-
-    def filter(self, *args, **kwargs):
-        self._inflate()
-        return super().filter(*args, **kwargs)
-
-    def extend(self, other, *args, **kwargs):
-        self._inflate()
-        if hasattr(other, "_inflate"):
-            other._inflate()
-        return super().extend(other, *args, **kwargs)
-
-
-class BatchKVCache(_ScalarOffsetMixin, _UpstreamBatchKVCache):
-    pass
-
-
-class BatchRotatingKVCache(_ScalarOffsetMixin, _UpstreamBatchRotatingKVCache):
-    pass
 
 
 class BatchQuantizedKVCache(_BaseCache):
@@ -78,11 +35,7 @@ class BatchQuantizedKVCache(_BaseCache):
         self.keys = None  # tuple (packed, scales, biases) or None
         self.values = None
         self.left_padding = mx.array(left_padding)
-        # Scalar fast-path for offset when uniform across the batch.
-        if left_padding and all(lp == left_padding[0] for lp in left_padding):
-            self.offset = -int(left_padding[0])
-        else:
-            self.offset = mx.array([-lp for lp in left_padding])
+        self.offset = mx.array([-lp for lp in left_padding])
         self._idx = 0
         self.group_size = group_size
         self.bits = bits
@@ -143,8 +96,6 @@ class BatchQuantizedKVCache(_BaseCache):
 
     def filter(self, batch_indices: mx.array):
         """Keep only the sequences at *batch_indices*."""
-        if isinstance(self.offset, int):
-            self.offset = mx.array([self.offset])
         if self.keys is not None:
             self.keys = tuple(k[batch_indices] for k in self.keys)
             self.values = tuple(v[batch_indices] for v in self.values)
@@ -161,9 +112,6 @@ class BatchQuantizedKVCache(_BaseCache):
 
     def extend(self, other: "BatchQuantizedKVCache"):
         """Concatenate *other* batch into this cache along the batch dim."""
-        for c in (self, other):
-            if isinstance(c.offset, int):
-                c.offset = mx.array([c.offset])
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])

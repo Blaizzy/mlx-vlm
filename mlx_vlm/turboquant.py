@@ -6139,8 +6139,6 @@ class BatchTurboQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def filter(self, batch_indices: mx.array):
-        if isinstance(self.offset, int):
-            self.offset = mx.array([self.offset])
         if self.keys is not None:
             self.keys = _filter_state(self.keys, batch_indices)
             self.values = _filter_state(self.values, batch_indices)
@@ -6162,9 +6160,6 @@ class BatchTurboQuantKVCache(_BaseCache):
             self.left_padding -= min_lp
 
     def extend(self, other: "BatchTurboQuantKVCache"):
-        for c in (self, other):
-            if isinstance(c.offset, int):
-                c.offset = mx.array([c.offset])
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
