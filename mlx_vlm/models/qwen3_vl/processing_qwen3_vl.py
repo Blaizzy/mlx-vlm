@@ -2,18 +2,463 @@
 Processor class for Qwen3VL.
 
 Adapted from HuggingFace Transformers:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py
+- https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/processing_qwen3_vl.py
+- https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_vl/video_processing_qwen3_vl.py
 """
 
-from typing import List, Optional, Union
+import math
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_processing_utils import ImageProcessingMixin
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.video_processing_utils import BaseVideoProcessor
 
 from ..base import load_chat_template, to_mlx
+
+
+def _smart_resize_video(
+    num_frames: int,
+    height: int,
+    width: int,
+    temporal_factor: int = 2,
+    factor: int = 32,
+    min_pixels: int = 128 * 128,
+    max_pixels: int = 16 * 16 * 2 * 2 * 2 * 6144,
+) -> Tuple[int, int]:
+    """Compute target (height, width) to fit a video into the token budget.
+
+    Mirrors HF's ``smart_resize`` exactly (no torch).
+    """
+    if height < factor or width < factor:
+        raise ValueError(
+            f"height:{height} or width:{width} must be larger than factor:{factor}"
+        )
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    t_bar = math.ceil(num_frames / temporal_factor) * temporal_factor
+
+    if t_bar * h_bar * w_bar > max_pixels:
+        beta = math.sqrt((num_frames * height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif t_bar * h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (num_frames * height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar
+
+
+def _resize_video_frames(video: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """Bicubic resize each frame of a ``(T, C, H, W)`` video."""
+    from PIL import Image
+
+    T, C, H, W = video.shape
+    if target_h == H and target_w == W:
+        return video
+    out = np.empty((T, C, target_h, target_w), dtype=video.dtype)
+    for i, frame in enumerate(video):
+        arr = np.transpose(frame, (1, 2, 0))
+        if arr.dtype in (np.float32, np.float64):
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+        pil = Image.fromarray(arr)
+        pil = pil.resize((target_w, target_h), resample=Image.BICUBIC)
+        out[i] = np.transpose(np.array(pil), (2, 0, 1))
+    return out
+
+
+def _smart_resize_image(
+    height: int,
+    width: int,
+    factor: int = 32,
+    min_pixels: int = 56 * 56,
+    max_pixels: int = 14 * 14 * 4 * 1280,
+) -> Tuple[int, int]:
+    """Image variant of ``smart_resize`` — ports HF's qwen2_vl ``smart_resize``."""
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar
+
+
+def _to_numpy_image(img) -> np.ndarray:
+    """Coerce a PIL.Image / path / numpy to a ``(C, H, W)`` uint8 array."""
+    from PIL import Image
+
+    if isinstance(img, str):
+        img = Image.open(img)
+    if hasattr(img, "convert"):
+        img = img.convert("RGB")
+        arr = np.array(img)  # (H, W, C)
+    elif isinstance(img, np.ndarray):
+        arr = img
+    else:
+        arr = np.asarray(img)
+    if arr.ndim == 2:
+        arr = np.stack([arr] * 3, axis=-1)
+    if arr.shape[-1] in (1, 3, 4) and arr.ndim == 3:
+        arr = np.transpose(arr, (2, 0, 1))  # HWC -> CHW
+    if arr.shape[0] == 4:
+        arr = arr[:3]
+    return arr
+
+
+class Qwen3VLImageProcessor(ImageProcessingMixin):
+    """Numpy port of Qwen2/3-VL image processor (torch-free).
+
+    Produces:
+      - ``pixel_values``: ``(sum_i grid_t*grid_h*grid_w, C * tps * ps * ps)``
+        where images have ``grid_t=1`` (duplicated along the temporal axis to
+        match the model's ``temporal_patch_size``)
+      - ``image_grid_thw``: ``(num_images, 3)``
+    """
+
+    model_input_names = ["pixel_values", "image_grid_thw"]
+
+    def __init__(
+        self,
+        patch_size: int = 16,
+        temporal_patch_size: int = 2,
+        merge_size: int = 2,
+        min_pixels: int = 56 * 56,
+        max_pixels: int = 14 * 14 * 4 * 1280,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255.0,
+        do_normalize: bool = True,
+        image_mean: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = None,
+        do_convert_rgb: bool = True,
+        **kwargs,
+    ):
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.merge_size = merge_size
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
+        self.image_mean = image_mean or [0.5, 0.5, 0.5]
+        self.image_std = image_std or [0.5, 0.5, 0.5]
+        self.do_convert_rgb = do_convert_rgb
+
+    def fetch_images(self, images):
+        if not isinstance(images, list):
+            images = [images]
+        return [_to_numpy_image(img) for img in images]
+
+    def _process_one(self, image: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+        C, H, W = image.shape
+        resized_h, resized_w = _smart_resize_image(
+            H,
+            W,
+            factor=self.patch_size * self.merge_size,
+            min_pixels=self.min_pixels,
+            max_pixels=self.max_pixels,
+        )
+        # Bicubic resize via PIL (same pattern as the video path).
+        frame = _resize_video_frames(image[None, ...], resized_h, resized_w)[0]
+
+        img = frame.astype(np.float32)
+        if self.do_rescale and image.dtype == np.uint8:
+            img = img * self.rescale_factor
+        if self.do_normalize:
+            mean = np.array(self.image_mean, dtype=np.float32)[:, None, None]
+            std = np.array(self.image_std, dtype=np.float32)[:, None, None]
+            img = (img - mean) / std
+
+        # Duplicate along T so grid_t * tps frames match the model's expectation.
+        patches = np.repeat(img[None, None, ...], self.temporal_patch_size, axis=1)
+
+        ps = self.patch_size
+        tps = self.temporal_patch_size
+        ms = self.merge_size
+        grid_t = 1
+        grid_h = resized_h // ps
+        grid_w = resized_w // ps
+
+        patches = patches.reshape(
+            1,
+            grid_t,
+            tps,
+            C,
+            grid_h // ms,
+            ms,
+            ps,
+            grid_w // ms,
+            ms,
+            ps,
+        )
+        patches = patches.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
+        return flatten[0], [grid_t, grid_h, grid_w]
+
+    def __call__(self, images, **kwargs):
+        if not isinstance(images, list):
+            images = [images]
+        imgs = [
+            (
+                img
+                if (isinstance(img, np.ndarray) and img.ndim == 3)
+                else _to_numpy_image(img)
+            )
+            for img in images
+        ]
+        all_patches = []
+        all_thw = []
+        for v in imgs:
+            patches, thw = self._process_one(v)
+            all_patches.append(patches)
+            all_thw.append(thw)
+        return {
+            "pixel_values": np.concatenate(all_patches, axis=0),
+            "image_grid_thw": np.array(all_thw, dtype=np.int64),
+        }
+
+    def preprocess(self, images, **kwargs):
+        return self(images, **kwargs)
+
+
+class Qwen3VLVideoProcessor(BaseVideoProcessor):
+    """Numpy port of ``transformers.Qwen3VLVideoProcessor``.
+
+    Produces:
+      - ``pixel_values_videos``: shape
+        ``(sum_i grid_t_i * grid_h_i * grid_w_i, C * tps * ps * ps)``
+      - ``video_grid_thw``: ``(num_videos, 3)`` of ``(grid_t, grid_h, grid_w)``
+
+    The upstream implementation hard-requires torch/torchvision via
+    ``BaseVideoProcessor``; this port reproduces the same outputs with
+    numpy + PIL only.
+    """
+
+    model_input_names = ["pixel_values_videos", "video_grid_thw"]
+
+    def __init__(
+        self,
+        patch_size: int = 16,
+        temporal_patch_size: int = 2,
+        merge_size: int = 2,
+        min_pixels: int = 128 * 32 * 32,
+        max_pixels: int = 32 * 32 * 768,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255.0,
+        do_normalize: bool = True,
+        image_mean: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = None,
+        do_convert_rgb: bool = True,
+        fps: float = 2.0,
+        min_frames: int = 4,
+        max_frames: int = 768,
+        **kwargs,
+    ):
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.merge_size = merge_size
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
+        self.image_mean = image_mean or [0.5, 0.5, 0.5]
+        self.image_std = image_std or [0.5, 0.5, 0.5]
+        self.do_convert_rgb = do_convert_rgb
+        self.fps = fps
+        self.min_frames = min_frames
+        self.max_frames = max_frames
+
+    def _process_one(self, video: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+        if video.ndim != 4:
+            raise ValueError(
+                f"Expected video as (T, C, H, W), got shape {video.shape}."
+            )
+        T, C, H, W = video.shape
+        if C == 1 and self.do_convert_rgb:
+            video = np.repeat(video, 3, axis=1)
+            C = 3
+
+        resized_h, resized_w = _smart_resize_video(
+            num_frames=T,
+            height=H,
+            width=W,
+            temporal_factor=self.temporal_patch_size,
+            factor=self.patch_size * self.merge_size,
+            min_pixels=self.min_pixels,
+            max_pixels=self.max_pixels,
+        )
+        video = _resize_video_frames(video, resized_h, resized_w)
+
+        video_f = video.astype(np.float32)
+        if self.do_rescale and video.dtype == np.uint8:
+            video_f = video_f * self.rescale_factor
+        if self.do_normalize:
+            mean = np.array(self.image_mean, dtype=np.float32)[None, :, None, None]
+            std = np.array(self.image_std, dtype=np.float32)[None, :, None, None]
+            video_f = (video_f - mean) / std
+
+        pad = (-video_f.shape[0]) % self.temporal_patch_size
+        if pad:
+            video_f = np.concatenate(
+                [video_f, np.repeat(video_f[-1:], pad, axis=0)], axis=0
+            )
+
+        T_padded = video_f.shape[0]
+        grid_t = T_padded // self.temporal_patch_size
+        grid_h = resized_h // self.patch_size
+        grid_w = resized_w // self.patch_size
+        ps = self.patch_size
+        tps = self.temporal_patch_size
+        ms = self.merge_size
+
+        patches = video_f[None, ...]  # (1, T_padded, C, H, W)
+        patches = patches.reshape(
+            1,
+            grid_t,
+            tps,
+            C,
+            grid_h // ms,
+            ms,
+            ps,
+            grid_w // ms,
+            ms,
+            ps,
+        )
+        patches = patches.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
+        return flatten[0], [grid_t, grid_h, grid_w]
+
+    def __call__(self, videos, **kwargs):
+        if not isinstance(videos, list):
+            videos = [videos]
+        all_patches = []
+        all_thw = []
+        for v in videos:
+            if not isinstance(v, np.ndarray):
+                v = np.asarray(v)
+            patches, thw = self._process_one(v)
+            all_patches.append(patches)
+            all_thw.append(thw)
+        return {
+            "pixel_values_videos": np.concatenate(all_patches, axis=0),
+            "video_grid_thw": np.array(all_thw, dtype=np.int64),
+        }
+
+
+def _load_qwen_vl_json(pretrained_model_name_or_path, relative_name: str):
+    """Load ``<checkpoint>/<relative_name>`` from disk or the Hub, or None."""
+    import json
+    from pathlib import Path
+
+    local = Path(pretrained_model_name_or_path) / relative_name
+    if local.exists():
+        return json.loads(local.read_text())
+    try:
+        from huggingface_hub import hf_hub_download
+
+        fetched = Path(hf_hub_download(pretrained_model_name_or_path, relative_name))
+        return json.loads(fetched.read_text())
+    except Exception:
+        return None
+
+
+def _qwen_vl_image_kwargs(pretrained_model_name_or_path, default_patch_size: int = 16):
+    """Read Qwen-VL image processor kwargs out of a checkpoint."""
+    proc_cfg = (
+        _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json") or {}
+    )
+    raw = (
+        _load_qwen_vl_json(pretrained_model_name_or_path, "preprocessor_config.json")
+        or {}
+    )
+    raw.update(proc_cfg.get("image_processor", {}) or {})
+    out = {"patch_size": default_patch_size}
+    for k in (
+        "patch_size",
+        "temporal_patch_size",
+        "merge_size",
+        "image_mean",
+        "image_std",
+        "rescale_factor",
+        "do_rescale",
+        "do_normalize",
+        "do_convert_rgb",
+    ):
+        if k in raw:
+            out[k] = raw[k]
+    size = raw.get("size", {})
+    if "shortest_edge" in size:
+        out["min_pixels"] = size["shortest_edge"]
+    if "longest_edge" in size:
+        out["max_pixels"] = size["longest_edge"]
+    # legacy flat-key forms (some Qwen2 checkpoints)
+    if "min_pixels" in raw:
+        out["min_pixels"] = raw["min_pixels"]
+    if "max_pixels" in raw:
+        out["max_pixels"] = raw["max_pixels"]
+    return out
+
+
+def _qwen_vl_video_kwargs(pretrained_model_name_or_path, default_patch_size: int = 16):
+    """Read Qwen-VL video processor kwargs out of a checkpoint."""
+    raw = _load_qwen_vl_json(
+        pretrained_model_name_or_path, "video_preprocessor_config.json"
+    )
+    if raw is None:
+        # Older checkpoints (e.g. qwen2_vl) keep video settings inside
+        # preprocessor_config.json alongside the image settings.
+        raw = (
+            _load_qwen_vl_json(
+                pretrained_model_name_or_path, "preprocessor_config.json"
+            )
+            or {}
+        )
+    out = {"patch_size": default_patch_size}
+    for k in (
+        "patch_size",
+        "temporal_patch_size",
+        "merge_size",
+        "fps",
+        "min_frames",
+        "max_frames",
+        "image_mean",
+        "image_std",
+        "rescale_factor",
+        "do_rescale",
+        "do_normalize",
+        "do_convert_rgb",
+    ):
+        if k in raw:
+            out[k] = raw[k]
+    size = raw.get("size", {})
+    if "shortest_edge" in size:
+        out["min_pixels"] = size["shortest_edge"]
+    if "longest_edge" in size:
+        out["max_pixels"] = size["longest_edge"]
+    if "min_pixels" in raw:
+        out["min_pixels"] = raw["min_pixels"]
+    if "max_pixels" in raw:
+        out["max_pixels"] = raw["max_pixels"]
+    return out
 
 
 class Qwen3VLProcessor(ProcessorMixin):
@@ -22,6 +467,14 @@ class Qwen3VLProcessor(ProcessorMixin):
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
     video_processor_class = "AutoVideoProcessor"
+
+    # HF's ProcessorMixin resolves expected base classes at runtime; in torch-
+    # free environments it picks up dummy classes from
+    # ``transformers.utils.dummy_torchvision_objects``, so our (real) numpy
+    # subclasses fail ``isinstance``. Skip that validation — our processors
+    # are duck-typed to the interfaces the call sites use.
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
 
     def __init__(
         self,
@@ -174,10 +627,7 @@ class Qwen3VLProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import json
-        from pathlib import Path
-
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from transformers import AutoTokenizer
 
         kwargs.pop("use_fast", None)
         tokenizer = AutoTokenizer.from_pretrained(
@@ -185,56 +635,30 @@ class Qwen3VLProcessor(ProcessorMixin):
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        # Read processor_config.json for correct init kwargs
-        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
-        proc_kwargs = {}
-        ip_overrides = {}
-        if proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
-            for k in ("chat_template",):
-                if k in proc_cfg:
-                    proc_kwargs[k] = proc_cfg[k]
-            ip_cfg = proc_cfg.get("image_processor", {})
-            if "patch_size" in ip_cfg:
-                ip_overrides["patch_size"] = ip_cfg["patch_size"]
-            if "size" in ip_cfg:
-                ip_overrides["size"] = ip_cfg["size"]
-
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                use_fast=False,
-                **ip_overrides,
-                **kwargs,
+        image_processor = Qwen3VLImageProcessor(
+            **_qwen_vl_image_kwargs(
+                pretrained_model_name_or_path, default_patch_size=16
             )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                **ip_overrides,
-                **kwargs,
+        )
+        video_processor = Qwen3VLVideoProcessor(
+            **_qwen_vl_video_kwargs(
+                pretrained_model_name_or_path, default_patch_size=16
             )
+        )
 
-        video_processor = None
-        try:
-            from transformers import AutoVideoProcessor
-
-            video_processor = AutoVideoProcessor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs
-            )
-        except (ImportError, ValueError, OSError):
-            pass
-
-        if "chat_template" not in proc_kwargs:
-            chat_template = getattr(tokenizer, "chat_template", None)
-            if chat_template is not None:
-                proc_kwargs["chat_template"] = chat_template
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or {}
+        )
+        chat_template = proc_cfg.get(
+            "chat_template", getattr(tokenizer, "chat_template", None)
+        )
 
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
             video_processor=video_processor,
-            **proc_kwargs,  # may include chat_template from processor_config.json
+            chat_template=chat_template,
         )
 
 

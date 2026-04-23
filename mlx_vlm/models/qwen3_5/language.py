@@ -735,7 +735,7 @@ class LanguageModel(nn.Module):
                 if (
                     self._position_ids is not None
                     and self._position_ids.shape[1] == batch_size
-                    and self._position_ids.shape[-1] == seq_length
+                    and self._position_ids.shape[-1] >= cache_offset + seq_length
                 ):
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
