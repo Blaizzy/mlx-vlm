@@ -1052,12 +1052,19 @@ def stream_generate(
             # Trim cache to prefix_len in case it includes generated tokens
             for c in kv_cache:
                 if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2]
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[:, :, :prefix_len, :]
-                        c.values = c.values[:, :, :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
+                    # TurboQuant caches store quantized states (NamedTuples)
+                    # instead of raw tensors, so use trim() instead of slicing
+                    if hasattr(c, "trim") and not hasattr(c.keys, "shape"):
+                        excess = c.offset - prefix_len
+                        if excess > 0:
+                            c.trim(excess)
+                    elif hasattr(c.keys, "shape"):
+                        cached_len = c.keys.shape[2]
+                        if cached_len > prefix_len:
+                            c.keys = c.keys[:, :, :prefix_len, :]
+                            c.values = c.values[:, :, :prefix_len, :]
+                            if hasattr(c, "offset"):
+                                c.offset = prefix_len
             kwargs["prompt_cache"] = kv_cache
 
     if thinking_budget is not None:
