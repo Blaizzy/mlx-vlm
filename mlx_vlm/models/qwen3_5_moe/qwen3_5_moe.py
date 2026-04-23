@@ -46,7 +46,14 @@ class Model(Qwen3_5Model):
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
-                if "model.language_model" in key:
+                # Qwen3.6-35B-A3B nests the ViT under
+                # `model.language_model.visual.*`. Handle that before the
+                # generic `model.language_model` rewrite so visual weights
+                # are routed to `vision_tower` rather than being buried at
+                # `language_model.model.visual.*`.
+                if "model.language_model.visual" in key:
+                    key = key.replace("model.language_model.visual", "vision_tower")
+                elif "model.language_model" in key:
                     key = key.replace("model.language_model", "language_model.model")
                 elif "model.visual" in key:
                     key = key.replace("model.visual", "vision_tower")
