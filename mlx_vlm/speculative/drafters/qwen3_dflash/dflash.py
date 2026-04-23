@@ -33,18 +33,28 @@ class DFlashAttention(nn.Module):
         ctx_values = self.v_proj(x_ctx)
         prop_keys = self.k_proj(x)
         prop_values = self.v_proj(x)
-        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
-        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
+        queries = self.q_norm(queries.reshape(B, L, self.n_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        ctx_keys = self.k_norm(ctx_keys.reshape(B, S, self.n_kv_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
         ctx_values = ctx_values.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3)
-        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        prop_keys = self.k_norm(prop_keys.reshape(B, L, self.n_kv_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
+        prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(
+            0, 2, 1, 3
+        )
         queries = rope(queries, offset=cache.offset + S)
         ctx_keys = rope(ctx_keys, offset=cache.offset)
         prop_keys = rope(prop_keys, offset=cache.offset + S)
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
-        o = mx.fast.scaled_dot_product_attention(queries, keys, values, scale=self.scale)
+        o = mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=self.scale
+        )
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
 

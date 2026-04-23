@@ -498,7 +498,6 @@ def _dflash_rounds(
         if bs <= 1:
             break
 
-
         draft_tokens = draft_model.draft_block(
             b, hidden, draft_cache, bs, sampler, token_dtype
         )
