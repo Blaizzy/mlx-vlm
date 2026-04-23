@@ -1,5 +1,4 @@
 import json
-import warnings
 from typing import Any
 
 import mlx.core as mx
@@ -52,7 +51,7 @@ class LLGuidanceLogitsProcessor:
                 self.ll_matchers[i].consume_token(last_token)
                 error = self.ll_matchers[i].get_error()
                 if error:
-                    warnings.warn(f"Error in LLMatcher: {error}")
+                    raise ValueError(f"LLGuidance matcher error: {error}")
 
         biased_logits = []
         for i in range(batch_size):
