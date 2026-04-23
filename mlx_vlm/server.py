@@ -766,7 +766,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
-def _build_gen_args(request) -> GenerationArguments:
+def _build_gen_args(request, processor=None) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
         request, "max_output_tokens", DEFAULT_MAX_TOKENS
@@ -774,7 +774,7 @@ def _build_gen_args(request) -> GenerationArguments:
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
-    return GenerationArguments(
+    args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
@@ -786,6 +786,11 @@ def _build_gen_args(request) -> GenerationArguments:
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
     )
+    if processor is not None:
+        args.logits_processors = _build_structured_logits_processors(
+            request, processor
+        )
+    return args
 
 
 def _as_plain_dict(value):
@@ -1664,11 +1669,8 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
-        gen_args = _build_gen_args(openai_request)
         try:
-            gen_args.logits_processors = _build_structured_logits_processors(
-                openai_request, processor
-            )
+            gen_args = _build_gen_args(openai_request, processor)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -2063,11 +2065,8 @@ async def chat_completions_endpoint(request: ChatRequest):
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
 
-        gen_args = _build_gen_args(request)
         try:
-            gen_args.logits_processors = _build_structured_logits_processors(
-                request, processor
-            )
+            gen_args = _build_gen_args(request, processor)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
