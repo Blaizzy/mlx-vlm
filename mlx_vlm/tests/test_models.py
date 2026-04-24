@@ -1978,7 +1978,7 @@ class TestModels(unittest.TestCase):
         )
 
     def test_kimi_vl(self):
-        from types import SimpleNamespace
+        pass
 
         from mlx_vlm.models import kimi_vl
 

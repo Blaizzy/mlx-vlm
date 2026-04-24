@@ -55,6 +55,7 @@ class Model(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_hws", None)
         video_grid_thw = kwargs.pop("video_grid_hws", None)
         image_token_id = kwargs.pop("image_token_id", None)
+        grid_shapes = kwargs.pop("_grid_shapes", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
@@ -71,6 +72,7 @@ class Model(nn.Module):
                 pixel_values.transpose(0, 2, 3, 1),
                 output_hidden_states=True,
                 grid_thw=grid_thw,
+                grid_shapes=grid_shapes,
             )
 
             image_features = self.multi_modal_projector(hidden_state)
