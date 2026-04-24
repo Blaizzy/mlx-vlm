@@ -127,8 +127,11 @@ def freeze_model(model):
                 # sub-objects (e.g. Gemma 4 audio_tower).
                 try:
                     from mlx.utils import tree_flatten
+
                     top = model[f"{name}"]
-                    leaves = tree_flatten(top.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module))
+                    leaves = tree_flatten(
+                        top.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+                    )
                     for _, m in leaves:
                         m.freeze(recurse=False)
                 except Exception:
