@@ -480,9 +480,7 @@ class Gemma3Model(nn.Module):
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-            # Prefer ``cache._idx`` (Python int) to avoid a per-step GPU sync;
-            # only fall back to reading ``cache.offset`` (which may require an
-            # ``.item()`` sync for ``BatchKVCache``) when no cache exposes it.
+
             c0 = next(
                 (c for c in (cache or []) if c is not None and hasattr(c, "_idx")),
                 None,
