@@ -480,7 +480,6 @@ class Gemma3Model(nn.Module):
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-
             c0 = next(
                 (c for c in (cache or []) if c is not None and hasattr(c, "_idx")),
                 None,

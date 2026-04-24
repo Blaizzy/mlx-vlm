@@ -209,11 +209,7 @@ class Attention(nn.Module):
                 offset_scalar = (
                     int(off)
                     if isinstance(off, int)
-                    else (
-                        int(off.max().item())
-                        if off.ndim > 0
-                        else int(off.item())
-                    )
+                    else (int(off.max().item()) if off.ndim > 0 else int(off.item()))
                 )
             kv_seq_len += offset_scalar
 
