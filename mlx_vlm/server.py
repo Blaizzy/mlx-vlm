@@ -243,12 +243,6 @@ class ResponseGenerator:
             if hasattr(raw_inputs["input_ids"], "size")
             else len(raw_inputs["input_ids"])
         )
-
-        # Precompute numpy-based indices on the caller thread (safe from
-        # the GPU thread's wired Metal resources).
-        if hasattr(self.model, "precompute_indices"):
-            self.model.precompute_indices(raw_inputs)
-
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
         # Block until the GPU thread sends back the context
@@ -413,8 +407,6 @@ class ResponseGenerator:
                     # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
-                    if has_embeds and active:
-                        mx.eval(gen_kwargs["inputs_embeds"])
 
                     # Image/embed requests can't share a prefill batch with
                     # pending text-only prompts — drain them first.

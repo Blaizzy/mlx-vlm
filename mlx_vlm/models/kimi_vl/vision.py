@@ -8,17 +8,12 @@ from .config import VisionConfig
 
 
 def _as_hw_shapes(grid_hws) -> List[Tuple[int, int]]:
-    if isinstance(grid_hws, list):
-        return [(int(s[0]), int(s[1])) for s in grid_hws]
-    if hasattr(grid_hws, "tolist"):
-        return [(int(s[0]), int(s[1])) for s in grid_hws.tolist()]
-    return [(int(s[0]), int(s[1])) for s in grid_hws]
+    raw_shapes = grid_hws.tolist() if hasattr(grid_hws, "tolist") else grid_hws
+    return [(int(shape[0]), int(shape[1])) for shape in raw_shapes]
 
 
 def make_block_attention_mask(cu_seqlens: mx.array, seq_length: int) -> mx.array:
-    # Pure MLX: each position belongs to a block; same-block pairs attend
     pos = mx.arange(seq_length)
-    # block_id[i] = number of segment boundaries <= i
     block_id = mx.sum(pos[None, :] >= cu_seqlens[1:, None], axis=0)
     return block_id[:, None] == block_id[None, :]
 
@@ -74,7 +69,7 @@ class VisionRotaryEmbedding(nn.Module):
         inv_freq = 1.0 / (
             self.theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        seq = mx.arange(int(seqlen) if not isinstance(seqlen, int) else seqlen, dtype=inv_freq.dtype)
+        seq = mx.arange(seqlen.tolist(), dtype=inv_freq.dtype)
         freqs = mx.outer(seq, inv_freq)
         return freqs
 
@@ -111,9 +106,8 @@ class Learnable2DInterpPosEmb(nn.Module):
         self._interp_cache[shape] = cached
         return cached
 
-    def __call__(self, x: mx.array, grid_hws: mx.array, grid_shapes=None) -> mx.array:
-        shapes = grid_shapes or _as_hw_shapes(grid_hws)
-        pos_embs = [self._get_pos_emb(shape) for shape in shapes]
+    def __call__(self, x: mx.array, grid_hws: mx.array) -> mx.array:
+        pos_embs = [self._get_pos_emb(shape) for shape in _as_hw_shapes(grid_hws)]
         out = x + mx.concatenate(pos_embs, axis=0).astype(x.dtype)
         return out
 
@@ -143,10 +137,10 @@ class PatchEmbed(nn.Module):
             height=init_pos_emb_height, width=init_pos_emb_height, dim=embed_dim
         )
 
-    def __call__(self, hidden_states: mx.array, grid_thw: mx.array, grid_shapes=None) -> mx.array:
+    def __call__(self, hidden_states: mx.array, grid_thw: mx.array) -> mx.array:
         hidden_states = self.proj(hidden_states).swapaxes(1, 3)
         hidden_states = hidden_states.reshape(hidden_states.shape[0], -1)
-        hidden_states = self.pos_emb(hidden_states, grid_thw, grid_shapes=grid_shapes)
+        hidden_states = self.pos_emb(hidden_states, grid_thw)
         return hidden_states
 
 
@@ -355,7 +349,7 @@ class Rope2DPosEmb(nn.Module):
         freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
         return freqs_cis
 
-    def get_freqs_cis(self, grid_hws: mx.array, grid_shapes=None) -> mx.array:
+    def get_freqs_cis(self, grid_hws: mx.array) -> mx.array:
         """
         Args:
             grid_hws (mx.array): grid height and width
@@ -366,7 +360,7 @@ class Rope2DPosEmb(nn.Module):
         if self._freqs_cis is None:
             self._freqs_cis = self._precompute_freqs_cis()
 
-        shapes = grid_shapes or _as_hw_shapes(grid_hws)
+        shapes = _as_hw_shapes(grid_hws)
         assert all(
             1 <= h <= self.max_height and 1 <= w <= self.max_width for h, w in shapes
         ), (
@@ -450,12 +444,10 @@ class VisionModel(nn.Module):
         hidden_states: mx.array,
         grid_thw: mx.array,
         output_hidden_states: Optional[bool] = None,
-        grid_shapes: Optional[List[Tuple[int, int]]] = None,
     ) -> mx.array:
-        shapes = grid_shapes or _as_hw_shapes(grid_thw)
 
-        hidden_states = self.patch_embed(hidden_states, grid_thw, grid_shapes=shapes)
-        rotary_pos_emb = self.rope_pos_emb.get_freqs_cis(grid_thw, grid_shapes=shapes)
+        hidden_states = self.patch_embed(hidden_states, grid_thw)
+        rotary_pos_emb = self.rope_pos_emb.get_freqs_cis(grid_thw)
 
         # Calculate cu_seqlens for each item in the batch
         lengths = mx.concatenate(

@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
@@ -62,16 +61,7 @@ class Model(nn.Module):
             inputs_embeds = self.language_model.embed_tokens(input_ids)
             return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
-        # Use precomputed positions (from caller thread) when available
-        image_positions = kwargs.pop("_precomputed_image_positions", None)
-        if image_positions is None:
-            image_positions = self._compute_image_positions(
-                input_ids, image_token_id
-            )
-
         inputs_embeds = self.language_model.embed_tokens(input_ids)
-
-        precomputed_grid = kwargs.pop("_precomputed_grid_shapes", None)
 
         cached = kwargs.get("cached_image_features", None)
         if cached is not None:
@@ -81,99 +71,29 @@ class Model(nn.Module):
                 pixel_values.transpose(0, 2, 3, 1),
                 output_hidden_states=True,
                 grid_thw=grid_thw,
-                grid_shapes=precomputed_grid,
             )
 
             image_features = self.multi_modal_projector(hidden_state)
 
-        inputs_embeds[:, image_positions, :] = image_features
-        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
-
-    def _compute_image_positions(self, input_ids, image_token_id=None):
-        """Compute image token positions (forces mx.eval via numpy)."""
-        candidate_ids = []
-        for t in [
-            image_token_id,
-            self.config.image_token_index,
-            getattr(self.config, "media_placeholder_token_id", None),
-        ]:
-            if t is None:
-                continue
-            if isinstance(t, mx.array):
-                if t.size == 0:
-                    continue
-                t = t.item()
-            candidate_ids.append(int(t))
-
-        ids_np = np.array(input_ids)
-        mask_np = np.zeros(ids_np.shape, dtype=bool)
-        for tid in candidate_ids:
-            mask_np |= ids_np == tid
-        return np.where(mask_np)[1].tolist()
-
-    def precompute_indices(self, raw_inputs: dict):
-        """Precompute image positions on the caller thread.
-
-        Must run before the GPU thread to avoid mx.eval conflicts
-        with the generation stream's wired Metal resources.
-        """
-        input_ids = raw_inputs.get("input_ids")
-        pixel_values = raw_inputs.get("pixel_values")
-        if input_ids is None or pixel_values is None:
-            return
-        image_token_id = raw_inputs.get("image_token_id")
-        positions = self._compute_image_positions(input_ids, image_token_id)
-        raw_inputs["_precomputed_image_positions"] = positions
-
-        # Precompute grid shapes as Python tuples to avoid .tolist() on GPU thread
-        for key in ("image_grid_hws", "video_grid_hws"):
-            v = raw_inputs.get(key)
-            if v is not None and hasattr(v, "tolist"):
-                raw_inputs["_precomputed_grid_shapes"] = [
-                    (int(s[0]), int(s[1])) for s in v.tolist()
-                ]
-
-    def _prepare_inputs_for_multimodal(
-        self,
-        image_features,
-        inputs_embeds,
-        input_ids,
-        image_token_id=None,
-    ):
-        candidate_token_ids = []
-        for token_id in [
-            image_token_id,
-            self.config.image_token_index,
-            getattr(self.config, "media_placeholder_token_id", None),
-        ]:
-            if token_id is None:
-                continue
-            if isinstance(token_id, mx.array):
-                if token_id.size == 0:
-                    continue
-                token_id = token_id.item()
-            token_id = int(token_id)
-            if token_id not in candidate_token_ids:
-                candidate_token_ids.append(token_id)
-
+        # Pure MLX merge — no numpy, safe during concurrent batching
         image_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
-        for token_id in candidate_token_ids:
-            image_mask = mx.logical_or(image_mask, input_ids == token_id)
+        for tid in [
+            image_token_id,
+            self.config.image_token_index,
+            getattr(self.config, "media_placeholder_token_id", None),
+        ]:
+            if tid is not None:
+                if isinstance(tid, mx.array) and tid.size == 0:
+                    continue
+                image_mask = image_mask | (input_ids == tid)
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(np.array(image_mask))[1].tolist()
-        num_image_tokens = len(image_positions)
-        num_image_features = image_features.shape[0]
-        if num_image_tokens != num_image_features:
-            raise ValueError(
-                "Number of image placeholder tokens does not match extracted image features: "
-                f"{num_image_tokens} tokens for {num_image_features} features. "
-                f"Candidate token IDs: {candidate_token_ids}."
-            )
+        mask_flat = image_mask.reshape(-1)
+        cumsum = mx.cumsum(mask_flat.astype(mx.int32)) - 1
+        feat_idx = mx.where(mask_flat, cumsum, 0).reshape(input_ids.shape)
+        gathered = image_features[feat_idx]
+        inputs_embeds = mx.where(image_mask[..., None], gathered, inputs_embeds)
 
-        inputs_embeds[:, image_positions, :] = image_features
-
-        return inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     @property
     def layers(self):
