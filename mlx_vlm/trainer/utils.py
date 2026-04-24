@@ -105,10 +105,6 @@ def get_peft_model(
 
 
 def freeze_model(model):
-    # Gemma 4 (and other multimodal models with an audio tower) also expose
-    # ``audio_tower`` / ``embed_audio`` / ``embed_vision`` at the top level;
-    # omitting them leaves hundreds of MB of unrelated weights marked
-    # trainable, which bloats adapter files and invites gradient leakage.
     top_level_to_freeze = {
         "language_model",
         "vision_model",
@@ -127,9 +123,8 @@ def freeze_model(model):
             try:
                 model[f"{name}"].freeze()
             except Exception:
-                # Some multimodal towers have custom sub-modules (e.g.
-                # AudioRelativePositionEmbedding) whose ``freeze`` errors out
-                # on non-Module buffers. Fall back to walking leaf modules.
+                # Fallback for towers whose .freeze() errors on non-Module
+                # sub-objects (e.g. Gemma 4 audio_tower).
                 try:
                     from mlx.utils import tree_flatten
                     top = model[f"{name}"]

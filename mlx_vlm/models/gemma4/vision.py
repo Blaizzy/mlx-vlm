@@ -503,13 +503,9 @@ class VisionModel(nn.Module):
             patch_positions = mx.concatenate(all_positions, axis=0)
             padding_positions = mx.concatenate(all_padding, axis=0)
 
-        # Build bidirectional attention mask [B, 1, L, L] for SDPA.
-        # Use a large finite negative mask value rather than -inf. When the
-        # input contains padded patches, queries at those positions see all
-        # keys masked; an all -inf softmax row produces NaN during backward
-        # (exp(-inf - -inf) = NaN), even though the forward value is finite
-        # because the padded outputs are zeroed downstream. A finite mask
-        # keeps the gradient defined, which is required for LoRA / fine-tuning.
+        # Bidirectional attention mask [B, 1, L, L] for SDPA. Use -1e4 not
+        # -inf: padded query rows would otherwise be all-masked and the
+        # softmax backward yields NaN (forward is fine, gradients aren't).
         valid_mask = ~padding_positions
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
         mask_fill = mx.array(-1e4, dtype=inputs_embeds.dtype)
