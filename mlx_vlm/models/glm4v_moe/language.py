@@ -589,19 +589,19 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim == 0 or offset.size == 1:
-                    cache_offset = offset.item()
-                else:
-                    cache_offsets = offset
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
