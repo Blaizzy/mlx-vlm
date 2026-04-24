@@ -21,6 +21,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Model-Specific Documentation](#model-specific-documentation)
 - [Vision Feature Caching](#vision-feature-caching)
 - [TurboQuant KV Cache](#turboquant-kv-cache)
+- [Distributed Inference](#distributed-inference)
 - [Fine-tuning](#fine-tuning)
 
 ## Model-Specific Documentation
@@ -722,6 +723,14 @@ Tested on gemma-4-31b-it at 128k context:
 TurboQuant automatically quantizes `KVCache` layers (global attention). Models with `RotatingKVCache` (sliding window) or `ArraysCache` (MLA/absorbed keys) keep their native cache format for those layers since they are already memory-efficient.
 
 TurboQuant is supported in both single-request generation and continuous batching on the server. In continuous batching mode, KV states are stored in TurboQuant's compressed format and dequantized at attention time (custom Metal kernels are not yet batch-aware).
+
+## Distributed Inference
+
+mlx-vlm supports distributed inference across multiple computers. It works by sharding the language model (not the vision tower), because the LLM is much larger and vision embeddings only need to be computed once.
+
+The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
+
+See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
 
 # Fine-tuning
 

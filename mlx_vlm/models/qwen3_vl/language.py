@@ -281,21 +281,27 @@ class Qwen3VLModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
+
         batch_size = hidden_states.shape[0]
 
         updated_batches = []
+        offset = 0
         for b in range(batch_size):
             batch_mask = visual_pos_masks[b]
             batch_hidden = hidden_states[b]
 
             batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
 
-            if len(batch_indices) == 0:
+            n_visual = len(batch_indices)
+            if n_visual == 0:
                 updated_batches.append(batch_hidden)
                 continue
 
+            sample_embeds = visual_embeds[offset : offset + n_visual]
+            offset += n_visual
+
             batch_result = mx.array(batch_hidden)  # avoid modifying in-place
-            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+            batch_result = batch_result.at[batch_indices].add(sample_embeds)
 
             updated_batches.append(batch_result)
 
@@ -505,7 +511,7 @@ class LanguageModel(nn.Module):
     ):
         # Slicing visual_pos_masks when prefilling
         n_to_process = kwargs.get("n_to_process", None)
-        if n_to_process is not None:
+        if n_to_process is not None and visual_pos_masks is not None:
             visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
@@ -518,21 +524,15 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offset_array = None  # For per-sequence offsets in batch mode
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim == 0:
-                    cache_offset = offset.item()
-                else:
-                    # Per-sequence offsets for batched generation
-                    cache_offset_array = offset
-                    cache_offset = offset[0].item()  # For compatibility checks
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
+                cache_offset_array = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -182,9 +182,8 @@ class ResponseGenerator:
 
     def __init__(
         self,
-        model,
-        processor,
-        stop_tokens=None,
+        model_path: str,
+        adapter_path: Optional[str] = None,
         vision_cache=None,
         kv_bits=None,
         kv_group_size=DEFAULT_KV_GROUP_SIZE,
@@ -192,20 +191,24 @@ class ResponseGenerator:
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
     ):
-        self.model = model
-        self.processor = processor
-        self.stop_tokens = stop_tokens or set()
+        self.model_path = model_path
+        self.adapter_path = adapter_path
+        self.model = None
+        self.processor = None
+        self.config = None
+        self.stop_tokens = set()
         self.vision_cache = vision_cache
+        self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
-        self.tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
+        self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
+        self._ready = Event()
+        self._load_error: Optional[Exception] = None
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
@@ -216,6 +219,13 @@ class ResponseGenerator:
         self.requests.put(None)
         self._thread.join(timeout=5.0)
 
+    def wait_until_ready(self, timeout: Optional[float] = None):
+        if not self._ready.wait(timeout):
+            raise RuntimeError("Timed out waiting for generation thread to load model.")
+        if self._load_error is not None:
+            raise self._load_error
+        return self.model, self.processor, self.config
+
     def _cancel(self, uid):
         with self._cancel_lock:
             self._cancelled.add(uid)
@@ -225,6 +235,37 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _initialize_model(self):
+        model, processor, config = load_model_resources(
+            self.model_path, self.adapter_path
+        )
+
+        stop_tokens = set()
+        if hasattr(config, "eos_token_id"):
+            if isinstance(config.eos_token_id, list):
+                stop_tokens.update(config.eos_token_id)
+            elif config.eos_token_id is not None:
+                stop_tokens.add(config.eos_token_id)
+
+        draft_model = None
+        draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+        if draft_model_path:
+            from .speculative.drafters import load_drafter
+
+            draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
+            print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
+            draft_model = load_drafter(draft_model_path, kind=draft_kind)
+            print("Drafter ready — speculative decoding enabled.")
+
+        self.model = model
+        self.processor = processor
+        self.config = config
+        self.stop_tokens = stop_tokens
+        self.draft_model = draft_model
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+
     def generate(
         self,
         prompt: str,
@@ -232,6 +273,7 @@ class ResponseGenerator:
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        self.wait_until_ready()
         args = args or GenerationArguments()
         rqueue: Queue = Queue()
 
@@ -339,6 +381,23 @@ class ResponseGenerator:
 
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        try:
+            self._initialize_model()
+        except Exception as e:
+            self._load_error = e
+            self._ready.set()
+            print(f"Error loading model in generation thread: {e}")
+            traceback.print_exc()
+            return
+
+        self._ready.set()
+
+        if self.draft_model is not None:
+            self._run_speculative()
+            return
+
+        generation_stream = mx.default_stream(mx.default_device())
+
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
@@ -401,6 +460,7 @@ class ResponseGenerator:
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
                             top_logprobs_k=self.top_logprobs_k,
+                            stream=generation_stream,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -441,6 +501,193 @@ class ResponseGenerator:
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
+                traceback.print_exc()
+
+    def _run_speculative(self):
+        """GPU thread loop with DFlash speculative decoding.
+
+        Collects incoming requests, prefills them as a batch with
+        ``capture_layer_ids``, then runs ``_dflash_rounds_batch`` for
+        decode. Between speculative rounds the loop checks for new
+        requests — new arrivals trigger a batch rebuild (re-prefill
+        for the new sequences, extend target caches, cold-restart
+        drafter). Finished sequences are filtered out automatically
+        by ``_dflash_rounds_batch``'s ``stop_check`` callback.
+        """
+        from mlx_lm.sample_utils import make_sampler as _make_sampler
+
+        generation_stream = mx.default_stream(mx.default_device())
+
+        lm = self.model.language_model
+        drafter = self.draft_model
+        target_layer_ids = list(drafter.config.target_layer_ids)
+        sampler = _make_sampler(temp=0)
+        draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
+        draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
+
+        while not self._stop:
+            try:
+                # --- Phase 1: collect pending requests ---
+                pending = []
+                timeout = 0.1
+                try:
+                    item = self.requests.get(timeout=timeout)
+                    if item is None and self._stop:
+                        break
+                    if item is not None:
+                        pending.append(item)
+                except QueueEmpty:
+                    pass
+                while True:
+                    try:
+                        item = self.requests.get_nowait()
+                        if item is not None:
+                            pending.append(item)
+                    except QueueEmpty:
+                        break
+
+                if not pending:
+                    continue
+
+                # --- Phase 2: prefill new batch ---
+                uids = []
+                rqueues = {}
+                token_lists = {}
+                max_tokens_map = {}
+                all_input_ids = []
+
+                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                    input_ids, _ = self._gpu_embed(raw_inputs, images)
+                    uid = id(rqueue)
+                    uids.append(uid)
+                    rqueues[uid] = rqueue
+                    token_lists[uid] = []
+                    max_tokens_map[uid] = args.max_tokens
+                    all_input_ids.append(input_ids.squeeze(0).tolist())
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    sampler = self._make_sampler(args) or _make_sampler(temp=0)
+
+                B = len(uids)
+                max_len = max(len(ids) for ids in all_input_ids)
+                padded = [[0] * (max_len - len(ids)) + ids for ids in all_input_ids]
+                input_mx = mx.array(padded, dtype=mx.int32)
+
+                prompt_cache = _make_cache(lm, [0] * B)
+                lm._position_ids = None
+                lm._rope_deltas = None
+
+                with mx.stream(generation_stream):
+                    out = lm(
+                        input_mx,
+                        cache=prompt_cache,
+                        capture_layer_ids=target_layer_ids,
+                    )
+                hidden = mx.concatenate(out.hidden_states, axis=-1)
+                first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+                mx.eval(first_bonus, hidden, out.logits)
+
+                # Send first bonus tokens to clients
+                fb_list = first_bonus.tolist()
+                for j, uid in enumerate(uids):
+                    tok = int(fb_list[j])
+                    token_lists[uid].append(tok)
+                    text = self.tokenizer.decode([tok])
+                    rqueues[uid].put(
+                        StreamingToken(
+                            text=text,
+                            token=tok,
+                            logprobs=0.0,
+                            finish_reason=None,
+                            peak_memory=mx.get_peak_memory() / 1e9,
+                        )
+                    )
+
+                # --- Phase 3: speculative decode rounds ---
+                max_tok = max(max_tokens_map[u] for u in uids)
+                finished_uids = set()
+
+                def stop_check(seq_idx, token_id):
+                    uid = uids[seq_idx]
+                    if uid in finished_uids:
+                        return True
+                    if token_id in self.stop_tokens:
+                        return True
+                    if len(token_lists[uid]) >= max_tokens_map[uid]:
+                        return True
+                    return False
+
+                for tok_list, _ in _dflash_rounds_batch(
+                    self.model,
+                    drafter,
+                    prompt_cache,
+                    hidden,
+                    first_bonus=first_bonus,
+                    max_tokens=max_tok,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=mx.int32,
+                    stop_check=stop_check,
+                ):
+                    for j, tok in enumerate(tok_list):
+                        if tok is None:
+                            continue
+                        uid = uids[j]
+                        if uid in finished_uids:
+                            continue
+
+                        token_lists[uid].append(tok)
+                        tokens = token_lists[uid]
+
+                        if len(tokens) >= 2:
+                            prev = self.tokenizer.decode(tokens[:-1])
+                            curr = self.tokenizer.decode(tokens)
+                            text = curr[len(prev) :]
+                        else:
+                            text = self.tokenizer.decode(tokens)
+
+                        is_stop = tok in self.stop_tokens
+                        is_max = len(tokens) >= max_tokens_map[uid]
+                        finish = "stop" if is_stop else "length" if is_max else None
+
+                        rqueues[uid].put(
+                            StreamingToken(
+                                text="" if is_stop else text,
+                                token=tok,
+                                logprobs=0.0,
+                                finish_reason=finish,
+                                peak_memory=mx.get_peak_memory() / 1e9,
+                            )
+                        )
+
+                        if finish is not None:
+                            rqueues[uid].put(None)
+                            finished_uids.add(uid)
+
+                # Log acceptance stats
+                al = drafter.accept_lens
+                if al:
+                    mean_a = sum(al) / len(al)
+                    print(
+                        f"[DFlash] batch={B} tokens={sum(len(token_lists[u]) for u in uids)} "
+                        f"accept={mean_a:.2f} rounds={len(al)}"
+                    )
+
+                # Finalize any remaining
+                for uid in uids:
+                    if uid not in finished_uids:
+                        rqueues[uid].put(
+                            StreamingToken(
+                                text="",
+                                token=0,
+                                logprobs=0.0,
+                                finish_reason="length",
+                                peak_memory=mx.get_peak_memory() / 1e9,
+                            )
+                        )
+                        rqueues[uid].put(None)
+
+            except Exception as e:
+                print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
@@ -755,18 +1002,6 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
 
-    # Load the model resources
-    model, processor, config = load_model_resources(model_path, adapter_path)
-
-    # Get stop tokens from model config
-    stop_tokens = set()
-    if hasattr(config, "eos_token_id"):
-        if isinstance(config.eos_token_id, list):
-            stop_tokens.update(config.eos_token_id)
-        elif config.eos_token_id is not None:
-            stop_tokens.add(config.eos_token_id)
-
-    # Create ResponseGenerator for continuous batching
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
@@ -777,9 +1012,8 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     kv_quant_scheme = get_kv_quant_scheme()
 
     response_generator = ResponseGenerator(
-        model=model,
-        processor=processor,
-        stop_tokens=stop_tokens,
+        model_path=model_path,
+        adapter_path=adapter_path,
         vision_cache=vision_cache,
         kv_bits=kv_bits,
         kv_group_size=kv_group_size,
@@ -787,6 +1021,13 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
     )
+    try:
+        model, processor, config = response_generator.wait_until_ready()
+    except Exception:
+        response_generator.stop_and_join()
+        response_generator = None
+        vision_cache.clear()
+        raise
 
     model_cache = {
         "cache_key": cache_key,

@@ -51,6 +51,7 @@ MODEL_CONFIG = {
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
@@ -76,6 +77,7 @@ MODEL_CONFIG = {
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
@@ -222,8 +224,9 @@ class MessageFormatter:
             "qwen3_5",
             "qwen3_5_moe",
             "qwen3_omni_moe",
+            "gemma4",
         ] and kwargs.get("video"):
-            return self._format_video_message(prompt, kwargs)
+            return self._format_video_message(prompt, role, **kwargs)
 
         # Route to appropriate formatter
         formatter_map = {
@@ -409,18 +412,31 @@ class MessageFormatter:
         num_audios: int = 0,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Format a video message with text."""
-        return {
-            "role": role,
-            "content": [
-                MessageBuilder.video_message(
-                    kwargs["video"],
-                    kwargs.get("max_pixels", 224 * 224),
-                    kwargs.get("fps", 1),
-                ),
-                MessageBuilder.text_message(prompt),
-            ],
-        }
+        """Format a video message with text.
+
+        Accepts either a single path in ``video=`` or a list of paths; emits
+        one ``{"type": "video", ...}`` content item per video, followed by the
+        text. ``fps`` may be a scalar (applied to all) or a list of the same
+        length as the videos.
+        """
+        videos = kwargs["video"]
+        if not isinstance(videos, list):
+            videos = [videos]
+
+        max_pixels = kwargs.get("max_pixels", 224 * 224)
+        fps = kwargs.get("fps", 1)
+        fps_list = fps if isinstance(fps, list) else [fps] * len(videos)
+        if len(fps_list) != len(videos):
+            raise ValueError(
+                f"Got {len(fps_list)} fps values for {len(videos)} videos."
+            )
+
+        content = [
+            MessageBuilder.video_message(v, max_pixels, f)
+            for v, f in zip(videos, fps_list)
+        ]
+        content.append(MessageBuilder.text_message(prompt))
+        return {"role": role, "content": content}
 
 
 def get_message_json(

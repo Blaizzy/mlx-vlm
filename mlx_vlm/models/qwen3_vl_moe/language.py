@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -186,7 +187,7 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
+class Qwen3VLMoEMLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
         self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
@@ -197,7 +198,7 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
-class Qwen3MoeSparseMoeBlock(nn.Module):
+class Qwen3VLMoESparseMoeBlock(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         dim = args.hidden_size
@@ -210,10 +211,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         x: mx.array,
     ):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
@@ -225,6 +231,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
 
@@ -244,9 +253,9 @@ class Qwen3VLMoEDecoderLayer(nn.Module):
         if (layer_idx not in args.mlp_only_layers) and (
             args.num_experts > 0 and (layer_idx + 1) % args.decoder_sparse_step == 0
         ):
-            self.mlp = Qwen3MoeSparseMoeBlock(args)
+            self.mlp = Qwen3VLMoESparseMoeBlock(args)
         else:
-            self.mlp = MLP(args.hidden_size, args.intermediate_size)
+            self.mlp = Qwen3VLMoEMLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -322,23 +331,29 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
+
         batch_size = hidden_states.shape[0]
 
         updated_batches = []
+        offset = 0
         for b in range(batch_size):
             batch_mask = visual_pos_masks[b]
             batch_hidden = hidden_states[b]
 
             batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
 
-            if len(batch_indices) == 0:
+            n_visual = len(batch_indices)
+            if n_visual == 0:
                 updated_batches.append(batch_hidden)
                 continue
 
-            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
-            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+            sample_embeds = visual_embeds[offset : offset + n_visual]
+            offset += n_visual
 
-            updated_batches.append(batch_hidden)
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(sample_embeds)
+
+            updated_batches.append(batch_result)
 
         return mx.stack(updated_batches, axis=0)
 
@@ -546,7 +561,7 @@ class LanguageModel(nn.Module):
     ):
         # Slicing visual_pos_masks when prefilling
         n_to_process = kwargs.get("n_to_process", None)
-        if n_to_process is not None:
+        if n_to_process is not None and visual_pos_masks is not None:
             visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
@@ -559,19 +574,19 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim == 0 or offset.size == 1:
-                    cache_offset = offset.item()
-                else:
-                    cache_offsets = offset
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -671,3 +686,46 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    def shard(self, group: Optional[mx.distributed.Group] = None) -> None:
+
+        group = group or mx.distributed.init()
+        N = group.size()
+
+        for layer in self.layers:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            if isinstance(layer.mlp, Qwen3VLMoEMLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )

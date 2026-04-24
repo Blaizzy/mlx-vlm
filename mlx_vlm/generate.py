@@ -30,6 +30,7 @@ from .utils import (
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
+DEFAULT_VIDEO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.0
@@ -77,6 +78,19 @@ def parse_arguments():
         nargs="+",
         default=DEFAULT_AUDIO,
         help="URL or path of the audio to process.",
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        nargs="+",
+        default=DEFAULT_VIDEO,
+        help="URL or path of the video to process.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -255,7 +269,7 @@ def normalize_resize_shape(
 
 
 # A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 def maybe_quantize_kv_cache(
@@ -401,8 +415,12 @@ def _speculative_walk(
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
     """
-    d = draft_tokens[0].tolist()
-    t = target_tokens[0].tolist()
+    n_draft = draft_tokens.shape[1]
+    combined = mx.concatenate(
+        [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
+    ).tolist()
+    d = combined[:n_draft]
+    t = combined[n_draft:]
     accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
     new_tokens = (d[:accepted] + [t[accepted]])[:budget]
     return accepted, new_tokens
@@ -419,12 +437,15 @@ def _speculative_walk_batch(
     corresponds to one sequence in the batch.
     """
     B = draft_tokens.shape[0]
-    d_batch = draft_tokens.tolist()
-    t_batch = target_tokens.tolist()
+    n_draft = draft_tokens.shape[1]
+    combined = mx.concatenate(
+        [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
+    ).tolist()
     accepted_list: List[int] = []
     new_tokens_list: List[List[int]] = []
     for i in range(B):
-        d, t = d_batch[i], t_batch[i]
+        d = combined[i][:n_draft]
+        t = combined[i][n_draft:]
         acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
         new = (d[:acc] + [t[acc]])[: budgets[i]]
         accepted_list.append(acc)
@@ -474,14 +495,11 @@ def _dflash_rounds(
         if bs <= 1:
             break
 
-        # Draft
-        with mx.stream(generation_stream):
-            draft_tokens = draft_model.draft_block(
-                b, hidden, draft_cache, bs, sampler, token_dtype
-            )
+        draft_tokens = draft_model.draft_block(
+            b, hidden, draft_cache, bs, sampler, token_dtype
+        )
         mx.async_eval(draft_tokens)
 
-        # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
@@ -509,10 +527,18 @@ def _dflash_rounds(
             if emitted >= max_tokens:
                 return
 
-        lm.rollback_speculative_cache(prompt_cache, verify_out.gdn_states, accepted, bs)
-
-        hidden = hidden[:, : accepted + 1, :]
+        if accepted < bs - 1:
+            hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
+
+        if accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted, bs
+                )
+
+        if emitted % 256 == 0:
+            mx.clear_cache()
 
 
 def _dflash_rounds_batch(
@@ -568,6 +594,8 @@ def _dflash_rounds_batch(
         nonlocal draft_cache
         draft_cache = draft_model.make_cache()
 
+    total_emitted = sum(emitted)
+
     while len(active_idx) > 0:
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
@@ -582,10 +610,9 @@ def _dflash_rounds_batch(
         b_arr = mx.array(b_active, dtype=token_dtype)
 
         # Draft
-        with mx.stream(generation_stream):
-            draft_tokens = draft_model.draft_block(
-                b_arr, hidden, draft_cache, bs, sampler, token_dtype
-            )
+        draft_tokens = draft_model.draft_block(
+            b_arr, hidden, draft_cache, bs, sampler, token_dtype
+        )
         mx.async_eval(draft_tokens)
 
         # Verify
@@ -606,11 +633,15 @@ def _dflash_rounds_batch(
             draft_tokens, target_tokens, budgets
         )
 
+        min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
-        max_a = lm.rollback_speculative_cache(
-            prompt_cache, verify_out.gdn_states, accepted_arr, bs
-        )
-        hidden = hidden_full[:, : max_a + 1, :]
+
+        if min_accepted < bs - 1:
+            max_a = int(accepted_arr.max().item())
+            hidden = hidden_full[:, : max_a + 1, :]
+        else:
+            max_a = bs - 1
+            hidden = hidden_full
 
         for a in accepted_list:
             draft_model.accept_lens.append(a)
@@ -637,6 +668,12 @@ def _dflash_rounds_batch(
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
 
+        if min_accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
+                )
+
         # --- Continuous batching: filter out finished sequences ---
         keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
         if len(keep_slots) < n_active:
@@ -653,6 +690,11 @@ def _dflash_rounds_batch(
             active_idx = [active_idx[j] for j in keep_slots]
             # Cold-restart drafter for the new batch size
             _reinit_drafter()
+
+        new_total = sum(emitted)
+        if new_total // 256 > total_emitted // 256:
+            mx.clear_cache()
+        total_emitted = new_total
 
 
 def generate_step(
@@ -926,6 +968,7 @@ def stream_generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -984,6 +1027,7 @@ def stream_generate(
             processor,
             images=image,
             audio=audio,
+            videos=video,
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
@@ -1141,6 +1185,7 @@ def generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
 ) -> GenerationResult:
@@ -1168,8 +1213,8 @@ def generate(
             files.extend(image)
         if audio is not None:
             files.extend(audio)
-        if kwargs.get("video") is not None:
-            files.extend(kwargs.get("video"))
+        if video is not None:
+            files.extend(video if isinstance(video, list) else [video])
 
         print(f"Files: {files}", "\n")
 
@@ -1201,7 +1246,9 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
+    for response in stream_generate(
+        model, processor, prompt, image, audio, video, **kwargs
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -1816,6 +1863,7 @@ class BatchGenerator:
         self,
         model,
         processor,
+        *,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -1829,6 +1877,7 @@ class BatchGenerator:
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
         compute_logprobs: bool = True,
         top_logprobs_k: int = 0,
+        stream=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1848,6 +1897,8 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
 
+        self._stream = stream or generation_stream
+
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self._generation_batch = GenerationBatch.empty(
@@ -1866,7 +1917,11 @@ class BatchGenerator:
         self._steps_counter = 0
 
         self._wire_stack = contextlib.ExitStack()
-        self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
+        self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    @property
+    def stream(self):
+        return self._stream
 
     def close(self):
         if self._wire_stack is not None:
@@ -1902,7 +1957,7 @@ class BatchGenerator:
 
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             # Waiting in the queue.
             for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
@@ -2062,7 +2117,7 @@ class BatchGenerator:
         return prompt_responses, generation_responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next(**kwargs)
 
 
@@ -2368,6 +2423,9 @@ def main():
     )  # TODO: Support multiple audio files
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.video:
+        chat_template_kwargs["video"] = args.video
+        chat_template_kwargs["fps"] = args.fps
 
     prompt = apply_chat_template(
         processor,
@@ -2448,6 +2506,8 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
+            "video": args.video,
+            "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
             "verbose": args.verbose,

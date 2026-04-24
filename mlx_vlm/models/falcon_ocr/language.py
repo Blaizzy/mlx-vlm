@@ -366,9 +366,14 @@ class LanguageModel(nn.Module):
         else:
             rope_deltas = self._rope_deltas
 
-        offset = cache[0].offset if cache and cache[0] is not None else 0
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
+        c0 = cache[0] if cache and cache[0] is not None else None
+        offset = c0.offset if c0 is not None else 0
         is_batch = isinstance(offset, mx.array) and offset.size > 1
-        if isinstance(offset, mx.array):
+        if c0 is not None and hasattr(c0, "_idx"):
+            cache_offset = int(c0._idx)
+        elif isinstance(offset, mx.array):
             cache_offset = int(offset[0].item()) if offset.size > 0 else 0
         else:
             cache_offset = int(offset)
