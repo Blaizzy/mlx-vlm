@@ -67,14 +67,24 @@ class Model(nn.Module):
                         break
                 new_k = ".".join(parts)
 
-            # 4-D weight transpose
+            # 4-D weight transpose.  sanitize() must be idempotent because
+            # `mlx_vlm.utils.load()` calls it unconditionally, including on
+            # checkpoints we've already saved in MLX layout.  We disambiguate by
+            # kernel-dim position: for square kernels, MLX layout has the two
+            # equal kernel dims at positions 1 and 2, while PT has them at 2
+            # and 3.  Sapiens2 uses only square kernels (1, 3, 4, 16).
             if v.ndim == 4:
-                if any(hint in new_k for hint in CONV_TRANSPOSE_HINTS):
-                    # ConvTranspose2d: (in, out, kH, kW) → (out, kH, kW, in)
-                    v = v.transpose(1, 2, 3, 0)
-                else:
-                    # Conv2d: (out, in, kH, kW) → (out, kH, kW, in)
-                    v = v.transpose(0, 2, 3, 1)
+                s = v.shape
+                mlx_like = s[1] == s[2] and s[1] <= 16
+                pt_like = s[2] == s[3] and s[2] <= 16
+                if pt_like and not mlx_like:
+                    if any(hint in new_k for hint in CONV_TRANSPOSE_HINTS):
+                        # ConvTranspose2d: (in, out, kH, kW) → (out, kH, kW, in)
+                        v = v.transpose(1, 2, 3, 0)
+                    else:
+                        # Conv2d: (out, in, kH, kW) → (out, kH, kW, in)
+                        v = v.transpose(0, 2, 3, 1)
+                # else: already MLX layout (or ambiguous — no-op is safe)
 
             sanitized[new_k] = v
         return sanitized

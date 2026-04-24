@@ -79,5 +79,18 @@ class Sapiens2Processor:
             }
         return self.preprocess_image(images)
 
+    def save_pretrained(self, save_directory, **_kwargs):
+        """Write preprocessor_config.json so mlx_vlm.convert can round-trip
+        the processor alongside the quantized weights."""
+        import json
+
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        (save_dir / "preprocessor_config.json").write_text(json.dumps({
+            "image_size": list(self.image_size),
+            "image_mean": self.image_mean.tolist(),
+            "image_std": self.image_std.tolist(),
+        }, indent=2))
+
 
 install_auto_processor_patch(["sapiens2"], Sapiens2Processor)
