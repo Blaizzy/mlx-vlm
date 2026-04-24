@@ -23,10 +23,14 @@ class Model(nn.Module):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+
         if pixel_values is None:
             self.language_model._position_ids = None
             return InputEmbeddingsFeatures(

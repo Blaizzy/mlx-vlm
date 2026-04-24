@@ -1,12 +1,12 @@
-mlx>=0.31.1
+mlx>=0.31.2
 transformers>=5.5.0
 datasets>=2.19.1
 miniaudio>=1.59
 tqdm>=4.66.2
 Pillow>=10.3.0
 requests>=2.31.0
-mlx-lm>=0.31.1
 llguidance>=1.7.0
+mlx-lm>=0.31.3
 opencv-python>=4.12.0.88
 fastapi>=0.95.1
 uvicorn

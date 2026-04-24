@@ -463,7 +463,8 @@ class LanguageModel(nn.Module):
         is_batch = accepted.size > 1
         valid_ends = accepted + 1
 
-        j = 0
+        # Separate trimmable (KV) caches from SSM caches.
+        ssm_caches = []
         for c in caches:
             if c is None:
                 continue
@@ -479,40 +480,81 @@ class LanguageModel(nn.Module):
                         if start < kv_len:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
-                continue
+            else:
+                ssm_caches.append(c)
+
+        if not ssm_caches:
+            return max_a
+
+        # Batch all SSM rollbacks into a single gated_delta_update call
+        # to eliminate per-layer kernel launch overhead (~30 launches → 1).
+        N = len(ssm_caches)
+        replay_mask = None
+        if is_batch:
+            replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
+
+        q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
+        A_log_list, dt_bias_list, state_list = [], [], []
+        conv_data = []
+        for j in range(N):
             q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
                 j
             ]
-            if is_batch:
-                replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
-            else:
-                replay_mask = None if mask is None else mask[:, :n]
-            _, state = gated_delta_update(
-                q[:, :n],
-                k[:, :n],
-                v[:, :n],
-                a[:, :n],
-                b[:, :n],
-                A_log,
-                dt_bias,
-                init_state,
-                replay_mask,
-                use_kernel=True,
-            )
-            c[1] = state
+            q_list.append(q[:, :n])
+            k_list.append(k[:, :n])
+            v_list.append(v[:, :n])
+            a_list.append(a[:, :n])
+            b_list.append(b[:, :n])
+            A_log_list.append(A_log[None, None, :])  # (1, 1, Hv)
+            dt_bias_list.append(dt_bias[None, None, :])  # (1, 1, Hv)
+            state_list.append(init_state)
+            conv_data.append((conv_input, K))
+            if not is_batch and replay_mask is None and mask is not None:
+                replay_mask = mask[:, :n]
+
+        # Stack along batch dim: (N, n, H, D) — one kernel launch for all layers.
+        q_bat = mx.concatenate(q_list, axis=0)
+        k_bat = mx.concatenate(k_list, axis=0)
+        v_bat = mx.concatenate(v_list, axis=0)
+        a_bat = mx.concatenate(a_list, axis=0)
+        b_bat = mx.concatenate(b_list, axis=0)
+        A_log_bat = mx.concatenate(A_log_list, axis=0)  # (N, 1, Hv)
+        dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
+        state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
+
+        if replay_mask is not None and replay_mask.shape[0] == 1 and N > 1:
+            replay_mask = mx.broadcast_to(replay_mask, (N, n))
+
+        _, states_out = gated_delta_update(
+            q_bat,
+            k_bat,
+            v_bat,
+            a_bat,
+            b_bat,
+            A_log_bat,
+            dt_bias_bat,
+            state_bat,
+            replay_mask,
+            use_kernel=True,
+        )
+
+        # Scatter results back to individual caches.
+        a0 = int(accepted[0].item()) if not is_batch else None
+        for j, c in enumerate(ssm_caches):
+            c[1] = states_out[j : j + 1]
+            conv_input, K = conv_data[j]
             if is_batch:
                 acc_list = accepted.tolist()
                 slices = [
                     conv_input[
-                        bi : bi + 1, int(acc_list[bi]) + 1 : int(acc_list[bi]) + K
+                        bi : bi + 1,
+                        int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
                     ]
                     for bi in range(accepted.shape[0])
                 ]
                 c[0] = mx.concatenate(slices, axis=0)
             else:
-                a0 = int(accepted[0].item())
                 c[0] = conv_input[:, a0 + 1 : a0 + K]
-            j += 1
         return max_a
 
     def get_rope_index(
@@ -702,18 +744,14 @@ class LanguageModel(nn.Module):
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[self.model.fa_idx] is not None:
-            offset = cache[self.model.fa_idx].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim > 0 and offset.size > 1:
-                    cache_offsets = mx.maximum(offset, 0)
-                    cache_offset = cache_offsets[0].item()
-                else:
-                    cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
-            cache_offset = max(cache_offset, 0)
+            c0 = cache[self.model.fa_idx]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = mx.maximum(c0.offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -735,7 +773,7 @@ class LanguageModel(nn.Module):
                 if (
                     self._position_ids is not None
                     and self._position_ids.shape[1] == batch_size
-                    and self._position_ids.shape[-1] == seq_length
+                    and self._position_ids.shape[-1] >= cache_offset + seq_length
                 ):
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
