@@ -41,6 +41,7 @@ MODEL_REMAPPING = {
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
+    "minicpmv4_6": "minicpmv",
 }
 
 MAX_FILE_SIZE_GB = 5
