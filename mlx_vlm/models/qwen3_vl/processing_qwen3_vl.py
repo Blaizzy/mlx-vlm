@@ -405,15 +405,14 @@ def _qwen_vl_image_kwargs(pretrained_model_name_or_path, default_patch_size: int
     ):
         if k in raw:
             out[k] = raw[k]
-    size = raw.get("size", {})
-    if "shortest_edge" in size:
+    size = raw.get("size") or {}
+    if size.get("shortest_edge") is not None:
         out["min_pixels"] = size["shortest_edge"]
-    if "longest_edge" in size:
+    if size.get("longest_edge") is not None:
         out["max_pixels"] = size["longest_edge"]
-    # legacy flat-key forms (some Qwen2 checkpoints)
-    if "min_pixels" in raw:
+    if raw.get("min_pixels") is not None:
         out["min_pixels"] = raw["min_pixels"]
-    if "max_pixels" in raw:
+    if raw.get("max_pixels") is not None:
         out["max_pixels"] = raw["max_pixels"]
     return out
 
@@ -449,14 +448,14 @@ def _qwen_vl_video_kwargs(pretrained_model_name_or_path, default_patch_size: int
     ):
         if k in raw:
             out[k] = raw[k]
-    size = raw.get("size", {})
-    if "shortest_edge" in size:
+    size = raw.get("size") or {}
+    if size.get("shortest_edge") is not None:
         out["min_pixels"] = size["shortest_edge"]
-    if "longest_edge" in size:
+    if size.get("longest_edge") is not None:
         out["max_pixels"] = size["longest_edge"]
-    if "min_pixels" in raw:
+    if raw.get("min_pixels") is not None:
         out["min_pixels"] = raw["min_pixels"]
-    if "max_pixels" in raw:
+    if raw.get("max_pixels") is not None:
         out["max_pixels"] = raw["max_pixels"]
     return out
 

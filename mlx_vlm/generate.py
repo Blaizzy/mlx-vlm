@@ -269,7 +269,7 @@ def normalize_resize_shape(
 
 
 # A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 def maybe_quantize_kv_cache(
@@ -1863,6 +1863,7 @@ class BatchGenerator:
         self,
         model,
         processor,
+        *,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -1876,6 +1877,7 @@ class BatchGenerator:
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
         compute_logprobs: bool = True,
         top_logprobs_k: int = 0,
+        stream=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1895,6 +1897,8 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
 
+        self._stream = stream or generation_stream
+
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
         self._generation_batch = GenerationBatch.empty(
@@ -1913,7 +1917,11 @@ class BatchGenerator:
         self._steps_counter = 0
 
         self._wire_stack = contextlib.ExitStack()
-        self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
+        self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    @property
+    def stream(self):
+        return self._stream
 
     def close(self):
         if self._wire_stack is not None:
@@ -1949,7 +1957,7 @@ class BatchGenerator:
 
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             # Waiting in the queue.
             for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
@@ -2109,7 +2117,7 @@ class BatchGenerator:
         return prompt_responses, generation_responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next(**kwargs)
 
 

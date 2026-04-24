@@ -488,7 +488,14 @@ class Gemma3Model(nn.Module):
                 ),
                 0,
             )
-            if isinstance(raw_offset, mx.array):
+            # Prefer ``cache._idx`` (Python int) to avoid a per-step GPU sync.
+            c0 = next(
+                (c for c in (cache or []) if c is not None and hasattr(c, "_idx")),
+                None,
+            )
+            if c0 is not None:
+                cache_offset = int(c0._idx)
+            elif isinstance(raw_offset, mx.array):
                 cache_offset = (
                     int(raw_offset.max().item())
                     if raw_offset.size > 1
