@@ -144,11 +144,17 @@ class MllamaTextSelfAttention(nn.Module):
         )
 
         if cache is not None:
-            offset = cache.offset
-            if isinstance(offset, mx.array):
-                offset = (
-                    int(offset.max().item()) if offset.size > 1 else int(offset.item())
-                )
+            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
+            if hasattr(cache, "_idx"):
+                offset = int(cache._idx)
+            else:
+                offset = cache.offset
+                if isinstance(offset, mx.array):
+                    offset = (
+                        int(offset.max().item())
+                        if offset.size > 1
+                        else int(offset.item())
+                    )
             query_states = self.rope(query_states, offset=offset)
             key_states = self.rope(key_states, offset=offset)
             key_states, value_states = cache.update_and_fetch(key_states, value_states)
