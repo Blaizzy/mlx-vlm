@@ -1009,6 +1009,11 @@ class TestModels(unittest.TestCase):
             grid_thw=mx.ones((1, 3)),  # image temporals shape (num_images, 3)
         )
 
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+
     def test_qwen2_5_vl(self):
         from mlx_vlm.models import qwen2_5_vl
 
@@ -1077,6 +1082,11 @@ class TestModels(unittest.TestCase):
             grid_thw=mx.array(
                 [[1, 10, 14]], dtype=mx.int64
             ),  # image temporals shape (num_images, 3)
+        )
+
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
         )
 
     def test_dots_ocr(self):
@@ -1223,6 +1233,17 @@ class TestModels(unittest.TestCase):
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
 
+        # Multi-image batch: per-sample slicing in `_deepstack_process` must
+        # avoid the (N,D)/(M,D) broadcast crash and write through to output.
+        self._run_deepstack_multi_image_assertions(
+            model.language_model.model._deepstack_process
+        )
+
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
@@ -1310,6 +1331,135 @@ class TestModels(unittest.TestCase):
         ) * (grid_thw[0, 2] // config.vision_config.spatial_merge_size)
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
+
+        # Multi-image batch
+        self._run_deepstack_multi_image_assertions(
+            model.language_model.model._deepstack_process
+        )
+
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+
+    def _run_deepstack_multi_image_assertions(self, deepstack_fn):
+        """Shared assertions for qwen3_vl / qwen3_vl_moe `_deepstack_process`.
+
+        Exercises the multi-image batch path: sample 0 has 2 visual tokens,
+        sample 1 has 3 visual tokens. Pre-PR-1055 this crashed with a
+        ``Shapes (N,D)/(M,D) cannot be broadcast`` because every sample saw
+        the full (5,H) ``visual_embeds`` instead of its per-sample slice.
+        """
+        H = 4
+        # hidden_states: distinct nonzero values per (batch, position) so
+        # we can check element-wise where the scatter-add landed.
+        base = mx.arange(2 * 6 * H, dtype=mx.float32).reshape(2, 6, H)
+        # mask sample 0 -> visuals at rows {1, 3} (2 visuals)
+        # mask sample 1 -> visuals at rows {0, 2, 4} (3 visuals)
+        visual_pos_masks = mx.array(
+            [
+                [False, True, False, True, False, False],
+                [True, False, True, False, True, False],
+            ]
+        )
+        # 5 distinct visual embed rows (2 for sample 0 + 3 for sample 1)
+        visual_embeds = mx.arange(5 * H, dtype=mx.float32).reshape(5, H) + 100.0
+
+        out = deepstack_fn(base, visual_pos_masks, visual_embeds)
+        self.assertEqual(out.shape, base.shape)
+
+        out_l = out.tolist()
+        base_l = base.tolist()
+        emb_l = visual_embeds.tolist()
+
+        # Sample 0: rows 1 and 3 received visual_embeds[0] and [1]
+        self.assertEqual(
+            out_l[0][1],
+            [base_l[0][1][i] + emb_l[0][i] for i in range(H)],
+        )
+        self.assertEqual(
+            out_l[0][3],
+            [base_l[0][3][i] + emb_l[1][i] for i in range(H)],
+        )
+        # Sample 0: untouched rows
+        for r in (0, 2, 4, 5):
+            self.assertEqual(out_l[0][r], base_l[0][r])
+
+        # Sample 1: rows 0, 2, 4 received visual_embeds[2], [3], [4]
+        self.assertEqual(
+            out_l[1][0],
+            [base_l[1][0][i] + emb_l[2][i] for i in range(H)],
+        )
+        self.assertEqual(
+            out_l[1][2],
+            [base_l[1][2][i] + emb_l[3][i] for i in range(H)],
+        )
+        self.assertEqual(
+            out_l[1][4],
+            [base_l[1][4][i] + emb_l[4][i] for i in range(H)],
+        )
+        # Sample 1: untouched rows
+        for r in (1, 3, 5):
+            self.assertEqual(out_l[1][r], base_l[1][r])
+
+        # Empty-mask sample passes through unchanged.
+        empty_masks = mx.array([[False, False, False]])
+        empty_hidden = mx.ones((1, 3, H))
+        empty_out = deepstack_fn(empty_hidden, empty_masks, mx.zeros((0, H)))
+        self.assertEqual(empty_out.tolist(), empty_hidden.tolist())
+
+    def _assert_mrope_decode_uses_cache_idx(self, language_model, hidden_size):
+        """Shared assertion: MRoPE decode-step reads RoPE position from
+        ``cache[0]._idx`` (Python int) rather than ``cache[0].offset.item()``
+        — the latter forces a per-step GPU sync. Regression guard for the
+        cache._idx refactor in PR #1055.
+        """
+        # Skip the prefill branch: pretend deltas have already been computed.
+        language_model._rope_deltas = mx.array([[0]])
+        language_model._position_ids = None
+
+        captured = {}
+
+        class _CapturingModel:
+            """Stand-in for the inner Qwen text model — captures position_ids
+            and exposes ``embed_tokens.as_linear`` so the tied-weights branch
+            in ``LanguageModel.__call__`` doesn't crash.
+            """
+
+            class _Embed:
+                @staticmethod
+                def as_linear(x):
+                    return x
+
+            embed_tokens = _Embed()
+
+            def __call__(self, inputs, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
+
+        language_model.model = _CapturingModel()
+        language_model.lm_head = lambda x: x  # bypass the real linear (untied path)
+
+        class _StubCacheWithIdx:
+            """``_idx`` (Python int) deliberately differs from ``offset``. If
+            extraction reads ``offset.item()`` the captured position is 3;
+            reading ``_idx`` gives 10. ``offset`` is 0-d so the per-sequence
+            ``cache_offsets`` / ``cache_offset_array`` branch is skipped
+            uniformly across qwen2_vl, qwen2_5_vl, and qwen3_vl.
+            """
+
+            def __init__(self):
+                self._idx = 10
+                self.offset = mx.array(3)  # 0-d -> never the per-seq path
+
+        language_model(mx.array([[5]]), cache=[_StubCacheWithIdx()])
+
+        position_ids = captured["position_ids"]
+        self.assertIsNotNone(position_ids)
+        # MRoPE shape: (3, batch, seq).
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        # Decode position == cache._idx (10), not cache.offset[0].item() (3).
+        self.assertEqual(position_ids[0, 0, 0].item(), 10)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe

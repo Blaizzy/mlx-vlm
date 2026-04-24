@@ -463,18 +463,14 @@ class LanguageModel(nn.Module):
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim > 0 and offset.size > 1:
-                    cache_offsets = mx.maximum(offset, 0)
-                    cache_offset = cache_offsets[0].item()
-                else:
-                    cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
-            cache_offset = max(cache_offset, 0)
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = mx.maximum(c0.offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
