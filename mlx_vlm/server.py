@@ -320,14 +320,14 @@ class ResponseGenerator:
         return ctx, token_iterator()
 
     def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
-        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+        """Tokenize text and prepare media inputs on the caller thread."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
             if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
-        return prepare_inputs(
+        raw_inputs = prepare_inputs(
             self.processor,
             images=images,
             audio=audio,
@@ -335,6 +335,26 @@ class ResponseGenerator:
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+        self._materialize_mx_arrays(raw_inputs)
+        return raw_inputs
+
+    @staticmethod
+    def _materialize_mx_arrays(value) -> None:
+        arrays = []
+
+        def collect(item):
+            if isinstance(item, mx.array):
+                arrays.append(item)
+            elif isinstance(item, dict):
+                for child in item.values():
+                    collect(child)
+            elif isinstance(item, (list, tuple)):
+                for child in item:
+                    collect(child)
+
+        collect(value)
+        if arrays:
+            mx.eval(*arrays)
 
     # -- internals --
 
