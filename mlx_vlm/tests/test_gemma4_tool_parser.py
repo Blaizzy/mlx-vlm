@@ -79,6 +79,50 @@ class TestGemma4ToolParser(unittest.TestCase):
         parsed = json.loads(result["arguments"])
         self.assertEqual(parsed, {"city": "Berlin"})
 
+    # ── JSON-formatted keys (models may output standard JSON) ─────────────
+
+    def test_json_formatted_keys_simple(self):
+        """Models may output standard JSON with quoted keys: {"key": value}."""
+        text = _wrap('call:get_weather{"city": "Berlin"}')
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "get_weather")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"city": "Berlin"})
+
+    def test_json_formatted_keys_multiple(self):
+        """Multiple JSON-formatted keys."""
+        text = _wrap('call:memory_add{"action": "add", "content": "test", "target": "memory"}')
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "memory_add")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"action": "add", "content": "test", "target": "memory"})
+
+    def test_json_formatted_keys_with_nested_values(self):
+        """JSON keys with nested object/array values."""
+        text = _wrap('call:process_data{"items": [1, 2, 3], "config": {"enabled": true}}')
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "process_data")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args["items"], [1, 2, 3])
+        self.assertEqual(args["config"], {"enabled": True})
+
+    def test_json_formatted_keys_with_unicode_escape(self):
+        """JSON keys with unicode escape sequences."""
+        text = _wrap(r'call:memory_add{"action": "add", "content": "2026-04-25 > \u672c\u5730\u73af\u5883"}')
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "memory_add")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args["action"], "add")
+        self.assertIn("本地环境", args["content"])
+
+    def test_mixed_gemma_and_json_formats(self):
+        """Mix of Gemma 4 escape strings and JSON-formatted keys."""
+        text = _wrap(f'call:search{{"query":{_str("Berlin weather")}}}')
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "search")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args["query"], "Berlin weather")
+
     # ── error path ────────────────────────────────────────────────────────
 
     def test_no_call_raises(self):

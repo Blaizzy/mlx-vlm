@@ -111,6 +111,15 @@ def _parse_object(text):
         if colon == -1:
             continue
         key = entry[:colon].strip()
+        # Handle JSON-formatted keys (e.g., '"action"' -> 'action')
+        # Models may output standard JSON: {"key": value} instead of {key: value}
+        if key.startswith('"') and key.endswith('"'):
+            try:
+                # Use json.loads to unescape the key (handles \" etc.)
+                key = json.loads(key)
+            except (json.JSONDecodeError, ValueError):
+                # Fallback: strip the surrounding quotes
+                key = key[1:-1]
         value_str = entry[colon + 1 :]
         result[key] = _parse_value(value_str)
     return result
