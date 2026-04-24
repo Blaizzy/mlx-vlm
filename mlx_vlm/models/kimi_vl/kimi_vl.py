@@ -77,7 +77,6 @@ class Model(nn.Module):
 
             image_features = self.multi_modal_projector(hidden_state)
 
-        # Pure MLX merge — no numpy, safe during concurrent batching
         image_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
         for tid in [
             image_token_id,
