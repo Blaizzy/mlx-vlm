@@ -13,7 +13,7 @@ from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
@@ -365,7 +365,6 @@ class TemplateParams(FlexibleBaseModel):
             "thinking_start_token",
             "thinking_end_token",
         )
-        kwargs.setdefault("enable_thinking", False)
         return kwargs
 
 
@@ -640,10 +639,44 @@ def get_default_resize_shape():
     return (int(parts[0]), int(parts[1])) if len(parts) == 2 else (int(parts[0]), int(parts[0]))
 
 
+_DEFAULT_THINKING_MODEL_TYPES = frozenset(
+    {"qwen3_5", "qwen3_5_moe", "qwen3_vl", "qwen3_vl_moe", "gemma4", "qwen3_omni_moe"}
+)
+
+
+def _resolve_model_type(config) -> str:
+    """Extract model_type string from config (dict or dataclass)."""
+    if isinstance(config, dict):
+        return config.get("model_type", "")
+    return getattr(config, "model_type", "")
+
+
+def _auto_enable_thinking(template_kwargs: dict, config, max_tokens: int) -> None:
+    """Auto-enable thinking for supported models if not explicitly set.
+
+    Sets enable_thinking=True and a sensible default thinking_budget when
+    the model supports thinking but the client didn't specify.
+    """
+    if template_kwargs.get("enable_thinking") is not None:
+        return
+    if _resolve_model_type(config) not in _DEFAULT_THINKING_MODEL_TYPES:
+        return
+    template_kwargs["enable_thinking"] = True
+    if template_kwargs.get("thinking_budget") is None:
+        # Default: 50% of max_tokens, capped at 16384
+        template_kwargs["thinking_budget"] = min(max_tokens // 2, 16384)
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
+    config: Any = None,
 ) -> dict[str, Any]:
+    # Auto-enable thinking before merging kwargs
+    _max_tokens = request.max_output_tokens if hasattr(request, "max_output_tokens") else getattr(request, "max_tokens", 8192)
+    if config is not None:
+        _auto_enable_thinking(template_kwargs, config, _max_tokens or 8192)
+
     kwargs = {
         "prefill_step_size": get_prefill_step_size(),
         "kv_bits": get_quantized_kv_bits(request.model),
@@ -716,6 +749,217 @@ class ModelInfo(BaseModel):
 class ModelsResponse(BaseModel):
     object: Literal["list"]
     data: List[ModelInfo]
+
+
+# ---- Anthropic Messages API compatible endpoint ----
+# Claude Code and other Anthropic SDK clients send requests here.
+
+
+class AnthroRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str = Field(..., description="Model ID.")
+    max_tokens: int = Field(DEFAULT_MAX_TOKENS, description="Max output tokens.")
+    system: Optional[Union[str, List[dict]]] = Field(
+        None, description="System prompt."
+    )
+    messages: List[dict] = Field(..., description="Conversation messages.")
+    stream: bool = Field(False, description="Stream response.")
+    temperature: Optional[float] = Field(None)
+    top_p: Optional[float] = Field(None)
+    top_k: Optional[int] = Field(None)
+    stop_sequences: Optional[List[str]] = Field(None)
+    thinking: Optional[dict] = Field(
+        None,
+        description='Thinking config, e.g. {"type": "enabled", "budget_tokens": 8192}.',
+    )
+    tools: Optional[List[dict]] = Field(None, description="Tool definitions.")
+    tool_choice: Optional[dict] = Field(None)
+
+    def _extract_text(self, content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        parts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_result":
+                        parts.append(block.get("content", ""))
+            return "\n".join(parts)
+        return str(content)
+
+    def to_chat_messages(self) -> tuple[List[ChatMessage], Optional[str]]:
+        chat = []
+        system_text = None
+        if self.system is not None:
+            system_text = (
+                self.system
+                if isinstance(self.system, str)
+                else " ".join(
+                    b.get("text", "") for b in self.system if isinstance(b, dict)
+                )
+            )
+        for msg in self.messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            text = self._extract_text(content)
+            if text:
+                chat.append(ChatMessage(role=role, content=text))
+        return chat, system_text
+
+    def to_template_kwargs(self) -> dict[str, Any]:
+        kwargs = {}
+        thinking = self.thinking
+        if thinking and thinking.get("type") == "enabled":
+            kwargs["enable_thinking"] = True
+            budget = thinking.get("budget_tokens")
+            if budget is not None:
+                kwargs["thinking_budget"] = budget
+        return kwargs
+
+    def generation_kwargs(self) -> dict[str, Any]:
+        kw = {}
+        if self.temperature is not None:
+            kw["temperature"] = self.temperature
+        if self.top_p is not None:
+            kw["top_p"] = self.top_p
+        if self.top_k is not None:
+            kw["top_k"] = self.top_k
+        if self.max_tokens is not None:
+            kw["max_tokens"] = self.max_tokens
+        return kw
+
+
+@app.post("/v1/messages", response_model=None)
+async def anthropic_messages_endpoint(request: AnthroRequest):
+    """Anthropic Messages API compatible endpoint for Claude Code integration."""
+    try:
+        model, processor, config = get_cached_model(request.model)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=503, detail=f"Model not loaded: {e}")
+
+    try:
+        chat_messages, system_text = request.to_chat_messages()
+        template_kwargs = request.to_template_kwargs()
+
+        if system_text and chat_messages and chat_messages[0].role != "system":
+            chat_messages.insert(0, ChatMessage(role="system", content=system_text))
+
+        formatted_prompt = apply_chat_template(
+            processor, config, chat_messages, **template_kwargs
+        )
+        gen_kw = build_generation_kwargs(request, template_kwargs, config)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=str(e))
+
+    msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+
+    if request.stream:
+        async def stream_anthro_sse():
+            loop = asyncio.get_event_loop()
+            token_iterator = stream_generate(
+                model=model, processor=processor,
+                prompt=formatted_prompt, **gen_kw,
+            )
+            full_text = ""
+            input_tokens = 0
+            output_tokens = 0
+
+            def _next(it):
+                try:
+                    return next(it), False
+                except StopIteration:
+                    return None, True
+
+            msg_start_obj = {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "content": [], "model": request.model,
+                    "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            }
+            yield f"event: message_start\ndata: {json.dumps(msg_start_obj)}\n\n"
+
+            cb_start_obj = {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            }
+            yield f"event: content_block_start\ndata: {json.dumps(cb_start_obj)}\n\n"
+
+            try:
+                while True:
+                    chunk, done = await loop.run_in_executor(
+                        None, _next, token_iterator
+                    )
+                    if done:
+                        break
+                    if chunk is None or not hasattr(chunk, "text"):
+                        continue
+                    delta = chunk.text
+                    full_text += delta
+                    output_tokens = chunk.generation_tokens
+                    input_tokens = chunk.prompt_tokens
+                    delta_obj = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": delta},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(delta_obj)}\n\n"
+            except Exception as e:
+                print(f"Anthropic stream error: {e}")
+                traceback.print_exc()
+
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
+            msg_delta_obj = {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            }
+            yield f"event: message_delta\ndata: {json.dumps(msg_delta_obj)}\n\n"
+
+            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+            mx.clear_cache()
+            gc.collect()
+
+        return StreamingResponse(
+            stream_anthro_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    else:
+        result = generate(
+            model=model, processor=processor,
+            prompt=formatted_prompt, verbose=False, **gen_kw,
+        )
+        mx.clear_cache()
+        gc.collect()
+        text = result.text if hasattr(result, "text") else str(result)
+        return {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": request.model,
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": getattr(result, "prompt_tokens", 0),
+                "output_tokens": getattr(result, "generation_tokens", 0),
+            },
+        }
 
 
 # OpenAI compatile endpoints
@@ -852,6 +1096,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         template_kwargs = openai_request.template_kwargs()
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
@@ -859,7 +1104,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             num_images=len(images),
             **template_kwargs,
         )
-        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+        generation_kwargs = build_generation_kwargs(openai_request, template_kwargs, config)
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -1132,6 +1377,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
         template_kwargs = request.template_kwargs()
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
@@ -1141,7 +1387,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             tools=tools,
             **template_kwargs,
         )
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
+        generation_kwargs = build_generation_kwargs(request, template_kwargs, config)
 
         if request.stream:
             # Streaming response
@@ -1372,6 +1618,21 @@ def models_endpoint():
 
 
 # MLX_VLM API endpoints
+
+
+@app.get("/api/tags")
+@app.get("/api/version")
+async def ollama_compat_tags():
+    """Ollama-compatible model list endpoint for Codex / aider integration."""
+    model_path = model_cache.get("model_path", "")
+    if model_path:
+        name = os.path.basename(model_path)
+        size = 0
+        weights_file = os.path.join(model_path, "weights.npz")
+        if os.path.exists(weights_file):
+            size = os.path.getsize(weights_file)
+        return {"models": [{"name": name, "model": name, "size": size}]}
+    return {"models": []}
 
 
 @app.get("/health")

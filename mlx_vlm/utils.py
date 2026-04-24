@@ -138,6 +138,10 @@ def get_model_path(
     """
     model_path = Path(path_or_hf_repo)
     if not model_path.exists():
+        # Try local model/ directory as fallback before hitting HuggingFace
+        local_model_dir = Path(__file__).resolve().parent.parent / "model" / path_or_hf_repo
+        if local_model_dir.exists():
+            return local_model_dir
         model_path = Path(
             snapshot_download(
                 repo_id=path_or_hf_repo,
@@ -320,7 +324,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    model.load_weights(list(weights.items()))
+    try:
+        model.load_weights(list(weights.items()))
+    except ValueError as e:
+        if "vision_tower" in str(e) and "Missing" in str(e):
+            logging.warning(
+                "Vision tower weights are missing. "
+                "Loading as text-only model with strict=False."
+            )
+            model.load_weights(list(weights.items()), strict=False)
+        else:
+            raise
 
     if not lazy:
         mx.eval(model.parameters())
@@ -410,7 +424,17 @@ def load(
     # Get the eos_token_id from the model config
     eos_token_id = getattr(model.config, "eos_token_id", None)
 
-    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
+    try:
+        processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
+    except (OSError, ValueError):
+        logging.warning(
+            "Failed to load multimodal processor, falling back to tokenizer-only."
+        )
+        from .tokenizer_utils import load_tokenizer
+        processor = load_tokenizer(model_path, return_tokenizer=True)
+        tokenizer_obj = processor._tokenizer
+        final_eos_ids = eos_token_id if eos_token_id is not None else tokenizer_obj.eos_token_ids
+        processor.stopping_criteria = StoppingCriteria(final_eos_ids, tokenizer_obj)
 
     if image_processor is not None:
         processor.image_processor = image_processor
@@ -1394,7 +1418,9 @@ def group_images_by_shape(
 class StoppingCriteria:
     def __init__(self, eos_token_ids: List[int], tokenizer=None):
 
-        if isinstance(eos_token_ids, int):
+        if eos_token_ids is None:
+            self.eos_token_ids = []
+        elif isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
             self.eos_token_ids = eos_token_ids

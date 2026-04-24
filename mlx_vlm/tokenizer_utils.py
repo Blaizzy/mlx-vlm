@@ -290,6 +290,9 @@ class TokenizerWrapper:
         self._tokenizer = tokenizer
         self._detokenizer = detokenizer_class(tokenizer)
 
+    def __call__(self, *args, **kwargs):
+        return self._tokenizer(*args, **kwargs)
+
     def __getattr__(self, attr):
         if attr == "detokenizer":
             return self._detokenizer
