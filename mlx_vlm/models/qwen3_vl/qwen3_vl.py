@@ -70,15 +70,14 @@ class Model(nn.Module):
         cached = kwargs.get("cached_image_features", None)
         if cached is not None:
             hidden_states = cached
-            deepstack_image_embeds = None
+            deepstack_visual_embeds = None
         else:
             # Get the ouptut hidden states from the vision model
-            hidden_states, deepstack_image_embeds = self.vision_tower(
+            hidden_states, deepstack_visual_embeds = self.vision_tower(
                 pixel_values, grid_thw
             )
 
         visual_pos_masks = None
-        deepstack_visual_embeds = None
 
         # Insert special image tokens in the input_ids
         inputs_embeds, image_mask = self.merge_input_ids_with_image_features(
@@ -91,7 +90,7 @@ class Model(nn.Module):
 
         image_mask = image_mask[..., 0]
         visual_pos_masks = image_mask
-        deepstack_visual_embeds = mx.eval(deepstack_image_embeds)
+        mx.eval(deepstack_visual_embeds)
 
         # Pre-calculate position_ids for chunked prefill
         if image_grid_thw is not None or video_grid_thw is not None:
