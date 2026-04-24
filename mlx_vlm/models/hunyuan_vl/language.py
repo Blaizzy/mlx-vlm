@@ -199,26 +199,19 @@ class Attention(nn.Module):
         )
 
         kv_seq_len = L
-        offset = 0
+        offset_scalar = 0
         if cache is not None:
             # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
             if hasattr(cache, "_idx"):
                 offset_scalar = int(cache._idx)
-                offset = cache.offset
             else:
-                offset = cache.offset
+                off = cache.offset
                 offset_scalar = (
-                    int(offset)
-                    if isinstance(offset, int)
-                    else (
-                        int(offset.max().item())
-                        if offset.ndim > 0
-                        else int(offset.item())
-                    )
+                    int(off)
+                    if isinstance(off, int)
+                    else (int(off.max().item()) if off.ndim > 0 else int(off.item()))
                 )
             kv_seq_len += offset_scalar
-        else:
-            offset_scalar = 0
 
         cos, sin = self.rotary_emb(values, seq_len=kv_seq_len)
 
