@@ -99,6 +99,23 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(skip_vision=False, weights=None, quantization_config=None):
+    def predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if quantization_config is not None and p in quantization_config:
+            return quantization_config[p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        if weights is not None:
+            return f"{p}.scales" in weights
+        return True
+
+    return predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -298,28 +315,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
-
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=get_class_predicate(
+                skip_vision=skip_vision,
+                weights=weights,
+                quantization_config=config["quantization"],
+            ),
         )
 
     if kwargs.get("quantize_activations", False):
@@ -1234,6 +1239,16 @@ def prepare_inputs(
         not hasattr(videos, "__len__") or len(videos) > 0
     )
     if not has_images and not has_audio and not has_videos:
+        image_token = getattr(processor, "image_token", None)
+        if isinstance(image_token, str) and prompts:
+            prompts_list = [prompts] if isinstance(prompts, str) else prompts
+            for prompt in prompts_list:
+                count = prompt.count(image_token)
+                if count > 0:
+                    raise ValueError(
+                        f"Number of image tokens in prompt_token_ids ({count}) "
+                        f"does not match number of images (0)"
+                    )
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )

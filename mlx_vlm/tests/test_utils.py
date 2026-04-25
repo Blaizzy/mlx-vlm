@@ -38,10 +38,13 @@ class MockTorch:
 
 
 class MockProcessor:
-    def __init__(self):
-        self.tokenizer = type(
-            "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
-        )()
+    def __init__(self, tokenizer_return_value=None):
+        self.image_token = "<image>"
+        self.tokenizer = MagicMock()
+        self.tokenizer.pad_token = None
+        self.tokenizer.eos_token = "[EOS]"
+        if tokenizer_return_value is not None:
+            self.tokenizer.return_value = tokenizer_return_value
 
     def __call__(
         self, text=None, images=None, audio=None, padding=None, return_tensors="mlx"
@@ -261,8 +264,12 @@ def test_quantize_module():
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
+    # Define tokenizer return values
+    tok_result = MagicMock()
+    tok_result.input_ids = [[1, 2, 3]]
+    tok_result.attention_mask = [7, 8, 9]
     # Mock processor
-    processor = MockProcessor()
+    processor = MockProcessor(tokenizer_return_value=tok_result)
 
     # Test text-only input
     inputs = prepare_inputs(
@@ -398,7 +405,9 @@ def test_load_passes_revision():
 
         assert model is model_mock
         assert processor is processor_mock
-        mock_get_model_path.assert_called_with("repo", revision="abc")
+        mock_get_model_path.assert_called_with(
+            "repo", force_download=False, revision="abc"
+        )
 
 
 def _make_test_image_bytes():
@@ -465,7 +474,7 @@ class TestLoadImage:
             "mlx_vlm.utils.requests.get",
             side_effect=Exception("Connection error"),
         ):
-            with pytest.raises(ValueError, match="Failed to load image from URL"):
+            with pytest.raises(ValueError, match="Failed to load image from"):
                 load_image("https://example.com/nonexistent.png")
 
     def test_nonexistent_file_raises(self):
