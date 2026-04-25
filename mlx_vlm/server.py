@@ -121,6 +121,7 @@ class GenerationArguments:
     enable_thinking: bool = True
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    stop: Optional[List[str]] = None
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -170,6 +171,56 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+
+
+class StopMatcher:
+    """Incrementally trims OpenAI stop strings from decoded token text."""
+
+    def __init__(self, stop: Optional[List[str]] = None):
+        self.stop = stop or []
+        self.buffer = ""
+        self.max_stop_len = max((len(s) for s in self.stop), default=0)
+        self.stopped = False
+
+    def append(self, text: str) -> Tuple[str, bool]:
+        if self.stopped or not text:
+            return "", self.stopped
+        if not self.stop:
+            return text, False
+
+        self.buffer += text
+        stop_at = None
+        for stop in self.stop:
+            idx = self.buffer.find(stop)
+            if idx != -1 and (stop_at is None or idx < stop_at):
+                stop_at = idx
+
+        if stop_at is not None:
+            out = self.buffer[:stop_at]
+            self.buffer = ""
+            self.stopped = True
+            return out, True
+
+        keep = max(self.max_stop_len - 1, 0)
+        if keep == 0:
+            out = self.buffer
+            self.buffer = ""
+            return out, False
+        if len(self.buffer) <= keep:
+            return "", False
+        out = self.buffer[:-keep]
+        self.buffer = self.buffer[-keep:]
+        return out, False
+
+    def feed(self, text: str) -> Tuple[str, bool]:
+        return self.append(text)
+
+    def flush(self) -> str:
+        if self.stopped:
+            return ""
+        out = self.buffer
+        self.buffer = ""
+        return out
 
 
 class ResponseGenerator:
@@ -302,9 +353,10 @@ class ResponseGenerator:
             # closes immediately after seeing finish_reason isn't treated
             # as a client abort.
             ended = False
+            queue_timeout = float(os.environ.get("TOKEN_QUEUE_TIMEOUT", "600"))
             try:
                 while True:
-                    item = rqueue.get(timeout=60.0)
+                    item = rqueue.get(timeout=queue_timeout)
                     if item is None:
                         ended = True
                         break
@@ -491,6 +543,7 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "tokens": [],
                         "prev_text": "",
+                        "stop_filter": StopMatcher(args.stop),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -556,6 +609,8 @@ class ResponseGenerator:
                 uids = []
                 rqueues = {}
                 token_lists = {}
+                prev_texts = {}
+                stop_matchers = {}
                 max_tokens_map = {}
                 all_input_ids = []
 
@@ -565,6 +620,8 @@ class ResponseGenerator:
                     uids.append(uid)
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
+                    prev_texts[uid] = ""
+                    stop_matchers[uid] = StopMatcher(args.stop)
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -588,26 +645,31 @@ class ResponseGenerator:
                 hidden = mx.concatenate(out.hidden_states, axis=-1)
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
+                finished_uids = set()
 
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
-                    text = self.tokenizer.decode([tok])
+                    raw_text = self.tokenizer.decode([tok])
+                    prev_texts[uid] = raw_text
+                    text, server_stop = stop_matchers[uid].append(raw_text)
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
                             token=tok,
                             logprobs=0.0,
-                            finish_reason=None,
+                            finish_reason="stop" if server_stop else None,
                             peak_memory=mx.get_peak_memory() / 1e9,
                         )
                     )
+                    if server_stop:
+                        rqueues[uid].put(None)
+                        finished_uids.add(uid)
 
                 # --- Phase 3: speculative decode rounds ---
                 max_tok = max(max_tokens_map[u] for u in uids)
-                finished_uids = set()
 
                 def stop_check(seq_idx, token_id):
                     uid = uids[seq_idx]
@@ -641,20 +703,25 @@ class ResponseGenerator:
                         token_lists[uid].append(tok)
                         tokens = token_lists[uid]
 
-                        if len(tokens) >= 2:
-                            prev = self.tokenizer.decode(tokens[:-1])
-                            curr = self.tokenizer.decode(tokens)
-                            text = curr[len(prev) :]
-                        else:
-                            text = self.tokenizer.decode(tokens)
+                        curr = self.tokenizer.decode(tokens)
+                        raw_text = curr[len(prev_texts[uid]) :]
+                        prev_texts[uid] = curr
 
                         is_stop = tok in self.stop_tokens
                         is_max = len(tokens) >= max_tokens_map[uid]
                         finish = "stop" if is_stop else "length" if is_max else None
+                        if is_stop:
+                            text = stop_matchers[uid].flush()
+                        else:
+                            text, server_stop = stop_matchers[uid].append(raw_text)
+                            if server_stop:
+                                finish = "stop"
+                            elif finish is not None:
+                                text += stop_matchers[uid].flush()
 
                         rqueues[uid].put(
                             StreamingToken(
-                                text="" if is_stop else text,
+                                text=text,
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
@@ -680,7 +747,7 @@ class ResponseGenerator:
                     if uid not in finished_uids:
                         rqueues[uid].put(
                             StreamingToken(
-                                text="",
+                                text=stop_matchers[uid].flush(),
                                 token=0,
                                 logprobs=0.0,
                                 finish_reason="length",
@@ -711,13 +778,24 @@ class ResponseGenerator:
             if hasattr(tok, "item"):
                 tok = tok.item()
 
+            finish_reason = r.finish_reason
+            stop_filter = info.get("stop_filter")
+
             if r.finish_reason == "stop":
-                text = ""
+                text = stop_filter.flush() if stop_filter is not None else ""
             else:
                 info["tokens"].append(tok)
                 curr = self.tokenizer.decode(info["tokens"])
-                text = curr[len(info["prev_text"]) :]
+                raw_text = curr[len(info["prev_text"]) :]
                 info["prev_text"] = curr
+                if stop_filter is not None:
+                    text, server_stop = stop_filter.append(raw_text)
+                    if server_stop:
+                        finish_reason = "stop"
+                    elif finish_reason is not None:
+                        text += stop_filter.flush()
+                else:
+                    text = raw_text
 
             lp = r.token_logprob
 
@@ -726,13 +804,15 @@ class ResponseGenerator:
                     text=text,
                     token=tok,
                     logprobs=lp,
-                    finish_reason=r.finish_reason,
-                    peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
+                    finish_reason=finish_reason,
+                    peak_memory=mx.get_peak_memory() / 1e9 if finish_reason else 0,
                     top_logprobs=getattr(r, "top_logprobs", None),
                 )
             )
 
-            if r.finish_reason is not None:
+            if finish_reason is not None:
+                if r.finish_reason is None:
+                    batch_gen.remove(r.uid)
                 rqueue.put(None)
                 del active[r.uid]
 
@@ -831,7 +911,36 @@ def _build_gen_args(request) -> GenerationArguments:
         enable_thinking=getattr(request, "enable_thinking", True),
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
+        stop=_normalize_stop(getattr(request, "stop", None)),
     )
+
+
+def _normalize_stop(stop: Optional[Union[str, List[str]]]) -> Optional[List[str]]:
+    """Normalize OpenAI-compatible stop into a list of up to 4 strings."""
+    if stop is None:
+        return None
+    if isinstance(stop, str):
+        stop_sequences = [stop]
+    elif isinstance(stop, list):
+        stop_sequences = stop
+    else:
+        raise HTTPException(
+            status_code=400, detail="stop must be a string or a list of strings."
+        )
+
+    if len(stop_sequences) == 0:
+        raise HTTPException(
+            status_code=400, detail="stop must contain at least 1 string."
+        )
+    if len(stop_sequences) > 4:
+        raise HTTPException(
+            status_code=400, detail="stop must contain at most 4 strings."
+        )
+    if not all(isinstance(item, str) for item in stop_sequences):
+        raise HTTPException(status_code=400, detail="stop entries must be strings.")
+    if any(item == "" for item in stop_sequences):
+        raise HTTPException(status_code=400, detail="stop entries must be non-empty.")
+    return stop_sequences
 
 
 def _count_thinking_tag_tokens(text: str) -> int:
@@ -1196,6 +1305,9 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None, description="Up to 4 stop sequences where generation should stop."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -1382,6 +1494,9 @@ class VLMRequest(FlexibleBaseModel):
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
+    )
+    stop: Optional[Union[str, List[str]]] = Field(
+        None, description="Up to 4 stop sequences where generation should stop."
     )
     logprobs: Optional[bool] = Field(
         None,
@@ -1637,6 +1752,7 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         gen_args = _build_gen_args(openai_request)
+        stop_sequences = gen_args.stop or []
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -1709,6 +1825,7 @@ async def responses_endpoint(request: Request):
 
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
+                    stop_filter = StopMatcher(stop_sequences)
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
                     if response_generator is not None:
@@ -1721,17 +1838,23 @@ async def responses_endpoint(request: Request):
                         output_tokens = 0
                         for token in token_iter:
                             output_tokens += 1
-                            delta = token.text
+                            delta, stopped = stop_filter.feed(token.text)
                             full_text += delta
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
                             }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            if delta:
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
-                            if token.finish_reason:
+                            if stopped or token.finish_reason:
+                                if not stopped:
+                                    tail = stop_filter.flush()
+                                    if tail:
+                                        full_text += tail
+                                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail).model_dump_json()}\n\n"
                                 break
                     else:
                         # Fallback to stream_generate
@@ -1751,15 +1874,24 @@ async def responses_endpoint(request: Request):
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
-                            delta = chunk.text
+                            delta, stopped = stop_filter.feed(chunk.text)
                             full_text += delta
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
                             }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            if delta:
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
+
+                            if stopped:
+                                break
+                        else:
+                            tail = stop_filter.flush()
+                            if tail:
+                                full_text += tail
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail).model_dump_json()}\n\n"
 
                     # Split thinking from content for final events
                     _, clean_text = _split_thinking(full_text)
@@ -1788,6 +1920,7 @@ async def responses_endpoint(request: Request):
                         update={
                             "status": "completed",
                             "output": [final_message_item],
+                            "output_text": clean_text,
                             "usage": {
                                 "input_tokens": usage_stats["input_tokens"],
                                 "output_tokens": usage_stats["output_tokens"],
@@ -1830,6 +1963,7 @@ async def responses_endpoint(request: Request):
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
+                stop_filter = StopMatcher(stop_sequences)
 
                 if response_generator is not None:
                     ctx, token_iter = response_generator.generate(
@@ -1839,28 +1973,53 @@ async def responses_endpoint(request: Request):
                     )
                     prompt_tokens = ctx.prompt_tokens
                     for token in token_iter:
-                        full_text += token.text
+                        text, stopped = stop_filter.feed(token.text)
+                        full_text += text
                         output_tokens += 1
-                        if token.finish_reason:
+                        if stopped or token.finish_reason:
+                            if not stopped:
+                                full_text += stop_filter.flush()
                             break
                     try:
                         token_iter.close()
                     except Exception:
                         pass
                 else:
-                    result = generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        verbose=logger.isEnabledFor(logging.DEBUG),
-                        vision_cache=model_cache.get("vision_cache"),
-                        **gen_args.to_generate_kwargs(),
-                        **kwargs,
-                    )
-                    full_text = result.text
-                    prompt_tokens = result.prompt_tokens
-                    output_tokens = result.generation_tokens
+                    if stop_sequences:
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            vision_cache=model_cache.get("vision_cache"),
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+                            text, stopped = stop_filter.feed(chunk.text)
+                            full_text += text
+                            prompt_tokens = chunk.prompt_tokens
+                            output_tokens = chunk.generation_tokens
+                            if stopped:
+                                break
+                        else:
+                            full_text += stop_filter.flush()
+                    else:
+                        result = generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            verbose=logger.isEnabledFor(logging.DEBUG),
+                            vision_cache=model_cache.get("vision_cache"),
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
+                        full_text = result.text
+                        prompt_tokens = result.prompt_tokens
+                        output_tokens = result.generation_tokens
 
                 mx.clear_cache()
                 gc.collect()
@@ -2029,6 +2188,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = load_tool_module(tool_parser_type)
 
         gen_args = _build_gen_args(request)
+        stop_sequences = gen_args.stop or []
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -2059,6 +2219,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 token_iter = None  # For ResponseGenerator cleanup
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
+                    output_tokens = 0
                     if response_generator is not None:
                         # generate() does blocking Queue.get — run off event loop
                         ctx, token_iter = await asyncio.to_thread(
@@ -2068,13 +2229,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                             audio if audio else None,
                             gen_args,
                         )
-
-                        output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         # Track thinking state for reasoning/content split
                         in_thinking = False
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
+                        stop_filter = StopMatcher(stop_sequences)
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
                         tc_start = tool_module.tool_call_start if tool_module else None
@@ -2091,8 +2251,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                             if token is None:
                                 break
                             output_tokens += 1
-                            accumulated += token.text
-                            full_output += token.text
+                            token_text, stopped = stop_filter.feed(token.text)
+                            finish_reason = "stop" if stopped else token.finish_reason
+                            if finish_reason and not stopped:
+                                token_text += stop_filter.flush()
+                            accumulated += token_text
+                            full_output += token_text
 
                             # Detect thinking boundaries
                             delta_reasoning = None
@@ -2112,13 +2276,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 accumulated = ""
                                 # Don't emit closing tag tokens
                             elif in_thinking:
-                                delta_reasoning = token.text
+                                delta_reasoning = token_text or None
                             elif not in_thinking and (
                                 "<|channel>" in accumulated or "<think" in accumulated
                             ):
                                 pass  # Partial tag, don't emit yet
                             else:
-                                delta_content = token.text
+                                delta_content = token_text or None
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -2126,7 +2290,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
 
                             chunk_logprobs = None
-                            if request.logprobs and token.finish_reason != "stop":
+                            if request.logprobs and token_text and finish_reason != "stop":
                                 req_top_k = int(request.top_logprobs or 0)
                                 chunk_logprobs = ChatLogprobs(
                                     content=[
@@ -2144,13 +2308,13 @@ async def chat_completions_endpoint(request: ChatRequest):
                             has_payload = (
                                 delta_content is not None
                                 or delta_reasoning is not None
-                                or token.finish_reason is not None
+                                or finish_reason is not None
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
                                 choices = [
                                     ChatStreamChoice(
-                                        finish_reason=token.finish_reason,
+                                        finish_reason=finish_reason,
                                         delta=ChatMessage(
                                             role="assistant",
                                             content=delta_content,
@@ -2174,7 +2338,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
-                            if token.finish_reason:
+                            if finish_reason:
                                 break
 
                         # Parse tool calls from full output and emit final chunk
@@ -2213,35 +2377,70 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        output_text = ""
+                        stop_filter = StopMatcher(stop_sequences)
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
-                            output_text += chunk.text
+                            delta, stopped = stop_filter.feed(chunk.text)
 
+                            if delta or stopped:
+                                choices = [
+                                    ChatStreamChoice(
+                                        finish_reason="stop" if stopped else None,
+                                        delta=ChatMessage(
+                                            role="assistant", content=delta or None
+                                        ),
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": chunk.prompt_tokens,
+                                        "completion_tokens": chunk.generation_tokens,
+                                        "total_tokens": chunk.prompt_tokens
+                                        + chunk.generation_tokens,
+                                    },
+                                    choices=choices,
+                                )
+
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
+
+                            if stopped:
+                                break
+                        else:
+                            tail = stop_filter.flush()
+                            if tail:
+                                choices = [
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant", content=tail
+                                        )
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    choices=choices,
+                                )
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
                             choices = [
                                 ChatStreamChoice(
-                                    delta=ChatMessage(
-                                        role="assistant", content=chunk.text
-                                    )
+                                    finish_reason="length",
+                                    delta=ChatMessage(role="assistant"),
                                 )
                             ]
                             chunk_data = ChatStreamChunk(
                                 id=request_id,
                                 created=int(time.time()),
                                 model=request.model,
-                                usage={
-                                    "prompt_tokens": chunk.prompt_tokens,
-                                    "completion_tokens": chunk.generation_tokens,
-                                    "total_tokens": chunk.prompt_tokens
-                                    + chunk.generation_tokens,
-                                },
                                 choices=choices,
                             )
-
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
 
                     # Signal stream end
                     yield "data: [DONE]\n\n"
@@ -2287,6 +2486,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 prompt_tokens = 0
                 output_tokens = 0
                 peak_memory = 0.0
+                finish_reason = "stop"
+                stop_filter = StopMatcher(stop_sequences)
 
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
@@ -2298,6 +2499,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         text = ""
                         pt = gt = 0
                         pm = 0.0
+                        local_finish_reason = "stop"
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
@@ -2306,40 +2508,83 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
                         pt = ctx.prompt_tokens
                         for token in token_iter:
-                            text += token.text
+                            token_text, stopped = stop_filter.feed(token.text)
+                            token_finish_reason = (
+                                "stop" if stopped else token.finish_reason
+                            )
+                            if token_finish_reason and not stopped:
+                                token_text += stop_filter.flush()
+                            text += token_text
                             gt += 1
                             pm = token.peak_memory
-                            if request.logprobs and token.finish_reason != "stop":
+                            if (
+                                request.logprobs
+                                and token_text
+                                and token_finish_reason != "stop"
+                            ):
                                 collected_logprobs.append(
                                     (token.token, token.logprobs, token.top_logprobs)
                                 )
-                            if token.finish_reason:
+                            if token_finish_reason:
+                                local_finish_reason = token_finish_reason
                                 break
                         try:
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, pm
+                        return text, pt, gt, pm, local_finish_reason
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                        finish_reason,
+                    ) = (
                         await asyncio.to_thread(_blocking_generate)
                     )
                 else:
-                    gen_result = generate(
-                        model=model,
-                        processor=processor,
-                        prompt=formatted_prompt,
-                        image=images,
-                        audio=audio,
-                        verbose=logger.isEnabledFor(logging.DEBUG),
-                        vision_cache=model_cache.get("vision_cache"),
-                        **gen_args.to_generate_kwargs(),
-                        **kwargs,
-                    )
-                    full_text = gen_result.text
-                    prompt_tokens = gen_result.prompt_tokens
-                    output_tokens = gen_result.generation_tokens
-                    peak_memory = gen_result.peak_memory
+                    if stop_sequences:
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            audio=audio,
+                            vision_cache=model_cache.get("vision_cache"),
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
+                        for chunk in token_iterator:
+                            if chunk is None or not hasattr(chunk, "text"):
+                                continue
+                            text, stopped = stop_filter.feed(chunk.text)
+                            full_text += text
+                            prompt_tokens = chunk.prompt_tokens
+                            output_tokens = chunk.generation_tokens
+                            peak_memory = chunk.peak_memory
+                            if stopped:
+                                finish_reason = "stop"
+                                break
+                        else:
+                            full_text += stop_filter.flush()
+                            finish_reason = "length"
+                    else:
+                        gen_result = generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            audio=audio,
+                            verbose=logger.isEnabledFor(logging.DEBUG),
+                            vision_cache=model_cache.get("vision_cache"),
+                            **gen_args.to_generate_kwargs(),
+                            **kwargs,
+                        )
+                        full_text = gen_result.text
+                        prompt_tokens = gen_result.prompt_tokens
+                        output_tokens = gen_result.generation_tokens
+                        peak_memory = gen_result.peak_memory
 
                 mx.clear_cache()
                 gc.collect()
@@ -2400,7 +2645,9 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                 choices = [
                     ChatChoice(
-                        finish_reason="tool_calls" if parsed_tool_calls else "stop",
+                        finish_reason=(
+                            "tool_calls" if parsed_tool_calls else finish_reason
+                        ),
                         message=ChatMessage(
                             role="assistant",
                             content=content if content else None,
