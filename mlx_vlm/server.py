@@ -2294,7 +2294,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )
@@ -2367,9 +2367,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                             pass
                         return text, pt, gt, pm
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
