@@ -40,6 +40,11 @@ class TextConfig(BaseModelConfig):
     tie_word_embeddings: bool = False
     attention_bias: bool = False
     head_dim: Optional[int] = None
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
+    norm_topk_prob: bool = True
     rope_parameters: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
         default_factory=lambda: {
             "type": "default",
