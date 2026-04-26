@@ -8,10 +8,7 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.base import (
-    create_attention_mask,
-    create_ssm_mask,
-)
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.base import (
     scaled_dot_product_attention as mlx_scaled_dot_product_attention,
 )

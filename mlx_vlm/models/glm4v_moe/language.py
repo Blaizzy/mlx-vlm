@@ -3,10 +3,7 @@ from ..glm4v.language import (  # noqa: F401 (backwards compat)
     GLM4VModel,
 )
 from ..glm4v.language import LanguageModel as Glm4vLanguageModel
-from ..glm4v.language import (  # noqa: F401 (backwards compat)
-    MoE,
-    MoEGate,
-)
+from ..glm4v.language import MoE, MoEGate  # noqa: F401 (backwards compat)
 from .config import ModelConfig, TextConfig
 
 # The base Glm4vDecoderLayer now handles MoE (when n_routed_experts is set),

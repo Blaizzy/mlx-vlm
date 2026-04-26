@@ -1,8 +1,5 @@
 from ..qwen3_vl.language import LanguageModel as Qwen3VLLanguageModel
-from ..qwen3_vl.language import (
-    Qwen3VLDecoderLayer,
-    Qwen3VLModel,
-)
+from ..qwen3_vl.language import Qwen3VLDecoderLayer, Qwen3VLModel
 from ..qwen3_vl.language import (  # noqa: F401 (backwards compat)
     Qwen3VLSparseMoeBlock as Qwen3VLMoESparseMoeBlock,
 )
