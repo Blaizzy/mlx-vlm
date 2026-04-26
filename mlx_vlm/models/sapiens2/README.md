@@ -27,6 +27,90 @@ result = predictor.predict(Image.open("person.jpg"))
 # result.pointmap   (3, H, W) XYZ  + .scale     (pointmap)
 ```
 
+## Plotting predictions
+
+The four task heads return different output types — here are minimal
+matplotlib snippets for each, run on `assets/sample.jpg` (an 800 × 1200
+Unsplash photo of a single person filling the frame).
+
+### Body-part segmentation (29 classes)
+
+```python
+import numpy as np, matplotlib.pyplot as plt
+result = predictor.predict(image)        # task = "seg"
+rng = np.random.default_rng(0)
+palette = rng.uniform(0.2, 1.0, size=(29, 3)).astype(np.float32)
+palette[0] = 0  # background
+mask_rgb = palette[np.clip(result.mask, 0, 28)]
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 7))
+ax[0].imshow(image); ax[0].set_axis_off(); ax[0].set_title("input")
+ax[1].imshow(image); ax[1].imshow(mask_rgb, alpha=0.55)
+ax[1].set_axis_off(); ax[1].set_title("body-part segmentation (29 classes)")
+plt.savefig("seg.png", bbox_inches="tight")
+```
+
+![Sapiens2 seg example](assets/seg.png)
+
+### Top-down pose (RTMDet → 308 keypoints)
+
+```python
+# detector = RTMDetPredictor or RFDETRPredictor
+predictor = Sapiens2Predictor(pose_model, pose_proc, detector=detector)
+result = predictor.predict(image)        # → Sapiens2PoseMultiResult
+
+fig, ax = plt.subplots(figsize=(image.width / 110, image.height / 110))
+ax.imshow(image)
+for p in result.persons:
+    x1, y1, x2, y2 = p.box
+    ax.add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                               fill=False, edgecolor="cyan", linewidth=2))
+    keep = p.keypoint_scores > 0.30
+    ax.scatter(p.keypoints[keep, 0], p.keypoints[keep, 1],
+               s=10, c="yellow", edgecolors="black", linewidths=0.4)
+ax.set_axis_off()
+plt.savefig("pose.png", bbox_inches="tight", pad_inches=0)
+```
+
+![Sapiens2 pose example](assets/pose.png)
+
+The same code on a multi-person scene (`assets/crowd.jpg`) with RF-DETR as
+the detector and `detector_class_filter=1` (COCO "person" class):
+
+![Sapiens2 multi-person pose example](assets/pose_multi.png)
+
+### Surface normals
+
+```python
+result = predictor.predict(image)        # task = "normal"
+rgb = np.clip((result.normal + 1) / 2, 0, 1).transpose(1, 2, 0)
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 7))
+ax[0].imshow(image); ax[0].set_axis_off(); ax[0].set_title("input")
+ax[1].imshow(rgb); ax[1].set_axis_off(); ax[1].set_title("surface normals (XYZ→RGB)")
+plt.savefig("normals.png", bbox_inches="tight")
+```
+
+![Sapiens2 surface normal example](assets/normal.png)
+
+### Pointmap depth (Z channel of the XYZ pointmap)
+
+```python
+result = predictor.predict(image)        # task = "pointmap"
+depth = result.pointmap[2]               # (H, W) Z component
+lo, hi = np.percentile(depth, [2, 98])
+depth_norm = np.clip((depth - lo) / max(hi - lo, 1e-6), 0, 1)
+
+fig, ax = plt.subplots(1, 2, figsize=(12, 7))
+ax[0].imshow(image); ax[0].set_axis_off(); ax[0].set_title("input")
+ax[1].imshow(depth_norm, cmap="turbo")
+ax[1].set_axis_off()
+ax[1].set_title(f"pointmap depth (z, scale={result.scale:.3f})")
+plt.savefig("depth.png", bbox_inches="tight")
+```
+
+![Sapiens2 pointmap example](assets/pointmap.png)
+
 ## Top-down pose (RTMDet or RF-DETR person detector)
 
 The pose head is top-down — it expects the image to already be cropped to

@@ -54,6 +54,30 @@ Output is a `DetectionResult` with:
 - `scores` — `(N,)` confidence scores in `[0, 1]`
 - `labels` — `(N,)` class indices (always `0` for the single-class person detector)
 
+## Plotting detections
+
+```python
+import matplotlib.pyplot as plt
+
+image = Image.open("image.jpg")
+result = predictor.predict(image)
+
+fig, ax = plt.subplots(figsize=(image.width / 110, image.height / 110))
+ax.imshow(image)
+for (x1, y1, x2, y2), score in zip(result.boxes, result.scores):
+    ax.add_patch(plt.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                               fill=False, edgecolor="lime", linewidth=3))
+    ax.text(x1, max(0, y1 - 6), f"person {score:.2f}",
+            color="black", fontsize=11,
+            bbox=dict(facecolor="lime", edgecolor="none", pad=2))
+ax.set_axis_off()
+plt.savefig("detection.png", bbox_inches="tight", pad_inches=0)
+```
+
+Result on `assets/sample.jpg` (Unsplash, 800 × 1200):
+
+![RTMDet detection example](assets/detection.png)
+
 ## Using it with Sapiens2 pose
 
 The typical flow is: **RTMDet → per-person crops → Sapiens2 pose**.  The
