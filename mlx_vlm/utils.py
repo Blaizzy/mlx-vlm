@@ -295,6 +295,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config["quantization_config"] = quantization
 
     if (quantization := config.get("quantization", None)) is not None:
+        # Remap per-layer quantization keys from weight-key format to module-path format
+        keys_to_remap = [
+            k for k in quantization
+            if isinstance(quantization[k], dict)
+            and k.startswith("model.language_model.")
+        ]
+        for k in keys_to_remap:
+            remapped = k.replace("model.language_model.", "language_model.model.")
+            if remapped not in quantization:
+                quantization[remapped] = quantization[k]
+
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
