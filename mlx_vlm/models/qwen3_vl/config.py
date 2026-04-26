@@ -42,6 +42,11 @@ class TextConfig(BaseModelConfig):
     head_dim: int
     rope_theta: float
     max_position_embeddings: int
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    decoder_sparse_step: int = 1
+    mlp_only_layers: List[int] = field(default_factory=list)
     norm_topk_prob: bool = True
     rope_scaling: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
         default_factory=lambda: {"type": "default", "mrope_section": [24, 20, 20]}

@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.gated_delta import gated_delta_update
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -216,6 +217,43 @@ class Qwen3_5MLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+class Qwen3_5SparseMoeBlock(nn.Module):
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        dim = args.hidden_size
+        intermediate_size = args.moe_intermediate_size
+        shared_expert_intermediate_size = args.shared_expert_intermediate_size
+
+        self.num_experts = num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
+
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+
+        self.shared_expert = Qwen3_5MLP(dim, shared_expert_intermediate_size)
+        self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
+
+    def __call__(
+        self,
+        x: mx.array,
+    ) -> mx.array:
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = scores / scores.sum(axis=-1, keepdims=True)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        shared_y = self.shared_expert(x)
+        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
+
+        return y + shared_y
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
@@ -369,7 +407,10 @@ class Qwen3_5DecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.mlp = Qwen3_5MLP(args.hidden_size, args.intermediate_size)
+        if getattr(args, "num_experts", 0) > 0:
+            self.mlp = Qwen3_5SparseMoeBlock(args)
+        else:
+            self.mlp = Qwen3_5MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,

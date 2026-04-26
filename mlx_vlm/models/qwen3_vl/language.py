@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -196,6 +197,48 @@ class MLP(nn.Module):
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class Qwen3VLSparseMoeBlock(nn.Module):
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        dim = args.hidden_size
+        intermediate_size = args.moe_intermediate_size
+
+        self.num_experts = num_experts = args.num_experts
+        self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
+
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+
+        self.sharding_group = None
+
+    def __call__(
+        self,
+        x: mx.array,
+    ):
+        if self.sharding_group is not None:
+            from mlx.nn.layers.distributed import sum_gradients
+
+            x = sum_gradients(self.sharding_group)(x)
+
+        gates = self.gate(x)
+        gates = mx.softmax(gates, axis=-1, precise=True)
+
+        k = self.top_k
+        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if self.norm_topk_prob:
+            scores /= mx.sum(scores, axis=-1, keepdims=True)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
+
+
 class Qwen3VLDecoderLayer(nn.Module):
     def __init__(self, args: TextConfig, layer_idx: int):
         super().__init__()
@@ -207,7 +250,15 @@ class Qwen3VLDecoderLayer(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.args = args
-        self.mlp = MLP(args.hidden_size, args.intermediate_size)
+
+        if (
+            getattr(args, "num_experts", 0) > 0
+            and layer_idx not in getattr(args, "mlp_only_layers", [])
+            and (layer_idx + 1) % getattr(args, "decoder_sparse_step", 1) == 0
+        ):
+            self.mlp = Qwen3VLSparseMoeBlock(args)
+        else:
+            self.mlp = MLP(args.hidden_size, args.intermediate_size)
 
     def __call__(
         self,
@@ -622,3 +673,22 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
+
+    def sanitize(self, weights):
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"language_model.model.layers.{l}.mlp"
+            # Only sanitize MoE layer weights
+            if f"{prefix}.experts.up_proj" in weights:
+                for n in ["up_proj", "down_proj", "gate_proj"]:
+                    to_join = weights.pop(f"{prefix}.experts.{n}")
+                    weights[f"{prefix}.switch_mlp.{n}.weight"] = to_join
+        return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
