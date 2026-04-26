@@ -5764,5 +5764,111 @@ class TestSam3(unittest.TestCase):
         self.assertEqual(sin.shape, (64, 64))
 
 
+class TestQwen3_5MoeSanitize(unittest.TestCase):
+    """Regression tests for issue #1057.
+
+    Qwen3.6 HF checkpoints nest the ViT inside the language-model submodule
+    as ``model.language_model.visual.*``. The sanitize chain previously
+    matched the broader ``model.language_model`` prefix first and rewrote
+    those keys to ``language_model.model.visual.*``, where they became
+    orphans the model has no attribute for and got silently dropped (333
+    ViT tensors lost on load).
+
+    Reported and diagnosed by @a4501150.
+    """
+
+    @staticmethod
+    def _stub_model():
+        """Build a minimal stub that exposes only what ``Model.sanitize`` reads.
+
+        ``num_hidden_layers = 0`` skips the per-layer ``gate_up_proj`` rewrite
+        loop so the test can focus on the prefix-routing chain that is the
+        subject of the bug. ``tie_word_embeddings = False`` keeps the
+        ``lm_head.weight`` pop branch off.
+        """
+
+        class _StubTextConfig:
+            tie_word_embeddings = False
+            num_hidden_layers = 0
+
+        class _StubConfig:
+            text_config = _StubTextConfig()
+
+        class _StubModel:
+            config = _StubConfig()
+
+        return _StubModel()
+
+    def test_sanitize_routes_nested_visual_to_vision_tower(self):
+        """Issue #1057: nested ``model.language_model.visual.*`` -> ``vision_tower.*``."""
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+
+        weights = {
+            "model.language_model.visual.blocks.0.attn.qkv.weight": mx.zeros((1,)),
+            "model.language_model.visual.patch_embed.proj.weight": mx.zeros((1,)),
+        }
+        sanitized = Model.sanitize(self._stub_model(), weights)
+
+        self.assertIn("vision_tower.blocks.0.attn.qkv.weight", sanitized)
+        self.assertIn("vision_tower.patch_embed.proj.weight", sanitized)
+        # Must NOT land under the orphan path that the buggy chain produced.
+        self.assertNotIn(
+            "language_model.model.visual.blocks.0.attn.qkv.weight", sanitized
+        )
+        self.assertNotIn(
+            "language_model.model.visual.patch_embed.proj.weight", sanitized
+        )
+
+    def test_sanitize_routes_pure_language_model_keys(self):
+        """Pure ``model.language_model.*`` (no visual) -> ``language_model.model.*``."""
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+
+        weights = {
+            "model.language_model.layers.0.self_attn.q_proj.weight": mx.zeros((1,)),
+            "model.language_model.embed_tokens.weight": mx.zeros((1,)),
+        }
+        sanitized = Model.sanitize(self._stub_model(), weights)
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight", sanitized
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+
+    def test_sanitize_routes_flat_visual_keys(self):
+        """Legacy flat ``model.visual.*`` -> ``vision_tower.*`` still works."""
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+
+        weights = {
+            "model.visual.blocks.0.attn.proj.weight": mx.zeros((1,)),
+        }
+        sanitized = Model.sanitize(self._stub_model(), weights)
+
+        self.assertIn("vision_tower.blocks.0.attn.proj.weight", sanitized)
+
+    def test_sanitize_namespace_boundary_for_nested_visual(self):
+        """Trailing-dot anchor: ``model.language_model.visualizer.*`` (hypothetical)
+        must NOT mis-route to ``vision_tower.*``. Falls through to the language-model
+        branch instead.
+        """
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+
+        weights = {
+            # Hypothetical sibling whose name shares the 'visual' prefix but
+            # is NOT a vision-tower key. Without the trailing-dot anchor on
+            # the first branch, this would mis-route to ``vision_towerizer.*``.
+            "model.language_model.visualizer.blocks.0.weight": mx.zeros((1,)),
+        }
+        sanitized = Model.sanitize(self._stub_model(), weights)
+
+        self.assertNotIn(
+            "vision_towerizer.blocks.0.weight", sanitized,
+            "Namespace boundary leaked: 'visualizer' was matched by the 'visual' prefix",
+        )
+        self.assertIn(
+            "language_model.model.visualizer.blocks.0.weight", sanitized,
+            "Hypothetical visualizer key should fall through to the language-model branch",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
