@@ -1,4 +1,5 @@
 import inspect
+import logging
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -7,7 +8,10 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+from mlx_lm.models.base import (
+    create_attention_mask,
+    create_ssm_mask,
+)
 from mlx_lm.models.base import (
     scaled_dot_product_attention as mlx_scaled_dot_product_attention,
 )
@@ -95,19 +99,35 @@ class InputEmbeddingsFeatures:
         }
 
 
+_ARCHITECTURE_FIELDS = {
+    "num_experts",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "shared_expert_intermediate_size",
+    "n_routed_experts",
+    "num_local_experts",
+    "norm_topk_prob",
+}
+
+_logger = logging.getLogger(__name__)
+
+
 @dataclass
 class BaseModelConfig:
     @classmethod
     def from_dict(cls, params):
         if not params:
             return cls()
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+        accepted = inspect.signature(cls).parameters
+        dropped = {k for k in params if k not in accepted and k in _ARCHITECTURE_FIELDS}
+        if dropped:
+            _logger.warning(
+                "%s.from_dict: dropped architecture fields %s "
+                "(present in config.json but absent from dataclass)",
+                cls.__name__,
+                sorted(dropped),
+            )
+        return cls(**{k: v for k, v in params.items() if k in accepted})
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if v is not None}
