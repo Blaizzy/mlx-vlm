@@ -12,11 +12,11 @@ pointmap), so inference goes through `Sapiens2Predictor`, not
 ```python
 from pathlib import Path
 from PIL import Image
-from mlx_vlm.utils import load
+from mlx_vlm.utils import load_model
 from mlx_vlm.models.sapiens2.processing_sapiens2 import Sapiens2Processor
 from mlx_vlm.models.sapiens2.generate import Sapiens2Predictor
 
-model, _processor = load(Path("./sapiens2-seg-0.4b-mlx"))
+model = load_model(Path("./sapiens2-seg-0.4b-mlx"))
 processor = Sapiens2Processor.from_pretrained("./sapiens2-seg-0.4b-mlx")
 predictor = Sapiens2Predictor(model, processor)
 
@@ -26,6 +26,25 @@ result = predictor.predict(Image.open("person.jpg"))
 # result.normal     (3, H, W) unit vectors      (normal)
 # result.pointmap   (3, H, W) XYZ  + .scale     (pointmap)
 ```
+
+## Top-down pose (RTMDet or RF-DETR person detector)
+
+The pose head is top-down — it expects the image to already be cropped to
+a single person.  Pass an optional `detector=` to `Sapiens2Predictor` and
+the predictor will run the detector, crop each person bbox to 3:4 with a 25%
+margin, run pose, and stitch the keypoints back to full-image coordinates.
+Two detectors are supported out of the box:
+
+- **RTMDet** (Meta's Sapiens companion person detector) — see
+  [`../rtmdet/README.md`](../rtmdet/README.md) for conversion + usage.
+- **RF-DETR** (already ported in `mlx_vlm.models.rfdetr`) — pass
+  `detector_class_filter=1` to keep only the COCO "person" class.
+
+You can also pass `person_boxes=[(x1, y1, x2, y2), ...]` to `predict()` to
+skip the detector entirely.  For the complete pose workflow with both
+detector options (and a BYO-boxes variant), see
+the per-task usage block in every `sapiens2-pose-*` quant README (generated
+by `mlx_vlm.models.sapiens2.readme`).
 
 ## Converting a HF checkpoint
 

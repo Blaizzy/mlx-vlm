@@ -43,6 +43,7 @@ MODEL_REMAPPING = {
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
     "sapiens2": "sapiens2",
+    "rtmdet": "rtmdet",
 }
 
 MAX_FILE_SIZE_GB = 5
