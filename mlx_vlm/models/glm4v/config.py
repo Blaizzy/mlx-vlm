@@ -27,6 +27,18 @@ class TextConfig(BaseModelConfig):
     rope_scaling: Dict = field(
         default_factory=lambda: {"rope_type": "default", "mrope_section": [8, 12, 12]}
     )
+    n_routed_experts: Optional[int] = None
+    n_shared_experts: Optional[int] = None
+    moe_intermediate_size: int = 0
+    num_experts_per_tok: int = 0
+    first_k_dense_replace: int = 0
+    n_group: int = 1
+    topk_group: int = 1
+    routed_scaling_factor: float = 1.0
+    norm_topk_prob: bool = True
+    scoring_func: str = "sigmoid"
+    topk_method: str = "noaux_tc"
+    rope_parameters: Optional[Dict] = None
     pad_token_id: int = 151329
     use_cache: bool = True
 
