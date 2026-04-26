@@ -297,7 +297,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if (quantization := config.get("quantization", None)) is not None:
         # Remap per-layer quantization keys from weight-key format to module-path format
         keys_to_remap = [
-            k for k in quantization
+            k
+            for k in quantization
             if isinstance(quantization[k], dict)
             and k.startswith("model.language_model.")
         ]
@@ -674,8 +675,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -687,8 +687,7 @@ def upload_to_hub(path: str, upload_repo: str):
         ```bash
         python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
