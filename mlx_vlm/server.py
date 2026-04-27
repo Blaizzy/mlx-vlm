@@ -2500,10 +2500,12 @@ async def add_server_header(request: Request, call_next):
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """
     Check if the server is healthy and what model is loaded.
     """
+    if api_key and request.headers.get("Authorization") != f"Bearer {api_key}":
+        raise HTTPException(status_code=401, detail="Invalid API key")
     return {
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
@@ -2513,10 +2515,12 @@ async def health_check():
 
 
 @app.post("/unload")
-async def unload_model_endpoint():
+async def unload_model_endpoint(request: Request):
     """
     Unload the currently loaded model from memory.
     """
+    if api_key and request.headers.get("Authorization") != f"Bearer {api_key}":
+        raise HTTPException(status_code=401, detail="Invalid API key")
     unloaded_info = {
         "model_name": model_cache.get("model_path", None),
         "adapter_name": model_cache.get("adapter_path", None),
