@@ -46,7 +46,18 @@ class Model(Qwen3_5Model):
         sanitized_weights = {}
         for key, value in weights.items():
             if "model" in key:
-                if "model.language_model" in key:
+                # Qwen3.6 HF checkpoints nest the ViT inside the language-model
+                # submodule as ``model.language_model.visual.*``. Match the
+                # more-specific nested-visual prefix first so those keys route
+                # to ``vision_tower.*`` rather than being captured by the
+                # broader ``model.language_model`` branch (issue #1057). The
+                # trailing dot anchors the namespace boundary so that keys
+                # like ``model.language_model.visualizer.*`` (hypothetical)
+                # fall through to the language-model branch instead of being
+                # mis-routed to ``vision_tower``.
+                if "model.language_model.visual." in key:
+                    key = key.replace("model.language_model.visual", "vision_tower")
+                elif "model.language_model" in key:
                     key = key.replace("model.language_model", "language_model.model")
                 elif "model.visual" in key:
                     key = key.replace("model.visual", "vision_tower")
