@@ -38,8 +38,6 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _dflash_rounds_batch,
-    _make_cache,
     generate,
     normalize_resize_shape,
     stream_generate,
@@ -287,7 +285,6 @@ class ResponseGenerator:
             if hasattr(raw_inputs["input_ids"], "size")
             else len(raw_inputs["input_ids"])
         )
-
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
         # Block until the GPU thread sends back the context
@@ -323,14 +320,14 @@ class ResponseGenerator:
         return ctx, token_iterator()
 
     def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
-        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+        """Tokenize text and prepare media inputs on the caller thread."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
             if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
-        return prepare_inputs(
+        raw_inputs = prepare_inputs(
             self.processor,
             images=images,
             audio=audio,
@@ -338,6 +335,26 @@ class ResponseGenerator:
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+        self._materialize_mx_arrays(raw_inputs)
+        return raw_inputs
+
+    @staticmethod
+    def _materialize_mx_arrays(value) -> None:
+        arrays = []
+
+        def collect(item):
+            if isinstance(item, mx.array):
+                arrays.append(item)
+            elif isinstance(item, dict):
+                for child in item.values():
+                    collect(child)
+            elif isinstance(item, (list, tuple)):
+                for child in item:
+                    collect(child)
+
+        collect(value)
+        if arrays:
+            mx.eval(*arrays)
 
     # -- internals --
 
@@ -2607,24 +2624,6 @@ def main():
         help="Start index for quantized KV cache.",
     )
     parser.add_argument(
-        "--draft-model",
-        type=str,
-        default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
-    )
-    parser.add_argument(
-        "--draft-kind",
-        type=str,
-        default="dflash",
-        help="Drafter family (default: dflash).",
-    )
-    parser.add_argument(
-        "--draft-block-size",
-        type=int,
-        default=None,
-        help="Override the drafter's configured block size.",
-    )
-    parser.add_argument(
         "--top-logprobs-k",
         type=int,
         default=None,
@@ -2654,11 +2653,6 @@ def main():
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
-    if args.draft_model:
-        os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
-        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
-        if args.draft_block_size is not None:
-            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     if args.kv_bits is not None:
