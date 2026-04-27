@@ -491,6 +491,7 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "tokens": [],
                         "prev_text": "",
+                        "detokenizer": self._make_detokenizer(),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -556,6 +557,7 @@ class ResponseGenerator:
                 uids = []
                 rqueues = {}
                 token_lists = {}
+                decode_infos = {}
                 max_tokens_map = {}
                 all_input_ids = []
 
@@ -565,6 +567,11 @@ class ResponseGenerator:
                     uids.append(uid)
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
+                    decode_infos[uid] = {
+                        "tokens": token_lists[uid],
+                        "prev_text": "",
+                        "detokenizer": self._make_detokenizer(),
+                    }
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -590,24 +597,32 @@ class ResponseGenerator:
                 mx.eval(first_bonus, hidden, out.logits)
 
                 # Send first bonus tokens to clients
+                finished_uids = set()
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
                     tok = int(fb_list[j])
-                    token_lists[uid].append(tok)
-                    text = self.tokenizer.decode([tok])
+                    is_stop = tok in self.stop_tokens
+                    is_max = len(token_lists[uid]) + 1 >= max_tokens_map[uid]
+                    finish = "stop" if is_stop else "length" if is_max else None
+                    text = self._decode_stream_token(decode_infos[uid], tok, finish)
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
                             token=tok,
                             logprobs=0.0,
-                            finish_reason=None,
+                            finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9,
                         )
                     )
+                    if finish is not None:
+                        rqueues[uid].put(None)
+                        finished_uids.add(uid)
 
                 # --- Phase 3: speculative decode rounds ---
+                if len(finished_uids) == len(uids):
+                    continue
+
                 max_tok = max(max_tokens_map[u] for u in uids)
-                finished_uids = set()
 
                 def stop_check(seq_idx, token_id):
                     uid = uids[seq_idx]
@@ -638,23 +653,16 @@ class ResponseGenerator:
                         if uid in finished_uids:
                             continue
 
-                        token_lists[uid].append(tok)
                         tokens = token_lists[uid]
 
-                        if len(tokens) >= 2:
-                            prev = self.tokenizer.decode(tokens[:-1])
-                            curr = self.tokenizer.decode(tokens)
-                            text = curr[len(prev) :]
-                        else:
-                            text = self.tokenizer.decode(tokens)
-
                         is_stop = tok in self.stop_tokens
-                        is_max = len(tokens) >= max_tokens_map[uid]
+                        is_max = len(tokens) + 1 >= max_tokens_map[uid]
                         finish = "stop" if is_stop else "length" if is_max else None
+                        text = self._decode_stream_token(decode_infos[uid], tok, finish)
 
                         rqueues[uid].put(
                             StreamingToken(
-                                text="" if is_stop else text,
+                                text=text,
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
@@ -711,13 +719,7 @@ class ResponseGenerator:
             if hasattr(tok, "item"):
                 tok = tok.item()
 
-            if r.finish_reason == "stop":
-                text = ""
-            else:
-                info["tokens"].append(tok)
-                curr = self.tokenizer.decode(info["tokens"])
-                text = curr[len(info["prev_text"]) :]
-                info["prev_text"] = curr
+            text = self._decode_stream_token(info, tok, r.finish_reason)
 
             lp = r.token_logprob
 
@@ -735,6 +737,50 @@ class ResponseGenerator:
             if r.finish_reason is not None:
                 rqueue.put(None)
                 del active[r.uid]
+
+    def _make_detokenizer(self):
+        source = getattr(self.processor, "detokenizer", None)
+        if source is None:
+            return None
+
+        cls = type(source)
+        try:
+            if hasattr(source, "trim_space"):
+                detokenizer = cls(self.tokenizer, trim_space=source.trim_space)
+            else:
+                detokenizer = cls(self.tokenizer)
+        except TypeError:
+            try:
+                detokenizer = cls()
+            except TypeError:
+                return None
+
+        detokenizer.reset()
+        return detokenizer
+
+    def _decode_stream_token(self, info, token: int, finish_reason: Optional[str]):
+        tokens = info["tokens"]
+        if finish_reason != "stop":
+            tokens.append(token)
+
+        detokenizer = info.get("detokenizer")
+        if detokenizer is not None:
+            if finish_reason != "stop":
+                detokenizer.add_token(token)
+
+            text = detokenizer.last_segment
+            if finish_reason is not None:
+                detokenizer.finalize()
+                text += detokenizer.last_segment
+            return text
+
+        if finish_reason == "stop":
+            return ""
+
+        curr = self.tokenizer.decode(tokens)
+        text = curr[len(info["prev_text"]) :]
+        info["prev_text"] = curr
+        return text
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
@@ -2248,7 +2294,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )
@@ -2321,9 +2367,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                             pass
                         return text, pt, gt, pm
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,

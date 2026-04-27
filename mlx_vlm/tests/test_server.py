@@ -5,6 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
+from mlx_vlm.tokenizer_utils import REPLACEMENT_CHAR, SPMStreamingDetokenizer
 
 
 @pytest.fixture
@@ -213,6 +214,47 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_stream_decode_preserves_byte_fallback_emoji(self):
+        class ByteFallbackTokenizer:
+            vocab = {
+                "<0xF0>": 0,
+                "<0x9F>": 1,
+                "<0x98>": 2,
+                "<0x80>": 3,
+            }
+            bytes_by_id = {
+                0: 0xF0,
+                1: 0x9F,
+                2: 0x98,
+                3: 0x80,
+            }
+
+            def decode(self, tokens):
+                raw = bytearray(self.bytes_by_id[int(tok)] for tok in tokens)
+                return raw.decode("utf-8", errors="replace")
+
+        tokenizer = ByteFallbackTokenizer()
+        detokenizer = SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        rg = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rg.processor = SimpleNamespace(detokenizer=detokenizer)
+        rg.tokenizer = tokenizer
+
+        info = {
+            "tokens": [],
+            "prev_text": "",
+            "detokenizer": rg._make_detokenizer(),
+        }
+        chunks = [
+            rg._decode_stream_token(info, 0, None),
+            rg._decode_stream_token(info, 1, None),
+            rg._decode_stream_token(info, 2, None),
+            rg._decode_stream_token(info, 3, "length"),
+        ]
+
+        text = "".join(chunks)
+        assert text == "\U0001f600"
+        assert REPLACEMENT_CHAR not in text
 
 
 class TestSplitThinking:
