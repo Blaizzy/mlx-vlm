@@ -95,6 +95,11 @@ def _serialize_schema(schema: str | dict[str, Any]) -> str:
     return json.dumps(schema)
 
 
+# Building an llguidance tokenizer walks the entire vocab (~1.5s for a 150k
+# token model), so we keep the result around for the lifetime of the process.
+_llg_tokenizer_cache = {}
+
+
 def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
     try:
         import llguidance as llg
@@ -105,6 +110,10 @@ def build_json_schema_logits_processor(tokenizer, schema: str | dict[str, Any]):
             "Install mlx-vlm with llguidance available."
         ) from exc
 
-    llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer)
+    llg_tokenizer = _llg_tokenizer_cache.get(id(tokenizer))
+    if llg_tokenizer is None:
+        llg_tokenizer = llguidance.hf.from_tokenizer(tokenizer)
+        _llg_tokenizer_cache[id(tokenizer)] = llg_tokenizer
+
     grammar = llg.grammar_from("json_schema", _serialize_schema(schema))
     return LLGuidanceLogitsProcessor(grammar, llg_tokenizer)
