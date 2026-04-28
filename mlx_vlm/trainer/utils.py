@@ -48,6 +48,9 @@ def get_learning_rate(
     learning_rate: float,
     min_learning_rate: float,
 ):
+    if warmup_steps >= iters:
+        return learning_rate * (step / max(iters, 1))
+
     if step < warmup_steps:
         return learning_rate * (step / warmup_steps)
 
