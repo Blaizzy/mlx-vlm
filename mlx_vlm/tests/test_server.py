@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -130,6 +131,435 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+def test_chat_completions_tool_choice_none_disables_tools(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": "none",
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] is None
+
+
+def test_chat_completions_default_tool_choice_uses_tools(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] == tools
+
+
+def test_chat_completions_tool_choice_auto_requires_tools(client):
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tool_choice": "auto",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "requires tools" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+def test_chat_completions_tool_choice_auto_uses_tools(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": "auto",
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] == tools
+
+
+def test_chat_completions_rejects_required_tool_choice(client):
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": "required",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "required" in response.json()["detail"]
+    assert "not supported" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+def test_chat_completions_rejects_named_tool_choice(client):
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "lookup"},
+                },
+            },
+        )
+
+    assert response.status_code == 400
+    assert "lookup" in response.json()["detail"]
+    assert "not supported" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "invalid",
+        {"type": "unsupported"},
+    ],
+)
+def test_chat_completions_rejects_unsupported_tool_choice(client, tool_choice):
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        )
+
+    assert response.status_code == 400
+    assert "Unsupported tool_choice" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+def test_responses_tool_choice_none_disables_tools(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tools": tools,
+                "tool_choice": "none",
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] is None
+
+
+def test_responses_default_tool_choice_uses_tools(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tools": tools,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] == tools
+
+
+def test_responses_stream_completed_preserves_output_text(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(text="hel", prompt_tokens=8, generation_tokens=1),
+        SimpleNamespace(text="lo", prompt_tokens=8, generation_tokens=2),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    completed = next(
+        event
+        for event in response.text.split("\n\n")
+        if event.startswith("event: response.completed")
+    )
+    data = json.loads(completed.split("data: ", 1)[1])
+    assert data["response"]["output_text"] == "hello"
+
+
+def test_responses_tool_choice_auto_uses_tools(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tools": tools,
+                "tool_choice": "auto",
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] == tools
+
+
+def test_responses_rejects_required_tool_choice(client):
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tools": tools,
+                "tool_choice": "required",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "required" in response.json()["detail"]
+    assert "not supported" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+def test_responses_tool_choice_auto_requires_tools(client):
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tool_choice": "auto",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "requires tools" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "invalid",
+        {"type": "unsupported"},
+    ],
+)
+def test_responses_rejects_unsupported_tool_choice(client, tool_choice):
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        )
+
+    assert response.status_code == 400
+    assert "Unsupported tool_choice" in response.json()["detail"]
+    mock_get_model.assert_not_called()
+
+
+def test_responses_rejects_named_tool_choice(client):
+    tools = [{"type": "function", "function": {"name": "lookup"}}]
+
+    with patch.object(server, "get_cached_model") as mock_get_model:
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "tools": tools,
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "lookup"},
+                },
+            },
+        )
+
+    assert response.status_code == 400
+    assert "lookup" in response.json()["detail"]
+    assert "not supported" in response.json()["detail"]
+    mock_get_model.assert_not_called()
 
 
 # ── Continuous batching / ResponseGenerator tests ─────────────────────

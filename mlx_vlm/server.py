@@ -812,6 +812,76 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
+def resolve_tool_choice(request) -> Tuple[Optional[List[Any]], bool]:
+    """Return (tools_for_template, parse_tool_calls) for an OpenAI request."""
+    tools = getattr(request, "tools", None)
+    tool_choice = getattr(request, "tool_choice", None)
+
+    if tool_choice is None:
+        return tools, bool(tools)
+    if tool_choice == "none":
+        return None, False
+    if tool_choice == "auto":
+        if not tools:
+            raise HTTPException(
+                status_code=400,
+                detail="tool_choice='auto' requires tools.",
+            )
+        return tools, True
+    if not tools:
+        raise HTTPException(status_code=400, detail="tool_choice requires tools.")
+    if tool_choice == "required":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "tool_choice='required' is not supported because this server cannot "
+                "force the loaded model to call a tool."
+            ),
+        )
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            function = tool_choice.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            detail = (
+                f"Named function tool_choice for '{name}' is not supported."
+                if name
+                else "Named function tool_choice is not supported."
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{detail} This server cannot force the loaded model to call a "
+                    "specific tool."
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported tool_choice object. Only 'none' and 'auto' are supported.",
+        )
+    raise HTTPException(
+        status_code=400,
+        detail="Unsupported tool_choice. Only 'none' and 'auto' are supported.",
+    )
+
+
+def response_tool_call_items(tool_calls: List[dict]) -> List[dict]:
+    """Convert chat-style tool calls into Responses API output items."""
+    items = []
+    for tool_call in tool_calls:
+        function = tool_call.get("function", {})
+        items.append(
+            {
+                "type": "function_call",
+                "id": tool_call.get("id"),
+                "call_id": tool_call.get("id"),
+                "name": function.get("name"),
+                "arguments": function.get("arguments", "{}"),
+                "status": "completed",
+            }
+        )
+    return items
+
+
 def _build_gen_args(request) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
@@ -1196,6 +1266,10 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    tools: Optional[List[Any]] = Field(None, description="Available tool definitions.")
+    tool_choice: Optional[Union[str, dict]] = Field(
+        None, description="Tool selection policy."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -1383,6 +1457,10 @@ class VLMRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    tools: Optional[List[Any]] = Field(None, description="Available tool definitions.")
+    tool_choice: Optional[Union[str, dict]] = Field(
+        None, description="Tool selection policy."
+    )
     logprobs: Optional[bool] = Field(
         None,
         description="Return log-probabilities for each output token.",
@@ -1564,6 +1642,8 @@ async def responses_endpoint(request: Request):
     openai_request = OpenAIRequest(**body)
 
     try:
+        tools, parse_tool_calls = resolve_tool_choice(openai_request)
+
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(openai_request.model)
 
@@ -1637,12 +1717,21 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         gen_args = _build_gen_args(openai_request)
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if parse_tool_calls and hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
+            tools=tools,
             **gen_args.to_template_kwargs(),
         )
 
@@ -1763,6 +1852,14 @@ async def responses_endpoint(request: Request):
 
                     # Split thinking from content for final events
                     _, clean_text = _split_thinking(full_text)
+                    parsed_tool_calls = []
+                    if tool_module is not None:
+                        tc = process_tool_calls(full_text, tool_module, tools)
+                        parsed_tool_calls = tc["calls"]
+                        if parsed_tool_calls:
+                            _, clean_text = _split_thinking(
+                                tc["remaining_text"] or ""
+                            )
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -1784,10 +1881,14 @@ async def responses_endpoint(request: Request):
                     yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
 
                     # Send response.completed event (to match the openai pipeline)
+                    output_items = [final_message_item] + response_tool_call_items(
+                        parsed_tool_calls
+                    )
                     completed_response = base_response.model_copy(
                         update={
                             "status": "completed",
-                            "output": [final_message_item],
+                            "output": output_items,
+                            "output_text": clean_text,
                             "usage": {
                                 "input_tokens": usage_stats["input_tokens"],
                                 "output_tokens": usage_stats["output_tokens"],
@@ -1866,6 +1967,25 @@ async def responses_endpoint(request: Request):
                 gc.collect()
 
                 reasoning, content = _split_thinking(full_text)
+                parsed_tool_calls = []
+                if tool_module is not None:
+                    tc = process_tool_calls(full_text, tool_module, tools)
+                    parsed_tool_calls = tc["calls"]
+                    if parsed_tool_calls:
+                        reasoning, content = _split_thinking(tc["remaining_text"] or "")
+
+                output_items = [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": content,
+                            }
+                        ],
+                        "reasoning": reasoning,
+                    }
+                ] + response_tool_call_items(parsed_tool_calls)
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -1875,18 +1995,7 @@ async def responses_endpoint(request: Request):
                     instructions=instructions,
                     max_output_tokens=openai_request.max_output_tokens,
                     model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": content,
-                                }
-                            ],
-                            "reasoning": reasoning,
-                        }
-                    ],
+                    output=output_items,
                     output_text=content,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
@@ -1945,6 +2054,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
     request_start = time.perf_counter()
     try:
+        tools, parse_tool_calls = resolve_tool_choice(request)
         adapter_path = (
             request.adapter_path
             if "adapter_path" in request.model_fields_set
@@ -2017,13 +2127,16 @@ async def chat_completions_endpoint(request: ChatRequest):
             processed_messages.append(msg)
 
         # Detect tool parser from chat template
-        tools = getattr(request, "tools", None)
         tool_parser_type = None
         tool_module = None
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        if (
+            parse_tool_calls
+            and hasattr(tokenizer, "chat_template")
+            and tokenizer.chat_template
+        ):
             tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
