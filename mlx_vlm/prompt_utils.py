@@ -16,6 +16,7 @@ class MessageFormat(Enum):
     IMAGE_TOKEN_PIPE = "image_token_pipe"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
+    MINICPMV_IMAGE_TOKEN = "minicpmv_image_token"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
@@ -43,6 +44,8 @@ MODEL_CONFIG = {
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
+    "minicpmv": MessageFormat.MINICPMV_IMAGE_TOKEN,
+    "minicpmv4_6": MessageFormat.MINICPMV_IMAGE_TOKEN,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -257,6 +260,9 @@ class MessageFormatter:
             ),
             MessageFormat.IMAGE_TOKEN_NEWLINE: partial(
                 self._format_with_token, token="<image>\n"
+            ),
+            MessageFormat.MINICPMV_IMAGE_TOKEN: partial(
+                self._format_with_token, token="(<image>./</image>)\n"
             ),
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
