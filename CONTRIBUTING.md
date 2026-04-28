@@ -34,7 +34,7 @@ To determine the model layer names, we suggest either:
 Additionally, add a test for the new model type to the [model
 tests](https://github.com/Blaizzy/mlx-vlm/tree/main/src/tests/test_models.py).
 
-From the `src/` directory, you can run the tests with:
+From the `mlx_vlm/` directory, you can run the tests with:
 
 ```shell
 python -m unittest discover tests/

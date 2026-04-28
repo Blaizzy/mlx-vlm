@@ -357,3 +357,34 @@ class TestExtractTextFromContentEdgeCases:
         ]
         result = extract_text_from_content(content)
         assert result == "Actual content"
+
+
+def test_apply_chat_template_uses_plamo2vl_processor():
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    captured = {}
+
+    class DummyProcessor:
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        ):
+            captured["messages"] = messages
+            captured["tokenize"] = tokenize
+            captured["add_generation_prompt"] = add_generation_prompt
+            return "formatted-plamo-prompt"
+
+    result = apply_chat_template(
+        DummyProcessor(),
+        {"model_type": "plamo2vl"},
+        "画像の前面に積み重なっているのはどのようなアイテムですか？",
+        num_images=1,
+    )
+
+    assert result == "formatted-plamo-prompt"
+    assert captured["messages"] == ["画像の前面に積み重なっているのはどのようなアイテムですか？"]
+    assert captured["tokenize"] is False
+    assert captured["add_generation_prompt"] is True

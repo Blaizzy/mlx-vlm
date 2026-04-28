@@ -99,6 +99,39 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(
+    skip_vision: bool = False,
+    weights: Optional[dict] = None,
+    quantization: Optional[dict] = None,
+):
+    """Build the quantization predicate used by ``nn.quantize``."""
+
+    def predicate(path, module):
+        # Always skip multimodal modules when requested.
+        if skip_multimodal_module(path) and skip_vision:
+            return False
+
+        # Respect explicit per-layer quantization overrides.
+        if quantization is not None and path in quantization:
+            return quantization[path]
+
+        if not hasattr(module, "to_quantized"):
+            return False
+
+        # QuantizedLinear expects weight sizes aligned to 64.
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+
+        # Without weight metadata, treat compatible modules as quantizable.
+        if weights is None:
+            return True
+
+        # Legacy checkpoints may only include scales for quantized submodules.
+        return f"{path}.scales" in weights
+
+    return predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -299,27 +332,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
 
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
-
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=get_class_predicate(
+                skip_vision=skip_vision,
+                weights=weights,
+                quantization=config["quantization"],
+            ),
         )
 
     if kwargs.get("quantize_activations", False):
@@ -541,8 +563,17 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
+    if isinstance(model_path, str):
+        model_path = get_model_path(model_path)
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    config = load_config(model_path, **kwargs) if kwargs else load_config(model_path)
+    model_class, _ = get_model_and_args(config)
+    processor_class = getattr(model_class, "Processor", None)
+
+    if processor_class is not None and hasattr(processor_class, "from_pretrained"):
+        processor = processor_class.from_pretrained(model_path)
+    else:
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 

@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import mlx.core as mx
@@ -81,12 +82,27 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.activation_fn = nn.GELU(approx="fast")
+        self.hidden_act = getattr(config, "hidden_act", "gelu")
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
+    def _gelu_pytorch_tanh(self, x: mx.array) -> mx.array:
+        return 0.5 * x * (
+            1.0
+            + mx.tanh(
+                # This calculation comes from https://github.com/huggingface/transformers/blob/3606a1f1e86cfe1aac10f49b63026ede57f12cc1/src/transformers/activations.py#L48
+                math.sqrt(2.0 / math.pi) * (x + 0.044715 * mx.power(x, 3))
+            )
+        )
+
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.activation_fn(self.fc1(x))
+        x = self.fc1(x)
+        if self.hidden_act in {"gelu_pytorch_tanh", "gelu_new"}:
+            x = self._gelu_pytorch_tanh(x)
+        elif self.hidden_act == "gelu":
+            x = nn.GELU(approx="fast")(x)
+        else:
+            raise ValueError(f"Unsupported vision activation: {self.hidden_act}")
         x = self.fc2(x)
         return x
 
