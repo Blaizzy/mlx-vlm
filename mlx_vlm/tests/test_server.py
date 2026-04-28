@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +12,20 @@ import mlx_vlm.server as server
 def client():
     with TestClient(server.app) as test_client:
         yield test_client
+
+
+def sse_json_events(response_text):
+    events = []
+    for block in response_text.split("\n\n"):
+        for line in block.splitlines():
+            if not line.startswith("data: "):
+                continue
+            data = line.removeprefix("data: ")
+            if data == "[DONE]":
+                events.append(data)
+            else:
+                events.append(json.loads(data))
+    return events
 
 
 @pytest.mark.parametrize("value", [224, "22", [1.0], [1.5], [True], [1, 2, 3]])
@@ -190,11 +205,13 @@ class TestResponseGenerator:
             enable_thinking=False,
             thinking_budget=None,
             thinking_start_token=None,
+            stop=["END"],
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 128
         assert args.top_k == 32
         assert args.logit_bias == {5: -1.0}  # string keys converted to int
+        assert args.stop == ["END"]
 
     def test_build_gen_args_from_chat_request(self):
         req = SimpleNamespace(
@@ -209,10 +226,407 @@ class TestResponseGenerator:
             enable_thinking=True,
             thinking_budget=None,
             thinking_start_token=None,
+            stop="END",
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+        assert args.stop == ["END"]
+
+    def test_normalize_stop_rejects_more_than_four_values(self):
+        with pytest.raises(server.HTTPException):
+            server._normalize_stop(["a", "b", "c", "d", "e"])
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, None),
+            ("END", ["END"]),
+            (["END"], ["END"]),
+            (["a", "b", "c", "d"], ["a", "b", "c", "d"]),
+        ],
+    )
+    def test_normalize_stop_accepts_openai_shapes(self, raw, expected):
+        assert server._normalize_stop(raw) == expected
+
+    @pytest.mark.parametrize("raw", ["", [], ["END", ""], ["END", 1], {"stop": "END"}])
+    def test_normalize_stop_rejects_invalid_values(self, raw):
+        with pytest.raises(server.HTTPException):
+            server._normalize_stop(raw)
+
+
+class TestStopMatcher:
+    """Tests for decoded text stop matching."""
+
+    def test_trims_stop_sequence_across_chunks(self):
+        matcher = server.StopMatcher(["END"])
+
+        text, stopped = matcher.feed("hello E")
+        assert text == "hello"
+        assert stopped is False
+
+        text, stopped = matcher.feed("ND tail")
+        assert text == " "
+        assert stopped is True
+        assert matcher.flush() == ""
+
+    def test_flushes_held_suffix_without_stop(self):
+        matcher = server.StopMatcher(["END"])
+
+        text, stopped = matcher.feed("hello E")
+        assert text == "hello"
+        assert stopped is False
+        assert matcher.flush() == " E"
+
+    def test_single_character_stop_does_not_buffer_unmatched_text(self):
+        matcher = server.StopMatcher(["x"])
+
+        text, stopped = matcher.feed("abc")
+        assert text == "abc"
+        assert stopped is False
+
+    def test_trims_stop_sequence_in_single_chunk(self):
+        matcher = server.StopMatcher(["END"])
+
+        text, stopped = matcher.feed("hello END tail")
+
+        assert text == "hello "
+        assert stopped is True
+        assert matcher.flush() == ""
+
+    def test_stop_at_beginning_emits_no_text(self):
+        matcher = server.StopMatcher(["END"])
+
+        text, stopped = matcher.feed("END tail")
+
+        assert text == ""
+        assert stopped is True
+
+    def test_uses_earliest_matching_stop_sequence(self):
+        matcher = server.StopMatcher(["world", "END"])
+
+        text, stopped = matcher.feed("hello world END")
+
+        assert text == "hello "
+        assert stopped is True
+
+    def test_does_not_emit_text_after_stop(self):
+        matcher = server.StopMatcher(["END"])
+
+        assert matcher.feed("hello END") == ("hello ", True)
+        assert matcher.feed("tail") == ("", True)
+
+    def test_partial_prefix_is_released_when_it_cannot_match(self):
+        matcher = server.StopMatcher(["END"])
+
+        assert matcher.feed("hello E") == ("hello", False)
+        assert matcher.feed("x") == (" ", False)
+        assert matcher.flush() == "Ex"
+
+
+def test_chat_completions_fallback_applies_stop_sequence(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text="hello E",
+            prompt_tokens=8,
+            generation_tokens=1,
+            peak_memory=0.1,
+        ),
+        SimpleNamespace(
+            text="ND tail",
+            prompt_tokens=8,
+            generation_tokens=2,
+            peak_memory=0.1,
+        ),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stop": "END",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "hello "
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completions_fallback_applies_earliest_stop_sequence(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text="hello world END tail",
+            prompt_tokens=8,
+            generation_tokens=1,
+            peak_memory=0.1,
+        ),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stop": ["END", "world"],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "hello "
+    assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def test_chat_completions_fallback_reports_length_when_stop_does_not_match(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text="hello",
+            prompt_tokens=8,
+            generation_tokens=1,
+            peak_memory=0.1,
+        ),
+        SimpleNamespace(
+            text=" world",
+            prompt_tokens=8,
+            generation_tokens=2,
+            peak_memory=0.1,
+        ),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stop": "END",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["choices"][0]["message"]["content"] == "hello world"
+    assert body["choices"][0]["finish_reason"] == "length"
+
+
+def test_chat_completions_streaming_fallback_applies_stop_sequence(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text="hello E",
+            prompt_tokens=8,
+            generation_tokens=1,
+            peak_memory=0.1,
+        ),
+        SimpleNamespace(
+            text="ND tail",
+            prompt_tokens=8,
+            generation_tokens=2,
+            peak_memory=0.1,
+        ),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        with client.stream(
+            "POST",
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "stop": "END",
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    events = sse_json_events(body)
+    chunks = [event for event in events if event != "[DONE]"]
+    assert [chunk["choices"][0]["delta"]["content"] for chunk in chunks] == [
+        "hello",
+        " ",
+    ]
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert events[-1] == "[DONE]"
+
+
+def test_chat_completions_streaming_fallback_reports_length_without_stop_match(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text="hello",
+            prompt_tokens=8,
+            generation_tokens=1,
+            peak_memory=0.1,
+        ),
+        SimpleNamespace(
+            text=" world",
+            prompt_tokens=8,
+            generation_tokens=2,
+            peak_memory=0.1,
+        ),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        with client.stream(
+            "POST",
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "stop": "END",
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    events = sse_json_events(body)
+    chunks = [event for event in events if event != "[DONE]"]
+    assert (
+        "".join(
+            chunk["choices"][0]["delta"].get("content") or "" for chunk in chunks
+        )
+        == "hello world"
+    )
+    assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+    assert events[-1] == "[DONE]"
+
+
+def test_responses_fallback_applies_stop_sequence(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(text="answer<", prompt_tokens=5, generation_tokens=1),
+        SimpleNamespace(text="stop>extra", prompt_tokens=5, generation_tokens=2),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "stop": "<stop>",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["output_text"] == "answer"
+
+
+def test_responses_streaming_fallback_applies_stop_sequence(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(text="answer<", prompt_tokens=5, generation_tokens=1),
+        SimpleNamespace(text="stop>extra", prompt_tokens=5, generation_tokens=2),
+    ]
+
+    with (
+        patch.object(server, "response_generator", None),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+    ):
+        with client.stream(
+            "POST",
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Hello",
+                "stream": True,
+                "stop": "<stop>",
+            },
+        ) as response:
+            body = response.read().decode()
+
+    assert response.status_code == 200
+    events = sse_json_events(body)
+    deltas = [
+        event["delta"]
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "response.output_text.delta"
+    ]
+    done = next(
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "response.output_text.done"
+    )
+    completed = next(
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "response.completed"
+    )
+
+    assert "".join(deltas) == "answer"
+    assert done["text"] == "answer"
+    assert completed["response"]["output_text"] == "answer"
 
 
 class TestSplitThinking:
