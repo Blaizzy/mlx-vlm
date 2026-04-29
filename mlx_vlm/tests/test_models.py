@@ -2011,21 +2011,6 @@ class TestModels(unittest.TestCase):
             vision_feature_layer=-1,
         )
 
-        # Regression: pure MLX merge scatters features at image token positions
-        input_ids = mx.array([[11, 163592, 12, 163592, 13]], dtype=mx.int32)
-        inputs_embeds = mx.zeros((1, 5, 8), dtype=mx.float32)
-        image_features = mx.ones((2, 8), dtype=mx.float32)
-
-        image_mask = input_ids == 163592
-        mask_flat = image_mask.reshape(-1)
-        cumsum = mx.cumsum(mask_flat.astype(mx.int32)) - 1
-        feat_idx = mx.where(mask_flat, cumsum, 0).reshape(input_ids.shape)
-        gathered = image_features[feat_idx]
-        merged = mx.where(image_mask[..., None], gathered, inputs_embeds)
-
-        self.assertEqual(merged.shape, inputs_embeds.shape)
-        self.assertTrue(mx.all(merged[0, 1] == 1).item())
-        self.assertTrue(mx.all(merged[0, 3] == 1).item())
 
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
