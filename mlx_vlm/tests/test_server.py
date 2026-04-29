@@ -146,6 +146,7 @@ class TestResponseGenerator:
         assert args.logit_bias is None
 
     def test_generate_arguments_to_generate_kwargs(self):
+        processor = lambda tokens, logits: logits
         args = server.GenerationArguments(
             max_tokens=50,
             temperature=0.7,
@@ -155,6 +156,7 @@ class TestResponseGenerator:
             logit_bias={3: -0.5},
             enable_thinking=False,
             thinking_budget=100,
+            logits_processors=[processor],
         )
         kw = args.to_generate_kwargs()
         assert kw["max_tokens"] == 50
@@ -164,6 +166,7 @@ class TestResponseGenerator:
         assert kw["logit_bias"] == {3: -0.5}
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 100
+        assert kw["logits_processors"] == [processor]
 
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(enable_thinking=False, thinking_budget=50)
@@ -213,6 +216,67 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_extract_chat_response_format_json_schema(self):
+        req = SimpleNamespace(
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "animal",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"animal": {"type": "string"}},
+                        "required": ["animal"],
+                    },
+                },
+            },
+            text=None,
+        )
+
+        schema = server._extract_response_format_schema(req)
+
+        assert schema["properties"]["animal"]["type"] == "string"
+
+    def test_extract_responses_text_format_json_schema(self):
+        req = SimpleNamespace(
+            response_format=None,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "animal",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"animal": {"type": "string"}},
+                        "required": ["animal"],
+                    },
+                }
+            },
+        )
+
+        schema = server._extract_response_format_schema(req)
+
+        assert schema["required"] == ["animal"]
+
+    def test_build_structured_logits_processors_uses_tokenizer(self):
+        req = SimpleNamespace(
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "animal",
+                    "schema": {"type": "object"},
+                },
+            },
+            text=None,
+        )
+        proc = SimpleNamespace(tokenizer=object())
+
+        with patch.object(
+            server, "build_json_schema_logits_processor", return_value="processor"
+        ) as mock_build:
+            processors = server._build_structured_logits_processors(req, proc)
+
+        assert processors == ["processor"]
+        assert mock_build.call_args.args[1] == {"type": "object"}
 
 
 class TestSplitThinking:

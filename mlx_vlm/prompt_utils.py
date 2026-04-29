@@ -50,6 +50,8 @@ MODEL_CONFIG = {
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,

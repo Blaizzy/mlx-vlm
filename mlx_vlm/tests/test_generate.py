@@ -453,6 +453,41 @@ class TestBatchGenerator:
         assert response.token == 42
         assert response.finish_reason == "stop"
 
+    def test_generation_batch_applies_per_sequence_logits_processors(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        seen_contexts = []
+
+        def force_token_2(tokens, logits):
+            seen_contexts.append(tokens.tolist())
+            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
+            return mx.broadcast_to(token_scores, logits.shape)
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2, 2],
+            token_context=[mx.array([10]), mx.array([20])],
+            logits_processors=[[force_token_2], [force_token_2]],
+        )
+
+        first = batch.next()
+        assert [r.token for r in first] == [5, 6]
+        assert seen_contexts == [[10, 5], [20, 6]]
+
+        second = batch.next()
+        assert [r.token for r in second] == [2, 2]
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
