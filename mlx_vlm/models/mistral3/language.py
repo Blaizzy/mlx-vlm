@@ -298,6 +298,8 @@ class LanguageModel(nn.Module):
             return None
 
         def predicate(path, _):
+            if "lm_head" in path:
+                return False
             if path.endswith("mlp.gate"):
                 return {"group_size": 64, "bits": 8}
             return True

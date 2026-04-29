@@ -88,17 +88,18 @@ def skip_multimodal_module(path: str) -> bool:
     Returns:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    return (
-        "vision_model" in path
-        or "vision_tower" in path
-        or "vl_connector" in path
-        or "sam_model" in path
-        or "audio_model" in path
-        or "audio_tower" in path
-        or "code_predictor" in path
-        or "img_projector" in path
+    multimodal_modules = (
+        "vision_model",
+        "vision_tower",
+        "vl_connector",
+        "sam_model",
+        "audio_model",
+        "audio_tower",
+        "code_predictor",
+        "img_projector",
+        "multi_modal_projector",
     )
-
+    return any(module in path for module in multimodal_modules)
 
 def get_model_and_args(config: dict):
     """
