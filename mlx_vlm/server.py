@@ -842,9 +842,7 @@ def _build_gen_args(request, processor=None) -> GenerationArguments:
         thinking_start_token=getattr(request, "thinking_start_token", None),
     )
     if processor is not None:
-        args.logits_processors = _build_structured_logits_processors(
-            request, processor
-        )
+        args.logits_processors = _build_structured_logits_processors(request, processor)
     return args
 
 

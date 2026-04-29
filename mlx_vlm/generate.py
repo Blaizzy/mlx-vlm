@@ -2467,10 +2467,7 @@ def _generate_batch(
         callable(processor) for processor in logits_processors
     ):
         logits_processors = [
-            [
-                _clone_or_share_logits_processor(p)
-                for p in logits_processors
-            ]
+            [_clone_or_share_logits_processor(p) for p in logits_processors]
             for _ in range(batch_size)
         ]
 

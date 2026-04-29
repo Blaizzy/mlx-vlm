@@ -53,7 +53,9 @@ class LLGuidanceLogitsProcessor:
             llguidance.numpy.fill_next_token_bitmask(
                 self.ll_matchers[i], self.bitmask, i
             )
-            row = mx.array(llguidance.mlx.apply_token_bitmask(logits[i], self.bitmask[i]))
+            row = mx.array(
+                llguidance.mlx.apply_token_bitmask(logits[i], self.bitmask[i])
+            )
             if row.ndim == 2 and row.shape[0] == 1:
                 row = row[0]
             biased_logits.append(row)
