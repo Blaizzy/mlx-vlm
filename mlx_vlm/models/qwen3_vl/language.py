@@ -257,7 +257,9 @@ class Qwen3VLModel(nn.Module):
             cache = [None] * len(self.layers)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
             h = layer(h, mask, c, position_ids)
             # Add deepstack visual embeds
@@ -279,21 +281,27 @@ class Qwen3VLModel(nn.Module):
         visual_pos_masks: mx.array,
         visual_embeds: mx.array,
     ):
+
         batch_size = hidden_states.shape[0]
 
         updated_batches = []
+        offset = 0
         for b in range(batch_size):
             batch_mask = visual_pos_masks[b]
             batch_hidden = hidden_states[b]
 
             batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
 
-            if len(batch_indices) == 0:
+            n_visual = len(batch_indices)
+            if n_visual == 0:
                 updated_batches.append(batch_hidden)
                 continue
 
+            sample_embeds = visual_embeds[offset : offset + n_visual]
+            offset += n_visual
+
             batch_result = mx.array(batch_hidden)  # avoid modifying in-place
-            batch_result = batch_result.at[batch_indices].add(visual_embeds)
+            batch_result = batch_result.at[batch_indices].add(sample_embeds)
 
             updated_batches.append(batch_result)
 
@@ -503,27 +511,28 @@ class LanguageModel(nn.Module):
     ):
         # Slicing visual_pos_masks when prefilling
         n_to_process = kwargs.get("n_to_process", None)
-        if n_to_process is not None:
+        if n_to_process is not None and visual_pos_masks is not None:
             visual_pos_masks = visual_pos_masks[:, n_to_process:]
 
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
+        cache_offset_array = None  # For per-sequence offsets in batch mode
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
+                cache_offset_array = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -532,11 +541,12 @@ class LanguageModel(nn.Module):
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
-            if (
+            recalc_condition = (
                 (cache is not None and cache[0] is not None and (cache_offset == 0))
                 or self._rope_deltas is None
                 or cache is None
-            ):
+            )
+            if recalc_condition:
                 if self._position_ids is not None:
                     seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
@@ -551,21 +561,36 @@ class LanguageModel(nn.Module):
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
+
+                # Use per-sequence offsets if available (for batched generation)
+                if cache_offset_array is not None:
+                    # Per-sequence cache offsets for continuous batching
+                    base_offset = cache_offset_array[:batch_size].reshape(-1, 1)
+                else:
+                    base_offset = mx.array(cache_offset)
+
+                rope_delta_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )
+                if rope_delta_src is not None:
+                    rope_delta = rope_delta_src
+                    if rope_delta.ndim == 0:
+                        rope_delta = mx.expand_dims(rope_delta, axis=0)
+                    if rope_delta.shape[0] < batch_size:
+                        rope_delta = mx.tile(rope_delta, (batch_size, 1))
+                    else:
+                        rope_delta = rope_delta[:batch_size]
+                    delta = base_offset + rope_delta
+                else:
+                    delta = base_offset
+
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
 
-                if cache_offset is not None:
-                    if delta.ndim == 0:
-                        delta = mx.expand_dims(delta, axis=0)
-
-                    if delta.shape[0] < batch_size:
-                        delta = mx.tile(delta, (batch_size, 1))
-                    else:
-                        # Slice delta to match batch
-                        delta = delta[:batch_size]
+                if delta.ndim == 0:
+                    delta = mx.expand_dims(delta, axis=0)
+                if delta.ndim == 1:
+                    delta = delta.reshape(-1, 1)
 
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(

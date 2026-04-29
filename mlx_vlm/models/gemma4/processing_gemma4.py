@@ -210,8 +210,164 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         return self.preprocess(images, **kwargs)
 
 
+class Gemma4VideoProcessor:
+    """Video processor for Gemma 4.
+
+    Samples frames, applies the same aspect-ratio preserving resize as images
+    (with a smaller per-frame token budget), rescales to [0, 1], and returns
+    channel-first pixel tensors stacked across frames. The existing
+    ``vision_tower`` internally patchifies each frame, so we output regular
+    (N_frames, C, H, W) tensors rather than pre-patched ones.
+    """
+
+    model_input_names = ["pixel_values_videos"]
+
+    def __init__(
+        self,
+        patch_size: int = 16,
+        max_soft_tokens: int = 70,
+        pooling_kernel_size: int = 3,
+        num_frames: int = 32,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255,
+        do_normalize: bool = False,
+        image_mean: Optional[list] = None,
+        image_std: Optional[list] = None,
+        default_fps: float = 2.0,
+    ):
+        if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
+            raise ValueError(
+                f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, "
+                f"got {max_soft_tokens}."
+            )
+        self.patch_size = patch_size
+        self.max_soft_tokens = max_soft_tokens
+        self.pooling_kernel_size = pooling_kernel_size
+        self.num_frames = num_frames
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
+        self.image_mean = image_mean or [0.0, 0.0, 0.0]
+        self.image_std = image_std or [1.0, 1.0, 1.0]
+        self.default_fps = default_fps
+
+    def _sample_frames(self, video: np.ndarray, num_frames: int) -> np.ndarray:
+        """Uniformly sample ``num_frames`` frames from ``video`` (T, C, H, W)."""
+        T = video.shape[0]
+        if T <= num_frames:
+            return video
+        idx = np.linspace(0, T - 1, num=num_frames).round().astype(np.int64)
+        return video[idx]
+
+    def _resize_frames(self, video: np.ndarray, max_patches: int) -> np.ndarray:
+        from PIL import Image
+
+        T, C, H, W = video.shape
+        target_px = max_patches * (self.patch_size**2)
+        factor = math.sqrt(target_px / (H * W))
+        side_mult = self.pooling_kernel_size * self.patch_size
+        target_h = int(math.floor(factor * H / side_mult)) * side_mult
+        target_w = int(math.floor(factor * W / side_mult)) * side_mult
+        max_side = (max_patches // self.pooling_kernel_size**2) * side_mult
+        if target_h == 0:
+            target_h = side_mult
+            target_w = min(int(math.floor(W / H)) * side_mult, max_side)
+        if target_w == 0:
+            target_w = side_mult
+            target_h = min(int(math.floor(H / W)) * side_mult, max_side)
+
+        if target_h == H and target_w == W:
+            return video
+
+        resized = np.empty((T, C, target_h, target_w), dtype=video.dtype)
+        for i, frame in enumerate(video):
+            arr = np.transpose(frame, (1, 2, 0))
+            if arr.dtype in (np.float32, np.float64):
+                arr = (arr * 255).clip(0, 255).astype(np.uint8)
+            pil = Image.fromarray(arr)
+            pil = pil.resize((target_w, target_h), resample=Image.BICUBIC)
+            resized[i] = np.transpose(np.array(pil), (2, 0, 1))
+        return resized
+
+    def __call__(self, videos, fps=None):
+        """Process a list of videos.
+
+        Args:
+            videos: list of numpy arrays, each shape (T, C, H, W) uint8 or float.
+            fps: optional list of sampling fps per video used to compute
+                per-frame timestamps. If None, uses ``default_fps`` for all.
+
+        Returns:
+            dict with:
+              - pixel_values_videos: np.ndarray (N_total_frames, C, H, W)
+                where all frames share the same H/W (one video at a time
+                preserves sizes; cross-video sizes may differ so we return a
+                list in that case)
+              - num_frames_per_video: list[int]
+              - num_soft_tokens_per_frame: list[int] (one per video)
+              - frame_timestamps: list[list[float]] seconds per frame
+        """
+        if not isinstance(videos, list):
+            videos = [videos]
+
+        max_patches = self.max_soft_tokens * self.pooling_kernel_size**2
+
+        if fps is None:
+            fps = [self.default_fps] * len(videos)
+        elif not isinstance(fps, list):
+            fps = [fps] * len(videos)
+
+        processed = []
+        num_frames_per_video = []
+        num_soft_tokens_per_frame = []
+        frame_timestamps = []
+
+        for i, video in enumerate(videos):
+            if not isinstance(video, np.ndarray):
+                video = np.asarray(video)
+            if video.ndim != 4:
+                raise ValueError(
+                    f"Expected video as (T, C, H, W), got shape {video.shape}."
+                )
+
+            video = self._sample_frames(video, self.num_frames)
+            video = self._resize_frames(video, max_patches)
+
+            video_f = video.astype(np.float32)
+            if self.do_rescale and video.dtype == np.uint8:
+                video_f = video_f * self.rescale_factor
+
+            if self.do_normalize:
+                mean = np.array(self.image_mean, dtype=np.float32)[:, None, None]
+                std = np.array(self.image_std, dtype=np.float32)[:, None, None]
+                video_f = (video_f - mean) / std
+
+            T, _, H, W = video_f.shape
+            num_patches = (H // self.patch_size) * (W // self.patch_size)
+            tokens_per_frame = num_patches // (self.pooling_kernel_size**2)
+
+            processed.append(video_f)
+            num_frames_per_video.append(T)
+            num_soft_tokens_per_frame.append(int(tokens_per_frame))
+            sr = fps[i] if fps[i] and fps[i] > 0 else self.default_fps
+            frame_timestamps.append([float(j) / float(sr) for j in range(T)])
+
+        shapes = {v.shape[1:] for v in processed}
+        if len(shapes) == 1:
+            pixel_values_videos = np.concatenate(processed, axis=0)
+        else:
+            pixel_values_videos = processed
+
+        return {
+            "pixel_values_videos": pixel_values_videos,
+            "num_frames_per_video": num_frames_per_video,
+            "num_soft_tokens_per_frame": num_soft_tokens_per_frame,
+            "frame_timestamps": frame_timestamps,
+        }
+
+
 class Gemma4Processor(ProcessorMixin):
-    """Combined processor for Gemma 4 (image + text + audio)."""
+    """Combined processor for Gemma 4 (image + text + audio + video)."""
 
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "Gemma4ImageProcessor"
@@ -228,9 +384,12 @@ class Gemma4Processor(ProcessorMixin):
         **kwargs,
     ):
         feature_extractor = kwargs.pop("feature_extractor", None)
+        video_processor = kwargs.pop("video_processor", None)
 
         if image_processor is None:
             image_processor = Gemma4ImageProcessor()
+        if video_processor is None:
+            video_processor = Gemma4VideoProcessor()
 
         self.image_seq_length = image_seq_length
         self.audio_seq_length = audio_seq_length
@@ -247,6 +406,18 @@ class Gemma4Processor(ProcessorMixin):
         self.audio_token = getattr(tokenizer, "audio_token", "")
         self.boa_token = getattr(tokenizer, "boa_token", "")
         self.eoa_token = getattr(tokenizer, "eoa_token", "")
+
+        self.video_token = getattr(tokenizer, "video_token", "<|video|>")
+        if tokenizer is not None:
+            existing = tokenizer.convert_tokens_to_ids(self.video_token)
+            unk_id = getattr(tokenizer, "unk_token_id", None)
+            if existing is None or existing == unk_id:
+                tokenizer.add_special_tokens(
+                    {"additional_special_tokens": [self.video_token]}
+                )
+            self.video_token_id = tokenizer.convert_tokens_to_ids(self.video_token)
+        else:
+            self.video_token_id = None
 
         # Precompute fallback full sequences
         image_tokens_expanded = self.image_token * image_seq_length
@@ -270,6 +441,7 @@ class Gemma4Processor(ProcessorMixin):
         )
 
         self.feature_extractor = feature_extractor
+        self.video_processor = video_processor
 
     def _compute_audio_num_tokens(self, audio_waveform, sampling_rate: int) -> int:
         """Compute number of audio soft tokens from waveform duration.
@@ -293,10 +465,16 @@ class Gemma4Processor(ProcessorMixin):
             ]
         ] = None,
         audio: Optional[List] = None,
+        videos: Optional[List] = None,
+        fps: Optional[Union[float, List[float]]] = None,
         **kwargs,
     ) -> BatchFeature:
-        if text is None and images is None and audio is None:
-            raise ValueError("Provide at least one of `text`, `images`, or `audio`.")
+        if text is None and images is None and audio is None and videos is None:
+            raise ValueError(
+                "Provide at least one of `text`, `images`, `audio`, or `videos`."
+            )
+
+        fps_kwarg = fps
 
         # Pop return_tensors - we handle conversion ourselves via to_mlx()
         kwargs.pop("return_tensors", None)
@@ -335,6 +513,42 @@ class Gemma4Processor(ProcessorMixin):
                     prompt.replace(self.image_token, self.full_image_sequence)
                     for prompt in text
                 ]
+
+        video_inputs = {}
+        if videos is not None:
+            video_data = self.video_processor(videos, fps=fps_kwarg)
+            num_tokens_per_frame = video_data["num_soft_tokens_per_frame"]
+            num_frames_per_video = video_data["num_frames_per_video"]
+            frame_timestamps = video_data["frame_timestamps"]
+
+            if text is not None:
+                # Expand each <|video|> placeholder into a per-frame sequence:
+                #   "<mm:ss> {boi}{video_token * n}{eoi}"  repeated per frame,
+                # joined with a space, matching HF Gemma 4 processor behavior.
+                replacements = []
+                for n_tokens, timestamps in zip(num_tokens_per_frame, frame_timestamps):
+                    frames = []
+                    for secs in timestamps:
+                        mm = int(secs // 60)
+                        ss = int(secs % 60)
+                        ts = f"{mm:02d}:{ss:02d}"
+                        frames.append(
+                            f"{ts} {self.boi_token}"
+                            f"{self.video_token * n_tokens}"
+                            f"{self.eoi_token}"
+                        )
+                    replacements.append(" ".join(frames))
+
+                replacements_iter = iter(replacements)
+                video_pattern = re.escape(self.video_token)
+                text = [
+                    re.sub(video_pattern, lambda _: next(replacements_iter), prompt)
+                    for prompt in text
+                ]
+
+            pvv = video_data["pixel_values_videos"]
+            video_inputs["pixel_values_videos"] = pvv
+            video_inputs["num_frames_per_video"] = num_frames_per_video
 
         # ── Process audio ───────────────────────────────────────────────
         audio_inputs = {}
@@ -400,12 +614,21 @@ class Gemma4Processor(ProcessorMixin):
                 mm_token_type_ids[array_ids == self.image_token_id] = 1
             if self.audio_token_id is not None:
                 mm_token_type_ids[array_ids == self.audio_token_id] = 2
+            if self.video_token_id is not None:
+                mm_token_type_ids[array_ids == self.video_token_id] = 3
             text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
 
+        # num_frames_per_video is Python-side metadata; keep it out of to_mlx
+        video_meta = {}
+        if "num_frames_per_video" in video_inputs:
+            video_meta["num_frames_per_video"] = video_inputs.pop(
+                "num_frames_per_video"
+            )
+
         # Merge all inputs and convert to MLX arrays
-        return BatchFeature(
-            data=to_mlx({**text_inputs, **image_inputs, **audio_inputs})
-        )
+        merged = to_mlx({**text_inputs, **image_inputs, **audio_inputs, **video_inputs})
+        merged.update(video_meta)
+        return BatchFeature(data=merged)
 
     def save_pretrained(self, save_directory, **kwargs):
         import json

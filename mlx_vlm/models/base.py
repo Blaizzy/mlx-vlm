@@ -13,7 +13,7 @@ from mlx_lm.models.base import (
 )
 from PIL import Image
 
-from ..turboquant import TurboQuantKVCache
+from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 
 
 def load_chat_template(tokenizer, model_path):
@@ -58,6 +58,7 @@ class LanguageModelOutput:
     hidden_states: Optional[List[mx.array]] = None
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+    gdn_states: Optional[List] = None
 
 
 @dataclass
@@ -72,6 +73,9 @@ class InputEmbeddingsFeatures:
     full_text_row_masked_out_mask: Optional[mx.array] = None
     decoder_inputs_embeds: Optional[mx.array] = None
     attention_mask: Optional[mx.array] = None  # For encoder-decoder models
+    position_ids: Optional[mx.array] = None
+    pos_hw: Optional[mx.array] = None
+    rope_deltas: Optional[mx.array] = None
 
     def to_dict(self):
         return {
@@ -85,6 +89,9 @@ class InputEmbeddingsFeatures:
             "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
             "decoder_inputs_embeds": self.decoder_inputs_embeds,
             "attention_mask": self.attention_mask,
+            "position_ids": self.position_ids,
+            "pos_hw": self.pos_hw,
+            "rope_deltas": self.rope_deltas,
         }
 
 
@@ -211,6 +218,16 @@ def scaled_dot_product_attention(
         )
         if result is not None:
             return result
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    if isinstance(cache, BatchTurboQuantKVCache):
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
         return mx.fast.scaled_dot_product_attention(
             queries,
