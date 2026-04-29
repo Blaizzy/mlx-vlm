@@ -2570,6 +2570,13 @@ def models_endpoint():
 # MLX_VLM API endpoints
 
 
+@app.middleware("http")
+async def add_server_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Server"] = f"mlx_vlm/{__version__}"
+    return response
+
+
 @app.get("/health")
 async def health_check():
     """
