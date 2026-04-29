@@ -101,6 +101,7 @@ def skip_multimodal_module(path: str) -> bool:
     )
     return any(module in path for module in multimodal_modules)
 
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
