@@ -292,6 +292,9 @@ class KimiVLImageProcessor(BaseImageProcessor):
         pixel_values = mx.concatenate(pixel_values_list, axis=0)
         grid_shapes = [(int(h), int(w)) for h, w in image_grid_hws]
         image_grid_hws = mx.array(image_grid_hws)
+        # Materialize so arrays are stream-independent when handed off to
+        # the generation thread (thread-local stream architecture).
+        mx.eval(pixel_values, image_grid_hws)
 
         data = {
             "pixel_values": pixel_values,
