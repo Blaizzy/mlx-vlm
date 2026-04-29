@@ -2011,7 +2011,6 @@ class TestModels(unittest.TestCase):
             vision_feature_layer=-1,
         )
 
-
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
 
