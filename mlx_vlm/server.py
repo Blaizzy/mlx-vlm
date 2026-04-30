@@ -47,7 +47,7 @@ from .generate import (
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
-from .tool_parsers import _infer_tool_parser, load_tool_module
+from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
 from .vision_cache import VisionFeatureCache
@@ -2090,15 +2090,8 @@ async def chat_completions_endpoint(request: ChatRequest):
 
         # Detect tool parser from chat template
         tools = getattr(request, "tools", None)
-        tool_parser_type = None
-        tool_module = None
-        tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
-        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
-            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
-            if tool_parser_type is not None:
-                tool_module = load_tool_module(tool_parser_type)
+        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
             gen_args = _build_gen_args(request, processor)
@@ -2580,10 +2573,19 @@ async def health_check():
     """
     Check if the server is healthy and what model is loaded.
     """
+    config = model_cache.get("config")
+    text_config = getattr(config, "text_config", None)
+
     return {
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
+        "loaded_context_size": getattr(text_config, "max_position_embeddings", None),
+        "loaded_tool_parser": (
+            _infer_tool_parser_from_processor(model_cache.get("processor"))
+            if model_cache.get("processor")
+            else None
+        ),
         "continuous_batching_enabled": response_generator is not None,
     }
 
