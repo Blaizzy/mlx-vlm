@@ -2004,6 +2004,7 @@ class BatchGenerator:
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
         self._gen_tokens_counter = 0
+        self._gen_time_counter = 0.0
         self._steps_counter = 0
 
         self._wire_stack = contextlib.ExitStack()
@@ -2109,6 +2110,12 @@ class BatchGenerator:
             else 0
         )
         stats.generation_tokens = self._gen_tokens_counter
+        stats.generation_time = self._gen_time_counter
+        stats.generation_tps = (
+            self._gen_tokens_counter / self._gen_time_counter
+            if self._gen_time_counter > 0
+            else 0
+        )
         stats.peak_memory = mx.get_peak_memory() / 1e9
         return stats
 
@@ -2118,7 +2125,9 @@ class BatchGenerator:
 
         # Decode-first: always emit a generation step before touching prefill.
         if len(self._generation_batch) > 0:
+            tic = time.perf_counter()
             generation_responses = self._generation_batch.next()
+            self._gen_time_counter += time.perf_counter() - tic
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
             if self._steps_counter % 512 == 0:

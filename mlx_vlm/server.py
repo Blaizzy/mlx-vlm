@@ -174,6 +174,8 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
 
 
 class ResponseGenerator:
@@ -730,6 +732,14 @@ class ResponseGenerator:
 
             lp = r.token_logprob
 
+            tps_kwargs = {}
+            if r.finish_reason:
+                s = batch_gen.stats()
+                tps_kwargs = {
+                    "prompt_tps": s.prompt_tps,
+                    "generation_tps": s.generation_tps,
+                }
+
             rqueue.put(
                 StreamingToken(
                     text=text,
@@ -738,6 +748,7 @@ class ResponseGenerator:
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     top_logprobs=getattr(r, "top_logprobs", None),
+                    **tps_kwargs,
                 )
             )
 
@@ -1797,6 +1808,10 @@ async def responses_endpoint(request: Request):
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
+                                "total_tokens": ctx.prompt_tokens + output_tokens,
+                                "prompt_tps": token.prompt_tps,
+                                "generation_tps": token.generation_tps,
+                                "peak_memory": token.peak_memory,
                             }
 
                             yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
@@ -1828,6 +1843,10 @@ async def responses_endpoint(request: Request):
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
+                                "total_tokens": chunk.prompt_tokens
+                                + chunk.generation_tokens,
+                                "prompt_tps": chunk.prompt_tps,
+                                "generation_tps": chunk.generation_tps,
                             }
 
                             yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
@@ -1865,6 +1884,10 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": usage_stats["output_tokens"],
                                 "total_tokens": usage_stats["input_tokens"]
                                 + usage_stats["output_tokens"],
+                                "prompt_tps": usage_stats.get("prompt_tps", 0.0),
+                                "generation_tps": usage_stats.get(
+                                    "generation_tps", 0.0
+                                ),
                             },
                         }
                     )
@@ -1902,6 +1925,8 @@ async def responses_endpoint(request: Request):
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
+                prompt_tps = 0.0
+                generation_tps = 0.0
 
                 if response_generator is not None:
                     ctx, token_iter = response_generator.generate(
@@ -1933,6 +1958,8 @@ async def responses_endpoint(request: Request):
                     full_text = result.text
                     prompt_tokens = result.prompt_tokens
                     output_tokens = result.generation_tokens
+                    prompt_tps = result.prompt_tps
+                    generation_tps = result.generation_tps
 
                 mx.clear_cache()
                 gc.collect()
@@ -1966,6 +1993,8 @@ async def responses_endpoint(request: Request):
                         "input_tokens": prompt_tokens,
                         "output_tokens": output_tokens,
                         "total_tokens": prompt_tokens + output_tokens,
+                        "prompt_tps": prompt_tps,
+                        "generation_tps": generation_tps,
                     },
                 )
 
@@ -2243,6 +2272,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                                         "completion_tokens": output_tokens,
                                         "total_tokens": ctx.prompt_tokens
                                         + output_tokens,
+                                        "prompt_tps": token.prompt_tps,
+                                        "generation_tps": token.generation_tps,
+                                        "peak_memory": token.peak_memory,
                                     },
                                     choices=choices,
                                 )
@@ -2312,6 +2344,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     "completion_tokens": chunk.generation_tokens,
                                     "total_tokens": chunk.prompt_tokens
                                     + chunk.generation_tokens,
+                                    "prompt_tps": chunk.prompt_tps,
+                                    "generation_tps": chunk.generation_tps,
                                 },
                                 choices=choices,
                             )
@@ -2324,7 +2358,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )
@@ -2363,6 +2397,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 prompt_tokens = 0
                 output_tokens = 0
                 peak_memory = 0.0
+                prompt_tps = 0.0
+                generation_tps = 0.0
 
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
@@ -2373,7 +2409,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     def _blocking_generate():
                         text = ""
                         pt = gt = 0
-                        pm = 0.0
+                        pm = p_tps = g_tps = 0.0
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
@@ -2390,16 +2426,23 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     (token.token, token.logprobs, token.top_logprobs)
                                 )
                             if token.finish_reason:
+                                p_tps = token.prompt_tps
+                                g_tps = token.generation_tps
                                 break
                         try:
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, pm
+                        return text, pt, gt, pm, p_tps, g_tps
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                        prompt_tps,
+                        generation_tps,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
@@ -2416,6 +2459,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prompt_tokens = gen_result.prompt_tokens
                     output_tokens = gen_result.generation_tokens
                     peak_memory = gen_result.peak_memory
+                    prompt_tps = gen_result.prompt_tps
+                    generation_tps = gen_result.generation_tps
 
                 mx.clear_cache()
                 gc.collect()
@@ -2432,6 +2477,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                     peak_memory=peak_memory,
+                    prompt_tps=prompt_tps,
+                    generation_tps=generation_tps,
                 )
 
                 # Parse tool calls from generated output
