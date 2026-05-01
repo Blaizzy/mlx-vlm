@@ -68,6 +68,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         # Bound at runtime via bind().
         self._lm_head_fn = None
         self._input_embed = None  # target's embed_tokens (backbone_hidden_size)
+        self._input_embed_scale: float = 1.0
         # Threaded by reset() / round-loop before each draft_block.
         self._shared_kv: Optional[dict] = None
         self._kv_offset: int = 0
@@ -116,6 +117,16 @@ class Gemma4AssistantDraftModel(nn.Module):
             inner = target_model.language_model.model
         if inner is not None:
             self._input_embed = inner.embed_tokens
+            # HF's target uses ``Gemma4TextScaledWordEmbedding`` which
+            # multiplies the lookup by ``sqrt(hidden_size)`` *inside* the
+            # module. In MLX-VLM the same scale is applied externally
+            # (``language.py: h = self.embed_tokens(inputs) * self.embed_scale``),
+            # so the bare ``embed_tokens`` here returns *unscaled* vectors.
+            # The drafter's ``pre_projection`` was trained against scaled
+            # target embeddings, so we replicate the scale at call time.
+            self._input_embed_scale = float(
+                getattr(inner, "embed_scale", 1.0)
+            )
 
         # Stash the target's layer_types so the round-loop knows which keys
         # the drafter expects in shared_kv_states.
@@ -148,15 +159,16 @@ class Gemma4AssistantDraftModel(nn.Module):
         """Threaded by the round-loop before each ``draft_block`` call.
 
         ``kv_offset`` is the length of the target's KV cache (= number of
-        tokens already in the cache). ``position`` is the absolute
-        position id used for RoPE on the drafter's queries — defaults to
-        ``kv_offset - 1`` (the position of the last seen token), matching
-        the HF SinglePositionMultiToken behavior of holding position_ids
-        constant across draft steps.
+        target-side tokens already written to KV; the just-sampled bonus
+        is *not* yet in the cache). ``position`` is the absolute position
+        id used for RoPE on the drafter's queries; HF
+        ``SinglePositionMultiTokenCandidateGenerator`` locks it to
+        ``input_ids.shape[1] - 1`` which equals the bonus's position —
+        i.e. ``kv_offset`` (one past the last cached token).
         """
         self._shared_kv = shared_kv_states
         self._kv_offset = int(kv_offset)
-        self._position = int(position) if position is not None else int(kv_offset) - 1
+        self._position = int(position) if position is not None else int(kv_offset)
 
     # ------------------------------------------------------------------
     # forward
@@ -252,7 +264,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         tokens: List[mx.array] = []
 
         for _ in range(block_size - 1):
-            tok_embed = self._input_embed(tok)
+            tok_embed = self._input_embed(tok) * self._input_embed_scale
             inputs_embeds = mx.concatenate([tok_embed, h_prev], axis=-1)
             h_prev, logits = self(inputs_embeds, shared_kv, position_ids)
             tok = sampler(logits)  # [B, 1]

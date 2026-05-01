@@ -491,9 +491,14 @@ def _mtp_rounds(
     )
     draft_model.reset(model)
 
-    # Hidden from prefill is full prompt-length; we only need the last slot.
+    # Hidden from prefill is full prompt-length; reduce to a single slot.
+    # Mirrors HF SinglePositionMultiTokenCandidateGenerator's
+    # ``last_hidden_state[:, n_last_matches:n_last_matches+1]`` with
+    # n_last_matches=0 on the first round (= position 0 of the prefill
+    # output). Subsequent rounds slice into the verify forward's hidden
+    # at index ``accepted`` further below.
     if hidden.shape[1] > 1:
-        hidden = hidden[:, -1:, :]
+        hidden = hidden[:, 0:1, :]
 
     kv_offset = int(prompt_cache[0].offset)
     draft_model.set_shared_kv(shared_kv_states, kv_offset)

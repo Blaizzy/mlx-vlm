@@ -543,10 +543,16 @@ class Gemma4TextModel(nn.Module):
                 if kvs is not None:
                     shared_kv_sink[layer.layer_type] = kvs
 
+        # Match HF's `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
+        # — the recorded value is the LAST decoder layer's output, captured
+        # BEFORE the final RMSNorm. The drafter's `pre_projection` was trained
+        # against this pre-norm hidden.
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
 
-        return self.norm(h)
+        h = self.norm(h)
+
+        return h
 
 
 class LanguageModel(nn.Module):
@@ -610,6 +616,7 @@ class LanguageModel(nn.Module):
         simple trim + per-row tail-zero. ``gdn_states`` is accepted (and
         ignored) for API parity with qwen3_5's hook.
         """
+        del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
 

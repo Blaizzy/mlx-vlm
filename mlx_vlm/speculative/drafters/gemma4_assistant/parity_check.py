@@ -33,7 +33,6 @@ def main():
     B = 1
     block = cfg.block_size
     backbone = cfg.backbone_hidden_size
-    h_dim = text_cfg.hidden_size
     n_kv_heads = (
         text_cfg.num_global_key_value_heads
         if text_cfg.attention_k_eq_v and text_cfg.num_global_key_value_heads
