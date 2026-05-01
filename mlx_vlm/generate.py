@@ -219,7 +219,8 @@ def parse_arguments():
         "--draft-kind",
         type=str,
         default="dflash",
-        help="Drafter family. Currently only 'dflash' is supported.",
+        help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model).",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -452,6 +453,116 @@ def _speculative_walk_batch(
         accepted_list.append(acc)
         new_tokens_list.append(new)
     return accepted_list, new_tokens_list
+
+
+def _mtp_rounds(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    shared_kv_states: dict,
+    *,
+    first_bonus: int,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+) -> Generator[Tuple[int, None], None, None]:
+    """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
+
+    Mirrors ``_dflash_rounds`` but with three differences:
+    (1) the drafter consumes the target's last-layer hidden + last-layer
+    shared K/V per layer-type rather than concatenated multi-layer hiddens;
+    (2) ``draft_block`` is autoregressive (K small forwards) rather than a
+    single masked forward; (3) ``rollback_speculative_cache`` ignores
+    ``gdn_states`` (Gemma 4 has no SSM/GDN state).
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
+            "MTP speculative decoding currently only supports gemma4."
+        )
+
+    block_total = (
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
+    )
+    draft_model.reset(model)
+
+    # Hidden from prefill is full prompt-length; we only need the last slot.
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+
+    kv_offset = int(prompt_cache[0].offset)
+    draft_model.set_shared_kv(shared_kv_states, kv_offset)
+
+    b = first_bonus
+    emitted = 1  # caller already yielded the first bonus
+
+    while emitted < max_tokens:
+        bs = min(block_total, max_tokens - emitted + 1)
+        if bs <= 1:
+            break
+
+        draft_tokens = draft_model.draft_block(
+            b, hidden, None, bs, sampler, token_dtype
+        )
+        mx.async_eval(draft_tokens)
+
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate(
+                [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
+            )
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                return_hidden=True,
+                return_shared_kv=True,
+            )
+            hidden_full = verify_out.hidden_states[-1]  # [B, bs, backbone]
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden_full)
+
+        accepted, new_tokens = _speculative_walk(
+            draft_tokens, target_tokens, max_tokens - emitted
+        )
+        draft_model.accept_lens.append(accepted)
+
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
+        # Hidden for next round: pick the slot of the newly accepted bonus.
+        hidden = hidden_full[:, accepted : accepted + 1, :]
+        b = new_tokens[-1] if new_tokens else b
+
+        if accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, None, accepted, bs
+                )
+
+        # Slice shared_kv_states to the post-rollback length and rebind.
+        rejected = bs - (accepted + 1)
+        next_shared_kv = {}
+        for k, kv in verify_out.shared_kv_states.items():
+            K, V = kv
+            valid = K.shape[-2] - rejected
+            if valid <= 0 or valid >= K.shape[-2]:
+                next_shared_kv[k] = (K, V) if valid >= K.shape[-2] else (
+                    K[..., :1, :], V[..., :1, :]
+                )
+            else:
+                next_shared_kv[k] = (K[..., :valid, :], V[..., :valid, :])
+        kv_offset = int(prompt_cache[0].offset)
+        draft_model.set_shared_kv(next_shared_kv, kv_offset)
+
+        if emitted % 256 == 0:
+            mx.clear_cache()
 
 
 def _dflash_rounds(
@@ -812,7 +923,13 @@ def generate_step(
     # Speculative decoding setup
     last_outputs = None
     if draft_model is not None:
-        kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
+        if draft_kind == "mtp":
+            # MTP drafter consumes target's last-layer hidden + shared K/V
+            # (per layer-type) rather than per-layer hidden captures.
+            kwargs["return_hidden"] = True
+            kwargs["return_shared_kv"] = True
+        else:
+            kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
         prefill_step_size = None
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
@@ -906,12 +1023,36 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
-        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
         B = input_ids.shape[0]
+        if draft_kind == "mtp":
+            if B != 1:
+                raise NotImplementedError(
+                    "MTP speculative decoding currently only supports batch=1."
+                )
+            shared_kv_states = last_outputs.shared_kv_states
+            hidden = last_outputs.hidden_states[-1]
+            mx.eval(y)
+            yield y.item(), logprobs
+            yield from _mtp_rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                shared_kv_states,
+                first_bonus=y.item(),
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
+            )
+            return
+
         if draft_kind != "dflash":
             raise ValueError(
-                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
+                f"Unknown draft_kind {draft_kind!r}. Supported: "
+                "['dflash', 'mtp']"
             )
+        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
         if B == 1:
             mx.eval(y)
             yield y.item(), logprobs
