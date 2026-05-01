@@ -773,6 +773,48 @@ def suppress_tool_call_content(
     return in_tool_call, delta_content
 
 
+def _responses_tools_to_chat_format(tools):
+    """
+    Translate the Responses-shaped tools list into the Chat-Completions shape
+    that ``apply_chat_template`` expects.
+
+    Responses request shape::
+
+        [{"type": "function", "name": "...", "description": "...", "parameters": {...}}, ...]
+
+    Chat-Completions request shape (what ``apply_chat_template`` accepts)::
+
+        [{"type": "function", "function": {"name": "...", "description": "...", "parameters": {...}}}, ...]
+
+    Tools that already use the Chat-Completions nested shape are passed through
+    unchanged so callers that send Chat-Completions-style tools to /v1/responses
+    still work. Non-function tool types (if any) are also passed through.
+    """
+    if not tools:
+        return None
+    converted = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if tool.get("type") != "function":
+            converted.append(tool)
+            continue
+        if "function" in tool and isinstance(tool["function"], dict):
+            converted.append(tool)
+            continue
+        converted.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.get("name"),
+                    "description": tool.get("description"),
+                    "parameters": tool.get("parameters") or {},
+                },
+            }
+        )
+    return converted
+
+
 def process_tool_calls(model_output: str, tool_module, tools):
     """Parse tool calls from model output using the appropriate tool parser."""
     called_tools = []
@@ -1229,18 +1271,97 @@ class ChatMessage(FlexibleBaseModel):
     name: Optional[str] = Field(None, description="Name of the tool/function.")
 
 
+class ResponsesInputItem(FlexibleBaseModel):
+    """
+    A single item in a /v1/responses ``input`` array.
+
+    Responses input is heterogeneous: it can contain regular chat messages
+    (``role`` + ``content``) and also non-message items emitted on prior turns,
+    namely ``function_call`` (an assistant tool call) and
+    ``function_call_output`` (the tool's result fed back to the model). This
+    model is permissive — only ``type`` is roughly discriminating — so callers
+    can mix all three without us re-validating the OpenAI schema field-by-field.
+
+    Kept separate from ``ChatMessage`` so the chat-completions request/response
+    schema stays unchanged.
+    """
+
+    type: Optional[Literal["message", "function_call", "function_call_output"]] = Field(
+        None,
+        description=(
+            "Item type. Optional because a plain message item may omit it "
+            "and rely on ``role`` for discrimination."
+        ),
+    )
+    role: Optional[Literal["user", "assistant", "system", "developer", "tool"]] = Field(
+        None,
+        description=(
+            "Role for message items; absent for function_call / "
+            "function_call_output."
+        ),
+    )
+    content: Optional[
+        Union[
+            str,
+            ResponseInputMessageContentListParam,
+            ResponseOutputMessageContentList,
+        ]
+    ] = Field(None, description="Content for message items.")
+    call_id: Optional[str] = Field(
+        None,
+        description=(
+            "Tool-call correlation id used to pair function_call with "
+            "function_call_output."
+        ),
+    )
+    name: Optional[str] = Field(
+        None, description="Function name for function_call items."
+    )
+    arguments: Optional[str] = Field(
+        None,
+        description="JSON-encoded function arguments string for function_call items.",
+    )
+    output: Optional[str] = Field(
+        None, description="Tool result text for function_call_output items."
+    )
+
+
 class OpenAIRequest(FlexibleBaseModel):
     """
     OpenAI-compatible request structure.
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
     """
 
-    input: Union[str, List[ChatMessage]] = Field(
-        ..., description="Input text or list of chat messages."
+    input: Union[str, List[ResponsesInputItem]] = Field(
+        ...,
+        description=(
+            "Input text or a heterogeneous list of input items: chat messages "
+            "({role, content}), function_call items, or function_call_output "
+            "items."
+        ),
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
         DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+    )
+    tools: Optional[List[dict]] = Field(
+        None,
+        description=(
+            "A list of tools the model may call. Each tool follows the OpenAI "
+            "Responses tool shape: {type: 'function', name, description, "
+            "parameters}. The Chat-Completions shape ({type: 'function', "
+            "function: {name, description, parameters}}) is also accepted and "
+            "passed through unchanged."
+        ),
+    )
+    tool_choice: Optional[Union[str, dict]] = Field(
+        None,
+        description=(
+            "Controls which (if any) tool is called by the model. Accepts "
+            "'none', 'auto', 'required', or {type: 'function', name: '...'}. "
+            "Currently advisory only — selection is model-driven via the chat "
+            "template."
+        ),
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -1349,6 +1470,20 @@ class MessageItem(BaseModel):
     content: List[ContentPartOutputText] = []
 
 
+class FunctionCallItem(BaseModel):
+    """Output item representing a function/tool call in the Responses output."""
+
+    id: str
+    type: Literal["function_call"]
+    status: Literal["in_progress", "completed"]
+    call_id: str
+    name: str
+    arguments: str  # JSON-encoded arguments (may be empty during in_progress)
+
+
+OutputItem = Union[MessageItem, FunctionCallItem]
+
+
 class ResponseCreatedEvent(BaseStreamEvent):
     type: Literal["response.created"]
     response: OpenAIResponse
@@ -1362,7 +1497,7 @@ class ResponseInProgressEvent(BaseStreamEvent):
 class ResponseOutputItemAddedEvent(BaseStreamEvent):
     type: Literal["response.output_item.added"]
     output_index: int
-    item: MessageItem
+    item: OutputItem
 
 
 class ResponseContentPartAddedEvent(BaseStreamEvent):
@@ -1400,7 +1535,25 @@ class ResponseContentPartDoneEvent(BaseStreamEvent):
 class ResponseOutputItemDoneEvent(BaseStreamEvent):
     type: Literal["response.output_item.done"]
     output_index: int
-    item: MessageItem
+    item: OutputItem
+
+
+class ResponseFunctionCallArgumentsDeltaEvent(BaseStreamEvent):
+    """Streamed chunk of a function-call's arguments JSON string."""
+
+    type: Literal["response.function_call_arguments.delta"]
+    item_id: str
+    output_index: int
+    delta: str
+
+
+class ResponseFunctionCallArgumentsDoneEvent(BaseStreamEvent):
+    """Final aggregated arguments JSON for a function-call."""
+
+    type: Literal["response.function_call_arguments.done"]
+    item_id: str
+    output_index: int
+    arguments: str
 
 
 class ResponseCompletedEvent(BaseStreamEvent):
@@ -1416,6 +1569,8 @@ StreamEvent = Union[
     ResponseOutputTextDeltaEvent,
     ResponseOutputTextDoneEvent,
     ResponseContentPartDoneEvent,
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
     ResponseOutputItemDoneEvent,
     ResponseCompletedEvent,
 ]
@@ -1647,7 +1802,44 @@ async def responses_endpoint(request: Request):
             elif isinstance(openai_request.input, list):
                 # If input is a list, treat it as a series of chat messages
                 for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
+                    if isinstance(message, ResponsesInputItem):
+                        # Responses-API non-message input items (function_call /
+                        # function_call_output) get translated into the
+                        # Chat-Completions message shape that apply_chat_template
+                        # understands. This is what lets multi-turn tool
+                        # conversations round-trip through /v1/responses: the
+                        # client sends back the prior assistant function_call
+                        # and the function_call_output (tool result) in the
+                        # input array, and the chat template re-emits them as
+                        # the tool-call and tool-result turns the model expects.
+                        if message.type == "function_call":
+                            chat_messages.append(
+                                {
+                                    "role": "assistant",
+                                    "content": "",
+                                    "tool_calls": [
+                                        {
+                                            "id": message.call_id
+                                            or f"call_{uuid.uuid4().hex}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": message.name or "",
+                                                "arguments": message.arguments or "{}",
+                                            },
+                                        }
+                                    ],
+                                }
+                            )
+                            continue
+                        if message.type == "function_call_output":
+                            chat_messages.append(
+                                {
+                                    "role": "tool",
+                                    "content": message.output or "",
+                                    "tool_call_id": message.call_id or "",
+                                }
+                            )
+                            continue
                         if isinstance(message.content, str):
                             chat_messages.append(
                                 {"role": message.role, "content": message.content}
@@ -1692,7 +1884,7 @@ async def responses_endpoint(request: Request):
                                 status_code=400, detail="Invalid input format."
                             )
                     else:
-                        print("not a ChatMessage")
+                        print("not a ResponsesInputItem")
                         raise HTTPException(
                             status_code=400, detail="Invalid input format."
                         )
@@ -1709,11 +1901,31 @@ async def responses_endpoint(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        # Convert Responses-shaped tools to the Chat-Completions shape that
+        # apply_chat_template / chat templates expect. None when no tools were
+        # requested.
+        tools_chat_fmt = _responses_tools_to_chat_format(openai_request.tools)
+
+        # Infer the model's tool-call parser from its chat template. This is the
+        # same path /v1/chat/completions takes — see chat_completions_endpoint.
+        # When a parser is found we use it later to extract function calls from
+        # the raw model output and translate them into Responses output items.
+        tool_parser_type = None
+        tool_module = None
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        if tools_chat_fmt and hasattr(tokenizer, "chat_template"):
+            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+            if tool_parser_type is not None:
+                tool_module = load_tool_module(tool_parser_type)
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
+            tools=tools_chat_fmt,
             **gen_args.to_template_kwargs(),
         )
 
@@ -1762,113 +1974,271 @@ async def responses_endpoint(request: Request):
                     # Send response.in_progress event  (to match the openai pipeline)
                     yield f"event: response.in_progress\ndata: {ResponseInProgressEvent(type='response.in_progress', response=base_response).model_dump_json()}\n\n"
 
-                    # Send response.output_item.added event  (to match the openai pipeline)
-                    message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="in_progress",
-                        role="assistant",
-                        content=[],
-                    )
-                    yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
-
-                    # Send response.content_part.added event
-                    content_part = ContentPartOutputText(
-                        type="output_text", text="", annotations=[]
-                    )
-                    yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
-
-                    # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
-                    if response_generator is not None:
-                        ctx, token_iter = response_generator.generate(
-                            prompt=formatted_prompt,
-                            images=images if images else None,
-                            args=gen_args,
+                    if tool_parser_type is not None:
+                        # Tools-in-play path: buffer the entire generation and
+                        # emit per-output-item events at the end. We can't
+                        # safely stream raw text deltas in this mode because
+                        # the model may emit tool-call markers (e.g.
+                        # ``<tool_call>...</tool_call>``) that should land on a
+                        # dedicated function_call output item rather than be
+                        # leaked into the message text.
+                        if response_generator is not None:
+                            ctx, token_iter = response_generator.generate(
+                                prompt=formatted_prompt,
+                                images=images if images else None,
+                                args=gen_args,
+                            )
+                            output_tokens = 0
+                            for token in token_iter:
+                                output_tokens += 1
+                                full_text += token.text
+                                usage_stats = {
+                                    "input_tokens": ctx.prompt_tokens,
+                                    "output_tokens": output_tokens,
+                                }
+                                if token.finish_reason:
+                                    break
+                        else:
+                            token_iterator = stream_generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                temperature=openai_request.temperature,
+                                max_tokens=openai_request.max_output_tokens,
+                                top_p=openai_request.top_p,
+                                vision_cache=model_cache.get("vision_cache"),
+                                logits_processors=gen_args.logits_processors,
+                                **kwargs,
+                            )
+                            for chunk in token_iterator:
+                                if chunk is None or not hasattr(chunk, "text"):
+                                    continue
+                                full_text += chunk.text
+                                usage_stats = {
+                                    "input_tokens": chunk.prompt_tokens,
+                                    "output_tokens": chunk.generation_tokens,
+                                }
+
+                        _, clean_text = _split_thinking(full_text)
+                        parsed = process_tool_calls(
+                            model_output=clean_text,
+                            tool_module=tool_module,
+                            tools=tools_chat_fmt,
                         )
+                        parsed_tool_calls = parsed.get("calls") or []
+                        text_output = parsed.get("remaining_text", clean_text)
 
-                        output_tokens = 0
-                        for token in token_iter:
-                            output_tokens += 1
-                            delta = token.text
-                            full_text += delta
-                            usage_stats = {
-                                "input_tokens": ctx.prompt_tokens,
-                                "output_tokens": output_tokens,
+                        output_index = 0
+                        completed_items: list = []
+
+                        # Emit a complete (non-streaming) message item only if
+                        # the model produced text outside the tool-call markers.
+                        if text_output and text_output.strip():
+                            msg_in_progress = MessageItem(
+                                id=message_id,
+                                type="message",
+                                status="in_progress",
+                                role="assistant",
+                                content=[],
+                            )
+                            yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=output_index, item=msg_in_progress).model_dump_json()}\n\n"
+                            empty_part = ContentPartOutputText(
+                                type="output_text", text="", annotations=[]
+                            )
+                            yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=output_index, content_index=0, part=empty_part).model_dump_json()}\n\n"
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=output_index, content_index=0, delta=text_output).model_dump_json()}\n\n"
+                            yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=output_index, content_index=0, text=text_output).model_dump_json()}\n\n"
+                            final_part = ContentPartOutputText(
+                                type="output_text",
+                                text=text_output,
+                                annotations=[],
+                            )
+                            yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=output_index, content_index=0, part=final_part).model_dump_json()}\n\n"
+                            final_msg = MessageItem(
+                                id=message_id,
+                                type="message",
+                                status="completed",
+                                role="assistant",
+                                content=[final_part],
+                            )
+                            yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=output_index, item=final_msg).model_dump_json()}\n\n"
+                            completed_items.append(final_msg)
+                            output_index += 1
+
+                        for call in parsed_tool_calls:
+                            fc_item_id = f"fc_{uuid.uuid4().hex}"
+                            fc_call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
+                            fc_name = call.get("function", {}).get("name", "")
+                            fc_args = call.get("function", {}).get("arguments", "")
+
+                            in_progress_fc = FunctionCallItem(
+                                id=fc_item_id,
+                                type="function_call",
+                                status="in_progress",
+                                call_id=fc_call_id,
+                                name=fc_name,
+                                arguments="",
+                            )
+                            yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=output_index, item=in_progress_fc).model_dump_json()}\n\n"
+                            # Single-shot delta: token-level argument streaming
+                            # would require routing through per-token model
+                            # output, which we don't have when buffering. The
+                            # spec allows zero or more delta events, so this is
+                            # compliant; clients that aggregate deltas will
+                            # still arrive at the same final arguments string.
+                            if fc_args:
+                                yield f"event: response.function_call_arguments.delta\ndata: {ResponseFunctionCallArgumentsDeltaEvent(type='response.function_call_arguments.delta', item_id=fc_item_id, output_index=output_index, delta=fc_args).model_dump_json()}\n\n"
+                            yield f"event: response.function_call_arguments.done\ndata: {ResponseFunctionCallArgumentsDoneEvent(type='response.function_call_arguments.done', item_id=fc_item_id, output_index=output_index, arguments=fc_args).model_dump_json()}\n\n"
+                            final_fc = FunctionCallItem(
+                                id=fc_item_id,
+                                type="function_call",
+                                status="completed",
+                                call_id=fc_call_id,
+                                name=fc_name,
+                                arguments=fc_args,
+                            )
+                            yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=output_index, item=final_fc).model_dump_json()}\n\n"
+                            completed_items.append(final_fc)
+                            output_index += 1
+
+                        # Empty-output fallback so response.completed always
+                        # carries at least one output item.
+                        if not completed_items:
+                            empty_part = ContentPartOutputText(
+                                type="output_text",
+                                text=clean_text,
+                                annotations=[],
+                            )
+                            empty_msg = MessageItem(
+                                id=message_id,
+                                type="message",
+                                status="completed",
+                                role="assistant",
+                                content=[empty_part],
+                            )
+                            yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=empty_msg).model_dump_json()}\n\n"
+                            yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=empty_msg).model_dump_json()}\n\n"
+                            completed_items.append(empty_msg)
+
+                        completed_response = base_response.model_copy(
+                            update={
+                                "status": "completed",
+                                "output": completed_items,
+                                "output_text": text_output,
+                                "usage": {
+                                    "input_tokens": usage_stats["input_tokens"],
+                                    "output_tokens": usage_stats["output_tokens"],
+                                    "total_tokens": usage_stats["input_tokens"]
+                                    + usage_stats["output_tokens"],
+                                },
                             }
+                        )
+                        yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
-
-                            if token.finish_reason:
-                                break
                     else:
-                        # Fallback to stream_generate
-                        token_iterator = stream_generate(
-                            model=model,
-                            processor=processor,
-                            prompt=formatted_prompt,
-                            image=images,
-                            temperature=openai_request.temperature,
-                            max_tokens=openai_request.max_output_tokens,
-                            top_p=openai_request.top_p,
-                            vision_cache=model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
-                            **kwargs,
+                        # No-tools path: stream text deltas exactly as before so
+                        # non-tool callers see zero behavioural change.
+                        message_item = MessageItem(
+                            id=message_id,
+                            type="message",
+                            status="in_progress",
+                            role="assistant",
+                            content=[],
                         )
+                        yield f"event: response.output_item.added\ndata: {ResponseOutputItemAddedEvent(type='response.output_item.added', output_index=0, item=message_item).model_dump_json()}\n\n"
 
-                        for chunk in token_iterator:
-                            if chunk is None or not hasattr(chunk, "text"):
-                                continue
+                        content_part = ContentPartOutputText(
+                            type="output_text", text="", annotations=[]
+                        )
+                        yield f"event: response.content_part.added\ndata: {ResponseContentPartAddedEvent(type='response.content_part.added', item_id=message_id, output_index=0, content_index=0, part=content_part).model_dump_json()}\n\n"
 
-                            delta = chunk.text
-                            full_text += delta
-                            usage_stats = {
-                                "input_tokens": chunk.prompt_tokens,
-                                "output_tokens": chunk.generation_tokens,
+                        if response_generator is not None:
+                            ctx, token_iter = response_generator.generate(
+                                prompt=formatted_prompt,
+                                images=images if images else None,
+                                args=gen_args,
+                            )
+
+                            output_tokens = 0
+                            for token in token_iter:
+                                output_tokens += 1
+                                delta = token.text
+                                full_text += delta
+                                usage_stats = {
+                                    "input_tokens": ctx.prompt_tokens,
+                                    "output_tokens": output_tokens,
+                                }
+
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
+
+                                if token.finish_reason:
+                                    break
+                        else:
+                            # Fallback to stream_generate
+                            token_iterator = stream_generate(
+                                model=model,
+                                processor=processor,
+                                prompt=formatted_prompt,
+                                image=images,
+                                temperature=openai_request.temperature,
+                                max_tokens=openai_request.max_output_tokens,
+                                top_p=openai_request.top_p,
+                                vision_cache=model_cache.get("vision_cache"),
+                                logits_processors=gen_args.logits_processors,
+                                **kwargs,
+                            )
+
+                            for chunk in token_iterator:
+                                if chunk is None or not hasattr(chunk, "text"):
+                                    continue
+
+                                delta = chunk.text
+                                full_text += delta
+                                usage_stats = {
+                                    "input_tokens": chunk.prompt_tokens,
+                                    "output_tokens": chunk.generation_tokens,
+                                }
+
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
+
+                        # Split thinking from content for final events
+                        _, clean_text = _split_thinking(full_text)
+
+                        yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
+
+                        final_content_part = ContentPartOutputText(
+                            type="output_text", text=clean_text, annotations=[]
+                        )
+                        yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
+
+                        final_message_item = MessageItem(
+                            id=message_id,
+                            type="message",
+                            status="completed",
+                            role="assistant",
+                            content=[final_content_part],
+                        )
+                        yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+
+                        completed_response = base_response.model_copy(
+                            update={
+                                "status": "completed",
+                                "output": [final_message_item],
+                                "usage": {
+                                    "input_tokens": usage_stats["input_tokens"],
+                                    "output_tokens": usage_stats["output_tokens"],
+                                    "total_tokens": usage_stats["input_tokens"]
+                                    + usage_stats["output_tokens"],
+                                },
                             }
-
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
-
-                    # Split thinking from content for final events
-                    _, clean_text = _split_thinking(full_text)
-
-                    # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
-
-                    # Send response.content_part.done event (to match the openai pipeline)
-                    final_content_part = ContentPartOutputText(
-                        type="output_text", text=clean_text, annotations=[]
-                    )
-                    yield f"event: response.content_part.done\ndata: {ResponseContentPartDoneEvent(type='response.content_part.done', item_id=message_id, output_index=0, content_index=0, part=final_content_part).model_dump_json()}\n\n"
-
-                    # Send response.output_item.done event (to match the openai pipeline)
-                    final_message_item = MessageItem(
-                        id=message_id,
-                        type="message",
-                        status="completed",
-                        role="assistant",
-                        content=[final_content_part],
-                    )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
-
-                    # Send response.completed event (to match the openai pipeline)
-                    completed_response = base_response.model_copy(
-                        update={
-                            "status": "completed",
-                            "output": [final_message_item],
-                            "usage": {
-                                "input_tokens": usage_stats["input_tokens"],
-                                "output_tokens": usage_stats["output_tokens"],
-                                "total_tokens": usage_stats["input_tokens"]
-                                + usage_stats["output_tokens"],
-                            },
-                        }
-                    )
-                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
+                        )
+                        yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -1939,6 +2309,74 @@ async def responses_endpoint(request: Request):
 
                 reasoning, content = _split_thinking(full_text)
 
+                # When the tokenizer has a tool-call parser, parse function
+                # calls out of the post-thinking content. process_tool_calls
+                # returns {calls: [...], remaining_text: "..."} where
+                # remaining_text is the model output minus the tool-call
+                # markers. We feed it ``content`` (not ``full_text``) so the
+                # ``<think>`` block is already stripped.
+                if tool_parser_type is not None:
+                    parsed = process_tool_calls(
+                        model_output=content,
+                        tool_module=tool_module,
+                        tools=tools_chat_fmt,
+                    )
+                    parsed_tool_calls = parsed.get("calls") or []
+                    text_output = parsed.get("remaining_text", content)
+                else:
+                    parsed_tool_calls = []
+                    text_output = content
+
+                output_items: list = []
+                if text_output and text_output.strip():
+                    output_items.append(
+                        {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": text_output,
+                                    "annotations": [],
+                                }
+                            ],
+                            "reasoning": reasoning,
+                        }
+                    )
+                for call in parsed_tool_calls:
+                    output_items.append(
+                        {
+                            "id": f"fc_{uuid.uuid4().hex}",
+                            "type": "function_call",
+                            "status": "completed",
+                            "call_id": call.get("id") or f"call_{uuid.uuid4().hex}",
+                            "name": call.get("function", {}).get("name", ""),
+                            "arguments": call.get("function", {}).get("arguments", ""),
+                        }
+                    )
+
+                # Empty-output fallback so the response always has at least one
+                # output item (matches OpenAI's behaviour for empty generations).
+                if not output_items:
+                    output_items.append(
+                        {
+                            "id": message_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": content,
+                                    "annotations": [],
+                                }
+                            ],
+                            "reasoning": reasoning,
+                        }
+                    )
+
                 response = OpenAIResponse(
                     id=response_id,
                     object="response",
@@ -1947,19 +2385,8 @@ async def responses_endpoint(request: Request):
                     instructions=instructions,
                     max_output_tokens=openai_request.max_output_tokens,
                     model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": content,
-                                }
-                            ],
-                            "reasoning": reasoning,
-                        }
-                    ],
-                    output_text=content,
+                    output=output_items,
+                    output_text=text_output,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
                     usage={

@@ -415,3 +415,289 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+class TestResponsesToolsToChatFormat:
+    """Tests for _responses_tools_to_chat_format()."""
+
+    def test_none_passthrough(self):
+        assert server._responses_tools_to_chat_format(None) is None
+
+    def test_empty_list(self):
+        assert server._responses_tools_to_chat_format([]) is None
+
+    def test_responses_shape_converted_to_chat_shape(self):
+        tools = [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {"type": "object", "properties": {"city": {}}},
+            }
+        ]
+        result = server._responses_tools_to_chat_format(tools)
+        assert result == [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {"city": {}}},
+                },
+            }
+        ]
+
+    def test_chat_shape_passes_through(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "f", "description": "d", "parameters": {}},
+            }
+        ]
+        assert server._responses_tools_to_chat_format(tools) == tools
+
+    def test_mixed_shapes(self):
+        tools = [
+            {"type": "function", "name": "a", "parameters": {}},
+            {
+                "type": "function",
+                "function": {"name": "b", "parameters": {}},
+            },
+        ]
+        result = server._responses_tools_to_chat_format(tools)
+        assert len(result) == 2
+        assert result[0]["function"]["name"] == "a"
+        assert result[1]["function"]["name"] == "b"
+
+    def test_missing_parameters_defaults_to_empty_object(self):
+        tools = [{"type": "function", "name": "x"}]
+        result = server._responses_tools_to_chat_format(tools)
+        assert result[0]["function"]["parameters"] == {}
+
+
+class TestResponsesInputItemSchema:
+    """Tests for the ResponsesInputItem Pydantic model."""
+
+    def test_message_item(self):
+        item = server.ResponsesInputItem(role="user", content="hello")
+        assert item.role == "user"
+        assert item.content == "hello"
+        assert item.type is None
+
+    def test_function_call_item(self):
+        item = server.ResponsesInputItem(
+            type="function_call",
+            call_id="call_1",
+            name="get_weather",
+            arguments='{"city":"Paris"}',
+        )
+        assert item.type == "function_call"
+        assert item.call_id == "call_1"
+        assert item.name == "get_weather"
+        assert item.arguments == '{"city":"Paris"}'
+        assert item.role is None
+
+    def test_function_call_output_item(self):
+        item = server.ResponsesInputItem(
+            type="function_call_output",
+            call_id="call_1",
+            output="Sunny",
+        )
+        assert item.type == "function_call_output"
+        assert item.call_id == "call_1"
+        assert item.output == "Sunny"
+
+
+class TestResponsesEndpointTools:
+    """End-to-end /responses tests covering the tools-on path (with mocks)."""
+
+    @staticmethod
+    def _build_mocks(model_output_text):
+        model = SimpleNamespace()
+        processor = SimpleNamespace(
+            tokenizer=SimpleNamespace(chat_template="dummy template")
+        )
+        config = SimpleNamespace(model_type="qwen2_vl")
+        gen_result = SimpleNamespace(
+            text=model_output_text,
+            prompt_tokens=12,
+            generation_tokens=8,
+            total_tokens=20,
+        )
+        tool_module = SimpleNamespace(
+            tool_call_start="<tool_call>", tool_call_end="</tool_call>"
+        )
+        return {
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "gen_result": gen_result,
+            "tool_module": tool_module,
+        }
+
+    def test_tools_field_passed_to_apply_chat_template(self, client):
+        """When tools are present, the converted chat-shape tools must be
+        forwarded to apply_chat_template (otherwise the model never sees them)."""
+        mocks = self._build_mocks("plain text")
+
+        with (
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(mocks["model"], mocks["processor"], mocks["config"]),
+            ),
+            patch.object(
+                server, "apply_chat_template", return_value="prompt"
+            ) as mock_template,
+            patch.object(server, "_infer_tool_parser", return_value="qwen"),
+            patch.object(server, "load_tool_module", return_value=mocks["tool_module"]),
+            patch.object(server, "generate", return_value=mocks["gen_result"]),
+            patch.object(server, "response_generator", new=None),
+        ):
+            response = client.post(
+                "/responses",
+                json={
+                    "model": "demo",
+                    "input": [{"role": "user", "content": "weather in Paris"}],
+                    "max_output_tokens": 16,
+                    "enable_thinking": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "description": "weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                            },
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        forwarded_tools = mock_template.call_args.kwargs.get("tools")
+        assert forwarded_tools is not None
+        # Must be the chat-shape (nested under 'function') after conversion.
+        assert forwarded_tools[0]["function"]["name"] == "get_weather"
+
+    def test_function_call_emitted_when_model_outputs_tool_call(self, client):
+        """When the model output contains tool-call markers, /responses must
+        produce a function_call output item rather than leaking the markers
+        into a message."""
+        mocks = self._build_mocks(
+            '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>'
+        )
+
+        with (
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(mocks["model"], mocks["processor"], mocks["config"]),
+            ),
+            patch.object(server, "apply_chat_template", return_value="prompt"),
+            patch.object(server, "_infer_tool_parser", return_value="qwen"),
+            patch.object(server, "load_tool_module", return_value=mocks["tool_module"]),
+            patch.object(
+                server,
+                "process_tool_calls",
+                return_value={
+                    "calls": [
+                        {
+                            "type": "function",
+                            "index": 0,
+                            "id": "call_xyz",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"city": "Paris"}',
+                            },
+                        }
+                    ],
+                    "remaining_text": "",
+                },
+            ),
+            patch.object(server, "generate", return_value=mocks["gen_result"]),
+            patch.object(server, "response_generator", new=None),
+        ):
+            response = client.post(
+                "/responses",
+                json={
+                    "model": "demo",
+                    "input": [{"role": "user", "content": "weather?"}],
+                    "max_output_tokens": 32,
+                    "enable_thinking": False,
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_weather",
+                            "parameters": {},
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        # Output should contain exactly one function_call item, no message.
+        assert len(body["output"]) == 1
+        item = body["output"][0]
+        assert item["type"] == "function_call"
+        assert item["name"] == "get_weather"
+        assert item["arguments"] == '{"city": "Paris"}'
+        assert item["call_id"] == "call_xyz"
+
+    def test_function_call_input_item_translated_to_assistant_tool_call(self, client):
+        """A function_call input item (replaying a prior assistant tool call)
+        must become an assistant message with tool_calls in the prompt
+        construction."""
+        mocks = self._build_mocks("Sunny in Paris.")
+        recorded = {}
+
+        def capture_template(processor, config, chat_messages, **kwargs):
+            recorded["chat_messages"] = list(chat_messages)
+            return "prompt"
+
+        with (
+            patch.object(
+                server,
+                "get_cached_model",
+                return_value=(mocks["model"], mocks["processor"], mocks["config"]),
+            ),
+            patch.object(server, "apply_chat_template", side_effect=capture_template),
+            patch.object(server, "_infer_tool_parser", return_value=None),
+            patch.object(server, "generate", return_value=mocks["gen_result"]),
+            patch.object(server, "response_generator", new=None),
+        ):
+            response = client.post(
+                "/responses",
+                json={
+                    "model": "demo",
+                    "input": [
+                        {"role": "user", "content": "weather?"},
+                        {
+                            "type": "function_call",
+                            "call_id": "call_abc",
+                            "name": "get_weather",
+                            "arguments": '{"city":"Paris"}',
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_abc",
+                            "output": "Sunny",
+                        },
+                    ],
+                    "max_output_tokens": 16,
+                    "enable_thinking": False,
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        msgs = recorded["chat_messages"]
+        # Sequence should be: user, assistant-with-tool_calls, tool-result.
+        assert msgs[0]["role"] == "user"
+        assert msgs[1]["role"] == "assistant"
+        assert msgs[1]["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert msgs[1]["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+        assert msgs[2]["role"] == "tool"
+        assert msgs[2]["content"] == "Sunny"
+        assert msgs[2]["tool_call_id"] == "call_abc"
