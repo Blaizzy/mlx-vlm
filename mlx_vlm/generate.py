@@ -1009,11 +1009,33 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
-        else True
-    )
+    # Some models (e.g. Gemma 3/4) rely on a HF chat template to format turns.
+    # The CLI path applies the chat template before calling generate(), but the
+    # Python API often passes raw strings. If the tokenizer provides a chat
+    # template, apply it here to avoid pathological repetition/echoing.
+    applied_chat_template = False
+    if (
+        isinstance(prompt, str)
+        and model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+        and hasattr(tokenizer, "apply_chat_template")
+        and getattr(tokenizer, "chat_template", None) is not None
+        and not kwargs.pop("skip_chat_template", False)
+    ):
+        try:
+            prompt = apply_chat_template(
+                processor,
+                model.config,
+                prompt,
+                add_generation_prompt=True,
+                num_images=len(image) if isinstance(image, list) else (1 if image else 0),
+                num_audios=len(audio) if isinstance(audio, list) else (1 if audio else 0),
+            )
+            applied_chat_template = True
+        except Exception:
+            # Fall back to raw prompt if templating fails.
+            applied_chat_template = False
+
+    add_special_tokens = False if applied_chat_template else True
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
