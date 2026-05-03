@@ -75,21 +75,45 @@ class SharedMLP(nn.Module):
         return self.output_linear(nn.silu(gate) * x)
 
 
+class MLP(nn.Module):
+    """Standard Granite MLP with separate gate/up/down projections."""
+
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        self.gate_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size, config.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size, config.hidden_size, bias=config.mlp_bias
+        )
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.self_attn = Attention(config)
-        self.shared_mlp = SharedMLP(config)
+        if config.use_shared_mlp:
+            self.shared_mlp = SharedMLP(config)
+        else:
+            self.mlp = MLP(config)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.residual_multiplier = config.residual_multiplier
+        self._use_shared_mlp = config.use_shared_mlp
 
     def __call__(self, x, mask=None, cache=None):
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r * self.residual_multiplier
-        r = self.shared_mlp(self.post_attention_layernorm(h))
+        mlp_fn = self.shared_mlp if self._use_shared_mlp else self.mlp
+        r = mlp_fn(self.post_attention_layernorm(h))
         out = h + r * self.residual_multiplier
         return out
 

@@ -28,6 +28,10 @@ class TextConfig(BaseModelConfig):
     residual_multiplier: float = 0.22
     logits_scaling: float = 10.0
 
+    @property
+    def use_shared_mlp(self) -> bool:
+        return self.model_type == "granitemoehybrid"
+
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
