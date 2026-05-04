@@ -75,8 +75,16 @@ class Attention(nn.Module):
 
         qkv_out = self.qkv(x)
 
+        # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
         raw_offset = cache.offset if cache is not None else 0
-        if isinstance(raw_offset, mx.array):
+        if cache is not None and hasattr(cache, "_idx"):
+            offset = int(cache._idx)
+            offsets_per_seq = (
+                raw_offset
+                if isinstance(raw_offset, mx.array) and raw_offset.size > 1
+                else None
+            )
+        elif isinstance(raw_offset, mx.array):
             if raw_offset.size > 1:
                 # Per-sequence offsets from BatchKVCache -- shape (B,).
                 offsets_per_seq = raw_offset

@@ -475,7 +475,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -483,11 +483,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -519,19 +518,19 @@ class LanguageModel(nn.Module):
         if pixel_values is not None:
             self._rope_deltas = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim == 0 or offset.size == 1:
-                    cache_offset = offset.item()
-                else:
-                    cache_offsets = offset
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = c0.offset
 
         if position_ids is None and (mask is None or mask.ndim == 2):
             is_prefill = (

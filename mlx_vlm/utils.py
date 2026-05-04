@@ -3,6 +3,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -41,6 +42,7 @@ MODEL_REMAPPING = {
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
+    "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -86,16 +88,18 @@ def skip_multimodal_module(path: str) -> bool:
     Returns:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    return (
-        "vision_model" in path
-        or "vision_tower" in path
-        or "vl_connector" in path
-        or "sam_model" in path
-        or "audio_model" in path
-        or "audio_tower" in path
-        or "code_predictor" in path
-        or "img_projector" in path
+    multimodal_modules = (
+        "vision_model",
+        "vision_tower",
+        "vl_connector",
+        "sam_model",
+        "audio_model",
+        "audio_tower",
+        "code_predictor",
+        "img_projector",
+        "multi_modal_projector",
     )
+    return any(module in path for module in multimodal_modules)
 
 
 def get_class_predicate(
@@ -301,7 +305,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if not "quantization" in config:
+    if "quantization" not in config:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
@@ -876,55 +880,6 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
-def _resample_fft(signal: np.ndarray, n_target: int) -> np.ndarray:
-    """FFT-based resampling for a 1D signal (matches scipy.signal.resample)."""
-    n_orig = len(signal)
-    if n_orig == n_target:
-        return signal
-
-    X = np.fft.rfft(signal)
-    m = min(n_target, n_orig)
-    m2 = m // 2 + 1
-
-    # Truncate to relevant frequency bins
-    X = X[:m2].copy()
-
-    # Account for unpaired Nyquist bin (matches scipy exactly)
-    if m % 2 == 0 and n_target != n_orig:
-        X[m // 2] *= 2.0 if n_target < n_orig else 0.5
-
-    s_fac = n_orig / n_target
-    resampled = np.fft.irfft(X / s_fac, n=n_target)
-    return resampled.astype(signal.dtype)
-
-
-def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio using FFT (matches scipy.signal.resample)."""
-    if orig_sr == target_sr:
-        return audio
-
-    ratio = target_sr / orig_sr
-
-    if audio.ndim == 1:
-        new_length = int(len(audio) * ratio)
-        resampled = _resample_fft(audio, new_length)
-
-    elif audio.ndim == 2:
-        if audio.shape[0] < audio.shape[1]:
-            audio = audio.T
-
-        n_samples, n_channels = audio.shape
-        new_length = int(n_samples * ratio)
-
-        resampled = np.zeros((new_length, n_channels), dtype=audio.dtype)
-        for i in range(n_channels):
-            resampled[:, i] = _resample_fft(audio[:, i], new_length)
-    else:
-        raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
-
-    return resampled
-
-
 def read_audio(file) -> tuple:
     """Read an audio file using miniaudio (or ffmpeg for m4a/aac/ogg/opus).
 
@@ -1079,29 +1034,100 @@ def load_audio(
     Helper function to load audio from either a URL, file path, or numpy array.
     """
     if isinstance(file, np.ndarray):
-        return file
+        audio = file.astype(np.float32, copy=False)
+        return audio.mean(axis=1) if audio.ndim > 1 else audio
+
+    from mlx_audio.audio_io import read as read_audio
+    from mlx_audio.utils import resample_audio
+
     if isinstance(file, Path):
         file = str(file)
     if isinstance(file, str) and file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
-            audio, sample_rate = read_audio(BytesIO(response.content))
+            audio, sample_rate = read_audio(BytesIO(response.content), dtype="float32")
         except Exception as e:
             raise ValueError(
                 f"Failed to load audio from URL: {file} with error {e}"
             ) from e
     else:
-        audio, sample_rate = read_audio(file)
+        audio, sample_rate = read_audio(file, dtype="float32")
 
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
-    return np.array(audio).mean(axis=1)
+    audio = np.asarray(audio, dtype=np.float32)
+    return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
 def normalize_audio_features(features: mx.array) -> mx.array:
     """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
     return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
+
+
+def load_video(
+    video_path: str,
+    fps: float = 2.0,
+    nframes: Optional[int] = None,
+    min_frames: int = 4,
+    max_frames: int = 768,
+    frame_factor: int = 2,
+) -> Tuple[np.ndarray, float]:
+    """Read a video file as a (T, C, H, W) numpy array.
+
+    Uniformly samples ``nframes`` frames — either a fixed count or derived
+    from ``fps`` — and returns the sampled frames alongside the effective
+    sampling fps.
+    """
+    import cv2
+
+    if video_path.startswith("file://"):
+        video_path = video_path[7:]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+
+    def _round(n):
+        return round(n / frame_factor) * frame_factor
+
+    def _floor(n):
+        return math.floor(n / frame_factor) * frame_factor
+
+    def _ceil(n):
+        return math.ceil(n / frame_factor) * frame_factor
+
+    if nframes is not None:
+        n = _round(nframes)
+    else:
+        lo = _ceil(min_frames)
+        hi = _floor(min(max_frames, total_frames))
+        n = total_frames / video_fps * fps
+        n = min(max(n, lo), hi, total_frames)
+        n = _floor(n)
+    if not (frame_factor <= n <= total_frames):
+        cap.release()
+        raise ValueError(
+            f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
+        )
+
+    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    if not frames:
+        raise ValueError("No frames read from the video.")
+
+    video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
+    sample_fps = n / max(total_frames, 1e-6) * video_fps
+    return video_np, sample_fps
 
 
 def process_inputs(
@@ -1179,6 +1205,7 @@ def prepare_inputs(
     processor,
     images=None,
     audio=None,
+    videos=None,
     prompts=None,
     image_token_index=None,
     resize_shape=None,
@@ -1194,7 +1221,10 @@ def prepare_inputs(
         not hasattr(images, "__len__") or len(images) > 0
     )
     has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
-    if not has_images and not has_audio:
+    has_videos = videos is not None and (
+        not hasattr(videos, "__len__") or len(videos) > 0
+    )
+    if not has_images and not has_audio and not has_videos:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1342,6 +1372,22 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
+    video_fps = None
+    if has_videos:
+        if not isinstance(videos, list):
+            videos = [videos]
+        fps_hint = kwargs.pop("fps", 2.0)
+        loaded, video_fps = [], []
+        for v in videos:
+            arr, s_fps = (
+                load_video(str(v), fps=fps_hint)
+                if isinstance(v, (str, bytes))
+                else (v, fps_hint)
+            )
+            loaded.append(arr)
+            video_fps.append(s_fps)
+        videos = loaded
+
     model_inputs = {}
 
     if hasattr(processor, "image_processor") and isinstance(
@@ -1380,12 +1426,18 @@ def prepare_inputs(
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        extra = {}
+        if has_videos:
+            extra["videos"] = videos
+            if video_fps is not None:
+                extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            **extra,
             **kwargs,
         )
 

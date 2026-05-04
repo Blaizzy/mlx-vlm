@@ -141,6 +141,38 @@ class TestApplyChatTemplateIntegration:
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
 
+    def test_nemotron_omni_formats_image_and_audio_messages(self):
+        """Nemotron Omni should use typed multimodal content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        for model_type in (
+            "nemotron_h_nano_omni",
+            "nemotronh_nano_omni_reasoning_v3",
+        ):
+            result = apply_chat_template(
+                None,
+                {"model_type": model_type},
+                "Describe the inputs.",
+                return_messages=True,
+                num_images=1,
+                num_audios=1,
+            )
+
+            assert result == [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {
+                            "type": "text",
+                            "text": "Describe the inputs.",
+                            "content": "Describe the inputs.",
+                        },
+                        {"type": "audio"},
+                    ],
+                }
+            ]
+
     def test_multimodal_message_does_not_include_base64_in_prompt(self):
         """Critical regression test: base64 should NOT appear in formatted messages.
 

@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import time
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
@@ -30,6 +31,7 @@ from .utils import (
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
 DEFAULT_AUDIO = None
+DEFAULT_VIDEO = None
 DEFAULT_PROMPT = "What are these?"
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.0
@@ -77,6 +79,19 @@ def parse_arguments():
         nargs="+",
         default=DEFAULT_AUDIO,
         help="URL or path of the audio to process.",
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        nargs="+",
+        default=DEFAULT_VIDEO,
+        help="URL or path of the video to process.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=2.0,
+        help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
         "--resize-shape",
@@ -255,7 +270,7 @@ def normalize_resize_shape(
 
 
 # A stream on the default device just for generation
-generation_stream = mx.new_stream(mx.default_device())
+generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 def maybe_quantize_kv_cache(
@@ -401,8 +416,12 @@ def _speculative_walk(
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
     """
-    d = draft_tokens[0].tolist()
-    t = target_tokens[0].tolist()
+    n_draft = draft_tokens.shape[1]
+    combined = mx.concatenate(
+        [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
+    ).tolist()
+    d = combined[:n_draft]
+    t = combined[n_draft:]
     accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
     new_tokens = (d[:accepted] + [t[accepted]])[:budget]
     return accepted, new_tokens
@@ -419,12 +438,15 @@ def _speculative_walk_batch(
     corresponds to one sequence in the batch.
     """
     B = draft_tokens.shape[0]
-    d_batch = draft_tokens.tolist()
-    t_batch = target_tokens.tolist()
+    n_draft = draft_tokens.shape[1]
+    combined = mx.concatenate(
+        [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
+    ).tolist()
     accepted_list: List[int] = []
     new_tokens_list: List[List[int]] = []
     for i in range(B):
-        d, t = d_batch[i], t_batch[i]
+        d = combined[i][:n_draft]
+        t = combined[i][n_draft:]
         acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
         new = (d[:acc] + [t[acc]])[: budgets[i]]
         accepted_list.append(acc)
@@ -474,14 +496,11 @@ def _dflash_rounds(
         if bs <= 1:
             break
 
-        # Draft
-        with mx.stream(generation_stream):
-            draft_tokens = draft_model.draft_block(
-                b, hidden, draft_cache, bs, sampler, token_dtype
-            )
+        draft_tokens = draft_model.draft_block(
+            b, hidden, draft_cache, bs, sampler, token_dtype
+        )
         mx.async_eval(draft_tokens)
 
-        # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
@@ -509,10 +528,18 @@ def _dflash_rounds(
             if emitted >= max_tokens:
                 return
 
-        lm.rollback_speculative_cache(prompt_cache, verify_out.gdn_states, accepted, bs)
-
-        hidden = hidden[:, : accepted + 1, :]
+        if accepted < bs - 1:
+            hidden = hidden[:, : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
+
+        if accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted, bs
+                )
+
+        if emitted % 256 == 0:
+            mx.clear_cache()
 
 
 def _dflash_rounds_batch(
@@ -568,6 +595,8 @@ def _dflash_rounds_batch(
         nonlocal draft_cache
         draft_cache = draft_model.make_cache()
 
+    total_emitted = sum(emitted)
+
     while len(active_idx) > 0:
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
@@ -582,10 +611,9 @@ def _dflash_rounds_batch(
         b_arr = mx.array(b_active, dtype=token_dtype)
 
         # Draft
-        with mx.stream(generation_stream):
-            draft_tokens = draft_model.draft_block(
-                b_arr, hidden, draft_cache, bs, sampler, token_dtype
-            )
+        draft_tokens = draft_model.draft_block(
+            b_arr, hidden, draft_cache, bs, sampler, token_dtype
+        )
         mx.async_eval(draft_tokens)
 
         # Verify
@@ -606,11 +634,15 @@ def _dflash_rounds_batch(
             draft_tokens, target_tokens, budgets
         )
 
+        min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
-        max_a = lm.rollback_speculative_cache(
-            prompt_cache, verify_out.gdn_states, accepted_arr, bs
-        )
-        hidden = hidden_full[:, : max_a + 1, :]
+
+        if min_accepted < bs - 1:
+            max_a = int(accepted_arr.max().item())
+            hidden = hidden_full[:, : max_a + 1, :]
+        else:
+            max_a = bs - 1
+            hidden = hidden_full
 
         for a in accepted_list:
             draft_model.accept_lens.append(a)
@@ -637,6 +669,12 @@ def _dflash_rounds_batch(
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
 
+        if min_accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
+                )
+
         # --- Continuous batching: filter out finished sequences ---
         keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
         if len(keep_slots) < n_active:
@@ -653,6 +691,11 @@ def _dflash_rounds_batch(
             active_idx = [active_idx[j] for j in keep_slots]
             # Cold-restart drafter for the new batch size
             _reinit_drafter()
+
+        new_total = sum(emitted)
+        if new_total // 256 > total_emitted // 256:
+            mx.clear_cache()
+        total_emitted = new_total
 
 
 def generate_step(
@@ -926,6 +969,7 @@ def stream_generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     **kwargs,
 ) -> Union[str, Generator[str, None, None]]:
     """
@@ -984,6 +1028,7 @@ def stream_generate(
             processor,
             images=image,
             audio=audio,
+            videos=video,
             prompts=prompt,
             image_token_index=image_token_index,
             resize_shape=resize_shape,
@@ -1141,6 +1186,7 @@ def generate(
     prompt: str,
     image: Union[str, List[str]] = None,
     audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
     verbose: bool = False,
     **kwargs,
 ) -> GenerationResult:
@@ -1168,8 +1214,8 @@ def generate(
             files.extend(image)
         if audio is not None:
             files.extend(audio)
-        if kwargs.get("video") is not None:
-            files.extend(kwargs.get("video"))
+        if video is not None:
+            files.extend(video if isinstance(video, list) else [video])
 
         print(f"Files: {files}", "\n")
 
@@ -1201,7 +1247,9 @@ def generate(
     else:
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
-    for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
+    for response in stream_generate(
+        model, processor, prompt, image, audio, video, **kwargs
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -1439,6 +1487,10 @@ class GenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         top_logprobs_k: int = 0,
+        token_context: Optional[List[List[int]]] = None,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1450,6 +1502,8 @@ class GenerationBatch:
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
+        self.logits_processors = logits_processors or []
+        self.token_context = [list(ctx) for ctx in (token_context or [])]
 
         self._current_tokens = None
         self._current_lps = None
@@ -1479,6 +1533,29 @@ class GenerationBatch:
         )
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
+
+        if self.logits_processors and any(self.logits_processors):
+            last_tokens = inputs.tolist()
+            if not self.token_context:
+                self.token_context = [[] for _ in self.uids]
+            for i, token in enumerate(last_tokens):
+                self.token_context[i].append(token)
+
+            processed_logits = []
+            for i in range(logits.shape[0]):
+                sample_logits = logits[i : i + 1]
+                processors = self.logits_processors[i] or []
+                for processor in processors:
+                    if hasattr(processor, "process_last_token"):
+                        sample_logits = processor.process_last_token(
+                            last_tokens[i], sample_logits
+                        )
+                    else:
+                        sample_logits = processor(
+                            mx.array(self.token_context[i]), sample_logits
+                        )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = self.sampler(logprobs)
@@ -1528,10 +1605,13 @@ class GenerationBatch:
 
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
+        self_was_empty = len(self.uids) == 0
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
         self._num_tokens.extend(other._num_tokens)
+        self.token_context.extend(other.token_context)
+        self.logits_processors.extend(other.logits_processors)
 
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
@@ -1570,9 +1650,14 @@ class GenerationBatch:
                 self._next_top_idx = None
                 self._next_top_lp = None
 
-        if self._rope_deltas is None:
+        if self_was_empty:
             self._rope_deltas = other._rope_deltas
-        elif other._rope_deltas is not None:
+        elif (self._rope_deltas is None) != (other._rope_deltas is None):
+            raise RuntimeError(
+                "extend() mixes MRoPE and non-MRoPE batches; both sides must "
+                "carry rope_deltas or neither side may."
+            )
+        elif self._rope_deltas is not None:
             self._rope_deltas = mx.concatenate([self._rope_deltas, other._rope_deltas])
 
     def filter(self, keep: List[int]):
@@ -1580,6 +1665,10 @@ class GenerationBatch:
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
+        if self.token_context:
+            self.token_context = [self.token_context[idx] for idx in keep]
+        if self.logits_processors:
+            self.logits_processors = [self.logits_processors[idx] for idx in keep]
 
         if not keep:
             self.prompt_cache.clear()
@@ -1590,6 +1679,8 @@ class GenerationBatch:
             self._next_top_idx = None
             self._next_top_lp = None
             self._rope_deltas = None
+            self.token_context = []
+            self.logits_processors = []
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1661,6 +1752,8 @@ class GenerationBatch:
         batch._num_tokens = []
         batch.compute_logprobs = compute_logprobs
         batch.top_logprobs_k = top_logprobs_k
+        batch.token_context = []
+        batch.logits_processors = []
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -1688,6 +1781,9 @@ class PromptProcessingBatch:
         max_tokens: List[int],
         inputs_embeds: mx.array,
         prompt_kwargs: dict,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
@@ -1704,6 +1800,12 @@ class PromptProcessingBatch:
         self._total_prompt_tokens = sum(lengths)
 
         self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
+        self.logits_processors = logits_processors or []
+        self._token_context = (
+            [list(ids) for ids in input_ids]
+            if self.logits_processors and any(self.logits_processors)
+            else []
+        )
         self._inputs_embeds = inputs_embeds
         self._prompt_kwargs = prompt_kwargs
 
@@ -1755,6 +1857,18 @@ class PromptProcessingBatch:
         )
         logits = output.logits if hasattr(output, "logits") else output
         logits = logits[:, -1, :]
+        if self.logits_processors and any(self.logits_processors):
+            processed_logits = []
+            for i in range(logits.shape[0]):
+                sample_logits = logits[i : i + 1]
+                processors = self.logits_processors[i] or []
+                for processor in processors:
+                    sample_logits = processor(
+                        mx.array(self._token_context[i]), sample_logits
+                    )
+                processed_logits.append(sample_logits)
+            logits = mx.concatenate(processed_logits, axis=0)
+
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
 
@@ -1767,6 +1881,8 @@ class PromptProcessingBatch:
             stop_criteria=stop_criteria,
             max_tokens=list(self.max_tokens),
             top_logprobs_k=top_logprobs_k,
+            token_context=[list(ctx) for ctx in self._token_context],
+            logits_processors=list(self.logits_processors),
         )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -1785,22 +1901,39 @@ class PromptProcessingBatch:
             gen_batch._next_top_lp = top_lp
 
         language_model = getattr(self.model, "language_model", self.model)
-        rope_deltas = getattr(language_model, "_rope_deltas", None)
+        rope_deltas = self._capture_rope_deltas(language_model, len(gen_batch.uids))
         if rope_deltas is not None:
-            # Normalize to shape (B, 1) so extend/filter stay consistent.
-            if rope_deltas.ndim == 0:
-                rope_deltas = rope_deltas.reshape(1, 1)
-            elif rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas[:, None]
             gen_batch._rope_deltas = rope_deltas
 
         self.uids = []
         self.prompt_cache = []
+        self._token_context = []
+        self.logits_processors = []
         return gen_batch
 
     @property
     def total_prompt_tokens(self):
         return self._total_prompt_tokens
+
+    @staticmethod
+    def _capture_rope_deltas(language_model, B: int):
+        if not hasattr(language_model, "_rope_deltas"):
+            return None
+        rope_deltas = language_model._rope_deltas
+        if rope_deltas is None:
+            return mx.zeros((B, 1), dtype=mx.int32)
+        if rope_deltas.ndim == 0:
+            rope_deltas = rope_deltas.reshape(1, 1)
+        elif rope_deltas.ndim == 1:
+            rope_deltas = rope_deltas[:, None]
+        # Falcon OCR emits a singleton meant to broadcast across rows.
+        if rope_deltas.shape[0] == 1 and B > 1:
+            rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
+        if rope_deltas.shape[0] != B:
+            raise RuntimeError(
+                f"_rope_deltas shape {rope_deltas.shape} does not match prefill batch size {B}"
+            )
+        return rope_deltas
 
 
 class BatchGenerator:
@@ -1816,6 +1949,7 @@ class BatchGenerator:
         self,
         model,
         processor,
+        *,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         stop_tokens: Optional[set] = None,
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
@@ -1829,6 +1963,10 @@ class BatchGenerator:
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
         compute_logprobs: bool = True,
         top_logprobs_k: int = 0,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
+        stream=None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1839,6 +1977,7 @@ class BatchGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
+        self.logits_processors = logits_processors or []
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1847,6 +1986,8 @@ class BatchGenerator:
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
+
+        self._stream = stream or generation_stream
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
@@ -1866,7 +2007,11 @@ class BatchGenerator:
         self._steps_counter = 0
 
         self._wire_stack = contextlib.ExitStack()
-        self._wire_stack.enter_context(wired_limit(model, [generation_stream]))
+        self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    @property
+    def stream(self):
+        return self._stream
 
     def close(self):
         if self._wire_stack is not None:
@@ -1881,6 +2026,9 @@ class BatchGenerator:
         prompts,
         max_tokens: Union[List[int], int, None] = None,
         prompt_kwargs: Optional[List[dict]] = None,
+        logits_processors: Optional[
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
+        ] = None,
     ):
         uids = []
 
@@ -1889,9 +2037,13 @@ class BatchGenerator:
 
         if prompt_kwargs is None:
             prompt_kwargs = [{}] * len(prompts)
+        if logits_processors is None:
+            logits_processors = [self.logits_processors] * len(prompts)
+        elif len(logits_processors) != len(prompts):
+            raise ValueError("Insufficient number of logits_processors provided")
 
-        for p, m, kw in zip(prompts, max_tokens, prompt_kwargs):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw))
+        for p, m, kw, lp in zip(prompts, max_tokens, prompt_kwargs, logits_processors):
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -1902,9 +2054,9 @@ class BatchGenerator:
 
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -2007,6 +2159,7 @@ class BatchGenerator:
             input_ids = [s[1] for s in sequences]
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
+            logits_processors = [s[4] for s in sequences]
 
             inputs_embeds = None
             merged_kwargs = {}
@@ -2033,6 +2186,7 @@ class BatchGenerator:
                 max_tokens=max_tokens_list,
                 inputs_embeds=inputs_embeds,
                 prompt_kwargs=merged_kwargs,
+                logits_processors=logits_processors,
                 prefill_step_size=self.prefill_step_size,
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
@@ -2062,7 +2216,7 @@ class BatchGenerator:
         return prompt_responses, generation_responses
 
     def next(self, **kwargs):
-        with mx.stream(generation_stream):
+        with mx.stream(self._stream):
             return self._next(**kwargs)
 
 
@@ -2181,6 +2335,16 @@ def batch_generate(
         else:
             group_max_tokens = max_tokens
 
+        group_kwargs = dict(kwargs)
+        logits_processors = group_kwargs.get("logits_processors")
+        if logits_processors is not None and isinstance(logits_processors, list):
+            if not logits_processors or all(callable(p) for p in logits_processors):
+                group_kwargs["logits_processors"] = logits_processors
+            else:
+                group_kwargs["logits_processors"] = [
+                    logits_processors[i] for i in indices
+                ]
+
         # Process the entire group at once (same shape = no padding needed)
         chunk_texts, chunk_stats = _generate_batch(
             model,
@@ -2188,7 +2352,7 @@ def batch_generate(
             group_prompts,
             group_images,
             group_max_tokens,
-            **kwargs,
+            **group_kwargs,
         )
 
         # Store results in original order
@@ -2230,6 +2394,19 @@ def batch_generate(
     return response
 
 
+def _clone_or_share_logits_processor(processor):
+    if hasattr(processor, "clone"):
+        return processor.clone()
+    warnings.warn(
+        "Sharing logits processor across batch entries because it does not "
+        "implement clone(). Stateful logits processors should implement clone() "
+        "to avoid shared state across sequences.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return processor
+
+
 def _generate_batch(
     model,
     processor,
@@ -2242,6 +2419,7 @@ def _generate_batch(
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
+    logits_processors = kwargs.pop("logits_processors", None)
 
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
@@ -2306,10 +2484,19 @@ def _generate_batch(
 
     gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
 
+    if logits_processors and all(
+        callable(processor) for processor in logits_processors
+    ):
+        logits_processors = [
+            [_clone_or_share_logits_processor(p) for p in logits_processors]
+            for _ in range(batch_size)
+        ]
+
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
         prompt_kwargs=[gen_kwargs] * len(input_ids),
+        logits_processors=logits_processors,
     )
     results = {uid: [] for uid in uids}
 
@@ -2343,6 +2530,10 @@ def main():
     args = parse_arguments()
     if isinstance(args.image, str):
         args.image = [args.image]
+    if isinstance(args.audio, str):
+        args.audio = [args.audio]
+    if isinstance(args.video, str):
+        args.video = [args.video]
 
     model, processor = load(
         args.model,
@@ -2363,11 +2554,12 @@ def main():
     prompt = args.prompt
 
     num_images = len(args.image) if args.image is not None else 0
-    num_audios = (
-        1 if args.audio is not None else 0
-    )  # TODO: Support multiple audio files
+    num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.video:
+        chat_template_kwargs["video"] = args.video
+        chat_template_kwargs["fps"] = args.fps
 
     prompt = apply_chat_template(
         processor,
@@ -2415,7 +2607,12 @@ def main():
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
             prompt = apply_chat_template(
-                processor, config, chat, num_images=num_images, **chat_template_kwargs
+                processor,
+                config,
+                chat,
+                num_images=num_images,
+                num_audios=num_audios,
+                **chat_template_kwargs,
             )
             response = ""
             print("Assistant:", end="")
@@ -2448,6 +2645,8 @@ def main():
         gen_kwargs = {
             "image": args.image,
             "audio": args.audio,
+            "video": args.video,
+            "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
             "verbose": args.verbose,

@@ -3,28 +3,10 @@ import warnings
 
 import mlx.core as mx
 
+from ..models.base import to_mlx
+from ..prompt_utils import MODEL_CONFIG, apply_chat_template
 
-def get_prompt(model_type, processor, conversation):
-    if model_type == "paligemma":
-        return conversation
-
-    tokenizer = getattr(processor, "tokenizer", processor)
-    chat_template = getattr(tokenizer, "chat_template", None)
-
-    apply_fn = (
-        tokenizer.apply_chat_template
-        if chat_template
-        else getattr(processor, "apply_chat_template", None)
-    )
-
-    if apply_fn is None:
-        raise ValueError("Processor/Tokenizer has no apply_chat_template method.")
-
-    return apply_fn(
-        conversation,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
+NATIVE_PREPROCESS_MODELS = set(MODEL_CONFIG.keys())
 
 
 class VisionDataset:
@@ -52,25 +34,24 @@ class VisionDataset:
 
     def process(self, item):
         """Process a single item from the dataset"""
-        from mlx_vlm.utils import prepare_inputs
+        from mlx_vlm.utils import prepare_inputs, process_inputs_with_fallback
 
-        # Handle images
         images = item.get("images", item.get("image", []))
         if not isinstance(images, list):
             images = [images] if images else []
 
-        # Handle audio
         audio = item.get("audio", item.get("audios", []))
         if not isinstance(audio, list):
             audio = [audio] if audio else []
 
-        # Get conversations
         conversations = item.get("messages", item.get("conversations"))
 
         model_type = self.config.get("model_type")
 
+        num_images = len(images)
+        num_audios = len(audio)
+
         prompts = []
-        # Format prompt based on model type
         if isinstance(conversations, list) and isinstance(conversations[0], list):
             for conversation in conversations:
                 if model_type == "pixtral":
@@ -80,16 +61,29 @@ class VisionDataset:
                             "Pixtral batch processing is not supported yet. Set batch size to 1."
                         )
 
-                prompt = get_prompt(model_type, self.processor, conversation)
+                prompt = apply_chat_template(
+                    self.processor,
+                    self.config,
+                    conversation,
+                    add_generation_prompt=False,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                )
                 prompts.append(prompt)
 
         else:
             if model_type == "pixtral":
                 conversations = [json.loads(i) for i in conversations]
-            prompt = get_prompt(model_type, self.processor, conversations)
+            prompt = apply_chat_template(
+                self.processor,
+                self.config,
+                conversations,
+                add_generation_prompt=False,
+                num_images=num_images,
+                num_audios=num_audios,
+            )
             prompts.append(prompt)
 
-        # Prepare inputs
         image_token_index = self.config.get("image_token_index") or self.config.get(
             "image_token_id"
         )
@@ -98,20 +92,32 @@ class VisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        )
+        inputs = None
+        if model_type in NATIVE_PREPROCESS_MODELS:
+            try:
+                inputs = process_inputs_with_fallback(
+                    processor=self.processor,
+                    prompts=prompts,
+                    images=images if images else None,
+                    audio=audio if audio else None,
+                    add_special_tokens=False,
+                )
+                if "images" in inputs and "pixel_values" not in inputs:
+                    inputs["pixel_values"] = inputs.pop("images")
+            except Exception:
+                pass
 
-        inputs = prepare_inputs(
-            processor=self.processor,
-            images=None if use_embedded_images else (images if images else None),
-            audio=audio if audio else None,
-            prompts=prompts,
-            image_token_index=image_token_index,
-            resize_shape=self.image_resize_shape,
-        )
+        if inputs is None:
+            inputs = prepare_inputs(
+                processor=self.processor,
+                images=images if images else None,
+                audio=audio if audio else None,
+                prompts=prompts,
+                image_token_index=image_token_index,
+                resize_shape=self.image_resize_shape,
+            )
+
+        inputs = to_mlx(inputs)
 
         return {
             "pixel_values": inputs.get("pixel_values"),
@@ -151,13 +157,11 @@ class PreferenceVisionDataset:
         return self.process(self.dataset[idx])
 
     def process(self, item):
-        from mlx_vlm.utils import prepare_inputs
+        from mlx_vlm.utils import prepare_inputs, process_inputs_with_fallback
 
         images = item.get("images", item.get("image", []))
         if not isinstance(images, list):
             images = [images] if images else []
-
-        model_type = self.config.get("model_type")
 
         image_token_index = self.config.get("image_token_index") or self.config.get(
             "image_token_id"
@@ -167,31 +171,50 @@ class PreferenceVisionDataset:
                 "Config must contain 'image_token_index' or 'image_token_id'"
             )
 
-        use_embedded_images = (
-            model_type.startswith("gemma")
-            or model_type.startswith("qwen")
-            or model_type == "smolvlm"
-        )
-        images_for_inputs = (
-            None if use_embedded_images else (images if images else None)
-        )
+        num_images = len(images)
+
+        model_type = self.config.get("model_type")
 
         result = {}
         for key in ("chosen", "rejected"):
             sequence = item[key]
-            prompt = (
-                sequence
-                if isinstance(sequence, str)
-                else get_prompt(model_type, self.processor, sequence)
-            )
-            inputs = prepare_inputs(
-                processor=self.processor,
-                images=images_for_inputs,
-                audio=None,
-                prompts=[prompt],
-                image_token_index=image_token_index,
-                resize_shape=self.image_resize_shape,
-            )
+            if isinstance(sequence, str):
+                prompt = sequence
+            else:
+                prompt = apply_chat_template(
+                    self.processor,
+                    self.config,
+                    sequence,
+                    add_generation_prompt=False,
+                    num_images=num_images,
+                )
+            inputs = None
+            if model_type in NATIVE_PREPROCESS_MODELS:
+                try:
+                    inputs = process_inputs_with_fallback(
+                        processor=self.processor,
+                        prompts=[prompt],
+                        images=images if images else None,
+                        audio=None,
+                        add_special_tokens=False,
+                    )
+                    if "images" in inputs and "pixel_values" not in inputs:
+                        inputs["pixel_values"] = inputs.pop("images")
+                except Exception:
+                    pass
+
+            if inputs is None:
+                inputs = prepare_inputs(
+                    processor=self.processor,
+                    images=images if images else None,
+                    audio=None,
+                    prompts=[prompt],
+                    image_token_index=image_token_index,
+                    resize_shape=self.image_resize_shape,
+                )
+
+            inputs = to_mlx(inputs)
+
             result[f"{key}_input_ids"] = inputs["input_ids"]
             result[f"{key}_attention_mask"] = inputs.get(
                 "attention_mask", mx.ones_like(inputs["input_ids"])

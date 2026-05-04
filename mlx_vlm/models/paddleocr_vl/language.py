@@ -403,7 +403,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -411,11 +411,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -451,18 +450,14 @@ class LanguageModel(nn.Module):
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                if offset.ndim > 0 and offset.size > 1:
-                    cache_offsets = mx.maximum(offset, 0)
-                    cache_offset = cache_offsets[0].item()
-                else:
-                    cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
-            cache_offset = max(cache_offset, 0)
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = mx.maximum(c0.offset, 0)
 
         # Check if mask shape matches input shape
         rope_mask = mask

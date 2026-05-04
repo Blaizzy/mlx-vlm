@@ -23,6 +23,10 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
     tokenizer_class = "AutoTokenizer"
     video_processor_class = "AutoVideoProcessor"
 
+    # Override the check_argument_for_proper_class method to allow for numpy processors
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
+
     def __init__(
         self,
         image_processor=None,
@@ -149,61 +153,48 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import json
-        from pathlib import Path
-
-        from transformers import AutoImageProcessor, AutoTokenizer
-
-        kwargs.pop("use_fast", None)
-        model_path = Path(pretrained_model_name_or_path)
+        from transformers import AutoTokenizer
 
         from ..base import load_chat_template
+        from ..qwen3_vl.processing_qwen3_vl import (
+            Qwen3VLImageProcessor,
+            Qwen3VLVideoProcessor,
+            _load_qwen_vl_json,
+            _qwen_vl_image_kwargs,
+            _qwen_vl_video_kwargs,
+        )
 
+        kwargs.pop("use_fast", None)
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
-        load_chat_template(tokenizer, model_path)
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        proc_cfg_path = model_path / "processor_config.json"
-        ip_overrides = {}
-        if proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
-            ip_cfg = proc_cfg.get("image_processor", {})
-            if "patch_size" in ip_cfg:
-                ip_overrides["patch_size"] = ip_cfg["patch_size"]
-            if "size" in ip_cfg:
-                ip_overrides["size"] = ip_cfg["size"]
-
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                use_fast=False,
-                **ip_overrides,
-                **kwargs,
+        # Qwen2.5 default: patch_size=14.
+        image_processor = Qwen3VLImageProcessor(
+            **_qwen_vl_image_kwargs(
+                pretrained_model_name_or_path, default_patch_size=14
             )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                **ip_overrides,
-                **kwargs,
+        )
+        video_processor = Qwen3VLVideoProcessor(
+            **_qwen_vl_video_kwargs(
+                pretrained_model_name_or_path, default_patch_size=14
             )
+        )
 
-        video_processor = None
-        try:
-            from transformers import AutoVideoProcessor
-
-            video_processor = AutoVideoProcessor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs
-            )
-        except (ImportError, ValueError, OSError):
-            pass
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or {}
+        )
+        chat_template = proc_cfg.get(
+            "chat_template", getattr(tokenizer, "chat_template", None)
+        )
 
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
             video_processor=video_processor,
-            chat_template=getattr(tokenizer, "chat_template", None),
+            chat_template=chat_template,
         )
 
 

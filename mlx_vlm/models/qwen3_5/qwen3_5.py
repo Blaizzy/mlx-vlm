@@ -27,6 +27,9 @@ class Model(Qwen3VLModel):
         pixel_values: Optional[mx.array] = None,
         **kwargs,
     ):
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos", None)
+
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)

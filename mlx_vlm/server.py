@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -41,12 +41,12 @@ from .generate import (
     _dflash_rounds_batch,
     _make_cache,
     generate,
-    generation_stream,
     normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
+from .structured import build_json_schema_logits_processor
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
@@ -122,6 +122,7 @@ class GenerationArguments:
     enable_thinking: bool = True
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -141,6 +142,8 @@ class GenerationArguments:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
             kw["thinking_start_token"] = self.thinking_start_token
+        if self.logits_processors is not None:
+            kw["logits_processors"] = self.logits_processors
         return kw
 
     def to_template_kwargs(self) -> dict:
@@ -185,32 +188,33 @@ class ResponseGenerator:
 
     def __init__(
         self,
-        model,
-        processor,
-        stop_tokens=None,
+        model_path: str,
+        adapter_path: Optional[str] = None,
         vision_cache=None,
-        draft_model=None,
         kv_bits=None,
         kv_group_size=DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
     ):
-        self.model = model
-        self.processor = processor
-        self.stop_tokens = stop_tokens or set()
+        self.model_path = model_path
+        self.adapter_path = adapter_path
+        self.model = None
+        self.processor = None
+        self.config = None
+        self.stop_tokens = set()
         self.vision_cache = vision_cache
-        self.draft_model = draft_model
+        self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
-        self.tokenizer = (
-            processor.tokenizer if hasattr(processor, "tokenizer") else processor
-        )
+        self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
+        self._ready = Event()
+        self._load_error: Optional[Exception] = None
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
@@ -221,6 +225,13 @@ class ResponseGenerator:
         self.requests.put(None)
         self._thread.join(timeout=5.0)
 
+    def wait_until_ready(self, timeout: Optional[float] = None):
+        if not self._ready.wait(timeout):
+            raise RuntimeError("Timed out waiting for generation thread to load model.")
+        if self._load_error is not None:
+            raise self._load_error
+        return self.model, self.processor, self.config
+
     def _cancel(self, uid):
         with self._cancel_lock:
             self._cancelled.add(uid)
@@ -230,6 +241,37 @@ class ResponseGenerator:
             pending, self._cancelled = self._cancelled, set()
             return pending
 
+    def _initialize_model(self):
+        model, processor, config = load_model_resources(
+            self.model_path, self.adapter_path
+        )
+
+        stop_tokens = set()
+        if hasattr(config, "eos_token_id"):
+            if isinstance(config.eos_token_id, list):
+                stop_tokens.update(config.eos_token_id)
+            elif config.eos_token_id is not None:
+                stop_tokens.add(config.eos_token_id)
+
+        draft_model = None
+        draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+        if draft_model_path:
+            from .speculative.drafters import load_drafter
+
+            draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
+            print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
+            draft_model = load_drafter(draft_model_path, kind=draft_kind)
+            print("Drafter ready — speculative decoding enabled.")
+
+        self.model = model
+        self.processor = processor
+        self.config = config
+        self.stop_tokens = stop_tokens
+        self.draft_model = draft_model
+        self.tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+
     def generate(
         self,
         prompt: str,
@@ -237,7 +279,12 @@ class ResponseGenerator:
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        self.wait_until_ready()
         args = args or GenerationArguments()
+        if self.draft_model is not None and args.logits_processors is not None:
+            raise ValueError(
+                "Structured response_format is not supported with speculative decoding."
+            )
         rqueue: Queue = Queue()
 
         # CPU preprocessing (tokenize, load images) on caller thread.
@@ -345,9 +392,22 @@ class ResponseGenerator:
 
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        try:
+            self._initialize_model()
+        except Exception as e:
+            self._load_error = e
+            self._ready.set()
+            print(f"Error loading model in generation thread: {e}")
+            traceback.print_exc()
+            return
+
+        self._ready.set()
+
         if self.draft_model is not None:
             self._run_speculative()
             return
+
+        generation_stream = mx.default_stream(mx.default_device())
 
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
@@ -411,6 +471,7 @@ class ResponseGenerator:
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
                             top_logprobs_k=self.top_logprobs_k,
+                            stream=generation_stream,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -428,6 +489,7 @@ class ResponseGenerator:
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
+                            logits_processors=[args.logits_processors],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -465,6 +527,8 @@ class ResponseGenerator:
         by ``_dflash_rounds_batch``'s ``stop_check`` callback.
         """
         from mlx_lm.sample_utils import make_sampler as _make_sampler
+
+        generation_stream = mx.default_stream(mx.default_device())
 
         lm = self.model.language_model
         drafter = self.draft_model
@@ -757,7 +821,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
-def _build_gen_args(request) -> GenerationArguments:
+def _build_gen_args(request, processor=None) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
         request, "max_output_tokens", DEFAULT_MAX_TOKENS
@@ -765,7 +829,7 @@ def _build_gen_args(request) -> GenerationArguments:
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
-    return GenerationArguments(
+    args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
@@ -777,6 +841,56 @@ def _build_gen_args(request) -> GenerationArguments:
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
     )
+    if processor is not None:
+        args.logits_processors = _build_structured_logits_processors(request, processor)
+    return args
+
+
+def _as_plain_dict(value):
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
+
+
+def _extract_response_format_schema(request) -> Optional[Union[str, dict]]:
+    response_format = _as_plain_dict(getattr(request, "response_format", None))
+
+    text_config = _as_plain_dict(getattr(request, "text", None))
+    if response_format is None and isinstance(text_config, dict):
+        response_format = _as_plain_dict(text_config.get("format"))
+
+    if response_format is None:
+        return None
+
+    format_type = response_format.get("type")
+    if format_type in (None, "text"):
+        return None
+    if format_type != "json_schema":
+        raise ValueError(f"Unsupported response_format type: {format_type!r}")
+
+    json_schema = _as_plain_dict(response_format.get("json_schema"))
+    if json_schema is None:
+        # Responses API text.format places schema directly on the format object.
+        json_schema = response_format
+
+    schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
+    if schema is None:
+        raise ValueError("response_format json_schema must include a schema field")
+    return schema
+
+
+def _build_structured_logits_processors(request, processor):
+    schema = _extract_response_format_schema(request)
+    if schema is None:
+        return None
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    logits_processor = build_json_schema_logits_processor(tokenizer, schema)
+    return [logits_processor]
 
 
 def _count_thinking_tag_tokens(text: str) -> int:
@@ -950,29 +1064,6 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
 
-    # Load the model resources
-    model, processor, config = load_model_resources(model_path, adapter_path)
-
-    # Get stop tokens from model config
-    stop_tokens = set()
-    if hasattr(config, "eos_token_id"):
-        if isinstance(config.eos_token_id, list):
-            stop_tokens.update(config.eos_token_id)
-        elif config.eos_token_id is not None:
-            stop_tokens.add(config.eos_token_id)
-
-    # Load speculative drafter if configured
-    draft_model = None
-    draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
-    if draft_model_path:
-        from .speculative.drafters import load_drafter
-
-        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
-        print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
-        draft_model = load_drafter(draft_model_path, kind=draft_kind)
-        print("Drafter ready — speculative decoding enabled.")
-
-    # Create ResponseGenerator for continuous batching
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
@@ -983,17 +1074,22 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     kv_quant_scheme = get_kv_quant_scheme()
 
     response_generator = ResponseGenerator(
-        model=model,
-        processor=processor,
-        stop_tokens=stop_tokens,
+        model_path=model_path,
+        adapter_path=adapter_path,
         vision_cache=vision_cache,
-        draft_model=draft_model,
         kv_bits=kv_bits,
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
     )
+    try:
+        model, processor, config = response_generator.wait_until_ready()
+    except Exception:
+        response_generator.stop_and_join()
+        response_generator = None
+        vision_cache.clear()
+        raise
 
     model_cache = {
         "cache_key": cache_key,
@@ -1161,6 +1257,12 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
+    )
+    response_format: Optional[Any] = Field(
+        None, description="OpenAI-compatible response_format for structured outputs."
+    )
+    text: Optional[Any] = Field(
+        None, description="Responses API text format configuration."
     )
 
 
@@ -1361,6 +1463,9 @@ class VLMRequest(FlexibleBaseModel):
     resize_shape: Optional[ResizeShapeInput] = Field(
         None,
         description="Resize shape for the image. Provide one integer for square or two for (height, width).",
+    )
+    response_format: Optional[Any] = Field(
+        None, description="OpenAI-compatible response_format for structured outputs."
     )
 
     @field_validator("resize_shape", mode="before")
@@ -1599,7 +1704,10 @@ async def responses_endpoint(request: Request):
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
-        gen_args = _build_gen_args(openai_request)
+        try:
+            gen_args = _build_gen_args(openai_request, processor)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -1707,6 +1815,7 @@ async def responses_endpoint(request: Request):
                             max_tokens=openai_request.max_output_tokens,
                             top_p=openai_request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
+                            logits_processors=gen_args.logits_processors,
                             **kwargs,
                         )
 
@@ -1991,7 +2100,10 @@ async def chat_completions_endpoint(request: ChatRequest):
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
 
-        gen_args = _build_gen_args(request)
+        try:
+            gen_args = _build_gen_args(request, processor)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -2172,6 +2284,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             max_tokens=request.max_tokens,
                             top_p=request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
+                            logits_processors=gen_args.logits_processors,
                             **kwargs,
                         )
 
@@ -2453,6 +2566,13 @@ def models_endpoint():
 
 
 # MLX_VLM API endpoints
+
+
+@app.middleware("http")
+async def add_server_header(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Server"] = f"mlx_vlm/{__version__}"
+    return response
 
 
 @app.get("/health")

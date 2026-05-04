@@ -480,22 +480,29 @@ class Gemma3Model(nn.Module):
             if target_len != h.shape[1]:
                 target_len = h.shape[1]
 
-            raw_offset = next(
-                (
-                    c.offset
-                    for c in (cache or [])
-                    if c is not None and hasattr(c, "offset")
-                ),
-                0,
+            c0 = next(
+                (c for c in (cache or []) if c is not None and hasattr(c, "_idx")),
+                None,
             )
-            if isinstance(raw_offset, mx.array):
-                cache_offset = (
-                    int(raw_offset.max().item())
-                    if raw_offset.size > 1
-                    else int(raw_offset.item())
-                )
+            if c0 is not None:
+                cache_offset = int(c0._idx)
             else:
-                cache_offset = int(raw_offset)
+                raw_offset = next(
+                    (
+                        c.offset
+                        for c in (cache or [])
+                        if c is not None and hasattr(c, "offset")
+                    ),
+                    0,
+                )
+                if isinstance(raw_offset, mx.array):
+                    cache_offset = (
+                        int(raw_offset.max().item())
+                        if raw_offset.size > 1
+                        else int(raw_offset.item())
+                    )
+                else:
+                    cache_offset = int(raw_offset)
             max_start = max(per_layer_inputs.shape[1] - target_len, 0)
             start = min(cache_offset, max_start)
             per_layer_inputs = per_layer_inputs[:, start : start + target_len]
