@@ -7,6 +7,7 @@ from mlx.nn import RMSNorm
 from ....models.gemma4.config import TextConfig
 from ....models.gemma4.language import DecoderLayer
 from .config import Gemma4AssistantConfig
+from .masked_embedder import MaskedEmbedder
 from .masks import make_drafter_masks
 
 
@@ -76,11 +77,11 @@ class Gemma4AssistantDraftModel(nn.Module):
 
         self.accept_lens: List[int] = []
 
+        # Centroid-routed sparse LM head for E2B / E4B drafters.
         if config.use_ordered_embeddings:
-            raise NotImplementedError(
-                "Gemma4Assistant `use_ordered_embeddings=True` (centroid LM "
-                "head) is not yet ported to mlx-vlm."
-            )
+            self.masked_embedding = MaskedEmbedder(config)
+        else:
+            self.masked_embedding = None
 
     # ------------------------------------------------------------------
     # binding / cache management
@@ -96,7 +97,12 @@ class Gemma4AssistantDraftModel(nn.Module):
         tied embedding.
         """
         # LM head — drafter's own tied embed.
-        if self.config.tie_word_embeddings:
+        if self.masked_embedding is not None:
+            # Centroid-routed: lm_head_weight is the (tied) embed_tokens weight.
+            embed_w = self.model.embed_tokens.weight
+            masked = self.masked_embedding
+            self._lm_head_fn = lambda h: masked(h, embed_w)
+        elif self.config.tie_word_embeddings:
             self._lm_head_fn = self.model.embed_tokens.as_linear
         else:
             self._lm_head_fn = self.lm_head
@@ -307,6 +313,10 @@ class Gemma4AssistantDraftModel(nn.Module):
     def sanitize(self, weights: dict) -> dict:
         out = {}
         for k, v in weights.items():
+            # ``token_ordering`` ships as int64 in the checkpoint; cast to
+            # int32 because mlx ``take`` expects int32/uint32 indices.
+            if k == "masked_embedding.token_ordering":
+                v = v.astype(mx.int32)
             # Drop any (rare) tied lm_head copy when we'll bind to the
             # embedding's as_linear at runtime.
             if k == "lm_head.weight" and self.config.tie_word_embeddings:

@@ -24,8 +24,15 @@ def main():
     cfg = model.config
     text_cfg = cfg.text_config
 
-    # No real target — fake the bind() outputs.
-    model._lm_head_fn = model.model.embed_tokens.as_linear
+    # No real target — fake the bind() outputs. Route lm_head through the
+    # centroid head when present (E2B / E4B) so this exercises the same path
+    # real generation uses; otherwise fall back to the tied embed.
+    if model.masked_embedding is not None:
+        embed_w = model.model.embed_tokens.weight
+        masked = model.masked_embedding
+        model._lm_head_fn = lambda h: masked(h, embed_w)
+    else:
+        model._lm_head_fn = model.model.embed_tokens.as_linear
     model._input_embed = _FakeTargetEmbed(
         text_cfg.vocab_size, cfg.backbone_hidden_size
     )
@@ -41,12 +48,9 @@ def main():
 
     kv_len = 32
     # Provide one dict per layer-type. Use the global head dim for full
-    # attention layers when present.
-    full_head = (
-        text_cfg.global_head_dim
-        if text_cfg.attention_k_eq_v and text_cfg.global_head_dim
-        else text_cfg.head_dim
-    )
+    # attention layers when present (the model code gates on layer_type ==
+    # "full_attention" + global_head_dim, regardless of ``attention_k_eq_v``).
+    full_head = text_cfg.global_head_dim or text_cfg.head_dim
 
     def _kv(seq_len: int, head_dim: int):
         return (
