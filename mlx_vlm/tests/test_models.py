@@ -5036,6 +5036,76 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
 
+    def test_glm4v_get_rope_index_per_row_deltas(self):
+        from mlx_vlm.models import glm4v
+
+        text_config = glm4v.TextConfig(
+            model_type="glm4v_text",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=256,
+        )
+        vision_config = glm4v.VisionConfig(
+            model_type="glm4v_vision",
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            image_size=28,
+        )
+        lm = glm4v.LanguageModel(
+            text_config,
+            glm4v.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                model_type="glm4v",
+                vocab_size=64,
+                image_token_id=61,
+                image_token_index=61,
+                video_token_id=62,
+                video_token_index=62,
+                vision_start_token_id=60,
+                vision_end_token_id=59,
+                pad_token_id=0,
+            ),
+        )
+
+        input_ids = mx.array(
+            [
+                [10, 60, 61, 61, 61, 61, 11, 12],
+                [10, 11, 12, 13, 14, 15, 16, 17],
+            ],
+            dtype=mx.int32,
+        )
+        _, rope_deltas = lm.get_rope_index(
+            input_ids, mx.array([[1, 4, 4]], dtype=mx.int32)
+        )
+        self.assertEqual(rope_deltas.shape, (2, 1))
+        self.assertEqual(rope_deltas[1, 0].item(), 0)
+        self.assertNotEqual(rope_deltas[0, 0].item(), rope_deltas[1, 0].item())
+
+        input_ids = mx.array(
+            [[0, 0, 10, 11, 12, 13], [10, 11, 12, 13, 14, 15]], dtype=mx.int32
+        )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.int32
+        )
+        position_ids, rope_deltas = lm.get_rope_index(
+            input_ids, image_grid_thw=None, attention_mask=attention_mask
+        )
+        self.assertEqual(rope_deltas.shape, (2, 1))
+        self.assertEqual(position_ids.shape, (3, 2, 6))
+        self.assertEqual(rope_deltas[0, 0].item(), -2)
+        self.assertEqual(rope_deltas[1, 0].item(), 0)
+
     def test_glm4v_moe_chunked_prefill_rope(self):
         """Test GLM4V-MoE chunked prefill RoPE position ID generation."""
         from mlx_vlm.models import glm4v_moe
