@@ -153,8 +153,8 @@ class Gemma4AssistantDraftModel(nn.Module):
     def set_shared_kv(
         self,
         shared_kv_states: dict,
-        kv_offset: int,
-        position: Optional[int] = None,
+        kv_offset,
+        position=None,
     ) -> None:
         """Threaded by the round-loop before each ``draft_block`` call.
 
@@ -165,10 +165,26 @@ class Gemma4AssistantDraftModel(nn.Module):
         ``SinglePositionMultiTokenCandidateGenerator`` locks it to
         ``input_ids.shape[1] - 1`` which equals the bonus's position —
         i.e. ``kv_offset`` (one past the last cached token).
+
+        Both ``kv_offset`` and ``position`` may be int (B=1) or array-like
+        of length B (per-row, for batched MTP). All rows share the same
+        ``shared_kv_states`` tensors; per-row variation in valid length is
+        expressed via tail-zeroing in those tensors and per-row ``position``
+        for RoPE.
         """
         self._shared_kv = shared_kv_states
-        self._kv_offset = int(kv_offset)
-        self._position = int(position) if position is not None else int(kv_offset)
+        if isinstance(kv_offset, int):
+            self._kv_offset = kv_offset
+        else:
+            self._kv_offset = int(mx.array(kv_offset).max().item()) if not isinstance(kv_offset, mx.array) else int(kv_offset.max().item())
+        if position is None:
+            position = kv_offset
+        if isinstance(position, int):
+            self._position = position
+        elif isinstance(position, mx.array):
+            self._position = position
+        else:
+            self._position = mx.array(position)
 
     # ------------------------------------------------------------------
     # forward
@@ -186,18 +202,26 @@ class Gemma4AssistantDraftModel(nn.Module):
         h = self.pre_projection(inputs_embeds)
 
         query_len = h.shape[1]
-        query_offset = int(position_ids[0, 0].item())
+        # ``position_ids`` is [B, 1]. For B=1 we forward an int for the
+        # mask helper (which only branches on whether kv_len > sliding_window).
+        # For B>1 the mask helper still returns None for short prompts so this
+        # is fine; the per-row offset matters only for RoPE below.
+        query_offset_scalar = int(position_ids[0, 0].item())
         masks = make_drafter_masks(
             shared_kv_states,
             query_len=query_len,
-            query_offset=query_offset,
+            query_offset=query_offset_scalar,
             sliding_window=text_cfg.sliding_window,
             dtype=h.dtype,
         )
 
-        # Drafter queries always live one slot past the end of the KV; the
-        # absolute position is what RoPE needs.
-        offset = mx.array(query_offset)
+        # Per-row RoPE offset for the drafter's queries. For B=1 this is a
+        # scalar; for B>1 it's an array of shape [B] so each row's Q is
+        # rotated at its own absolute position.
+        if position_ids.shape[0] == 1:
+            offset = mx.array(query_offset_scalar)
+        else:
+            offset = position_ids[:, 0]
 
         for layer in self.model.layers:
             kv = shared_kv_states[layer.layer_type]
@@ -253,7 +277,12 @@ class Gemma4AssistantDraftModel(nn.Module):
                 "so the drafter can use the target's input embeddings."
             )
         shared_kv = self._shared_kv
-        position_ids = mx.array([[self._position]])
+        if isinstance(self._position, int):
+            position_ids = mx.array([[self._position]])
+        else:
+            # Per-row positions for batched MTP. ``self._position`` is a
+            # 1-D mx.array of length B.
+            position_ids = self._position[:, None]
 
         if isinstance(last_bonus, int):
             tok = mx.array([[last_bonus]], dtype=token_dtype)
