@@ -1112,6 +1112,8 @@ def generate_step(
     draft_model: Optional[nn.Module] = None,
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
+    prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
+    prompt_cache_checkpoint_len: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -1272,12 +1274,32 @@ def generate_step(
         )
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
-        if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
+        checkpoint_len = (
+            int(prompt_cache_checkpoint_len)
+            if prompt_cache_checkpoint is not None
+            and prompt_cache_checkpoint_len is not None
+            else None
+        )
+        checkpoint_done = False
+        should_chunk = (
+            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
+        ) or (
+            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
+        )
+        if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
+            processed_tokens = 0
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                    if (
+                        checkpoint_len is not None
+                        and not checkpoint_done
+                        and processed_tokens < checkpoint_len
+                        and processed_tokens + n_to_process > checkpoint_len
+                    ):
+                        n_to_process = checkpoint_len - processed_tokens
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -1287,6 +1309,14 @@ def generate_step(
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
+                    processed_tokens += n_to_process
+                    if (
+                        checkpoint_len is not None
+                        and not checkpoint_done
+                        and processed_tokens == checkpoint_len
+                    ):
+                        prompt_cache_checkpoint(processed_tokens, prompt_cache)
+                        checkpoint_done = True
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -1505,10 +1535,12 @@ def stream_generate(
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
     apc_extra_hash = 0
+    apc_mode: Optional[str] = None
 
-    # Disable APC for models with custom (non-KVCache) layouts
-    if apc_manager is not None and not _apc.model_supports_apc(model.language_model):
-        apc_manager = None
+    if apc_manager is not None:
+        apc_mode = _apc.model_apc_mode(model.language_model)
+        if apc_mode is None:
+            apc_manager = None
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
@@ -1548,24 +1580,19 @@ def stream_generate(
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        matched_blocks, prefix_len = apc_manager.lookup_prefix(
-            full_input_ids_list, extra_hash=apc_extra_hash
-        )
-        disk_prompt_cache = None
-        disk_prefix_len = 0
-        if prefix_len < input_ids.shape[1]:
-            disk_prompt_cache, disk_prefix_len = apc_manager.lookup_prefix_disk_cache(
+        if apc_mode == "exact":
+            exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                 full_input_ids_list,
                 extra_hash=apc_extra_hash,
-                min_prefix_tokens=prefix_len,
-                allow_memory_overlap=prefix_len > 0,
             )
-        if disk_prefix_len > prefix_len and disk_prefix_len < input_ids.shape[1]:
-            if matched_blocks:
-                apc_manager.release(matched_blocks)
-            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
-                reused_prefix_len = disk_prefix_len
-                input_ids = input_ids[:, disk_prefix_len:]
+            if (
+                exact_prompt_cache is not None
+                and exact_prefix_len > 0
+                and exact_prefix_len < input_ids.shape[1]
+                and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+            ):
+                reused_prefix_len = exact_prefix_len
+                input_ids = input_ids[:, exact_prefix_len:]
                 image_token_id = getattr(
                     model.config, "image_token_id", None
                 ) or getattr(model.config, "image_token_index", None)
@@ -1573,28 +1600,84 @@ def stream_generate(
                 if image_token_id is None or image_token_id not in new_ids:
                     pixel_values = None
                     kwargs.pop("cached_image_features", None)
-                kwargs["prompt_cache"] = disk_prompt_cache
-        elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
-                apc_blocks_in_use = matched_blocks
-                reused_prefix_len = prefix_len
-                input_ids = input_ids[:, prefix_len:]
-                image_token_id = getattr(
-                    model.config, "image_token_id", None
-                ) or getattr(model.config, "image_token_index", None)
-                new_ids = input_ids.flatten().tolist()
-                if image_token_id is None or image_token_id not in new_ids:
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
-                kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
-                    matched_blocks,
-                    min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                kwargs["prompt_cache"] = exact_prompt_cache
+        else:
+            matched_blocks, prefix_len = apc_manager.lookup_prefix(
+                full_input_ids_list, extra_hash=apc_extra_hash
+            )
+            exact_prompt_cache = None
+            exact_prefix_len = 0
+            if prefix_len < input_ids.shape[1]:
+                exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
+                    full_input_ids_list,
+                    extra_hash=apc_extra_hash,
+                    min_prefix_tokens=prefix_len,
                 )
-            else:
+            disk_prompt_cache = None
+            disk_prefix_len = 0
+            if max(prefix_len, exact_prefix_len) < input_ids.shape[1]:
+                disk_prompt_cache, disk_prefix_len = (
+                    apc_manager.lookup_prefix_disk_cache(
+                        full_input_ids_list,
+                        extra_hash=apc_extra_hash,
+                        min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                        allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+                    )
+                )
+            if (
+                disk_prefix_len > max(prefix_len, exact_prefix_len)
+                and disk_prefix_len < input_ids.shape[1]
+            ):
+                if matched_blocks:
+                    apc_manager.release(matched_blocks)
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    reused_prefix_len = disk_prefix_len
+                    input_ids = input_ids[:, disk_prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = disk_prompt_cache
+            elif (
+                exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
+            ):
+                if matched_blocks:
+                    apc_manager.release(matched_blocks)
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    reused_prefix_len = exact_prefix_len
+                    input_ids = input_ids[:, exact_prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = exact_prompt_cache
+            elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    apc_blocks_in_use = matched_blocks
+                    reused_prefix_len = prefix_len
+                    input_ids = input_ids[:, prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
+                        matched_blocks,
+                        min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                    )
+                else:
+                    apc_manager.release(matched_blocks)
+            elif matched_blocks:
+                # Full match (no new tokens to compute) — release; fall through to normal path
                 apc_manager.release(matched_blocks)
-        elif matched_blocks:
-            # Full match (no new tokens to compute) — release; fall through to normal path
-            apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
@@ -1628,7 +1711,30 @@ def stream_generate(
         detokenizer = processor.detokenizer
         detokenizer.reset()
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
-        gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        exact_checkpoint_len = None
+        exact_checkpoint = None
+        if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
+            exact_checkpoint_len = max(
+                1,
+                len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
+            )
+
+            def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
+                apc_manager.store_exact_cache(
+                    full_input_ids_list[:prefix_len],
+                    prompt_cache,
+                    extra_hash=apc_extra_hash,
+                )
+
+        gen = generate_step(
+            input_ids,
+            model,
+            pixel_values,
+            mask,
+            prompt_cache_checkpoint=exact_checkpoint,
+            prompt_cache_checkpoint_len=exact_checkpoint_len,
+            **kwargs,
+        )
         tic = time.perf_counter()
 
         generated_tokens = []
@@ -1637,6 +1743,19 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
+                if (
+                    apc_manager is not None
+                    and apc_mode == "exact"
+                    and reused_prefix_len == 0
+                ):
+                    try:
+                        apc_manager.store_exact_cache(
+                            full_input_ids_list,
+                            tracked_cache,
+                            extra_hash=apc_extra_hash,
+                        )
+                    except Exception as e:
+                        logger.warning("APC exact-cache store failed: %s", e)
 
             generated_tokens.append(token)
 
@@ -1685,7 +1804,7 @@ def stream_generate(
             prompt_cache_state.update(all_ids, tracked_cache)
 
         # APC: harvest new blocks from the post-generation KV state.
-        if apc_manager is not None:
+        if apc_manager is not None and apc_mode == "block":
             try:
                 if all_ids is None:
                     all_ids = full_input_ids_list + [
@@ -2343,6 +2462,7 @@ class PromptProcessingBatch:
         apc_manager: Optional["_apc.APCManager"] = None,
         right_pad_per_row: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
+        apc_mode: Optional[str] = None,
     ):
         self.model = model
         self.uids = uids
@@ -2358,6 +2478,7 @@ class PromptProcessingBatch:
         # we left-pad as before.
         self._right_pad_per_row = right_pad_per_row
         self._suffix_lens = suffix_lens or lengths
+        self._left_padding_per_row: List[int]
 
         if right_pad_per_row is not None:
             # Right-pad each row to max_length (so the last `pad[i]` cells are
@@ -2367,7 +2488,9 @@ class PromptProcessingBatch:
         else:
             left_padding = [max_length - l for l in lengths]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
+        self._left_padding_per_row = list(left_padding)
         self._total_prompt_tokens = sum(lengths)
+        self._processed_prompt_columns = 0
 
         self.logits_processors = logits_processors or []
         self._token_context = (
@@ -2381,6 +2504,7 @@ class PromptProcessingBatch:
         # APC metadata used for post-prefill block harvest (per-row).
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
+        self._apc_mode = apc_mode
         self._apc_harvest_enabled = True
 
         if warm_cache is not None:
@@ -2405,7 +2529,7 @@ class PromptProcessingBatch:
                     raise RuntimeError(
                         "APC mixed prefill requires a prompt cache with prepare()"
                     )
-                prepare(right_padding=right_pad_per_row)
+                prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
 
     def __len__(self):
         return len(self.uids)
@@ -2420,15 +2544,102 @@ class PromptProcessingBatch:
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
         if self._inputs_embeds is None or self.prefill_step_size is None:
-            return False
+            return self._next_apc_checkpoint_column() is not None
+        if self._next_apc_checkpoint_column() is not None:
+            return True
         return self._inputs_embeds.shape[1] > self.prefill_step_size
+
+    def _apc_checkpoint_column_for_meta(
+        self, batch_idx: int, meta: dict
+    ) -> Optional[int]:
+        checkpoint_len = int(meta.get("checkpoint_len") or 0)
+        if (
+            self._apc_mode != "exact"
+            or checkpoint_len <= 0
+            or meta.get("checkpoint_done")
+        ):
+            return None
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        if checkpoint_len <= prefix_len:
+            meta["checkpoint_done"] = True
+            return None
+        if self._right_pad_per_row is not None:
+            suffix_checkpoint = checkpoint_len - prefix_len
+            if suffix_checkpoint >= self._suffix_lens[batch_idx]:
+                return None
+            return suffix_checkpoint
+        return self._left_padding_per_row[batch_idx] + checkpoint_len
+
+    def _next_apc_checkpoint_column(self) -> Optional[int]:
+        if (
+            self._apc_manager is None
+            or self._apc_mode != "exact"
+            or not self._apc_meta
+            or self._inputs_embeds is None
+        ):
+            return None
+        start = self._processed_prompt_columns
+        end = start + self._inputs_embeds.shape[1]
+        next_col: Optional[int] = None
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None:
+                continue
+            col = self._apc_checkpoint_column_for_meta(batch_idx, meta)
+            if col is None or col <= start or col >= end:
+                continue
+            next_col = col if next_col is None else min(next_col, col)
+        return next_col
+
+    def _row_real_tokens_processed(self, batch_idx: int) -> int:
+        meta = self._apc_meta[batch_idx]
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        if self._right_pad_per_row is not None:
+            suffix_done = min(
+                self._suffix_lens[batch_idx],
+                max(0, self._processed_prompt_columns),
+            )
+            return prefix_len + suffix_done
+        real_done = (
+            self._processed_prompt_columns - self._left_padding_per_row[batch_idx]
+        )
+        return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
+
+    def _store_apc_exact_checkpoints(self) -> None:
+        if self._apc_manager is None or self._apc_mode != "exact":
+            return
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None or meta.get("checkpoint_done"):
+                continue
+            checkpoint_len = int(meta.get("checkpoint_len") or 0)
+            if checkpoint_len <= 0:
+                continue
+            if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
+                continue
+            prompt_cache = _apc.extract_prompt_cache_from_batch(
+                self.prompt_cache,
+                batch_idx,
+            )
+            if prompt_cache is None:
+                continue
+            self._apc_manager.store_exact_cache(
+                meta["full_input_ids"][:checkpoint_len],
+                prompt_cache,
+                extra_hash=meta.get("extra_hash", 0),
+            )
+            meta["checkpoint_done"] = True
 
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
             return 0
 
-        n = min(self.prefill_step_size, self._inputs_embeds.shape[1] - 1)
+        step = self.prefill_step_size or self._inputs_embeds.shape[1]
+        n = min(step, self._inputs_embeds.shape[1] - 1)
+        checkpoint_col = self._next_apc_checkpoint_column()
+        if checkpoint_col is not None:
+            n = min(n, checkpoint_col - self._processed_prompt_columns)
+        if n <= 0:
+            return 0
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
@@ -2437,6 +2648,8 @@ class PromptProcessingBatch:
             **self._prompt_kwargs,
         )
         mx.eval([c.state for c in self.prompt_cache])
+        self._processed_prompt_columns += n
+        self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         mx.clear_cache()
@@ -2579,15 +2792,30 @@ class PromptProcessingBatch:
                 for batch_idx, meta in enumerate(self._apc_meta):
                     if meta is None:
                         continue
-                    new_blocks = _apc.harvest_blocks_from_batch_cache(
-                        self._apc_manager,
-                        self.prompt_cache,
-                        batch_idx,
-                        meta["full_input_ids"],
-                        extra_hash=meta.get("extra_hash", 0),
-                        skip_first_n_tokens=meta.get("prefix_len", 0),
-                    )
-                    self._apc_manager.release(meta.get("apc_blocks", []) + new_blocks)
+                    if self._apc_mode == "exact":
+                        prompt_cache = _apc.extract_prompt_cache_from_batch(
+                            self.prompt_cache,
+                            batch_idx,
+                        )
+                        if prompt_cache is not None:
+                            self._apc_manager.store_exact_cache(
+                                meta["full_input_ids"],
+                                prompt_cache,
+                                extra_hash=meta.get("extra_hash", 0),
+                            )
+                        self._apc_manager.release(meta.get("apc_blocks", []))
+                    else:
+                        new_blocks = _apc.harvest_blocks_from_batch_cache(
+                            self._apc_manager,
+                            self.prompt_cache,
+                            batch_idx,
+                            meta["full_input_ids"],
+                            extra_hash=meta.get("extra_hash", 0),
+                            skip_first_n_tokens=meta.get("prefix_len", 0),
+                        )
+                        self._apc_manager.release(
+                            meta.get("apc_blocks", []) + new_blocks
+                        )
             except Exception as e:
                 logger.warning("APC harvest failed during batched prefill: %s", e)
                 # Best effort — release any acquired prefix blocks.
@@ -2670,12 +2898,15 @@ class BatchGenerator:
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
-        # APC: opt-out for KV-quantized caches and models with custom layouts
-        # (those are handled in stream_generate path or skipped entirely).
+        # APC: opt-out for KV-quantized caches. Plain KV models use block APC;
+        # mixed/custom cache models use exact prompt-cache snapshots.
+        self.apc_mode = None
         if apc_manager is not None and kv_bits is not None:
             apc_manager = None
-        if apc_manager is not None and not _apc.model_supports_apc(model):
-            apc_manager = None
+        if apc_manager is not None:
+            self.apc_mode = _apc.model_apc_mode(model)
+            if self.apc_mode is None:
+                apc_manager = None
         self.apc_manager = apc_manager
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -2741,19 +2972,53 @@ class BatchGenerator:
             self.model.config, "image_token_index", None
         )
         extra_hash = self._apc_extra_hash(prompt_kwargs or {})
+        apc_mode = getattr(self, "apc_mode", "block")
+        if apc_mode == "exact":
+            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
+                ids_list,
+                extra_hash=extra_hash,
+            )
+            if (
+                exact_cache is not None
+                and exact_prefix_len > 0
+                and exact_prefix_len < len(ids_list)
+            ):
+                if (
+                    image_token_id is not None
+                    and image_token_id in ids_list[:exact_prefix_len]
+                ):
+                    return None
+                return {
+                    "matched_blocks": [],
+                    "warm_cache": exact_cache,
+                    "prefix_len": exact_prefix_len,
+                    "extra_hash": extra_hash,
+                    "full_input_ids": list(ids_list),
+                }
+            return None
         matched, prefix_len = self.apc_manager.lookup_prefix(
             ids_list, extra_hash=extra_hash
         )
-        warm_cache = None
-        disk_prefix_len = 0
+        exact_cache = None
+        exact_prefix_len = 0
         if prefix_len < len(ids_list):
-            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
+            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
                 ids_list,
                 extra_hash=extra_hash,
                 min_prefix_tokens=prefix_len,
-                allow_memory_overlap=prefix_len > 0,
             )
-        if disk_prefix_len > prefix_len and disk_prefix_len < len(ids_list):
+        warm_cache = None
+        disk_prefix_len = 0
+        if max(prefix_len, exact_prefix_len) < len(ids_list):
+            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
+                ids_list,
+                extra_hash=extra_hash,
+                min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+            )
+        if disk_prefix_len > max(
+            prefix_len, exact_prefix_len
+        ) and disk_prefix_len < len(ids_list):
             if matched:
                 self.apc_manager.release(matched)
             if (
@@ -2765,6 +3030,21 @@ class BatchGenerator:
                 "matched_blocks": [],
                 "warm_cache": warm_cache,
                 "prefix_len": disk_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
+            if matched:
+                self.apc_manager.release(matched)
+            if (
+                image_token_id is not None
+                and image_token_id in ids_list[:exact_prefix_len]
+            ):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": exact_cache,
+                "prefix_len": exact_prefix_len,
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
             }
@@ -2854,15 +3134,28 @@ class BatchGenerator:
         for k, vs in per_row_keys.items():
             merged_kwargs[k] = mx.concatenate(vs, axis=0)
 
-        # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
-        num_layers = (
-            len(self.model.make_cache())
-            if hasattr(self.model, "make_cache")
-            else len(self.model.layers)
-        )
-        warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
-            picks, num_layers=num_layers
-        )
+        apc_mode = getattr(self, "apc_mode", "block")
+        if apc_mode == "exact":
+            row_caches = [
+                p["warm_cache"] if p is not None else self.model.make_cache()
+                for p in picks
+            ]
+            warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
+                row_caches,
+                prefix_lens,
+            )
+            if warm_cache is None:
+                return None
+        else:
+            # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
+            num_layers = (
+                len(self.model.make_cache())
+                if hasattr(self.model, "make_cache")
+                else len(self.model.layers)
+            )
+            warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
+                picks, num_layers=num_layers
+            )
 
         apc_meta = [
             {
@@ -2874,6 +3167,14 @@ class BatchGenerator:
                     else self._apc_extra_hash(prompt_kwargs_list[i] or {})
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
+                "checkpoint_len": (
+                    max(
+                        1,
+                        len(full_ids[i]) - self.apc_manager.exact_cache_guard_tokens,
+                    )
+                    if apc_mode == "exact"
+                    else 0
+                ),
             }
             for i in range(len(sequences))
         ]
@@ -2895,6 +3196,7 @@ class BatchGenerator:
             apc_manager=self.apc_manager,
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
+            apc_mode=apc_mode,
         )
 
     def _build_apc_meta_for_cold(
@@ -2916,6 +3218,14 @@ class BatchGenerator:
                     "prefix_len": 0,
                     "extra_hash": extra_hash,
                     "apc_blocks": [],
+                    "checkpoint_len": (
+                        max(
+                            1,
+                            len(ids_list) - self.apc_manager.exact_cache_guard_tokens,
+                        )
+                        if getattr(self, "apc_mode", "block") == "exact"
+                        else 0
+                    ),
                 }
             )
         return meta
@@ -3159,6 +3469,7 @@ class BatchGenerator:
                 kv_quant_scheme=self.kv_quant_scheme,
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
+                apc_mode=self.apc_mode,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

@@ -102,6 +102,209 @@ def _copy_mlx_array(x: mx.array) -> mx.array:
     return mx.contiguous(mx.array(x, dtype=x.dtype))
 
 
+def _pad_kv_for_capacity(
+    keys: mx.array,
+    values: mx.array,
+    *,
+    offset: int,
+    min_capacity_tokens: Optional[int],
+    step: int,
+) -> Tuple[mx.array, mx.array]:
+    if min_capacity_tokens is None or min_capacity_tokens <= offset:
+        return keys, values
+    capacity = int(min_capacity_tokens)
+    if step > 0:
+        capacity = ((capacity + step - 1) // step) * step
+    if capacity <= keys.shape[2]:
+        return keys, values
+    pad_tokens = capacity - keys.shape[2]
+    k_shape = (*keys.shape[:2], pad_tokens, keys.shape[3])
+    v_shape = (*values.shape[:2], pad_tokens, values.shape[3])
+    keys = mx.concatenate([keys, mx.zeros(k_shape, dtype=keys.dtype)], axis=2)
+    values = mx.concatenate([values, mx.zeros(v_shape, dtype=values.dtype)], axis=2)
+    return keys, values
+
+
+def _clone_cache_entry_for_apc(
+    c: Any,
+    *,
+    min_capacity_tokens: Optional[int],
+    eval_targets: List[mx.array],
+) -> Optional[Any]:
+    """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
+    from mlx_lm.models import cache as lm_cache
+
+    if isinstance(c, lm_cache.KVCache):
+        out = type(c)()
+        off = int(getattr(c, "offset", 0) or 0)
+        if c.keys is not None and c.values is not None and off > 0:
+            keys = _copy_mlx_array(c.keys[..., :off, :])
+            values = _copy_mlx_array(c.values[..., :off, :])
+            step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
+            keys, values = _pad_kv_for_capacity(
+                keys,
+                values,
+                offset=off,
+                min_capacity_tokens=min_capacity_tokens,
+                step=step,
+            )
+            out.keys = keys
+            out.values = values
+            out.offset = off
+            eval_targets.extend([keys, values])
+        return out
+
+    if isinstance(c, lm_cache.RotatingKVCache):
+        out = type(c)(
+            max_size=int(getattr(c, "max_size")),
+            keep=int(getattr(c, "keep", 0)),
+        )
+        out.offset = int(getattr(c, "offset", 0) or 0)
+        out._idx = int(getattr(c, "_idx", 0) or 0)
+        if c.keys is not None and c.values is not None:
+            out.keys = _copy_mlx_array(c.keys)
+            out.values = _copy_mlx_array(c.values)
+            eval_targets.extend([out.keys, out.values])
+        return out
+
+    if isinstance(c, lm_cache.ChunkedKVCache):
+        out = type(c)(chunk_size=int(getattr(c, "chunk_size")))
+        out.offset = int(getattr(c, "offset", 0) or 0)
+        out.start_position = int(getattr(c, "start_position", 0) or 0)
+        if c.keys is not None and c.values is not None:
+            out.keys = _copy_mlx_array(c.keys)
+            out.values = _copy_mlx_array(c.values)
+            eval_targets.extend([out.keys, out.values])
+        return out
+
+    if isinstance(c, lm_cache.ArraysCache):
+        out = lm_cache.ArraysCache(len(c.cache))
+        out.cache = []
+        for state in c.cache:
+            if state is None:
+                out.cache.append(None)
+                continue
+            copied = _copy_mlx_array(state)
+            out.cache.append(copied)
+            eval_targets.append(copied)
+        if c.left_padding is not None:
+            out.left_padding = _copy_mlx_array(c.left_padding)
+            eval_targets.append(out.left_padding)
+        if c.lengths is not None:
+            out.lengths = _copy_mlx_array(c.lengths)
+            eval_targets.append(out.lengths)
+        return out
+
+    if isinstance(c, lm_cache.CacheList):
+        copied = [
+            _clone_cache_entry_for_apc(
+                sub_c,
+                min_capacity_tokens=min_capacity_tokens,
+                eval_targets=eval_targets,
+            )
+            for sub_c in c.caches
+        ]
+        if any(sub_c is None for sub_c in copied):
+            return None
+        return lm_cache.CacheList(*copied)
+
+    if isinstance(c, tuple):
+        copied = [
+            _clone_cache_entry_for_apc(
+                sub_c,
+                min_capacity_tokens=min_capacity_tokens,
+                eval_targets=eval_targets,
+            )
+            for sub_c in c
+        ]
+        if any(sub_c is None for sub_c in copied):
+            return None
+        return tuple(copied)
+
+    return None
+
+
+def _clone_prompt_cache_for_apc(
+    prompt_cache: Sequence[Any],
+    *,
+    min_capacity_tokens: Optional[int] = None,
+) -> Optional[List[Any]]:
+    eval_targets: List[mx.array] = []
+    out: List[Any] = []
+    for c in prompt_cache:
+        copied = _clone_cache_entry_for_apc(
+            c,
+            min_capacity_tokens=min_capacity_tokens,
+            eval_targets=eval_targets,
+        )
+        if copied is None:
+            return None
+        out.append(copied)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out
+
+
+def _clone_layer_major_kv_cache_for_apc(
+    layer_keys: Sequence[mx.array],
+    layer_values: Sequence[mx.array],
+    prefix_len: int,
+) -> Optional[List[Any]]:
+    """Deep-copy layer-major K/V tensors into compact ``KVCache`` entries."""
+    from mlx_lm.models.cache import KVCache
+
+    if prefix_len <= 0 or len(layer_keys) != len(layer_values):
+        return None
+    eval_targets: List[mx.array] = []
+    out: List[Any] = []
+    for k, v in zip(layer_keys, layer_values):
+        c = KVCache()
+        c.keys = _copy_mlx_array(k[..., :prefix_len, :])
+        c.values = _copy_mlx_array(v[..., :prefix_len, :])
+        c.offset = prefix_len
+        eval_targets.extend([c.keys, c.values])
+        out.append(c)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out
+
+
+def _cache_entry_supports_exact_apc(c: Any) -> bool:
+    from mlx_lm.models import cache as lm_cache
+
+    if isinstance(
+        c,
+        (
+            lm_cache.KVCache,
+            lm_cache.RotatingKVCache,
+            lm_cache.ChunkedKVCache,
+            lm_cache.ArraysCache,
+        ),
+    ):
+        return True
+    if isinstance(c, lm_cache.CacheList):
+        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
+    if isinstance(c, tuple):
+        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c)
+    return False
+
+
+def _cache_entry_supports_block_apc(c: Any) -> bool:
+    from mlx_lm.models import cache as lm_cache
+
+    return isinstance(c, lm_cache.KVCache)
+
+
+def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
+    h = hashlib.sha256()
+    h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
+    h.update(int(block_size).to_bytes(4, "little", signed=False))
+    arr = np.asarray([int(t) for t in token_ids], dtype=np.int32)
+    h.update(int(arr.size).to_bytes(8, "little", signed=False))
+    h.update(arr.tobytes())
+    return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
 def hash_image_payload(
     pixel_values: Optional[mx.array] = None,
     image_ref: Any = None,
@@ -155,6 +358,16 @@ class APCBlock:
     next: Optional["APCBlock"] = None
 
 
+@dataclass
+class APCExactCacheEntry:
+    """Exact-prefix prompt-cache snapshot for custom cache layouts."""
+
+    token_ids: Tuple[int, ...]
+    extra_hash: int
+    prompt_cache: List[Any]
+    last_used: float
+
+
 @dataclass(frozen=True)
 class _DiskBlockSnapshot:
     """Immutable view of an APC block for the asynchronous disk writer."""
@@ -191,6 +404,14 @@ class _DiskLayerMajorSnapshot:
     segment_count: int
 
 
+@dataclass(frozen=True)
+class _DiskExactCacheSnapshot:
+    cache_hash: int
+    token_ids: Tuple[int, ...]
+    extra_hash: int
+    prompt_cache: List[Any]
+
+
 @dataclass
 class APCStats:
     hits: int = 0
@@ -202,6 +423,8 @@ class APCStats:
     pool_used: int = 0
     disk_hits: int = 0
     disk_writes: int = 0
+    exact_hits: int = 0
+    exact_stores: int = 0
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -219,6 +442,8 @@ class APCStats:
             "stores": self.stores,
             "disk_hits": self.disk_hits,
             "disk_writes": self.disk_writes,
+            "exact_hits": self.exact_hits,
+            "exact_stores": self.exact_stores,
         }
 
 
@@ -461,7 +686,9 @@ class DiskBlockStore:
 
     SUFFIX = ".safetensors"
     SHARD_PREFIX = "shard_"
+    EXACT_PREFIX = "exact_"
     SHARD_STEM_LEN = len(SHARD_PREFIX) + 32  # "shard_" + 32 hex chars
+    EXACT_STEM_LEN = len(EXACT_PREFIX) + 32  # "exact_" + 32 hex chars
     # Eviction targets this fraction of max_bytes after a single sweep so
     # we don't thrash on every write near the cap.
     _EVICT_LOW_WATERMARK = 0.9
@@ -485,6 +712,8 @@ class DiskBlockStore:
         self._in_flight_lock = threading.Lock()
         # block_hash -> (shard_path, block_idx_in_shard)
         self._index: dict[int, Tuple[Path, int]] = {}
+        # exact full-prefix hash -> snapshot path
+        self._exact_index: dict[int, Path] = {}
         self._index_lock = threading.RLock()
         # Direct-read mode avoids mmap-backed MLX arrays entirely. It parses
         # safetensors headers, reads only the requested block's byte ranges
@@ -560,6 +789,20 @@ class DiskBlockStore:
             return False
         return all(c in "0123456789abcdef" for c in rest)
 
+    @classmethod
+    def _is_canonical_exact(cls, path: Path) -> bool:
+        stem = path.stem
+        if not stem.startswith(cls.EXACT_PREFIX):
+            return False
+        rest = stem[len(cls.EXACT_PREFIX) :]
+        if len(rest) != 32:
+            return False
+        return all(c in "0123456789abcdef" for c in rest)
+
+    @classmethod
+    def _is_canonical_store_file(cls, path: Path) -> bool:
+        return cls._is_canonical_shard(path) or cls._is_canonical_exact(path)
+
     def _shard_path(self, shard_id: str) -> Path:
         return self.dir / f"{shard_id}{self.SUFFIX}"
 
@@ -570,13 +813,19 @@ class DiskBlockStore:
             h.update(int(bh & ((1 << 64) - 1)).to_bytes(8, "little"))
         return f"{DiskBlockStore.SHARD_PREFIX}{h.hexdigest()[:32]}"
 
+    @staticmethod
+    def _exact_id_for(cache_hash: int) -> str:
+        h = hashlib.sha256()
+        h.update(int(cache_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
+        return f"{DiskBlockStore.EXACT_PREFIX}{h.hexdigest()[:32]}"
+
     def _cleanup_partials(self) -> int:
         """Delete anything in the dir that isn't a canonical shard (left
         over from a crashed write, or files from an older block-per-file
         layout that this class no longer recognises)."""
         n = 0
         for p in self.dir.glob(f"*{self.SUFFIX}"):
-            if not p.is_file() or self._is_canonical_shard(p):
+            if not p.is_file() or self._is_canonical_store_file(p):
                 continue
             try:
                 p.unlink()
@@ -596,8 +845,9 @@ class DiskBlockStore:
         total = 0
         with self._index_lock:
             self._index.clear()
+            self._exact_index.clear()
             for p in self.dir.glob(f"*{self.SUFFIX}"):
-                if not self._is_canonical_shard(p):
+                if not self._is_canonical_store_file(p):
                     continue
                 try:
                     total += p.stat().st_size
@@ -610,6 +860,13 @@ class DiskBlockStore:
                         p.unlink()
                     except OSError:
                         pass
+                    continue
+                if self._is_canonical_exact(p):
+                    try:
+                        cache_hash = int(metadata.get("cache_hash", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    self._exact_index[cache_hash] = p
                     continue
                 hashes_csv = metadata.get("block_hashes", "")
                 if not hashes_csv:
@@ -630,6 +887,11 @@ class DiskBlockStore:
     def num_blocks_indexed(self) -> int:
         with self._index_lock:
             return len(self._index)
+
+    @property
+    def num_exact_indexed(self) -> int:
+        with self._index_lock:
+            return len(self._exact_index)
 
     @property
     def load_returns_detached(self) -> bool:
@@ -653,10 +915,13 @@ class DiskBlockStore:
             in_flight_paths = {
                 self._index[h][0] for h in in_flight_hashes if h in self._index
             }
+            in_flight_paths.update(
+                self._exact_index[h] for h in in_flight_hashes if h in self._exact_index
+            )
 
         candidates: list[dict[str, Any]] = []
         for p in self.dir.glob(f"*{self.SUFFIX}"):
-            if not self._is_canonical_shard(p) or p in in_flight_paths:
+            if not self._is_canonical_store_file(p) or p in in_flight_paths:
                 continue
             try:
                 st = p.stat()
@@ -716,6 +981,9 @@ class DiskBlockStore:
                 stale = [h for h, (sp, _) in self._index.items() if sp == p]
                 for h in stale:
                     del self._index[h]
+                stale_exact = [h for h, sp in self._exact_index.items() if sp == p]
+                for h in stale_exact:
+                    del self._exact_index[h]
             with self._mmap_cache_lock:
                 self._mmap_cache.pop(p, None)
             with self._header_cache_lock:
@@ -779,6 +1047,282 @@ class DiskBlockStore:
     def has(self, block_hash: int) -> bool:
         with self._index_lock:
             return block_hash in self._index
+
+    def has_exact(self, cache_hash: int) -> bool:
+        with self._index_lock:
+            return cache_hash in self._exact_index
+
+    def find_exact_prefix(
+        self,
+        token_ids: Sequence[int],
+        *,
+        extra_hash: int = 0,
+        max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+    ) -> Optional[Tuple[int, int]]:
+        token_tuple = tuple(int(t) for t in token_ids)
+        max_len = len(token_tuple) - 1
+        if max_prefix_tokens is not None and max_prefix_tokens > 0:
+            max_len = min(max_len, int(max_prefix_tokens))
+        if max_len <= min_prefix_tokens:
+            return None
+
+        with self._index_lock:
+            entries = list(self._exact_index.items())
+
+        best: Optional[Tuple[int, int]] = None
+        for cache_hash, path in entries:
+            parsed = self._open_shard_header(path)
+            if parsed is None:
+                continue
+            _tensor_entries, metadata, _data_start = parsed
+            if metadata.get("layout") != "exact_cache_v1":
+                continue
+            try:
+                stored_extra = int(metadata.get("extra_hash", "0"))
+                stored_tokens = tuple(
+                    int(x) for x in metadata.get("token_ids", "").split(",") if x
+                )
+            except (TypeError, ValueError):
+                continue
+            prefix_len = len(stored_tokens)
+            if (
+                stored_extra != extra_hash
+                or prefix_len <= min_prefix_tokens
+                or prefix_len > max_len
+                or token_tuple[:prefix_len] != stored_tokens
+            ):
+                continue
+            if best is None or prefix_len > best[1]:
+                best = (int(cache_hash), prefix_len)
+        return best
+
+    def load_exact_cache(
+        self,
+        cache_hash: int,
+        *,
+        wait_in_flight_ms: float = 0.0,
+        min_capacity_tokens: Optional[int] = None,
+    ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
+        with self._index_lock:
+            path = self._exact_index.get(cache_hash)
+        if path is None:
+            if wait_in_flight_ms > 0:
+                with self._in_flight_lock:
+                    ev = self._in_flight.get(cache_hash)
+                if ev is not None and ev.wait(wait_in_flight_ms / 1000.0):
+                    with self._index_lock:
+                        path = self._exact_index.get(cache_hash)
+            if path is None:
+                return None
+        return self._load_exact_cache_file(
+            path, min_capacity_tokens=min_capacity_tokens
+        )
+
+    def _load_exact_cache_file(
+        self,
+        path: Path,
+        *,
+        min_capacity_tokens: Optional[int],
+    ) -> Optional[Tuple[Tuple[int, ...], int, List[Any]]]:
+        parsed = self._open_shard_header(path)
+        if parsed is None:
+            return None
+        tensor_entries, metadata, data_start = parsed
+        if metadata.get("layout") != "exact_cache_v1":
+            return None
+        try:
+            token_ids = tuple(
+                int(x) for x in metadata.get("token_ids", "").split(",") if x
+            )
+            extra_hash = int(metadata.get("extra_hash", "0"))
+            n_entries = int(metadata.get("num_entries", "0"))
+        except (TypeError, ValueError):
+            return None
+        if n_entries <= 0:
+            return None
+
+        prompt_cache: List[Any] = []
+        eval_targets: List[mx.array] = []
+        for i in range(n_entries):
+            loaded = self._load_exact_cache_entry(
+                path,
+                tensor_entries,
+                metadata,
+                data_start,
+                f"c{i}",
+                min_capacity_tokens=min_capacity_tokens,
+                eval_targets=eval_targets,
+            )
+            if loaded is None:
+                return None
+            prompt_cache.append(loaded)
+        if eval_targets:
+            mx.eval(eval_targets)
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return token_ids, extra_hash, prompt_cache
+
+    def _load_exact_cache_entry(
+        self,
+        path: Path,
+        tensor_entries: dict,
+        metadata: dict,
+        data_start: int,
+        prefix: str,
+        *,
+        min_capacity_tokens: Optional[int],
+        eval_targets: List[mx.array],
+    ) -> Optional[Any]:
+        from mlx_lm.models import cache as lm_cache
+
+        kind = metadata.get(f"{prefix}_kind")
+        if kind == "kv":
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                c = lm_cache.KVCache()
+                try:
+                    c.offset = int(metadata.get(f"{prefix}_offset", "0"))
+                except (TypeError, ValueError):
+                    c.offset = 0
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            k = _read_safetensors_tensor(path, data_start, k_entry)
+            v = _read_safetensors_tensor(path, data_start, v_entry)
+            if k is None or v is None:
+                return None
+            try:
+                off = int(metadata.get(f"{prefix}_offset", str(k.shape[2])))
+                step = int(metadata.get(f"{prefix}_step", "256"))
+            except (TypeError, ValueError):
+                return None
+            k, v = _pad_kv_for_capacity(
+                k,
+                v,
+                offset=off,
+                min_capacity_tokens=min_capacity_tokens,
+                step=step,
+            )
+            c = lm_cache.KVCache()
+            c.keys = k
+            c.values = v
+            c.offset = off
+            eval_targets.extend([k, v])
+            return c
+
+        if kind == "rotating_kv":
+            try:
+                keep = int(metadata.get(f"{prefix}_keep", "0"))
+                max_size = int(metadata[f"{prefix}_max_size"])
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                idx = int(metadata.get(f"{prefix}_idx", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            c = lm_cache.RotatingKVCache(max_size=max_size, keep=keep)
+            c.offset = offset
+            c._idx = idx
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            k = _read_safetensors_tensor(path, data_start, k_entry)
+            v = _read_safetensors_tensor(path, data_start, v_entry)
+            if k is None or v is None:
+                return None
+            c.keys = k
+            c.values = v
+            eval_targets.extend([k, v])
+            return c
+
+        if kind == "chunked_kv":
+            try:
+                chunk_size = int(metadata[f"{prefix}_chunk_size"])
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                start_position = int(metadata.get(f"{prefix}_start_position", "0"))
+            except (KeyError, TypeError, ValueError):
+                return None
+            c = lm_cache.ChunkedKVCache(chunk_size=chunk_size)
+            c.offset = offset
+            c.start_position = start_position
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                return c
+            k_entry = tensor_entries.get(f"{prefix}_k")
+            v_entry = tensor_entries.get(f"{prefix}_v")
+            if k_entry is None or v_entry is None:
+                return None
+            k = _read_safetensors_tensor(path, data_start, k_entry)
+            v = _read_safetensors_tensor(path, data_start, v_entry)
+            if k is None or v is None:
+                return None
+            c.keys = k
+            c.values = v
+            eval_targets.extend([k, v])
+            return c
+
+        if kind == "arrays":
+            try:
+                size = int(metadata.get(f"{prefix}_size", "0"))
+            except (TypeError, ValueError):
+                return None
+            c = lm_cache.ArraysCache(size=size)
+            states: List[Optional[mx.array]] = []
+            for j in range(size):
+                if metadata.get(f"{prefix}_s{j}_none", "0") == "1":
+                    states.append(None)
+                    continue
+                entry = tensor_entries.get(f"{prefix}_s{j}")
+                if entry is None:
+                    return None
+                state = _read_safetensors_tensor(path, data_start, entry)
+                if state is None:
+                    return None
+                states.append(state)
+                eval_targets.append(state)
+            c.cache = states
+            lp_entry = tensor_entries.get(f"{prefix}_left_padding")
+            if lp_entry is not None:
+                c.left_padding = _read_safetensors_tensor(path, data_start, lp_entry)
+                if c.left_padding is None:
+                    return None
+                eval_targets.append(c.left_padding)
+            lengths_entry = tensor_entries.get(f"{prefix}_lengths")
+            if lengths_entry is not None:
+                c.lengths = _read_safetensors_tensor(path, data_start, lengths_entry)
+                if c.lengths is None:
+                    return None
+                eval_targets.append(c.lengths)
+            return c
+
+        if kind in ("cache_list", "tuple"):
+            try:
+                size = int(metadata.get(f"{prefix}_size", "0"))
+            except (TypeError, ValueError):
+                return None
+            loaded = []
+            for j in range(size):
+                sub_c = self._load_exact_cache_entry(
+                    path,
+                    tensor_entries,
+                    metadata,
+                    data_start,
+                    f"{prefix}_e{j}",
+                    min_capacity_tokens=min_capacity_tokens,
+                    eval_targets=eval_targets,
+                )
+                if sub_c is None:
+                    return None
+                loaded.append(sub_c)
+            if kind == "cache_list":
+                return lm_cache.CacheList(*loaded)
+            return tuple(loaded)
+
+        return None
 
     def load(
         self, block_hash: int, *, wait_in_flight_ms: float = 0.0
@@ -1619,6 +2163,29 @@ class DiskBlockStore:
 
         self._enqueue_block_snapshots(snapshots)
 
+    def save_exact_cache(
+        self,
+        cache_hash: int,
+        token_ids: Sequence[int],
+        extra_hash: int,
+        prompt_cache: Sequence[Any],
+    ) -> None:
+        """Schedule an exact prompt-cache snapshot write.
+
+        Exact snapshots are used for custom cache layouts that cannot be
+        reconstructed from independently concatenated K/V blocks.
+        """
+        token_tuple = tuple(int(t) for t in token_ids)
+        if not token_tuple or not prompt_cache:
+            return
+        snapshot = _DiskExactCacheSnapshot(
+            cache_hash=int(cache_hash),
+            token_ids=token_tuple,
+            extra_hash=int(extra_hash),
+            prompt_cache=list(prompt_cache),
+        )
+        self._enqueue_exact_snapshot(snapshot)
+
     def save_layer_major_blocks(
         self,
         blocks: List[_DiskLayerMajorBlock],
@@ -1661,6 +2228,26 @@ class DiskBlockStore:
         self._enqueue_shard(
             self._shard_id_for(block_hashes), block_hashes, list(snapshots)
         )
+
+    def _enqueue_exact_snapshot(self, snapshot: _DiskExactCacheSnapshot) -> None:
+        cache_hash = int(snapshot.cache_hash)
+        shard_id = self._exact_id_for(cache_hash)
+        path = self._shard_path(shard_id)
+        if path.exists():
+            with self._index_lock:
+                self._exact_index.setdefault(cache_hash, path)
+            return
+
+        ev = threading.Event()
+        with self._in_flight_lock:
+            self._in_flight[cache_hash] = ev
+        try:
+            self._q.put_nowait((shard_id, [cache_hash], snapshot, ev))
+        except queue.Full:
+            with self._in_flight_lock:
+                self._in_flight.pop(cache_hash, None)
+            ev.set()
+            logger.warning("APC disk write queue full; dropping exact-cache snapshot")
 
     def _enqueue_shard(
         self,
@@ -1739,6 +2326,126 @@ class DiskBlockStore:
             start = prev = idx
         ranges.append((start, prev + 1))
         return ranges
+
+    def _snapshot_exact_cache_entry(
+        self,
+        c: Any,
+        prefix: str,
+        arrays: dict[str, mx.array],
+        metadata: dict[str, str],
+    ) -> bool:
+        from mlx_lm.models import cache as lm_cache
+
+        if isinstance(c, lm_cache.KVCache):
+            off = int(getattr(c, "offset", 0) or 0)
+            metadata[f"{prefix}_kind"] = "kv"
+            metadata[f"{prefix}_offset"] = str(off)
+            metadata[f"{prefix}_step"] = str(
+                int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
+            )
+            if c.keys is None or c.values is None or off <= 0:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys[..., :off, :]
+            arrays[f"{prefix}_v"] = c.values[..., :off, :]
+            return True
+
+        if isinstance(c, lm_cache.RotatingKVCache):
+            metadata[f"{prefix}_kind"] = "rotating_kv"
+            metadata[f"{prefix}_keep"] = str(int(getattr(c, "keep", 0) or 0))
+            metadata[f"{prefix}_max_size"] = str(int(getattr(c, "max_size")))
+            metadata[f"{prefix}_offset"] = str(int(getattr(c, "offset", 0) or 0))
+            metadata[f"{prefix}_idx"] = str(int(getattr(c, "_idx", 0) or 0))
+            if c.keys is None or c.values is None:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys
+            arrays[f"{prefix}_v"] = c.values
+            return True
+
+        if isinstance(c, lm_cache.ChunkedKVCache):
+            metadata[f"{prefix}_kind"] = "chunked_kv"
+            metadata[f"{prefix}_chunk_size"] = str(int(getattr(c, "chunk_size")))
+            metadata[f"{prefix}_offset"] = str(int(getattr(c, "offset", 0) or 0))
+            metadata[f"{prefix}_start_position"] = str(
+                int(getattr(c, "start_position", 0) or 0)
+            )
+            if c.keys is None or c.values is None:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            arrays[f"{prefix}_k"] = c.keys
+            arrays[f"{prefix}_v"] = c.values
+            return True
+
+        if isinstance(c, lm_cache.ArraysCache):
+            metadata[f"{prefix}_kind"] = "arrays"
+            metadata[f"{prefix}_size"] = str(len(c.cache))
+            for j, state in enumerate(c.cache):
+                if state is None:
+                    metadata[f"{prefix}_s{j}_none"] = "1"
+                else:
+                    arrays[f"{prefix}_s{j}"] = state
+            if c.left_padding is not None:
+                arrays[f"{prefix}_left_padding"] = c.left_padding
+            if c.lengths is not None:
+                arrays[f"{prefix}_lengths"] = c.lengths
+            return True
+
+        if isinstance(c, lm_cache.CacheList):
+            metadata[f"{prefix}_kind"] = "cache_list"
+            metadata[f"{prefix}_size"] = str(len(c.caches))
+            return all(
+                self._snapshot_exact_cache_entry(
+                    sub_c, f"{prefix}_e{j}", arrays, metadata
+                )
+                for j, sub_c in enumerate(c.caches)
+            )
+
+        if isinstance(c, tuple):
+            metadata[f"{prefix}_kind"] = "tuple"
+            metadata[f"{prefix}_size"] = str(len(c))
+            return all(
+                self._snapshot_exact_cache_entry(
+                    sub_c, f"{prefix}_e{j}", arrays, metadata
+                )
+                for j, sub_c in enumerate(c)
+            )
+
+        return False
+
+    def _write_exact_cache_snapshot(
+        self,
+        path: Path,
+        snapshot: _DiskExactCacheSnapshot,
+    ) -> List[int]:
+        metadata: dict[str, str] = {
+            "layout": "exact_cache_v1",
+            "cache_hash": str(int(snapshot.cache_hash)),
+            "extra_hash": str(int(snapshot.extra_hash)),
+            "token_ids": ",".join(str(int(t)) for t in snapshot.token_ids),
+            "num_entries": str(len(snapshot.prompt_cache)),
+            "store_id": self._exact_id_for(snapshot.cache_hash),
+        }
+        arrays: dict[str, mx.array] = {}
+        for i, c in enumerate(snapshot.prompt_cache):
+            if not self._snapshot_exact_cache_entry(c, f"c{i}", arrays, metadata):
+                raise ValueError(f"unsupported exact-cache entry at index {i}")
+        if not arrays:
+            return []
+
+        mx.eval(list(arrays.values()))
+        tag = f"{os.getpid()}-{threading.get_ident()}"
+        tmp = path.parent / f"{path.stem}.{tag}{self.SUFFIX}"
+        mx.save_safetensors(str(tmp), arrays, metadata=metadata)
+        os.replace(tmp, path)
+        try:
+            self._disk_bytes += path.stat().st_size
+        except OSError:
+            pass
+        with self._index_lock:
+            self._exact_index[int(snapshot.cache_hash)] = path
+        self._maybe_evict()
+        return [int(snapshot.cache_hash)]
 
     def _write_layer_major_snapshot(
         self,
@@ -1869,7 +2576,9 @@ class DiskBlockStore:
             shard_id, block_hashes, payload, ev = item
             path = self._shard_path(shard_id)
             try:
-                if isinstance(payload, _DiskLayerMajorSnapshot):
+                if isinstance(payload, _DiskExactCacheSnapshot):
+                    block_hashes = self._write_exact_cache_snapshot(path, payload)
+                elif isinstance(payload, _DiskLayerMajorSnapshot):
                     block_hashes = self._write_layer_major_snapshot(path, payload)
                 else:
                     block_hashes = self._write_block_snapshot(path, payload)
@@ -1917,9 +2626,16 @@ class APCManager:
         for b in self.pool:
             self._free_push(b)
         self.hash_table: dict[int, APCBlock] = {}
+        self._exact_cache: "OrderedDict[int, APCExactCacheEntry]" = OrderedDict()
         self.stats = APCStats()
         self.lock = threading.RLock()
         self.disk = disk
+        self._exact_cache_max = max(
+            0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
+        )
+        self.exact_cache_guard_tokens = max(
+            1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
+        )
         # If free RAM (best-effort reading) drops below this, skip disk
         # promotion this turn and fall back to memory-only matching. The
         # request still serves correctly — it just doesn't get the warm-
@@ -1956,6 +2672,14 @@ class APCManager:
         # the resource limit. Set to 0 to disable.
         self._max_pool_tensors = max(
             0, int(os.environ.get("APC_MAX_POOL_TENSORS", "450000"))
+        )
+        # Optional compact warm-memory tier for long KV-only prefixes. When a
+        # prompt reaches this many full-block tokens, store one layer-major
+        # prompt-cache snapshot instead of thousands of per-block tensors. This
+        # avoids Apple Metal's resource-count ceiling while preserving fast
+        # warm-memory reuse for repeated long-document prompts.
+        self._layer_major_memory_min_tokens = max(
+            0, int(os.environ.get("APC_LAYER_MAJOR_MEMORY_MIN_TOKENS", "50000"))
         )
 
     # ---------- LRU free queue (O(1)) ----------
@@ -2015,6 +2739,153 @@ class APCManager:
                 self._release_one(b)
 
     # ---------- Public API ----------
+    def lookup_exact_cache(
+        self,
+        token_ids: Sequence[int],
+        extra_hash: int = 0,
+        max_prefix_tokens: Optional[int] = None,
+        min_prefix_tokens: int = 0,
+    ) -> Tuple[Optional[List[Any]], int]:
+        """Return an exact-prefix prompt-cache snapshot for custom caches.
+
+        Mixed architectures such as Nemotron-H use recurrent SSM state in
+        addition to attention KV. That state is not block-concatenable, so the
+        safe reuse unit is an exact prompt-cache snapshot at a prefix boundary.
+        """
+        disk = self.disk
+        if self._exact_cache_max <= 0 and disk is None:
+            return None, 0
+        token_tuple = tuple(int(t) for t in token_ids)
+        max_len = len(token_tuple) - 1
+        if max_prefix_tokens is not None and max_prefix_tokens > 0:
+            max_len = min(max_len, int(max_prefix_tokens))
+        if max_len <= min_prefix_tokens:
+            return None, 0
+
+        source_cache: Optional[List[Any]] = None
+        prefix_len = 0
+        with self.lock:
+            best_key: Optional[int] = None
+            best_entry: Optional[APCExactCacheEntry] = None
+            if self._exact_cache_max > 0:
+                for key, entry in self._exact_cache.items():
+                    candidate_len = len(entry.token_ids)
+                    if (
+                        entry.extra_hash != extra_hash
+                        or candidate_len <= min_prefix_tokens
+                        or candidate_len > max_len
+                    ):
+                        continue
+                    if token_tuple[:candidate_len] != entry.token_ids:
+                        continue
+                    if best_entry is None or candidate_len > len(best_entry.token_ids):
+                        best_key = key
+                        best_entry = entry
+
+                if best_entry is not None and best_key is not None:
+                    self._exact_cache.move_to_end(best_key)
+                    best_entry.last_used = time.time()
+                    prefix_len = len(best_entry.token_ids)
+                    source_cache = best_entry.prompt_cache
+
+        can_try_disk = disk is not None and prefix_len < max_len
+        if can_try_disk and self._disk_min_free_ram_bytes > 0:
+            free_now = _free_ram_bytes()
+            if free_now is not None and free_now < self._disk_min_free_ram_bytes:
+                logger.info(
+                    "APC: skipping exact disk restore " "(free RAM %.1f GB < %.1f GB)",
+                    free_now / (1 << 30),
+                    self._disk_min_free_ram_bytes / (1 << 30),
+                )
+                can_try_disk = False
+
+        if can_try_disk and disk is not None:
+            disk_match = disk.find_exact_prefix(
+                token_tuple,
+                extra_hash=extra_hash,
+                max_prefix_tokens=max_prefix_tokens,
+                min_prefix_tokens=max(min_prefix_tokens, prefix_len),
+            )
+            if disk_match is not None:
+                cache_hash, disk_prefix_len = disk_match
+                loaded = disk.load_exact_cache(
+                    cache_hash,
+                    min_capacity_tokens=len(token_tuple) + 1,
+                )
+                if loaded is not None:
+                    stored_tokens, stored_extra_hash, prompt_cache = loaded
+                    if (
+                        stored_extra_hash == extra_hash
+                        and len(stored_tokens) == disk_prefix_len
+                        and token_tuple[:disk_prefix_len] == stored_tokens
+                    ):
+                        # Disk reads and warm-cache construction intentionally
+                        # happen outside the manager lock. If clear()/reset_stats()
+                        # races here, the restored tensors are still valid; only
+                        # the hit counter lands in the new stats window.
+                        with self.lock:
+                            self.stats.exact_hits += 1
+                            self.stats.disk_hits += 1
+                            self.stats.hits += 1
+                            self.stats.matched_tokens += disk_prefix_len
+                        return prompt_cache, disk_prefix_len
+
+        if source_cache is None:
+            return None, 0
+        prompt_cache = _clone_prompt_cache_for_apc(
+            source_cache,
+            min_capacity_tokens=len(token_tuple) + 1,
+        )
+        if prompt_cache is None:
+            return None, 0
+        with self.lock:
+            self.stats.exact_hits += 1
+            self.stats.hits += 1
+            self.stats.matched_tokens += prefix_len
+        return prompt_cache, prefix_len
+
+    def store_exact_cache(
+        self,
+        token_ids: Sequence[int],
+        prompt_cache: Sequence[Any],
+        *,
+        extra_hash: int = 0,
+    ) -> bool:
+        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
+            return False
+        token_tuple = tuple(int(t) for t in token_ids)
+        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        if copied is None:
+            return False
+        key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+        stored = False
+        with self.lock:
+            if self._exact_cache_max > 0:
+                self._exact_cache[key] = APCExactCacheEntry(
+                    token_ids=token_tuple,
+                    extra_hash=int(extra_hash),
+                    prompt_cache=copied,
+                    last_used=time.time(),
+                )
+                self._exact_cache.move_to_end(key)
+                while len(self._exact_cache) > self._exact_cache_max:
+                    self._exact_cache.popitem(last=False)
+                stored = True
+        if self.disk is not None:
+            try:
+                self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
+                with self.lock:
+                    self.stats.disk_writes += 1
+                stored = True
+            except Exception as e:
+                logger.warning("APC exact disk save scheduling failed: %s", e)
+        if stored:
+            with self.lock:
+                self.stats.exact_stores += 1
+            return True
+        return False
+
     def lookup_prefix_disk_cache(
         self,
         token_ids: Sequence[int],
@@ -2155,9 +3026,42 @@ class APCManager:
         with self.lock:
             n_full = len(token_ids) // self.block_size
             skip_full = skip_first_n_tokens // self.block_size
+            full_prefix_tokens = n_full * self.block_size
+            guarded_prefix_tokens = max(
+                0, len(token_ids) - self.exact_cache_guard_tokens
+            )
+            layer_major_prefix_tokens = min(
+                full_prefix_tokens,
+                (guarded_prefix_tokens // self.block_size) * self.block_size,
+            )
             new_blocks: List[APCBlock] = []
             disk_blocks: List[_DiskLayerMajorBlock] = []
             per_block_tensors = len(layer_keys) + len(layer_values)
+            token_tuple = tuple(int(t) for t in token_ids[:layer_major_prefix_tokens])
+            layer_major_stored = False
+            if (
+                self._layer_major_memory_min_tokens > 0
+                and self._exact_cache_max > 0
+                and layer_major_prefix_tokens >= self._layer_major_memory_min_tokens
+            ):
+                copied = _clone_layer_major_kv_cache_for_apc(
+                    layer_keys,
+                    layer_values,
+                    layer_major_prefix_tokens,
+                )
+                if copied is not None:
+                    key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+                    self._exact_cache[key] = APCExactCacheEntry(
+                        token_ids=token_tuple,
+                        extra_hash=int(extra_hash),
+                        prompt_cache=copied,
+                        last_used=time.time(),
+                    )
+                    self._exact_cache.move_to_end(key)
+                    while len(self._exact_cache) > self._exact_cache_max:
+                        self._exact_cache.popitem(last=False)
+                    self.stats.exact_stores += 1
+                    layer_major_stored = True
             parent = SEED_PARENT_HASH
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
@@ -2183,6 +3087,9 @@ class APCManager:
                             source_block_idx=i,
                         )
                     )
+                if layer_major_stored:
+                    parent = h
+                    continue
                 existing = self.hash_table.get(h)
                 if existing is not None and existing.token_ids == chunk:
                     acquired = self._acquire_existing(existing)
@@ -2261,11 +3168,12 @@ class APCManager:
                     snap["disk_files"] = sum(
                         1
                         for p in self.disk.dir.glob(f"*{self.disk.SUFFIX}")
-                        if self.disk._is_canonical_shard(p)
+                        if self.disk._is_canonical_store_file(p)
                     )
                 except OSError:
                     snap["disk_files"] = -1
                 snap["disk_blocks_indexed"] = self.disk.num_blocks_indexed
+                snap["disk_exact_indexed"] = self.disk.num_exact_indexed
             return snap
 
     def reset_stats(self) -> None:
@@ -2287,6 +3195,7 @@ class APCManager:
             self._free_head = self._free_tail = None
             for b in self.pool:
                 self._free_push(b)
+            self._exact_cache.clear()
             self.stats = APCStats()
 
     def close(self) -> None:
@@ -2475,6 +3384,134 @@ def make_warm_batch_kv_cache_multi(
     return out, max_prefix
 
 
+def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
+    if isinstance(x, mx.array):
+        out.append(x)
+    elif isinstance(x, (list, tuple)):
+        for item in x:
+            _collect_mx_arrays(item, out)
+
+
+def _merge_arrays_cache_entries(
+    entries: Sequence[Any],
+    prefix_lens: Sequence[int],
+) -> Any:
+    from mlx_lm.models import cache as lm_cache
+
+    size = len(entries[0].cache)
+    out = lm_cache.ArraysCache(size)
+    merged_states: List[Optional[mx.array]] = []
+    for state_idx in range(size):
+        states = [entry.cache[state_idx] for entry in entries]
+        sample = next((s for s in states if s is not None), None)
+        if sample is None:
+            merged_states.append(None)
+            continue
+        rows = []
+        for state in states:
+            if state is None:
+                rows.append(mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype))
+            else:
+                rows.append(state[:1])
+        merged_states.append(mx.concatenate(rows, axis=0))
+    out.cache = merged_states
+    return out
+
+
+def _merge_exact_cache_entries(
+    entries: Sequence[Any],
+    prefix_lens: Sequence[int],
+) -> Any:
+    from mlx_lm.models import cache as lm_cache
+
+    if not entries:
+        return None
+    first = entries[0]
+    if all(isinstance(c, lm_cache.KVCache) for c in entries):
+        return lm_cache.BatchKVCache.merge(entries)
+    if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
+        return lm_cache.BatchKVCache.merge(entries)
+    if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
+        return lm_cache.BatchRotatingKVCache.merge(entries)
+    if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
+        return _merge_arrays_cache_entries(entries, prefix_lens)
+    if all(isinstance(c, lm_cache.CacheList) for c in entries):
+        merged = [
+            _merge_exact_cache_entries(
+                [entry.caches[i] for entry in entries],
+                prefix_lens,
+            )
+            for i in range(len(first.caches))
+        ]
+        if any(c is None for c in merged):
+            return None
+        return lm_cache.CacheList(*merged)
+    if all(isinstance(c, tuple) for c in entries):
+        merged = [
+            _merge_exact_cache_entries(
+                [entry[i] for entry in entries],
+                prefix_lens,
+            )
+            for i in range(len(first))
+        ]
+        if any(c is None for c in merged):
+            return None
+        return lm_cache.CacheList(*merged)
+    return None
+
+
+def make_warm_batch_exact_cache_multi(
+    row_caches: Sequence[Sequence[Any]],
+    prefix_lens: Sequence[int],
+) -> Tuple[Optional[List[Any]], int]:
+    """Merge single-row exact-cache snapshots into batch-aware caches."""
+
+    if not row_caches:
+        return [], 0
+    if len(row_caches) != len(prefix_lens):
+        return None, 0
+    num_entries = len(row_caches[0])
+    if any(len(row) != num_entries for row in row_caches):
+        return None, 0
+
+    out: List[Any] = []
+    for entry_idx in range(num_entries):
+        merged = _merge_exact_cache_entries(
+            [row[entry_idx] for row in row_caches],
+            prefix_lens,
+        )
+        if merged is None:
+            return None, 0
+        out.append(merged)
+
+    eval_targets: List[mx.array] = []
+    for c in out:
+        _collect_mx_arrays(c.state, eval_targets)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out, max(prefix_lens) if prefix_lens else 0
+
+
+def extract_prompt_cache_from_batch(
+    batch_caches: Sequence[Any],
+    batch_idx: int,
+) -> Optional[List[Any]]:
+    """Extract one row from batch-aware caches as single-row cache objects."""
+
+    out: List[Any] = []
+    eval_targets: List[mx.array] = []
+    for c in batch_caches:
+        extract = getattr(c, "extract", None)
+        if not callable(extract):
+            return None
+        extracted = extract(batch_idx)
+        out.append(extracted)
+        _collect_mx_arrays(extracted.state, eval_targets)
+    if eval_targets:
+        mx.eval(eval_targets)
+    return out
+
+
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],
@@ -2518,9 +3555,29 @@ def harvest_blocks_from_batch_cache(
     )
 
 
+def model_apc_mode(language_model: Any) -> Optional[str]:
+    """Return the APC strategy supported by ``language_model``.
+
+    ``"block"`` is the normal block-level KV path. ``"exact"`` is a
+    conservative whole-prefix snapshot path for custom mixed cache layouts
+    such as hybrid SSM/attention models, where recurrent state cannot be
+    reconstructed by concatenating K/V blocks alone.
+    """
+    if not hasattr(language_model, "make_cache"):
+        return "block"
+    try:
+        prompt_cache = language_model.make_cache()
+    except Exception:
+        return None
+    if prompt_cache and all(_cache_entry_supports_block_apc(c) for c in prompt_cache):
+        return "block"
+    if prompt_cache and all(_cache_entry_supports_exact_apc(c) for c in prompt_cache):
+        return "exact"
+    return None
+
+
 def model_supports_apc(language_model: Any) -> bool:
-    """APC requires the default KVCache layout — opt out for custom caches."""
-    return not hasattr(language_model, "make_cache")
+    return model_apc_mode(language_model) is not None
 
 
 def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
