@@ -1,12 +1,14 @@
 import time
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
+from mlx_vlm.apc import hash_image_payload
 
 
 @pytest.fixture
@@ -134,6 +136,33 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
 
 
+def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
+    monkeypatch.setattr(server, "apc_manager", None)
+
+    response = client.get("/v1/cache/stats")
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False}
+
+    response = client.post("/v1/cache/reset")
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False}
+
+    manager = SimpleNamespace(
+        stats_snapshot=MagicMock(return_value={"hits": 2, "pool_used": 1}),
+        clear=MagicMock(),
+    )
+    monkeypatch.setattr(server, "apc_manager", manager)
+
+    response = client.get("/v1/cache/stats")
+    assert response.status_code == 200
+    assert response.json() == {"hits": 2, "pool_used": 1, "enabled": True}
+
+    response = client.post("/v1/cache/reset")
+    assert response.status_code == 200
+    assert response.json() == {"enabled": True, "status": "cleared"}
+    manager.clear.assert_called_once_with()
+
+
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
 
 
@@ -241,6 +270,7 @@ class TestResponseGenerator:
             enable_thinking=False,
             thinking_budget=100,
             logits_processors=[processor],
+            tenant_id="tenant-a",
         )
         kw = args.to_generate_kwargs()
         assert kw["max_tokens"] == 50
@@ -251,6 +281,7 @@ class TestResponseGenerator:
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 100
         assert kw["logits_processors"] == [processor]
+        assert kw["apc_tenant"] == "tenant-a"
 
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(enable_thinking=False, thinking_budget=50)
@@ -278,10 +309,11 @@ class TestResponseGenerator:
             thinking_budget=None,
             thinking_start_token=None,
         )
-        args = server._build_gen_args(req)
+        args = server._build_gen_args(req, tenant_id="tenant-a")
         assert args.max_tokens == 128
         assert args.top_k == 32
         assert args.logit_bias == {5: -1.0}  # string keys converted to int
+        assert args.to_generate_kwargs()["apc_tenant"] == "tenant-a"
 
     def test_build_gen_args_from_chat_request(self):
         req = SimpleNamespace(
@@ -300,6 +332,64 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
+        class Embed:
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, **kwargs
+            ):
+                return Embed()
+
+        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
+        pixel_values = mx.array([[[[1.0, 2.0]]]])
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {
+                "input_ids": mx.array([[1, 2]]),
+                "pixel_values": pixel_values,
+                "attention_mask": mx.array([[1, 1]]),
+            },
+            images=None,
+        )
+
+        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(
+            pixel_values=pixel_values
+        )
+
+    def test_gpu_embed_prefers_image_ref_for_apc_hash(self):
+        class Embed:
+            def to_dict(self):
+                return {"inputs_embeds": mx.zeros((1, 2, 4))}
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, **kwargs
+            ):
+                return Embed()
+
+        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
+        pixel_values = mx.array([[[[1.0, 2.0]]]])
+        images = ["image-a.png"]
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {
+                "input_ids": mx.array([[1, 2]]),
+                "pixel_values": pixel_values,
+                "attention_mask": mx.array([[1, 1]]),
+            },
+            images=images,
+        )
+
+        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(image_ref=images)
+        assert gen_kwargs["_apc_image_hash"] != hash_image_payload(
+            pixel_values=pixel_values
+        )
 
     def test_extract_chat_response_format_json_schema(self):
         req = SimpleNamespace(

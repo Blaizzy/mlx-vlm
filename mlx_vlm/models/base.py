@@ -59,6 +59,7 @@ class LanguageModelOutput:
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
     gdn_states: Optional[List] = None
+    shared_kv_states: Optional[Dict[str, tuple]] = None
 
 
 @dataclass

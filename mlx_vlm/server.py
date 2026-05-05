@@ -27,6 +27,7 @@ from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
+from . import apc as _apc
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -142,6 +143,10 @@ class GenerationArguments:
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
+    # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
+    # cached blocks from one tenant can't be reused (or detected via timing)
+    # by another. None = no salt = single-tenant behaviour.
+    tenant_id: Optional[str] = None
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -163,6 +168,8 @@ class GenerationArguments:
             kw["thinking_start_token"] = self.thinking_start_token
         if self.logits_processors is not None:
             kw["logits_processors"] = self.logits_processors
+        if self.tenant_id is not None:
+            kw["apc_tenant"] = self.tenant_id
         return kw
 
     def to_template_kwargs(self) -> dict:
@@ -215,6 +222,7 @@ class ResponseGenerator:
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
+        apc_manager: Optional["_apc.APCManager"] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -229,6 +237,7 @@ class ResponseGenerator:
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
+        self.apc_manager = apc_manager
         self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
@@ -421,6 +430,12 @@ class ResponseGenerator:
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
         gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        if images is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
+        elif pixel_values is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(
+                pixel_values=pixel_values
+            )
         return input_ids, gen_kwargs
 
     def _run(self):
@@ -505,16 +520,27 @@ class ResponseGenerator:
                             quantized_kv_start=self.quantized_kv_start,
                             top_logprobs_k=self.top_logprobs_k,
                             stream=generation_stream,
+                            apc_manager=self.apc_manager,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                    # Per-tenant APC salt: keep this out of the model forward
+                    # by namespacing under "_apc_tenant"; BatchGenerator strips
+                    # it before merging kwargs for the language model.
+                    if getattr(args, "tenant_id", None):
+                        gen_kwargs["_apc_tenant"] = args.tenant_id
 
-                    # Image/embed requests can't share a prefill batch with
-                    # pending text-only prompts — drain them first.
-                    if has_embeds and batch_gen.unprocessed_prompts:
+                    # Drain pending text-only prompts before inserting an
+                    # embed-bearing request — multi-row PromptProcessingBatch
+                    # admission expects all rows to carry inputs_embeds (the
+                    # mixed APC path concatenates them per-row).
+                    if has_embeds and any(
+                        not (s[3] and s[3].get("inputs_embeds") is not None)
+                        for s in batch_gen.unprocessed_prompts
+                    ):
                         self._flush(batch_gen, active)
 
                     try:
@@ -536,17 +562,23 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
-                    if has_embeds:
-                        self._step(batch_gen, active)
-
                 if not active or batch_gen is None:
                     continue
 
                 self._step(batch_gen, active)
 
             except Exception as e:
-                print(f"Error in generation thread: {e}")
-                traceback.print_exc()
+                logger.exception("Error in generation thread")
+                for info in list(active.values()):
+                    try:
+                        info["rqueue"].put(e)
+                        info["rqueue"].put(None)
+                    except Exception:
+                        pass
+                active.clear()
+                batch_gen = None
+                mx.clear_cache()
+                gc.collect()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash speculative decoding.
@@ -854,7 +886,9 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
-def _build_gen_args(request, processor=None) -> GenerationArguments:
+def _build_gen_args(
+    request, processor=None, tenant_id: Optional[str] = None
+) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
     max_tokens = getattr(request, "max_tokens", None) or getattr(
         request, "max_output_tokens", DEFAULT_MAX_TOKENS
@@ -873,10 +907,22 @@ def _build_gen_args(request, processor=None) -> GenerationArguments:
         enable_thinking=getattr(request, "enable_thinking", True),
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
+        tenant_id=tenant_id,
     )
     if processor is not None:
         args.logits_processors = _build_structured_logits_processors(request, processor)
     return args
+
+
+def _read_tenant_id(http_request) -> Optional[str]:
+    """Pull a per-tenant APC salt from the request headers.
+
+    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    """
+    if http_request is None or not hasattr(http_request, "headers"):
+        return None
+    h = http_request.headers
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
 
 
 def _as_plain_dict(value):
@@ -1003,6 +1049,10 @@ def _make_logprob_content(
 # Global response generator for continuous batching
 response_generator: Optional[ResponseGenerator] = None
 
+# Global APC manager (shared across requests for the loaded model)
+apc_manager: Optional[_apc.APCManager] = None
+
+
 # Loading/unloading utilities
 model_cache = {}
 
@@ -1079,7 +1129,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
-    global model_cache, response_generator
+    global model_cache, response_generator, apc_manager
 
     if adapter_path is _INHERIT_ADAPTER:
         cached = model_cache.get("cache_key")
@@ -1100,6 +1150,9 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
+    # APC: build a shared block pool if opted in via env var.
+    apc_manager = _apc.from_env(model_namespace=model_path)
+
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
     kv_group_size = get_kv_group_size()
@@ -1115,6 +1168,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
+        apc_manager=apc_manager,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
@@ -1139,7 +1193,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    global model_cache, response_generator
+    global model_cache, response_generator, apc_manager
     if not model_cache:
         return False
 
@@ -1152,6 +1206,11 @@ def unload_model_sync():
         print("Stopping ResponseGenerator...")
         response_generator.stop_and_join()
         response_generator = None
+
+    # Drop APC blocks for the previous model
+    if apc_manager is not None:
+        apc_manager.clear()
+        apc_manager = None
 
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
@@ -1738,7 +1797,9 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Missing input.")
 
         try:
-            gen_args = _build_gen_args(openai_request, processor)
+            gen_args = _build_gen_args(
+                openai_request, processor, tenant_id=_read_tenant_id(request)
+            )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -1816,14 +1877,28 @@ async def responses_endpoint(request: Request):
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
                     if response_generator is not None:
-                        ctx, token_iter = response_generator.generate(
-                            prompt=formatted_prompt,
-                            images=images if images else None,
-                            args=gen_args,
+                        # generate() blocks on _cpu_preprocess + queue.get;
+                        # offload so concurrent handlers preprocess in parallel.
+                        ctx, token_iter = await asyncio.to_thread(
+                            response_generator.generate,
+                            formatted_prompt,
+                            images if images else None,
+                            None,  # audio
+                            gen_args,
                         )
 
                         output_tokens = 0
-                        for token in token_iter:
+
+                        def _next_token_resp_stream():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
+
+                        while True:
+                            token = await asyncio.to_thread(_next_token_resp_stream)
+                            if token is None:
+                                break
                             output_tokens += 1
                             delta = token.text
                             full_text += delta
@@ -1849,6 +1924,8 @@ async def responses_endpoint(request: Request):
                             top_p=openai_request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
+                            apc_manager=apc_manager,
+                            apc_tenant=gen_args.tenant_id,
                             **kwargs,
                         )
 
@@ -1937,21 +2014,29 @@ async def responses_endpoint(request: Request):
                 output_tokens = 0
 
                 if response_generator is not None:
-                    ctx, token_iter = response_generator.generate(
-                        prompt=formatted_prompt,
-                        images=images if images else None,
-                        args=gen_args,
+
+                    def _blocking_resp():
+                        ctx_, ti = response_generator.generate(
+                            prompt=formatted_prompt,
+                            images=images if images else None,
+                            args=gen_args,
+                        )
+                        text = ""
+                        ot = 0
+                        for tok in ti:
+                            text += tok.text
+                            ot += 1
+                            if tok.finish_reason:
+                                break
+                        try:
+                            ti.close()
+                        except Exception:
+                            pass
+                        return ctx_.prompt_tokens, text, ot
+
+                    prompt_tokens, full_text, output_tokens = await asyncio.to_thread(
+                        _blocking_resp
                     )
-                    prompt_tokens = ctx.prompt_tokens
-                    for token in token_iter:
-                        full_text += token.text
-                        output_tokens += 1
-                        if token.finish_reason:
-                            break
-                    try:
-                        token_iter.close()
-                    except Exception:
-                        pass
                 else:
                     result = generate(
                         model=model,
@@ -1960,6 +2045,7 @@ async def responses_endpoint(request: Request):
                         image=images,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
+                        apc_manager=apc_manager,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -2040,7 +2126,7 @@ async def responses_endpoint(request: Request):
 
 @app.post("/chat/completions", response_model=None)
 @app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
-async def chat_completions_endpoint(request: ChatRequest):
+async def chat_completions_endpoint(request: ChatRequest, http_request: Request):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
@@ -2134,7 +2220,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = load_tool_module(tool_parser_type)
 
         try:
-            gen_args = _build_gen_args(request, processor)
+            gen_args = _build_gen_args(
+                request, processor, tenant_id=_read_tenant_id(http_request)
+            )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -2318,6 +2406,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                             top_p=request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
+                            apc_manager=apc_manager,
+                            apc_tenant=gen_args.tenant_id,
                             **kwargs,
                         )
 
@@ -2442,6 +2532,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         audio=audio,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
+                        apc_manager=apc_manager,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -2617,8 +2708,28 @@ async def health_check():
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
-        "continuous_batching_enabled": response_generator is not None,
+        "apc_enabled": apc_manager is not None,
     }
+
+
+@app.get("/v1/cache/stats")
+@app.get("/cache/stats", include_in_schema=False)
+async def apc_cache_stats():
+    """Return Automatic Prefix Cache statistics (or ``enabled=false``)."""
+    if apc_manager is None:
+        return {"enabled": False}
+    snap = apc_manager.stats_snapshot()
+    snap["enabled"] = True
+    return snap
+
+
+@app.post("/v1/cache/reset")
+@app.post("/cache/reset", include_in_schema=False)
+async def apc_cache_reset():
+    if apc_manager is None:
+        return {"enabled": False}
+    apc_manager.clear()
+    return {"enabled": True, "status": "cleared"}
 
 
 @app.post("/unload")
