@@ -679,7 +679,9 @@ class ResponseGenerator:
                 B = len(uids)
                 max_len = max(len(ids) for ids in all_input_ids)
                 left_padding = [max_len - len(ids) for ids in all_input_ids]
-                padded = [[0] * left_padding[i] + ids for i, ids in enumerate(all_input_ids)]
+                padded = [
+                    [0] * left_padding[i] + ids for i, ids in enumerate(all_input_ids)
+                ]
                 input_mx = mx.array(padded, dtype=mx.int32)
 
                 prompt_cache = _make_cache(lm, left_padding)

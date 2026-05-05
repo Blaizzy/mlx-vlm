@@ -57,9 +57,12 @@ def bidirectional_swa_mask(
     Returns ``None`` when no masking is needed (the entire KV fits in the
     bidirectional window of every query).
     """
-    if isinstance(query_offset, int) and (
-        kv_valid_len is None or isinstance(kv_valid_len, int)
-    ) and kv_len <= window and query_offset + query_len <= kv_len + window:
+    if (
+        isinstance(query_offset, int)
+        and (kv_valid_len is None or isinstance(kv_valid_len, int))
+        and kv_len <= window
+        and query_offset + query_len <= kv_len + window
+    ):
         return None
 
     if isinstance(query_offset, int):
@@ -79,7 +82,11 @@ def bidirectional_swa_mask(
     dist = q_idx[:, :, None] - k_idx
     inside = (dist > -window) & (dist < window)
     if kv_valid_len is not None:
-        valid = kv_valid_len if isinstance(kv_valid_len, mx.array) else mx.array(kv_valid_len)
+        valid = (
+            kv_valid_len
+            if isinstance(kv_valid_len, mx.array)
+            else mx.array(kv_valid_len)
+        )
         inside = inside & (k_idx < valid[:, None, None])
     # SDPA expects an additive mask broadcastable to (B, H, L, S).
     bias = mx.where(inside, mx.array(0.0, dtype=dtype), mx.array(-mx.inf, dtype=dtype))

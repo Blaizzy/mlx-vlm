@@ -827,7 +827,9 @@ def _mtp_rounds_batch(
         # Re-bind drafter with new shared_kv and per-row positions.
         positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
         offset0 = prompt_cache[0].offset
-        new_kv_offset = int(offset0.max().item()) if isinstance(offset0, mx.array) else int(offset0)
+        new_kv_offset = (
+            int(offset0.max().item()) if isinstance(offset0, mx.array) else int(offset0)
+        )
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset=new_kv_offset,
