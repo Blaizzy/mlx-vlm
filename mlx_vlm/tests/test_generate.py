@@ -313,6 +313,62 @@ class TestGenerationBatch:
         assert batch._num_tokens == [5, 15]
         assert len(batch) == 2
 
+    @staticmethod
+    def _mrope_batch(uids, deltas):
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        batch = GenerationBatch.empty(MagicMock(), sampler, lambda tok: False)
+        batch.uids = list(uids)
+        batch.max_tokens = [10] * len(uids)
+        batch._num_tokens = [0] * len(uids)
+        batch._rope_deltas = mx.array(deltas, dtype=mx.int32)
+        return batch
+
+    def test_extend_concatenates_and_filters_per_row_rope_deltas(self):
+        a = self._mrope_batch([0, 1], [[5], [7]])
+        b = self._mrope_batch([2], [[0]])
+        a.extend(b)
+        assert a._rope_deltas.tolist() == [[5], [7], [0]]
+        a.filter([0, 2])
+        assert a.uids == [0, 2]
+        assert a._rope_deltas.tolist() == [[5], [0]]
+
+    def test_extend_rejects_mixed_mrope_state(self):
+        a = self._mrope_batch([0], [[3]])
+        b = self._mrope_batch([1], [[0]])
+        b._rope_deltas = None
+        with pytest.raises(RuntimeError, match="MRoPE"):
+            a.extend(b)
+
+    def test_extend_into_empty_accumulator_absorbs_mrope_state(self):
+        empty = GenerationBatch.empty(
+            MagicMock(), lambda x: mx.argmax(x, axis=-1), lambda tok: False
+        )
+        empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
+        assert empty._rope_deltas.tolist() == [[5], [7]]
+
+    @staticmethod
+    def _capture(value, B):
+        from mlx_vlm.generate import PromptProcessingBatch
+
+        return PromptProcessingBatch._capture_rope_deltas(
+            SimpleNamespace(_rope_deltas=value), B
+        )
+
+    def test_capture_rope_deltas(self):
+        from mlx_vlm.generate import PromptProcessingBatch
+
+        assert PromptProcessingBatch._capture_rope_deltas(SimpleNamespace(), 3) is None
+        assert self._capture(None, 3).tolist() == [[0], [0], [0]]
+        assert self._capture(mx.array([[5], [7], [9]], dtype=mx.int32), 3).tolist() == [
+            [5],
+            [7],
+            [9],
+        ]
+        # Falcon OCR singleton: (1, 1) broadcasts to (B, 1).
+        assert self._capture(mx.array([[5]], dtype=mx.int32), 4).tolist() == [[5]] * 4
+        with pytest.raises(RuntimeError, match="does not match"):
+            self._capture(mx.array([[5], [7]], dtype=mx.int32), 3)
+
 
 # ============================================================================
 # Tests for Helper Functions

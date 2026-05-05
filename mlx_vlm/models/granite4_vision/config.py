@@ -11,7 +11,7 @@ class TextConfig(BaseModelConfig):
     hidden_size: int = 2560
     num_hidden_layers: int = 40
     intermediate_size: int = 8192
-    shared_intermediate_size: int = 8192
+    shared_intermediate_size: Optional[int] = None
     num_attention_heads: int = 40
     rms_norm_eps: float = 1e-5
     vocab_size: int = 100353
@@ -27,6 +27,10 @@ class TextConfig(BaseModelConfig):
     attention_multiplier: float = 0.015625
     residual_multiplier: float = 0.22
     logits_scaling: float = 10.0
+
+    @property
+    def use_shared_mlp(self) -> bool:
+        return self.shared_intermediate_size is not None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
