@@ -1605,6 +1605,7 @@ class GenerationBatch:
 
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
+        self_was_empty = len(self.uids) == 0
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
@@ -1649,9 +1650,14 @@ class GenerationBatch:
                 self._next_top_idx = None
                 self._next_top_lp = None
 
-        if self._rope_deltas is None:
+        if self_was_empty:
             self._rope_deltas = other._rope_deltas
-        elif other._rope_deltas is not None:
+        elif (self._rope_deltas is None) != (other._rope_deltas is None):
+            raise RuntimeError(
+                "extend() mixes MRoPE and non-MRoPE batches; both sides must "
+                "carry rope_deltas or neither side may."
+            )
+        elif self._rope_deltas is not None:
             self._rope_deltas = mx.concatenate([self._rope_deltas, other._rope_deltas])
 
     def filter(self, keep: List[int]):
@@ -1895,13 +1901,8 @@ class PromptProcessingBatch:
             gen_batch._next_top_lp = top_lp
 
         language_model = getattr(self.model, "language_model", self.model)
-        rope_deltas = getattr(language_model, "_rope_deltas", None)
+        rope_deltas = self._capture_rope_deltas(language_model, len(gen_batch.uids))
         if rope_deltas is not None:
-            # Normalize to shape (B, 1) so extend/filter stay consistent.
-            if rope_deltas.ndim == 0:
-                rope_deltas = rope_deltas.reshape(1, 1)
-            elif rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas[:, None]
             gen_batch._rope_deltas = rope_deltas
 
         self.uids = []
@@ -1913,6 +1914,26 @@ class PromptProcessingBatch:
     @property
     def total_prompt_tokens(self):
         return self._total_prompt_tokens
+
+    @staticmethod
+    def _capture_rope_deltas(language_model, B: int):
+        if not hasattr(language_model, "_rope_deltas"):
+            return None
+        rope_deltas = language_model._rope_deltas
+        if rope_deltas is None:
+            return mx.zeros((B, 1), dtype=mx.int32)
+        if rope_deltas.ndim == 0:
+            rope_deltas = rope_deltas.reshape(1, 1)
+        elif rope_deltas.ndim == 1:
+            rope_deltas = rope_deltas[:, None]
+        # Falcon OCR emits a singleton meant to broadcast across rows.
+        if rope_deltas.shape[0] == 1 and B > 1:
+            rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
+        if rope_deltas.shape[0] != B:
+            raise RuntimeError(
+                f"_rope_deltas shape {rope_deltas.shape} does not match prefill batch size {B}"
+            )
+        return rope_deltas
 
 
 class BatchGenerator:
