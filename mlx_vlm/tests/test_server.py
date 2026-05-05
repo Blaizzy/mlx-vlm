@@ -1,3 +1,4 @@
+import time
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -155,7 +156,6 @@ class TestResponseGenerator:
 
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
-        monkeypatch.delenv("TOKEN_QUEUE_TIMEOUT", raising=False)
 
         assert server.get_token_queue_timeout() == 600.0
 
@@ -163,12 +163,6 @@ class TestResponseGenerator:
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
 
         assert server.get_token_queue_timeout() == 42.5
-
-    def test_token_queue_timeout_accepts_legacy_env_alias(self, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
-        monkeypatch.setenv("TOKEN_QUEUE_TIMEOUT", "90")
-
-        assert server.get_token_queue_timeout() == 90.0
 
     def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
@@ -200,25 +194,37 @@ class TestResponseGenerator:
 
         assert cancelled == ["req-1"]
 
-    def test_token_iterator_yields_items_before_timeout(self, monkeypatch):
+    def test_token_iterator_waits_past_timeout_for_delayed_token(
+        self, monkeypatch
+    ):
+        import threading
+
         gen = self._bare_generator()
         cancelled = []
         token = SimpleNamespace(text="hi")
+        timeout_s = 0.05
+        delay_s = timeout_s * 3
 
         class Requests:
             def put(self, item):
                 rqueue: Queue = item[0]
                 rqueue.put(SimpleNamespace(uid="req-1"))
-                rqueue.put(token)
-                rqueue.put(None)
+
+                def deliver():
+                    rqueue.put(token)
+                    rqueue.put(None)
+
+                threading.Timer(delay_s, deliver).start()
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", str(timeout_s * 10))
 
         _, token_iter = gen.generate("hello")
 
+        start = time.monotonic()
         assert next(token_iter) is token
+        assert time.monotonic() - start >= delay_s * 0.5
         with pytest.raises(StopIteration):
             next(token_iter)
         assert cancelled == []

@@ -62,14 +62,17 @@ def get_prefill_step_size():
 
 
 def get_token_queue_timeout():
-    raw_timeout = os.environ.get(
-        "MLX_VLM_TOKEN_QUEUE_TIMEOUT", os.environ.get("TOKEN_QUEUE_TIMEOUT", "")
-    )
+    raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
     if raw_timeout == "":
         return DEFAULT_TOKEN_QUEUE_TIMEOUT
     try:
         timeout = float(raw_timeout)
     except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_TOKEN_QUEUE_TIMEOUT=%r; falling back to %ss.",
+            raw_timeout,
+            DEFAULT_TOKEN_QUEUE_TIMEOUT,
+        )
         return DEFAULT_TOKEN_QUEUE_TIMEOUT
     if timeout <= 0:
         return None
@@ -341,7 +344,7 @@ class ResponseGenerator:
                             "Timed out waiting "
                             f"{timeout_label} for the next generated token. "
                             "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
-                            "prefills or reduce the prompt size."
+                            "prefills, or reduce the prompt size."
                         ) from exc
                     if item is None:
                         ended = True
