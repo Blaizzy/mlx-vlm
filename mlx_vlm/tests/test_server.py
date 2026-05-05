@@ -1,3 +1,4 @@
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -138,6 +139,14 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
 
+    def _bare_generator(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen._consecutive_generation_errors = 0
+        gen._last_generation_error = None
+        gen._last_generation_error_at = 0.0
+        gen._stop = False
+        return gen
+
     def test_generate_arguments_defaults(self):
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS
@@ -216,6 +225,63 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_fail_active_requests_notifies_and_clears_streams(self):
+        gen = self._bare_generator()
+        first = Queue()
+        second = Queue()
+        active = {
+            1: {"rqueue": first},
+            2: {"rqueue": second},
+        }
+
+        gen._fail_active_requests(active, IndexError("boom"), "Generation failed")
+
+        assert active == {}
+        for rqueue in (first, second):
+            error = rqueue.get_nowait()
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "Generation failed: boom"
+            assert rqueue.get_nowait() is None
+
+    def test_notify_request_queues_deduplicates_and_terminates(self):
+        gen = self._bare_generator()
+        rqueue = Queue()
+
+        gen._notify_request_queues(
+            [rqueue, rqueue], ValueError("bad batch"), "Generation failed"
+        )
+
+        error = rqueue.get_nowait()
+        assert isinstance(error, RuntimeError)
+        assert str(error) == "Generation failed: bad batch"
+        assert rqueue.get_nowait() is None
+        assert rqueue.empty()
+
+    def test_generation_error_backoff_tracks_and_resets_state(self):
+        gen = self._bare_generator()
+
+        first_delay = gen._record_generation_error(IndexError("first"))
+        second_delay = gen._record_generation_error(IndexError("second"))
+
+        assert gen._consecutive_generation_errors == 2
+        assert gen._last_generation_error == "IndexError: second"
+        assert second_delay >= first_delay
+
+        gen._record_generation_success()
+
+        assert gen._consecutive_generation_errors == 0
+        assert gen._last_generation_error is None
+
+    def test_generation_health_reports_last_error_state(self):
+        gen = self._bare_generator()
+        gen._record_generation_error(RuntimeError("failed"))
+
+        health = gen.generation_health()
+
+        assert health["consecutive_generation_errors"] == 1
+        assert health["last_generation_error"] == "RuntimeError: failed"
+        assert health["last_generation_error_at"] is not None
 
     def test_extract_chat_response_format_json_schema(self):
         req = SimpleNamespace(

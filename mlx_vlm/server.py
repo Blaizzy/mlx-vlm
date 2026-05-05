@@ -102,6 +102,17 @@ def get_top_logprobs_k():
     return max(0, min(k, 20))
 
 
+GENERATION_ERROR_BACKOFF_SECONDS = float(
+    os.environ.get("MLX_VLM_GENERATION_ERROR_BACKOFF_SECONDS", 0.25)
+)
+GENERATION_ERROR_BACKOFF_MAX_SECONDS = float(
+    os.environ.get("MLX_VLM_GENERATION_ERROR_BACKOFF_MAX_SECONDS", 5.0)
+)
+GENERATION_ERROR_RESET_WINDOW_SECONDS = float(
+    os.environ.get("MLX_VLM_GENERATION_ERROR_RESET_WINDOW_SECONDS", 30.0)
+)
+
+
 # =============================================================================
 # ResponseGenerator - Concurrent Request Handling with Threaded Batching
 # =============================================================================
@@ -217,6 +228,9 @@ class ResponseGenerator:
         self._load_error: Optional[Exception] = None
         self._cancelled: set = set()
         self._cancel_lock = Lock()
+        self._consecutive_generation_errors = 0
+        self._last_generation_error: Optional[str] = None
+        self._last_generation_error_at = 0.0
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -240,6 +254,65 @@ class ResponseGenerator:
         with self._cancel_lock:
             pending, self._cancelled = self._cancelled, set()
             return pending
+
+    def generation_health(self) -> dict:
+        return {
+            "consecutive_generation_errors": self._consecutive_generation_errors,
+            "last_generation_error": self._last_generation_error,
+            "last_generation_error_at": self._last_generation_error_at or None,
+        }
+
+    def _record_generation_error(self, error: Exception) -> float:
+        now = time.monotonic()
+        if now - self._last_generation_error_at > GENERATION_ERROR_RESET_WINDOW_SECONDS:
+            self._consecutive_generation_errors = 0
+
+        self._consecutive_generation_errors += 1
+        self._last_generation_error_at = now
+        self._last_generation_error = f"{type(error).__name__}: {error}"
+
+        return min(
+            GENERATION_ERROR_BACKOFF_MAX_SECONDS,
+            GENERATION_ERROR_BACKOFF_SECONDS
+            * (2 ** (self._consecutive_generation_errors - 1)),
+        )
+
+    def _record_generation_success(self):
+        self._consecutive_generation_errors = 0
+        self._last_generation_error = None
+
+    def _notify_request_queues(self, queues, error: Exception, context: str):
+        wrapped = RuntimeError(f"{context}: {error}")
+        seen = set()
+        for rqueue in queues:
+            if rqueue is None or id(rqueue) in seen:
+                continue
+            seen.add(id(rqueue))
+            try:
+                rqueue.put(wrapped)
+                rqueue.put(None)
+            except Exception:
+                pass
+
+    def _fail_active_requests(self, active: dict, error: Exception, context: str):
+        self._notify_request_queues(
+            [info.get("rqueue") for info in active.values()], error, context
+        )
+        active.clear()
+
+    def _cleanup_after_generation_error(self, error: Exception, context: str):
+        delay = self._record_generation_error(error)
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
+        gc.collect()
+        print(
+            f"{context}; reset batch state and backing off for {delay:.2f}s "
+            f"after {self._consecutive_generation_errors} consecutive error(s)."
+        )
+        if delay > 0 and not self._stop:
+            time.sleep(delay)
 
     def _initialize_model(self):
         model, processor, config = load_model_resources(
@@ -414,10 +487,11 @@ class ResponseGenerator:
         active: dict = {}
 
         while not self._stop:
+            new_items = []
+            current_item_index = None
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
-                new_items = []
                 if active:
                     try:
                         item = self.requests.get_nowait()
@@ -459,7 +533,13 @@ class ResponseGenerator:
                             except Exception:
                                 pass
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                for current_item_index, (
+                    rqueue,
+                    raw_inputs,
+                    prompt_tokens,
+                    args,
+                    images,
+                ) in enumerate(new_items):
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -506,14 +586,37 @@ class ResponseGenerator:
                     if has_embeds:
                         self._step(batch_gen, active)
 
+                current_item_index = len(new_items)
+
                 if not active or batch_gen is None:
                     continue
 
                 self._step(batch_gen, active)
+                self._record_generation_success()
 
             except Exception as e:
                 print(f"Error in generation thread: {e}")
                 traceback.print_exc()
+                pending_items = (
+                    new_items[current_item_index:]
+                    if current_item_index is not None
+                    else new_items
+                )
+                active_queue_ids = {
+                    id(info.get("rqueue")) for info in active.values()
+                }
+                self._fail_active_requests(active, e, "Generation failed")
+                self._notify_request_queues(
+                    [
+                        item[0]
+                        for item in pending_items
+                        if id(item[0]) not in active_queue_ids
+                    ],
+                    e,
+                    "Generation failed before request activation",
+                )
+                batch_gen = None
+                self._cleanup_after_generation_error(e, "Generation thread error")
 
     def _run_speculative(self):
         """GPU thread loop with DFlash speculative decoding.
@@ -538,9 +641,10 @@ class ResponseGenerator:
         draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
 
         while not self._stop:
+            pending = []
+            rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
-                pending = []
                 timeout = 0.1
                 try:
                     item = self.requests.get(timeout=timeout)
@@ -563,7 +667,6 @@ class ResponseGenerator:
 
                 # --- Phase 2: prefill new batch ---
                 uids = []
-                rqueues = {}
                 token_lists = {}
                 max_tokens_map = {}
                 all_input_ids = []
@@ -701,6 +804,14 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
+                self._notify_request_queues(
+                    [item[0] for item in pending] + list(rqueues.values()),
+                    e,
+                    "Speculative generation failed",
+                )
+                self._cleanup_after_generation_error(
+                    e, "Speculative generation thread error"
+                )
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
@@ -2580,11 +2691,17 @@ async def health_check():
     """
     Check if the server is healthy and what model is loaded.
     """
+    generation = (
+        response_generator.generation_health()
+        if response_generator is not None
+        else None
+    )
     return {
         "status": "healthy",
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
         "continuous_batching_enabled": response_generator is not None,
+        "generation": generation,
     }
 
 
