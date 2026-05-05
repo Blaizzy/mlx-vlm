@@ -25,7 +25,9 @@ class _DraftInner(nn.Module):
     def __init__(self, text_config: TextConfig):
         super().__init__()
         self.config = text_config
-        self.embed_tokens = nn.Embedding(text_config.vocab_size, text_config.hidden_size)
+        self.embed_tokens = nn.Embedding(
+            text_config.vocab_size, text_config.hidden_size
+        )
         self.layers = [
             DecoderLayer(text_config, layer_idx=i, kv_shared_only=True)
             for i in range(text_config.num_hidden_layers)
@@ -130,9 +132,7 @@ class Gemma4AssistantDraftModel(nn.Module):
             # so the bare ``embed_tokens`` here returns *unscaled* vectors.
             # The drafter's ``pre_projection`` was trained against scaled
             # target embeddings, so we replicate the scale at call time.
-            self._input_embed_scale = float(
-                getattr(inner, "embed_scale", 1.0)
-            )
+            self._input_embed_scale = float(getattr(inner, "embed_scale", 1.0))
 
         # Stash the target's layer_types so the round-loop knows which keys
         # the drafter expects in shared_kv_states.
@@ -182,7 +182,11 @@ class Gemma4AssistantDraftModel(nn.Module):
         if isinstance(kv_offset, int):
             self._kv_offset = kv_offset
         else:
-            self._kv_offset = int(mx.array(kv_offset).max().item()) if not isinstance(kv_offset, mx.array) else int(kv_offset.max().item())
+            self._kv_offset = (
+                int(mx.array(kv_offset).max().item())
+                if not isinstance(kv_offset, mx.array)
+                else int(kv_offset.max().item())
+            )
         if position is None:
             position = kv_offset
         if isinstance(position, int):
@@ -243,8 +247,10 @@ class Gemma4AssistantDraftModel(nn.Module):
 
         h = self.model.norm(h)
         last_hidden = self.post_projection(h)
-        logits = self._lm_head_fn(h) if self._lm_head_fn is not None else (
-            self.model.embed_tokens.as_linear(h)
+        logits = (
+            self._lm_head_fn(h)
+            if self._lm_head_fn is not None
+            else (self.model.embed_tokens.as_linear(h))
         )
         return last_hidden, logits
 

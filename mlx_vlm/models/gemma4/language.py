@@ -574,7 +574,9 @@ class LanguageModel(nn.Module):
         **kwargs,
     ):
         hidden_sink: Optional[list] = (
-            [] if capture_layer_ids is not None or kwargs.pop("return_hidden", False) else None
+            []
+            if capture_layer_ids is not None or kwargs.pop("return_hidden", False)
+            else None
         )
         shared_kv_sink: Optional[dict] = (
             {} if kwargs.pop("return_shared_kv", False) else None

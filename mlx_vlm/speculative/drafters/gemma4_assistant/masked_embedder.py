@@ -49,9 +49,9 @@ class MaskedEmbedder(nn.Module):
 
         # Cluster scores → top-K cluster indices.
         centroid_logits = self.centroids(hidden_states)  # [B, L, num_centroids]
-        topk_idx = mx.argpartition(
-            centroid_logits, kth=-self.top_k, axis=-1
-        )[..., -self.top_k :]  # [B, L, top_k]
+        topk_idx = mx.argpartition(centroid_logits, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]  # [B, L, top_k]
 
         # Reshape token_ordering to [num_centroids, vocab_size_per_centroid].
         ordering = self.token_ordering.reshape(
@@ -72,7 +72,9 @@ class MaskedEmbedder(nn.Module):
         selected_logits = mx.matmul(
             hidden_states[..., None, :],  # [B, L, 1, hidden]
             selected_emb.swapaxes(-1, -2),  # [B, L, hidden, top_k*vsc]
-        ).squeeze(-2)  # [B, L, top_k*vsc]
+        ).squeeze(
+            -2
+        )  # [B, L, top_k*vsc]
 
         mask_value = float(selected_logits.min().item()) - 1.0
 

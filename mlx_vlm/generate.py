@@ -549,9 +549,7 @@ def _mtp_rounds(
 
         if accepted < bs - 1:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, None, accepted, bs
-                )
+                lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
 
         # Slice shared_kv_states to the post-rollback length and rebind.
         rejected = bs - (accepted + 1)
@@ -560,8 +558,8 @@ def _mtp_rounds(
             K, V = kv
             valid = K.shape[-2] - rejected
             if valid <= 0 or valid >= K.shape[-2]:
-                next_shared_kv[k] = (K, V) if valid >= K.shape[-2] else (
-                    K[..., :1, :], V[..., :1, :]
+                next_shared_kv[k] = (
+                    (K, V) if valid >= K.shape[-2] else (K[..., :1, :], V[..., :1, :])
                 )
             else:
                 next_shared_kv[k] = (K[..., :valid, :], V[..., :valid, :])
@@ -715,9 +713,7 @@ def _mtp_rounds_batch(
         # per-row tail-zero on rows that accepted less).
         if max_a < bs - 1:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, None, accepted_arr, bs
-                )
+                lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
 
         # Slice + tail-zero ``verify_out.shared_kv_states`` to match the
         # post-rollback target cache. After this, all rows share the same
@@ -1299,8 +1295,7 @@ def generate_step(
 
         if draft_kind != "dflash":
             raise ValueError(
-                f"Unknown draft_kind {draft_kind!r}. Supported: "
-                "['dflash', 'mtp']"
+                f"Unknown draft_kind {draft_kind!r}. Supported: " "['dflash', 'mtp']"
             )
         hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
         if B == 1:

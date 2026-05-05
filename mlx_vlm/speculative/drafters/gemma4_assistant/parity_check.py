@@ -33,9 +33,7 @@ def main():
         model._lm_head_fn = lambda h: masked(h, embed_w)
     else:
         model._lm_head_fn = model.model.embed_tokens.as_linear
-    model._input_embed = _FakeTargetEmbed(
-        text_cfg.vocab_size, cfg.backbone_hidden_size
-    )
+    model._input_embed = _FakeTargetEmbed(text_cfg.vocab_size, cfg.backbone_hidden_size)
 
     B = 1
     block = cfg.block_size
@@ -60,7 +58,9 @@ def main():
 
     shared_kv = {
         "full_attention": _kv(kv_len, full_head),
-        "sliding_attention": _kv(min(kv_len, text_cfg.sliding_window), text_cfg.head_dim),
+        "sliding_attention": _kv(
+            min(kv_len, text_cfg.sliding_window), text_cfg.head_dim
+        ),
     }
     model.set_shared_kv(shared_kv, kv_offset=kv_len)
 
