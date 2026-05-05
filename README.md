@@ -143,6 +143,11 @@ mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
   --draft-kind mtp --draft-block-size 4 \
   --prompt "Explain speculative decoding in 3 sentences." \
   --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
+  --draft-kind mtp --draft-block-size 4
 ```
 
 Supported pairings (target ↔ drafter):

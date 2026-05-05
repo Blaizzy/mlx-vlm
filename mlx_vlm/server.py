@@ -58,6 +58,41 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+def _get_speculative_rounds_batch(draft_kind: str):
+    if draft_kind == "mtp":
+        return _mtp_rounds_batch
+    if draft_kind == "dflash":
+        return _dflash_rounds_batch
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
+    )
+
+
+def _speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
+    if draft_kind == "mtp":
+        return {"return_hidden": True, "return_shared_kv": True}
+    if draft_kind == "dflash":
+        return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
+    )
+
+
+def _speculative_hidden_state(draft_kind: str, outputs):
+    if draft_kind == "mtp":
+        return outputs.hidden_states[-1]
+    if draft_kind == "dflash":
+        return mx.concatenate(outputs.hidden_states, axis=-1)
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
+    )
+
+
+def _get_draft_block_size_from_env():
+    draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
+    return int(draft_block_size_str) if draft_block_size_str else None
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -566,11 +601,11 @@ class ResponseGenerator:
         drafter = self.draft_model
         draft_kind = self.draft_kind
         is_mtp = draft_kind == "mtp"
-        target_layer_ids = [] if is_mtp else list(drafter.config.target_layer_ids)
+        rounds_batch = _get_speculative_rounds_batch(draft_kind)
+        prefill_kwargs = _speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
-        draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
-        draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
+        draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
             try:
@@ -624,25 +659,9 @@ class ResponseGenerator:
                 lm._rope_deltas = None
 
                 with mx.stream(generation_stream):
-                    if is_mtp:
-                        out = lm(
-                            input_mx,
-                            cache=prompt_cache,
-                            return_hidden=True,
-                            return_shared_kv=True,
-                        )
-                    else:
-                        out = lm(
-                            input_mx,
-                            cache=prompt_cache,
-                            capture_layer_ids=target_layer_ids,
-                        )
-                if is_mtp:
-                    hidden = out.hidden_states[-1]
-                    shared_kv_states = out.shared_kv_states
-                else:
-                    hidden = mx.concatenate(out.hidden_states, axis=-1)
-                    shared_kv_states = None
+                    out = lm(input_mx, cache=prompt_cache, **prefill_kwargs)
+                hidden = _speculative_hidden_state(draft_kind, out)
+                shared_kv_states = out.shared_kv_states if is_mtp else None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
 
@@ -676,33 +695,31 @@ class ResponseGenerator:
                         return True
                     return False
 
+                rounds_kwargs = dict(
+                    first_bonus=first_bonus,
+                    max_tokens=max_tok,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=mx.int32,
+                    stop_check=stop_check,
+                )
                 if is_mtp:
-                    rounds_iter = _mtp_rounds_batch(
+                    rounds_iter = rounds_batch(
                         self.model,
                         drafter,
                         prompt_cache,
                         hidden,
                         shared_kv_states,
-                        first_bonus=first_bonus,
-                        max_tokens=max_tok,
-                        sampler=sampler,
-                        draft_block_size=draft_block_size,
-                        token_dtype=mx.int32,
-                        stop_check=stop_check,
                         eos_token_ids=eos_set,
+                        **rounds_kwargs,
                     )
                 else:
-                    rounds_iter = _dflash_rounds_batch(
+                    rounds_iter = rounds_batch(
                         self.model,
                         drafter,
                         prompt_cache,
                         hidden,
-                        first_bonus=first_bonus,
-                        max_tokens=max_tok,
-                        sampler=sampler,
-                        draft_block_size=draft_block_size,
-                        token_dtype=mx.int32,
-                        stop_check=stop_check,
+                        **rounds_kwargs,
                     )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
