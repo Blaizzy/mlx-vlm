@@ -112,27 +112,6 @@ target forward time dominates. On the small E4B target, target forward is
 already cheap and at high batch sizes the drafter's per-step overhead
 exceeds the speedup it buys.
 
-Reproduce with `scripts/mtp_batch_sweep.py`:
-
-```bash
-uv run python scripts/mtp_batch_sweep.py \
-    --model mlx-community/gemma-4-26B-A4B-it-bf16 \
-    --drafter mlx-community/gemma-4-26B-A4B-it-assistant-bf16 \
-    --batch-sizes 4 8 --block-sizes 2 3 --max-tokens 64
-```
-
-## Smoke test
-
-```bash
-uv run python -m mlx_vlm.speculative.drafters.gemma4_assistant.parity_check \
-    --drafter mlx-community/gemma-4-E4B-it-assistant-bf16
-```
-
-Expects `forward OK: logits shape=(1, 1, 262144) ...` and
-`draft_block OK: tokens shape=(1, 3) ...`. For drafters with the centroid
-LM head the parity check exercises `MaskedEmbedder` end-to-end (most
-positions land at the sparse `min - 1` floor).
-
 ## Caveats
 
 - **Sampling.** Greedy (temp 0) is verified byte-identical. Stochastic
