@@ -1209,7 +1209,6 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "fastapi" },
-    { name = "llguidance" },
     { name = "miniaudio" },
     { name = "mlx" },
     { name = "mlx-audio" },
@@ -1240,7 +1239,6 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.19.1" },
     { name = "fastapi", specifier = ">=0.95.1" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=5.19.0" },
-    { name = "llguidance", specifier = ">=1.7.0" },
     { name = "miniaudio", specifier = ">=1.59" },
     { name = "mlx", specifier = ">=0.31.2" },
     { name = "mlx-audio", specifier = ">=0.4.3" },

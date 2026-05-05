@@ -223,9 +223,7 @@ class TestResponseGenerator:
 
         assert cancelled == ["req-1"]
 
-    def test_token_iterator_waits_past_timeout_for_delayed_token(
-        self, monkeypatch
-    ):
+    def test_token_iterator_waits_past_timeout_for_delayed_token(self, monkeypatch):
         import threading
 
         gen = self._bare_generator()
