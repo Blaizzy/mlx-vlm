@@ -147,17 +147,21 @@ class Gemma4AssistantDraftModel(nn.Module):
         h = self.pre_projection(inputs_embeds)
 
         query_len = h.shape[1]
-        query_offset_scalar = int(position_ids[0, 0].item())
+        query_offset = (
+            int(position_ids[0, 0].item())
+            if position_ids.shape[0] == 1
+            else position_ids[:, 0]
+        )
         masks = make_drafter_masks(
             shared_kv_states,
             query_len=query_len,
-            query_offset=query_offset_scalar,
+            query_offset=query_offset,
             sliding_window=text_cfg.sliding_window,
             dtype=h.dtype,
         )
 
         if position_ids.shape[0] == 1:
-            offset = mx.array(query_offset_scalar)
+            offset = mx.array(query_offset)
         else:
             offset = position_ids[:, 0]
 

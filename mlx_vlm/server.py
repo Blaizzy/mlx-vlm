@@ -87,6 +87,11 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _get_spec_batch_wait_from_env() -> float:
+    wait_ms = os.environ.get("MLX_VLM_SPEC_BATCH_WAIT_MS")
+    return max(0.0, float(wait_ms) / 1000.0) if wait_ms else 0.0
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -600,6 +605,7 @@ class ResponseGenerator:
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
+        spec_batch_wait = _get_spec_batch_wait_from_env()
 
         while not self._stop:
             try:
@@ -614,6 +620,8 @@ class ResponseGenerator:
                         pending.append(item)
                 except QueueEmpty:
                     pass
+                if pending and spec_batch_wait > 0:
+                    time.sleep(spec_batch_wait)
                 while True:
                     try:
                         item = self.requests.get_nowait()
@@ -645,10 +653,11 @@ class ResponseGenerator:
 
                 B = len(uids)
                 max_len = max(len(ids) for ids in all_input_ids)
-                padded = [[0] * (max_len - len(ids)) + ids for ids in all_input_ids]
+                left_padding = [max_len - len(ids) for ids in all_input_ids]
+                padded = [[0] * left_padding[i] + ids for i, ids in enumerate(all_input_ids)]
                 input_mx = mx.array(padded, dtype=mx.int32)
 
-                prompt_cache = _make_cache(lm, [0] * B)
+                prompt_cache = _make_cache(lm, left_padding)
                 lm._position_ids = None
                 lm._rope_deltas = None
 
