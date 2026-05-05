@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
@@ -56,6 +55,7 @@ class Model(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_hws", None)
         video_grid_thw = kwargs.pop("video_grid_hws", None)
         image_token_id = kwargs.pop("image_token_id", None)
+        grid_shapes = kwargs.pop("_grid_shapes", None)
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
@@ -72,59 +72,29 @@ class Model(nn.Module):
                 pixel_values.transpose(0, 2, 3, 1),
                 output_hidden_states=True,
                 grid_thw=grid_thw,
+                grid_shapes=grid_shapes,
             )
 
             image_features = self.multi_modal_projector(hidden_state)
 
-        final_inputs_embeds = self._prepare_inputs_for_multimodal(
-            image_features,
-            inputs_embeds,
-            input_ids,
-            image_token_id=image_token_id,
-        )
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
-
-    def _prepare_inputs_for_multimodal(
-        self,
-        image_features,
-        inputs_embeds,
-        input_ids,
-        image_token_id=None,
-    ):
-        candidate_token_ids = []
-        for token_id in [
+        image_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        for tid in [
             image_token_id,
             self.config.image_token_index,
             getattr(self.config, "media_placeholder_token_id", None),
         ]:
-            if token_id is None:
-                continue
-            if isinstance(token_id, mx.array):
-                if token_id.size == 0:
+            if tid is not None:
+                if isinstance(tid, mx.array) and tid.size == 0:
                     continue
-                token_id = token_id.item()
-            token_id = int(token_id)
-            if token_id not in candidate_token_ids:
-                candidate_token_ids.append(token_id)
+                image_mask = image_mask | (input_ids == tid)
 
-        image_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
-        for token_id in candidate_token_ids:
-            image_mask = mx.logical_or(image_mask, input_ids == token_id)
+        mask_flat = image_mask.reshape(-1)
+        cumsum = mx.cumsum(mask_flat.astype(mx.int32)) - 1
+        feat_idx = mx.where(mask_flat, cumsum, 0).reshape(input_ids.shape)
+        gathered = image_features[feat_idx]
+        inputs_embeds = mx.where(image_mask[..., None], gathered, inputs_embeds)
 
-        # Positions of <image> tokens in input_ids, assuming batch size is 1
-        image_positions = np.where(np.array(image_mask))[1].tolist()
-        num_image_tokens = len(image_positions)
-        num_image_features = image_features.shape[0]
-        if num_image_tokens != num_image_features:
-            raise ValueError(
-                "Number of image placeholder tokens does not match extracted image features: "
-                f"{num_image_tokens} tokens for {num_image_features} features. "
-                f"Candidate token IDs: {candidate_token_ids}."
-            )
-
-        inputs_embeds[:, image_positions, :] = image_features
-
-        return inputs_embeds
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     @property
     def layers(self):
