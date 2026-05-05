@@ -56,6 +56,7 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 
 
 def _get_speculative_rounds_batch(draft_kind: str):
@@ -89,6 +90,24 @@ def _get_draft_block_size_from_env():
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_token_queue_timeout():
+    raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
+    if raw_timeout == "":
+        return DEFAULT_TOKEN_QUEUE_TIMEOUT
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_TOKEN_QUEUE_TIMEOUT=%r; falling back to %ss.",
+            raw_timeout,
+            DEFAULT_TOKEN_QUEUE_TIMEOUT,
+        )
+        return DEFAULT_TOKEN_QUEUE_TIMEOUT
+    if timeout <= 0:
+        return None
+    return timeout
 
 
 def get_quantized_kv_bits(model: str):
@@ -350,9 +369,23 @@ class ResponseGenerator:
             # closes immediately after seeing finish_reason isn't treated
             # as a client abort.
             ended = False
+            queue_timeout = get_token_queue_timeout()
             try:
                 while True:
-                    item = rqueue.get(timeout=60.0)
+                    try:
+                        item = rqueue.get(timeout=queue_timeout)
+                    except QueueEmpty as exc:
+                        timeout_label = (
+                            "without a timeout"
+                            if queue_timeout is None
+                            else f"for {queue_timeout:g}s"
+                        )
+                        raise RuntimeError(
+                            "Timed out waiting "
+                            f"{timeout_label} for the next generated token. "
+                            "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
+                            "prefills, or reduce the prompt size."
+                        ) from exc
                     if item is None:
                         ended = True
                         break
