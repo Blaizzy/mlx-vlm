@@ -41,6 +41,7 @@ from .generate import (
     BatchGenerator,
     _dflash_rounds_batch,
     _make_cache,
+    _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
     stream_generate,
@@ -263,11 +264,11 @@ class ResponseGenerator:
                 stop_tokens.add(config.eos_token_id)
 
         draft_model = None
+        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
             from .speculative.drafters import load_drafter
 
-            draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
             print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
             draft_model = load_drafter(draft_model_path, kind=draft_kind)
             print("Drafter ready — speculative decoding enabled.")
@@ -277,6 +278,7 @@ class ResponseGenerator:
         self.config = config
         self.stop_tokens = stop_tokens
         self.draft_model = draft_model
+        self.draft_kind = draft_kind
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -548,15 +550,13 @@ class ResponseGenerator:
                 gc.collect()
 
     def _run_speculative(self):
-        """GPU thread loop with DFlash speculative decoding.
+        """GPU thread loop with DFlash or Gemma 4 MTP speculative decoding.
 
-        Collects incoming requests, prefills them as a batch with
-        ``capture_layer_ids``, then runs ``_dflash_rounds_batch`` for
-        decode. Between speculative rounds the loop checks for new
-        requests — new arrivals trigger a batch rebuild (re-prefill
-        for the new sequences, extend target caches, cold-restart
-        drafter). Finished sequences are filtered out automatically
-        by ``_dflash_rounds_batch``'s ``stop_check`` callback.
+        Collects incoming requests, prefills them as a batch with the
+        per-family hooks (``capture_layer_ids`` for DFlash; ``return_hidden``
+        + ``return_shared_kv`` for MTP), then runs the matching round-loop
+        for decode. Finished sequences are filtered out automatically by
+        the round-loop's ``stop_check`` callback.
         """
         from mlx_lm.sample_utils import make_sampler as _make_sampler
 
@@ -564,7 +564,12 @@ class ResponseGenerator:
 
         lm = self.model.language_model
         drafter = self.draft_model
-        target_layer_ids = list(drafter.config.target_layer_ids)
+        draft_kind = self.draft_kind
+        is_mtp = draft_kind == "mtp"
+        target_layer_ids = (
+            [] if is_mtp else list(drafter.config.target_layer_ids)
+        )
+        eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
         draft_block_size = int(draft_block_size_str) if draft_block_size_str else None
@@ -621,12 +626,25 @@ class ResponseGenerator:
                 lm._rope_deltas = None
 
                 with mx.stream(generation_stream):
-                    out = lm(
-                        input_mx,
-                        cache=prompt_cache,
-                        capture_layer_ids=target_layer_ids,
-                    )
-                hidden = mx.concatenate(out.hidden_states, axis=-1)
+                    if is_mtp:
+                        out = lm(
+                            input_mx,
+                            cache=prompt_cache,
+                            return_hidden=True,
+                            return_shared_kv=True,
+                        )
+                    else:
+                        out = lm(
+                            input_mx,
+                            cache=prompt_cache,
+                            capture_layer_ids=target_layer_ids,
+                        )
+                if is_mtp:
+                    hidden = out.hidden_states[-1]
+                    shared_kv_states = out.shared_kv_states
+                else:
+                    hidden = mx.concatenate(out.hidden_states, axis=-1)
+                    shared_kv_states = None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
 
@@ -660,18 +678,35 @@ class ResponseGenerator:
                         return True
                     return False
 
-                for tok_list, _ in _dflash_rounds_batch(
-                    self.model,
-                    drafter,
-                    prompt_cache,
-                    hidden,
-                    first_bonus=first_bonus,
-                    max_tokens=max_tok,
-                    sampler=sampler,
-                    draft_block_size=draft_block_size,
-                    token_dtype=mx.int32,
-                    stop_check=stop_check,
-                ):
+                if is_mtp:
+                    rounds_iter = _mtp_rounds_batch(
+                        self.model,
+                        drafter,
+                        prompt_cache,
+                        hidden,
+                        shared_kv_states,
+                        first_bonus=first_bonus,
+                        max_tokens=max_tok,
+                        sampler=sampler,
+                        draft_block_size=draft_block_size,
+                        token_dtype=mx.int32,
+                        stop_check=stop_check,
+                        eos_token_ids=eos_set,
+                    )
+                else:
+                    rounds_iter = _dflash_rounds_batch(
+                        self.model,
+                        drafter,
+                        prompt_cache,
+                        hidden,
+                        first_bonus=first_bonus,
+                        max_tokens=max_tok,
+                        sampler=sampler,
+                        draft_block_size=draft_block_size,
+                        token_dtype=mx.int32,
+                        stop_check=stop_check,
+                    )
+                for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
                         if tok is None:
                             continue
@@ -712,7 +747,8 @@ class ResponseGenerator:
                 if al:
                     mean_a = sum(al) / len(al)
                     print(
-                        f"[DFlash] batch={B} tokens={sum(len(token_lists[u]) for u in uids)} "
+                        f"[{'MTP' if is_mtp else 'DFlash'}] batch={B} "
+                        f"tokens={sum(len(token_lists[u]) for u in uids)} "
                         f"accept={mean_a:.2f} rounds={len(al)}"
                     )
 
@@ -2797,13 +2833,17 @@ def main():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help=(
+            "Speculative drafter path or HF id "
+            "(e.g. z-lab/Qwen3.5-4B-DFlash, google/gemma-4-31B-it-assistant)."
+        ),
     )
     parser.add_argument(
         "--draft-kind",
         type=str,
         default="dflash",
-        help="Drafter family (default: dflash).",
+        choices=["dflash", "mtp"],
+        help="Drafter family — 'dflash' (default) or 'mtp' (Gemma 4).",
     )
     parser.add_argument(
         "--draft-block-size",
