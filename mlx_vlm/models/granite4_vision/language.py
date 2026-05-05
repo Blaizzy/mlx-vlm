@@ -55,8 +55,6 @@ class Attention(nn.Module):
 
 
 class SharedMLP(nn.Module):
-    """GraniteMoeHybrid shared MLP with fused gate+up projection."""
-
     def __init__(self, config: TextConfig):
         super().__init__()
         # Fused gate + up projection: output is 2 * intermediate_size
@@ -76,8 +74,6 @@ class SharedMLP(nn.Module):
 
 
 class MLP(nn.Module):
-    """Standard Granite MLP with separate gate/up/down projections."""
-
     def __init__(self, config: TextConfig):
         super().__init__()
         self.gate_proj = nn.Linear(
