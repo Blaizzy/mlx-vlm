@@ -42,6 +42,7 @@ MODEL_REMAPPING = {
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
+    "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -87,16 +88,18 @@ def skip_multimodal_module(path: str) -> bool:
     Returns:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    return (
-        "vision_model" in path
-        or "vision_tower" in path
-        or "vl_connector" in path
-        or "sam_model" in path
-        or "audio_model" in path
-        or "audio_tower" in path
-        or "code_predictor" in path
-        or "img_projector" in path
+    multimodal_modules = (
+        "vision_model",
+        "vision_tower",
+        "vl_connector",
+        "sam_model",
+        "audio_model",
+        "audio_tower",
+        "code_predictor",
+        "img_projector",
+        "multi_modal_projector",
     )
+    return any(module in path for module in multimodal_modules)
 
 
 def get_model_and_args(config: dict):
@@ -269,7 +272,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if not "quantization" in config:
+    if "quantization" not in config:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
@@ -846,55 +849,6 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
-def _resample_fft(signal: np.ndarray, n_target: int) -> np.ndarray:
-    """FFT-based resampling for a 1D signal (matches scipy.signal.resample)."""
-    n_orig = len(signal)
-    if n_orig == n_target:
-        return signal
-
-    X = np.fft.rfft(signal)
-    m = min(n_target, n_orig)
-    m2 = m // 2 + 1
-
-    # Truncate to relevant frequency bins
-    X = X[:m2].copy()
-
-    # Account for unpaired Nyquist bin (matches scipy exactly)
-    if m % 2 == 0 and n_target != n_orig:
-        X[m // 2] *= 2.0 if n_target < n_orig else 0.5
-
-    s_fac = n_orig / n_target
-    resampled = np.fft.irfft(X / s_fac, n=n_target)
-    return resampled.astype(signal.dtype)
-
-
-def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio using FFT (matches scipy.signal.resample)."""
-    if orig_sr == target_sr:
-        return audio
-
-    ratio = target_sr / orig_sr
-
-    if audio.ndim == 1:
-        new_length = int(len(audio) * ratio)
-        resampled = _resample_fft(audio, new_length)
-
-    elif audio.ndim == 2:
-        if audio.shape[0] < audio.shape[1]:
-            audio = audio.T
-
-        n_samples, n_channels = audio.shape
-        new_length = int(n_samples * ratio)
-
-        resampled = np.zeros((new_length, n_channels), dtype=audio.dtype)
-        for i in range(n_channels):
-            resampled[:, i] = _resample_fft(audio[:, i], new_length)
-    else:
-        raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
-
-    return resampled
-
-
 def read_audio(file) -> tuple:
     """Read an audio file using miniaudio (or ffmpeg for m4a/aac/ogg/opus).
 
@@ -1049,24 +1003,30 @@ def load_audio(
     Helper function to load audio from either a URL, file path, or numpy array.
     """
     if isinstance(file, np.ndarray):
-        return file
+        audio = file.astype(np.float32, copy=False)
+        return audio.mean(axis=1) if audio.ndim > 1 else audio
+
+    from mlx_audio.audio_io import read as read_audio
+    from mlx_audio.utils import resample_audio
+
     if isinstance(file, Path):
         file = str(file)
     if isinstance(file, str) and file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
-            audio, sample_rate = read_audio(BytesIO(response.content))
+            audio, sample_rate = read_audio(BytesIO(response.content), dtype="float32")
         except Exception as e:
             raise ValueError(
                 f"Failed to load audio from URL: {file} with error {e}"
             ) from e
     else:
-        audio, sample_rate = read_audio(file)
+        audio, sample_rate = read_audio(file, dtype="float32")
 
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
-    return np.array(audio).mean(axis=1)
+    audio = np.asarray(audio, dtype=np.float32)
+    return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
 def normalize_audio_features(features: mx.array) -> mx.array:

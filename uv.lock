@@ -926,6 +926,29 @@ wheels = [
 ]
 
 [[package]]
+name = "llguidance"
+version = "1.7.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f0/1b/d23007f94b74a8465a8a12602579aca5f9cf4bf868dab5fd5b2d61a233ee/llguidance-1.7.3.tar.gz", hash = "sha256:b97ba454c723d70d3b036dea7ef7f2de376d0bd81ab3d99502cc1efe373b03ec", size = 1153440, upload-time = "2026-04-20T21:15:08.781Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2c/f1/818e93b059bf00219cfcaa1157b176492e03a5f488cfe159566f7e6e5fde/llguidance-1.7.3-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:e2eeeeb54bb033bc070c828eba6a0644644756a6e4ce4898d5cd79caf2462390", size = 3240288, upload-time = "2026-04-20T21:14:42.984Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/c9/896f56f36673b230d32af473d957dfd8e979d66879ebf2eaf699257f572f/llguidance-1.7.3-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:fe42358c2fb476b69789c555743e0d12fb354d6ddf8bbd2c669c710ee4e2cbb2", size = 3144890, upload-time = "2026-04-20T21:14:44.868Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/ea/ddc889167111d00a91cb4f9b6cbc9e451786439a13c5522b01be479ae01c/llguidance-1.7.3-cp314-cp314t-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:fc74a9390418d9a2ed7811f243eb1417842aa23a850233914311a51bbcea29ee", size = 3470103, upload-time = "2026-04-20T21:14:46.624Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/f3/79db5a135f5d587d0f589004e2352f77f127cc92db352dba3904685ad88b/llguidance-1.7.3-cp314-cp314t-manylinux_2_17_i686.manylinux2014_i686.whl", hash = "sha256:7c578a077a7b87c9ef57717dc9fa61513cbb3ebb30c5b58acd0c18b2fb627187", size = 3760709, upload-time = "2026-04-20T21:14:48.191Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/42/9542dae2efcbd83940bd9dbe7b65ad09342608d509535835c005b32d0a0a/llguidance-1.7.3-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:1cbf32aa6cfbf0fefde5b8ea98903b1c29f4ac8216c082c740f7592618fff7f8", size = 3490209, upload-time = "2026-04-20T21:14:50.138Z" },
+    { url = "https://files.pythonhosted.org/packages/db/3a/fd453c7df03633f35c0e6ef4b9679df28ea6cd9983e4480710b710d2f834/llguidance-1.7.3-cp314-cp314t-win32.whl", hash = "sha256:d3ae30aa74ebb9727ad2649fbcdabf55c6dd4c7dd424094539f8508d780f70e8", size = 2600881, upload-time = "2026-04-20T21:14:51.636Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/7d/82ca82290f80a89de9fb6d64f9208917e13aa0a114619ffea0647c1cdbe6/llguidance-1.7.3-cp314-cp314t-win_amd64.whl", hash = "sha256:418f34ff6e1ec96cab89b13dcc15b1a696eb36aba90fe49e3fa06b593ddedb28", size = 2867893, upload-time = "2026-04-20T21:14:53.493Z" },
+    { url = "https://files.pythonhosted.org/packages/29/19/31349c112f1dd62e2e1613dd5fee10419fd67ca3497332b802fc98a9b4f6/llguidance-1.7.3-cp39-abi3-macosx_10_12_x86_64.whl", hash = "sha256:d441049d75286f60d55b28a73483ad02ffb742ef9b33ac8efa98b29c698897ec", size = 3248781, upload-time = "2026-04-20T21:14:55.023Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/d6/e8a6b4a17a0ddcd19dd522bc0e479939d3775456ba15116fc8cf51a3b1b0/llguidance-1.7.3-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:76aced208b63d732f15cc848765023c9e91e492f80ed3458b407f023a07761ff", size = 3149797, upload-time = "2026-04-20T21:14:56.9Z" },
+    { url = "https://files.pythonhosted.org/packages/31/c5/dc9156786739a267978b0b5e593b1d61e92db97f76b00794f625def8a176/llguidance-1.7.3-cp39-abi3-manylinux_2_31_aarch64.whl", hash = "sha256:1a35f8296159d7cecc488e702f698658da4b6a0eeca421f1f1bf1349d00bb0c7", size = 2891142, upload-time = "2026-04-20T21:14:58.747Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/c5/4564d131a02caefcf4876c26c33d05a35fddf53980b4c86fce31fdb27088/llguidance-1.7.3-cp39-abi3-manylinux_2_31_x86_64.whl", hash = "sha256:50dd687a5d944c898dfe66af7af86c7591a0425fe84c4862b8f5549582106732", size = 3083627, upload-time = "2026-04-20T21:15:00.592Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/05/201350217c781d6ad131af4fbb5644a551de1b9012a734bccc44300495f9/llguidance-1.7.3-cp39-abi3-manylinux_2_34_i686.whl", hash = "sha256:87b2019ff00b463558f6731b82246095bab202c45291a6038933bc75efbc674a", size = 3341351, upload-time = "2026-04-20T21:15:02.243Z" },
+    { url = "https://files.pythonhosted.org/packages/97/50/f89f4ba15ead1e472ace2b919adf28e9fb88334f6c5796e46ee1937def7c/llguidance-1.7.3-cp39-abi3-manylinux_2_39_riscv64.whl", hash = "sha256:0ca0ba2985a09a74c6572d72d0f1885c90f01276b079f32ab0fbe41818dfc955", size = 3611737, upload-time = "2026-04-20T21:15:04.264Z" },
+    { url = "https://files.pythonhosted.org/packages/59/b2/bd822432b8be03cc610790708ba6516a02dd4d1090f3dad95c74d8cdc77b/llguidance-1.7.3-cp39-abi3-win32.whl", hash = "sha256:ff5c6e16727fb1d72609600b8ec94023a57a13799583b9ca77f8de56c4425df9", size = 2613685, upload-time = "2026-04-20T21:15:05.738Z" },
+    { url = "https://files.pythonhosted.org/packages/3e/97/2a488c3e696e3fb22e0bc5e07248736626f7ad92c0caf9d88dbc7866c6bd/llguidance-1.7.3-cp39-abi3-win_amd64.whl", hash = "sha256:c2f3d5f369fb74dc7ecdc4f686b15ec5522c6b81a903024078f9a6ab9b2dc1f4", size = 2873297, upload-time = "2026-04-20T21:15:07.451Z" },
+]
+
+[[package]]
 name = "markdown-it-py"
 version = "4.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1164,6 +1187,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "fastapi" },
+    { name = "llguidance" },
     { name = "miniaudio" },
     { name = "mlx" },
     { name = "mlx-lm" },
@@ -1193,6 +1217,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.19.1" },
     { name = "fastapi", specifier = ">=0.95.1" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=5.19.0" },
+    { name = "llguidance", specifier = ">=1.7.0" },
     { name = "miniaudio", specifier = ">=1.59" },
     { name = "mlx", specifier = ">=0.31.1" },
     { name = "mlx-cpu", marker = "extra == 'cpu'" },
