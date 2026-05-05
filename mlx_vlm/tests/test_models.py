@@ -1244,6 +1244,50 @@ class TestModels(unittest.TestCase):
             model.language_model, config.text_config.hidden_size
         )
 
+    def test_qwen3_5_model_config(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        quantization = {
+            "group_size": 128,
+            "bits": 4,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                "group_size": 128,
+                "bits": 6,
+            },
+            "model.visual.blocks.0.attn.qkv": False,
+            "lm_head": False,
+        }
+
+        for model_module in (qwen3_5, qwen3_5_moe):
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {},
+                        "vision_config": {},
+                        "quantization": quantization,
+                        "quantization_config": quantization,
+                    }
+                )
+
+                self.assertIn(
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertEqual(
+                    config.quantization[
+                        "language_model.model.layers.0.linear_attn.in_proj_qkv"
+                    ],
+                    {"group_size": 128, "bits": 6},
+                )
+                self.assertNotIn(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
+                self.assertIn("language_model.lm_head", config.quantization)
+                self.assertIs(config.quantization, config.quantization_config)
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
