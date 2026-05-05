@@ -28,7 +28,6 @@ class _DraftInner(nn.Module):
 
 class Gemma4AssistantDraftModel(nn.Module):
 
-
     def __init__(self, config: Gemma4AssistantConfig):
         super().__init__()
         self.config = config
@@ -116,7 +115,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         kv_offset,
         position=None,
     ) -> None:
-        
+
         self._shared_kv = shared_kv_states
         if isinstance(kv_offset, int):
             self._kv_offset = kv_offset
@@ -183,7 +182,6 @@ class Gemma4AssistantDraftModel(nn.Module):
         )
         return last_hidden, logits
 
-
     def draft_block(
         self,
         last_bonus,
@@ -237,7 +235,6 @@ class Gemma4AssistantDraftModel(nn.Module):
             tokens.append(tok)
 
         return mx.concatenate(tokens, axis=1)
-
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
