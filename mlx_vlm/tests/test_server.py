@@ -1,3 +1,4 @@
+from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -138,12 +139,89 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
 
+    def _bare_generator(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.draft_model = None
+        gen.wait_until_ready = lambda: None
+        gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
+        return gen
+
     def test_generate_arguments_defaults(self):
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS
         assert args.temperature == server.DEFAULT_TEMPERATURE
         assert args.enable_thinking is True
         assert args.logit_bias is None
+
+    def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.delenv("TOKEN_QUEUE_TIMEOUT", raising=False)
+
+        assert server.get_token_queue_timeout() == 600.0
+
+    def test_token_queue_timeout_accepts_namespaced_env(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
+
+        assert server.get_token_queue_timeout() == 42.5
+
+    def test_token_queue_timeout_accepts_legacy_env_alias(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setenv("TOKEN_QUEUE_TIMEOUT", "90")
+
+        assert server.get_token_queue_timeout() == 90.0
+
+    def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
+
+        assert server.get_token_queue_timeout() == 600.0
+
+    def test_token_queue_timeout_can_disable_timeout(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0")
+
+        assert server.get_token_queue_timeout() is None
+
+    def test_token_iterator_reports_timeout_and_cancels_request(self, monkeypatch):
+        gen = self._bare_generator()
+        cancelled = []
+
+        class Requests:
+            def put(self, item):
+                rqueue = item[0]
+                rqueue.put(SimpleNamespace(uid="req-1"))
+
+        gen.requests = Requests()
+        gen._cancel = cancelled.append
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+
+        _, token_iter = gen.generate("hello")
+
+        with pytest.raises(RuntimeError, match="Timed out waiting for 0.01s"):
+            next(token_iter)
+
+        assert cancelled == ["req-1"]
+
+    def test_token_iterator_yields_items_before_timeout(self, monkeypatch):
+        gen = self._bare_generator()
+        cancelled = []
+        token = SimpleNamespace(text="hi")
+
+        class Requests:
+            def put(self, item):
+                rqueue: Queue = item[0]
+                rqueue.put(SimpleNamespace(uid="req-1"))
+                rqueue.put(token)
+                rqueue.put(None)
+
+        gen.requests = Requests()
+        gen._cancel = cancelled.append
+        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+
+        _, token_iter = gen.generate("hello")
+
+        assert next(token_iter) is token
+        with pytest.raises(StopIteration):
+            next(token_iter)
+        assert cancelled == []
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
