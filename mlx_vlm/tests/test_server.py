@@ -88,6 +88,14 @@ def test_speculative_server_reads_draft_block_size_env(monkeypatch):
     assert server._get_draft_block_size_from_env() == 3
 
 
+def test_speculative_server_reads_batch_wait_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SPEC_BATCH_WAIT_MS", raising=False)
+    assert server._get_spec_batch_wait_from_env() == 0.0
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_WAIT_MS", "750")
+    assert server._get_spec_batch_wait_from_env() == 0.75
+
+
 def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
