@@ -98,7 +98,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
         self.self_attn = Attention(config)
-        if config.use_shared_mlp:
+        self.use_shared_mlp = config.use_shared_mlp
+        if self.use_shared_mlp:
             self.shared_mlp = SharedMLP(config)
         else:
             self.mlp = MLP(config)
@@ -107,12 +108,11 @@ class TransformerBlock(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.residual_multiplier = config.residual_multiplier
-        self._use_shared_mlp = config.use_shared_mlp
 
     def __call__(self, x, mask=None, cache=None):
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r * self.residual_multiplier
-        mlp_fn = self.shared_mlp if self._use_shared_mlp else self.mlp
+        mlp_fn = self.shared_mlp if self.use_shared_mlp else self.mlp
         r = mlp_fn(self.post_attention_layernorm(h))
         out = h + r * self.residual_multiplier
         return out
