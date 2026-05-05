@@ -29,10 +29,10 @@ The drafter is tightly coupled to the target's internals:
 
 | Target                                | Drafter                                              | LM head                |
 | ------------------------------------- | ---------------------------------------------------- | ---------------------- |
-| `google/gemma-4-E2B-it`               | `google/gemma-4-E2B-it-assistant`                  | centroid (sparse)      |
-| `google/gemma-4-E4B-it`               | `google/gemma-4-E4B-it-assistant`                  | centroid (sparse)      |
-| `google/gemma-4-26B-A4B-it`           | `google/gemma-4-26B-A4B-it-assistant`              | tied dense             |
-| `google/gemma-4-31B-it`               | `google/gemma-4-31B-it-assistant`                  | tied dense             |
+| `mlx-community/gemma-4-E2B-it-bf16`               | `mlx-community/gemma-4-E2B-it-assistant-bf16`                  | centroid (sparse)      |
+| `mlx-community/gemma-4-E4B-it-bf16`               | `mlx-community/gemma-4-E4B-it-assistant-bf16`                  | centroid (sparse)      |
+| `mlx-community/gemma-4-26B-A4B-it-bf16`           | `mlx-community/gemma-4-26B-A4B-it-assistant-bf16`              | tied dense             |
+| `mlx-community/gemma-4-31B-it-bf16`               | `mlx-community/gemma-4-31B-it-assistant-bf16  `                  | tied dense             |
 
 For E2B / E4B drafters, `use_ordered_embeddings=True` and the LM head is a
 **centroid-routed sparse softmax** (`MaskedEmbedder`): the drafter scores
@@ -57,8 +57,8 @@ just pass `--draft-model` and `--draft-kind mtp` to `mlx_vlm.generate`:
 
 ```bash
 uv run python -m mlx_vlm.generate \
-    --model google/gemma-4-31B-it \
-    --draft-model google/gemma-4-31B-it-assistant \
+    --model mlx-community/gemma-4-31B-it-bf16 \
+    --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
     --draft-kind mtp \
     --draft-block-size 4 \
     --prompt "Explain speculative decoding in 3 sentences." \
@@ -66,7 +66,7 @@ uv run python -m mlx_vlm.generate \
 ```
 
 `--draft-block-size` is the number of speculatively drafted tokens per
-round (Google calls this `num_assistant_tokens`). The first token of the
+round (google calls this `num_assistant_tokens`). The first token of the
 block is the most recently accepted bonus, so the drafter actually
 generates `block_size - 1` candidates each round.
 
@@ -77,8 +77,8 @@ from mlx_vlm.utils import load
 from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.generate import generate_step
 
-model, processor = load("google/gemma-4-31B-it")
-drafter = load_drafter("google/gemma-4-31B-it-assistant", kind="mtp")
+model, processor = load("mlx-community/gemma-4-31B-it-bf16")
+drafter = load_drafter("mlx-community/gemma-4-31B-it-assistant-bf16", kind="mtp")
 
 for tok, _ in generate_step(
     input_ids, model, None, None,
@@ -116,8 +116,8 @@ Reproduce with `scripts/mtp_batch_sweep.py`:
 
 ```bash
 uv run python scripts/mtp_batch_sweep.py \
-    --model google/gemma-4-26B-A4B-it \
-    --drafter google/gemma-4-26B-A4B-it-assistant \
+    --model mlx-community/gemma-4-26B-A4B-it-bf16 \
+    --drafter mlx-community/gemma-4-26B-A4B-it-assistant-bf16 \
     --batch-sizes 4 8 --block-sizes 2 3 --max-tokens 64
 ```
 
@@ -125,7 +125,7 @@ uv run python scripts/mtp_batch_sweep.py \
 
 ```bash
 uv run python -m mlx_vlm.speculative.drafters.gemma4_assistant.parity_check \
-    --drafter google/gemma-4-E4B-it-assistant
+    --drafter mlx-community/gemma-4-E4B-it-assistant-bf16
 ```
 
 Expects `forward OK: logits shape=(1, 1, 262144) ...` and

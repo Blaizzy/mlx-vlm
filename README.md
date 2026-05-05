@@ -137,8 +137,8 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 [Multi-Token Prediction](https://ai.google.dev/gemma/docs/mtp/mtp): Google's 4-layer "assistant" drafter that shares K/V with the target and drafts multiple tokens autoregressively from a constant position. Pass `--draft-kind mtp` to dispatch the MTP round-loop.
 
 ```sh
-mlx_vlm.generate --model google/gemma-4-31B-it \
-  --draft-model google/gemma-4-31B-it-assistant \
+mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
   --draft-kind mtp --draft-block-size 4 \
   --prompt "Explain speculative decoding in 3 sentences." \
   --max-tokens 256 --temperature 0
@@ -148,10 +148,10 @@ Supported pairings (target ↔ drafter):
 
 | Target                          | Drafter                                  |
 |---------------------------------|------------------------------------------|
-| `google/gemma-4-E2B-it`         | `google/gemma-4-E2B-it-assistant`        |
-| `google/gemma-4-E4B-it`         | `google/gemma-4-E4B-it-assistant`        |
-| `google/gemma-4-26B-A4B-it`     | `google/gemma-4-26B-A4B-it-assistant`    |
-| `google/gemma-4-31B-it`         | `google/gemma-4-31B-it-assistant`        |
+| `mlx-community/gemma-4-E2B-it-bf16`         | `mlx-community/gemma-4-E2B-it-assistant-bf16`        |
+| `mlx-community/gemma-4-E4B-it-bf16`         | `mlx-community/gemma-4-E4B-it-assistant-bf16`        |
+| `mlx-community/gemma-4-26B-A4B-it-bf16`     | `mlx-community/gemma-4-26B-A4B-it-assistant-bf16`    |
+| `mlx-community/gemma-4-31B-it-bf16`         | `mlx-community/gemma-4-31B-it-assistant-bf16`        |
 
 Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
 
