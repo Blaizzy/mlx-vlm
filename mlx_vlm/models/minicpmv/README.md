@@ -1,8 +1,5 @@
 # MiniCPM-V 4.6
 
-Last updated: 2026-04-24 16:07 (UTC+8)  
-Maintained by: Codex
-
 `mlx_vlm.models.minicpmv` provides an MLX backend adaptation for **MiniCPM-V 4.6**.
 The language backbone reuses `Qwen3.5`, while the vision stack uses
 `SigLIP2 + MiniCPM NaViT-style bucket positional embeddings`.
