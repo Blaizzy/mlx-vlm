@@ -8,7 +8,9 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
-  - [Speculative Decoding (DFlash)](#speculative-decoding-dflash)
+  - [Speculative Decoding](#speculative-decoding)
+    - [DFlash (Qwen3.5)](#dflash-qwen35)
+    - [Gemma 4 MTP](#gemma-4-mtp)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
@@ -95,9 +97,21 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
 
-### Speculative Decoding (DFlash)
+### Speculative Decoding
 
-Speed up generation 2–3× using a lightweight block-diffusion drafter that predicts multiple tokens per round, verified in parallel by the target model.
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Two drafter families are supported.
+
+| Flag | Description |
+|------|-------------|
+| `--draft-model` | HuggingFace repo or local path for the drafter |
+| `--draft-kind` | Drafter family — `dflash` (default) or `mtp` (Gemma 4) |
+| `--draft-block-size` | Override the drafter's configured block size |
+
+See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+
+#### DFlash (Qwen3.5)
+
+A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
 ```sh
 # Text generation with speculative decoding
@@ -118,13 +132,28 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family (default: `dflash`) |
-| `--draft-block-size` | Override the drafter's configured block size |
+#### Gemma 4 MTP
 
-See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+[Multi-Token Prediction](https://ai.google.dev/gemma/docs/mtp/mtp): Google's 4-layer "assistant" drafter that shares K/V with the target and drafts multiple tokens autoregressively from a constant position. Pass `--draft-kind mtp` to dispatch the MTP round-loop.
+
+```sh
+mlx_vlm.generate --model google/gemma-4-31B-it \
+  --draft-model google/gemma-4-31B-it-assistant \
+  --draft-kind mtp --draft-block-size 4 \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+```
+
+Supported pairings (target ↔ drafter):
+
+| Target                          | Drafter                                  |
+|---------------------------------|------------------------------------------|
+| `google/gemma-4-E2B-it`         | `google/gemma-4-E2B-it-assistant`        |
+| `google/gemma-4-E4B-it`         | `google/gemma-4-E4B-it-assistant`        |
+| `google/gemma-4-26B-A4B-it`     | `google/gemma-4-26B-A4B-it-assistant`    |
+| `google/gemma-4-31B-it`         | `google/gemma-4-31B-it-assistant`        |
+
+Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
 
 ### Chat UI with Gradio
 
@@ -239,8 +268,8 @@ mlx_vlm.server --trust-remote-code
 
 - `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`) — enables DFlash speculative decoding for ~2× higher throughput
-- `--draft-kind`: Drafter family (default: `dflash`)
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default) or `mtp` (Gemma 4)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
