@@ -27,6 +27,8 @@ QUANT_RECIPES = [
     "mixed_3_8",
     "mixed_4_6",
     "mixed_4_8",
+    "mixed_4_6_gemma31_safe",
+    "mixed_4_8_gemma31_safe",
 ]
 
 
@@ -43,12 +45,16 @@ def mixed_quant_predicate_builder(
         "mixed_3_8": (3, 8),
         "mixed_4_6": (4, 6),
         "mixed_4_8": (4, 8),
+        "mixed_4_6_gemma31_safe": (4, 6),
+        "mixed_4_8_gemma31_safe": (4, 8),
     }
 
     if recipe not in recipe_config:
         raise ValueError(f"Invalid quant recipe {recipe}")
 
     low_bits, high_bits = recipe_config[recipe]
+    gemma31_safe = recipe.endswith("_gemma31_safe")
+    model_quant_predicate = getattr(model, "quant_predicate", None)
 
     down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
     if len(down_keys) == 0:
@@ -71,10 +77,31 @@ def mixed_quant_predicate_builder(
 
         if skip_multimodal_module(path):
             return False
+        model_decision = (
+            model_quant_predicate(path, module)
+            if model_quant_predicate is not None
+            else None
+        )
+        if model_decision is False:
+            return False
         if not hasattr(module, "to_quantized"):
             return False
         if module.weight.shape[1] % group_size != 0:
             return False
+
+        if gemma31_safe:
+            if "router" in path:
+                return {"group_size": group_size, "bits": 8}
+            if any(
+                s in path
+                for s in [
+                    "embed_tokens_per_layer",
+                    "per_layer_input",
+                    "per_layer_model_projection",
+                    "per_layer_projection",
+                ]
+            ):
+                return {"group_size": group_size, "bits": high_bits}
 
         path_parts = path.split(".")
         index = 0

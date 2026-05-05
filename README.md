@@ -143,6 +143,11 @@ mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
   --draft-kind mtp --draft-block-size 4 \
   --prompt "Explain speculative decoding in 3 sentences." \
   --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
+  --draft-kind mtp --draft-block-size 4
 ```
 
 Supported pairings (target ↔ drafter):
@@ -155,6 +160,11 @@ Supported pairings (target ↔ drafter):
 | `mlx-community/gemma-4-31B-it-bf16`         | `mlx-community/gemma-4-31B-it-assistant-bf16`        |
 
 Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
+
+For memory-constrained 31B deployments, `mlx_vlm.convert` also provides
+Gemma-safe mixed quantization predicates (`mixed_4_6_gemma31_safe` and
+`mixed_4_8_gemma31_safe`) that keep embeddings / per-layer embedding paths and
+selected `v_proj` / `down_proj` tensors at higher precision.
 
 ### Chat UI with Gradio
 

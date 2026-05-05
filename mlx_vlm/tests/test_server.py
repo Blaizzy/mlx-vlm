@@ -40,6 +40,34 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     assert lengths == {(1, 1), (2, 2)}
 
 
+def test_speculative_server_dispatches_mtp_batch_loop():
+    assert server._get_speculative_rounds_batch("mtp") is server._mtp_rounds_batch
+
+
+def test_speculative_server_keeps_dflash_default_batch_loop():
+    assert server._get_speculative_rounds_batch("dflash") is server._dflash_rounds_batch
+
+
+def test_speculative_server_prefill_kwargs_are_drafter_specific():
+    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[1, 2, 3]))
+
+    assert server._speculative_prefill_kwargs("mtp", drafter) == {
+        "return_hidden": True,
+        "return_shared_kv": True,
+    }
+    assert server._speculative_prefill_kwargs("dflash", drafter) == {
+        "capture_layer_ids": [1, 2, 3],
+    }
+
+
+def test_speculative_server_reads_draft_block_size_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_DRAFT_BLOCK_SIZE", raising=False)
+    assert server._get_draft_block_size_from_env() is None
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "3")
+    assert server._get_draft_block_size_from_env() == 3
+
+
 def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
