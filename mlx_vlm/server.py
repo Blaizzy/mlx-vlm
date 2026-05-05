@@ -566,9 +566,7 @@ class ResponseGenerator:
         drafter = self.draft_model
         draft_kind = self.draft_kind
         is_mtp = draft_kind == "mtp"
-        target_layer_ids = (
-            [] if is_mtp else list(drafter.config.target_layer_ids)
-        )
+        target_layer_ids = [] if is_mtp else list(drafter.config.target_layer_ids)
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size_str = os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE")
