@@ -186,11 +186,25 @@ class Model(nn.Module):
             **kwargs,
         )
 
+        # Forward speculative-decoding hooks straight through to the LM.
+        lm_kwargs = {
+            k: kwargs[k]
+            for k in (
+                "capture_layer_ids",
+                "hidden_sink",
+                "shared_kv_sink",
+                "return_hidden",
+                "return_shared_kv",
+            )
+            if k in kwargs
+        }
+
         logits = self.language_model(
             input_ids=None,
             cache=cache,
             inputs_embeds=input_embeddings_features.inputs_embeds,
             per_layer_inputs=input_embeddings_features.per_layer_inputs,
+            **lm_kwargs,
         )
         return logits
 
