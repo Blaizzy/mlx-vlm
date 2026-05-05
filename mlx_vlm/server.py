@@ -63,9 +63,7 @@ def _get_speculative_rounds_batch(draft_kind: str):
         return _mtp_rounds_batch
     if draft_kind == "dflash":
         return _dflash_rounds_batch
-    raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
-    )
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
 
 
 def _speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
@@ -73,9 +71,7 @@ def _speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
         return {"return_hidden": True, "return_shared_kv": True}
     if draft_kind == "dflash":
         return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
-    raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
-    )
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
 
 
 def _speculative_hidden_state(draft_kind: str, outputs):
@@ -83,9 +79,7 @@ def _speculative_hidden_state(draft_kind: str, outputs):
         return outputs.hidden_states[-1]
     if draft_kind == "dflash":
         return mx.concatenate(outputs.hidden_states, axis=-1)
-    raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
-    )
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
 
 
 def _get_draft_block_size_from_env():
