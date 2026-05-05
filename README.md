@@ -452,6 +452,7 @@ Common APC environment variables:
 | `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
+| `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
 | `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
 
 APC is disabled automatically for models that use a custom cache layout. On the server, APC is also skipped when KV-cache quantization is enabled.
