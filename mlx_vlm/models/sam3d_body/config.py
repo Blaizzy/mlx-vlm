@@ -15,8 +15,13 @@ class BaseModelConfig:
     def from_dict(cls, params):
         if not params:
             return cls()
-        return cls(**{k: v for k, v in params.items()
-                      if k in inspect.signature(cls).parameters})
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -25,6 +30,7 @@ class BaseModelConfig:
 @dataclass
 class VisionConfig(BaseModelConfig):
     """Vision encoder config (DINOv3 ViT-H+)."""
+
     embed_dim: int = 1280
     depth: int = 32
     num_heads: int = 20
@@ -41,6 +47,7 @@ class VisionConfig(BaseModelConfig):
 @dataclass
 class TextConfig(BaseModelConfig):
     """Stub text config — SAM 3D Body has no text encoder."""
+
     model_type: str = "none"
 
 
@@ -99,8 +106,9 @@ class SAM3DConfig(BaseModelConfig):
             return cls()
         vision_params = params.pop("vision_config", {})
         text_params = params.pop("text_config", {})
-        filtered = {k: v for k, v in params.items()
-                    if k in inspect.signature(cls).parameters}
+        filtered = {
+            k: v for k, v in params.items() if k in inspect.signature(cls).parameters
+        }
         return cls(
             vision_config=VisionConfig.from_dict(vision_params),
             text_config=TextConfig.from_dict(text_params),

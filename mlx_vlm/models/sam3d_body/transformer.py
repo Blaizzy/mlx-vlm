@@ -27,9 +27,21 @@ class DecoderAttention(nn.Module):
 
     def __call__(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
         B, N, _ = q.shape
-        q = self.q_proj(q).reshape(B, N, self.num_heads, self.head_dims).transpose(0, 2, 1, 3)
-        k = self.k_proj(k).reshape(B, -1, self.num_heads, self.head_dims).transpose(0, 2, 1, 3)
-        v = self.v_proj(v).reshape(B, -1, self.num_heads, self.head_dims).transpose(0, 2, 1, 3)
+        q = (
+            self.q_proj(q)
+            .reshape(B, N, self.num_heads, self.head_dims)
+            .transpose(0, 2, 1, 3)
+        )
+        k = (
+            self.k_proj(k)
+            .reshape(B, -1, self.num_heads, self.head_dims)
+            .transpose(0, 2, 1, 3)
+        )
+        v = (
+            self.v_proj(v)
+            .reshape(B, -1, self.num_heads, self.head_dims)
+            .transpose(0, 2, 1, 3)
+        )
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.head_dims**-0.5)
         out = out.transpose(0, 2, 1, 3).reshape(B, N, -1)
         return self.proj(out)
@@ -42,7 +54,10 @@ class DecoderFFN(nn.Module):
         super().__init__()
         # layers[0] is a list with one Linear -> keys: layers.0.0.*
         # layers[1] is a Linear -> keys: layers.1.*
-        self.layers = [[nn.Linear(embed_dims, hidden_dims)], nn.Linear(hidden_dims, embed_dims)]
+        self.layers = [
+            [nn.Linear(embed_dims, hidden_dims)],
+            nn.Linear(hidden_dims, embed_dims),
+        ]
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.layers[0][0](x))

@@ -5,11 +5,14 @@ import mlx.core as mx
 
 def cross(a: mx.array, b: mx.array) -> mx.array:
     """Cross product along last axis. MLX lacks mx.cross."""
-    return mx.stack([
-        a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1],
-        a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2],
-        a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0],
-    ], axis=-1)
+    return mx.stack(
+        [
+            a[..., 1] * b[..., 2] - a[..., 2] * b[..., 1],
+            a[..., 2] * b[..., 0] - a[..., 0] * b[..., 2],
+            a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0],
+        ],
+        axis=-1,
+    )
 
 
 def rot6d_to_rotmat(x: mx.array) -> mx.array:
@@ -40,8 +43,10 @@ def rotmat_to_euler_ZYX(R: mx.array) -> mx.array:
     sy = mx.sqrt(R[..., 0, 0] ** 2 + R[..., 1, 0] ** 2)
     singular = (sy < 1e-6).astype(mx.float32)
 
-    x = mx.arctan2(R[..., 2, 1], R[..., 2, 2]) * (1 - singular) + \
-        mx.arctan2(-R[..., 1, 2], R[..., 1, 1]) * singular
+    x = (
+        mx.arctan2(R[..., 2, 1], R[..., 2, 2]) * (1 - singular)
+        + mx.arctan2(-R[..., 1, 2], R[..., 1, 1]) * singular
+    )
     y = mx.arctan2(-R[..., 2, 0], sy)
     z = mx.arctan2(R[..., 1, 0], R[..., 0, 0]) * (1 - singular)
 
@@ -75,11 +80,14 @@ def batch_xyz_from_6d(poses: mx.array) -> mx.array:
 
     exs = mx.arctan2(-matrix[..., 1, 2], matrix[..., 1, 1])
 
-    return mx.stack([
-        ex * (1 - singular) + exs * singular,
-        ey,
-        ez * (1 - singular),
-    ], axis=-1)
+    return mx.stack(
+        [
+            ex * (1 - singular) + exs * singular,
+            ey,
+            ez * (1 - singular),
+        ],
+        axis=-1,
+    )
 
 
 def sincos_to_angle(sc: mx.array) -> mx.array:
@@ -96,21 +104,91 @@ def sincos_to_angle(sc: mx.array) -> mx.array:
 # --- Index arrays ---
 # 3-DOF joints: 23 groups of 3 indices into the 133D output
 ALL_PARAM_3DOF_ROT_IDXS = [
-    (0, 2, 4), (6, 8, 10), (12, 13, 14), (15, 16, 17),
-    (18, 19, 20), (21, 22, 23), (24, 25, 26), (27, 28, 29),
-    (34, 35, 36), (37, 38, 39), (44, 45, 46), (53, 54, 55),
-    (64, 65, 66), (85, 69, 73), (86, 70, 79), (87, 71, 82),
-    (88, 72, 76), (91, 92, 93), (112, 96, 100), (113, 97, 106),
-    (114, 98, 109), (115, 99, 103), (130, 131, 132)
+    (0, 2, 4),
+    (6, 8, 10),
+    (12, 13, 14),
+    (15, 16, 17),
+    (18, 19, 20),
+    (21, 22, 23),
+    (24, 25, 26),
+    (27, 28, 29),
+    (34, 35, 36),
+    (37, 38, 39),
+    (44, 45, 46),
+    (53, 54, 55),
+    (64, 65, 66),
+    (85, 69, 73),
+    (86, 70, 79),
+    (87, 71, 82),
+    (88, 72, 76),
+    (91, 92, 93),
+    (112, 96, 100),
+    (113, 97, 106),
+    (114, 98, 109),
+    (115, 99, 103),
+    (130, 131, 132),
 ]
 
 # 1-DOF joints: 58 indices into the 133D output
 ALL_PARAM_1DOF_ROT_IDXS = [
-    1, 3, 5, 7, 9, 11, 30, 31, 32, 33, 40, 41, 42, 43,
-    47, 48, 49, 50, 51, 52, 56, 57, 58, 59, 60, 61, 62, 63,
-    67, 68, 74, 75, 77, 78, 80, 81, 83, 84, 89, 90,
-    94, 95, 101, 102, 104, 105, 107, 108, 110, 111,
-    116, 117, 118, 119, 120, 121, 122, 123
+    1,
+    3,
+    5,
+    7,
+    9,
+    11,
+    30,
+    31,
+    32,
+    33,
+    40,
+    41,
+    42,
+    43,
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    56,
+    57,
+    58,
+    59,
+    60,
+    61,
+    62,
+    63,
+    67,
+    68,
+    74,
+    75,
+    77,
+    78,
+    80,
+    81,
+    83,
+    84,
+    89,
+    90,
+    94,
+    95,
+    101,
+    102,
+    104,
+    105,
+    107,
+    108,
+    110,
+    111,
+    116,
+    117,
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
 ]
 
 # Translation indices: 6 into the 133D output
@@ -141,7 +219,7 @@ def compact_cont_to_model_params_body(body_pose_cont: mx.array) -> mx.array:
     offset = 0
     parts_3dof = []
     for i, (idx_x, idx_y, idx_z) in enumerate(ALL_PARAM_3DOF_ROT_IDXS):
-        chunk = body_pose_cont[:, offset:offset + 6]  # (B, 6)
+        chunk = body_pose_cont[:, offset : offset + 6]  # (B, 6)
         euler = batch_xyz_from_6d(chunk)  # (B, 3)
         parts_3dof.append((idx_x, euler[:, 0:1]))
         parts_3dof.append((idx_y, euler[:, 1:2]))
@@ -152,7 +230,7 @@ def compact_cont_to_model_params_body(body_pose_cont: mx.array) -> mx.array:
     # Process 1-DOF joints: 58 pairs, each 2D (sin,cos) -> 1D angle
     parts_1dof = []
     for i, idx in enumerate(ALL_PARAM_1DOF_ROT_IDXS):
-        sc = body_pose_cont[:, offset:offset + 2]  # (B, 2)
+        sc = body_pose_cont[:, offset : offset + 2]  # (B, 2)
         angle = sincos_to_angle(sc)  # (B,)
         parts_1dof.append((idx, angle[:, None]))
         offset += 2
@@ -161,7 +239,7 @@ def compact_cont_to_model_params_body(body_pose_cont: mx.array) -> mx.array:
     # Process translations: 6 pass-through values
     parts_trans = []
     for i, idx in enumerate(ALL_PARAM_1DOF_TRANS_IDXS):
-        val = body_pose_cont[:, offset:offset + 1]  # (B, 1)
+        val = body_pose_cont[:, offset : offset + 1]  # (B, 1)
         parts_trans.append((idx, val))
         offset += 1
     # offset should be 260
@@ -201,19 +279,19 @@ def compact_cont_to_model_params_hand(hand_cont: mx.array) -> mx.array:
 
     for dof in HAND_DOFS_IN_ORDER:
         if dof == 3:
-            chunk = hand_cont[:, offset:offset + 6]
+            chunk = hand_cont[:, offset : offset + 6]
             euler = batch_xyz_from_6d(chunk)  # (B, 3)
             parts.append(euler)
             offset += 6
         elif dof == 1:
-            sc = hand_cont[:, offset:offset + 2]
+            sc = hand_cont[:, offset : offset + 2]
             angle = sincos_to_angle(sc)[:, None]  # (B, 1)
             parts.append(angle)
             offset += 2
         elif dof == 2:
             # Two 1-DOF joints packed together
-            sc1 = hand_cont[:, offset:offset + 2]
-            sc2 = hand_cont[:, offset + 2:offset + 4]
+            sc1 = hand_cont[:, offset : offset + 2]
+            sc2 = hand_cont[:, offset + 2 : offset + 4]
             a1 = sincos_to_angle(sc1)[:, None]  # (B, 1)
             a2 = sincos_to_angle(sc2)[:, None]  # (B, 1)
             parts.append(mx.concatenate([a1, a2], axis=1))

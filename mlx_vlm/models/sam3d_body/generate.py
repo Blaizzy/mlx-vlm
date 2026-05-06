@@ -57,14 +57,18 @@ class SAM3DPredictor:
 
         if cam_int is None:
             focal = math.sqrt(h**2 + w**2)  # image diagonal (PyTorch default)
-            cam_int = np.array([
-                [focal, 0, w / 2],
-                [0, focal, h / 2],
-                [0, 0, 1],
-            ], dtype=np.float32)
+            cam_int = np.array(
+                [
+                    [focal, 0, w / 2],
+                    [0, focal, h / 2],
+                    [0, 0, 1],
+                ],
+                dtype=np.float32,
+            )
 
         processed = prepare_image(
-            image, bbox,
+            image,
+            bbox,
             image_size=self.config.image_size,
             mean=self.config.image_mean,
             std=self.config.image_std,
@@ -109,12 +113,14 @@ def main():
     parser = argparse.ArgumentParser(description="SAM 3D Body MLX predictor")
     parser.add_argument("--image", required=True, help="Input image path")
     parser.add_argument("--weights", required=True, help="Weights directory")
-    parser.add_argument("--bbox", type=str, default=None,
-                        help="Bounding box as 'x1,y1,x2,y2'")
+    parser.add_argument(
+        "--bbox", type=str, default=None, help="Bounding box as 'x1,y1,x2,y2'"
+    )
     parser.add_argument("--output", default=None, help="Output JSON path")
     args = parser.parse_args()
 
     import cv2
+
     image = cv2.imread(args.image)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 

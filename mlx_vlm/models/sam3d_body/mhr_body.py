@@ -112,10 +112,9 @@ class MHRBodyModel(nn.Module):
         """
         B = model_params.shape[0]
         # Pad to 249 (extra 45 columns are unused, all zeros in PT)
-        padded = mx.concatenate([
-            model_params,
-            mx.zeros((B, 249 - 204))
-        ], axis=1)  # (B, 249)
+        padded = mx.concatenate(
+            [model_params, mx.zeros((B, 249 - 204))], axis=1
+        )  # (B, 249)
 
         joint_dofs = padded @ self.parameter_transform.T  # (B, 889)
         return joint_dofs
@@ -145,7 +144,7 @@ class MHRBodyModel(nn.Module):
         prerot_mat = quat_to_rotmat(self.joint_prerotations)  # (127, 3, 3)
         # local_rot_composed = prerot @ local_rot for each joint
         # prerot_mat: (127, 3, 3), local_rot: (B, 127, 3, 3)
-        local_rot_composed = mx.einsum('jpq,bjqr->bjpr', prerot_mat, local_rot)
+        local_rot_composed = mx.einsum("jpq,bjqr->bjpr", prerot_mat, local_rot)
 
         # Build 4x4 local transforms
         # translation = joint_translation_offsets + local_trans
@@ -181,9 +180,9 @@ class MHRBodyModel(nn.Module):
                 ps = global_scale_list[parent]  # (B, 1)
 
                 # Position: parent_pos + parent_scale * (parent_rot @ local_trans)
-                gp = pp + ps * mx.einsum('bij,bj->bi', pr, lt)
+                gp = pp + ps * mx.einsum("bij,bj->bi", pr, lt)
                 # Rotation: parent_rot @ local_rot
-                gr = mx.einsum('bij,bjk->bik', pr, lr)
+                gr = mx.einsum("bij,bjk->bik", pr, lr)
                 # Scale
                 gs = ps * ls
 
@@ -198,14 +197,18 @@ class MHRBodyModel(nn.Module):
 
         # Convert rotation matrices to quaternions for skel_state
         from .mhr_utils import rotmat_to_quat
+
         global_quat = rotmat_to_quat(global_rot)  # (B, 127, 4) [x,y,z,w]
 
         # skel_state: (B, 127, 8) = [x, y, z, qx, qy, qz, qw, scale]
-        skel_state = mx.concatenate([
-            global_pos,
-            global_quat,
-            global_scale,
-        ], axis=-1)
+        skel_state = mx.concatenate(
+            [
+                global_pos,
+                global_quat,
+                global_scale,
+            ],
+            axis=-1,
+        )
 
         return skel_state, global_pos, global_rot, global_scale
 
@@ -246,11 +249,13 @@ class MHRBodyModel(nn.Module):
         # combined_scale[j] = global_scale[j] * ibp_scale[j]
 
         # ibp_rot: (127, 3, 3), global_rot: (B, 127, 3, 3)
-        combined_rot = mx.einsum('bjik,jkl->bjil', global_rot, ibp_rot)  # (B, 127, 3, 3)
+        combined_rot = mx.einsum(
+            "bjik,jkl->bjil", global_rot, ibp_rot
+        )  # (B, 127, 3, 3)
         # global_pos: (B, 127, 3), ibp_trans: (127, 3)
-        combined_trans = global_pos + mx.einsum(
-            'bjik,jk->bji', global_rot, ibp_trans
-        ) * global_scale  # (B, 127, 3)
+        combined_trans = (
+            global_pos + mx.einsum("bjik,jk->bji", global_rot, ibp_trans) * global_scale
+        )  # (B, 127, 3)
         combined_scale = global_scale * ibp_scale[None, :, :]  # (B, 127, 1)
 
         # Now for each skinning triple, compute:
@@ -272,7 +277,7 @@ class MHRBodyModel(nn.Module):
         cs = combined_scale[:, si, :]  # (B, N, 1)
 
         # Transform each vertex
-        v_transformed = cs * mx.einsum('bnij,bnj->bni', cr, v) + ct  # (B, N, 3)
+        v_transformed = cs * mx.einsum("bnij,bnj->bni", cr, v) + ct  # (B, N, 3)
 
         # Weight
         v_weighted = v_transformed * sw[None, :, None]  # (B, N, 3)
@@ -325,11 +330,11 @@ class MHRBodyModel(nn.Module):
             verts: (B, num_verts, 3)
         """
         verts = self.base_shape[None] + mx.einsum(
-            'bs,svd->bvd', shape_params, self.shape_vectors
+            "bs,svd->bvd", shape_params, self.shape_vectors
         )
         if expr_params is not None:
             verts = verts + mx.einsum(
-                'bf,fvd->bvd', expr_params, self.face_shape_vectors
+                "bf,fvd->bvd", expr_params, self.face_shape_vectors
             )
         return verts
 
@@ -468,6 +473,7 @@ def _scatter_add_1d(values: mx.array, indices: mx.array, size: int) -> mx.array:
     but a performance bottleneck for video pipelines.
     """
     import numpy as np
+
     idx_np = np.array(indices, copy=False)
     val_np = np.array(values, copy=False)
     out_np = np.zeros(size, dtype=np.float32)
@@ -482,7 +488,7 @@ def _set_column(arr: mx.array, col: int, values: mx.array) -> mx.array:
         if c == col:
             cols.append(values[:, None] if values.ndim == 1 else values)
         else:
-            cols.append(arr[:, c:c + 1])
+            cols.append(arr[:, c : c + 1])
     return mx.concatenate(cols, axis=1)
 
 
@@ -493,5 +499,5 @@ def _set_column_2d(arr: mx.array, col: int, values: mx.array) -> mx.array:
         if c == col:
             cols.append(values[:, None])
         else:
-            cols.append(arr[:, c:c + 1])
+            cols.append(arr[:, c : c + 1])
     return mx.concatenate(cols, axis=1)

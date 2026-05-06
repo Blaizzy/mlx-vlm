@@ -43,7 +43,9 @@ class RayConditionEmbedding(nn.Module):
 
     def __init__(self, embed_dim: int = 1280, ray_channels: int = 1379):
         super().__init__()
-        self.conv = nn.Conv2d(ray_channels, embed_dim, kernel_size=1, stride=1, bias=False)
+        self.conv = nn.Conv2d(
+            ray_channels, embed_dim, kernel_size=1, stride=1, bias=False
+        )
         self.norm = nn.LayerNorm(embed_dim)
 
     def __call__(self, image_features: mx.array, ray_map: mx.array) -> mx.array:
@@ -60,7 +62,10 @@ class MLP2Layer(nn.Module):
 
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
-        self.layers = [[nn.Linear(input_dim, hidden_dim)], nn.Linear(hidden_dim, output_dim)]
+        self.layers = [
+            [nn.Linear(input_dim, hidden_dim)],
+            nn.Linear(hidden_dim, output_dim),
+        ]
 
     def __call__(self, x: mx.array) -> mx.array:
         x = nn.relu(self.layers[0][0](x))
@@ -101,10 +106,13 @@ def fourier_encode(pos, num_bands=16, max_resolution=64):
     orig_shape = pos.shape[:-1]
     features = features.reshape(*orig_shape, 48)  # (..., 48)
 
-    encoded = mx.concatenate([
-        mx.sin(math.pi * features),
-        mx.cos(math.pi * features),
-    ], axis=-1)  # (..., 96)
+    encoded = mx.concatenate(
+        [
+            mx.sin(math.pi * features),
+            mx.cos(math.pi * features),
+        ],
+        axis=-1,
+    )  # (..., 96)
 
     return mx.concatenate([pos, encoded], axis=-1)  # (..., 99)
 
@@ -143,10 +151,10 @@ def grid_sample_2d(features, coords):
     for b in range(B):
         f = features[b]  # (H, W, C)
         vals = (
-            wa[b, :, None] * f[y0c[b], x0c[b]] +
-            wb[b, :, None] * f[y0c[b], x1c[b]] +
-            wc[b, :, None] * f[y1c[b], x0c[b]] +
-            wd[b, :, None] * f[y1c[b], x1c[b]]
+            wa[b, :, None] * f[y0c[b], x0c[b]]
+            + wb[b, :, None] * f[y0c[b], x1c[b]]
+            + wc[b, :, None] * f[y1c[b], x0c[b]]
+            + wd[b, :, None] * f[y1c[b], x1c[b]]
         )
         results.append(vals)
 
@@ -176,7 +184,9 @@ class SAM3DBody(nn.Module):
             mlp_dims=config.decoder_mlp_dim,
         )
         self.head_pose = MHRHead(input_dim=config.decoder_dim, config=config)
-        self.head_camera = CameraHead(input_dim=config.decoder_dim, output_dim=config.camera_output_dim)
+        self.head_camera = CameraHead(
+            input_dim=config.decoder_dim, output_dim=config.camera_output_dim
+        )
         self.prompt_encoder = PromptEncoder(
             embed_dim=config.prompt_embed_dim,
             num_point_embeddings=config.num_point_embeddings,
@@ -184,9 +194,13 @@ class SAM3DBody(nn.Module):
 
         # Projections
         # init_to_token: 525 = 519 pose + 3 cam + 3 CLIFF condition
-        self.init_to_token_mhr = nn.Linear(config.pose_output_dim + config.camera_output_dim + 3, config.decoder_dim)
+        self.init_to_token_mhr = nn.Linear(
+            config.pose_output_dim + config.camera_output_dim + 3, config.decoder_dim
+        )
         # prev_to_token: 522 = 519 pose + 3 cam
-        self.prev_to_token_mhr = nn.Linear(config.pose_output_dim + config.camera_output_dim, config.decoder_dim)
+        self.prev_to_token_mhr = nn.Linear(
+            config.pose_output_dim + config.camera_output_dim, config.decoder_dim
+        )
         # prompt projection: 1280 -> 1024
         self.prompt_to_token = nn.Linear(config.prompt_embed_dim, config.decoder_dim)
 
@@ -195,13 +209,21 @@ class SAM3DBody(nn.Module):
         self.init_camera = mx.zeros((1, config.camera_output_dim))
 
         # Keypoint embeddings and projections (already 1024-dim in weights)
-        self.keypoint_embedding = mx.zeros((config.num_point_embeddings, config.decoder_dim))
+        self.keypoint_embedding = mx.zeros(
+            (config.num_point_embeddings, config.decoder_dim)
+        )
         self.keypoint_feat_linear = nn.Linear(config.embed_dim, config.decoder_dim)
         # 2D keypoint pos: input 2 -> 1024
-        self.keypoint_posemb_linear = MLP2Layer(2, config.decoder_dim, config.decoder_dim)
+        self.keypoint_posemb_linear = MLP2Layer(
+            2, config.decoder_dim, config.decoder_dim
+        )
         # 3D keypoint pos: input 3 -> 1024
-        self.keypoint3d_embedding = mx.zeros((config.num_point_embeddings, config.decoder_dim))
-        self.keypoint3d_posemb_linear = MLP2Layer(3, config.decoder_dim, config.decoder_dim)
+        self.keypoint3d_embedding = mx.zeros(
+            (config.num_point_embeddings, config.decoder_dim)
+        )
+        self.keypoint3d_posemb_linear = MLP2Layer(
+            3, config.decoder_dim, config.decoder_dim
+        )
 
         # Hand detection tokens
         self.hand_box_embedding = mx.zeros((2, config.decoder_dim))
@@ -210,7 +232,10 @@ class SAM3DBody(nn.Module):
 
         # Hand PE layer (gaussian positional encoding for hand boxes)
         from .prompt_encoder import PositionalEncodingGaussian
-        self.hand_pe_layer = PositionalEncodingGaussian(num_feats=config.prompt_embed_dim // 2)
+
+        self.hand_pe_layer = PositionalEncodingGaussian(
+            num_feats=config.prompt_embed_dim // 2
+        )
 
         # Ray conditioning
         self.ray_cond_emb = RayConditionEmbedding(config.embed_dim, 1379)
@@ -265,7 +290,9 @@ class SAM3DBody(nn.Module):
         # Downsample rays to patch resolution via area-averaging (matches antialias)
         # Image is (512, 384), patches are (32, 24) = 16x downsample
         patch_size = self.config.patch_size
-        rays_down = nn.AvgPool2d(kernel_size=patch_size, stride=patch_size)(rays)  # (B, H_p, W_p, 2)
+        rays_down = nn.AvgPool2d(kernel_size=patch_size, stride=patch_size)(
+            rays
+        )  # (B, H_p, W_p, 2)
 
         # Append z=1 to get 3D ray directions
         ones = mx.ones((*rays_down.shape[:-1], 1))
@@ -319,11 +346,14 @@ class SAM3DBody(nn.Module):
         cx_offset = 2 * (bbox_center_x - img_w / 2) / bs
         cy_offset = 2 * (bbox_center_y - img_h / 2) / bs
 
-        cam_t = mx.concatenate([
-            tx + cx_offset,
-            ty + cy_offset,
-            tz,
-        ], axis=1)  # (B, 3)
+        cam_t = mx.concatenate(
+            [
+                tx + cx_offset,
+                ty + cy_offset,
+                tz,
+            ],
+            axis=1,
+        )  # (B, 3)
 
         # Translate to camera space
         j3d_cam = kp3d + cam_t[:, None, :]  # (B, N, 3)
@@ -388,14 +418,21 @@ class SAM3DBody(nn.Module):
         # 4. Build init token (with CLIFF condition or zeros)
         if cliff_condition is None:
             cliff_condition = mx.zeros((B, 3))
-        init_input = mx.concatenate([
-            cliff_condition,
-            init_estimate,
-        ], axis=1)  # (B, 525)
-        init_token = self.init_to_token_mhr(init_input.reshape(B, 1, -1))  # (B, 1, 1024)
+        init_input = mx.concatenate(
+            [
+                cliff_condition,
+                init_estimate,
+            ],
+            axis=1,
+        )  # (B, 525)
+        init_token = self.init_to_token_mhr(
+            init_input.reshape(B, 1, -1)
+        )  # (B, 1, 1024)
 
         # 5. Previous estimate token (same as init on first pass)
-        prev_token = self.prev_to_token_mhr(init_estimate.reshape(B, 1, -1))  # (B, 1, 1024)
+        prev_token = self.prev_to_token_mhr(
+            init_estimate.reshape(B, 1, -1)
+        )  # (B, 1, 1024)
 
         # 6. Prompt token (dummy - all invalid)
         dummy_points = mx.zeros((B, 1, 2))
@@ -423,9 +460,10 @@ class SAM3DBody(nn.Module):
         # 10. Assemble all tokens:
         # [init, prev, prompt, hand_det_0, hand_det_1, kp2d_0..69, kp3d_0..69]
         # Total: 1 + 1 + 1 + 2 + 70 + 70 = 145
-        tokens = mx.concatenate([
-            init_token, prev_token, prompt_token, hand_tokens, kp_tokens, kp3d_tokens
-        ], axis=1)  # (B, 145, 1024)
+        tokens = mx.concatenate(
+            [init_token, prev_token, prompt_token, hand_tokens, kp_tokens, kp3d_tokens],
+            axis=1,
+        )  # (B, 145, 1024)
 
         # Token index layout
         KP2D_START = 5
@@ -439,8 +477,12 @@ class SAM3DBody(nn.Module):
         prompt_pe = prompt_token  # reuse as PE
         hand_pe = mx.zeros((B, 2, self.config.decoder_dim))
         kp_pe = mx.zeros((B, self.config.num_point_embeddings, self.config.decoder_dim))
-        kp3d_pe = mx.zeros((B, self.config.num_point_embeddings, self.config.decoder_dim))
-        token_pe = mx.concatenate([init_pe, prev_pe, prompt_pe, hand_pe, kp_pe, kp3d_pe], axis=1)
+        kp3d_pe = mx.zeros(
+            (B, self.config.num_point_embeddings, self.config.decoder_dim)
+        )
+        token_pe = mx.concatenate(
+            [init_pe, prev_pe, prompt_pe, hand_pe, kp_pe, kp3d_pe], axis=1
+        )
 
         # 12. Image positional encoding
         image_pe = self.prompt_encoder.get_dense_pe(H_p, W_p)  # (1, H_p, W_p, 1280)
@@ -477,18 +519,24 @@ class SAM3DBody(nn.Module):
 
                 # Update 2D kp tokens: add sampled features
                 new_kp_tokens = tokens[:, KP2D_START:KP2D_END, :] + sampled_proj
-                tokens = mx.concatenate([
-                    tokens[:, :KP2D_START, :],
-                    new_kp_tokens,
-                    tokens[:, KP2D_END:, :],
-                ], axis=1)
+                tokens = mx.concatenate(
+                    [
+                        tokens[:, :KP2D_START, :],
+                        new_kp_tokens,
+                        tokens[:, KP2D_END:, :],
+                    ],
+                    axis=1,
+                )
 
                 # Update 2D kp position embeddings
-                token_pe = mx.concatenate([
-                    token_pe[:, :KP2D_START, :],
-                    new_kp_pe,
-                    token_pe[:, KP2D_END:, :],
-                ], axis=1)
+                token_pe = mx.concatenate(
+                    [
+                        token_pe[:, :KP2D_START, :],
+                        new_kp_pe,
+                        token_pe[:, KP2D_END:, :],
+                    ],
+                    axis=1,
+                )
 
             # --- Update 3D keypoint tokens ---
             # Pelvis-normalize: average of left_hip (9) and right_hip (10)
@@ -499,17 +547,23 @@ class SAM3DBody(nn.Module):
             new_kp3d_pe = self.keypoint3d_posemb_linear(kp3d_centered)  # (B, 70, 1024)
 
             # Update 3D kp position embeddings
-            token_pe = mx.concatenate([
-                token_pe[:, :KP3D_START, :],
-                new_kp3d_pe,
-                token_pe[:, KP3D_END:, :],
-            ], axis=1)
+            token_pe = mx.concatenate(
+                [
+                    token_pe[:, :KP3D_START, :],
+                    new_kp3d_pe,
+                    token_pe[:, KP3D_END:, :],
+                ],
+                axis=1,
+            )
 
             return tokens, token_pe
 
         # 15. Run decoder with intermediate predictions
         output, all_outputs = self.decoder(
-            tokens, image_features, token_pe, image_pe,
+            tokens,
+            image_features,
+            token_pe,
+            image_pe,
             token_to_pose_fn=token_to_pose_fn,
             kp_update_fn=kp_update_fn,
         )  # output: (B, 145, 1024)
@@ -530,6 +584,7 @@ class SAM3DBody(nn.Module):
     def load_all_weights(self, weights_dir: str):
         """Load all model weights from safetensors in weights_dir."""
         from pathlib import Path
+
         from safetensors import safe_open
 
         weights_dir = Path(weights_dir)
@@ -540,6 +595,7 @@ class SAM3DBody(nn.Module):
 
         if index_path.exists():
             import json
+
             with open(index_path) as f:
                 index = json.load(f)
             shard_files = set(index["weight_map"].values())
@@ -559,12 +615,19 @@ class SAM3DBody(nn.Module):
 
         # Skip keys that belong to hand-specific modules
         hand_prefixes = (
-            "decoder_hand.", "head_pose_hand.", "head_camera_hand.",
-            "init_pose_hand.", "init_camera_hand.",
-            "init_to_token_mhr_hand.", "prev_to_token_mhr_hand.",
-            "keypoint_embedding_hand.", "keypoint3d_embedding_hand.",
-            "keypoint_posemb_linear_hand.", "keypoint3d_posemb_linear_hand.",
-            "keypoint_feat_linear_hand.", "ray_cond_emb_hand.",
+            "decoder_hand.",
+            "head_pose_hand.",
+            "head_camera_hand.",
+            "init_pose_hand.",
+            "init_camera_hand.",
+            "init_to_token_mhr_hand.",
+            "prev_to_token_mhr_hand.",
+            "keypoint_embedding_hand.",
+            "keypoint3d_embedding_hand.",
+            "keypoint_posemb_linear_hand.",
+            "keypoint3d_posemb_linear_hand.",
+            "keypoint_feat_linear_hand.",
+            "ray_cond_emb_hand.",
         )
 
         # Bare array parameters stored with ".weight" suffix in safetensors
@@ -640,12 +703,19 @@ class SAM3DBody(nn.Module):
             weights = SAM3DBody._remap_raw_pytorch_keys(weights)
 
         hand_prefixes = (
-            "decoder_hand.", "head_pose_hand.", "head_camera_hand.",
-            "init_pose_hand.", "init_camera_hand.",
-            "init_to_token_mhr_hand.", "prev_to_token_mhr_hand.",
-            "keypoint_embedding_hand.", "keypoint3d_embedding_hand.",
-            "keypoint_posemb_linear_hand.", "keypoint3d_posemb_linear_hand.",
-            "keypoint_feat_linear_hand.", "ray_cond_emb_hand.",
+            "decoder_hand.",
+            "head_pose_hand.",
+            "head_camera_hand.",
+            "init_pose_hand.",
+            "init_camera_hand.",
+            "init_to_token_mhr_hand.",
+            "prev_to_token_mhr_hand.",
+            "keypoint_embedding_hand.",
+            "keypoint3d_embedding_hand.",
+            "keypoint_posemb_linear_hand.",
+            "keypoint3d_posemb_linear_hand.",
+            "keypoint_feat_linear_hand.",
+            "ray_cond_emb_hand.",
         )
         bare_param_keys = {
             "init_pose.weight": "init_pose",
@@ -662,7 +732,9 @@ class SAM3DBody(nn.Module):
                 continue
             if any(key.startswith(p) for p in skip_prefixes):
                 continue
-            if key.startswith("backbone.") and ("bias_mask" in key or "k_proj.bias" in key):
+            if key.startswith("backbone.") and (
+                "bias_mask" in key or "k_proj.bias" in key
+            ):
                 continue
             if key in bare_param_keys:
                 sanitized[bare_param_keys[key]] = tensor
@@ -740,15 +812,23 @@ class SAM3DBody(nn.Module):
             if "mask_downscaling" in key and value.ndim == 4:
                 result[key] = value.transpose(0, 2, 3, 1)
                 continue
-            if "ray_cond_emb" in key and key.endswith("conv.weight") and value.ndim == 4:
+            if (
+                "ray_cond_emb" in key
+                and key.endswith("conv.weight")
+                and value.ndim == 4
+            ):
                 result[key] = value.transpose(0, 2, 3, 1)
                 continue
 
             # MHR JIT prefix renames
             new_key = key
             new_key = new_key.replace("character_torch.", "mhr.character.")
-            new_key = new_key.replace("face_expressions_model.", "mhr.face_expressions.")
-            new_key = new_key.replace("pose_correctives_model.", "mhr.pose_correctives.")
+            new_key = new_key.replace(
+                "face_expressions_model.", "mhr.face_expressions."
+            )
+            new_key = new_key.replace(
+                "pose_correctives_model.", "mhr.pose_correctives."
+            )
             result[new_key] = value
 
         return result

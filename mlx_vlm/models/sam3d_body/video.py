@@ -22,28 +22,44 @@ import numpy as np
 # 67-68=acromion, 69=neck
 SKELETON_PAIRS = [
     # Head
-    (0, 1), (0, 2), (1, 3), (2, 4), (1, 2),
-    (3, 5), (4, 6),  # ears to shoulders
+    (0, 1),
+    (0, 2),
+    (1, 3),
+    (2, 4),
+    (1, 2),
+    (3, 5),
+    (4, 6),  # ears to shoulders
     # Torso
-    (5, 6), (5, 9), (6, 10), (9, 10),
+    (5, 6),
+    (5, 9),
+    (6, 10),
+    (9, 10),
     # Left arm: shoulder(5) -> elbow(7) -> wrist(62)
-    (5, 7), (7, 62),
+    (5, 7),
+    (7, 62),
     # Right arm: shoulder(6) -> elbow(8) -> wrist(41)
-    (6, 8), (8, 41),
+    (6, 8),
+    (8, 41),
     # Left leg: hip(9) -> knee(11) -> ankle(13)
-    (9, 11), (11, 13),
+    (9, 11),
+    (11, 13),
     # Right leg: hip(10) -> knee(12) -> ankle(14)
-    (10, 12), (12, 14),
+    (10, 12),
+    (12, 14),
     # Left foot fan
-    (13, 15), (13, 16), (13, 17),
+    (13, 15),
+    (13, 16),
+    (13, 17),
     # Right foot fan
-    (14, 18), (14, 19), (14, 20),
+    (14, 18),
+    (14, 19),
+    (14, 20),
 ]
 
 JOINT_COLORS = [
-    (255, 0, 0),    # red - head/face
-    (0, 255, 0),    # green - torso
-    (0, 0, 255),    # blue - arms
+    (255, 0, 0),  # red - head/face
+    (0, 255, 0),  # green - torso
+    (0, 0, 255),  # blue - arms
     (255, 255, 0),  # yellow - legs
 ]
 
@@ -85,7 +101,9 @@ def track_person(detections, prev_bbox, iou_threshold=0.3):
     return detections[0]  # lost track: fall back to largest
 
 
-def project_keypoints_perspective(keypoints_3d, camera, bbox, img_w, img_h, fov_deg=60.0):
+def project_keypoints_perspective(
+    keypoints_3d, camera, bbox, img_w, img_h, fov_deg=60.0
+):
     """Project 3D keypoints to 2D using full perspective projection.
 
     Replicates the PyTorch PerspectiveHead.perspective_projection() logic:
@@ -224,6 +242,7 @@ def process_video(
         print("Loading person detector...")
         t0 = time.time()
         from .estimator import detect_persons_cached
+
         # Warm up with a small dummy image
         dummy = np.zeros((100, 100, 3), dtype=np.uint8)
         detect_persons_cached(dummy)
@@ -265,6 +284,7 @@ def process_video(
         # Determine bbox for this frame
         if use_detection:
             from .estimator import detect_persons_cached
+
             detections = detect_persons_cached(rgb)
             frame_bbox = track_person(detections, tracked_bbox)
             if frame_bbox is not None:
@@ -330,7 +350,9 @@ def process_video(
         if processed % 10 == 0 or processed == 1:
             avg_ms = np.mean(frame_times[-10:]) * 1000
             eta = (total_frames - frame_idx) * avg_ms / 1000
-            print(f"  Frame {frame_idx:4d}/{total_frames}  {avg_ms:.0f}ms/frame  ETA: {eta:.0f}s")
+            print(
+                f"  Frame {frame_idx:4d}/{total_frames}  {avg_ms:.0f}ms/frame  ETA: {eta:.0f}s"
+            )
 
         frame_idx += 1
 
@@ -354,7 +376,9 @@ def process_video(
         if use_detection:
             print(f"  Detection fails:  {detection_failures}/{processed}")
         print(f"  Output:           {output_path}")
-        print(f"  Output size:      {Path(output_path).stat().st_size / 1024**2:.1f} MB")
+        print(
+            f"  Output size:      {Path(output_path).stat().st_size / 1024**2:.1f} MB"
+        )
 
         # Save keypoints
         kp_path = output_path.rsplit(".", 1)[0] + "_keypoints.npy"
@@ -373,7 +397,9 @@ def main():
     parser = argparse.ArgumentParser(description="SAM 3D Body video processing (MLX)")
     parser.add_argument("--input", "-i", required=True, help="Input video path")
     parser.add_argument("--output", "-o", default=None, help="Output video path")
-    parser.add_argument("--weights", default="/tmp/sam3d-mlx-weights/", help="Weights directory")
+    parser.add_argument(
+        "--weights", default="/tmp/sam3d-mlx-weights/", help="Weights directory"
+    )
     parser.add_argument("--bbox", help="Fixed bbox as x1,y1,x2,y2")
     parser.add_argument("--max-frames", type=int, help="Process at most N frames")
     parser.add_argument("--skip", type=int, default=0, help="Skip every N frames")

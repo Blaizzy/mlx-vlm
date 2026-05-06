@@ -73,7 +73,9 @@ class PromptableDecoder(nn.Module):
 
         all_outputs = []
         for i, layer in enumerate(self.layers):
-            tokens, context = layer(tokens, context, x_pe=token_pe, context_pe=context_pe)
+            tokens, context = layer(
+                tokens, context, x_pe=token_pe, context_pe=context_pe
+            )
 
             # Intermediate predictions at every layer
             normed = self.norm_final(tokens)

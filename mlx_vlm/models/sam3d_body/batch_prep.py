@@ -27,23 +27,30 @@ def get_affine_transform(
     crop_size = crop_size * 1.2
 
     # Source triangle: center, center+right, center+down
-    src = np.array([
-        center,
-        center + np.array([crop_size / 2.0, 0.0]),
-        center + np.array([0.0, crop_size / 2.0]),
-    ], dtype=np.float32)
+    src = np.array(
+        [
+            center,
+            center + np.array([crop_size / 2.0, 0.0]),
+            center + np.array([0.0, crop_size / 2.0]),
+        ],
+        dtype=np.float32,
+    )
 
     # Destination triangle
-    dst = np.array([
-        [dst_w / 2.0, dst_h / 2.0],
-        [dst_w, dst_h / 2.0],
-        [dst_w / 2.0, dst_h],
-    ], dtype=np.float32)
+    dst = np.array(
+        [
+            [dst_w / 2.0, dst_h / 2.0],
+            [dst_w, dst_h / 2.0],
+            [dst_w / 2.0, dst_h],
+        ],
+        dtype=np.float32,
+    )
 
     # Solve for affine transform: dst = src @ M[:2,:2].T + M[:, 2]
     # Use cv2 if available, otherwise solve manually
     try:
         import cv2
+
         return cv2.getAffineTransform(src.astype(np.float32), dst.astype(np.float32))
     except ImportError:
         return _solve_affine(src, dst)
@@ -65,10 +72,13 @@ def _solve_affine(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
         A[2 * i + 1, 5] = 1
         b[2 * i + 1] = dst[i, 1]
     params = np.linalg.solve(A, b)
-    M = np.array([
-        [params[0], params[1], params[2]],
-        [params[3], params[4], params[5]],
-    ], dtype=np.float64)
+    M = np.array(
+        [
+            [params[0], params[1], params[2]],
+            [params[3], params[4], params[5]],
+        ],
+        dtype=np.float64,
+    )
     return M
 
 
@@ -89,8 +99,11 @@ def apply_affine_transform(
     """
     try:
         import cv2
+
         return cv2.warpAffine(
-            image, M, output_size,
+            image,
+            M,
+            output_size,
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),

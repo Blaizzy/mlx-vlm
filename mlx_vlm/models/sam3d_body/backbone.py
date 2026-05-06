@@ -19,14 +19,16 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
+        self.scale = head_dim**-0.5
 
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=False)  # K bias masked to 0
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.o_proj = nn.Linear(embed_dim, embed_dim)
 
-    def __call__(self, x: mx.array, rope: tuple[mx.array, mx.array] | None = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, rope: tuple[mx.array, mx.array] | None = None
+    ) -> mx.array:
         B, N, C = x.shape
 
         q = self.q_proj(x)
@@ -59,7 +61,9 @@ class TransformerBlock(nn.Module):
         self.mlp = SwiGLU(embed_dim, hidden_dim)
         self.ls2 = LayerScale(embed_dim)
 
-    def __call__(self, x: mx.array, rope: tuple[mx.array, mx.array] | None = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, rope: tuple[mx.array, mx.array] | None = None
+    ) -> mx.array:
         x = x + self.ls1(self.attention(self.norm1(x), rope))
         x = x + self.ls2(self.mlp(self.norm2(x)))
         return x
@@ -71,8 +75,10 @@ class PatchEmbed(nn.Module):
     def __init__(self, patch_size: int, embed_dim: int, in_channels: int = 3):
         super().__init__()
         self.projection = nn.Conv2d(
-            in_channels, embed_dim,
-            kernel_size=patch_size, stride=patch_size,
+            in_channels,
+            embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
         )
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -124,7 +130,10 @@ class DINOv3Backbone(nn.Module):
 
         # prepend CLS + storage tokens
         cls = mx.broadcast_to(self.cls_token, (B, 1, self.config.embed_dim))
-        stor = mx.broadcast_to(self.storage_tokens, (B, self.config.num_storage_tokens, self.config.embed_dim))
+        stor = mx.broadcast_to(
+            self.storage_tokens,
+            (B, self.config.num_storage_tokens, self.config.embed_dim),
+        )
         x = mx.concatenate([cls, stor, x], axis=1)
 
         # compute RoPE for patch grid

@@ -17,7 +17,6 @@ Notes:
 import argparse
 import json
 import re
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -105,9 +104,7 @@ def split_qkv_weights(state_dict: dict) -> dict:
 # --------------------------------------------------------------------------
 
 # Patterns for backbone block keys (non-QKV)
-BACKBONE_BLOCK_PATTERN = re.compile(
-    r"backbone\.encoder\.blocks\.(\d+)\.(.+)"
-)
+BACKBONE_BLOCK_PATTERN = re.compile(r"backbone\.encoder\.blocks\.(\d+)\.(.+)")
 
 
 def map_backbone_block_key(block_idx: str, rest: str) -> str:
@@ -191,6 +188,7 @@ def convert_main_checkpoint(state_dict: dict) -> dict:
 # MHR JIT model conversion
 # --------------------------------------------------------------------------
 
+
 def convert_mhr_model(mhr_model) -> dict:
     """Extract buffers and parameters from the JIT MHR model."""
     result = {}
@@ -224,6 +222,7 @@ def convert_mhr_model(mhr_model) -> dict:
 # --------------------------------------------------------------------------
 # Sharded saving
 # --------------------------------------------------------------------------
+
 
 def save_sharded(weights: dict, output_dir: Path):
     """Save weights as safetensors, splitting into shards if needed."""
@@ -274,7 +273,9 @@ def save_sharded(weights: dict, output_dir: Path):
             fname = f"model-{i:05d}-of-{num_shards:05d}.safetensors"
             path = output_dir / fname
             save_file(shard, str(path))
-            print(f"Saved shard {i}/{num_shards}: {path} ({path.stat().st_size / 1024**3:.2f} GB)")
+            print(
+                f"Saved shard {i}/{num_shards}: {path} ({path.stat().st_size / 1024**3:.2f} GB)"
+            )
             for key in shard:
                 weight_map[key] = fname
 
@@ -291,8 +292,11 @@ def save_sharded(weights: dict, output_dir: Path):
 # Main
 # --------------------------------------------------------------------------
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Convert SAM 3D Body weights to MLX safetensors")
+    parser = argparse.ArgumentParser(
+        description="Convert SAM 3D Body weights to MLX safetensors"
+    )
     parser.add_argument("--checkpoint", required=True, help="Path to model.ckpt")
     parser.add_argument("--mhr-model", required=True, help="Path to mhr_model.pt (JIT)")
     parser.add_argument("--output", required=True, help="Output directory")

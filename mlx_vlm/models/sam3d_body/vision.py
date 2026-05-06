@@ -3,8 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from .backbone import DINOv3Backbone
-from .config import SAM3DConfig, VisionConfig
+from .config import VisionConfig
 
 
 class VisionModel(nn.Module):

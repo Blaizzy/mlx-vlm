@@ -23,7 +23,9 @@ class PositionalEncodingGaussian(nn.Module):
             (B, N, num_feats*2) positional encoding
         """
         coords = coords * 2 - 1  # map to [-1, 1]
-        coords = coords @ (self.positional_encoding_gaussian_matrix * self.scale * 2 * math.pi)
+        coords = coords @ (
+            self.positional_encoding_gaussian_matrix * self.scale * 2 * math.pi
+        )
         # (B, N, num_feats) -> concat sin and cos -> (B, N, num_feats*2)
         return mx.concatenate([mx.sin(coords), mx.cos(coords)], axis=-1)
 
@@ -74,15 +76,18 @@ class PromptEncoder(nn.Module):
 
         # Apply per-label type embedding
         for i in range(len(self.point_embeddings)):
-            mask = (labels == i)  # (B, N)
+            mask = labels == i  # (B, N)
             if mx.any(mask):
                 embed = self.point_embeddings[i].weight[0]  # (embed_dim,)
                 embeddings = embeddings + mask[..., None] * embed
 
         # Invalid/padding points (label == -1)
-        invalid_mask = (labels == -1)
+        invalid_mask = labels == -1
         if mx.any(invalid_mask):
-            embeddings = embeddings + invalid_mask[..., None] * self.invalid_point_embed.weight[0]
+            embeddings = (
+                embeddings
+                + invalid_mask[..., None] * self.invalid_point_embed.weight[0]
+            )
             pe = pe * (1 - invalid_mask[..., None].astype(pe.dtype))
 
         return embeddings, pe

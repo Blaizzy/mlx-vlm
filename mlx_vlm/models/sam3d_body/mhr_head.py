@@ -1,9 +1,8 @@
 """MHR pose head: proj FFN -> parameter extraction -> body model."""
 
-import numpy as np
-
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .config import SAM3DConfig
 from .mhr_body import MHRBodyModel
@@ -106,12 +105,8 @@ class MHRHead(nn.Module):
 
         # Insert decoded hand params at the correct indices
         # hand_joint_idxs_left/right: (27,) indices into 136-dim pose vector
-        result = _scatter_set(
-            full_pose_params, self.hand_joint_idxs_left, left_decoded
-        )
-        result = _scatter_set(
-            result, self.hand_joint_idxs_right, right_decoded
-        )
+        result = _scatter_set(full_pose_params, self.hand_joint_idxs_left, left_decoded)
+        result = _scatter_set(result, self.hand_joint_idxs_right, right_decoded)
         return result
 
     def __call__(
@@ -164,24 +159,23 @@ class MHRHead(nn.Module):
         scales = self.scale_mean[None, :] + pred_scale @ self.scale_comps  # (B, 68)
 
         # Assemble full pose: [trans*10, rot, body_pose]
-        full_pose_params = mx.concatenate([
-            global_trans * 10,
-            global_rot_euler,
-            body_pose_params,
-        ], axis=1)  # (B, 136)
+        full_pose_params = mx.concatenate(
+            [
+                global_trans * 10,
+                global_rot_euler,
+                body_pose_params,
+            ],
+            axis=1,
+        )  # (B, 136)
 
         # Replace hand joints with decoded PCA hand params
         full_pose_params = self._replace_hands_in_pose(full_pose_params, pred_hand)
 
         # Combine with scales for full model params
-        model_params = mx.concatenate([
-            full_pose_params, scales
-        ], axis=1)  # (B, 204)
+        model_params = mx.concatenate([full_pose_params, scales], axis=1)  # (B, 204)
 
         # Run body model
-        skinned_verts, skel_state = self.body_model(
-            pred_shape, model_params, pred_face
-        )
+        skinned_verts, skel_state = self.body_model(pred_shape, model_params, pred_face)
 
         # Parse skeleton state
         joint_coords = skel_state[:, :, :3]  # (B, 127, 3)
@@ -192,12 +186,12 @@ class MHRHead(nn.Module):
 
         # Compute keypoints via mapping
         # keypoint_mapping: (308, 18566) where 18566 = 18439 verts + 127 joints
-        model_vert_joints = mx.concatenate([
-            verts, joint_coords
-        ], axis=1)  # (B, 18566, 3)
+        model_vert_joints = mx.concatenate(
+            [verts, joint_coords], axis=1
+        )  # (B, 18566, 3)
 
         keypoints = mx.einsum(
-            'kv,bvd->bkd', self.keypoint_mapping, model_vert_joints
+            "kv,bvd->bkd", self.keypoint_mapping, model_vert_joints
         )  # (B, 308, 3)
         keypoints = keypoints[:, :70]  # Take first 70
 
@@ -213,7 +207,6 @@ class MHRHead(nn.Module):
             "pred_model_params": model_params,
             "pred_shape": pred_shape,
         }
-
 
     def load_all_weights(self, safetensors_path: str):
         """Load head_pose and mhr body model weights from safetensors.
@@ -260,12 +253,14 @@ class MHRHead(nn.Module):
             for key in f.keys():
                 tensor = mx.array(f.get_tensor(key))
 
-                if key.startswith("head_pose.") and not key.startswith("head_pose_hand."):
-                    model_key = key[len("head_pose."):]
+                if key.startswith("head_pose.") and not key.startswith(
+                    "head_pose_hand."
+                ):
+                    model_key = key[len("head_pose.") :]
                     weights.append((model_key, tensor))
 
                 elif key.startswith("mhr."):
-                    mhr_key = key[len("mhr."):]
+                    mhr_key = key[len("mhr.") :]
                     mapped = MHR_KEY_MAP.get(mhr_key)
                     if mapped is None:
                         continue  # skip unused buffers
@@ -298,10 +293,12 @@ def _zero_at_indices(arr: mx.array, indices: mx.array) -> mx.array:
 def _zero_last_n(arr: mx.array, n: int) -> mx.array:
     """Zero out the last n columns of a (B, D) array."""
     D = arr.shape[1]
-    mask = mx.concatenate([
-        mx.ones((D - n,)),
-        mx.zeros((n,)),
-    ])
+    mask = mx.concatenate(
+        [
+            mx.ones((D - n,)),
+            mx.zeros((n,)),
+        ]
+    )
     return arr * mask[None, :]
 
 

@@ -31,7 +31,9 @@ from .video import draw_bbox, draw_skeleton, project_keypoints_perspective
 _LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 
 
-def compute_cam_t(camera: np.ndarray, bbox, img_w: int, img_h: int, fov_deg: float = 60.0):
+def compute_cam_t(
+    camera: np.ndarray, bbox, img_w: int, img_h: int, fov_deg: float = 60.0
+):
     """Convert weak-perspective (scale, tx, ty) -> 3D translation + focal length.
 
     Matches the PyTorch reference's conversion used for photorealistic mesh
@@ -151,7 +153,9 @@ def render_mesh_overlay(
     image = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
     vertices = np.asarray(result["pred_vertices"], dtype=np.float32)
-    cam_t, focal_length = compute_cam_t(result["pred_camera"], result["bbox"], w, h, fov_deg)
+    cam_t, focal_length = compute_cam_t(
+        result["pred_camera"], result["bbox"], w, h, fov_deg
+    )
     cam_t = cam_t.copy()
     cam_t[0] *= -1.0  # flip x for pyrender camera frame
 

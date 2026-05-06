@@ -39,9 +39,9 @@ def detect_persons(image_rgb, threshold=0.5):
         predictions = model([img_tensor])[0]
 
     # Filter for person class (class 1 in COCO)
-    person_mask = predictions['labels'] == 1
-    scores = predictions['scores'][person_mask]
-    boxes = predictions['boxes'][person_mask]
+    person_mask = predictions["labels"] == 1
+    scores = predictions["scores"][person_mask]
+    boxes = predictions["boxes"][person_mask]
 
     # Threshold
     keep = scores > threshold
@@ -70,7 +70,6 @@ def _get_detector():
         return _cached_detector
 
     try:
-        import torch
         import torchvision
     except ImportError:
         return None
@@ -104,9 +103,9 @@ def detect_persons_cached(image_rgb, threshold=0.5):
     with torch.no_grad():
         predictions = model([img_tensor])[0]
 
-    person_mask = predictions['labels'] == 1
-    scores = predictions['scores'][person_mask]
-    boxes = predictions['boxes'][person_mask]
+    person_mask = predictions["labels"] == 1
+    scores = predictions["scores"][person_mask]
+    boxes = predictions["boxes"][person_mask]
 
     keep = scores > threshold
     boxes = boxes[keep].numpy()
@@ -128,11 +127,14 @@ def make_default_intrinsics(img_h, img_w):
     Returns: (3, 3) float32 numpy array
     """
     focal = math.sqrt(img_h**2 + img_w**2)
-    return np.array([
-        [focal, 0, img_w / 2],
-        [0, focal, img_h / 2],
-        [0, 0, 1],
-    ], dtype=np.float32)
+    return np.array(
+        [
+            [focal, 0, img_w / 2],
+            [0, focal, img_h / 2],
+            [0, 0, 1],
+        ],
+        dtype=np.float32,
+    )
 
 
 class SAM3DBodyEstimator:
@@ -200,7 +202,8 @@ class SAM3DBodyEstimator:
 
         # Preprocess
         processed = prepare_image(
-            image, bbox,
+            image,
+            bbox,
             image_size=self.config.image_size,
             mean=self.config.image_mean,
             std=self.config.image_std,
