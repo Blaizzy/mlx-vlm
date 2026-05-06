@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1287,6 +1288,66 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        text_configs = {
+            qwen3_5: qwen3_5.TextConfig(
+                model_type="qwen3_5",
+                hidden_size=128,
+                intermediate_size=256,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=1024,
+                num_key_value_heads=2,
+                max_position_embeddings=1024,
+                eos_token_id=248044,
+            ),
+            qwen3_5_moe: qwen3_5_moe.TextConfig(
+                model_type="qwen3_5_moe",
+                hidden_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_experts=4,
+                num_experts_per_tok=2,
+                shared_expert_intermediate_size=128,
+                moe_intermediate_size=128,
+                rms_norm_eps=1e-5,
+                vocab_size=1024,
+                num_key_value_heads=2,
+                max_position_embeddings=1024,
+                eos_token_id=248044,
+            ),
+        }
+
+        for model_module, text_config in text_configs.items():
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig(
+                    text_config=text_config,
+                    vision_config=SimpleNamespace(),
+                    model_type=model_module.__name__.rsplit(".", 1)[-1],
+                )
+                self.assertEqual(config.eos_token_id, 248044)
+
+                explicit = model_module.ModelConfig(
+                    text_config=text_config,
+                    vision_config=SimpleNamespace(),
+                    model_type=model_module.__name__.rsplit(".", 1)[-1],
+                    eos_token_id=248046,
+                )
+                self.assertEqual(explicit.eos_token_id, 248046)
 
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
