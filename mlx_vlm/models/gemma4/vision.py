@@ -503,12 +503,14 @@ class VisionModel(nn.Module):
             patch_positions = mx.concatenate(all_positions, axis=0)
             padding_positions = mx.concatenate(all_padding, axis=0)
 
-        # Build bidirectional attention mask [B, 1, L, L] for SDPA
+        # Bidirectional attention mask [B, 1, L, L] for SDPA. Use -1e4 not
+        # -inf: padded query rows would otherwise be all-masked and the
+        # softmax backward yields NaN (forward is fine, gradients aren't).
         valid_mask = ~padding_positions
         attn_mask = mx.expand_dims(valid_mask, 1) * mx.expand_dims(valid_mask, 2)
-        neg_inf = mx.array(float("-inf"), dtype=inputs_embeds.dtype)
+        mask_fill = mx.array(-1e4, dtype=inputs_embeds.dtype)
         attn_mask = mx.where(
-            attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), neg_inf
+            attn_mask, mx.array(0.0, dtype=inputs_embeds.dtype), mask_fill
         )
         attn_mask = mx.expand_dims(attn_mask, 1)
 

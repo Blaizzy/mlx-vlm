@@ -8,10 +8,15 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
+  - [Speculative Decoding](#speculative-decoding)
+    - [DFlash (Qwen3.5)](#dflash-qwen35)
+    - [Gemma 4 MTP](#gemma-4-mtp)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
     - [Continuous Batching](#continuous-batching)
+    - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
+    - [KV Cache Quantization](#kv-cache-quantization)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -19,6 +24,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 - [Model-Specific Documentation](#model-specific-documentation)
 - [Vision Feature Caching](#vision-feature-caching)
 - [TurboQuant KV Cache](#turboquant-kv-cache)
+- [Distributed Inference](#distributed-inference)
 - [Fine-tuning](#fine-tuning)
 
 ## Model-Specific Documentation
@@ -91,6 +97,69 @@ mlx_vlm.generate --model mlx-community/Qwen3.5-2B-4bit \
 | `--thinking-end-token` | Token that closes a thinking block (default: `</think>`) |
 
 When the budget is exceeded, the model is forced to emit `\n</think>` and transition to the answer. If `--enable-thinking` is passed but the model's chat template does not support it, the budget is applied only if the model generates the start token on its own.
+
+### Speculative Decoding
+
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Two drafter families are supported.
+
+| Flag | Description |
+|------|-------------|
+| `--draft-model` | HuggingFace repo or local path for the drafter |
+| `--draft-kind` | Drafter family — `dflash` (default) or `mtp` (Gemma 4) |
+| `--draft-block-size` | Override the drafter's configured block size |
+
+See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
+
+#### DFlash (Qwen3.5)
+
+A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
+
+```sh
+# Text generation with speculative decoding
+mlx_vlm.generate --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0 --enable-thinking
+
+# Also works with images
+mlx_vlm.generate --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash \
+  --image examples/images/cats.jpg \
+  --prompt "Describe this image." \
+  --max-tokens 256 --temperature 0 --enable-thinking
+
+# Server with speculative decoding
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+#### Gemma 4 MTP
+
+[Multi-Token Prediction](https://ai.google.dev/gemma/docs/mtp/mtp): Google's 4-layer "assistant" drafter that shares K/V with the target and drafts multiple tokens autoregressively from a constant position. Pass `--draft-kind mtp` to dispatch the MTP round-loop.
+
+```sh
+mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
+  --draft-kind mtp --draft-block-size 4 \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model mlx-community/gemma-4-31B-it-assistant-bf16 \
+  --draft-kind mtp --draft-block-size 4
+```
+
+Supported pairings (target ↔ drafter):
+
+| Target                          | Drafter                                  |
+|---------------------------------|------------------------------------------|
+| `mlx-community/gemma-4-E2B-it-bf16`         | `mlx-community/gemma-4-E2B-it-assistant-bf16`        |
+| `mlx-community/gemma-4-E4B-it-bf16`         | `mlx-community/gemma-4-E4B-it-assistant-bf16`        |
+| `mlx-community/gemma-4-26B-A4B-it-bf16`     | `mlx-community/gemma-4-26B-A4B-it-assistant-bf16`    |
+| `mlx-community/gemma-4-31B-it-bf16`         | `mlx-community/gemma-4-31B-it-assistant-bf16`        |
+
+Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
 
 ### Chat UI with Gradio
 
@@ -205,12 +274,18 @@ mlx_vlm.server --trust-remote-code
 
 - `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default) or `mtp` (Gemma 4)
+- `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
-- `--kv-bits`: Number of bits for KV cache quantization (e.g. `3.5` for TurboQuant)
+- `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
+- `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -233,10 +308,304 @@ Verify via the health endpoint:
 
 ```sh
 curl http://localhost:8080/health
-# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+# {"status":"healthy","loaded_model":"...","apc_enabled":false}
 ```
 
 If `--model` is omitted, the model is loaded on the first request.
+
+### Automatic Prefix Caching (APC)
+
+Automatic Prefix Caching reuses block-level K/V cache state across requests that share the same prefix. It is useful for repeated long documents, long chat histories, or retrieval contexts where each request appends a short new suffix.
+
+APC has two tiers:
+
+- **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
+- **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
+
+#### Python Script
+
+Use `APCManager` directly when calling `stream_generate`:
+
+```python
+from pathlib import Path
+
+from mlx_vlm import load, stream_generate
+from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
+model, processor = load(model_id)
+
+disk = DiskBlockStore(
+    Path("~/.cache/mlx-vlm/caching").expanduser(),
+    namespace=model_id,
+    max_bytes=3 * (1 << 30),  # 3 GB disk cap; use None for uncapped
+)
+apc = APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+document = Path("long_document.txt").read_text()
+
+try:
+    # First request computes the full prefix and stores reusable K/V blocks.
+    prompt1 = apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{document}\n\nSummarize the key decisions.",
+        num_images=0,
+    )
+    for _ in stream_generate(
+        model, processor, prompt1, max_tokens=128, temperature=0.0, apc_manager=apc
+    ):
+        pass
+
+    # Second request shares the same document prefix and only prefills the suffix.
+    prompt2 = apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{document}\n\nList the open engineering risks.",
+        num_images=0,
+    )
+    for chunk in stream_generate(
+        model, processor, prompt2, max_tokens=128, temperature=0.0, apc_manager=apc
+    ):
+        print(chunk.text, end="", flush=True)
+
+    print(apc.stats_snapshot())
+finally:
+    apc.close()
+```
+
+To compare cold, warm-memory, and warm-disk behavior with a model:
+
+```sh
+python scripts/bench_apc_context_sweep.py \
+  --model Qwen/Qwen3-VL-4B-Instruct \
+  --contexts 8000 20000 50000 100000 \
+  --disk-cap-gb 0 \
+  --shard-max-blocks 256
+```
+
+For a disk-eviction workload:
+
+```sh
+python scripts/bench_apc_disk_genstep.py \
+  --model Qwen/Qwen3-VL-4B-Instruct \
+  --test-prompt-tokens 8000 \
+  --fill-prompts 80 \
+  --disk-cap-gb 3.0
+```
+
+#### Server
+
+Enable in-memory APC for the server with environment variables:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
+Enable the persistent disk tier:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+APC_DISK_PATH=~/.cache/mlx-vlm/caching \
+APC_DISK_MAX_GB=3 \
+APC_DISK_SHARD_MAX_BLOCKS=256 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
+Repeated requests with the same long prefix will hit APC automatically:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "X-APC-Tenant: demo" \
+  -d '{
+    "model": "Qwen/Qwen3-VL-4B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": "Paste a long shared document here.\n\nNow answer question A."
+    }],
+    "max_tokens": 128
+  }'
+```
+
+Use the same `X-APC-Tenant` value for requests that may share cached prefixes. Use different tenant values to isolate cache entries between users or workspaces.
+
+Inspect and reset APC state:
+
+```sh
+curl http://localhost:8080/v1/cache/stats
+curl -X POST http://localhost:8080/v1/cache/reset
+```
+
+Common APC environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APC_ENABLED` | `0` | Set to `1` to enable APC |
+| `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
+| `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
+| `APC_DISK_PATH` | unset | Directory for persistent disk shards |
+| `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
+| `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
+| `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
+| `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
+
+APC is disabled automatically for models that use a custom cache layout. On the server, APC is also skipped when KV-cache quantization is enabled.
+
+#### KV Cache Quantization
+
+Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported:
+
+```sh
+# Uniform 8-bit KV cache quantization
+mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 8
+
+# TurboQuant 3.5-bit (3-bit keys + 4-bit values)
+mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme turboquant
+```
+
+Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
+
+Tested with gemma-4-26b-a4b-it at 20K context:
+
+| Config | Gen tok/s | KV Cache | KV Reduction |
+|--------|-----------|----------|--------------|
+| No quant | 50.3 | 0.624 GB | 1x |
+| Uniform 8-bit | 52.6 | 0.469 GB | **1.33x** |
+| TurboQuant 3.5-bit | 25.6 | 0.365 GB | **1.71x** |
+
+> Models with all full-attention layers (e.g. Qwen, LLaMA) see larger reductions — up to 3.6x at 8-bit and 6.4x at 4-bit.
+
+#### Log Probabilities
+
+The `/chat/completions` endpoint supports OpenAI-compatible per-token log probabilities. Pass `logprobs: true` (and optionally `top_logprobs: N`, up to 20) in the request:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen2-VL-2B-Instruct-4bit",
+    "messages": [{"role":"user","content":"Say hi in 3 words."}],
+    "max_tokens": 8,
+    "logprobs": true,
+    "top_logprobs": 3
+  }'
+```
+
+Each choice gets a `logprobs.content[]` list with one entry per generated token: `{token, logprob, bytes, top_logprobs: [{token, logprob, bytes}, ...]}`. Works for both streaming and non-streaming.
+
+`top_logprobs` requires the server to be started with a non-zero cap on how many alternatives it will compute per token (default `0` = disabled, max `20`). Set it via the `--top-logprobs-k` flag or the `TOP_LOGPROBS_K` env var:
+
+```sh
+mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit --top-logprobs-k 5
+# or
+TOP_LOGPROBS_K=5 mlx_vlm.server --model mlx-community/Qwen2-VL-2B-Instruct-4bit
+```
+
+Per-request `top_logprobs` is clamped to `TOP_LOGPROBS_K`. When `TOP_LOGPROBS_K=0`, requests with `logprobs: true` still return chosen-token logprobs; only the `top_logprobs` list stays empty. Leaving the cap at `0` keeps the vocab-wide sort out of the decode graph, so deployments that don't need logprobs pay zero overhead.
+
+#### Structured Outputs
+
+The `/v1/chat/completions` and `/v1/responses` endpoints support OpenAI-compatible `json_schema` structured outputs. The server constrains generation to the supplied JSON schema and supports both streaming and non-streaming responses.
+
+You can define the schema with Pydantic:
+
+```python
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class AnimalResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    animal: Literal["dog", "cat", "bird", "unknown"]
+    species: str = Field(max_length=60)
+    description: str = Field(max_length=200)
+
+
+schema = AnimalResult.model_json_schema()
+```
+
+Call the local server with the OpenAI Python client:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
+
+response = client.chat.completions.create(
+    model="mlx-community/Qwen3.5-4B-MLX-4bit",
+    messages=[
+        {"role": "user", "content": "Return a dog object."},
+    ],
+    response_format={
+        "type": "json_schema",
+        "json_schema": {
+            "name": "AnimalResult",
+            "strict": True,
+            "schema": schema,
+        },
+    },
+)
+
+result = AnimalResult.model_validate_json(response.choices[0].message.content)
+print(result)
+```
+
+Example output:
+
+```text
+animal='dog' species='Canis lupus familiaris' description='A domesticated canine known for companionship and loyalty.'
+```
+
+Chat completions use top-level `response_format`. The same format works for text-only and multimodal requests:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Identify the main animal in this image."},
+        {"type": "image_url", "image_url": {"url": "/path/to/image.jpg"}}
+      ]
+    }],
+    "response_format": {
+      "type": "json_schema",
+      "json_schema": {
+        "name": "AnimalResult",
+        "strict": true,
+        "schema": {
+          "type": "object",
+          "properties": {
+            "animal": {"type": "string", "enum": ["dog", "cat", "bird", "unknown"]},
+            "species": {"type": "string", "maxLength": 60},
+            "description": {"type": "string", "maxLength": 200}
+          },
+          "required": ["animal", "species", "description"],
+          "additionalProperties": false
+        }
+      }
+    },
+    "max_tokens": 256
+  }'
+```
+
+Structured outputs are also supported with:
+
+- Streaming chat completions by setting `"stream": true`
+- The responses API via `text.format` on `/v1/responses`
+- Text-only requests using the same `response_format` shape
+
+Structured outputs are not currently supported with speculative decoding.
 
 #### How It Works
 
@@ -629,6 +998,16 @@ Tested on gemma-4-31b-it at 128k context:
 ### Compatibility
 
 TurboQuant automatically quantizes `KVCache` layers (global attention). Models with `RotatingKVCache` (sliding window) or `ArraysCache` (MLA/absorbed keys) keep their native cache format for those layers since they are already memory-efficient.
+
+TurboQuant is supported in both single-request generation and continuous batching on the server. In continuous batching mode, KV states are stored in TurboQuant's compressed format and dequantized at attention time (custom Metal kernels are not yet batch-aware).
+
+## Distributed Inference
+
+mlx-vlm supports distributed inference across multiple computers. It works by sharding the language model (not the vision tower), because the LLM is much larger and vision embeddings only need to be computed once.
+
+The parallel implementation is compatible with [mlx-lm](https://github.com/ml-explore/mlx-lm) sharding primitives.
+
+See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#distributed-inference) for command-line examples.
 
 # Fine-tuning
 

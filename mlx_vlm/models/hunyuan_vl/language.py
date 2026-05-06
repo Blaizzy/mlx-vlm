@@ -199,19 +199,19 @@ class Attention(nn.Module):
         )
 
         kv_seq_len = L
-        offset = 0
+        offset_scalar = 0
         if cache is not None:
-            offset = cache.offset
-            # Handle array-valued offset from BatchKVCache
-            if isinstance(offset, mx.array):
-                offset_scalar = (
-                    offset.max().item() if offset.ndim > 0 else offset.item()
-                )
+            # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
+            if hasattr(cache, "_idx"):
+                offset_scalar = int(cache._idx)
             else:
-                offset_scalar = int(offset)
+                off = cache.offset
+                offset_scalar = (
+                    int(off)
+                    if isinstance(off, int)
+                    else (int(off.max().item()) if off.ndim > 0 else int(off.item()))
+                )
             kv_seq_len += offset_scalar
-        else:
-            offset_scalar = 0
 
         cos, sin = self.rotary_emb(values, seq_len=kv_seq_len)
 
@@ -465,9 +465,7 @@ class LanguageModel(nn.Module):
         position_ids = None
         if cache is None or cache_offset == 0:
             # Prefill phase - need xdrope position_ids
-            # Only reuse _position_ids for chunked prefill (cache_offset > 0)
-            # For new prompts (cache_offset == 0), always recalculate
-            if self._position_ids is not None and cache_offset > 0:
+            if self._position_ids is not None:
                 # Use stored position_ids (sliced for chunked prefill)
                 position_ids = self._position_ids[
                     :, :, cache_offset : cache_offset + seq_length

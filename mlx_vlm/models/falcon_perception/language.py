@@ -27,8 +27,12 @@ def apply_rotary_emb_1d(
     xk_r = xk.astype(mx.float32).reshape(*shape_k, d // 2, 2)
     xq_0, xq_1 = xq_r[..., 0], xq_r[..., 1]
     xk_0, xk_1 = xk_r[..., 0], xk_r[..., 1]
-    c = cos.reshape(1, 1, -1, cos.shape[-1])
-    s = sin.reshape(1, 1, -1, sin.shape[-1])
+    if cos.ndim == 2:
+        c = cos.reshape(1, 1, -1, cos.shape[-1])
+        s = sin.reshape(1, 1, -1, sin.shape[-1])
+    else:
+        c = cos.reshape(cos.shape[0], 1, -1, cos.shape[-1])
+        s = sin.reshape(sin.shape[0], 1, -1, sin.shape[-1])
     oq = mx.stack([xq_0 * c - xq_1 * s, xq_0 * s + xq_1 * c], axis=-1)
     ok = mx.stack([xk_0 * c - xk_1 * s, xk_0 * s + xk_1 * c], axis=-1)
     return oq.reshape(*shape_q, d).astype(dtype), ok.reshape(*shape_k, d).astype(dtype)
@@ -277,14 +281,23 @@ class FalconPerceptionTransformerModel(nn.Module):
         B, L, _ = h.shape
 
         if position_ids is None:
-            offset = 0
             if cache[0] is not None:
                 offset = cache[0].offset
                 if isinstance(offset, mx.array):
-                    offset = offset.item()
-            position_ids = mx.arange(offset, offset + L)
+                    if offset.ndim > 0 and offset.size > 1:
+                        base = mx.maximum(offset, 0).reshape(-1, 1)
+                        position_ids = base + mx.arange(L).reshape(1, -1)
+                    else:
+                        off = (offset if offset.ndim == 0 else offset[0]).item()
+                        position_ids = mx.arange(off, off + L)
+                else:
+                    position_ids = mx.arange(offset, offset + L)
+            else:
+                position_ids = mx.arange(L)
 
-        if position_ids.ndim > 1:
+        if position_ids.ndim == 2:
+            pos_t = position_ids
+        elif position_ids.ndim > 1:
             pos_t = position_ids.reshape(-1)[:L]
         else:
             pos_t = position_ids[:L]

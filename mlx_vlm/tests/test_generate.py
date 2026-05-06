@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import logging
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
@@ -8,14 +9,16 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
-    Batch,
     BatchGenerationResult,
     BatchGenerator,
     BatchResponse,
     BatchStats,
+    GenerationBatch,
     GenerationResult,
     _left_pad_prompts,
+    _prime_cached_prefix_rope_state,
     normalize_resize_shape,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -282,72 +285,92 @@ class TestBatchResponse:
         assert response.image_sizes is None
 
 
-class TestBatch:
-    """Tests for Batch dataclass."""
+class TestGenerationBatch:
+    """Tests for GenerationBatch class."""
 
-    def test_creation(self):
-        batch = Batch(
-            uids=[0, 1, 2],
-            y=mx.array([10, 20, 30]),
-            logprobs=mx.zeros((3, 100)),
-            max_tokens=[50, 50, 50],
-            num_tokens=[5, 10, 15],
-            cache=[MagicMock()],
-        )
-        assert len(batch) == 3
-        assert batch.uids == [0, 1, 2]
-        assert batch.max_tokens == [50, 50, 50]
+    def test_empty_creation(self):
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
+        assert len(batch) == 0
+        assert batch.uids == []
+        assert batch.max_tokens == []
 
     def test_filter(self):
-        # Create mock cache with filter method
-        mock_cache = MagicMock()
-        mock_cache.filter = MagicMock()
-
-        batch = Batch(
-            uids=[0, 1, 2],
-            y=mx.array([10, 20, 30]),
-            logprobs=mx.zeros((3, 100)),
-            max_tokens=[50, 60, 70],
-            num_tokens=[5, 10, 15],
-            cache=[mock_cache],
-        )
+        mock_model = MagicMock()
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        stop_criteria = lambda tok: tok == 2
+        batch = GenerationBatch.empty(mock_model, sampler, stop_criteria)
+        batch.uids = [0, 1, 2]
+        batch.max_tokens = [50, 60, 70]
+        batch._num_tokens = [5, 10, 15]
+        batch._next_tokens = mx.array([10, 20, 30])
+        batch._next_logprobs = mx.zeros((3, 100))
 
         # Keep only indices 0 and 2
         batch.filter([0, 2])
 
         assert batch.uids == [0, 2]
         assert batch.max_tokens == [50, 70]
-        assert batch.num_tokens == [5, 15]
+        assert batch._num_tokens == [5, 15]
         assert len(batch) == 2
 
-    def test_extend(self):
-        mock_cache1 = MagicMock()
-        mock_cache1.extend = MagicMock()
-        mock_cache2 = MagicMock()
+    @staticmethod
+    def _mrope_batch(uids, deltas):
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        batch = GenerationBatch.empty(MagicMock(), sampler, lambda tok: False)
+        batch.uids = list(uids)
+        batch.max_tokens = [10] * len(uids)
+        batch._num_tokens = [0] * len(uids)
+        batch._rope_deltas = mx.array(deltas, dtype=mx.int32)
+        return batch
 
-        batch1 = Batch(
-            uids=[0, 1],
-            y=mx.array([10, 20]),
-            logprobs=mx.zeros((2, 100)),
-            max_tokens=[50, 50],
-            num_tokens=[5, 10],
-            cache=[mock_cache1],
+    def test_extend_concatenates_and_filters_per_row_rope_deltas(self):
+        a = self._mrope_batch([0, 1], [[5], [7]])
+        b = self._mrope_batch([2], [[0]])
+        a.extend(b)
+        assert a._rope_deltas.tolist() == [[5], [7], [0]]
+        a.filter([0, 2])
+        assert a.uids == [0, 2]
+        assert a._rope_deltas.tolist() == [[5], [0]]
+
+    def test_extend_rejects_mixed_mrope_state(self):
+        a = self._mrope_batch([0], [[3]])
+        b = self._mrope_batch([1], [[0]])
+        b._rope_deltas = None
+        with pytest.raises(RuntimeError, match="MRoPE"):
+            a.extend(b)
+
+    def test_extend_into_empty_accumulator_absorbs_mrope_state(self):
+        empty = GenerationBatch.empty(
+            MagicMock(), lambda x: mx.argmax(x, axis=-1), lambda tok: False
+        )
+        empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
+        assert empty._rope_deltas.tolist() == [[5], [7]]
+
+    @staticmethod
+    def _capture(value, B):
+        from mlx_vlm.generate import PromptProcessingBatch
+
+        return PromptProcessingBatch._capture_rope_deltas(
+            SimpleNamespace(_rope_deltas=value), B
         )
 
-        batch2 = Batch(
-            uids=[2, 3],
-            y=mx.array([30, 40]),
-            logprobs=mx.zeros((2, 100)),
-            max_tokens=[60, 60],
-            num_tokens=[15, 20],
-            cache=[mock_cache2],
-        )
+    def test_capture_rope_deltas(self):
+        from mlx_vlm.generate import PromptProcessingBatch
 
-        batch1.extend(batch2)
-
-        assert batch1.uids == [0, 1, 2, 3]
-        assert batch1.max_tokens == [50, 50, 60, 60]
-        assert len(batch1) == 4
+        assert PromptProcessingBatch._capture_rope_deltas(SimpleNamespace(), 3) is None
+        assert self._capture(None, 3).tolist() == [[0], [0], [0]]
+        assert self._capture(mx.array([[5], [7], [9]], dtype=mx.int32), 3).tolist() == [
+            [5],
+            [7],
+            [9],
+        ]
+        # Falcon OCR singleton: (1, 1) broadcasts to (B, 1).
+        assert self._capture(mx.array([[5]], dtype=mx.int32), 4).tolist() == [[5]] * 4
+        with pytest.raises(RuntimeError, match="does not match"):
+            self._capture(mx.array([[5], [7]], dtype=mx.int32), 3)
 
 
 # ============================================================================
@@ -419,7 +442,7 @@ class TestBatchGenerator:
 
         assert gen.max_tokens == 128
         assert gen.model == mock_model.language_model
-        assert gen.active_batch is None
+        assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
 
     def test_insert_prompts(self, mock_model, mock_processor):
@@ -470,25 +493,84 @@ class TestBatchGenerator:
             processor=mock_processor,
         )
 
-        # Set some stats manually
-        gen._stats.prompt_tokens = 100
-        gen._stats.prompt_time = 0.5
-        gen._stats.generation_tokens = 50
-        gen._stats.generation_time = 0.25
+        # Set some stats manually via counters
+        gen._prompt_tokens_counter = 100
+        gen._prompt_time_counter = 0.5
+        gen._gen_tokens_counter = 50
 
         stats = gen.stats()
 
         assert stats.prompt_tps == 200.0  # 100 / 0.5
-        assert stats.generation_tps == 200.0  # 50 / 0.25
+        assert stats.prompt_tokens == 100
 
     def test_response_dataclass(self):
-        response = BatchGenerator.Response(
-            uid=0, token=42, logprobs=mx.array([0.1, 0.2]), finish_reason="stop"
+        response = GenerationBatch.Response(
+            uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
         )
 
         assert response.uid == 0
         assert response.token == 42
         assert response.finish_reason == "stop"
+
+    def test_generation_batch_applies_per_sequence_logits_processors(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        seen_contexts = []
+
+        def force_token_2(tokens, logits):
+            seen_contexts.append(tokens.tolist())
+            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
+            return mx.broadcast_to(token_scores, logits.shape)
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2, 2],
+            token_context=[mx.array([10]), mx.array([20])],
+            logits_processors=[[force_token_2], [force_token_2]],
+        )
+
+        first = batch.next()
+        assert [r.token for r in first] == [5, 6]
+        assert seen_contexts == [[10, 5], [20, 6]]
+
+        second = batch.next()
+        assert [r.token for r in second] == [2, 2]
+
+    def test_remove_from_unprocessed(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        assert len(gen.unprocessed_prompts) == 3
+
+        assert gen.remove(uids[1]) is True
+        assert len(gen.unprocessed_prompts) == 2
+        remaining_uids = [seq[0] for seq in gen.unprocessed_prompts]
+        assert uids[1] not in remaining_uids
+        assert uids[0] in remaining_uids
+        assert uids[2] in remaining_uids
+
+    def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        gen.insert([[1, 2, 3]])
+        assert gen.remove(9999) is False
 
 
 # ============================================================================
@@ -1054,6 +1136,8 @@ def test_generate_cli_smoke(capsys):
         adapter_path=None,
         image=["image.png"],
         audio=None,
+        video=None,
+        fps=2.0,
         resize_shape=[224],
         prompt=["Describe this image."],
         system=None,
@@ -1077,6 +1161,9 @@ def test_generate_cli_smoke(capsys):
         thinking_budget=None,
         thinking_start_token="<think>",
         thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind="dflash",
+        draft_block_size=None,
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
     processor = SimpleNamespace()
@@ -1110,6 +1197,141 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
 
     assert args.thinking_start_token == "<think>"
     assert args.thinking_end_token == "</think>"
+
+
+def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
+    class BrokenRopeLanguageModel:
+        def __init__(self):
+            self._rope_deltas = mx.array([1])
+            self._position_ids = mx.array([[0, 1, 2]])
+
+        def get_rope_index(self, *args, **kwargs):
+            raise ValueError("bad grid")
+
+    language_model = BrokenRopeLanguageModel()
+    model = SimpleNamespace(language_model=language_model)
+    rope_deltas_before = language_model._rope_deltas
+    position_ids_before = language_model._position_ids
+    kwargs = {}
+
+    with caplog.at_level(logging.WARNING, logger="mlx_vlm.generate"):
+        ok = _prime_cached_prefix_rope_state(
+            model,
+            mx.array([[1, 2, 3]]),
+            None,
+            kwargs,
+        )
+
+    assert ok is False
+    assert "rope_deltas" not in kwargs
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
+    assert "falling back to cold prefill" in caplog.text
+
+
+def test_batch_apc_extra_hash_uses_precomputed_image_hash():
+    batch_generator = SimpleNamespace(apc_manager=object())
+
+    got = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {"_apc_image_hash": 123, "_apc_tenant": "tenant-a"},
+    )
+
+    assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
+
+
+def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = None
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    sequences = [
+        (
+            1,
+            list(range(8)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 8, 4)),
+                "keep_tensor": mx.ones((1, 1)),
+                "_apc_tenant": "tenant-a",
+                "_apc_image_hash": 123,
+            },
+            [],
+        ),
+        (
+            2,
+            list(range(6)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 6, 4)),
+                "keep_tensor": mx.zeros((1, 1)),
+                "_apc_tenant": "tenant-b",
+                "_apc_image_hash": 456,
+            },
+            [],
+        ),
+    ]
+    picks = [
+        {
+            "matched_blocks": [],
+            "prefix_len": 4,
+            "extra_hash": 7,
+            "full_input_ids": list(range(8)),
+        },
+        None,
+    ]
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+        patch.object(
+            generate_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch(sequences)
+
+    assert batch is not None
+    assert "_apc_tenant" not in captured["prompt_kwargs"]
+    assert "_apc_image_hash" not in captured["prompt_kwargs"]
+    assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
+
+
+def test_apc_pick_rejects_image_tokens_and_releases_blocks():
+    block_size = 4
+    image_token_id = 99
+    token_ids = [image_token_id, 1, 2, 3, 4]
+    manager = apc_module.APCManager(num_blocks=4, block_size=block_size)
+    layer_keys = [mx.ones((1, 1, block_size, 2))]
+    layer_values = [mx.ones((1, 1, block_size, 2)) * 2]
+    stored = manager.store_kv_blocks(
+        token_ids[:block_size],
+        layer_keys,
+        layer_values,
+    )
+    manager.release(stored)
+
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = manager
+    bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
+    bg._wire_stack = None
+
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, []))
+
+    assert pick is None
+    assert all(block.ref_cnt == 0 for block in stored)
 
 
 if __name__ == "__main__":

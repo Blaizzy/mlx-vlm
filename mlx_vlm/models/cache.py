@@ -9,9 +9,218 @@ from mlx_lm.models.cache import (
     CacheList,
     ChunkedKVCache,
     KVCache,
+    QuantizedKVCache,
     RotatingKVCache,
     _BaseCache,
 )
+
+
+class BatchQuantizedKVCache(_BaseCache):
+    """Batch-aware quantized KV cache for continuous batching.
+
+    Mirrors ``BatchKVCache`` but stores keys/values in quantized form
+    (packed uint32 + scales + biases), matching the format produced by
+    ``mx.quantize``.  Supports ``extend()`` and ``filter()`` so that
+    ``Batch.extend`` / ``Batch.filter`` work during continuous-batching.
+    """
+
+    step = 256
+
+    def __init__(
+        self,
+        left_padding: List[int],
+        group_size: int = 64,
+        bits: int = 8,
+    ):
+        self.keys = None  # tuple (packed, scales, biases) or None
+        self.values = None
+        self.left_padding = mx.array(left_padding)
+        self.offset = mx.array([-lp for lp in left_padding])
+        self._idx = 0
+        self.group_size = group_size
+        self.bits = bits
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        """Quantize incoming keys/values and append to the cache.
+
+        Args:
+            keys:   float [B, H, S, D_k]
+            values: float [B, H, S, D_v]
+
+        Returns:
+            Quantized (keys_tuple, values_tuple) sliced to ``_idx``.
+        """
+        B, n_kv_heads, num_steps, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        prev = self._idx
+        el_per_int = 8 * mx.uint32.size // self.bits
+
+        if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
+            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_kv_heads, new_steps)
+
+            def _init(dim):
+                return (
+                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                )
+
+            def _expand(x):
+                new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
+                return mx.concatenate([x, new_x], axis=-2)
+
+            if self.keys is not None:
+                if prev % self.step != 0:
+                    self.keys = tuple(k[..., :prev, :] for k in self.keys)
+                    self.values = tuple(v[..., :prev, :] for v in self.values)
+                self.keys = tuple(_expand(k) for k in self.keys)
+                self.values = tuple(_expand(v) for v in self.values)
+            else:
+                self.keys = _init(k_head_dim)
+                self.values = _init(v_head_dim)
+
+        self.offset += num_steps
+        self._idx += num_steps
+
+        q_keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+        q_values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+        for i in range(len(self.keys)):
+            self.keys[i][..., prev : self._idx, :] = q_keys[i]
+            self.values[i][..., prev : self._idx, :] = q_values[i]
+
+        return (
+            tuple(k[..., : self._idx, :] for k in self.keys),
+            tuple(v[..., : self._idx, :] for v in self.values),
+        )
+
+    def filter(self, batch_indices: mx.array):
+        """Keep only the sequences at *batch_indices*."""
+        if self.keys is not None:
+            self.keys = tuple(k[batch_indices] for k in self.keys)
+            self.values = tuple(v[batch_indices] for v in self.values)
+        self.offset = self.offset[batch_indices]
+        self.left_padding = self.left_padding[batch_indices]
+
+        min_lp = self.left_padding.min().item()
+        if min_lp > 0:
+            if self.keys is not None:
+                self.keys = tuple(k[..., min_lp:, :] for k in self.keys)
+                self.values = tuple(v[..., min_lp:, :] for v in self.values)
+            self._idx -= min_lp
+            self.left_padding -= min_lp
+
+    def extend(self, other: "BatchQuantizedKVCache"):
+        """Concatenate *other* batch into this cache along the batch dim."""
+        if self.keys is None and other.keys is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+
+        max_idx = max(self._idx, other._idx)
+
+        def _pad_quant(cache_obj):
+            if cache_obj.keys is None:
+                return None
+            left = max_idx - cache_obj._idx
+            right_total = max(
+                cache_obj.keys[0].shape[-2],
+                max_idx,
+            )
+            right = right_total - cache_obj.keys[0].shape[-2] - left
+            if right < 0:
+                trimmed_keys = tuple(
+                    k[..., : right_total - left, :] for k in cache_obj.keys
+                )
+                trimmed_values = tuple(
+                    v[..., : right_total - left, :] for v in cache_obj.values
+                )
+                right = 0
+            else:
+                trimmed_keys = cache_obj.keys
+                trimmed_values = cache_obj.values
+
+            if left != 0 or right != 0:
+                pad_spec = [(0, 0), (0, 0), (left, right), (0, 0)]
+                padded_keys = tuple(mx.pad(k, pad_spec) for k in trimmed_keys)
+                padded_values = tuple(mx.pad(v, pad_spec) for v in trimmed_values)
+            else:
+                padded_keys = trimmed_keys
+                padded_values = trimmed_values
+
+            lp = cache_obj.left_padding + left
+            return padded_keys, padded_values, cache_obj.offset, lp
+
+        r_self = _pad_quant(self)
+        r_other = _pad_quant(other)
+
+        if r_self is None and r_other is None:
+            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self.offset = mx.concatenate([self.offset, other.offset])
+            return
+        if r_self is None:
+            ok, ov, oo, olp = r_other
+            slp = self.left_padding + max_idx
+            self.keys = ok
+            self.values = ov
+            self.offset = mx.concatenate([self.offset, oo])
+            self.left_padding = mx.concatenate([slp, olp])
+            self._idx = max_idx
+            return
+        if r_other is None:
+            sk, sv, so, slp = r_self
+            olp = other.left_padding + max_idx
+            self.keys = sk
+            self.values = sv
+            self.offset = mx.concatenate([so, other.offset])
+            self.left_padding = mx.concatenate([slp, olp])
+            self._idx = max_idx
+            return
+
+        sk, sv, so, slp = r_self
+        ok, ov, oo, olp = r_other
+
+        self.keys = tuple(mx.concatenate([s, o]) for s, o in zip(sk, ok))
+        self.values = tuple(mx.concatenate([s, o]) for s, o in zip(sv, ov))
+        self.offset = mx.concatenate([so, oo])
+        self.left_padding = mx.concatenate([slp, olp])
+        self._idx = max_idx
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None, self.offset, self.left_padding
+        k = tuple(x[..., : self._idx, :] for x in self.keys)
+        v = tuple(x[..., : self._idx, :] for x in self.values)
+        return k, v, self.offset, self.left_padding
+
+    @state.setter
+    def state(self, val):
+        self.keys, self.values, self.offset, self.left_padding = val
+        if self.keys is not None:
+            self._idx = self.keys[0].shape[2]
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self._idx, self.group_size, self.bits)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self._idx, self.group_size, self.bits = map(int, v)
+
+    def is_trimmable(self):
+        return False
+
+    def trim(self, n):
+        return 0
+
+    def empty(self):
+        return self.keys is None
+
+    def make_mask(self, *args, **kwargs):
+        from mlx_lm.models.cache import create_attention_mask
+
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
 
 
 def make_prompt_cache(
