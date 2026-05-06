@@ -50,6 +50,7 @@ from .generate import (
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
+from .tokenizer_utils import make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
@@ -58,6 +59,7 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_ENABLE_THINKING = False
 
 
 def _get_speculative_rounds_batch(draft_kind: str):
@@ -113,6 +115,13 @@ def get_token_queue_timeout():
     if timeout <= 0:
         return None
     return timeout
+
+
+def get_server_enable_thinking():
+    raw = os.environ.get("MLX_VLM_ENABLE_THINKING")
+    if raw is None:
+        return DEFAULT_ENABLE_THINKING
+    return raw.lower() in ("1", "true", "yes", "on")
 
 
 def get_quantized_kv_bits(model: str):
@@ -174,7 +183,7 @@ class GenerationArguments:
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
-    enable_thinking: bool = True
+    enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
@@ -604,8 +613,7 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
-                        "tokens": [],
-                        "prev_text": "",
+                        "detokenizer": make_streaming_detokenizer(self.processor),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -678,6 +686,7 @@ class ResponseGenerator:
                 uids = []
                 rqueues = {}
                 token_lists = {}
+                stream_infos = {}
                 max_tokens_map = {}
                 all_input_ids = []
                 prompt_kwargs_list = []
@@ -693,6 +702,9 @@ class ResponseGenerator:
                     uids.append(uid)
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
+                    stream_infos[uid] = {
+                        "detokenizer": make_streaming_detokenizer(self.processor)
+                    }
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
@@ -723,25 +735,35 @@ class ResponseGenerator:
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
 
+                finished_uids = set()
+
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
-                    text = self.tokenizer.decode([tok])
+                    is_stop = tok in self.stop_tokens
+                    is_max = len(token_lists[uid]) >= max_tokens_map[uid]
+                    finish = "stop" if is_stop else "length" if is_max else None
+                    text = self._stream_text(stream_infos[uid], tok, finish)
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
                             token=tok,
                             logprobs=0.0,
-                            finish_reason=None,
+                            finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9,
                         )
                     )
+                    if finish is not None:
+                        rqueues[uid].put(None)
+                        finished_uids.add(uid)
+
+                if len(finished_uids) == len(uids):
+                    continue
 
                 # --- Phase 3: speculative decode rounds ---
                 max_tok = max(max_tokens_map[u] for u in uids)
-                finished_uids = set()
 
                 def stop_check(seq_idx, token_id):
                     uid = uids[seq_idx]
@@ -790,20 +812,14 @@ class ResponseGenerator:
                         token_lists[uid].append(tok)
                         tokens = token_lists[uid]
 
-                        if len(tokens) >= 2:
-                            prev = self.tokenizer.decode(tokens[:-1])
-                            curr = self.tokenizer.decode(tokens)
-                            text = curr[len(prev) :]
-                        else:
-                            text = self.tokenizer.decode(tokens)
-
                         is_stop = tok in self.stop_tokens
                         is_max = len(tokens) >= max_tokens_map[uid]
                         finish = "stop" if is_stop else "length" if is_max else None
+                        text = self._stream_text(stream_infos[uid], tok, finish)
 
                         rqueues[uid].put(
                             StreamingToken(
-                                text="" if is_stop else text,
+                                text=text,
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
@@ -828,9 +844,11 @@ class ResponseGenerator:
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
+                        stream_infos[uid]["detokenizer"].finalize()
+                        text = stream_infos[uid]["detokenizer"].last_segment
                         rqueues[uid].put(
                             StreamingToken(
-                                text="",
+                                text=text,
                                 token=0,
                                 logprobs=0.0,
                                 finish_reason="length",
@@ -861,13 +879,7 @@ class ResponseGenerator:
             if hasattr(tok, "item"):
                 tok = tok.item()
 
-            if r.finish_reason == "stop":
-                text = ""
-            else:
-                info["tokens"].append(tok)
-                curr = self.tokenizer.decode(info["tokens"])
-                text = curr[len(info["prev_text"]) :]
-                info["prev_text"] = curr
+            text = self._stream_text(info, tok, r.finish_reason)
 
             lp = r.token_logprob
 
@@ -885,6 +897,17 @@ class ResponseGenerator:
             if r.finish_reason is not None:
                 rqueue.put(None)
                 del active[r.uid]
+
+    def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:
+        """Convert one generated token into a streaming text segment."""
+        detokenizer = info["detokenizer"]
+        if finish_reason == "stop":
+            detokenizer.finalize()
+        else:
+            detokenizer.add_token(token)
+            if finish_reason is not None:
+                detokenizer.finalize()
+        return detokenizer.last_segment
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
@@ -974,6 +997,11 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+    enable_thinking = _request_field_or_default(
+        request,
+        "enable_thinking",
+        get_server_enable_thinking(),
+    )
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
@@ -982,7 +1010,7 @@ def _build_gen_args(
         min_p=getattr(request, "min_p", 0.0),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         logit_bias=logit_bias,
-        enable_thinking=getattr(request, "enable_thinking", True),
+        enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
         tenant_id=tenant_id,
@@ -990,6 +1018,14 @@ def _build_gen_args(
     if processor is not None:
         args.logits_processors = _build_structured_logits_processors(request, processor)
     return args
+
+
+def _request_field_or_default(request, field_name: str, default):
+    fields_set = getattr(request, "model_fields_set", None)
+    if fields_set is not None and field_name not in fields_set:
+        return default
+    value = getattr(request, field_name, default)
+    return default if value is None else value
 
 
 def _read_tenant_id(http_request) -> Optional[str]:
@@ -1421,7 +1457,13 @@ class OpenAIRequest(FlexibleBaseModel):
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: Optional[bool] = Field(
+        None,
+        description=(
+            "Override server thinking mode for this request. If omitted, the "
+            "server default set by --enable-thinking is used."
+        ),
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -1615,7 +1657,13 @@ class VLMRequest(FlexibleBaseModel):
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: Optional[bool] = Field(
+        None,
+        description=(
+            "Override server thinking mode for this request. If omitted, the "
+            "server default set by --enable-thinking is used."
+        ),
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -2885,6 +2933,15 @@ def main():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=DEFAULT_ENABLE_THINKING,
+        help=(
+            "Enable thinking mode by default for requests that do not set "
+            "enable_thinking explicitly."
+        ),
+    )
+    parser.add_argument(
         "--kv-bits",
         type=float,
         default=None,
@@ -2977,6 +3034,7 @@ def main():
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
+    os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
 from mlx_vlm.apc import hash_image_payload
+from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer
 
 
 @pytest.fixture
@@ -374,7 +375,7 @@ class TestResponseGenerator:
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS
         assert args.temperature == server.DEFAULT_TEMPERATURE
-        assert args.enable_thinking is True
+        assert args.enable_thinking is False
         assert args.logit_bias is None
 
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
@@ -450,6 +451,89 @@ class TestResponseGenerator:
             next(token_iter)
         assert cancelled == []
 
+    def test_step_uses_streaming_detokenizer_for_utf8_byte_tokens(self):
+        class ByteFallbackTokenizer:
+            vocab = {
+                "hi": 0,
+                "<0xF0>": 1,
+                "<0x9F>": 2,
+                "<0x98>": 3,
+                "<0x80>": 4,
+            }
+
+            def decode(self, tokens):
+                text = ""
+                byte_buffer = bytearray()
+                byte_values = {1: 0xF0, 2: 0x9F, 3: 0x98, 4: 0x80}
+
+                def flush_bytes():
+                    nonlocal text, byte_buffer
+                    if byte_buffer:
+                        text += byte_buffer.decode("utf-8", errors="replace")
+                        byte_buffer = bytearray()
+
+                for token in tokens:
+                    if token == 0:
+                        flush_bytes()
+                        text += "hi"
+                    else:
+                        byte_buffer.append(byte_values[token])
+                flush_bytes()
+                return text
+
+        class SingleResponseBatch:
+            def __init__(self, response):
+                self.response = response
+
+            def next(self, **kwargs):
+                return [], [self.response]
+
+        tokenizer = ByteFallbackTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "detokenizer": server.make_streaming_detokenizer(processor),
+            }
+        }
+
+        for token in [0, 1, 2, 3, 4]:
+            gen._step(
+                SingleResponseBatch(
+                    SimpleNamespace(
+                        uid=1,
+                        token=token,
+                        token_logprob=0.0,
+                        finish_reason=None,
+                    )
+                ),
+                active,
+            )
+        gen._step(
+            SingleResponseBatch(
+                SimpleNamespace(
+                    uid=1,
+                    token=99,
+                    token_logprob=0.0,
+                    finish_reason="stop",
+                )
+            ),
+            active,
+        )
+
+        streamed_text = ""
+        while not rqueue.empty():
+            item = rqueue.get()
+            if item is not None:
+                streamed_text += item.text
+
+        assert streamed_text == "hi😀"
+        assert "\ufffd" not in streamed_text
+
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
         args = server.GenerationArguments(
@@ -524,6 +608,47 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_uses_server_thinking_default_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert "enable_thinking" not in req.model_fields_set
+        assert server._build_gen_args(req).enable_thinking is True
+
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert server._build_gen_args(req).enable_thinking is False
+
+    def test_build_gen_args_request_thinking_overrides_server_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=False,
+        )
+
+        assert server._build_gen_args(req).enable_thinking is False
+
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=True,
+        )
+
+        assert server._build_gen_args(req).enable_thinking is True
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:

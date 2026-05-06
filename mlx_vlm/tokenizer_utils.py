@@ -1,4 +1,5 @@
 import json
+from copy import copy
 from functools import partial
 from json import JSONDecodeError
 from typing import List
@@ -295,6 +296,13 @@ class TokenizerWrapper:
             return self._detokenizer
         else:
             return getattr(self._tokenizer, attr)
+
+
+def make_streaming_detokenizer(processor):
+    """Return an isolated, reset streaming detokenizer for a processor."""
+    detokenizer = copy(processor.detokenizer)
+    detokenizer.reset()
+    return detokenizer
 
 
 def _match(a, b):
