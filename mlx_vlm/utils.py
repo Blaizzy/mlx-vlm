@@ -1215,16 +1215,6 @@ def prepare_inputs(
         not hasattr(videos, "__len__") or len(videos) > 0
     )
     if not has_images and not has_audio and not has_videos:
-        image_token = getattr(processor, "image_token", None)
-        if isinstance(image_token, str) and prompts:
-            prompts_list = [prompts] if isinstance(prompts, str) else prompts
-            for prompt in prompts_list:
-                count = prompt.count(image_token)
-                if count > 0:
-                    raise ValueError(
-                        f"Number of image tokens in prompt_token_ids ({count}) "
-                        f"does not match number of images (0)"
-                    )
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
