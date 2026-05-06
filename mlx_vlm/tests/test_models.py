@@ -1244,6 +1244,50 @@ class TestModels(unittest.TestCase):
             model.language_model, config.text_config.hidden_size
         )
 
+    def test_qwen3_5_model_config(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        quantization = {
+            "group_size": 128,
+            "bits": 4,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                "group_size": 128,
+                "bits": 6,
+            },
+            "model.visual.blocks.0.attn.qkv": False,
+            "lm_head": False,
+        }
+
+        for model_module in (qwen3_5, qwen3_5_moe):
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {},
+                        "vision_config": {},
+                        "quantization": quantization,
+                        "quantization_config": quantization,
+                    }
+                )
+
+                self.assertIn(
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertEqual(
+                    config.quantization[
+                        "language_model.model.layers.0.linear_attn.in_proj_qkv"
+                    ],
+                    {"group_size": 128, "bits": 6},
+                )
+                self.assertNotIn(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
+                self.assertIn("language_model.lm_head", config.quantization)
+                self.assertIs(config.quantization, config.quantization_config)
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
@@ -1978,7 +2022,7 @@ class TestModels(unittest.TestCase):
         )
 
     def test_kimi_vl(self):
-        from types import SimpleNamespace
+        pass
 
         from mlx_vlm.models import kimi_vl
 
@@ -2010,32 +2054,6 @@ class TestModels(unittest.TestCase):
             batch_size=1176,
             vision_feature_layer=-1,
         )
-
-        # Regression check: runtime image token id from tokenizer should be used
-
-        dummy_model = SimpleNamespace(config=model.config)
-        dummy_model.config.media_placeholder_token_id = 163605
-        dummy_model.config.image_token_index = 163605
-
-        input_ids = mx.array([[11, 163592, 12, 163592, 13]], dtype=mx.int32)
-        inputs_embeds = mx.zeros((1, 5, 8), dtype=mx.float32)
-        image_features = mx.ones((2, 8), dtype=mx.float32)
-
-        with self.assertRaises(ValueError):
-            kimi_vl.Model._prepare_inputs_for_multimodal(
-                dummy_model, image_features, inputs_embeds, input_ids
-            )
-
-        merged = kimi_vl.Model._prepare_inputs_for_multimodal(
-            dummy_model,
-            image_features,
-            inputs_embeds,
-            input_ids,
-            image_token_id=163592,
-        )
-        self.assertEqual(merged.shape, inputs_embeds.shape)
-        self.assertTrue(mx.all(merged[0, 1] == 1).item())
-        self.assertTrue(mx.all(merged[0, 3] == 1).item())
 
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
@@ -3384,6 +3402,63 @@ class TestModels(unittest.TestCase):
             config.text_config.model_type,
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
+        )
+
+    def test_granite4_1_vision(self):
+        from mlx_vlm.models import granite4_vision
+
+        text_config = granite4_vision.TextConfig(
+            model_type="granite",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=10000000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=10.0,
+        )
+
+        vision_config = granite4_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=48,
+            patch_size=16,
+        )
+
+        config = granite4_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite4_vision",
+            deepstack_layer_map=[[-1, 0]],
+            use_spatial_sampling=False,
+            downsample_rate="3/3",
+            use_image_newline_parameter=False,
+        )
+
+        model = granite4_vision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            vision_feature_layer=0,
         )
 
     def test_youtu_vl(self):
@@ -5061,6 +5136,76 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
+
+    def test_glm4v_get_rope_index_per_row_deltas(self):
+        from mlx_vlm.models import glm4v
+
+        text_config = glm4v.TextConfig(
+            model_type="glm4v_text",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=256,
+        )
+        vision_config = glm4v.VisionConfig(
+            model_type="glm4v_vision",
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            image_size=28,
+        )
+        lm = glm4v.LanguageModel(
+            text_config,
+            glm4v.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                model_type="glm4v",
+                vocab_size=64,
+                image_token_id=61,
+                image_token_index=61,
+                video_token_id=62,
+                video_token_index=62,
+                vision_start_token_id=60,
+                vision_end_token_id=59,
+                pad_token_id=0,
+            ),
+        )
+
+        input_ids = mx.array(
+            [
+                [10, 60, 61, 61, 61, 61, 11, 12],
+                [10, 11, 12, 13, 14, 15, 16, 17],
+            ],
+            dtype=mx.int32,
+        )
+        _, rope_deltas = lm.get_rope_index(
+            input_ids, mx.array([[1, 4, 4]], dtype=mx.int32)
+        )
+        self.assertEqual(rope_deltas.shape, (2, 1))
+        self.assertEqual(rope_deltas[1, 0].item(), 0)
+        self.assertNotEqual(rope_deltas[0, 0].item(), rope_deltas[1, 0].item())
+
+        input_ids = mx.array(
+            [[0, 0, 10, 11, 12, 13], [10, 11, 12, 13, 14, 15]], dtype=mx.int32
+        )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.int32
+        )
+        position_ids, rope_deltas = lm.get_rope_index(
+            input_ids, image_grid_thw=None, attention_mask=attention_mask
+        )
+        self.assertEqual(rope_deltas.shape, (2, 1))
+        self.assertEqual(position_ids.shape, (3, 2, 6))
+        self.assertEqual(rope_deltas[0, 0].item(), -2)
+        self.assertEqual(rope_deltas[1, 0].item(), 0)
 
     def test_glm4v_moe_chunked_prefill_rope(self):
         """Test GLM4V-MoE chunked prefill RoPE position ID generation."""

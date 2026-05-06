@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
+from ..qwen3_5.config import sanitize_quantization_config
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
 
 
@@ -86,12 +87,22 @@ class ModelConfig(BaseModelConfig):
     vision_end_token_id: int = 248046
     vocab_size: int = 248320
     eos_token_id: Optional[List[int]] = None
+    quantization: Optional[Dict] = None
+    quantization_config: Optional[Dict] = None
 
     def __post_init__(self):
         if self.image_token_index is None:
             self.image_token_index = self.image_token_id
         if self.video_token_index is None:
             self.video_token_index = self.video_token_id
+        quantization = self.quantization
+        self.quantization = sanitize_quantization_config(quantization)
+        if self.quantization_config == quantization:
+            self.quantization_config = self.quantization
+        else:
+            self.quantization_config = sanitize_quantization_config(
+                self.quantization_config
+            )
 
     @classmethod
     def from_dict(cls, params):
