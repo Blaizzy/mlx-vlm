@@ -8,8 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
-from mlx_vlm.tokenizer_utils import REPLACEMENT_CHAR, SPMStreamingDetokenizer
 from mlx_vlm.apc import hash_image_payload
+from mlx_vlm.tokenizer_utils import REPLACEMENT_CHAR, SPMStreamingDetokenizer
 
 
 @pytest.fixture
