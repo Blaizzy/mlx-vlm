@@ -3,8 +3,8 @@ from unittest.mock import patch
 
 import mlx.core as mx
 
-from mlx_vlm.models.cache import ArraysCache
 import mlx_vlm.models.qwen3_5.language as qwen_language
+from mlx_vlm.models.cache import ArraysCache
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:

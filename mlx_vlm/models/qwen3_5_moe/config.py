@@ -3,10 +3,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
-from ..qwen3_5.config import (
-    resolve_qwen_eos_token_id,
-    sanitize_quantization_config,
-)
+from ..qwen3_5.config import resolve_qwen_eos_token_id, sanitize_quantization_config
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
 
 
