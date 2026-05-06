@@ -92,6 +92,10 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+def get_server_max_tokens():
+    return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+
+
 def get_token_queue_timeout():
     raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
     if raw_timeout == "":
@@ -339,7 +343,7 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
         self.wait_until_ready()
-        args = args or GenerationArguments()
+        args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         if self.draft_model is not None and args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
@@ -938,9 +942,11 @@ def _build_gen_args(
     request, processor=None, tenant_id: Optional[str] = None
 ) -> GenerationArguments:
     """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
-    max_tokens = getattr(request, "max_tokens", None) or getattr(
-        request, "max_output_tokens", DEFAULT_MAX_TOKENS
-    )
+    max_tokens = getattr(request, "max_tokens", None)
+    if max_tokens is None:
+        max_tokens = getattr(request, "max_output_tokens", None)
+    if max_tokens is None:
+        max_tokens = get_server_max_tokens()
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
@@ -1380,7 +1386,8 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     model: str = Field(..., description="The model to use for generation.")
     max_output_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        default_factory=get_server_max_tokens,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -1572,7 +1579,8 @@ class VLMRequest(FlexibleBaseModel):
         None, description="The path to the adapter weights."
     )
     max_tokens: int = Field(
-        DEFAULT_MAX_TOKENS, description="Maximum number of tokens to generate."
+        default_factory=get_server_max_tokens,
+        description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
@@ -1968,7 +1976,7 @@ async def responses_endpoint(request: Request):
                             prompt=formatted_prompt,
                             image=images,
                             temperature=openai_request.temperature,
-                            max_tokens=openai_request.max_output_tokens,
+                            max_tokens=gen_args.max_tokens,
                             top_p=openai_request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
@@ -2443,7 +2451,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             image=images,
                             audio=audio,
                             temperature=request.temperature,
-                            max_tokens=request.max_tokens,
+                            max_tokens=gen_args.max_tokens,
                             top_p=request.top_p,
                             vision_cache=model_cache.get("vision_cache"),
                             logits_processors=gen_args.logits_processors,
@@ -2847,6 +2855,12 @@ def main():
         help="Tokens per prefill step (default: %(default)s).",
     )
     parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=get_server_max_tokens(),
+        help="Maximum number of tokens to generate.",
+    )
+    parser.add_argument(
         "--kv-bits",
         type=float,
         default=None,
@@ -2936,6 +2950,7 @@ def main():
             os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
