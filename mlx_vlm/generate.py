@@ -617,6 +617,14 @@ def _mtp_rounds(
             mx.clear_cache()
 
 
+def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
+    for cache_entry in prompt_cache:
+        left_padding = getattr(cache_entry, "left_padding", None)
+        if left_padding is not None:
+            return left_padding
+    return None
+
+
 def _mtp_rounds_batch(
     model: nn.Module,
     draft_model: nn.Module,
@@ -638,9 +646,8 @@ def _mtp_rounds_batch(
     index, continuous-batching filter on row finish. Differences vs DFlash
     batched: drafter consumes ``shared_kv_states`` (per-layer-type K/V
     snapshot) instead of multi-layer hidden capture, ``draft_block`` is
-    autoregressive, and the per-round ``shared_kv`` slicing mirrors
-    ``rollback_speculative_cache``'s tail-zero pattern so each row's KV
-    has the correct row-specific valid length.
+    autoregressive, and the per-round ``shared_kv`` snapshot is normalized
+    back to the unbatched prefix-valid layout before each drafter rebind.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -673,7 +680,10 @@ def _mtp_rounds_batch(
         L_prefill = int(offset0)
         positions = [L_prefill] * B
     draft_model.set_shared_kv(
-        shared_kv_states, kv_offset=L_prefill, position=mx.array(positions)
+        shared_kv_states,
+        kv_offset=L_prefill,
+        position=mx.array(positions),
+        left_padding=_batch_cache_left_padding(prompt_cache),
     )
 
     b = first_bonus.tolist()
@@ -768,9 +778,8 @@ def _mtp_rounds_batch(
                 lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
 
         # Slice + tail-zero ``verify_out.shared_kv_states`` to match the
-        # post-rollback target cache. After this, all rows share the same
-        # tensor length but rows that accepted less have zeros in the tail
-        # positions [L_prefill_round + accepted_i + 1, L_prefill_round + max_a + 1).
+        # post-rollback target cache. ``set_shared_kv()`` will normalize the
+        # resulting hybrid layout back into a prefix-valid drafter view.
         rejected_global = bs - (max_a + 1)
         next_shared_kv = {}
         for k, kv in verify_out.shared_kv_states.items():
@@ -836,6 +845,7 @@ def _mtp_rounds_batch(
             next_shared_kv,
             kv_offset=new_kv_offset,
             position=mx.array(positions_active),
+            left_padding=_batch_cache_left_padding(prompt_cache),
         )
 
         if sum(emitted) % 256 == 0:
