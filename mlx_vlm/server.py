@@ -503,6 +503,9 @@ class ResponseGenerator:
                         "tokens": [],
                         "prev_text": "",
                         "gen_kwargs": gen_kwargs if has_embeds else None,
+                        "prompt_tokens": prompt_tokens,
+                        "start_time": time.perf_counter(),
+                        "first_token_time": None,
                     }
 
                     if has_embeds:
@@ -568,6 +571,9 @@ class ResponseGenerator:
                 rqueues = {}
                 token_lists = {}
                 max_tokens_map = {}
+                prompt_tokens_map = {}
+                start_time_map = {}
+                first_token_time_map = {}
                 all_input_ids = []
 
                 for rqueue, raw_inputs, prompt_tokens, args, images in pending:
@@ -577,6 +583,9 @@ class ResponseGenerator:
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
                     max_tokens_map[uid] = args.max_tokens
+                    prompt_tokens_map[uid] = prompt_tokens
+                    start_time_map[uid] = time.perf_counter()
+                    first_token_time_map[uid] = None
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or _make_sampler(temp=0)
@@ -663,6 +672,27 @@ class ResponseGenerator:
                         is_max = len(tokens) >= max_tokens_map[uid]
                         finish = "stop" if is_stop else "length" if is_max else None
 
+                        # Track first token time for per-request TPS
+                        now = time.perf_counter()
+                        if first_token_time_map[uid] is None:
+                            first_token_time_map[uid] = now
+
+                        tps_kwargs = {}
+                        if finish:
+                            prompt_tps = 0.0
+                            generation_tps = 0.0
+                            start = start_time_map[uid]
+                            first = first_token_time_map[uid]
+                            num_gen_tokens = len(token_lists[uid])
+                            if first and first > start:
+                                prompt_tps = prompt_tokens_map[uid] / (first - start)
+                            if num_gen_tokens > 0 and now > first:
+                                generation_tps = num_gen_tokens / (now - first)
+                            tps_kwargs = {
+                                "prompt_tps": prompt_tps,
+                                "generation_tps": generation_tps,
+                            }
+
                         rqueues[uid].put(
                             StreamingToken(
                                 text="" if is_stop else text,
@@ -670,6 +700,7 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason=finish,
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                **tps_kwargs,
                             )
                         )
 
@@ -689,6 +720,16 @@ class ResponseGenerator:
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
+                        now = time.perf_counter()
+                        prompt_tps = 0.0
+                        generation_tps = 0.0
+                        start = start_time_map[uid]
+                        first = first_token_time_map[uid]
+                        num_gen_tokens = len(token_lists[uid])
+                        if first and first > start:
+                            prompt_tps = prompt_tokens_map[uid] / (first - start)
+                        if num_gen_tokens > 0 and now > first:
+                            generation_tps = num_gen_tokens / (now - first)
                         rqueues[uid].put(
                             StreamingToken(
                                 text="",
@@ -696,6 +737,8 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason="length",
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                prompt_tps=prompt_tps,
+                                generation_tps=generation_tps,
                             )
                         )
                         rqueues[uid].put(None)
@@ -732,12 +775,25 @@ class ResponseGenerator:
 
             lp = r.token_logprob
 
+            # Track first token time for per-request TPS
+            now = time.perf_counter()
+            if info["first_token_time"] is None:
+                info["first_token_time"] = now
+
             tps_kwargs = {}
             if r.finish_reason:
-                s = batch_gen.stats()
+                prompt_tps = 0.0
+                generation_tps = 0.0
+                start = info["start_time"]
+                first = info["first_token_time"]
+                num_gen_tokens = len(info["tokens"])
+                if first and first > start:
+                    prompt_tps = info["prompt_tokens"] / (first - start)
+                if num_gen_tokens > 0 and now > first:
+                    generation_tps = num_gen_tokens / (now - first)
                 tps_kwargs = {
-                    "prompt_tps": s.prompt_tps,
-                    "generation_tps": s.generation_tps,
+                    "prompt_tps": prompt_tps,
+                    "generation_tps": generation_tps,
                 }
 
             rqueue.put(
