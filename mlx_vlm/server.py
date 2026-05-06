@@ -703,25 +703,35 @@ class ResponseGenerator:
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
 
+                finished_uids = set()
+
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
-                    text = self._stream_text(stream_infos[uid], tok, None)
+                    is_stop = tok in self.stop_tokens
+                    is_max = len(token_lists[uid]) >= max_tokens_map[uid]
+                    finish = "stop" if is_stop else "length" if is_max else None
+                    text = self._stream_text(stream_infos[uid], tok, finish)
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
                             token=tok,
                             logprobs=0.0,
-                            finish_reason=None,
+                            finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9,
                         )
                     )
+                    if finish is not None:
+                        rqueues[uid].put(None)
+                        finished_uids.add(uid)
+
+                if len(finished_uids) == len(uids):
+                    continue
 
                 # --- Phase 3: speculative decode rounds ---
                 max_tok = max(max_tokens_map[u] for u in uids)
-                finished_uids = set()
 
                 def stop_check(seq_idx, token_id):
                     uid = uids[seq_idx]
