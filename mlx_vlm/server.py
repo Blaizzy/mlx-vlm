@@ -234,6 +234,8 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+    prompt_tps: float = 0.0
+    generation_tps: float = 0.0
 
 
 class ResponseGenerator:
@@ -595,6 +597,9 @@ class ResponseGenerator:
                         "tokens": [],
                         "prev_text": "",
                         "gen_kwargs": gen_kwargs if has_embeds else None,
+                        "prompt_tokens": prompt_tokens,
+                        "start_time": time.perf_counter(),
+                        "first_token_time": None,
                     }
 
                 if not active or batch_gen is None:
@@ -667,6 +672,9 @@ class ResponseGenerator:
                 rqueues = {}
                 token_lists = {}
                 max_tokens_map = {}
+                prompt_tokens_map = {}
+                start_time_map = {}
+                first_token_time_map = {}
                 all_input_ids = []
 
                 for rqueue, raw_inputs, prompt_tokens, args, images in pending:
@@ -676,6 +684,9 @@ class ResponseGenerator:
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
                     max_tokens_map[uid] = args.max_tokens
+                    prompt_tokens_map[uid] = prompt_tokens
+                    start_time_map[uid] = time.perf_counter()
+                    first_token_time_map[uid] = None
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or _make_sampler(temp=0)
@@ -777,6 +788,27 @@ class ResponseGenerator:
                         is_max = len(tokens) >= max_tokens_map[uid]
                         finish = "stop" if is_stop else "length" if is_max else None
 
+                        # Track first token time for per-request TPS
+                        now = time.perf_counter()
+                        if first_token_time_map[uid] is None:
+                            first_token_time_map[uid] = now
+
+                        tps_kwargs = {}
+                        if finish:
+                            prompt_tps = 0.0
+                            generation_tps = 0.0
+                            start = start_time_map[uid]
+                            first = first_token_time_map[uid]
+                            num_gen_tokens = len(token_lists[uid])
+                            if first and first > start:
+                                prompt_tps = prompt_tokens_map[uid] / (first - start)
+                            if num_gen_tokens > 0 and now > first:
+                                generation_tps = num_gen_tokens / (now - first)
+                            tps_kwargs = {
+                                "prompt_tps": prompt_tps,
+                                "generation_tps": generation_tps,
+                            }
+
                         rqueues[uid].put(
                             StreamingToken(
                                 text="" if is_stop else text,
@@ -784,6 +816,7 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason=finish,
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                **tps_kwargs,
                             )
                         )
 
@@ -804,6 +837,16 @@ class ResponseGenerator:
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
+                        now = time.perf_counter()
+                        prompt_tps = 0.0
+                        generation_tps = 0.0
+                        start = start_time_map[uid]
+                        first = first_token_time_map[uid]
+                        num_gen_tokens = len(token_lists[uid])
+                        if first and first > start:
+                            prompt_tps = prompt_tokens_map[uid] / (first - start)
+                        if num_gen_tokens > 0 and now > first:
+                            generation_tps = num_gen_tokens / (now - first)
                         rqueues[uid].put(
                             StreamingToken(
                                 text="",
@@ -811,6 +854,8 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason="length",
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                prompt_tps=prompt_tps,
+                                generation_tps=generation_tps,
                             )
                         )
                         rqueues[uid].put(None)
@@ -847,6 +892,27 @@ class ResponseGenerator:
 
             lp = r.token_logprob
 
+            # Track first token time for per-request TPS
+            now = time.perf_counter()
+            if info["first_token_time"] is None:
+                info["first_token_time"] = now
+
+            tps_kwargs = {}
+            if r.finish_reason:
+                prompt_tps = 0.0
+                generation_tps = 0.0
+                start = info["start_time"]
+                first = info["first_token_time"]
+                num_gen_tokens = len(info["tokens"])
+                if first and first > start:
+                    prompt_tps = info["prompt_tokens"] / (first - start)
+                if num_gen_tokens > 0 and now > first:
+                    generation_tps = num_gen_tokens / (now - first)
+                tps_kwargs = {
+                    "prompt_tps": prompt_tps,
+                    "generation_tps": generation_tps,
+                }
+
             rqueue.put(
                 StreamingToken(
                     text=text,
@@ -855,6 +921,7 @@ class ResponseGenerator:
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     top_logprobs=getattr(r, "top_logprobs", None),
+                    **tps_kwargs,
                 )
             )
 
@@ -1961,6 +2028,10 @@ async def responses_endpoint(request: Request):
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
+                                "total_tokens": ctx.prompt_tokens + output_tokens,
+                                "prompt_tps": token.prompt_tps,
+                                "generation_tps": token.generation_tps,
+                                "peak_memory": token.peak_memory,
                             }
 
                             yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
@@ -1994,6 +2065,10 @@ async def responses_endpoint(request: Request):
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
+                                "total_tokens": chunk.prompt_tokens
+                                + chunk.generation_tokens,
+                                "prompt_tps": chunk.prompt_tps,
+                                "generation_tps": chunk.generation_tps,
                             }
 
                             yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
@@ -2031,6 +2106,10 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": usage_stats["output_tokens"],
                                 "total_tokens": usage_stats["input_tokens"]
                                 + usage_stats["output_tokens"],
+                                "prompt_tps": usage_stats.get("prompt_tps", 0.0),
+                                "generation_tps": usage_stats.get(
+                                    "generation_tps", 0.0
+                                ),
                             },
                         }
                     )
@@ -2068,6 +2147,8 @@ async def responses_endpoint(request: Request):
                 full_text = ""
                 prompt_tokens = 0
                 output_tokens = 0
+                prompt_tps = 0.0
+                generation_tps = 0.0
 
                 if response_generator is not None:
 
@@ -2108,6 +2189,8 @@ async def responses_endpoint(request: Request):
                     full_text = result.text
                     prompt_tokens = result.prompt_tokens
                     output_tokens = result.generation_tokens
+                    prompt_tps = result.prompt_tps
+                    generation_tps = result.generation_tps
 
                 mx.clear_cache()
                 gc.collect()
@@ -2141,6 +2224,8 @@ async def responses_endpoint(request: Request):
                         "input_tokens": prompt_tokens,
                         "output_tokens": output_tokens,
                         "total_tokens": prompt_tokens + output_tokens,
+                        "prompt_tps": prompt_tps,
+                        "generation_tps": generation_tps,
                     },
                 )
 
@@ -2413,6 +2498,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         "completion_tokens": output_tokens,
                                         "total_tokens": ctx.prompt_tokens
                                         + output_tokens,
+                                        "prompt_tps": token.prompt_tps,
+                                        "generation_tps": token.generation_tps,
+                                        "peak_memory": token.peak_memory,
                                     },
                                     choices=choices,
                                 )
@@ -2484,6 +2572,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     "completion_tokens": chunk.generation_tokens,
                                     "total_tokens": chunk.prompt_tokens
                                     + chunk.generation_tokens,
+                                    "prompt_tps": chunk.prompt_tps,
+                                    "generation_tps": chunk.generation_tps,
                                 },
                                 choices=choices,
                             )
@@ -2496,7 +2586,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     elapsed = time.perf_counter() - request_start
                     logger.debug(
-                        "chat/completions stream done: tokens=%d " "total_time=%.2fs",
+                        "chat/completions stream done: tokens=%d total_time=%.2fs",
                         output_tokens,
                         elapsed,
                     )
@@ -2535,6 +2625,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 prompt_tokens = 0
                 output_tokens = 0
                 peak_memory = 0.0
+                prompt_tps = 0.0
+                generation_tps = 0.0
 
                 collected_logprobs: List[
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
@@ -2545,7 +2637,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     def _blocking_generate():
                         text = ""
                         pt = gt = 0
-                        pm = 0.0
+                        pm = p_tps = g_tps = 0.0
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
@@ -2562,16 +2654,23 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     (token.token, token.logprobs, token.top_logprobs)
                                 )
                             if token.finish_reason:
+                                p_tps = token.prompt_tps
+                                g_tps = token.generation_tps
                                 break
                         try:
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, pm
+                        return text, pt, gt, pm, p_tps, g_tps
 
-                    full_text, prompt_tokens, output_tokens, peak_memory = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    (
+                        full_text,
+                        prompt_tokens,
+                        output_tokens,
+                        peak_memory,
+                        prompt_tps,
+                        generation_tps,
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
@@ -2589,6 +2688,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     prompt_tokens = gen_result.prompt_tokens
                     output_tokens = gen_result.generation_tokens
                     peak_memory = gen_result.peak_memory
+                    prompt_tps = gen_result.prompt_tps
+                    generation_tps = gen_result.generation_tps
 
                 mx.clear_cache()
                 gc.collect()
@@ -2605,6 +2706,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
                     peak_memory=peak_memory,
+                    prompt_tps=prompt_tps,
+                    generation_tps=generation_tps,
                 )
 
                 # Parse tool calls from generated output
