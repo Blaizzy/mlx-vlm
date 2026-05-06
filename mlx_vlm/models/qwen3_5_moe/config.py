@@ -3,7 +3,10 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
-from ..qwen3_5.config import sanitize_quantization_config
+from ..qwen3_5.config import (
+    resolve_qwen_eos_token_id,
+    sanitize_quantization_config,
+)
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
 
 
@@ -96,11 +99,9 @@ class ModelConfig(BaseModelConfig):
             self.image_token_index = self.image_token_id
         if self.video_token_index is None:
             self.video_token_index = self.video_token_id
-        if self.eos_token_id is None:
-            if isinstance(self.text_config, dict):
-                self.eos_token_id = self.text_config.get("eos_token_id")
-            else:
-                self.eos_token_id = self.text_config.eos_token_id
+        self.eos_token_id = resolve_qwen_eos_token_id(
+            self.eos_token_id, self.text_config
+        )
         quantization = self.quantization
         self.quantization = sanitize_quantization_config(quantization)
         if self.quantization_config == quantization:

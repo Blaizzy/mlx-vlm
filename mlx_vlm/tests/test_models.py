@@ -1339,7 +1339,16 @@ class TestModels(unittest.TestCase):
                     vision_config=SimpleNamespace(),
                     model_type=model_module.__name__.rsplit(".", 1)[-1],
                 )
-                self.assertEqual(config.eos_token_id, 248044)
+                self.assertEqual(config.eos_token_id, [248044, 248046])
+
+                config_from_dict = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {"eos_token_id": 248044},
+                        "vision_config": {},
+                    }
+                )
+                self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
 
                 explicit = model_module.ModelConfig(
                     text_config=text_config,
