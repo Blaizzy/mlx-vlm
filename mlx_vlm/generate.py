@@ -3931,9 +3931,7 @@ def main():
     if args.draft_model is not None:
         from .speculative.drafters import load_drafter
 
-        print(
-            f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}"
-        )
+        print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
         draft_model, resolved_kind = load_drafter(
             args.draft_model, kind=args.draft_kind
         )

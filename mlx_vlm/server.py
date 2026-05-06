@@ -325,9 +325,7 @@ class ResponseGenerator:
                 f"Loading speculative drafter ({draft_kind or 'auto'}): "
                 f"{draft_model_path}"
             )
-            draft_model, resolved_kind = load_drafter(
-                draft_model_path, kind=draft_kind
-            )
+            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
             if draft_kind is None:
                 print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
             elif resolved_kind != draft_kind:
