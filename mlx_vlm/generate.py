@@ -3861,7 +3861,15 @@ def main():
         from .speculative.drafters import load_drafter
 
         print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
-        draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
+        draft_model, resolved_kind = load_drafter(
+            args.draft_model, kind=args.draft_kind
+        )
+        if resolved_kind != args.draft_kind:
+            print(
+                f"  → drafter requires --draft-kind={resolved_kind!r}; "
+                f"using {resolved_kind!r} instead of {args.draft_kind!r}."
+            )
+            args.draft_kind = resolved_kind
 
     prompt = args.prompt
 

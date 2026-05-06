@@ -322,7 +322,15 @@ class ResponseGenerator:
             from .speculative.drafters import load_drafter
 
             print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
-            draft_model = load_drafter(draft_model_path, kind=draft_kind)
+            draft_model, resolved_kind = load_drafter(
+                draft_model_path, kind=draft_kind
+            )
+            if resolved_kind != draft_kind:
+                print(
+                    f"  → drafter requires --draft-kind={resolved_kind!r}; "
+                    f"using {resolved_kind!r} instead of {draft_kind!r}."
+                )
+                draft_kind = resolved_kind
             print("Drafter ready — speculative decoding enabled.")
 
         self.model = model
