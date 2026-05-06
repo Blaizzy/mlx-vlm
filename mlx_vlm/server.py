@@ -316,21 +316,26 @@ class ResponseGenerator:
                 stop_tokens.add(config.eos_token_id)
 
         draft_model = None
-        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
+        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
             from .speculative.drafters import load_drafter
 
-            print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
+            print(
+                f"Loading speculative drafter ({draft_kind or 'auto'}): "
+                f"{draft_model_path}"
+            )
             draft_model, resolved_kind = load_drafter(
                 draft_model_path, kind=draft_kind
             )
-            if resolved_kind != draft_kind:
+            if draft_kind is None:
+                print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+            elif resolved_kind != draft_kind:
                 print(
                     f"  → drafter requires --draft-kind={resolved_kind!r}; "
                     f"using {resolved_kind!r} instead of {draft_kind!r}."
                 )
-                draft_kind = resolved_kind
+            draft_kind = resolved_kind
             print("Drafter ready — speculative decoding enabled.")
 
         self.model = model
@@ -2911,9 +2916,10 @@ def main():
     parser.add_argument(
         "--draft-kind",
         type=str,
-        default="dflash",
+        default=None,
         choices=["dflash", "mtp"],
-        help="Drafter family — 'dflash' (default) or 'mtp' (Gemma 4).",
+        help="Drafter family — 'dflash' or 'mtp' (Gemma 4). "
+        "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -2953,7 +2959,8 @@ def main():
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
-        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+        if args.draft_kind is not None:
+            os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
         if args.draft_block_size is not None:
             os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:

@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from mlx_vlm.speculative.drafters import (
+    DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
@@ -72,3 +73,20 @@ def test_kind_table_only_uses_known_kinds():
 def test_resolver_handles_no_model_type_field(tmp_path, model_type):
     path = _make_drafter_dir(tmp_path, model_type)
     assert resolve_drafter_kind(path, "dflash") == "dflash"
+
+
+def test_kind_none_autodetects_mtp_for_gemma4_assistant(tmp_path):
+    path = _make_drafter_dir(tmp_path, "gemma4_assistant")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path) == "mtp"  # default arg
+
+
+def test_kind_none_falls_back_to_default_for_unknown_model_type(tmp_path):
+    path = _make_drafter_dir(tmp_path, "qwen3_dflash")
+    assert resolve_drafter_kind(path, None) == DEFAULT_DRAFTER_KIND
+
+
+def test_kind_none_falls_back_to_default_for_missing_config(tmp_path):
+    d = tmp_path / "drafter"
+    d.mkdir()
+    assert resolve_drafter_kind(d, None) == DEFAULT_DRAFTER_KIND

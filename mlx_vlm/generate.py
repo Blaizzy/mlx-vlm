@@ -223,9 +223,11 @@ def parse_arguments():
     parser.add_argument(
         "--draft-kind",
         type=str,
-        default="dflash",
+        default=None,
+        choices=["dflash", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model).",
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -3860,16 +3862,20 @@ def main():
     if args.draft_model is not None:
         from .speculative.drafters import load_drafter
 
-        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
+        print(
+            f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}"
+        )
         draft_model, resolved_kind = load_drafter(
             args.draft_model, kind=args.draft_kind
         )
-        if resolved_kind != args.draft_kind:
+        if args.draft_kind is None:
+            print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+        elif resolved_kind != args.draft_kind:
             print(
                 f"  → drafter requires --draft-kind={resolved_kind!r}; "
                 f"using {resolved_kind!r} instead of {args.draft_kind!r}."
             )
-            args.draft_kind = resolved_kind
+        args.draft_kind = resolved_kind
 
     prompt = args.prompt
 
