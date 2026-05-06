@@ -380,7 +380,7 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
-def test_stream_decode_preserves_byte_fallback_emoji(self):
+    def test_stream_decode_preserves_byte_fallback_emoji(self):
         class ByteFallbackTokenizer:
             vocab = {
                 "<0xF0>": 0,
