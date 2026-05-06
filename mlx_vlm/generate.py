@@ -22,6 +22,7 @@ from transformers import PreTrainedTokenizer
 from . import apc as _apc
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .tokenizer_utils import make_streaming_detokenizer
 from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
@@ -1706,8 +1707,7 @@ def stream_generate(
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
     with wired_limit(model, [generation_stream]):
-        detokenizer = processor.detokenizer
-        detokenizer.reset()
+        detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
         exact_checkpoint = None
