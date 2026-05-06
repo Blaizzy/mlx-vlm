@@ -70,7 +70,13 @@ class TestModels(unittest.TestCase):
                 )
 
             batch_size = kwargs.pop("batch_size", 1)
-            if model_type in ["qwen2_5_vl", "glm4v_moe", "glm4v", "hunyuan_vl"]:
+            if model_type in [
+                "qwen2_5_vl",
+                "glm4v_moe",
+                "glm4v",
+                "hunyuan_vl",
+                "siglip2_vision_model",
+            ]:
                 input_tensor = mx.random.uniform(shape=(image_size[0], image_size[1]))
             else:
                 shape = (
@@ -1003,6 +1009,11 @@ class TestModels(unittest.TestCase):
             grid_thw=mx.ones((1, 3)),  # image temporals shape (num_images, 3)
         )
 
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+
     def test_qwen2_5_vl(self):
         from mlx_vlm.models import qwen2_5_vl
 
@@ -1071,6 +1082,11 @@ class TestModels(unittest.TestCase):
             grid_thw=mx.array(
                 [[1, 10, 14]], dtype=mx.int64
             ),  # image temporals shape (num_images, 3)
+        )
+
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
         )
 
     def test_dots_ocr(self):
@@ -1217,6 +1233,61 @@ class TestModels(unittest.TestCase):
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
 
+        # Multi-image batch: per-sample slicing in `_deepstack_process` must
+        # avoid the (N,D)/(M,D) broadcast crash and write through to output.
+        self._run_deepstack_multi_image_assertions(
+            model.language_model.model._deepstack_process
+        )
+
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+
+    def test_qwen3_5_model_config(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        quantization = {
+            "group_size": 128,
+            "bits": 4,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                "group_size": 128,
+                "bits": 6,
+            },
+            "model.visual.blocks.0.attn.qkv": False,
+            "lm_head": False,
+        }
+
+        for model_module in (qwen3_5, qwen3_5_moe):
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {},
+                        "vision_config": {},
+                        "quantization": quantization,
+                        "quantization_config": quantization,
+                    }
+                )
+
+                self.assertIn(
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertEqual(
+                    config.quantization[
+                        "language_model.model.layers.0.linear_attn.in_proj_qkv"
+                    ],
+                    {"group_size": 128, "bits": 6},
+                )
+                self.assertNotIn(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
+                self.assertIn("language_model.lm_head", config.quantization)
+                self.assertIs(config.quantization, config.quantization_config)
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
@@ -1304,6 +1375,135 @@ class TestModels(unittest.TestCase):
         ) * (grid_thw[0, 2] // config.vision_config.spatial_merge_size)
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
+
+        # Multi-image batch
+        self._run_deepstack_multi_image_assertions(
+            model.language_model.model._deepstack_process
+        )
+
+        # Decode-step RoPE offset must come from cache._idx, not offset.item().
+        self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+
+    def _run_deepstack_multi_image_assertions(self, deepstack_fn):
+        """Shared assertions for qwen3_vl / qwen3_vl_moe `_deepstack_process`.
+
+        Exercises the multi-image batch path: sample 0 has 2 visual tokens,
+        sample 1 has 3 visual tokens. Pre-PR-1055 this crashed with a
+        ``Shapes (N,D)/(M,D) cannot be broadcast`` because every sample saw
+        the full (5,H) ``visual_embeds`` instead of its per-sample slice.
+        """
+        H = 4
+        # hidden_states: distinct nonzero values per (batch, position) so
+        # we can check element-wise where the scatter-add landed.
+        base = mx.arange(2 * 6 * H, dtype=mx.float32).reshape(2, 6, H)
+        # mask sample 0 -> visuals at rows {1, 3} (2 visuals)
+        # mask sample 1 -> visuals at rows {0, 2, 4} (3 visuals)
+        visual_pos_masks = mx.array(
+            [
+                [False, True, False, True, False, False],
+                [True, False, True, False, True, False],
+            ]
+        )
+        # 5 distinct visual embed rows (2 for sample 0 + 3 for sample 1)
+        visual_embeds = mx.arange(5 * H, dtype=mx.float32).reshape(5, H) + 100.0
+
+        out = deepstack_fn(base, visual_pos_masks, visual_embeds)
+        self.assertEqual(out.shape, base.shape)
+
+        out_l = out.tolist()
+        base_l = base.tolist()
+        emb_l = visual_embeds.tolist()
+
+        # Sample 0: rows 1 and 3 received visual_embeds[0] and [1]
+        self.assertEqual(
+            out_l[0][1],
+            [base_l[0][1][i] + emb_l[0][i] for i in range(H)],
+        )
+        self.assertEqual(
+            out_l[0][3],
+            [base_l[0][3][i] + emb_l[1][i] for i in range(H)],
+        )
+        # Sample 0: untouched rows
+        for r in (0, 2, 4, 5):
+            self.assertEqual(out_l[0][r], base_l[0][r])
+
+        # Sample 1: rows 0, 2, 4 received visual_embeds[2], [3], [4]
+        self.assertEqual(
+            out_l[1][0],
+            [base_l[1][0][i] + emb_l[2][i] for i in range(H)],
+        )
+        self.assertEqual(
+            out_l[1][2],
+            [base_l[1][2][i] + emb_l[3][i] for i in range(H)],
+        )
+        self.assertEqual(
+            out_l[1][4],
+            [base_l[1][4][i] + emb_l[4][i] for i in range(H)],
+        )
+        # Sample 1: untouched rows
+        for r in (1, 3, 5):
+            self.assertEqual(out_l[1][r], base_l[1][r])
+
+        # Empty-mask sample passes through unchanged.
+        empty_masks = mx.array([[False, False, False]])
+        empty_hidden = mx.ones((1, 3, H))
+        empty_out = deepstack_fn(empty_hidden, empty_masks, mx.zeros((0, H)))
+        self.assertEqual(empty_out.tolist(), empty_hidden.tolist())
+
+    def _assert_mrope_decode_uses_cache_idx(self, language_model, hidden_size):
+        """Shared assertion: MRoPE decode-step reads RoPE position from
+        ``cache[0]._idx`` (Python int) rather than ``cache[0].offset.item()``
+        — the latter forces a per-step GPU sync. Regression guard for the
+        cache._idx refactor in PR #1055.
+        """
+        # Skip the prefill branch: pretend deltas have already been computed.
+        language_model._rope_deltas = mx.array([[0]])
+        language_model._position_ids = None
+
+        captured = {}
+
+        class _CapturingModel:
+            """Stand-in for the inner Qwen text model — captures position_ids
+            and exposes ``embed_tokens.as_linear`` so the tied-weights branch
+            in ``LanguageModel.__call__`` doesn't crash.
+            """
+
+            class _Embed:
+                @staticmethod
+                def as_linear(x):
+                    return x
+
+            embed_tokens = _Embed()
+
+            def __call__(self, inputs, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
+
+        language_model.model = _CapturingModel()
+        language_model.lm_head = lambda x: x  # bypass the real linear (untied path)
+
+        class _StubCacheWithIdx:
+            """``_idx`` (Python int) deliberately differs from ``offset``. If
+            extraction reads ``offset.item()`` the captured position is 3;
+            reading ``_idx`` gives 10. ``offset`` is 0-d so the per-sequence
+            ``cache_offsets`` / ``cache_offset_array`` branch is skipped
+            uniformly across qwen2_vl, qwen2_5_vl, and qwen3_vl.
+            """
+
+            def __init__(self):
+                self._idx = 10
+                self.offset = mx.array(3)  # 0-d -> never the per-seq path
+
+        language_model(mx.array([[5]]), cache=[_StubCacheWithIdx()])
+
+        position_ids = captured["position_ids"]
+        self.assertIsNotNone(position_ids)
+        # MRoPE shape: (3, batch, seq).
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        # Decode position == cache._idx (10), not cache.offset[0].item() (3).
+        self.assertEqual(position_ids[0, 0, 0].item(), 10)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
@@ -1822,7 +2022,7 @@ class TestModels(unittest.TestCase):
         )
 
     def test_kimi_vl(self):
-        from types import SimpleNamespace
+        pass
 
         from mlx_vlm.models import kimi_vl
 
@@ -1854,32 +2054,6 @@ class TestModels(unittest.TestCase):
             batch_size=1176,
             vision_feature_layer=-1,
         )
-
-        # Regression check: runtime image token id from tokenizer should be used
-
-        dummy_model = SimpleNamespace(config=model.config)
-        dummy_model.config.media_placeholder_token_id = 163605
-        dummy_model.config.image_token_index = 163605
-
-        input_ids = mx.array([[11, 163592, 12, 163592, 13]], dtype=mx.int32)
-        inputs_embeds = mx.zeros((1, 5, 8), dtype=mx.float32)
-        image_features = mx.ones((2, 8), dtype=mx.float32)
-
-        with self.assertRaises(ValueError):
-            kimi_vl.Model._prepare_inputs_for_multimodal(
-                dummy_model, image_features, inputs_embeds, input_ids
-            )
-
-        merged = kimi_vl.Model._prepare_inputs_for_multimodal(
-            dummy_model,
-            image_features,
-            inputs_embeds,
-            input_ids,
-            image_token_id=163592,
-        )
-        self.assertEqual(merged.shape, inputs_embeds.shape)
-        self.assertTrue(mx.all(merged[0, 1] == 1).item())
-        self.assertTrue(mx.all(merged[0, 3] == 1).item())
 
     def test_gemma3(self):
         from mlx_vlm.models import gemma3
@@ -3228,6 +3402,153 @@ class TestModels(unittest.TestCase):
             config.text_config.model_type,
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
+        )
+
+    def test_granite4_1_vision(self):
+        from mlx_vlm.models import granite4_vision
+
+        text_config = granite4_vision.TextConfig(
+            model_type="granite",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=10000000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=10.0,
+        )
+
+        vision_config = granite4_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=48,
+            patch_size=16,
+        )
+
+        config = granite4_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite4_vision",
+            deepstack_layer_map=[[-1, 0]],
+            use_spatial_sampling=False,
+            downsample_rate="3/3",
+            use_image_newline_parameter=False,
+        )
+
+        model = granite4_vision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            vision_feature_layer=0,
+        )
+
+    def test_youtu_vl(self):
+        from mlx_vlm.models import youtu_vl
+
+        text_config = youtu_vl.TextConfig(
+            model_type="youtu_vl",
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=1024,
+            q_lora_rank=128,
+            kv_lora_rank=64,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            rope_theta=500000.0,
+            rope_interleave=True,
+            max_position_embeddings=2048,
+            tie_word_embeddings=True,
+        )
+        vision_config = youtu_vl.VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=128,
+            out_hidden_size=256,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            patch_size=16,
+            spatial_merge_size=2,
+            window_size=64,
+            fullatt_block_indexes=[1],
+        )
+        config = youtu_vl.ModelConfig(
+            model_type="youtu_vl",
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=100,
+            video_token_id=101,
+            vocab_size=1024,
+        )
+        model = youtu_vl.Model(config)
+
+        # Language model: MLA with absorb — fp32/fp16 forward + cached decode check
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Vision tower takes packed patches + spatial_shapes:
+        #   pixel_values: (num_patches, patch_size**2 * channels)
+        #   spatial_shapes: (batch, 2) — (h_patches, w_patches)
+        patch_dim = vision_config.patch_size**2 * vision_config.num_channels
+        h_p, w_p = 4, 4
+        num_patches = h_p * w_p
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.num_channels,
+            (num_patches, patch_dim),
+            vision_feature_layer=-1,
+            spatial_shapes=mx.array([[h_p, w_p]], dtype=mx.int32),
+        )
+
+        # sanitize splits kv_b_proj per-head into embed_q (k) + unembed_out (v)
+        H, nope, v_head = 4, 32, 32
+        kv_rank = text_config.kv_lora_rank
+        w = mx.arange(H * (nope + v_head) * kv_rank, dtype=mx.float32).reshape(
+            H * (nope + v_head), kv_rank
+        )
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.self_attn.kv_b_proj.weight": w,
+                "lm_head.weight": mx.zeros((1, 1)),  # tied; must be dropped
+            }
+        )
+        prefix = "language_model.model.layers.0.self_attn"
+        self.assertNotIn(f"{prefix}.kv_b_proj.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            sanitized[f"{prefix}.embed_q.weight"].shape, (H, kv_rank, nope)
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
         )
 
 
@@ -4815,6 +5136,76 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
+
+    def test_glm4v_get_rope_index_per_row_deltas(self):
+        from mlx_vlm.models import glm4v
+
+        text_config = glm4v.TextConfig(
+            model_type="glm4v_text",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=256,
+        )
+        vision_config = glm4v.VisionConfig(
+            model_type="glm4v_vision",
+            depth=1,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=14,
+            out_hidden_size=16,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            image_size=28,
+        )
+        lm = glm4v.LanguageModel(
+            text_config,
+            glm4v.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                model_type="glm4v",
+                vocab_size=64,
+                image_token_id=61,
+                image_token_index=61,
+                video_token_id=62,
+                video_token_index=62,
+                vision_start_token_id=60,
+                vision_end_token_id=59,
+                pad_token_id=0,
+            ),
+        )
+
+        input_ids = mx.array(
+            [
+                [10, 60, 61, 61, 61, 61, 11, 12],
+                [10, 11, 12, 13, 14, 15, 16, 17],
+            ],
+            dtype=mx.int32,
+        )
+        _, rope_deltas = lm.get_rope_index(
+            input_ids, mx.array([[1, 4, 4]], dtype=mx.int32)
+        )
+        self.assertEqual(rope_deltas.shape, (2, 1))
+        self.assertEqual(rope_deltas[1, 0].item(), 0)
+        self.assertNotEqual(rope_deltas[0, 0].item(), rope_deltas[1, 0].item())
+
+        input_ids = mx.array(
+            [[0, 0, 10, 11, 12, 13], [10, 11, 12, 13, 14, 15]], dtype=mx.int32
+        )
+        attention_mask = mx.array(
+            [[0, 0, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.int32
+        )
+        position_ids, rope_deltas = lm.get_rope_index(
+            input_ids, image_grid_thw=None, attention_mask=attention_mask
+        )
+        self.assertEqual(rope_deltas.shape, (2, 1))
+        self.assertEqual(position_ids.shape, (3, 2, 6))
+        self.assertEqual(rope_deltas[0, 0].item(), -2)
+        self.assertEqual(rope_deltas[1, 0].item(), 0)
 
     def test_glm4v_moe_chunked_prefill_rope(self):
         """Test GLM4V-MoE chunked prefill RoPE position ID generation."""

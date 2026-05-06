@@ -25,11 +25,20 @@ class Tau(nn.Module):
 
         dtype = qkv_cat.dtype
         log_pos = mx.log(positions + 1.0)
-        alpha_log_pos = self.alpha[:, None] * log_pos[None, :]
-        tau_pos = (1.0 + (mx.sigmoid(alpha_log_pos) - 0.5)).astype(dtype)
+        if log_pos.ndim == 1:
+            # Shared positions across the batch.
+            alpha_log_pos = self.alpha[:, None] * log_pos[None, :]
+            tau_pos = (1.0 + (mx.sigmoid(alpha_log_pos) - 0.5)).astype(dtype)
+            tau_pos = tau_pos[None, :, :]
+        else:
+            # Per-sequence positions: log_pos shape (B, L).
+            alpha_log_pos = (
+                self.alpha[None, :, None] * log_pos[:, None, :]
+            )  # (B, n_heads, L)
+            tau_pos = (1.0 + (mx.sigmoid(alpha_log_pos) - 0.5)).astype(dtype)
 
-        tau_q = tok_q.transpose(0, 2, 1) + tau_pos[None, :, :]
-        tau_v = tok_v.transpose(0, 2, 1) + tau_pos[None, :, :]
+        tau_q = tok_q.transpose(0, 2, 1) + tau_pos
+        tau_v = tok_v.transpose(0, 2, 1) + tau_pos
 
         return tau_q[..., None], tau_v[..., None]
 
@@ -66,8 +75,32 @@ class Attention(nn.Module):
 
         qkv_out = self.qkv(x)
 
-        offset = cache.offset if cache is not None else 0
-        positions = mx.arange(offset, offset + L)
+        # Prefer cache._idx (Python int) to avoid a per-step GPU sync.
+        raw_offset = cache.offset if cache is not None else 0
+        if cache is not None and hasattr(cache, "_idx"):
+            offset = int(cache._idx)
+            offsets_per_seq = (
+                raw_offset
+                if isinstance(raw_offset, mx.array) and raw_offset.size > 1
+                else None
+            )
+        elif isinstance(raw_offset, mx.array):
+            if raw_offset.size > 1:
+                # Per-sequence offsets from BatchKVCache -- shape (B,).
+                offsets_per_seq = raw_offset
+                offset = int(raw_offset.max().item())
+            else:
+                offsets_per_seq = None
+                offset = int(raw_offset.item())
+        else:
+            offsets_per_seq = None
+            offset = int(raw_offset)
+
+        if offsets_per_seq is not None:
+            # Build per-sequence positions: (B, L) = offsets[:, None] + arange(L)
+            positions = offsets_per_seq[:, None] + mx.arange(L)
+        else:
+            positions = mx.arange(offset, offset + L)
         tau_q, tau_v = self.tau(qkv_out, positions)
 
         q_dim = self.n_heads * self.head_dim
@@ -86,8 +119,26 @@ class Attention(nn.Module):
         values = values * tau_v
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            if offsets_per_seq is not None and B > 1:
+                # Per-row RoPE offsets for a batched cache. mx.fast.rope only
+                # accepts scalar offsets, so apply it one row at a time and
+                # stitch back.
+                seq_offsets = offsets_per_seq.tolist()
+                queries = mx.concatenate(
+                    [
+                        self.rope(queries[i : i + 1], offset=int(seq_offsets[i]))
+                        for i in range(B)
+                    ]
+                )
+                keys = mx.concatenate(
+                    [
+                        self.rope(keys[i : i + 1], offset=int(seq_offsets[i]))
+                        for i in range(B)
+                    ]
+                )
+            else:
+                queries = self.rope(queries, offset=offset)
+                keys = self.rope(keys, offset=offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)

@@ -105,18 +105,37 @@ def get_peft_model(
 
 
 def freeze_model(model):
+    top_level_to_freeze = {
+        "language_model",
+        "vision_model",
+        "vision_tower",
+        "aligner",
+        "connector",
+        "multi_modal_projector",
+        "mm_projector",
+        "audio_tower",
+        "embed_audio",
+        "embed_vision",
+    }
     for name, module in model.named_modules():
         name = name.split(".")[0]
-        if name in [
-            "language_model",
-            "vision_model",
-            "vision_tower",
-            "aligner",
-            "connector",
-            "multi_modal_projector",
-            "mm_projector",
-        ]:
-            model[f"{name}"].freeze()
+        if name in top_level_to_freeze and hasattr(model, name):
+            try:
+                model[f"{name}"].freeze()
+            except Exception:
+                # Fallback for towers whose .freeze() errors on non-Module
+                # sub-objects (e.g. Gemma 4 audio_tower).
+                try:
+                    from mlx.utils import tree_flatten
+
+                    top = model[f"{name}"]
+                    leaves = tree_flatten(
+                        top.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+                    )
+                    for _, m in leaves:
+                        m.freeze(recurse=False)
+                except Exception:
+                    pass
 
 
 def find_all_linear_names(model):

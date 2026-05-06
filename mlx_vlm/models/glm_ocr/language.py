@@ -298,7 +298,9 @@ class GlmOcrTextModel(nn.Module):
         position_embeddings = self.rotary_emb(h, position_ids)
 
         if mask is None:
-            mask = create_attention_mask(h, cache)
+            mask = create_attention_mask(
+                h, cache[0] if cache and cache[0] is not None else cache
+            )
 
         if cache is None:
             cache = [None] * self.num_layers
@@ -464,7 +466,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -472,11 +474,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -502,18 +503,23 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
 
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
+        cache_offsets = None
         if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[0]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = c0.offset
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -522,11 +528,12 @@ class LanguageModel(nn.Module):
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
-            if (
-                (cache is not None and cache[0] is not None and (cache_offset == 0))
-                or self._rope_deltas is None
-                or cache is None
-            ):
+            is_prefill = (
+                cache is None
+                or cache[0] is None
+                or (cache_offsets is None and cache_offset == 0)
+            )
+            if is_prefill or self._rope_deltas is None:
                 # Use cached position_ids if available (pre-computed in get_input_embeddings)
                 if self._position_ids is not None:
                     seq_length = inputs.shape[1]
@@ -542,21 +549,28 @@ class LanguageModel(nn.Module):
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
                 )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
-                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-
-                if cache_offset is not None:
+                if cache_offsets is not None:
+                    offsets = cache_offsets[:batch_size]
+                    rope_deltas = rope_deltas_src
+                    if rope_deltas.shape[0] > batch_size:
+                        rope_deltas = rope_deltas[:batch_size]
+                    delta = (offsets + rope_deltas.squeeze(-1))[:, None]
+                else:
+                    delta = mx.array(
+                        cache_offset + rope_deltas_src if cache is not None else 0
+                    )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
-
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
                         delta = delta[:batch_size]
 
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)

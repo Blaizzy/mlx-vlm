@@ -180,8 +180,11 @@ class Phi4SigLipProcessor:
 
         from transformers import AutoTokenizer
 
+        tokenizer_kwargs = {k: v for k, v in kwargs.items() if k != "trust_remote_code"}
         tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path, **kwargs
+            pretrained_model_name_or_path,
+            trust_remote_code=False,
+            **tokenizer_kwargs,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
