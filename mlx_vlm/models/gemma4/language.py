@@ -629,9 +629,10 @@ class LanguageModel(nn.Module):
         valid_ends = accepted + 1
 
         for c in caches:
-            if c is None or not c.is_trimmable():
+            if c is None:
                 continue
-            if trim > 0:
+
+            if trim > 0 and hasattr(c, "trim"):
                 c.trim(trim)
             if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
                 kv_len = c._idx
