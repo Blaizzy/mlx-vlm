@@ -123,6 +123,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
+    gen.processor = SimpleNamespace()
     gen.draft_model = SimpleNamespace(
         config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
     )
@@ -146,6 +147,23 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
     monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
+
+    class _FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def reset(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    monkeypatch.setattr(
+        server, "make_streaming_detokenizer", lambda processor: _FakeDetokenizer()
+    )
 
     def fake_rounds(*args, **kwargs):
         del args
