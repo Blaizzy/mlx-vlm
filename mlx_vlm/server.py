@@ -47,7 +47,7 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
-from .prompt_utils import apply_chat_template
+from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
 from .tokenizer_utils import make_streaming_detokenizer
@@ -2294,19 +2294,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if isinstance(message.content, str):
                 msg["content"] = message.content
             elif isinstance(message.content, list):
-                text_content = ""
-                for item in message.content:
-                    if isinstance(item, dict):
-                        if message.role == "user":
-                            if item["type"] == "input_image":
-                                images.append(item["image_url"])
-                            elif item["type"] == "image_url":
-                                images.append(item["image_url"]["url"])
-                            elif item["type"] == "input_audio":
-                                audio.append(item["input_audio"]["data"])
-                        if item["type"] in ("text", "input_text"):
-                            text_content = item.get("text", "")
-                msg["content"] = text_content
+                if message.role == "user":
+                    for item in message.content:
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = item.get("type")
+                        if item_type == "input_image":
+                            images.append(item["image_url"])
+                        elif item_type == "image_url":
+                            images.append(item["image_url"]["url"])
+                        elif item_type == "input_audio":
+                            audio.append(item["input_audio"]["data"])
+                msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
 

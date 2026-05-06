@@ -349,6 +349,54 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
 
 
+def test_chat_completions_endpoint_flattens_text_content_parts(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "First text block."},
+                            {"type": "text", "text": "Second text block."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "user",
+            "content": "First text block. Second text block.",
+        }
+    ]
+
+
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     monkeypatch.setattr(server, "apc_manager", None)
 
