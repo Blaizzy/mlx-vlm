@@ -2010,6 +2010,8 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "pos_hw",
 }
 
+APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+
 
 def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
     if v.shape[0] == batch_size:
@@ -2060,6 +2062,56 @@ def _pad_sequence_aligned_prompt_kwarg(
     pad_v = mx.zeros(pad_shape, dtype=v.dtype)
     parts = [pad_v, v] if left else [v, pad_v]
     return mx.concatenate(parts, axis=1)
+
+
+def _merge_prefill_prompt_kwargs(
+    prompt_kwargs_list: List[Optional[dict]],
+    input_ids: List[List[int]],
+) -> Tuple[mx.array, dict]:
+    """Batch per-row prompt kwargs for a left-padded prefill forward."""
+    lengths = [len(ids) for ids in input_ids]
+    max_length = max(lengths)
+
+    row_embeds: List[mx.array] = []
+    embed_dtype = None
+    embed_dim = None
+    for kw, length in zip(prompt_kwargs_list, lengths):
+        if not kw or kw.get("inputs_embeds") is None:
+            raise ValueError("inputs_embeds is required")
+        embeds = kw["inputs_embeds"]  # [1, length, D]
+        embed_dtype = embeds.dtype
+        embed_dim = embeds.shape[-1]
+        if length < max_length:
+            pad = mx.zeros(
+                (embeds.shape[0], max_length - length, embed_dim),
+                dtype=embed_dtype,
+            )
+            embeds = mx.concatenate([pad, embeds], axis=1)
+        row_embeds.append(embeds)
+    inputs_embeds = mx.concatenate(row_embeds, axis=0)
+
+    merged_kwargs: dict = {}
+    per_row_keys: dict = {}
+    batch_size = len(prompt_kwargs_list)
+    for i, (kw, length) in enumerate(zip(prompt_kwargs_list, lengths)):
+        if not kw:
+            continue
+        for k, v in kw.items():
+            if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
+                continue
+            if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                row_v = _prompt_kwarg_row(v, i, batch_size)
+                if _is_sequence_aligned_prompt_kwarg(k, row_v, length):
+                    row_v = _pad_sequence_aligned_prompt_kwarg(
+                        row_v, max_length, left=True
+                    )
+                per_row_keys.setdefault(k, []).append(row_v)
+            elif k not in merged_kwargs:
+                merged_kwargs[k] = v
+    for k, vs in per_row_keys.items():
+        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+
+    return inputs_embeds, merged_kwargs
 
 
 def _extend_cache(cache_a, cache_b):
@@ -3028,7 +3080,7 @@ class BatchGenerator:
     # ---------------- APC integration helpers ----------------
     # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
     # the merged kwargs are passed to the language model forward.
-    _APC_PRIVATE_KEYS = ("_apc_tenant", "_apc_image_hash")
+    _APC_PRIVATE_KEYS = APC_PRIVATE_PROMPT_KEYS
 
     def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
         """Salt for the APC hash chain."""
@@ -3513,48 +3565,9 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
 
-            # Concatenate per-row inputs_embeds (left-padded to max length so
-            # all rows end at the same cache index). Other tensor kwargs get
-            # concatenated along the batch dim too; scalars take row 0.
-            lengths = [len(ids) for ids in input_ids]
-            max_length = max(lengths)
-            row_embeds: List[mx.array] = []
-            embed_dtype = None
-            embed_dim = None
-            for kw, l in zip(prompt_kwargs_list, lengths):
-                if not kw or kw.get("inputs_embeds") is None:
-                    raise ValueError("inputs_embeds is required")
-                e = kw["inputs_embeds"]  # [1, l, D]
-                embed_dtype = e.dtype
-                embed_dim = e.shape[-1]
-                if l < max_length:
-                    pad = mx.zeros(
-                        (e.shape[0], max_length - l, embed_dim), dtype=embed_dtype
-                    )
-                    e = mx.concatenate([pad, e], axis=1)  # left-pad
-                row_embeds.append(e)
-            inputs_embeds = mx.concatenate(row_embeds, axis=0)
-
-            merged_kwargs: dict = {}
-            per_row_keys: dict = {}
-            batch_size = len(prompt_kwargs_list)
-            for i, (kw, l) in enumerate(zip(prompt_kwargs_list, lengths)):
-                if not kw:
-                    continue
-                for k, v in kw.items():
-                    if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
-                        continue
-                    if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                        row_v = _prompt_kwarg_row(v, i, batch_size)
-                        if _is_sequence_aligned_prompt_kwarg(k, row_v, l):
-                            row_v = _pad_sequence_aligned_prompt_kwarg(
-                                row_v, max_length, left=True
-                            )
-                        per_row_keys.setdefault(k, []).append(row_v)
-                    elif k not in merged_kwargs:
-                        merged_kwargs[k] = v
-            for k, vs in per_row_keys.items():
-                merged_kwargs[k] = mx.concatenate(vs, axis=0)
+            inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
+                prompt_kwargs_list, input_ids
+            )
 
             # APC: also harvest cold-prefill prefixes so future requests hit.
             apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)

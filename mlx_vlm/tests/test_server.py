@@ -90,6 +90,152 @@ def test_speculative_server_reads_draft_block_size_env(monkeypatch):
     assert server._get_draft_block_size_from_env() == 3
 
 
+class _RecordingSpeculativeLM:
+    def __init__(self, draft_kind):
+        self.calls = []
+        self.draft_kind = draft_kind
+        self._position_ids = "stale"
+        self._rope_deltas = "stale"
+
+    def __call__(self, inputs, cache=None, **kwargs):
+        self.calls.append({"inputs": inputs, "cache": cache, **kwargs})
+        batch_size, seq_len = inputs.shape
+        logits = mx.broadcast_to(
+            mx.array([[[0.0, 1.0, 0.0, 0.0, 0.0]]], dtype=mx.float32),
+            (batch_size, seq_len, 5),
+        )
+        hidden = mx.ones((batch_size, seq_len, 2), dtype=mx.float32)
+        if self.draft_kind == "mtp":
+            return SimpleNamespace(
+                logits=logits,
+                hidden_states=[hidden],
+                shared_kv_states={"full_attention": ("k", "v")},
+            )
+        return SimpleNamespace(
+            logits=logits,
+            hidden_states=[hidden, hidden],
+            shared_kv_states=None,
+        )
+
+
+def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+    lm = _RecordingSpeculativeLM(draft_kind)
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model = SimpleNamespace(language_model=lm)
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = draft_kind
+    gen.stop_tokens = {99}
+    gen.requests = Queue()
+    gen._stop = False
+    gen._make_sampler = lambda args: None
+    gen.tokenizer = SimpleNamespace(
+        decode=lambda tokens: "".join(str(tok) for tok in tokens)
+    )
+
+    specs_iter = iter(request_specs)
+
+    def fake_gpu_embed(raw_inputs, images=None):
+        del raw_inputs, images
+        spec = next(specs_iter)
+        return spec["input_ids"], spec["gen_kwargs"]
+
+    gen._gpu_embed = fake_gpu_embed
+
+    monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
+    monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
+
+    def fake_rounds(*args, **kwargs):
+        del args
+        gen._stop = True
+        yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
+
+    monkeypatch.setattr(
+        server, "_get_speculative_rounds_batch", lambda kind: fake_rounds
+    )
+
+    args = server.GenerationArguments(max_tokens=2, temperature=0)
+    for spec in request_specs:
+        gen.requests.put(
+            (
+                Queue(),
+                {"input_ids": spec["input_ids"]},
+                int(spec["input_ids"].shape[1]),
+                args,
+                None,
+            )
+        )
+
+    gen._run_speculative()
+    return lm.calls[0]
+
+
+def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                    "per_layer_inputs": mx.array(
+                        [[[1.0, 1.5], [2.0, 2.5], [3.0, 3.5]]], dtype=mx.float32
+                    ),
+                },
+            },
+            {
+                "input_ids": mx.array([[21, 22]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 7.0, dtype=mx.float32),
+                    "per_layer_inputs": mx.array(
+                        [[[4.0, 4.5], [5.0, 5.5]]], dtype=mx.float32
+                    ),
+                },
+            },
+        ],
+    )
+
+    assert call["return_hidden"] is True
+    assert call["return_shared_kv"] is True
+    assert call["per_layer_inputs"].shape == (2, 3, 2)
+    assert call["per_layer_inputs"].tolist()[1][0] == [0.0, 0.0]
+    assert call["inputs_embeds"].shape == (2, 3, 4)
+
+
+def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="dflash",
+        request_specs=[
+            {
+                "input_ids": mx.array([[31, 32, 33]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                    "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
+                    "_apc_image_hash": 123,
+                    "_apc_tenant": "tenant-a",
+                },
+            },
+            {
+                "input_ids": mx.array([[41, 42]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 9.0, dtype=mx.float32),
+                    "image_grid_thw": mx.array([[4, 5, 6]], dtype=mx.int32),
+                },
+            },
+        ],
+    )
+
+    assert call["capture_layer_ids"] == [1, 2]
+    assert call["image_grid_thw"].tolist() == [[1, 2, 3], [4, 5, 6]]
+    assert call["inputs_embeds"].shape == (2, 3, 4)
+    assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
+    assert "_apc_image_hash" not in call
+    assert "_apc_tenant" not in call
+
+
 def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()

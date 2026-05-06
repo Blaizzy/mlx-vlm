@@ -41,6 +41,7 @@ from .generate import (
     BatchGenerator,
     _dflash_rounds_batch,
     _make_cache,
+    _merge_prefill_prompt_kwargs,
     _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
@@ -679,8 +680,12 @@ class ResponseGenerator:
                 token_lists = {}
                 max_tokens_map = {}
                 all_input_ids = []
-                all_embeds = []  # per-request inputs_embeds (with image features merged)
-                all_per_layer = []  # per-request per_layer_inputs (or None)
+                prompt_kwargs_list = []
+
+                if hasattr(lm, "_position_ids"):
+                    lm._position_ids = None
+                if hasattr(lm, "_rope_deltas"):
+                    lm._rope_deltas = None
 
                 for rqueue, raw_inputs, prompt_tokens, args, images in pending:
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
@@ -690,8 +695,7 @@ class ResponseGenerator:
                     token_lists[uid] = []
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
-                    all_embeds.append(gen_kwargs.get("inputs_embeds"))
-                    all_per_layer.append(gen_kwargs.get("per_layer_inputs"))
+                    prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or _make_sampler(temp=0)
 
@@ -703,56 +707,14 @@ class ResponseGenerator:
                 ]
                 input_mx = mx.array(padded, dtype=mx.int32)
 
-                # Build inputs_embeds (and per_layer_inputs) batches by left-
-                # padding each request's pre-computed embeddings. We must use
-                # the merged inputs_embeds rather than re-embedding input_mx,
-                # otherwise vision/audio features encoded into the embeddings
-                # by ``get_input_embeddings`` are lost on the speculative path.
-                inputs_embeds_mx = None
-                per_layer_inputs_mx = None
-                if any(e is not None for e in all_embeds):
-                    embed_dim = next(e for e in all_embeds if e is not None).shape[-1]
-                    embed_dtype = next(e for e in all_embeds if e is not None).dtype
-                    rows = []
-                    for i, e in enumerate(all_embeds):
-                        T_i = len(all_input_ids[i])
-                        if e is None:
-                            row = mx.zeros((1, T_i, embed_dim), dtype=embed_dtype)
-                        else:
-                            row = e[:, -T_i:, :] if e.shape[1] > T_i else e
-                        pad_len = max_len - T_i
-                        if pad_len > 0:
-                            pad = mx.zeros((1, pad_len, embed_dim), dtype=embed_dtype)
-                            row = mx.concatenate([pad, row], axis=1)
-                        rows.append(row)
-                    inputs_embeds_mx = mx.concatenate(rows, axis=0)
-
-                if any(p is not None for p in all_per_layer):
-                    pli_dim = next(p for p in all_per_layer if p is not None).shape[-1]
-                    pli_dtype = next(p for p in all_per_layer if p is not None).dtype
-                    rows = []
-                    for i, p in enumerate(all_per_layer):
-                        T_i = len(all_input_ids[i])
-                        if p is None:
-                            row = mx.zeros((1, T_i, pli_dim), dtype=pli_dtype)
-                        else:
-                            row = p[:, -T_i:, :] if p.shape[1] > T_i else p
-                        pad_len = max_len - T_i
-                        if pad_len > 0:
-                            pad = mx.zeros((1, pad_len, pli_dim), dtype=pli_dtype)
-                            row = mx.concatenate([pad, row], axis=1)
-                        rows.append(row)
-                    per_layer_inputs_mx = mx.concatenate(rows, axis=0)
+                inputs_embeds_mx, prompt_kwargs = _merge_prefill_prompt_kwargs(
+                    prompt_kwargs_list, all_input_ids
+                )
 
                 prompt_cache = _make_cache(lm, left_padding)
-                lm._position_ids = None
-                lm._rope_deltas = None
 
-                lm_call_kwargs = dict(prefill_kwargs)
-                if inputs_embeds_mx is not None:
-                    lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
-                if per_layer_inputs_mx is not None:
-                    lm_call_kwargs["per_layer_inputs"] = per_layer_inputs_mx
+                lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
+                lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
 
                 with mx.stream(generation_stream):
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
