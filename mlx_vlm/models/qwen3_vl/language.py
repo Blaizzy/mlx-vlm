@@ -157,14 +157,23 @@ class Attention(nn.Module):
         )
 
         kv_seq_len = keys.shape[-2]
+        # Use cache._idx (the Python-int cursor) when available so the mask
+        # slice matches the cache size after update_and_fetch. cache.offset is
+        # per-row in batched mode, where max(offset) < _idx if any row carries
+        # left padding — slicing on it then under-sizes the mask.
+        if cache is not None:
+            cache_size = cache._idx if hasattr(cache, "_idx") else cache.offset
+        else:
+            cache_size = 0
 
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
+            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            offset_for_pos = cache.offset if cache is not None else 0
+            position_ids = mx.arange(offset_for_pos, offset_for_pos + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
         else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            kv_seq_len += cache_size
 
         cos, sin = self.rotary_emb(values, position_ids)
 
@@ -473,7 +482,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -481,11 +490,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)

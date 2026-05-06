@@ -31,6 +31,16 @@ def _infer_tool_parser(chat_template):
     return None
 
 
+def _infer_tool_parser_from_processor(processor):
+    """Infer tool parser type from processor's chat template."""
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    if hasattr(tokenizer, "chat_template") and tokenizer.chat_template:
+        return _infer_tool_parser(tokenizer.chat_template)
+
+    return None
+
+
 def load_tool_module(tool_parser_type):
     """Load a tool parser module from mlx_vlm.tool_parsers or mlx_lm.tool_parsers."""
     if importlib.util.find_spec(f"mlx_vlm.tool_parsers.{tool_parser_type}"):

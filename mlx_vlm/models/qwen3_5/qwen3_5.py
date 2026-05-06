@@ -12,6 +12,17 @@ from .language import LanguageModel
 from .vision import VisionModel
 
 
+def sanitize_key(key):
+    if "model" in key:
+        if "model.language_model" in key:
+            key = key.replace("model.language_model", "language_model.model")
+        elif "model.visual" in key:
+            key = key.replace("model.visual", "vision_tower")
+    elif "lm_head" in key:
+        key = key.replace("lm_head", "language_model.lm_head")
+    return key
+
+
 class Model(Qwen3VLModel):
 
     def __init__(self, config: ModelConfig):
@@ -122,13 +133,7 @@ class Model(Qwen3VLModel):
 
         sanitized_weights = {}
         for key, value in weights.items():
-            if "model" in key:
-                if "model.language_model" in key:
-                    key = key.replace("model.language_model", "language_model.model")
-                elif "model.visual" in key:
-                    key = key.replace("model.visual", "vision_tower")
-            elif "lm_head" in key:
-                key = key.replace("lm_head", "language_model.lm_head")
+            key = sanitize_key(key)
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)

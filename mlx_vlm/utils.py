@@ -240,6 +240,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
+    has_quantization = "quantization" in config
+
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "projector", "audio"]
@@ -272,7 +274,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if "quantization" not in config:
+    if not has_quantization:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
@@ -296,6 +298,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization is not None:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
+
+    if has_quantization:
+        for quantization_key in ("quantization", "quantization_config"):
+            quantization_value = getattr(model_config, quantization_key, None)
+            if quantization_value is not None:
+                config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
