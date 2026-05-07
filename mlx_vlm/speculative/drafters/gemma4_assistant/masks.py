@@ -129,14 +129,19 @@ def make_drafter_masks(
     masks = {}
     for layer_type, kv in shared_kv_states.items():
         kv_len = _kv_len(kv)
-        kv_valid_len = query_offset
+        local_valid_len = _local_window_offset(query_offset, kv_len)
         if layer_type == "sliding_attention":
             masks[layer_type] = bidirectional_swa_mask(
-                query_len, query_offset, kv_len, sliding_window, kv_valid_len, dtype
+                query_len,
+                local_valid_len,
+                kv_len,
+                sliding_window,
+                local_valid_len,
+                dtype,
             )
         else:
             masks[layer_type] = bidirectional_full_mask(
-                query_len, kv_len, kv_valid_len, dtype
+                query_len, kv_len, local_valid_len, dtype
             )
     return masks
 
@@ -144,6 +149,16 @@ def make_drafter_masks(
 def _kv_len(kv: Tuple[mx.array, mx.array]) -> int:
     K, _ = kv
     return int(K.shape[-2])
+
+
+def _local_window_offset(
+    query_offset: Union[int, mx.array],
+    kv_len: int,
+) -> Union[int, mx.array]:
+    """Map absolute decode positions onto the local rotating-cache window."""
+    if isinstance(query_offset, int):
+        return min(query_offset, kv_len)
+    return mx.minimum(query_offset, kv_len)
 
 
 def _normalize_shared_kv_tensor(
