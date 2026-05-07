@@ -6073,11 +6073,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         self.key_codec = None
         self.value_codec = None
         self.left_padding = mx.array(left_padding)
-        # Scalar fast-path for offset when uniform across the batch.
-        if left_padding and all(lp == left_padding[0] for lp in left_padding):
-            self.offset = -int(left_padding[0])
-        else:
-            self.offset = mx.array([-lp for lp in left_padding])
+        self.offset = mx.array([-lp for lp in left_padding])
         self._idx = 0
 
     # ------------------------------------------------------------------

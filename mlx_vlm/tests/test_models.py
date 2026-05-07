@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1243,6 +1244,119 @@ class TestModels(unittest.TestCase):
         self._assert_mrope_decode_uses_cache_idx(
             model.language_model, config.text_config.hidden_size
         )
+
+    def test_qwen3_5_model_config(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        quantization = {
+            "group_size": 128,
+            "bits": 4,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                "group_size": 128,
+                "bits": 6,
+            },
+            "model.visual.blocks.0.attn.qkv": False,
+            "lm_head": False,
+        }
+
+        for model_module in (qwen3_5, qwen3_5_moe):
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {},
+                        "vision_config": {},
+                        "quantization": quantization,
+                        "quantization_config": quantization,
+                    }
+                )
+
+                self.assertIn(
+                    "language_model.model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertEqual(
+                    config.quantization[
+                        "language_model.model.layers.0.linear_attn.in_proj_qkv"
+                    ],
+                    {"group_size": 128, "bits": 6},
+                )
+                self.assertNotIn(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                    config.quantization,
+                )
+                self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
+                self.assertIn("language_model.lm_head", config.quantization)
+                self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        text_configs = {
+            qwen3_5: qwen3_5.TextConfig(
+                model_type="qwen3_5",
+                hidden_size=128,
+                intermediate_size=256,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=1024,
+                num_key_value_heads=2,
+                max_position_embeddings=1024,
+                eos_token_id=248044,
+            ),
+            qwen3_5_moe: qwen3_5_moe.TextConfig(
+                model_type="qwen3_5_moe",
+                hidden_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_experts=4,
+                num_experts_per_tok=2,
+                shared_expert_intermediate_size=128,
+                moe_intermediate_size=128,
+                rms_norm_eps=1e-5,
+                vocab_size=1024,
+                num_key_value_heads=2,
+                max_position_embeddings=1024,
+                eos_token_id=248044,
+            ),
+        }
+
+        for model_module, text_config in text_configs.items():
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig(
+                    text_config=text_config,
+                    vision_config=SimpleNamespace(),
+                    model_type=model_module.__name__.rsplit(".", 1)[-1],
+                )
+                self.assertEqual(config.eos_token_id, [248044, 248046])
+
+                config_from_dict = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {"eos_token_id": 248044},
+                        "vision_config": {},
+                    }
+                )
+                self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
+
+                explicit = model_module.ModelConfig(
+                    text_config=text_config,
+                    vision_config=SimpleNamespace(),
+                    model_type=model_module.__name__.rsplit(".", 1)[-1],
+                    eos_token_id=248046,
+                )
+                self.assertEqual(explicit.eos_token_id, 248046)
 
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
@@ -3451,6 +3565,63 @@ class TestModels(unittest.TestCase):
             config.text_config.model_type,
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
+        )
+
+    def test_granite4_1_vision(self):
+        from mlx_vlm.models import granite4_vision
+
+        text_config = granite4_vision.TextConfig(
+            model_type="granite",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=10000000.0,
+            embedding_multiplier=12.0,
+            attention_multiplier=0.015625,
+            residual_multiplier=0.22,
+            logits_scaling=10.0,
+        )
+
+        vision_config = granite4_vision.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            image_size=48,
+            patch_size=16,
+        )
+
+        config = granite4_vision.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="granite4_vision",
+            deepstack_layer_map=[[-1, 0]],
+            use_spatial_sampling=False,
+            downsample_rate="3/3",
+            use_image_newline_parameter=False,
+        )
+
+        model = granite4_vision.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            vision_feature_layer=0,
         )
 
     def test_youtu_vl(self):

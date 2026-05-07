@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import logging
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
     BatchGenerationResult,
     BatchGenerator,
@@ -16,6 +18,7 @@ from mlx_vlm.generate import (
     GenerationBatch,
     GenerationResult,
     _left_pad_prompts,
+    _prime_cached_prefix_rope_state,
     normalize_resize_shape,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -600,6 +603,83 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
+
+    def test_generate_batch_splits_batched_prompt_kwargs_per_row(
+        self, mock_model, mock_processor
+    ):
+        """Regression test for Gemma 4-style batched ``inputs_embeds``."""
+
+        class _EmbeddingOutput:
+            def __init__(self, inputs_embeds, position_ids):
+                self.inputs_embeds = inputs_embeds
+                self.position_ids = position_ids
+
+            def to_dict(self):
+                return {
+                    "inputs_embeds": self.inputs_embeds,
+                    "position_ids": self.position_ids,
+                }
+
+        class _StopInsert(Exception):
+            pass
+
+        batch_size = 3
+        seq_len = 5
+        hidden_size = 7
+        input_ids = mx.array(
+            [
+                [11, 12, 13, 14, 15],
+                [21, 22, 23, 24, 25],
+                [31, 32, 33, 34, 35],
+            ],
+            dtype=mx.int32,
+        )
+        inputs_embeds = mx.arange(
+            batch_size * seq_len * hidden_size, dtype=mx.float32
+        ).reshape(batch_size, seq_len, hidden_size)
+        position_ids = mx.arange(batch_size * seq_len, dtype=mx.int32).reshape(
+            batch_size, seq_len
+        )
+        embedding_output = _EmbeddingOutput(inputs_embeds, position_ids)
+
+        def fake_insert(
+            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+        ):
+            assert len(prompts) == batch_size
+            assert len(prompt_kwargs) == batch_size
+            for i, kw in enumerate(prompt_kwargs):
+                assert kw["inputs_embeds"].shape == (1, seq_len, hidden_size)
+                assert kw["position_ids"].shape == (1, seq_len)
+                assert kw["inputs_embeds"].tolist() == inputs_embeds[i : i + 1].tolist()
+                assert kw["position_ids"].tolist() == position_ids[i : i + 1].tolist()
+            raise _StopInsert
+
+        with (
+            patch.object(
+                generate_module,
+                "apply_chat_template",
+                side_effect=lambda processor, config, prompt, num_images=0: prompt,
+            ),
+            patch.object(
+                generate_module,
+                "prepare_inputs",
+                return_value={
+                    "input_ids": input_ids,
+                    "attention_mask": mx.ones((batch_size, seq_len), dtype=mx.int32),
+                },
+            ),
+            patch.object(
+                mock_model, "get_input_embeddings", return_value=embedding_output
+            ),
+            patch.object(generate_module.BatchGenerator, "insert", new=fake_insert),
+        ):
+            with pytest.raises(_StopInsert):
+                generate_module._generate_batch(
+                    mock_model,
+                    mock_processor,
+                    prompts=["alpha", "beta", "gamma"],
+                    max_tokens=5,
+                )
 
     @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1197,6 +1277,213 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
 
     assert args.thinking_start_token == "<think>"
     assert args.thinking_end_token == "</think>"
+
+
+def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
+    class BrokenRopeLanguageModel:
+        def __init__(self):
+            self._rope_deltas = mx.array([1])
+            self._position_ids = mx.array([[0, 1, 2]])
+
+        def get_rope_index(self, *args, **kwargs):
+            raise ValueError("bad grid")
+
+    language_model = BrokenRopeLanguageModel()
+    model = SimpleNamespace(language_model=language_model)
+    rope_deltas_before = language_model._rope_deltas
+    position_ids_before = language_model._position_ids
+    kwargs = {}
+
+    with caplog.at_level(logging.WARNING, logger="mlx_vlm.generate"):
+        ok = _prime_cached_prefix_rope_state(
+            model,
+            mx.array([[1, 2, 3]]),
+            None,
+            kwargs,
+        )
+
+    assert ok is False
+    assert "rope_deltas" not in kwargs
+    assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
+    assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
+    assert "falling back to cold prefill" in caplog.text
+
+
+def test_batch_apc_extra_hash_uses_precomputed_image_hash():
+    batch_generator = SimpleNamespace(apc_manager=object())
+
+    got = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {"_apc_image_hash": 123, "_apc_tenant": "tenant-a"},
+    )
+
+    assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
+
+
+def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
+    class EmptyGenerationBatch:
+        def __len__(self):
+            return 0
+
+    bg = object.__new__(BatchGenerator)
+    bg._generation_batch = EmptyGenerationBatch()
+    bg._prompt_batch = None
+    bg._prompt_tokens_counter = 0
+    bg._prompt_time_counter = 0
+    bg._gen_tokens_counter = 0
+    bg._steps_counter = 0
+    bg.completion_batch_size = 4
+    bg.prefill_batch_size = 4
+    bg.prefill_step_size = 1
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg.apc_manager = None
+    bg.apc_mode = None
+    bg.model = SimpleNamespace()
+    bg._wire_stack = None
+    bg.compute_logprobs = False
+    bg.top_logprobs_k = 0
+    bg.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+    bg.tokenizer = SimpleNamespace(stopping_criteria=object())
+
+    lengths = [2, 4, 3, 1]
+    bg._unprocessed_sequences = [
+        (
+            i,
+            list(range(length)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, length, 3)) * (i + 1),
+                "per_layer_inputs": mx.ones((1, length, 2, 5)) * (i + 1),
+                "attention_mask": mx.ones((1, length), dtype=mx.int32),
+                "pixel_values": mx.ones((1, 3, 2, 2)) * (i + 1),
+                "keep_tensor": mx.array([[i + 1]], dtype=mx.int32),
+                "rope_deltas": mx.array([[i + 10]], dtype=mx.int32),
+                "_apc_tenant": "tenant",
+            },
+            [],
+        )
+        for i, length in enumerate(lengths)
+    ]
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
+            needs_processing=lambda: True,
+            prompt_step=lambda: 0,
+        )
+
+    with patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch):
+        bg._next()
+
+    prompt_kwargs = captured["prompt_kwargs"]
+    assert captured["inputs_embeds"].shape == (4, 4, 3)
+    assert prompt_kwargs["per_layer_inputs"].shape == (4, 4, 2, 5)
+    assert prompt_kwargs["attention_mask"].shape == (4, 4)
+    assert prompt_kwargs["pixel_values"].shape == (4, 3, 2, 2)
+    assert prompt_kwargs["keep_tensor"].shape == (4, 1)
+    assert prompt_kwargs["rope_deltas"].shape == (4, 1)
+    assert "_apc_tenant" not in prompt_kwargs
+    assert prompt_kwargs["per_layer_inputs"][0, :, 0, 0].tolist() == [0, 0, 1, 1]
+    assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
+
+
+def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = object()
+    bg.model = SimpleNamespace(layers=[object()])
+    bg.prefill_step_size = None
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    sequences = [
+        (
+            1,
+            list(range(8)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 8, 4)),
+                "keep_tensor": mx.ones((1, 1)),
+                "_apc_tenant": "tenant-a",
+                "_apc_image_hash": 123,
+            },
+            [],
+        ),
+        (
+            2,
+            list(range(6)),
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 6, 4)),
+                "keep_tensor": mx.zeros((1, 1)),
+                "_apc_tenant": "tenant-b",
+                "_apc_image_hash": 456,
+            },
+            [],
+        ),
+    ]
+    picks = [
+        {
+            "matched_blocks": [],
+            "prefix_len": 4,
+            "extra_hash": 7,
+            "full_input_ids": list(range(8)),
+        },
+        None,
+    ]
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+        patch.object(
+            generate_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch(sequences)
+
+    assert batch is not None
+    assert "_apc_tenant" not in captured["prompt_kwargs"]
+    assert "_apc_image_hash" not in captured["prompt_kwargs"]
+    assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
+
+
+def test_apc_pick_rejects_image_tokens_and_releases_blocks():
+    block_size = 4
+    image_token_id = 99
+    token_ids = [image_token_id, 1, 2, 3, 4]
+    manager = apc_module.APCManager(num_blocks=4, block_size=block_size)
+    layer_keys = [mx.ones((1, 1, block_size, 2))]
+    layer_values = [mx.ones((1, 1, block_size, 2)) * 2]
+    stored = manager.store_kv_blocks(
+        token_ids[:block_size],
+        layer_keys,
+        layer_values,
+    )
+    manager.release(stored)
+
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = manager
+    bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
+    bg._wire_stack = None
+
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, []))
+
+    assert pick is None
+    assert all(block.ref_cnt == 0 for block in stored)
 
 
 if __name__ == "__main__":
