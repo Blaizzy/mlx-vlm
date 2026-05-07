@@ -466,13 +466,19 @@ def _speculative_walk(
     truncated to ``budget``.
     """
     n_draft = draft_tokens.shape[1]
-    combined = mx.concatenate(
-        [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
-    ).tolist()
-    d = combined[:n_draft]
-    t = combined[n_draft:]
-    accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
-    new_tokens = (d[:accepted] + [t[accepted]])[:budget]
+    mismatch = draft_tokens[:, :n_draft] != target_tokens[:, :n_draft]
+    mismatch = mismatch.reshape(-1)
+    has_mismatch = bool(mx.any(mismatch).item())
+    accepted = (
+        int(mx.argmax(mismatch.astype(mx.int32)).item()) if has_mismatch else n_draft
+    )
+    accepted_prefix = draft_tokens[:, :accepted]
+    bonus = target_tokens[:, accepted : accepted + 1]
+    new_tokens = (
+        mx.concatenate([accepted_prefix, bonus], axis=1)[:, :budget]
+        .reshape(-1)
+        .tolist()
+    )
     return accepted, new_tokens
 
 
@@ -488,17 +494,25 @@ def _speculative_walk_batch(
     """
     B = draft_tokens.shape[0]
     n_draft = draft_tokens.shape[1]
-    combined = mx.concatenate(
-        [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
-    ).tolist()
-    accepted_list: List[int] = []
+    mismatch = draft_tokens[:, :n_draft] != target_tokens[:, :n_draft]
+    has_mismatch = mx.any(mismatch, axis=1)
+    first_mismatch = mx.argmax(mismatch.astype(mx.int32), axis=1)
+    accepted_arr = mx.where(
+        has_mismatch,
+        first_mismatch,
+        mx.full((B,), n_draft, dtype=mx.int32),
+    )
+    accepted_list = [int(x) for x in accepted_arr.tolist()]
     new_tokens_list: List[List[int]] = []
     for i in range(B):
-        d = combined[i][:n_draft]
-        t = combined[i][n_draft:]
-        acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
-        new = (d[:acc] + [t[acc]])[: budgets[i]]
-        accepted_list.append(acc)
+        accepted = accepted_list[i]
+        accepted_prefix = draft_tokens[i : i + 1, :accepted]
+        bonus = target_tokens[i : i + 1, accepted : accepted + 1]
+        new = (
+            mx.concatenate([accepted_prefix, bonus], axis=1)[:, : budgets[i]]
+            .reshape(-1)
+            .tolist()
+        )
         new_tokens_list.append(new)
     return accepted_list, new_tokens_list
 

@@ -13,7 +13,11 @@ import mlx.core as mx
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
-from mlx_vlm.generate import _effective_mtp_block_size
+from mlx_vlm.generate import (
+    _effective_mtp_block_size,
+    _speculative_walk,
+    _speculative_walk_batch,
+)
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -140,6 +144,39 @@ def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
 
     assert captured["state"].shape == (2, 3, 5, 4)
     assert float(mx.sum(mx.abs(captured["state"])).item()) == 0.0
+
+
+def test_speculative_walk_accepts_until_first_mismatch():
+    accepted, new_tokens = _speculative_walk(
+        mx.array([[11, 12, 13]], dtype=mx.int32),
+        mx.array([[11, 99, 77, 55]], dtype=mx.int32),
+        budget=4,
+    )
+
+    assert accepted == 1
+    assert new_tokens == [11, 99]
+
+
+def test_speculative_walk_uses_target_bonus_when_all_drafts_match():
+    accepted, new_tokens = _speculative_walk(
+        mx.array([[11, 12]], dtype=mx.int32),
+        mx.array([[11, 12, 42]], dtype=mx.int32),
+        budget=3,
+    )
+
+    assert accepted == 2
+    assert new_tokens == [11, 12, 42]
+
+
+def test_speculative_walk_batch_matches_per_row_acceptance():
+    accepted, new_tokens = _speculative_walk_batch(
+        mx.array([[11, 12], [21, 22]], dtype=mx.int32),
+        mx.array([[11, 90, 91], [21, 22, 23]], dtype=mx.int32),
+        budgets=[3, 2],
+    )
+
+    assert accepted == [1, 2]
+    assert new_tokens == [[11, 90], [21, 22]]
 
 
 def test_mtp_drafter_masks_support_batched_offsets():
