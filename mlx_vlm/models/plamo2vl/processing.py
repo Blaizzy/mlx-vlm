@@ -10,6 +10,8 @@ import numpy as np
 import PIL.Image
 from transformers import PreTrainedTokenizer
 
+from ..base import install_auto_processor_patch
+
 try:
     from transformers import SiglipImageProcessorPil as SiglipImageProcessor
 except ImportError:
@@ -73,7 +75,9 @@ class AhoCorasick:
             if suffix != "":
                 piece_code = (ord(suffix[0]) << 32) | suffix_to_id[suffix[1:]]
                 self._to_suffix_id[piece_code] = np.int32(num_pieces)
-            num_pieces += 1 + sum(suffix[:i] in suffix_to_score for i in range(1, len(suffix) + 1))
+            num_pieces += 1 + sum(
+                suffix[:i] in suffix_to_score for i in range(1, len(suffix) + 1)
+            )
 
         self._table = np.zeros((num_pieces, 4), dtype=np.int32)
         row_idx = 0
@@ -120,9 +124,13 @@ class AhoCorasick:
                         scores[i] = s
                         path[i, PATH_TOKEN_LENGTH] = piece_length
                         path[i, PATH_TOKEN_ID] = int(self._table[p, TABLE_TOKEN_ID])
-                        path[i, PATH_NUM_TOKENS] = path[i + piece_length, PATH_NUM_TOKENS] + 1
+                        path[i, PATH_NUM_TOKENS] = (
+                            path[i + piece_length, PATH_NUM_TOKENS] + 1
+                        )
                         if score == UNKNOWN_SCORE:
-                            path[i, PATH_NUM_TOKENS] += (c >= 0x80) + (c >= 0x800) + (c >= 0x10000)
+                            path[i, PATH_NUM_TOKENS] += (
+                                (c >= 0x80) + (c >= 0x800) + (c >= 0x10000)
+                            )
 
                 if score == UNKNOWN_SCORE:
                     break
@@ -200,7 +208,9 @@ class Plamo2Tokenizer(PreTrainedTokenizer):  # type: ignore[misc]
         )
 
     @classmethod
-    def _get_additional_special_tokens(cls, tokenizer_config: dict[str, Any]) -> list[str]:
+    def _get_additional_special_tokens(
+        cls, tokenizer_config: dict[str, Any]
+    ) -> list[str]:
         tokens = tokenizer_config.get("additional_special_tokens")
         if tokens:
             return list(tokens)
@@ -297,15 +307,20 @@ class Plamo2Tokenizer(PreTrainedTokenizer):  # type: ignore[misc]
             output = output + bos_token_id + token_ids_1 + eos_token_id
         return output
 
-    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
+    def save_vocabulary(
+        self, save_directory: str, filename_prefix: Optional[str] = None
+    ) -> Tuple[str]:
         if not os.path.isdir(save_directory):
             return ("",)
 
         out_vocab_file = os.path.join(
             save_directory,
-            (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"],
+            (filename_prefix + "-" if filename_prefix else "")
+            + VOCAB_FILES_NAMES["vocab_file"],
         )
-        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file) and os.path.isfile(self.vocab_file):
+        if os.path.abspath(self.vocab_file) != os.path.abspath(
+            out_vocab_file
+        ) and os.path.isfile(self.vocab_file):
             copyfile(self.vocab_file, out_vocab_file)
         elif not os.path.isfile(self.vocab_file):
             with open(out_vocab_file, "w", encoding="utf-8") as f:
@@ -347,7 +362,9 @@ class Plamo2Tokenizer(PreTrainedTokenizer):  # type: ignore[misc]
         return files
 
 
-def _apply_ja01_template(dummy_image_token: str, text: str, image_length: int = 1) -> str:
+def _apply_ja01_template(
+    dummy_image_token: str, text: str, image_length: int = 1
+) -> str:
     return "\n".join(
         [
             "以下はタスクを説明する指示で、文脈を説明した入力とペアになっています。要求を適切に補完するよう応答を書いてください。",
@@ -362,14 +379,20 @@ def _apply_ja01_template(dummy_image_token: str, text: str, image_length: int = 
 
 
 def _find_closest_aspect_ratio(
-    aspect_ratio: float, target_ratios: list[tuple[int, int]], width: int, height: int, image_size: int
+    aspect_ratio: float,
+    target_ratios: list[tuple[int, int]],
+    width: int,
+    height: int,
+    image_size: int,
 ) -> tuple[int, int]:
     best_factor = float("-inf")
     best_ratio = (1, 1)
     area = width * height
     for ratio in target_ratios:
         target_aspect_ratio = ratio[0] / ratio[1]
-        factor = min(aspect_ratio, target_aspect_ratio) / max(aspect_ratio, target_aspect_ratio)
+        factor = min(aspect_ratio, target_aspect_ratio) / max(
+            aspect_ratio, target_aspect_ratio
+        )
         if factor > best_factor:
             best_factor = factor
             best_ratio = ratio
@@ -380,7 +403,11 @@ def _find_closest_aspect_ratio(
 
 
 def _dynamic_preprocess_eagle2_image(
-    image: PIL.Image.Image, min_num: int = 1, max_num: int = 6, image_size: int = 448, use_thumbnail: bool = False
+    image: PIL.Image.Image,
+    min_num: int = 1,
+    max_num: int = 6,
+    image_size: int = 448,
+    use_thumbnail: bool = False,
 ) -> list[PIL.Image.Image]:
     orig_width, orig_height = image.size
     aspect_ratio = orig_width / orig_height
@@ -446,20 +473,31 @@ def _dynamic_preprocess_eagle2(
             )
             for image in images
         ]
-        if sum([2 + len(tiles) * per_tile_len for tiles in image_tiles]) < context_length:
+        if (
+            sum([2 + len(tiles) * per_tile_len for tiles in image_tiles])
+            < context_length
+        ):
             break
-        max_input_tiles_limited_by_context -= 2 if max_input_tiles_limited_by_context >= 3 else 1
+        max_input_tiles_limited_by_context -= (
+            2 if max_input_tiles_limited_by_context >= 3 else 1
+        )
 
     for text_part, tiles in zip(text_parts[:-1], image_tiles):
         num_patches = len(tiles)
-        image_tokens = image_start_token + dummy_image_token * num_image_token * num_patches + image_end_token
+        image_tokens = (
+            image_start_token
+            + dummy_image_token * num_image_token * num_patches
+            + image_end_token
+        )
         new_text_buf.write(text_part)
         new_text_buf.write(image_tokens)
     new_text_buf.write(text_parts[-1])
     return new_text_buf.getvalue(), image_tiles
 
 
-def _pad_image_to_multiple_of_stride(image: PIL.Image.Image, stride: int) -> PIL.Image.Image:
+def _pad_image_to_multiple_of_stride(
+    image: PIL.Image.Image, stride: int
+) -> PIL.Image.Image:
     width, height = image.size
     padded_width = math.ceil(width / stride) * stride
     padded_height = math.ceil(height / stride) * stride
@@ -471,6 +509,7 @@ def _pad_image_to_multiple_of_stride(image: PIL.Image.Image, stride: int) -> PIL
 
 
 class Plamo2VLProcessor:
+    chat_template = "plamo2vl"
     preserve_pad_token = True
 
     def __init__(
@@ -489,7 +528,8 @@ class Plamo2VLProcessor:
         self._tile_context_length = int(image_processor.tile_context_length)
 
     @classmethod
-    def from_pretrained(cls, model_path: str | Path):
+    def from_pretrained(cls, model_path: str | Path, **kwargs):
+        del kwargs
         model_path = Path(model_path)
         image_processor = SiglipImageProcessor.from_pretrained(model_path)
         tokenizer = Plamo2Tokenizer.from_pretrained(model_path)
@@ -566,11 +606,21 @@ class Plamo2VLProcessor:
         images = [tile for tiles in image_tiles for tile in tiles]
         if self._downsample_ratio != 1.0:
             downsampled_stride = self._patch_size * int(1 / self._downsample_ratio)
-            images = [_pad_image_to_multiple_of_stride(img, downsampled_stride) for img in images]
+            images = [
+                _pad_image_to_multiple_of_stride(img, downsampled_stride)
+                for img in images
+            ]
         images = [img.convert("RGB") if img.mode != "RGB" else img for img in images]
         return new_text, images
 
-    def process(self, text, images, padding: bool = False, return_tensors: Optional[str] = None, **kwargs):
+    def process(
+        self,
+        text,
+        images,
+        padding: bool = False,
+        return_tensors: Optional[str] = None,
+        **kwargs,
+    ):
         del return_tensors, kwargs
         if isinstance(text, list):
             if len(text) != 1:
@@ -584,7 +634,9 @@ class Plamo2VLProcessor:
             raise ValueError("At least one image is required")
 
         formatted_text = self.format_prompt(str(text), image_length=len(images))
-        tiled_text, tiled_images = self._split_images_into_tiles(formatted_text, list(images))
+        tiled_text, tiled_images = self._split_images_into_tiles(
+            formatted_text, list(images)
+        )
         text_inputs = self.tokenizer(
             [tiled_text],
             return_attention_mask=True,
@@ -598,3 +650,6 @@ class Plamo2VLProcessor:
         }
 
     __call__ = process
+
+
+install_auto_processor_patch("plamo2vl", Plamo2VLProcessor)
