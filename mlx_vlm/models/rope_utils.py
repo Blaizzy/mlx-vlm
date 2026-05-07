@@ -71,33 +71,27 @@ def _pairing_for_style(style: str):
 
 
 @lru_cache(maxsize=None)
-def _mrope_apply_kernel(rotary_dim: int, position_ndim: int, pairing: str):
+def _mrope_apply_kernel(
+    rotary_dim: int,
+    position_ndim: int,
+    pairing: str,
+):
     if not _HAS_METAL:
         return None
 
     if position_ndim == 2:
         position_expr = "position_ids[b * q_len + t]"
+        selector_source = ""
     else:
         position_expr = "position_ids[(axis * q_bsz + b) * q_len + t]"
+        selector_source = "int axis = int(position_selector[freq_idx]);"
 
     if pairing == _EVEN_ODD:
         pair_source = f"""
-        if (d >= {rotary_dim}) {{
-            if (is_q) {{
-                q_out[local] = q[local];
-            }} else {{
-                k_out[local] = k[local];
-            }}
-            return;
-        }}
-
-        if ((d & 1) != 0) {{
-            return;
-        }}
-
-        int freq_idx = d / 2;
+        int freq_idx = slot;
+        int d = freq_idx * 2;
         int pair_d = d + 1;
-        int axis = int(position_selector[freq_idx]);
+        {selector_source}
         float pos = static_cast<float>({position_expr});
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
         float c = metal::cos(angle);
@@ -105,22 +99,10 @@ def _mrope_apply_kernel(rotary_dim: int, position_ndim: int, pairing: str):
         """
     else:
         pair_source = f"""
-        if (d >= {rotary_dim}) {{
-            if (is_q) {{
-                q_out[local] = q[local];
-            }} else {{
-                k_out[local] = k[local];
-            }}
-            return;
-        }}
-
-        if (d >= half_dim) {{
-            return;
-        }}
-
-        int freq_idx = d;
+        int freq_idx = slot;
+        int d = freq_idx;
         int pair_d = d + half_dim;
-        int axis = int(position_selector[freq_idx]);
+        {selector_source}
         float pos = static_cast<float>({position_expr});
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
         float c = metal::cos(angle);
@@ -130,51 +112,47 @@ def _mrope_apply_kernel(rotary_dim: int, position_ndim: int, pairing: str):
     source = f"""
         uint elem = thread_position_in_grid.x;
 
-        const int q_bsz = q_shape[0];
-        const int q_heads = q_shape[1];
-        const int q_len = q_shape[2];
-        const int q_dim = q_shape[3];
-        const int k_heads = k_shape[1];
-        const int k_dim = k_shape[3];
         const int half_dim = {rotary_dim // 2};
-        const int q_size = q_bsz * q_heads * q_len * q_dim;
-        const int k_size = q_bsz * k_heads * q_len * k_dim;
+        const int q_bsz = x_shape[0];
+        const int q_heads = x_shape[1];
+        const int q_len = x_shape[2];
+        const int q_dim = x_shape[3];
+        const int slots = half_dim + q_dim - {rotary_dim};
+        const int work_size = q_bsz * q_heads * q_len * slots;
 
-        if (elem >= uint(q_size + k_size)) {{
+        if (elem >= uint(work_size)) {{
             return;
         }}
 
-        bool is_q = elem < uint(q_size);
-        int local = is_q ? int(elem) : int(elem) - q_size;
-        int D = is_q ? q_dim : k_dim;
-        int H = is_q ? q_heads : k_heads;
-        int d = local % D;
-        int tmp = local / D;
+        int local = int(elem);
+        int slot = local % slots;
+        int tmp = local / slots;
         int t = tmp % q_len;
         tmp = tmp / q_len;
-        int h = tmp % H;
-        int b = tmp / H;
-        int base = ((b * H + h) * q_len + t) * D;
+        int h = tmp % q_heads;
+        int b = tmp / q_heads;
+        int base = ((b * q_heads + h) * q_len + t) * q_dim;
+
+        if (slot >= half_dim) {{
+            int pass_d = {rotary_dim} + slot - half_dim;
+            int pass_idx = base + pass_d;
+            x_out[pass_idx] = x[pass_idx];
+            return;
+        }}
 
         {pair_source}
 
-        if (is_q) {{
-            float x = static_cast<float>(q[local]);
-            float xp = static_cast<float>(q[base + pair_d]);
-            q_out[local] = static_cast<T>(x * c - xp * s);
-            q_out[base + pair_d] = static_cast<T>(xp * c + x * s);
-        }} else {{
-            float x = static_cast<float>(k[local]);
-            float xp = static_cast<float>(k[base + pair_d]);
-            k_out[local] = static_cast<T>(x * c - xp * s);
-            k_out[base + pair_d] = static_cast<T>(xp * c + x * s);
-        }}
+        int idx = base + d;
+        float xv = static_cast<float>(x[idx]);
+        float xp = static_cast<float>(x[base + pair_d]);
+        x_out[idx] = static_cast<T>(xv * c - xp * s);
+        x_out[base + pair_d] = static_cast<T>(xp * c + xv * s);
     """
 
     return mx.fast.metal_kernel(
         name=f"mrope_apply_{pairing}_{rotary_dim}_{position_ndim}d",
-        input_names=["q", "k", "position_ids", "inv_freq", "position_selector"],
-        output_names=["q_out", "k_out"],
+        input_names=["x", "position_ids", "inv_freq", "position_selector"],
+        output_names=["x_out"],
         source=source,
     )
 
@@ -187,37 +165,21 @@ def _fast_mrope_apply(
     inv_freq,
     position_selector,
 ):
-    q_size = q.size
-    k_size = k.size
-    outputs = kernel(
-        inputs=[q, k, position_ids, inv_freq, position_selector],
-        template=[("T", q.dtype)],
-        grid=(q_size + k_size, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[q.shape, k.shape],
-        output_dtypes=[q.dtype, k.dtype],
-    )
-    return outputs[0], outputs[1]
-
-
-@lru_cache(maxsize=None)
-def _compiled_mrope_apply(rotary_dim: int, position_ndim: int, pairing: str):
-    kernel = _mrope_apply_kernel(rotary_dim, position_ndim, pairing)
-    if kernel is None:
-        return None
-
-    @mx.compile
-    def apply(q, k, position_ids, inv_freq, position_selector):
-        return _fast_mrope_apply(
-            kernel,
-            q,
-            k,
-            position_ids,
-            inv_freq,
-            position_selector,
+    def apply_one(x):
+        half_dim = inv_freq.shape[0]
+        slots = half_dim + x.shape[-1] - half_dim * 2
+        work_size = x.shape[0] * x.shape[1] * x.shape[2] * slots
+        (out,) = kernel(
+            inputs=[x, position_ids, inv_freq, position_selector],
+            template=[("T", x.dtype)],
+            grid=(work_size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
         )
+        return out
 
-    return apply
+    return apply_one(q), apply_one(k)
 
 
 @lru_cache(maxsize=None)
@@ -233,38 +195,14 @@ def _rotary_apply_kernel(
 
     if pairing == _EVEN_ODD:
         pair_source = f"""
-        if (d >= {rotary_dim}) {{
-            if (is_q) {{
-                q_out[local] = q[local];
-            }} else {{
-                k_out[local] = k[local];
-            }}
-            return;
-        }}
-
-        if ((d & 1) != 0) {{
-            return;
-        }}
-
-        int freq_idx = d / 2;
+        int freq_idx = slot;
+        int d = freq_idx * 2;
         int pair_d = d + 1;
         """
     else:
         pair_source = f"""
-        if (d >= {rotary_dim}) {{
-            if (is_q) {{
-                q_out[local] = q[local];
-            }} else {{
-                k_out[local] = k[local];
-            }}
-            return;
-        }}
-
-        if (d >= half_dim) {{
-            return;
-        }}
-
-        int freq_idx = d;
+        int freq_idx = slot;
+        int d = freq_idx;
         int pair_d = d + half_dim;
         """
 
@@ -296,7 +234,7 @@ def _rotary_apply_kernel(
             f"{pair_cos_freq_idx}]"
         )
         selector_source = "int axis = int(position_selector[freq_idx]);"
-        input_names = ["q", "k", "cos", "sin", "position_selector"]
+        input_names = ["x", "cos", "sin", "position_selector"]
     elif cos_ndim == 4:
         cos_expr = (
             f"cos[((0 * q_bsz + b) * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
@@ -313,43 +251,45 @@ def _rotary_apply_kernel(
             f"{pair_cos_freq_idx}]"
         )
         selector_source = ""
-        input_names = ["q", "k", "cos", "sin"]
+        input_names = ["x", "cos", "sin"]
     else:
         cos_expr = f"cos[(b * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
         sin_expr = f"sin[(b * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
         pair_cos_expr = f"cos[(b * q_len + t) * {rotary_dim} + {pair_cos_freq_idx}]"
         pair_sin_expr = f"sin[(b * q_len + t) * {rotary_dim} + {pair_cos_freq_idx}]"
         selector_source = ""
-        input_names = ["q", "k", "cos", "sin"]
+        input_names = ["x", "cos", "sin"]
 
     source = f"""
         uint elem = thread_position_in_grid.x;
 
-        const int q_bsz = q_shape[0];
-        const int q_heads = q_shape[1];
-        const int q_len = q_shape[2];
-        const int q_dim = q_shape[3];
-        const int k_heads = k_shape[1];
-        const int k_dim = k_shape[3];
+        const int q_bsz = x_shape[0];
+        const int q_heads = x_shape[1];
+        const int q_len = x_shape[2];
+        const int q_dim = x_shape[3];
         const int half_dim = {rotary_dim // 2};
-        const int q_size = q_bsz * q_heads * q_len * q_dim;
-        const int k_size = q_bsz * k_heads * q_len * k_dim;
+        const int slots = half_dim + q_dim - {rotary_dim};
+        const int work_size = q_bsz * q_heads * q_len * slots;
 
-        if (elem >= uint(q_size + k_size)) {{
+        if (elem >= uint(work_size)) {{
             return;
         }}
 
-        bool is_q = elem < uint(q_size);
-        int local = is_q ? int(elem) : int(elem) - q_size;
-        int D = is_q ? q_dim : k_dim;
-        int H = is_q ? q_heads : k_heads;
-        int d = local % D;
-        int tmp = local / D;
+        int local = int(elem);
+        int slot = local % slots;
+        int tmp = local / slots;
         int t = tmp % q_len;
         tmp = tmp / q_len;
-        int h = tmp % H;
-        int b = tmp / H;
-        int base = ((b * H + h) * q_len + t) * D;
+        int h = tmp % q_heads;
+        int b = tmp / q_heads;
+        int base = ((b * q_heads + h) * q_len + t) * q_dim;
+
+        if (slot >= half_dim) {{
+            int pass_d = {rotary_dim} + slot - half_dim;
+            int pass_idx = base + pass_d;
+            x_out[pass_idx] = x[pass_idx];
+            return;
+        }}
 
         {pair_source}
         {selector_source}
@@ -358,17 +298,11 @@ def _rotary_apply_kernel(
         float cp = static_cast<float>({pair_cos_expr});
         float sp = static_cast<float>({pair_sin_expr});
 
-        if (is_q) {{
-            float x = static_cast<float>(q[local]);
-            float xp = static_cast<float>(q[base + pair_d]);
-            q_out[local] = static_cast<T>(x * c - xp * s);
-            q_out[base + pair_d] = static_cast<T>(xp * cp + x * sp);
-        }} else {{
-            float x = static_cast<float>(k[local]);
-            float xp = static_cast<float>(k[base + pair_d]);
-            k_out[local] = static_cast<T>(x * c - xp * s);
-            k_out[base + pair_d] = static_cast<T>(xp * cp + x * sp);
-        }}
+        int idx = base + d;
+        float xv = static_cast<float>(x[idx]);
+        float xp = static_cast<float>(x[base + pair_d]);
+        x_out[idx] = static_cast<T>(xv * c - xp * s);
+        x_out[base + pair_d] = static_cast<T>(xp * cp + xv * sp);
     """
 
     section_suffix = "sectioned" if sectioned else "preselected"
@@ -378,24 +312,30 @@ def _rotary_apply_kernel(
             f"{rotary_dim}_{cos_ndim}d"
         ),
         input_names=input_names,
-        output_names=["q_out", "k_out"],
+        output_names=["x_out"],
         source=source,
     )
 
 
 def _fast_rotary_apply(kernel, q, k, cos, sin, position_selector=None):
-    inputs = [q, k, cos, sin]
-    if position_selector is not None:
-        inputs.append(position_selector)
-    outputs = kernel(
-        inputs=inputs,
-        template=[("T", q.dtype)],
-        grid=(q.size + k.size, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[q.shape, k.shape],
-        output_dtypes=[q.dtype, k.dtype],
-    )
-    return outputs[0], outputs[1]
+    def apply_one(x):
+        rotary_dim = cos.shape[-1]
+        slots = rotary_dim // 2 + x.shape[-1] - rotary_dim
+        work_size = x.shape[0] * x.shape[1] * x.shape[2] * slots
+        inputs = [x, cos, sin]
+        if position_selector is not None:
+            inputs.append(position_selector)
+        (out,) = kernel(
+            inputs=inputs,
+            template=[("T", x.dtype)],
+            grid=(work_size, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[x.shape],
+            output_dtypes=[x.dtype],
+        )
+        return out
+
+    return apply_one(q), apply_one(k)
 
 
 @lru_cache(maxsize=None)
@@ -419,6 +359,26 @@ def _compiled_rotary_apply(
     @mx.compile
     def apply(q, k, cos, sin, position_selector):
         return _fast_rotary_apply(kernel, q, k, cos, sin, position_selector)
+
+    return apply
+
+
+@lru_cache(maxsize=None)
+def _compiled_mrope_apply(rotary_dim: int, position_ndim: int, pairing: str):
+    kernel = _mrope_apply_kernel(rotary_dim, position_ndim, pairing)
+    if kernel is None:
+        return None
+
+    @mx.compile
+    def apply(q, k, position_ids, inv_freq, position_selector):
+        return _fast_mrope_apply(
+            kernel,
+            q,
+            k,
+            position_ids,
+            inv_freq,
+            position_selector,
+        )
 
     return apply
 
