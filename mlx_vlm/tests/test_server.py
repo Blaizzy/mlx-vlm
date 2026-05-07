@@ -1021,15 +1021,19 @@ class TestResponseGenerator:
                     ],
                 )
 
+        tokenizer = SimpleTokenizer()
         processor = SimpleNamespace(
-            detokenizer=SPMStreamingDetokenizer(SimpleTokenizer(), trim_space=False)
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
         )
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         rqueue = Queue()
         active = {
             1: {
                 "rqueue": rqueue,
-                "detokenizer": server.make_streaming_detokenizer(processor),
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
                 "prompt_tps": None,
             }
         }
