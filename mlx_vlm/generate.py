@@ -2876,9 +2876,8 @@ class PromptProcessingBatch:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
-        # Materialize the first sampled token so prompt timing ends when the
-        # first token is actually ready, matching the CLI prompt TPS semantics.
-        mx.eval(first_tokens)
+
+        mx.async_eval(first_tokens)
 
         # Roll any right-padding into left-padding so the cache decoded by
         # GenerationBatch sees a canonical layout.
