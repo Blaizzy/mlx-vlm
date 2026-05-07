@@ -89,13 +89,32 @@ class Gemma4AssistantDraftModel(nn.Module):
             self._input_embed = inner.embed_tokens
             self._input_embed_scale = float(getattr(inner, "embed_scale", 1.0))
 
-        try:
-            tcfg = getattr(target_model, "language_model", target_model)
-            tcfg = getattr(tcfg, "config", None)
-            if tcfg is not None:
+        tcfg = getattr(target_model, "language_model", target_model)
+        tcfg = getattr(tcfg, "config", None)
+        if tcfg is not None:
+            try:
                 self.config.target_layer_types = list(tcfg.layer_types)
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+            target_hidden = getattr(tcfg, "hidden_size", None)
+            if (
+                target_hidden is not None
+                and target_hidden != self.config.backbone_hidden_size
+            ):
+                raise ValueError(
+                    "Gemma 4 MTP drafter ↔ target hidden-size mismatch:\n"
+                    f"  drafter backbone_hidden_size = {self.config.backbone_hidden_size}\n"
+                    f"  target hidden_size           = {target_hidden}\n\n"
+                    "This drafter checkpoint was trained for a different "
+                    "target. Each Gemma 4 target has its own paired drafter:\n"
+                    "  mlx-community/gemma-4-E2B-it-bf16     ↔ mlx-community/gemma-4-E2B-it-assistant-bf16\n"
+                    "  mlx-community/gemma-4-E4B-it-bf16     ↔ mlx-community/gemma-4-E4B-it-assistant-bf16\n"
+                    "  mlx-community/gemma-4-26B-A4B-it-bf16 ↔ mlx-community/gemma-4-26B-A4B-it-assistant-bf16\n"
+                    "  mlx-community/gemma-4-31B-it-bf16     ↔ mlx-community/gemma-4-31B-it-assistant-bf16\n"
+                    "Pass --draft-model pointing to the drafter that matches "
+                    "your --model."
+                )
         return self
 
     def make_cache(self) -> List:
