@@ -45,10 +45,9 @@ from .generate import (
     _merge_prefill_prompt_kwargs,
     _mtp_rounds_batch,
     generate,
-    generation_stream as batch_generation_stream,
-    normalize_resize_shape,
-    stream_generate,
 )
+from .generate import generation_stream as batch_generation_stream
+from .generate import normalize_resize_shape, stream_generate
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
