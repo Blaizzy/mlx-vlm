@@ -273,7 +273,9 @@ class ServerMetricsStore:
                 if self._decode_time_total_s > 0
                 else 0.0
             )
-            last_error = dict(self._last_error) if self._last_error is not None else None
+            last_error = (
+                dict(self._last_error) if self._last_error is not None else None
+            )
             last_request_at = self._last_request_at
             return {
                 "latest": latest,
@@ -343,11 +345,7 @@ def _build_metrics_envelope(
     tool_calls: bool = False,
 ) -> dict:
     token_times = token_times or []
-    ttft_s = (
-        max(0.0, token_times[0] - request_started_s)
-        if token_times
-        else None
-    )
+    ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
     decode_elapsed_s = _decode_elapsed_from_metrics(
         token_times, generated_tokens, generation_tps
     )
@@ -1140,9 +1138,7 @@ class ResponseGenerator:
         prompt_responses, responses = batch_gen.next(**kwargs)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
-                active[prompt_response.uid]["prompt_tps"] = (
-                    prompt_response.prompt_tps
-                )
+                active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
         if not responses:
             return
 
@@ -2522,9 +2518,7 @@ async def responses_endpoint(request: Request):
                             ot += 1
                             tt.append(time.perf_counter())
                             ptps = getattr(tok, "prompt_tps", ptps)
-                            pm = max(
-                                pm, float(getattr(tok, "peak_memory", 0.0) or 0.0)
-                            )
+                            pm = max(pm, float(getattr(tok, "peak_memory", 0.0) or 0.0))
                             if tok.finish_reason:
                                 fr = tok.finish_reason
                                 break
@@ -3039,9 +3033,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         prompt_tps=prompt_tps,
                         generation_tps=generation_tps,
                         peak_memory_gb=peak_memory or None,
-                        finish_reason=finish_reason or (
-                            "stop" if output_tokens > 0 else None
-                        ),
+                        finish_reason=finish_reason
+                        or ("stop" if output_tokens > 0 else None),
                         image_count=len(images),
                         audio_count=len(audio),
                         structured_output=bool(gen_args.logits_processors),
@@ -3168,9 +3161,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         peak_memory,
                         token_times,
                         finish_reason,
-                    ) = (
-                        await asyncio.to_thread(_blocking_generate)
-                    )
+                    ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
                         model=model,
@@ -3187,9 +3178,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     full_text = gen_result.text
                     prompt_tokens = gen_result.prompt_tokens
                     output_tokens = gen_result.generation_tokens
-                    peak_memory = float(
-                        getattr(gen_result, "peak_memory", 0.0) or 0.0
-                    )
+                    peak_memory = float(getattr(gen_result, "peak_memory", 0.0) or 0.0)
                     prompt_tps = getattr(gen_result, "prompt_tps", None)
                     generation_tps = getattr(gen_result, "generation_tps", None)
                     finish_reason = "stop"

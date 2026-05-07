@@ -423,6 +423,7 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     assert response.json() == {"enabled": True, "status": "cleared"}
     manager.clear.assert_called_once_with()
 
+
 def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server, "apc_manager", None)
