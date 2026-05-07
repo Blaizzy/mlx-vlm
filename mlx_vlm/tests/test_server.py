@@ -999,6 +999,13 @@ class TestSuppressToolCallContent:
         assert in_tc is False
         assert content is None
 
+    def test_literal_less_than_is_not_suppressed(self):
+        in_tc, content = server.suppress_tool_call_content(
+            "if n <", False, "<tool_call>", "<"
+        )
+        assert in_tc is False
+        assert content == "<"
+
 
 class TestProcessToolCalls:
     """Tests for tool call parsing from model output."""

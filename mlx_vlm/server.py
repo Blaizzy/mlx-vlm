@@ -1186,7 +1186,8 @@ def suppress_tool_call_content(
     if not in_tool_call:
         if tc_start in full_output:
             return True, None
-        if any(full_output.endswith(tc_start[:j]) for j in range(1, len(tc_start))):
+
+        if any(full_output.endswith(tc_start[:j]) for j in range(2, len(tc_start))):
             return False, None
     else:
         return True, None
