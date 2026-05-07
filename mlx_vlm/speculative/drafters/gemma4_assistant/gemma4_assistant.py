@@ -55,6 +55,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         self._position: int = 0
 
         self.accept_lens: List[int] = []
+        self.draft_lens: List[int] = []
 
         if config.use_ordered_embeddings:
             self.masked_embedding = MaskedEmbedder(config)
@@ -105,6 +106,7 @@ class Gemma4AssistantDraftModel(nn.Module):
     def reset(self, target_model) -> List:
         self.bind(target_model)
         self.accept_lens = []
+        self.draft_lens = []
         self._shared_kv = None
         self._kv_offset = 0
         return self.make_cache()

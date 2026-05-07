@@ -4,6 +4,7 @@ import contextlib
 import functools
 import json
 import logging
+import math
 import os
 import time
 import warnings
@@ -517,6 +518,142 @@ def _speculative_walk_batch(
     return accepted_list, new_tokens_list
 
 
+@dataclass
+class _MTPVerifyResult:
+    hidden: mx.array
+    shared_kv_states: dict
+    target_tokens: Optional[mx.array] = None
+
+
+def _mtp_verify_without_logits(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+) -> Optional[_MTPVerifyResult]:
+    shared_kv_sink: dict = {}
+    hidden = lm.model(
+        verify_input,
+        cache=prompt_cache,
+        shared_kv_sink=shared_kv_sink,
+        skip_final_norm=True,
+    )
+    if not shared_kv_sink:
+        return None
+    return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_sink)
+
+
+def _mtp_verify_target(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    sampler: Callable[[mx.array], mx.array],
+) -> _MTPVerifyResult:
+    if hasattr(lm, "speculative_logits_from_hidden"):
+        result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
+        if result is not None:
+            return result
+
+    verify_out = lm(
+        verify_input,
+        cache=prompt_cache,
+        return_hidden=True,
+        return_shared_kv=True,
+    )
+    return _MTPVerifyResult(
+        hidden=verify_out.hidden_states[-1],
+        shared_kv_states=verify_out.shared_kv_states,
+        target_tokens=sampler(verify_out.logits),
+    )
+
+
+def _speculative_walk_deferred_greedy(
+    lm: nn.Module,
+    target_hidden: mx.array,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budget: int,
+) -> Tuple[int, List[int]]:
+    """Greedy MTP walk that projects target logits only until rejection."""
+    n_draft = draft_tokens.shape[1]
+    draft_list = [int(x) for x in draft_tokens.reshape(-1).tolist()]
+    accepted = 0
+    new_tokens: List[int] = []
+
+    for pos in range(n_draft + 1):
+        with mx.stream(generation_stream):
+            logits = lm.speculative_logits_from_hidden(
+                target_hidden[:, pos : pos + 1, :]
+            )
+            target_token = sampler(logits)
+        mx.eval(target_token)
+        token = int(target_token.reshape(-1).item())
+
+        if pos < n_draft and token == draft_list[pos]:
+            accepted += 1
+            if len(new_tokens) < budget:
+                new_tokens.append(token)
+            continue
+
+        if len(new_tokens) < budget:
+            new_tokens.append(token)
+        break
+
+    return accepted, new_tokens
+
+
+def _mtp_acceptance_walk(
+    lm: nn.Module,
+    verify: _MTPVerifyResult,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budget: int,
+) -> Tuple[int, List[int]]:
+    if verify.target_tokens is not None:
+        mx.async_eval(verify.target_tokens, verify.hidden)
+        return _speculative_walk(draft_tokens, verify.target_tokens, budget)
+
+    mx.async_eval(verify.hidden)
+    return _speculative_walk_deferred_greedy(
+        lm,
+        verify.hidden,
+        draft_tokens,
+        sampler,
+        budget,
+    )
+
+
+def _record_speculative_round(
+    draft_model: nn.Module, accepted: float, draft_count: int
+) -> None:
+    draft_model.accept_lens.append(accepted)
+    if hasattr(draft_model, "draft_lens"):
+        draft_model.draft_lens.append(int(draft_count))
+
+
+def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
+    accepted_lens = getattr(draft_model, "accept_lens", None) or []
+    if not accepted_lens:
+        return None
+
+    rounds = len(accepted_lens)
+    mean_accept = sum(accepted_lens) / rounds
+    draft_lens = getattr(draft_model, "draft_lens", None) or []
+    if len(draft_lens) == rounds and sum(draft_lens) > 0:
+        accept_rate = 100 * sum(accepted_lens) / sum(draft_lens)
+        mean_draft = sum(draft_lens) / rounds
+        return (
+            "Speculative decoding: "
+            f"{mean_accept:.2f} accepted tokens/round "
+            f"({accept_rate:.1f}% of drafted, "
+            f"avg draft {mean_draft:.2f}) over {rounds} rounds"
+        )
+
+    return (
+        "Speculative decoding: "
+        f"{mean_accept:.2f} accepted tokens over {rounds} rounds"
+    )
+
+
 def _effective_mtp_block_size(
     requested_block_total: int,
     configured_block_total: int,
@@ -525,17 +662,18 @@ def _effective_mtp_block_size(
 ) -> int:
     """Choose an effective MTP block size for the next speculative round."""
     bs = min(requested_block_total, remaining_budget)
-    if bs <= 2 or requested_block_total <= configured_block_total:
+    if bs <= 2:
         return bs
 
     if not accept_lens:
-        return min(bs, max(2, configured_block_total))
+        return min(bs, max(2, min(configured_block_total, 3)))
 
-    recent = accept_lens[-4:]
+    recent = accept_lens[-8:]
     mean_accept = sum(recent) / len(recent)
-    # ``accepted`` counts drafted tokens only; add one target "bonus" token and
-    # one token of slack before expanding the next draft block.
-    adaptive_total = max(2, int(mean_accept + 0.5) + 2)
+    # ``accepted`` counts drafted tokens only. The verifier only benefits from
+    # a block roughly as long as the expected accepted prefix plus the target
+    # bonus; extra slots become wasted target work when acceptance is low.
+    adaptive_total = max(2, math.ceil(mean_accept + 1.0))
     return min(bs, adaptive_total)
 
 
@@ -612,20 +750,20 @@ def _mtp_rounds(
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
             )
-            verify_out = lm(
+            verify = _mtp_verify_target(
+                lm,
                 verify_input,
-                cache=prompt_cache,
-                return_hidden=True,
-                return_shared_kv=True,
+                prompt_cache,
+                sampler,
             )
-            hidden_full = verify_out.hidden_states[-1]  # [B, bs, backbone]
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
-
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, target_tokens, max_tokens - emitted
+        accepted, new_tokens = _mtp_acceptance_walk(
+            lm,
+            verify,
+            draft_tokens,
+            sampler,
+            max_tokens - emitted,
         )
-        draft_model.accept_lens.append(accepted)
+        _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
             yield tok, None
@@ -634,7 +772,7 @@ def _mtp_rounds(
                 return
 
         # Hidden for next round: pick the slot of the newly accepted bonus.
-        hidden = hidden_full[:, accepted : accepted + 1, :]
+        hidden = verify.hidden[:, accepted : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
@@ -644,7 +782,7 @@ def _mtp_rounds(
         # Slice shared_kv_states to the post-rollback length and rebind.
         rejected = bs - (accepted + 1)
         next_shared_kv = {}
-        for k, kv in verify_out.shared_kv_states.items():
+        for k, kv in verify.shared_kv_states.items():
             K, V = kv
             valid = K.shape[-2] - rejected
             if valid <= 0 or valid >= K.shape[-2]:
@@ -850,7 +988,11 @@ def _mtp_rounds_batch(
         # Keep the adaptive block-size history on a per-round basis so
         # batched MTP reacts like the singleton loop instead of letting
         # batch size change the controller signal.
-        draft_model.accept_lens.append(sum(accepted_list) / len(accepted_list))
+        _record_speculative_round(
+            draft_model,
+            sum(accepted_list) / len(accepted_list),
+            bs - 1,
+        )
 
         max_a = max(accepted_list)
         accepted_arr = mx.array(accepted_list)
@@ -4214,12 +4356,9 @@ def main():
             print(result.text)
 
         if draft_model is not None:
-            lens = getattr(draft_model, "accept_lens", None) or []
-            if lens:
-                mean_accept = round(sum(lens) / len(lens), 2)
-                print(
-                    f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds"
-                )
+            stats = _format_speculative_stats(draft_model)
+            if stats is not None:
+                print(stats)
 
 
 if __name__ == "__main__":

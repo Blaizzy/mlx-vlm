@@ -15,9 +15,11 @@ import pytest
 import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
     _effective_mtp_block_size,
+    _format_speculative_stats,
     _mtp_draft_block_rowwise,
     _speculative_walk,
     _speculative_walk_batch,
+    _speculative_walk_deferred_greedy,
 )
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.drafters import (
@@ -264,19 +266,72 @@ def test_normalize_batched_shared_kv_states_drops_tail_zero_slack():
     ]
 
 
-def test_effective_mtp_block_size_keeps_small_requested_override():
-    assert _effective_mtp_block_size(4, 4, [], 10) == 4
-    assert _effective_mtp_block_size(3, 4, [1, 1], 10) == 3
+def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    fake_head = FakeEmbed()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [
+            [
+                [0, 0, 9, 0],
+                [0, 0, 0, 9],
+                [0, 9, 0, 0],
+                [9, 0, 0, 0],
+            ]
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 1, 3]], dtype=mx.int32)
+    accepted, new_tokens = _speculative_walk_deferred_greedy(
+        lm,
+        target_hidden,
+        draft_tokens,
+        lambda logits: mx.argmax(logits, axis=-1),
+        budget=4,
+    )
+
+    expected_accepted, expected_tokens = _speculative_walk(
+        draft_tokens, mx.argmax(target_hidden, axis=-1), budget=4
+    )
+    assert accepted == expected_accepted
+    assert new_tokens == expected_tokens
+    assert accepted == 1
+    assert new_tokens == [2, 3]
+    assert fake_head.calls == 2
+
+
+def test_format_speculative_stats_includes_variable_draft_rate():
+    stats = _format_speculative_stats(
+        SimpleNamespace(accept_lens=[1, 0, 2], draft_lens=[2, 1, 2])
+    )
+
+    assert (
+        stats
+        == "Speculative decoding: 1.00 accepted tokens/round "
+        "(60.0% of drafted, avg draft 1.67) over 3 rounds"
+    )
+
+
+def test_effective_mtp_block_size_uses_compact_warm_start():
+    assert _effective_mtp_block_size(4, 4, [], 10) == 3
+    assert _effective_mtp_block_size(3, 4, [1, 1], 10) == 2
 
 
 def test_effective_mtp_block_size_warm_starts_from_config_when_override_is_large():
-    assert _effective_mtp_block_size(8, 4, [], 10) == 4
-    assert _effective_mtp_block_size(6, 4, [], 10) == 4
+    assert _effective_mtp_block_size(8, 4, [], 10) == 3
+    assert _effective_mtp_block_size(6, 4, [], 10) == 3
 
 
 def test_effective_mtp_block_size_shrinks_large_override_to_recent_acceptance():
-    assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 4
-    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 3
+    assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 3
+    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 2
     assert _effective_mtp_block_size(8, 4, [0, 0, 0, 0], 10) == 2
 
 
