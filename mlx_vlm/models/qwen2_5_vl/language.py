@@ -34,9 +34,7 @@ class Qwen2RotaryEmbedding(MRoPERotaryEmbedding):
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    return _apply_mrope(
-        q, k, cos, sin, style="chunked", unsqueeze_dim=unqueeze_dim
-    )
+    return _apply_mrope(q, k, cos, sin, style="chunked", unsqueeze_dim=unqueeze_dim)
 
 
 class Attention(nn.Module):

@@ -4,13 +4,13 @@ import pytest
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
     MRoPERotaryEmbedding,
-    apply_multimodal_rotary_pos_emb,
     apply_mrope_frequency_layout,
+    apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_even_odd,
     compute_mrope_frequencies,
     compute_selected_mrope_cos_sin,
-    mrope_section_selectors,
     mrope_position_selector,
+    mrope_section_selectors,
 )
 
 

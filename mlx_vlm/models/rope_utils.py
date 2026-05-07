@@ -218,12 +218,10 @@ def _rotary_apply_kernel(
 
     if sectioned:
         cos_expr = (
-            f"cos[((axis * q_bsz + b) * q_len + t) * {rotary_dim} + "
-            f"{cos_freq_idx}]"
+            f"cos[((axis * q_bsz + b) * q_len + t) * {rotary_dim} + " f"{cos_freq_idx}]"
         )
         sin_expr = (
-            f"sin[((axis * q_bsz + b) * q_len + t) * {rotary_dim} + "
-            f"{cos_freq_idx}]"
+            f"sin[((axis * q_bsz + b) * q_len + t) * {rotary_dim} + " f"{cos_freq_idx}]"
         )
         pair_cos_expr = (
             f"cos[((axis * q_bsz + b) * q_len + t) * {rotary_dim} + "
@@ -236,12 +234,8 @@ def _rotary_apply_kernel(
         selector_source = "int axis = int(position_selector[freq_idx]);"
         input_names = ["x", "cos", "sin", "position_selector"]
     elif cos_ndim == 4:
-        cos_expr = (
-            f"cos[((0 * q_bsz + b) * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
-        )
-        sin_expr = (
-            f"sin[((0 * q_bsz + b) * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
-        )
+        cos_expr = f"cos[((0 * q_bsz + b) * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
+        sin_expr = f"sin[((0 * q_bsz + b) * q_len + t) * {rotary_dim} + {cos_freq_idx}]"
         pair_cos_expr = (
             f"cos[((0 * q_bsz + b) * q_len + t) * {rotary_dim} + "
             f"{pair_cos_freq_idx}]"

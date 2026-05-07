@@ -3,6 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -32,9 +33,7 @@ class Qwen3VLRotaryEmbedding(MRoPERotaryEmbedding):
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    return _apply_mrope(
-        q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim
-    )
+    return _apply_mrope(q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim)
 
 
 class Attention(nn.Module):
@@ -504,9 +503,7 @@ class LanguageModel(nn.Module):
                     if isinstance(cache_offset, mx.array)
                     else int(cache_offset)
                 )
-                visual_pos_masks = visual_pos_masks[
-                    :, start : start + inputs.shape[1]
-                ]
+                visual_pos_masks = visual_pos_masks[:, start : start + inputs.shape[1]]
             else:
                 rows = []
                 for b in range(visual_pos_masks.shape[0]):
