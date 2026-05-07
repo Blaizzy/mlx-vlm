@@ -3059,6 +3059,7 @@ def main():
         port=args.port,
         workers=1,
         reload=args.reload,
+        server_header=False,
     )
 
 
