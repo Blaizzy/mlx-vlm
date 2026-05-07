@@ -2262,6 +2262,9 @@ class PromptProgress:
     prompt_tokens: int
     prompt_tps: float = 0.0
     prompt_time: float = 0.0
+    # Number of leading prompt tokens served from a prefix cache (APC).
+    # Reported back as ``usage.prompt_tokens_details.cached_tokens``.
+    cached_tokens: int = 0
 
 
 class GenerationBatch:
@@ -2829,15 +2832,28 @@ class PromptProcessingBatch:
     def prompt_progress(self) -> List[PromptProgress]:
         if self._prompt_time_s <= 0:
             return []
+        cached_tokens_per_row: List[int] = []
+        for idx in range(len(self._prompt_uids)):
+            meta = (
+                self._apc_meta[idx]
+                if self._apc_meta and idx < len(self._apc_meta)
+                else None
+            )
+            cached_tokens_per_row.append(
+                int(meta.get("prefix_len", 0)) if meta else 0
+            )
         return [
             PromptProgress(
                 uid=uid,
                 prompt_tokens=prompt_tokens,
                 prompt_tps=prompt_tokens / self._prompt_time_s,
                 prompt_time=self._prompt_time_s,
+                cached_tokens=cached,
             )
-            for uid, prompt_tokens in zip(
-                self._prompt_uids, self._prompt_tokens_per_row
+            for uid, prompt_tokens, cached in zip(
+                self._prompt_uids,
+                self._prompt_tokens_per_row,
+                cached_tokens_per_row,
             )
         ]
 
