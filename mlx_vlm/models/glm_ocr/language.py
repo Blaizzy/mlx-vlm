@@ -59,7 +59,7 @@ class GlmOcrRotaryEmbedding(nn.Module):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config)
         self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
         self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
-        self.position_selector = mrope_position_selector(
+        self._position_selector = mrope_position_selector(
             "split_select",
             self.mrope_section,
             self._inv_freq.shape[0],
@@ -71,7 +71,7 @@ class GlmOcrRotaryEmbedding(nn.Module):
             self._inv_freq,
             self.mrope_section,
             style="split_select",
-            position_selector=self.position_selector,
+            position_selector=self._position_selector,
         )
         emb = mx.concatenate((freqs, freqs), axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
