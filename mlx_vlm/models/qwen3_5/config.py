@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Union
 from ..base import BaseModelConfig
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
 
+QWEN_CHAT_EOS_TOKEN_ID = 248046
+
 
 def sanitize_quantization_config(quantization):
     if not isinstance(quantization, dict):
@@ -16,6 +18,29 @@ def sanitize_quantization_config(quantization):
     for key, value in quantization.items():
         sanitized[sanitize_key(key)] = value
     return sanitized
+
+
+def resolve_qwen_eos_token_id(eos_token_id, text_config):
+    if eos_token_id is not None:
+        return eos_token_id
+
+    if isinstance(text_config, dict):
+        text_eos = text_config.get("eos_token_id")
+    else:
+        text_eos = text_config.eos_token_id
+
+    if text_eos is None:
+        return None
+
+    if isinstance(text_eos, list):
+        eos_values = [int(token_id) for token_id in text_eos]
+    else:
+        eos_values = [int(text_eos)]
+
+    if QWEN_CHAT_EOS_TOKEN_ID not in eos_values:
+        eos_values.append(QWEN_CHAT_EOS_TOKEN_ID)
+
+    return eos_values
 
 
 @dataclass
@@ -49,6 +74,7 @@ class TextConfig(BaseModelConfig):
     vocab_size: int
     num_key_value_heads: int
     max_position_embeddings: int
+    eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
     attention_bias: bool = False
     head_dim: Optional[int] = None
@@ -94,7 +120,7 @@ class ModelConfig(BaseModelConfig):
     vision_start_token_id: int = 248045
     vision_end_token_id: int = 248046
     vocab_size: int = 248320
-    eos_token_id: Optional[List[int]] = None
+    eos_token_id: Optional[Union[int, List[int]]] = None
     quantization: Optional[Dict] = None
     quantization_config: Optional[Dict] = None
 
@@ -103,6 +129,9 @@ class ModelConfig(BaseModelConfig):
             self.image_token_index = self.image_token_id
         if self.video_token_index is None:
             self.video_token_index = self.video_token_id
+        self.eos_token_id = resolve_qwen_eos_token_id(
+            self.eos_token_id, self.text_config
+        )
         quantization = self.quantization
         self.quantization = sanitize_quantization_config(quantization)
         if self.quantization_config == quantization:

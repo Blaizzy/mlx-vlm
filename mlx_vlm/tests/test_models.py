@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1013,6 +1014,9 @@ class TestModels(unittest.TestCase):
         self._assert_mrope_decode_uses_cache_idx(
             model.language_model, config.text_config.hidden_size
         )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
+            model.language_model, config.text_config.hidden_size
+        )
 
     def test_qwen2_5_vl(self):
         from mlx_vlm.models import qwen2_5_vl
@@ -1086,6 +1090,9 @@ class TestModels(unittest.TestCase):
 
         # Decode-step RoPE offset must come from cache._idx, not offset.item().
         self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
             model.language_model, config.text_config.hidden_size
         )
 
@@ -1287,6 +1294,75 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        text_configs = {
+            qwen3_5: qwen3_5.TextConfig(
+                model_type="qwen3_5",
+                hidden_size=128,
+                intermediate_size=256,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=1024,
+                num_key_value_heads=2,
+                max_position_embeddings=1024,
+                eos_token_id=248044,
+            ),
+            qwen3_5_moe: qwen3_5_moe.TextConfig(
+                model_type="qwen3_5_moe",
+                hidden_size=128,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                linear_num_value_heads=2,
+                linear_num_key_heads=2,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=4,
+                num_experts=4,
+                num_experts_per_tok=2,
+                shared_expert_intermediate_size=128,
+                moe_intermediate_size=128,
+                rms_norm_eps=1e-5,
+                vocab_size=1024,
+                num_key_value_heads=2,
+                max_position_embeddings=1024,
+                eos_token_id=248044,
+            ),
+        }
+
+        for model_module, text_config in text_configs.items():
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig(
+                    text_config=text_config,
+                    vision_config=SimpleNamespace(),
+                    model_type=model_module.__name__.rsplit(".", 1)[-1],
+                )
+                self.assertEqual(config.eos_token_id, [248044, 248046])
+
+                config_from_dict = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": {"eos_token_id": 248044},
+                        "vision_config": {},
+                    }
+                )
+                self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
+
+                explicit = model_module.ModelConfig(
+                    text_config=text_config,
+                    vision_config=SimpleNamespace(),
+                    model_type=model_module.__name__.rsplit(".", 1)[-1],
+                    eos_token_id=248046,
+                )
+                self.assertEqual(explicit.eos_token_id, 248046)
 
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
@@ -1506,6 +1582,60 @@ class TestModels(unittest.TestCase):
             self.assertEqual(position_ids[0, 0, 0].item(), 10)
         else:
             self.assertEqual(position_ids[0, 0].item(), 10)
+
+    def _assert_mrope_decode_uses_rope_deltas_kwarg(self, language_model, hidden_size):
+        """Shared assertion: under continuous batching, an explicit
+        ``rope_deltas`` kwarg passed by ``GenerationBatch._step()`` must
+        override the mutable ``language_model._rope_deltas`` attribute. The
+        latter can be clobbered mid-decode when a newer request's prefill
+        runs ``get_input_embeddings`` on the same GPU thread.
+        """
+        # Stale per-model state — simulates a newer request having just
+        # prefilled and overwritten ``_rope_deltas``.
+        language_model._rope_deltas = mx.array([[99]])
+        language_model._position_ids = None
+
+        captured = {}
+
+        class _CapturingModel:
+            class _Embed:
+                @staticmethod
+                def as_linear(x):
+                    return x
+
+            embed_tokens = _Embed()
+            # ``fa_idx`` lets the qwen3_5 / qwen3_5_moe cache-indexing path
+            # (``cache[self.model.fa_idx]``) resolve to the stub cache below.
+            fa_idx = 0
+
+            def __call__(self, inputs, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
+
+        language_model.model = _CapturingModel()
+        language_model.lm_head = lambda x: x
+
+        class _StubCacheWithIdx:
+            def __init__(self):
+                self._idx = 10
+                self.offset = mx.array(3)  # 0-d -> scalar decode branch
+
+        # Caller-supplied kwarg (the row-local delta from ``GenerationBatch``)
+        # disagrees with the stale ``_rope_deltas`` (99). Position must
+        # follow the kwarg.
+        kwarg_delta = mx.array([[5]])
+        language_model(
+            mx.array([[7]]),
+            cache=[_StubCacheWithIdx()],
+            rope_deltas=kwarg_delta,
+        )
+
+        position_ids = captured["position_ids"]
+        self.assertIsNotNone(position_ids)
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        # Position == cache._idx (10) + kwarg delta (5) == 15.
+        # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
+        self.assertEqual(position_ids[0, 0, 0].item(), 15)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe

@@ -20,7 +20,7 @@ def main():
     p.add_argument("--drafter", default="gg-hf-am/gemma-4-26B-A4B-it-assistant")
     args = p.parse_args()
 
-    model = load_drafter(args.drafter, kind="mtp")
+    model, _ = load_drafter(args.drafter, kind="mtp")
     cfg = model.config
     text_cfg = cfg.text_config
 

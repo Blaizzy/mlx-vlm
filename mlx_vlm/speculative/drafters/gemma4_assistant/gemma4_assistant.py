@@ -8,7 +8,7 @@ from ....models.gemma4.config import TextConfig
 from ....models.gemma4.language import DecoderLayer
 from .config import Gemma4AssistantConfig
 from .masked_embedder import MaskedEmbedder
-from .masks import make_drafter_masks
+from .masks import make_drafter_masks, normalize_batched_shared_kv_states
 
 
 class _DraftInner(nn.Module):
@@ -114,9 +114,8 @@ class Gemma4AssistantDraftModel(nn.Module):
         shared_kv_states: dict,
         kv_offset,
         position=None,
+        left_padding=None,
     ) -> None:
-
-        self._shared_kv = shared_kv_states
         if isinstance(kv_offset, int):
             self._kv_offset = kv_offset
         else:
@@ -127,6 +126,13 @@ class Gemma4AssistantDraftModel(nn.Module):
             )
         if position is None:
             position = kv_offset
+        if left_padding is not None:
+            shared_kv_states = normalize_batched_shared_kv_states(
+                shared_kv_states,
+                kv_valid_len=position,
+                left_padding=left_padding,
+            )
+        self._shared_kv = shared_kv_states
         if isinstance(position, int):
             self._position = position
         elif isinstance(position, mx.array):
@@ -209,8 +215,13 @@ class Gemma4AssistantDraftModel(nn.Module):
         del cache
         if self._shared_kv is None:
             raise RuntimeError(
-                "set_shared_kv() must be called before draft_block(). "
-                "The round-loop in generate.py is responsible for this."
+                "Gemma 4 assistant drafter requires the MTP round-loop, but "
+                "no shared K/V was set before draft_block() — this typically "
+                "means the DFlash round-loop ran instead. Pass "
+                "--draft-kind mtp on the CLI (or MLX_VLM_DRAFT_KIND=mtp on "
+                "the server). If you call load_drafter() directly, use "
+                "kind='mtp' and pass draft_kind='mtp' through to "
+                "generate_step()."
             )
         if self._input_embed is None:
             raise RuntimeError(
