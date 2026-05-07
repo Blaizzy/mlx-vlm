@@ -51,10 +51,7 @@ from .generate import (
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
-from .tokenizer_utils import (
-    _ServerTokenStreamer,
-    make_streaming_detokenizer,
-)
+from .tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
