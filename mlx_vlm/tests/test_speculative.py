@@ -371,6 +371,37 @@ def test_gemma4_drafter_bind_works_for_language_only_target():
     drafter.bind(target)
 
 
+def test_probe_drafter_compat_returns_value_error_on_mismatch():
+    """Helper surfaces the bind-time ValueError so callers can react.
+
+    Used by ``_initialize_model`` to demote to AR on mismatch instead of
+    letting the generation thread crash on the first request. The future
+    per-request drafter API will use the same probe to surface the error
+    back to the client that explicitly opted into the mismatched drafter.
+    """
+    from mlx_vlm.server import _probe_drafter_compat
+
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=2816)
+    target = _stub_target(hidden_size=5376)
+
+    err = _probe_drafter_compat(drafter, target)
+
+    assert isinstance(err, ValueError)
+    assert "hidden-size mismatch" in str(err)
+    assert "2816" in str(err)
+    assert "5376" in str(err)
+
+
+def test_probe_drafter_compat_returns_none_on_match():
+    """Matched pairing must not be flagged as incompatible."""
+    from mlx_vlm.server import _probe_drafter_compat
+
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=5376)
+    target = _stub_target(hidden_size=5376)
+
+    assert _probe_drafter_compat(drafter, target) is None
+
+
 def test_broadcast_exception_to_active_unblocks_streaming_clients():
     """An exception in _run_speculative must reach every active client.
 

@@ -91,6 +91,23 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _probe_drafter_compat(drafter, target_model) -> Optional[BaseException]:
+    """Return None if the loaded drafter binds cleanly to the target.
+
+    ``drafter.bind(target_model)`` is the source-of-truth compat check
+    (e.g. Gemma 4 MTP raises ``ValueError`` on hidden-size mismatch).
+    bind() is idempotent and re-called per-request, so probing here is
+    side-effect-safe. Returns the exception so the caller can decide how
+    to react (server startup demotes to AR; future per-request path
+    surfaces it to the client).
+    """
+    try:
+        drafter.bind(target_model)
+    except ValueError as exc:
+        return exc
+    return None
+
+
 def _broadcast_exception_to_active(
     rqueues: dict, finished_uids: set, exc: BaseException
 ) -> None:
@@ -364,7 +381,30 @@ class ResponseGenerator:
                     f"using {resolved_kind!r} instead of {draft_kind!r}."
                 )
             draft_kind = resolved_kind
-            print("Drafter ready — speculative decoding enabled.")
+
+            # Probe drafter ↔ target compatibility before announcing
+            # speculative decoding. On mismatch, demote to AR so the
+            # server keeps serving requests instead of crashing the
+            # generation thread on the first request.
+            compat_err = _probe_drafter_compat(draft_model, model)
+            if compat_err is not None:
+                logger.warning(
+                    "Loaded drafter %s is incompatible with target %s; "
+                    "speculative decoding disabled, falling back to "
+                    "autoregressive generation. Reason: %s",
+                    draft_model_path,
+                    self.model_path,
+                    compat_err,
+                )
+                print(
+                    "WARNING: drafter ↔ target incompatibility — "
+                    "speculative decoding DISABLED. Server will run "
+                    "autoregressive. See log for details."
+                )
+                draft_model = None
+                draft_kind = None
+            else:
+                print("Drafter ready — speculative decoding enabled.")
 
         self.model = model
         self.processor = processor
