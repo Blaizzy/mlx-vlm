@@ -91,6 +91,26 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _broadcast_exception_to_active(
+    rqueues: dict, finished_uids: set, exc: BaseException
+) -> None:
+    """Push (exc, None) onto each unfinished per-request queue.
+
+    The streaming iterator at ``ResponseGenerator.token_iterator`` checks
+    ``isinstance(item, Exception)`` and re-raises, which surfaces the error
+    to the client as an HTTP/SSE error instead of an indefinite hang.
+    Mirrors the non-speculative generation thread's recovery pattern.
+    """
+    for uid, rqueue in list(rqueues.items()):
+        if uid in finished_uids:
+            continue
+        try:
+            rqueue.put(exc)
+            rqueue.put(None)
+        except Exception:
+            pass
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -659,9 +679,15 @@ class ResponseGenerator:
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
+            # Per-iteration state — initialized outside the try so the
+            # except handler can broadcast errors back to any client whose
+            # request was already pulled off the request queue.
+            pending: list = []
+            uids: list = []
+            rqueues: dict = {}
+            finished_uids: set = set()
             try:
                 # --- Phase 1: collect pending requests ---
-                pending = []
                 timeout = 0.1
                 try:
                     item = self.requests.get(timeout=timeout)
@@ -683,8 +709,8 @@ class ResponseGenerator:
                     continue
 
                 # --- Phase 2: prefill new batch ---
-                uids = []
-                rqueues = {}
+                # uids, rqueues, finished_uids are pre-initialized above the
+                # try so error broadcast can see partial state.
                 token_lists = {}
                 stream_infos = {}
                 max_tokens_map = {}
@@ -735,7 +761,7 @@ class ResponseGenerator:
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
 
-                finished_uids = set()
+                # finished_uids pre-initialized at top of loop iteration.
 
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
@@ -858,8 +884,21 @@ class ResponseGenerator:
                         rqueues[uid].put(None)
 
             except Exception as e:
-                print(f"Error in speculative generation thread: {e}")
-                traceback.print_exc()
+                logger.exception("Error in speculative generation thread")
+                # Surface the error to every client whose request reached
+                # this iteration. ``rqueues`` covers requests already
+                # admitted to the batch; ``pending`` covers items pulled
+                # off the request queue but not yet registered (the
+                # exception fired between request collection and prefill).
+                for rqueue, *_ in pending:
+                    uid = id(rqueue)
+                    if uid not in rqueues:
+                        rqueues[uid] = rqueue
+                _broadcast_exception_to_active(rqueues, finished_uids, e)
+                # Reset GPU state for the next iteration, mirroring the
+                # non-speculative recovery path.
+                mx.clear_cache()
+                gc.collect()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""

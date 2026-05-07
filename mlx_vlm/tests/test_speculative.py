@@ -369,3 +369,54 @@ def test_gemma4_drafter_bind_works_for_language_only_target():
     drafter = _stub_gemma4_drafter(backbone_hidden_size=5376)
     target = _stub_target(hidden_size=5376, multimodal=False)
     drafter.bind(target)
+
+
+def test_broadcast_exception_to_active_unblocks_streaming_clients():
+    """An exception in _run_speculative must reach every active client.
+
+    Repro of the production hang: when the speculative GPU thread raised
+    a ValueError, the per-request token queue was never signalled, so
+    FastAPI handlers awaited tokens forever. This helper drives the
+    behaviour the streaming iterator at server.py:417-419 relies on
+    (``isinstance(item, Exception): raise item`` followed by ``None``).
+    """
+    from queue import Queue
+
+    from mlx_vlm.server import _broadcast_exception_to_active
+
+    rqueues = {1: Queue(), 2: Queue(), 3: Queue()}
+    finished_uids = {2}  # uid 2 already completed — must not be touched
+    exc = ValueError("mtp drafter ↔ target hidden-size mismatch")
+
+    _broadcast_exception_to_active(rqueues, finished_uids, exc)
+
+    # uid 1 and uid 3 should each see (exc, None) — the iterator raises
+    # on the exception and the None sentinel guards a hang on the next
+    # .get().
+    for uid in (1, 3):
+        assert rqueues[uid].get_nowait() is exc
+        assert rqueues[uid].get_nowait() is None
+        assert rqueues[uid].empty()
+
+    assert rqueues[2].empty()
+
+
+def test_broadcast_exception_to_active_tolerates_full_queue():
+    """A queue raising on .put() must not stop other clients from being unblocked."""
+
+    from mlx_vlm.server import _broadcast_exception_to_active
+
+    class _BrokenQueue:
+        def put(self, _):
+            raise RuntimeError("queue is dead")
+
+    good = SimpleNamespace(puts=[])
+    good.put = good.puts.append
+
+    rqueues = {1: _BrokenQueue(), 2: good}
+    exc = RuntimeError("boom")
+
+    _broadcast_exception_to_active(rqueues, set(), exc)
+
+    # Broken queue did not propagate; good queue still received (exc, None).
+    assert good.puts == [exc, None]
