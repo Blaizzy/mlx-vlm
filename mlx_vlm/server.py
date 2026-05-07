@@ -50,7 +50,10 @@ from .generate import (
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
-from .tokenizer_utils import make_streaming_detokenizer
+from .tokenizer_utils import (
+    _ServerTokenStreamer,
+    make_streaming_detokenizer,
+)
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
@@ -613,7 +616,10 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
-                        "detokenizer": make_streaming_detokenizer(self.processor),
+                        "streamer": _ServerTokenStreamer(
+                            self.tokenizer,
+                            make_streaming_detokenizer(self.processor),
+                        ),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -703,7 +709,10 @@ class ResponseGenerator:
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
                     stream_infos[uid] = {
-                        "detokenizer": make_streaming_detokenizer(self.processor)
+                        "streamer": _ServerTokenStreamer(
+                            self.tokenizer,
+                            make_streaming_detokenizer(self.processor),
+                        )
                     }
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
@@ -844,8 +853,7 @@ class ResponseGenerator:
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
-                        stream_infos[uid]["detokenizer"].finalize()
-                        text = stream_infos[uid]["detokenizer"].last_segment
+                        text = stream_infos[uid]["streamer"].finalize()
                         rqueues[uid].put(
                             StreamingToken(
                                 text=text,
@@ -900,14 +908,7 @@ class ResponseGenerator:
 
     def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:
         """Convert one generated token into a streaming text segment."""
-        detokenizer = info["detokenizer"]
-        if finish_reason == "stop":
-            detokenizer.finalize()
-        else:
-            detokenizer.add_token(token)
-            if finish_reason is not None:
-                detokenizer.finalize()
-        return detokenizer.last_segment
+        return info["streamer"].advance(token, finish_reason)
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
