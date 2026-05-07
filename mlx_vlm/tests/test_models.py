@@ -1014,6 +1014,9 @@ class TestModels(unittest.TestCase):
         self._assert_mrope_decode_uses_cache_idx(
             model.language_model, config.text_config.hidden_size
         )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
+            model.language_model, config.text_config.hidden_size
+        )
 
     def test_qwen2_5_vl(self):
         from mlx_vlm.models import qwen2_5_vl
@@ -1087,6 +1090,9 @@ class TestModels(unittest.TestCase):
 
         # Decode-step RoPE offset must come from cache._idx, not offset.item().
         self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
             model.language_model, config.text_config.hidden_size
         )
 
@@ -1574,6 +1580,60 @@ class TestModels(unittest.TestCase):
         self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
         # Decode position == cache._idx (10), not cache.offset[0].item() (3).
         self.assertEqual(position_ids[0, 0, 0].item(), 10)
+
+    def _assert_mrope_decode_uses_rope_deltas_kwarg(self, language_model, hidden_size):
+        """Shared assertion: under continuous batching, an explicit
+        ``rope_deltas`` kwarg passed by ``GenerationBatch._step()`` must
+        override the mutable ``language_model._rope_deltas`` attribute. The
+        latter can be clobbered mid-decode when a newer request's prefill
+        runs ``get_input_embeddings`` on the same GPU thread.
+        """
+        # Stale per-model state — simulates a newer request having just
+        # prefilled and overwritten ``_rope_deltas``.
+        language_model._rope_deltas = mx.array([[99]])
+        language_model._position_ids = None
+
+        captured = {}
+
+        class _CapturingModel:
+            class _Embed:
+                @staticmethod
+                def as_linear(x):
+                    return x
+
+            embed_tokens = _Embed()
+            # ``fa_idx`` lets the qwen3_5 / qwen3_5_moe cache-indexing path
+            # (``cache[self.model.fa_idx]``) resolve to the stub cache below.
+            fa_idx = 0
+
+            def __call__(self, inputs, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
+
+        language_model.model = _CapturingModel()
+        language_model.lm_head = lambda x: x
+
+        class _StubCacheWithIdx:
+            def __init__(self):
+                self._idx = 10
+                self.offset = mx.array(3)  # 0-d -> scalar decode branch
+
+        # Caller-supplied kwarg (the row-local delta from ``GenerationBatch``)
+        # disagrees with the stale ``_rope_deltas`` (99). Position must
+        # follow the kwarg.
+        kwarg_delta = mx.array([[5]])
+        language_model(
+            mx.array([[7]]),
+            cache=[_StubCacheWithIdx()],
+            rope_deltas=kwarg_delta,
+        )
+
+        position_ids = captured["position_ids"]
+        self.assertIsNotNone(position_ids)
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        # Position == cache._idx (10) + kwarg delta (5) == 15.
+        # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
+        self.assertEqual(position_ids[0, 0, 0].item(), 15)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
