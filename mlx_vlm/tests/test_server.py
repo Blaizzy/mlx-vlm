@@ -376,6 +376,107 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     manager.clear.assert_called_once_with()
 
 
+def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "apc_manager", None)
+    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server, "model_cache", {})
+
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["latest"] is None
+    assert payload["recent"] == []
+    assert payload["summary"]["requests_started"] == 0
+    assert payload["summary"]["requests_completed"] == 0
+    assert payload["summary"]["requests_failed"] == 0
+    assert payload["server"]["loaded_model"] is None
+    assert payload["server"]["apc"] == {"enabled": False}
+
+
+def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "apc_manager", None)
+    monkeypatch.setattr(server, "response_generator", None)
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(max_position_embeddings=4096),
+    )
+    processor = SimpleNamespace()
+    model = SimpleNamespace()
+    monkeypatch.setattr(
+        server,
+        "model_cache",
+        {
+            "model_path": "demo-model",
+            "adapter_path": None,
+            "config": config,
+            "processor": processor,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        MagicMock(return_value=(model, processor, config)),
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+    monkeypatch.setattr(
+        server,
+        "generate",
+        MagicMock(
+            return_value=SimpleNamespace(
+                text="Hello there",
+                prompt_tokens=12,
+                generation_tokens=5,
+                prompt_tps=120.0,
+                generation_tps=50.0,
+                peak_memory=1.25,
+            )
+        ),
+    )
+
+    response = client.post(
+        "/chat/completions",
+        json={
+            "model": "demo-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 8,
+        },
+    )
+
+    assert response.status_code == 200
+
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    payload = metrics.json()
+
+    latest = payload["latest"]
+    assert latest["endpoint"] == "/chat/completions"
+    assert latest["model"] == "demo-model"
+    assert latest["stream"] is False
+    assert latest["backend"] == "generate"
+    assert latest["prompt_tokens"] == 12
+    assert latest["completion_tokens"] == 5
+    assert latest["generated_tokens"] == 5
+    assert latest["prefill_tok_s"] == 120.0
+    assert latest["decode_tok_s"] == 50.0
+    assert latest["peak_memory_gb"] == 1.25
+    assert latest["image_count"] == 0
+    assert latest["audio_count"] == 0
+    assert latest["apc_enabled"] is False
+
+    assert len(payload["recent"]) == 1
+    assert payload["summary"]["requests_started"] == 1
+    assert payload["summary"]["requests_completed"] == 1
+    assert payload["summary"]["requests_failed"] == 0
+    assert payload["summary"]["prompt_tokens_total"] == 12
+    assert payload["summary"]["completion_tokens_total"] == 5
+    assert payload["summary"]["generated_tokens_total"] == 5
+    assert payload["server"]["loaded_model"] == "demo-model"
+    assert payload["server"]["loaded_context_size"] == 4096
+
+
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
 
 
