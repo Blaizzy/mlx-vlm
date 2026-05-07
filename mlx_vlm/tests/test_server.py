@@ -1,5 +1,6 @@
 import time
 from queue import Queue
+from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,7 +10,7 @@ from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
 from mlx_vlm.apc import hash_image_payload
-from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer
+from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
 @pytest.fixture
@@ -618,35 +619,25 @@ class TestResponseGenerator:
             next(token_iter)
         assert cancelled == []
 
-    def test_step_uses_streaming_detokenizer_for_utf8_byte_tokens(self):
-        class ByteFallbackTokenizer:
+    def test_step_streams_spm_subword_tokens_immediately(self):
+        class SentencePieceTokenizer:
             vocab = {
-                "hi": 0,
-                "<0xF0>": 1,
-                "<0x9F>": 2,
-                "<0x98>": 3,
-                "<0x80>": 4,
+                "▁hello": 0,
+                "world": 1,
+                "!": 2,
             }
 
             def decode(self, tokens):
-                text = ""
-                byte_buffer = bytearray()
-                byte_values = {1: 0xF0, 2: 0x9F, 3: 0x98, 4: 0x80}
-
-                def flush_bytes():
-                    nonlocal text, byte_buffer
-                    if byte_buffer:
-                        text += byte_buffer.decode("utf-8", errors="replace")
-                        byte_buffer = bytearray()
-
+                parts = []
                 for token in tokens:
-                    if token == 0:
-                        flush_bytes()
-                        text += "hi"
-                    else:
-                        byte_buffer.append(byte_values[token])
-                flush_bytes()
-                return text
+                    parts.append(
+                        {
+                            0: " hello",
+                            1: "world",
+                            2: "!",
+                        }[token]
+                    )
+                return "".join(parts).lstrip()
 
         class SingleResponseBatch:
             def __init__(self, response):
@@ -655,20 +646,21 @@ class TestResponseGenerator:
             def next(self, **kwargs):
                 return [], [self.response]
 
-        tokenizer = ByteFallbackTokenizer()
-        processor = SimpleNamespace(
-            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
-        )
+        tokenizer = SentencePieceTokenizer()
+        processor = SimpleNamespace(detokenizer=SPMStreamingDetokenizer(tokenizer))
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         rqueue = Queue()
         active = {
             1: {
                 "rqueue": rqueue,
-                "detokenizer": server.make_streaming_detokenizer(processor),
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
             }
         }
 
-        for token in [0, 1, 2, 3, 4]:
+        for token in [0, 1, 2]:
             gen._step(
                 SingleResponseBatch(
                     SimpleNamespace(
@@ -692,14 +684,321 @@ class TestResponseGenerator:
             active,
         )
 
-        streamed_text = ""
+        segments = []
         while not rqueue.empty():
             item = rqueue.get()
             if item is not None:
-                streamed_text += item.text
+                segments.append(item.text)
 
-        assert streamed_text == "hi😀"
+        assert segments == ["hello", "world", "!", ""]
+
+    def test_server_token_streamer_flushes_incomplete_utf8_on_finalize(self):
+        class ByteFallbackTokenizer:
+            vocab = {
+                "<0xF0>": 0,
+                "<0x9F>": 1,
+            }
+
+            def decode(self, tokens):
+                byte_values = {0: 0xF0, 1: 0x9F}
+                return bytes(byte_values[token] for token in tokens).decode(
+                    "utf-8", errors="replace"
+                )
+
+        tokenizer = ByteFallbackTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        streamer = _ServerTokenStreamer(
+            tokenizer,
+            server.make_streaming_detokenizer(processor),
+        )
+
+        assert streamer.advance(0, None) == ""
+        assert streamer.advance(1, None) == ""
+        assert streamer.finalize() == "\ufffd"
+
+    def test_step_streams_multiple_utf8_emojis_with_text_between_them(self):
+        class MixedEmojiTokenizer:
+            vocab = {
+                "hi": 0,
+                "<0xF0>": 1,
+                "<0x9F>": 2,
+                "<0x98>": 3,
+                "<0x80>": 4,
+                "▁mid": 5,
+                "<0x82>": 6,
+                "▁wow": 7,
+                "<0x8E>": 8,
+                "▁done": 9,
+            }
+
+            def decode(self, tokens):
+                text = ""
+                byte_buffer = bytearray()
+                byte_values = {
+                    1: 0xF0,
+                    2: 0x9F,
+                    3: 0x98,
+                    4: 0x80,
+                    6: 0x82,
+                    8: 0x8E,
+                }
+                regular = {0: "hi", 5: "▁mid", 7: "▁wow", 9: "▁done"}
+
+                def flush_bytes():
+                    nonlocal text, byte_buffer
+                    if byte_buffer:
+                        text += byte_buffer.decode("utf-8", errors="replace")
+                        byte_buffer = bytearray()
+
+                for token in tokens:
+                    if token in byte_values:
+                        byte_buffer.append(byte_values[token])
+                    else:
+                        flush_bytes()
+                        text += regular[token].replace("▁", " ")
+                flush_bytes()
+                return text
+
+        class SingleResponseBatch:
+            def __init__(self, response):
+                self.response = response
+
+            def next(self, **kwargs):
+                return [], [self.response]
+
+        tokenizer = MixedEmojiTokenizer()
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
+        )
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
+            }
+        }
+
+        for token in [0, 1, 2, 3, 4, 5, 1, 2, 3, 6, 7, 1, 2, 3, 8, 9, 1, 2, 3, 4]:
+            gen._step(
+                SingleResponseBatch(
+                    SimpleNamespace(
+                        uid=1,
+                        token=token,
+                        token_logprob=0.0,
+                        finish_reason=None,
+                    )
+                ),
+                active,
+            )
+        gen._step(
+            SingleResponseBatch(
+                SimpleNamespace(
+                    uid=1,
+                    token=99,
+                    token_logprob=0.0,
+                    finish_reason="stop",
+                )
+            ),
+            active,
+        )
+
+        segments = []
+        while not rqueue.empty():
+            item = rqueue.get()
+            if item is not None:
+                segments.append(item.text)
+
+        streamed_text = "".join(segments)
+        assert segments == [
+            "hi",
+            "",
+            "",
+            "",
+            "😀",
+            " mid",
+            "",
+            "",
+            "",
+            "😂",
+            " wow",
+            "",
+            "",
+            "",
+            "😎",
+            " done",
+            "",
+            "",
+            "",
+            "😀",
+            "",
+        ]
+        assert streamed_text == "hi😀 mid😂 wow😎 done😀"
         assert "\ufffd" not in streamed_text
+
+    def test_run_batches_eight_streaming_requests(self, monkeypatch):
+        batch_state = {}
+
+        class FakeDetokenizer:
+            def __init__(self):
+                self.last_segment = ""
+
+            def reset(self):
+                self.last_segment = ""
+
+            def add_token(self, token):
+                self.last_segment = str(token)
+
+            def finalize(self):
+                pass
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, **kwargs):
+                del args, kwargs
+                self._next_uid = 1
+                self._active = {}
+                self.inserted_uids = []
+                self.next_active_sizes = []
+                batch_state["instance"] = self
+
+            def insert(self, *args, **kwargs):
+                del args, kwargs
+                uid = self._next_uid
+                self._next_uid += 1
+                self._active[uid] = 0
+                self.inserted_uids.append(uid)
+                return (uid,)
+
+            def remove(self, uid):
+                return self._active.pop(uid, None) is not None
+
+            @property
+            def unprocessed_prompts(self):
+                return []
+
+            @property
+            def has_pending_prompts(self):
+                return False
+
+            def next(self, **kwargs):
+                del kwargs
+                self.next_active_sizes.append(len(self._active))
+                responses = []
+                finished = []
+                for uid in sorted(self._active):
+                    step = self._active[uid]
+                    token = uid * 10 + step
+                    finish_reason = None if step == 0 else "length"
+                    responses.append(
+                        SimpleNamespace(
+                            uid=uid,
+                            token=token,
+                            token_logprob=0.0,
+                            finish_reason=finish_reason,
+                        )
+                    )
+                    if finish_reason is None:
+                        self._active[uid] = step + 1
+                    else:
+                        finished.append(uid)
+                for uid in finished:
+                    del self._active[uid]
+                return [], responses
+
+        monkeypatch.setattr(server, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(
+            server, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.model_path = "demo"
+        gen.adapter_path = None
+        gen.model = None
+        gen.processor = None
+        gen.config = None
+        gen.stop_tokens = set()
+        gen.vision_cache = None
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.kv_bits = None
+        gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+        gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+        gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+        gen.top_logprobs_k = 0
+        gen.apc_manager = None
+        gen.tokenizer = SimpleNamespace()
+        gen.requests = Queue()
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+        gen._cancelled = set()
+        gen._cancel_lock = Lock()
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = None
+            gen.draft_kind = None
+            gen.tokenizer = SimpleNamespace()
+
+        gen._initialize_model = fake_initialize_model
+        gen._gpu_embed = lambda raw_inputs, images=None: (
+            mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
+            {},
+        )
+
+        request_queues = []
+        for request_id in range(8):
+            rqueue = Queue()
+            request_queues.append(rqueue)
+            gen.requests.put(
+                (
+                    rqueue,
+                    {"request_id": request_id},
+                    1,
+                    server.GenerationArguments(max_tokens=2),
+                    None,
+                )
+            )
+
+        worker = Thread(target=gen._run, daemon=True)
+        worker.start()
+
+        streamed_by_uid = {}
+        try:
+            for rqueue in request_queues:
+                ctx = rqueue.get(timeout=1)
+                assert isinstance(ctx, server.GenerationContext)
+                assert ctx.prompt_tokens == 1
+
+                items = []
+                while True:
+                    item = rqueue.get(timeout=1)
+                    if item is None:
+                        break
+                    items.append((item.text, item.finish_reason))
+                streamed_by_uid[ctx.uid] = items
+        finally:
+            gen._stop = True
+            gen.requests.put(None)
+            worker.join(timeout=2)
+
+        batch_gen = batch_state["instance"]
+        assert batch_gen.inserted_uids == list(range(1, 9))
+        assert batch_gen.next_active_sizes[:2] == [8, 8]
+        assert len(streamed_by_uid) == 8
+        for uid, items in streamed_by_uid.items():
+            assert items == [
+                (str(uid * 10), None),
+                (str(uid * 10 + 1), "length"),
+            ]
 
     def test_step_attaches_prompt_tps_from_prompt_progress(self):
         class SimpleTokenizer:
@@ -722,15 +1021,19 @@ class TestResponseGenerator:
                     ],
                 )
 
+        tokenizer = SimpleTokenizer()
         processor = SimpleNamespace(
-            detokenizer=SPMStreamingDetokenizer(SimpleTokenizer(), trim_space=False)
+            detokenizer=SPMStreamingDetokenizer(tokenizer, trim_space=False)
         )
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         rqueue = Queue()
         active = {
             1: {
                 "rqueue": rqueue,
-                "detokenizer": server.make_streaming_detokenizer(processor),
+                "streamer": _ServerTokenStreamer(
+                    tokenizer,
+                    server.make_streaming_detokenizer(processor),
+                ),
                 "prompt_tps": None,
             }
         }
