@@ -999,6 +999,7 @@ class TestResponseGenerator:
                 (str(uid * 10), None),
                 (str(uid * 10 + 1), "length"),
             ]
+
     def test_step_attaches_prompt_tps_from_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
