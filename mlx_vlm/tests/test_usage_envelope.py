@@ -1,19 +1,19 @@
 """Tests for the streaming/non-streaming usage envelope fixes.
 
-Covers two intertwined fixes:
+Covers two related fixes:
 
   * Streaming /chat/completions chunks were being constructed with a
-    plain ``dict`` for ``usage`` that dropped ``prompt_tps``,
-    ``generation_tps``, ``peak_memory``, and ``prompt_tokens_details``.
-    They now use ``UsageStats``.
-  * Non-streaming ``_blocking_generate`` previously dropped
-    ``generation_tps`` (only ``prompt_tps`` was returned), so the
-    final ``UsageStats.generation_tps`` was always 0. The tuple is now
-    extended.
+    plain ``dict`` for ``usage``. Pydantic coerced it into ``UsageStats``
+    with ``prompt_tps``, ``peak_memory``, and ``prompt_tokens_details``
+    silently filled from defaults — clients always saw 0. Pass a full
+    ``UsageStats`` so chunks report real rates.
   * ``cached_tokens`` is plumbed from APC's per-row ``prefix_len``
     through ``PromptProgress`` → ``StreamingToken`` →
     ``UsageStats.prompt_tokens_details.cached_tokens``, mirroring
     OpenAI's ``input_tokens_details.cached_tokens``.
+
+``generation_tps`` is intentionally untouched — its source is not yet
+wired in continuous batching (#1113 is the open PR for that).
 
 These tests run without a real model — they exercise the data-class
 plumbing only.
@@ -49,19 +49,17 @@ def test_prompt_progress_carries_cached_tokens():
     assert PromptProgress(uid=1, prompt_tokens=10).cached_tokens == 0
 
 
-def test_streaming_token_carries_tps_and_cached_tokens():
+def test_streaming_token_carries_prompt_tps_and_cached_tokens():
     tok = StreamingToken(
         text="x",
         token=42,
         logprobs=0.0,
         finish_reason=None,
         prompt_tps=120.0,
-        generation_tps=33.5,
         cached_tokens=128,
     )
     assert tok.cached_tokens == 128
     assert tok.prompt_tps == 120.0
-    assert tok.generation_tps == 33.5
 
 
 def test_streaming_token_defaults_preserve_old_callers():
@@ -69,7 +67,7 @@ def test_streaming_token_defaults_preserve_old_callers():
         text="x", token=1, logprobs=0.0, finish_reason=None,
     )
     assert tok.cached_tokens == 0
-    assert tok.generation_tps is None
+    assert tok.prompt_tps is None
 
 
 def test_generation_context_unchanged():

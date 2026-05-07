@@ -498,7 +498,6 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
-    generation_tps: Optional[float] = None
     # Number of leading prompt tokens served from a prefix cache (APC).
     # Surfaced via PromptProgress on the first prompt response and copied
     # onto every subsequent StreamingToken for the same request so the
@@ -2349,9 +2348,6 @@ async def responses_endpoint(request: Request):
                                 float(getattr(token, "peak_memory", 0.0) or 0.0),
                             )
                             prompt_tps = getattr(token, "prompt_tps", prompt_tps)
-                            generation_tps = (
-                                getattr(token, "generation_tps", None) or generation_tps
-                            )
                             tok_cached = int(getattr(token, "cached_tokens", 0) or 0)
                             if tok_cached:
                                 cached_tokens = tok_cached
@@ -2877,9 +2873,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 float(getattr(token, "peak_memory", 0.0) or 0.0),
                             )
                             prompt_tps = getattr(token, "prompt_tps", prompt_tps)
-                            generation_tps = (
-                                getattr(token, "generation_tps", None) or generation_tps
-                            )
                             tok_cached = int(getattr(token, "cached_tokens", 0) or 0)
                             if tok_cached:
                                 cached_tokens = tok_cached
@@ -3179,7 +3172,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         pm = 0.0
                         tt: List[float] = []
                         ptps = None
-                        gtps = None
                         cached = 0
                         fr = None
                         ctx, token_iter = response_generator.generate(
@@ -3194,7 +3186,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gt += 1
                             tt.append(time.perf_counter())
                             ptps = getattr(token, "prompt_tps", ptps)
-                            gtps = getattr(token, "generation_tps", gtps) or gtps
                             tok_cached = int(getattr(token, "cached_tokens", 0) or 0)
                             if tok_cached:
                                 cached = tok_cached
@@ -3210,14 +3201,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, ptps, gtps, pm, tt, cached, fr
+                        return text, pt, gt, ptps, pm, tt, cached, fr
 
                     (
                         full_text,
                         prompt_tokens,
                         output_tokens,
                         prompt_tps,
-                        generation_tps,
                         peak_memory,
                         token_times,
                         cached_tokens,
