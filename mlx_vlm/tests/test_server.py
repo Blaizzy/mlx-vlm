@@ -375,7 +375,6 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     assert response.json() == {"enabled": True, "status": "cleared"}
     manager.clear.assert_called_once_with()
 
-
 def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server, "apc_manager", None)
@@ -652,6 +651,46 @@ class TestResponseGenerator:
 
         assert streamed_text == "hi😀"
         assert "\ufffd" not in streamed_text
+
+    def test_step_attaches_prompt_tps_from_prompt_progress(self):
+        class SimpleTokenizer:
+            vocab = {"hi": 0}
+
+            def decode(self, tokens):
+                return "hi" if tokens else ""
+
+        class PromptProgressBatch:
+            def next(self, **kwargs):
+                return (
+                    [SimpleNamespace(uid=1, prompt_tps=184.431)],
+                    [
+                        SimpleNamespace(
+                            uid=1,
+                            token=0,
+                            token_logprob=0.0,
+                            finish_reason="stop",
+                        )
+                    ],
+                )
+
+        processor = SimpleNamespace(
+            detokenizer=SPMStreamingDetokenizer(SimpleTokenizer(), trim_space=False)
+        )
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "detokenizer": server.make_streaming_detokenizer(processor),
+                "prompt_tps": None,
+            }
+        }
+
+        gen._step(PromptProgressBatch(), active)
+
+        item = rqueue.get()
+        assert item.prompt_tps == pytest.approx(184.431)
+        assert rqueue.get() is None
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits

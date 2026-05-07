@@ -343,7 +343,6 @@ def _build_metrics_envelope(
     tool_calls: bool = False,
 ) -> dict:
     token_times = token_times or []
-    prompt_eval_time_s = _prompt_eval_time_from_tps(prompt_tokens, prompt_tps)
     ttft_s = (
         max(0.0, token_times[0] - request_started_s)
         if token_times
@@ -357,6 +356,7 @@ def _build_metrics_envelope(
         decode_tok_s = generation_tps
     elif decode_elapsed_s is not None and decode_elapsed_s > 0 and generated_tokens > 0:
         decode_tok_s = generated_tokens / decode_elapsed_s
+    prompt_eval_time_s = _prompt_eval_time_from_tps(prompt_tokens, prompt_tps)
     request_tok_s = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
@@ -499,6 +499,7 @@ class StreamingToken:
     logprobs: float
     finish_reason: Optional[str]
     peak_memory: float = 0.0
+    prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
 
 
@@ -871,6 +872,7 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "detokenizer": make_streaming_detokenizer(self.processor),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
+                        "prompt_tps": None,
                     }
 
                 if not active or batch_gen is None:
@@ -944,6 +946,8 @@ class ResponseGenerator:
                 token_lists = {}
                 stream_infos = {}
                 max_tokens_map = {}
+                prompt_tokens_map = {}
+                prompt_tps_map = {}
                 all_input_ids = []
                 prompt_kwargs_list = []
 
@@ -962,6 +966,7 @@ class ResponseGenerator:
                         "detokenizer": make_streaming_detokenizer(self.processor)
                     }
                     max_tokens_map[uid] = args.max_tokens
+                    prompt_tokens_map[uid] = prompt_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -984,12 +989,21 @@ class ResponseGenerator:
                 lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
                 lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
 
+                prompt_started = time.perf_counter()
                 with mx.stream(generation_stream):
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
                 hidden = _speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
+                prompt_elapsed = time.perf_counter() - prompt_started
+                for uid in uids:
+                    prompt_tokens = prompt_tokens_map[uid]
+                    prompt_tps_map[uid] = (
+                        prompt_tokens / prompt_elapsed
+                        if prompt_tokens > 0 and prompt_elapsed > 0
+                        else None
+                    )
 
                 finished_uids = set()
 
@@ -1009,6 +1023,7 @@ class ResponseGenerator:
                             logprobs=0.0,
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9,
+                            prompt_tps=prompt_tps_map.get(uid),
                         )
                     )
                     if finish is not None:
@@ -1080,6 +1095,7 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason=finish,
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
 
@@ -1109,6 +1125,7 @@ class ResponseGenerator:
                                 logprobs=0.0,
                                 finish_reason="length",
                                 peak_memory=mx.get_peak_memory() / 1e9,
+                                prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
                         rqueues[uid].put(None)
@@ -1120,7 +1137,12 @@ class ResponseGenerator:
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        _, responses = batch_gen.next(**kwargs)
+        prompt_responses, responses = batch_gen.next(**kwargs)
+        for prompt_response in prompt_responses:
+            if prompt_response.uid in active:
+                active[prompt_response.uid]["prompt_tps"] = (
+                    prompt_response.prompt_tps
+                )
         if not responses:
             return
 
@@ -1146,6 +1168,7 @@ class ResponseGenerator:
                     logprobs=lp,
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
+                    prompt_tps=info.get("prompt_tps"),
                     top_logprobs=getattr(r, "top_logprobs", None),
                 )
             )
@@ -2305,6 +2328,7 @@ async def responses_endpoint(request: Request):
                                 peak_memory,
                                 float(getattr(token, "peak_memory", 0.0) or 0.0),
                             )
+                            prompt_tps = getattr(token, "prompt_tps", prompt_tps)
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
@@ -2490,12 +2514,14 @@ async def responses_endpoint(request: Request):
                         text = ""
                         ot = 0
                         tt: List[float] = []
+                        ptps = None
                         pm = 0.0
                         fr = None
                         for tok in ti:
                             text += tok.text
                             ot += 1
                             tt.append(time.perf_counter())
+                            ptps = getattr(tok, "prompt_tps", ptps)
                             pm = max(
                                 pm, float(getattr(tok, "peak_memory", 0.0) or 0.0)
                             )
@@ -2506,13 +2532,14 @@ async def responses_endpoint(request: Request):
                             ti.close()
                         except Exception:
                             pass
-                        return ctx_.prompt_tokens, text, ot, tt, pm, fr
+                        return ctx_.prompt_tokens, text, ot, tt, ptps, pm, fr
 
                     (
                         prompt_tokens,
                         full_text,
                         output_tokens,
                         token_times,
+                        prompt_tps,
                         peak_memory,
                         finish_reason,
                     ) = await asyncio.to_thread(_blocking_resp)
@@ -2819,6 +2846,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 peak_memory,
                                 float(getattr(token, "peak_memory", 0.0) or 0.0),
                             )
+                            prompt_tps = getattr(token, "prompt_tps", prompt_tps)
 
                             # Detect thinking boundaries
                             delta_reasoning = None
@@ -3105,6 +3133,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         pt = gt = 0
                         pm = 0.0
                         tt: List[float] = []
+                        ptps = None
                         fr = None
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
@@ -3117,6 +3146,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             text += token.text
                             gt += 1
                             tt.append(time.perf_counter())
+                            ptps = getattr(token, "prompt_tps", ptps)
                             pm = token.peak_memory
                             if request.logprobs and token.finish_reason != "stop":
                                 collected_logprobs.append(
@@ -3129,12 +3159,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, pm, tt, fr
+                        return text, pt, gt, ptps, pm, tt, fr
 
                     (
                         full_text,
                         prompt_tokens,
                         output_tokens,
+                        prompt_tps,
                         peak_memory,
                         token_times,
                         finish_reason,
@@ -3178,6 +3209,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tps=float(prompt_tps or 0.0),
+                    generation_tps=float(generation_tps or 0.0),
                     peak_memory=peak_memory,
                 )
 
