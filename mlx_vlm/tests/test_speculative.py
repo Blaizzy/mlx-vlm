@@ -15,6 +15,7 @@ import pytest
 import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
     _effective_mtp_block_size,
+    _mtp_draft_block_rowwise,
     _speculative_walk,
     _speculative_walk_batch,
 )
@@ -277,6 +278,58 @@ def test_effective_mtp_block_size_shrinks_large_override_to_recent_acceptance():
     assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 4
     assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 3
     assert _effective_mtp_block_size(8, 4, [0, 0, 0, 0], 10) == 2
+
+
+def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_binding():
+    class FakeDraftModel:
+        def __init__(self):
+            self._shared_kv = None
+
+        def set_shared_kv(
+            self, shared_kv_states, kv_offset, position=None, left_padding=None
+        ):
+            del kv_offset, position, left_padding
+            self._shared_kv = shared_kv_states
+
+        def draft_block(
+            self,
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype,
+        ):
+            batch_size = hidden.shape[0]
+            del cache, sampler
+            base = int(
+                next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item()
+            )
+            bonus = last_bonus if isinstance(last_bonus, int) else int(last_bonus[0].item())
+            row_count = 1 if isinstance(last_bonus, int) else batch_size
+            return mx.full((row_count, block_size - 1), base + bonus, dtype=token_dtype)
+
+    draft_model = FakeDraftModel()
+    shared_kv = {
+        "full_attention": (
+            mx.array([[[[10.0]]], [[[20.0]]]], dtype=mx.float32),
+            mx.zeros((2, 1, 1, 1), dtype=mx.float32),
+        )
+    }
+    draft_model.set_shared_kv(shared_kv, kv_offset=11, position=mx.array([11, 12]))
+
+    drafted = _mtp_draft_block_rowwise(
+        draft_model,
+        bonus_tokens=[3, 7],
+        hidden=mx.zeros((2, 1, 1), dtype=mx.float32),
+        block_size=2,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+        positions=[11, 12],
+    )
+
+    assert drafted.tolist() == [[13], [27]]
+    assert next(iter(draft_model._shared_kv.values()))[0].shape[0] == 2
 
 
 def test_gemma4_assistant_overrides_dflash_to_mtp(tmp_path, caplog):

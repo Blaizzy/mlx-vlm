@@ -668,6 +668,68 @@ def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
     return None
 
 
+def _mtp_draft_block_rowwise(
+    draft_model,
+    bonus_tokens: List[int],
+    hidden: mx.array,
+    block_size: int,
+    sampler: Callable[[mx.array], mx.array],
+    token_dtype: mx.Dtype,
+    positions: List[int],
+) -> mx.array:
+    """Draft each active MTP row independently.
+
+    The batched Gemma 4 assistant forward can drift from the singleton
+    drafter even when the target verify path is identical. Drafting rows
+    one-by-one recovers the singleton behavior while keeping batched
+    target verification intact.
+    """
+    if hidden.shape[0] <= 1:
+        return draft_model.draft_block(
+            mx.array(bonus_tokens, dtype=token_dtype),
+            hidden,
+            None,
+            block_size,
+            sampler,
+            token_dtype,
+        )
+
+    shared_kv = getattr(draft_model, "_shared_kv", None)
+    if shared_kv is None:
+        raise RuntimeError("MTP drafter missing shared K/V before rowwise draft.")
+
+    rowwise_tokens = []
+    for row_idx, (bonus_token, position) in enumerate(zip(bonus_tokens, positions)):
+        per_row_shared_kv = {
+            layer_type: (keys[row_idx : row_idx + 1], values[row_idx : row_idx + 1])
+            for layer_type, (keys, values) in shared_kv.items()
+        }
+        draft_model.set_shared_kv(
+            per_row_shared_kv,
+            kv_offset=position,
+            position=position,
+            left_padding=None,
+        )
+        rowwise_tokens.append(
+            draft_model.draft_block(
+                bonus_token,
+                hidden[row_idx : row_idx + 1],
+                None,
+                block_size,
+                sampler,
+                token_dtype,
+            )
+        )
+
+    draft_model.set_shared_kv(
+        shared_kv,
+        kv_offset=max(positions),
+        position=mx.array(positions),
+        left_padding=None,
+    )
+    return mx.concatenate(rowwise_tokens, axis=0)
+
+
 def _mtp_rounds_batch(
     model: nn.Module,
     draft_model: nn.Module,
@@ -751,12 +813,19 @@ def _mtp_rounds_batch(
 
         n_active = len(active_idx)
         b_active = [b[active_idx[j]] for j in range(n_active)]
+        positions_active = [positions[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
 
         # Draft (autoregressive K-step). hidden / shared_kv state was set
         # via set_shared_kv above; the drafter pulls it from there.
-        draft_tokens = draft_model.draft_block(
-            b_arr, hidden, None, bs, sampler, token_dtype
+        draft_tokens = _mtp_draft_block_rowwise(
+            draft_model,
+            b_active,
+            hidden,
+            bs,
+            sampler,
+            token_dtype,
+            positions_active,
         )
         mx.async_eval(draft_tokens)
 
@@ -778,8 +847,10 @@ def _mtp_rounds_batch(
         accepted_list, new_tokens_list = _speculative_walk_batch(
             draft_tokens, target_tokens, budgets
         )
-        for a in accepted_list:
-            draft_model.accept_lens.append(a)
+        # Keep the adaptive block-size history on a per-round basis so
+        # batched MTP reacts like the singleton loop instead of letting
+        # batch size change the controller signal.
+        draft_model.accept_lens.append(sum(accepted_list) / len(accepted_list))
 
         max_a = max(accepted_list)
         accepted_arr = mx.array(accepted_list)
