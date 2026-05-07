@@ -2254,6 +2254,16 @@ class BatchResponse:
     image_sizes: Optional[List[Tuple[int, int]]] = None
 
 
+@dataclass
+class PromptProgress:
+    """Per-request prompt processing metrics for continuous batching."""
+
+    uid: int
+    prompt_tokens: int
+    prompt_tps: float = 0.0
+    prompt_time: float = 0.0
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -2591,6 +2601,7 @@ class PromptProcessingBatch:
     ):
         self.model = model
         self.uids = uids
+        self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
 
@@ -2643,6 +2654,15 @@ class PromptProcessingBatch:
         self._apc_manager = apc_manager
         self._apc_mode = apc_mode
         self._apc_harvest_enabled = True
+        self._prompt_time_s = 0.0
+        self._prompt_tokens_per_row: List[int] = []
+        for idx, suffix_len in enumerate(lengths):
+            full_input_ids = None
+            if idx < len(self._apc_meta) and self._apc_meta[idx] is not None:
+                full_input_ids = self._apc_meta[idx].get("full_input_ids")
+            self._prompt_tokens_per_row.append(
+                len(full_input_ids) if full_input_ids is not None else suffix_len
+            )
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -2803,6 +2823,24 @@ class PromptProcessingBatch:
         mx.clear_cache()
         return n
 
+    def record_prompt_time(self, elapsed_s: float) -> None:
+        self._prompt_time_s += max(0.0, float(elapsed_s))
+
+    def prompt_progress(self) -> List[PromptProgress]:
+        if self._prompt_time_s <= 0:
+            return []
+        return [
+            PromptProgress(
+                uid=uid,
+                prompt_tokens=prompt_tokens,
+                prompt_tps=prompt_tokens / self._prompt_time_s,
+                prompt_time=self._prompt_time_s,
+            )
+            for uid, prompt_tokens in zip(
+                self._prompt_uids, self._prompt_tokens_per_row
+            )
+        ]
+
     def generate(
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
@@ -2838,6 +2876,8 @@ class PromptProcessingBatch:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
+
+        mx.async_eval(first_tokens)
 
         # Roll any right-padding into left-padding so the cache decoded by
         # GenerationBatch sees a canonical layout.
@@ -3008,7 +3048,7 @@ class BatchGenerator:
     Continuous batching with separate prompt processing and generation phases.
 
     next() returns (prompt_responses, generation_responses) where:
-    - prompt_responses is currently always [] (reserved for progress tracking)
+    - prompt_responses contains completed prompt-batch timing stats
     - generation_responses is a list of GenerationBatch.Response objects
     """
 
@@ -3493,6 +3533,19 @@ class BatchGenerator:
         stats.peak_memory = mx.get_peak_memory() / 1e9
         return stats
 
+    @staticmethod
+    def _record_prompt_batch_time(prompt_batch, elapsed_s: float) -> None:
+        recorder = getattr(prompt_batch, "record_prompt_time", None)
+        if callable(recorder):
+            recorder(elapsed_s)
+
+    @staticmethod
+    def _prompt_batch_progress(prompt_batch) -> List[PromptProgress]:
+        progress = getattr(prompt_batch, "prompt_progress", None)
+        if callable(progress):
+            return progress()
+        return []
+
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
@@ -3512,7 +3565,9 @@ class BatchGenerator:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
@@ -3523,7 +3578,10 @@ class BatchGenerator:
                 compute_logprobs=self.compute_logprobs,
                 top_logprobs_k=self.top_logprobs_k,
             )
-            self._prompt_time_counter += time.perf_counter() - tic
+            elapsed = time.perf_counter() - tic
+            self._prompt_time_counter += elapsed
+            self._record_prompt_batch_time(self._prompt_batch, elapsed)
+            prompt_responses = self._prompt_batch_progress(self._prompt_batch)
             self._generation_batch.extend(gen_batch)
             self._prompt_batch = None
             mx.clear_cache()
@@ -3552,7 +3610,9 @@ class BatchGenerator:
                 if self._prompt_batch.needs_processing():
                     tic = time.perf_counter()
                     nstep = self._prompt_batch.prompt_step()
-                    self._prompt_time_counter += time.perf_counter() - tic
+                    elapsed = time.perf_counter() - tic
+                    self._prompt_time_counter += elapsed
+                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 else:
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
@@ -3561,7 +3621,10 @@ class BatchGenerator:
                         compute_logprobs=self.compute_logprobs,
                         top_logprobs_k=self.top_logprobs_k,
                     )
-                    self._prompt_time_counter += time.perf_counter() - tic
+                    elapsed = time.perf_counter() - tic
+                    self._prompt_time_counter += elapsed
+                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                    prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                     self._generation_batch.extend(gen_batch)
                     self._prompt_batch = None
                     mx.clear_cache()
@@ -3603,7 +3666,9 @@ class BatchGenerator:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
             else:
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(
@@ -3612,7 +3677,10 @@ class BatchGenerator:
                     compute_logprobs=self.compute_logprobs,
                     top_logprobs_k=self.top_logprobs_k,
                 )
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 self._generation_batch.extend(gen_batch)
                 self._prompt_batch = None
                 mx.clear_cache()
