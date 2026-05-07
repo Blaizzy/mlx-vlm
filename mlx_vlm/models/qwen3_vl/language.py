@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -452,14 +451,11 @@ class LanguageModel(nn.Module):
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
                 max_position_ids = position_ids.max(axis=-1, keepdims=True)
-                position_ids = mx.broadcast_to(
-                    position_ids[None, :, :], (3, *position_ids.shape)
-                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
-                    position_ids, (3, input_ids.shape[0], input_ids.shape[1])
+                    position_ids, (input_ids.shape[0], input_ids.shape[1])
                 )
                 mrope_position_deltas = mx.zeros(
                     [input_ids.shape[0], 1],
@@ -534,10 +530,29 @@ class LanguageModel(nn.Module):
             )
             if recalc_condition:
                 if self._position_ids is not None:
-                    seq_length = inputs.shape[1]
-                    position_ids = self._position_ids[
-                        :, :, cache_offset : cache_offset + seq_length
-                    ]
+                    batch_size, seq_length = inputs.shape
+                    if (
+                        self._position_ids.ndim == 3
+                        and self._position_ids.shape[1] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, :, cache_offset : cache_offset + seq_length
+                        ]
+                    elif (
+                        self._position_ids.ndim == 2
+                        and self._position_ids.shape[0] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, cache_offset : cache_offset + seq_length
+                        ]
+                    else:
+                        position_ids, rope_deltas = self.get_rope_index(
+                            inputs, image_grid_thw, video_grid_thw, rope_mask
+                        )
+                        self._rope_deltas = rope_deltas
+                        self._position_ids = position_ids
                 else:
                     position_ids, rope_deltas = self.get_rope_index(
                         inputs, image_grid_thw, video_grid_thw, rope_mask
@@ -578,10 +593,12 @@ class LanguageModel(nn.Module):
                 if delta.ndim == 1:
                     delta = delta.reshape(-1, 1)
 
-                position_ids = mx.add(position_ids, delta)[None, ...]
-                position_ids = mx.broadcast_to(
-                    position_ids, (3, batch_size, seq_length)
-                )
+                position_ids = mx.add(position_ids, delta)
+                if self._position_ids is not None and self._position_ids.ndim == 3:
+                    position_ids = position_ids[None, ...]
+                    position_ids = mx.broadcast_to(
+                        position_ids, (3, batch_size, seq_length)
+                    )
 
         out = self.model(
             inputs,
