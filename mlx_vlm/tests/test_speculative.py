@@ -11,10 +11,10 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import BatchKVCache
 
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
-from mlx_lm.models.cache import BatchKVCache
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
