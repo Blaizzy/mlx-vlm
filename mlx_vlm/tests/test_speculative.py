@@ -16,9 +16,10 @@ import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
     _effective_mtp_block_size,
     _format_speculative_stats,
-    _mtp_draft_block_rowwise,
+    _mtp_draft_block_active,
     _speculative_walk,
     _speculative_walk_batch,
+    _speculative_walk_batch_deferred_greedy,
     _speculative_walk_deferred_greedy,
 )
 from mlx_vlm.models.cache import ArraysCache
@@ -307,6 +308,54 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
     assert fake_head.calls == 2
 
 
+def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    fake_head = FakeEmbed()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [
+            [
+                [0, 0, 9, 0],
+                [0, 9, 0, 0],
+                [0, 0, 0, 9],
+            ],
+            [
+                [9, 0, 0, 0],
+                [0, 0, 9, 0],
+                [0, 9, 0, 0],
+            ],
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 3], [0, 2]], dtype=mx.int32)
+
+    accepted, new_tokens = _speculative_walk_batch_deferred_greedy(
+        lm,
+        target_hidden,
+        draft_tokens,
+        lambda logits: mx.argmax(logits, axis=-1),
+        budgets=[3, 2],
+    )
+
+    expected_accepted, expected_tokens = _speculative_walk_batch(
+        draft_tokens,
+        mx.argmax(target_hidden, axis=-1),
+        budgets=[3, 2],
+    )
+    assert accepted == expected_accepted
+    assert new_tokens == expected_tokens
+    assert accepted == [1, 2]
+    assert new_tokens == [[2, 1], [0, 2]]
+    assert fake_head.calls == 3
+
+
 def test_format_speculative_stats_includes_variable_draft_rate():
     stats = _format_speculative_stats(
         SimpleNamespace(accept_lens=[1, 0, 2], draft_lens=[2, 1, 2])
@@ -319,23 +368,17 @@ def test_format_speculative_stats_includes_variable_draft_rate():
     )
 
 
-def test_effective_mtp_block_size_uses_compact_warm_start():
-    assert _effective_mtp_block_size(4, 4, [], 10) == 3
-    assert _effective_mtp_block_size(3, 4, [1, 1], 10) == 2
+def test_effective_mtp_block_size_respects_requested_block_size():
+    assert _effective_mtp_block_size(4, 4, [], 10) == 4
+    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 8
 
 
-def test_effective_mtp_block_size_warm_starts_from_config_when_override_is_large():
-    assert _effective_mtp_block_size(8, 4, [], 10) == 3
-    assert _effective_mtp_block_size(6, 4, [], 10) == 3
+def test_effective_mtp_block_size_caps_to_remaining_budget():
+    assert _effective_mtp_block_size(8, 4, [], 3) == 3
+    assert _effective_mtp_block_size(6, 4, [2, 2, 2, 2], 1) == 1
 
 
-def test_effective_mtp_block_size_shrinks_large_override_to_recent_acceptance():
-    assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 3
-    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 2
-    assert _effective_mtp_block_size(8, 4, [0, 0, 0, 0], 10) == 2
-
-
-def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_binding():
+def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
     class FakeDraftModel:
         def __init__(self):
             self._shared_kv = None
@@ -373,7 +416,7 @@ def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_bindi
     }
     draft_model.set_shared_kv(shared_kv, kv_offset=11, position=mx.array([11, 12]))
 
-    drafted = _mtp_draft_block_rowwise(
+    drafted = _mtp_draft_block_active(
         draft_model,
         bonus_tokens=[3, 7],
         hidden=mx.zeros((2, 1, 1), dtype=mx.float32),
@@ -385,6 +428,40 @@ def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_bindi
 
     assert drafted.tolist() == [[13], [27]]
     assert next(iter(draft_model._shared_kv.values()))[0].shape[0] == 2
+
+
+def test_mtp_draft_block_active_uses_batched_path_for_aligned_positions():
+    class FakeDraftModel:
+        def __init__(self):
+            self.calls = []
+
+        def draft_block(
+            self,
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype,
+        ):
+            del cache, sampler
+            self.calls.append((last_bonus.shape, hidden.shape))
+            return last_bonus[:, None].astype(token_dtype) + mx.arange(block_size - 1)
+
+    draft_model = FakeDraftModel()
+
+    drafted = _mtp_draft_block_active(
+        draft_model,
+        bonus_tokens=[3, 7],
+        hidden=mx.zeros((2, 1, 1), dtype=mx.float32),
+        block_size=3,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+        positions=[11, 11],
+    )
+
+    assert drafted.tolist() == [[3, 4], [7, 8]]
+    assert draft_model.calls == [((2,), (2, 1, 1))]
 
 
 def test_gemma4_assistant_overrides_dflash_to_mtp(tmp_path, caplog):

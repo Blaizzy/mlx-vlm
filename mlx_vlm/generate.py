@@ -4,7 +4,6 @@ import contextlib
 import functools
 import json
 import logging
-import math
 import os
 import time
 import warnings
@@ -601,6 +600,49 @@ def _speculative_walk_deferred_greedy(
     return accepted, new_tokens
 
 
+def _speculative_walk_batch_deferred_greedy(
+    lm: nn.Module,
+    target_hidden: mx.array,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budgets: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    """Batched greedy walk that projects target logits only until all rows stop."""
+    B = draft_tokens.shape[0]
+    n_draft = draft_tokens.shape[1]
+    draft_lists = [[int(token) for token in row] for row in draft_tokens.tolist()]
+    budgets = [int(budget) for budget in budgets]
+    accepted = [0] * B
+    new_tokens: List[List[int]] = [[] for _ in range(B)]
+    done = [False] * B
+
+    for pos in range(n_draft + 1):
+        if all(done):
+            break
+        with mx.stream(generation_stream):
+            logits = lm.speculative_logits_from_hidden(
+                target_hidden[:, pos : pos + 1, :]
+            )
+            target_tokens = sampler(logits)
+        mx.eval(target_tokens)
+        target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
+
+        for row, token in enumerate(target_list):
+            if done[row]:
+                continue
+            if pos < n_draft and token == draft_lists[row][pos]:
+                accepted[row] += 1
+                if len(new_tokens[row]) < budgets[row]:
+                    new_tokens[row].append(token)
+                continue
+
+            if len(new_tokens[row]) < budgets[row]:
+                new_tokens[row].append(token)
+            done[row] = True
+
+    return accepted, new_tokens
+
+
 def _mtp_acceptance_walk(
     lm: nn.Module,
     verify: _MTPVerifyResult,
@@ -660,21 +702,9 @@ def _effective_mtp_block_size(
     accept_lens: List[int],
     remaining_budget: int,
 ) -> int:
-    """Choose an effective MTP block size for the next speculative round."""
-    bs = min(requested_block_total, remaining_budget)
-    if bs <= 2:
-        return bs
-
-    if not accept_lens:
-        return min(bs, max(2, min(configured_block_total, 3)))
-
-    recent = accept_lens[-8:]
-    mean_accept = sum(recent) / len(recent)
-    # ``accepted`` counts drafted tokens only. The verifier only benefits from
-    # a block roughly as long as the expected accepted prefix plus the target
-    # bonus; extra slots become wasted target work when acceptance is low.
-    adaptive_total = max(2, math.ceil(mean_accept + 1.0))
-    return min(bs, adaptive_total)
+    """Cap MTP block size by the remaining token budget."""
+    del configured_block_total, accept_lens
+    return min(requested_block_total, remaining_budget)
 
 
 def _mtp_rounds(
@@ -806,7 +836,7 @@ def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
     return None
 
 
-def _mtp_draft_block_rowwise(
+def _mtp_draft_block_active(
     draft_model,
     bonus_tokens: List[int],
     hidden: mx.array,
@@ -815,14 +845,24 @@ def _mtp_draft_block_rowwise(
     token_dtype: mx.Dtype,
     positions: List[int],
 ) -> mx.array:
-    """Draft each active MTP row independently.
+    """Draft an active MTP batch, falling back to rowwise for mixed positions.
 
-    The batched Gemma 4 assistant forward can drift from the singleton
-    drafter even when the target verify path is identical. Drafting rows
-    one-by-one recovers the singleton behavior while keeping batched
-    target verification intact.
+    The drafter supports vectorized rows while every active request has the
+    same absolute position. After mixed accepts, positions can diverge; those
+    rows are drafted independently to preserve singleton position semantics.
     """
     if hidden.shape[0] <= 1:
+        return draft_model.draft_block(
+            mx.array(bonus_tokens, dtype=token_dtype),
+            hidden,
+            None,
+            block_size,
+            sampler,
+            token_dtype,
+        )
+
+    positions_list = [int(position) for position in positions]
+    if len(set(positions_list)) == 1:
         return draft_model.draft_block(
             mx.array(bonus_tokens, dtype=token_dtype),
             hidden,
@@ -861,8 +901,8 @@ def _mtp_draft_block_rowwise(
 
     draft_model.set_shared_kv(
         shared_kv,
-        kv_offset=max(positions),
-        position=mx.array(positions),
+        kv_offset=max(positions_list),
+        position=mx.array(positions_list),
         left_padding=None,
     )
     return mx.concatenate(rowwise_tokens, axis=0)
@@ -956,7 +996,7 @@ def _mtp_rounds_batch(
 
         # Draft (autoregressive K-step). hidden / shared_kv state was set
         # via set_shared_kv above; the drafter pulls it from there.
-        draft_tokens = _mtp_draft_block_rowwise(
+        draft_tokens = _mtp_draft_block_active(
             draft_model,
             b_active,
             hidden,
@@ -970,21 +1010,30 @@ def _mtp_rounds_batch(
         # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
+            verify = _mtp_verify_target(
+                lm,
                 verify_input,
-                cache=prompt_cache,
-                return_hidden=True,
-                return_shared_kv=True,
+                prompt_cache,
+                sampler,
             )
-            hidden_full = verify_out.hidden_states[-1]  # [B_active, bs, H]
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
+            hidden_full = verify.hidden  # [B_active, bs, H]
 
         # Walk per-row
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        accepted_list, new_tokens_list = _speculative_walk_batch(
-            draft_tokens, target_tokens, budgets
-        )
+        if verify.target_tokens is not None:
+            mx.async_eval(verify.target_tokens, hidden_full)
+            accepted_list, new_tokens_list = _speculative_walk_batch(
+                draft_tokens, verify.target_tokens, budgets
+            )
+        else:
+            mx.async_eval(hidden_full)
+            accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
+                lm,
+                hidden_full,
+                draft_tokens,
+                sampler,
+                budgets,
+            )
         # Keep the adaptive block-size history on a per-round basis so
         # batched MTP reacts like the singleton loop instead of letting
         # batch size change the controller signal.
@@ -1039,12 +1088,12 @@ def _mtp_rounds_batch(
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
 
-        # Slice + tail-zero ``verify_out.shared_kv_states`` to match the
+        # Slice + tail-zero ``verify.shared_kv_states`` to match the
         # post-rollback target cache. ``set_shared_kv()`` will normalize the
         # resulting hybrid layout back into a prefix-valid drafter view.
         rejected_global = bs - (max_a + 1)
         next_shared_kv = {}
-        for k, kv in verify_out.shared_kv_states.items():
+        for k, kv in verify.shared_kv_states.items():
             K, V = kv
             valid = K.shape[-2] - rejected_global
             if valid >= K.shape[-2]:
