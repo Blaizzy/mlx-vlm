@@ -54,6 +54,7 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+MTP_MIN_ACCEPT_STABLE_PREFIX_TOKENS = 64
 
 
 def parse_arguments():
@@ -550,6 +551,32 @@ class _MTPVerifyResult:
     target_tokens: Optional[mx.array] = None
 
 
+def _mtp_shared_kv_from_prompt_cache(
+    lm: nn.Module,
+    prompt_cache: List[Any],
+) -> dict:
+    layers = getattr(getattr(lm, "model", None), "layers", [])
+    if len(prompt_cache) != len(layers):
+        return {}
+
+    shared_kv_states = {}
+    for layer, layer_cache in zip(layers, prompt_cache):
+        if layer_cache is None or not hasattr(layer_cache, "state"):
+            continue
+        keys, values = layer_cache.state
+        if keys is None or values is None:
+            continue
+        if (
+            isinstance(layer_cache, cache.RotatingKVCache)
+            and not isinstance(layer_cache, cache.BufferedRotatingKVCache)
+            and hasattr(layer_cache, "_temporal_order")
+        ):
+            keys = layer_cache._temporal_order(keys)
+            values = layer_cache._temporal_order(values)
+        shared_kv_states[layer.layer_type] = (keys, values)
+    return shared_kv_states
+
+
 def _mtp_verify_without_logits(
     lm: nn.Module,
     verify_input: mx.array,
@@ -562,18 +589,7 @@ def _mtp_verify_without_logits(
             cache=prompt_cache,
             skip_final_norm=True,
         )
-        shared_kv_states = {}
-        for layer, layer_cache in zip(layers, prompt_cache):
-            if layer_cache is not None and hasattr(layer_cache, "state"):
-                keys, values = layer_cache.state
-                if (
-                    isinstance(layer_cache, cache.RotatingKVCache)
-                    and not isinstance(layer_cache, cache.BufferedRotatingKVCache)
-                    and hasattr(layer_cache, "_temporal_order")
-                ):
-                    keys = layer_cache._temporal_order(keys)
-                    values = layer_cache._temporal_order(values)
-                shared_kv_states[layer.layer_type] = (keys, values)
+        shared_kv_states = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)
         if shared_kv_states:
             return _MTPVerifyResult(
                 hidden=hidden, shared_kv_states=shared_kv_states
@@ -719,7 +735,7 @@ def _mtp_acceptance_walk(
         target_tokens = None
 
     forced = min(int(min_accept), draft_tokens.shape[1])
-    if forced <= accepted:
+    if forced <= accepted or accepted == 0:
         return accepted, new_tokens
 
     if target_tokens is None:
@@ -740,6 +756,71 @@ def _mtp_acceptance_walk(
     else:
         new_tokens = trusted[:, :budget].reshape(-1).tolist()
     return forced, new_tokens
+
+
+def _mtp_target_one_token(
+    lm: nn.Module,
+    prompt_cache: List[Any],
+    token: int,
+    sampler: Callable[[mx.array], mx.array],
+    token_dtype: mx.Dtype,
+) -> Tuple[mx.array, int, dict]:
+    token_arr = mx.array([[token]], dtype=token_dtype)
+    shared_kv_sink: dict = {}
+    hidden = lm.model(
+        token_arr,
+        cache=prompt_cache,
+        shared_kv_sink=shared_kv_sink,
+        skip_final_norm=True,
+    )
+    logits = lm.speculative_logits_from_hidden(hidden[:, -1:, :])
+    target_token = sampler(logits)
+    mx.eval(target_token, hidden)
+    if not shared_kv_sink:
+        shared_kv_sink = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)
+    return hidden[:, -1:, :], int(target_token.reshape(-1).item()), shared_kv_sink
+
+
+def _mtp_verify_sequential_greedy(
+    lm: nn.Module,
+    prompt_cache: List[Any],
+    first_bonus: int,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budget: int,
+    token_dtype: mx.Dtype,
+) -> Tuple[int, List[int], mx.array, dict]:
+    draft_list = [int(token) for token in draft_tokens.reshape(-1).tolist()]
+    accepted = 0
+    new_tokens: List[int] = []
+    current = int(first_bonus)
+    hidden = None
+    shared_kv_states = {}
+
+    for pos in range(len(draft_list) + 1):
+        with mx.stream(generation_stream):
+            hidden, target_token, shared_kv_states = _mtp_target_one_token(
+                lm,
+                prompt_cache,
+                current,
+                sampler,
+                token_dtype,
+            )
+
+        if pos < len(draft_list) and target_token == draft_list[pos]:
+            accepted += 1
+            if len(new_tokens) < budget:
+                new_tokens.append(target_token)
+            current = target_token
+            continue
+
+        if len(new_tokens) < budget:
+            new_tokens.append(target_token)
+        break
+
+    if hidden is None:
+        raise RuntimeError("MTP sequential verification produced no target hidden.")
+    return accepted, new_tokens, hidden, shared_kv_states
 
 
 def _slice_shared_kv_after_reject(shared_kv_states: dict, rejected: int) -> dict:
@@ -889,6 +970,7 @@ def _mtp_rounds(
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
     draft_model.approx_verify = bool(mtp_approx_verify or mtp_min_accept > 0)
+    stable_exact_verify = not mtp_approx_verify and mtp_min_accept == 0
 
     # Hidden from prefill is full prompt-length; reduce to a single slot.
     # The semantically-correct choice is the *last* prompt token's hidden:
@@ -963,6 +1045,39 @@ def _mtp_rounds(
                 mx.clear_cache()
             continue
 
+        stable_prefix_verify = (
+            not mtp_approx_verify
+            and mtp_min_accept > 1
+            and emitted < MTP_MIN_ACCEPT_STABLE_PREFIX_TOKENS
+        )
+        if stable_exact_verify or stable_prefix_verify:
+            accepted, new_tokens, hidden, next_shared_kv = (
+                _mtp_verify_sequential_greedy(
+                    lm,
+                    prompt_cache,
+                    b,
+                    draft_tokens,
+                    sampler,
+                    max_tokens - emitted,
+                    token_dtype,
+                )
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1)
+
+            for tok in new_tokens:
+                yield tok, None
+                emitted += 1
+                if emitted >= max_tokens:
+                    return
+
+            b = new_tokens[-1] if new_tokens else b
+            kv_offset = int(prompt_cache[0].offset)
+            draft_model.set_shared_kv(next_shared_kv, kv_offset)
+
+            if emitted % 256 == 0:
+                mx.clear_cache()
+            continue
+
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
@@ -981,7 +1096,7 @@ def _mtp_rounds(
             max_tokens - emitted,
             min_accept=mtp_min_accept,
         )
-        hidden = verify.hidden[:, accepted : accepted + 1, :]
+        next_hidden = verify.hidden[:, accepted : accepted + 1, :]
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
@@ -994,12 +1109,14 @@ def _mtp_rounds(
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
+            hidden = next_hidden
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
             next_shared_kv = _slice_shared_kv_after_reject(
                 verify.shared_kv_states, bs - (accepted + 1)
             )
         else:
+            hidden = next_hidden
             next_shared_kv = verify.shared_kv_states
 
         kv_offset = int(prompt_cache[0].offset)

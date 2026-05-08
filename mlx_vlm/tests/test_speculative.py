@@ -17,7 +17,9 @@ from mlx_vlm.generate import (
     _MTPVerifyResult,
     _effective_mtp_block_size,
     _format_speculative_stats,
+    _mtp_acceptance_walk,
     _mtp_draft_block_active,
+    _mtp_verify_sequential_greedy,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_deferred_greedy,
@@ -362,6 +364,86 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
     assert accepted == 1
     assert new_tokens == [2, 3]
     assert fake_head.calls == 2
+
+
+def test_mtp_min_accept_does_not_force_immediate_rejection():
+    accepted, new_tokens = _mtp_acceptance_walk(
+        SimpleNamespace(),
+        _MTPVerifyResult(
+            hidden=mx.zeros((1, 3, 4)),
+            shared_kv_states={},
+            target_tokens=mx.array([[7, 8, 9]], dtype=mx.int32),
+        ),
+        mx.array([[2, 3]], dtype=mx.int32),
+        lambda logits: mx.argmax(logits, axis=-1),
+        budget=3,
+        min_accept=2,
+    )
+
+    assert accepted == 0
+    assert new_tokens == [7]
+
+
+def test_mtp_min_accept_extends_after_verified_anchor_token():
+    accepted, new_tokens = _mtp_acceptance_walk(
+        SimpleNamespace(),
+        _MTPVerifyResult(
+            hidden=mx.zeros((1, 3, 4)),
+            shared_kv_states={},
+            target_tokens=mx.array([[2, 8, 9]], dtype=mx.int32),
+        ),
+        mx.array([[2, 3]], dtype=mx.int32),
+        lambda logits: mx.argmax(logits, axis=-1),
+        budget=3,
+        min_accept=2,
+    )
+
+    assert accepted == 2
+    assert new_tokens == [2, 3, 9]
+
+
+def test_mtp_verify_sequential_greedy_uses_one_token_target_steps():
+    class FakeTargetModel:
+        def __init__(self):
+            self.inputs = []
+
+        def __call__(self, token, cache, shared_kv_sink, skip_final_norm):
+            del cache, skip_final_norm
+            token_id = int(token.reshape(-1).item())
+            self.inputs.append(token_id)
+            target_by_input = {10: 2, 2: 3}
+            target = target_by_input[token_id]
+            hidden = mx.zeros((1, 1, 5), dtype=mx.float32)
+            hidden[:, :, target] = 10
+            shared_kv_sink["full_attention"] = (
+                mx.array([[[[token_id]]]], dtype=mx.float32),
+                mx.array([[[[target]]]], dtype=mx.float32),
+            )
+            return hidden
+
+    class FakeLM:
+        def __init__(self):
+            self.model = FakeTargetModel()
+
+        def speculative_logits_from_hidden(self, hidden):
+            return hidden
+
+    lm = FakeLM()
+    accepted, new_tokens, hidden, shared_kv = _mtp_verify_sequential_greedy(
+        lm,
+        prompt_cache=[],
+        first_bonus=10,
+        draft_tokens=mx.array([[2, 4]], dtype=mx.int32),
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        budget=3,
+        token_dtype=mx.int32,
+    )
+
+    assert accepted == 1
+    assert new_tokens == [2, 3]
+    assert lm.model.inputs == [10, 2]
+    assert int(mx.argmax(hidden, axis=-1).item()) == 3
+    assert shared_kv["full_attention"][0].reshape(-1).tolist() == [2.0]
 
 
 def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
