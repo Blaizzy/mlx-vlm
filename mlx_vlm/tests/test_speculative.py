@@ -14,6 +14,7 @@ import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
+    _MTPVerifyResult,
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
@@ -22,7 +23,13 @@ from mlx_vlm.generate import (
     _speculative_walk_batch_deferred_greedy,
     _speculative_walk_deferred_greedy,
 )
-from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -198,6 +205,55 @@ def test_mtp_drafter_masks_support_batched_offsets():
     full = masks["full_attention"].tolist()
     assert full[0][0][0][5] == -float("inf")
     assert full[1][0][0][7] == 0.0
+
+
+def test_mtp_drafter_sliding_mask_accounts_for_tail_offset():
+    kv = (mx.zeros((1, 1, 6, 4)), mx.zeros((1, 1, 6, 4)))
+
+    masks = make_drafter_masks(
+        {"sliding_attention": kv},
+        query_len=1,
+        query_offset=10,
+        sliding_window=4,
+    )
+
+    row = masks["sliding_attention"][0, 0, 0].tolist()
+    assert row[:3] == [-float("inf"), -float("inf"), -float("inf")]
+    assert row[3:] == [0.0, 0.0, 0.0]
+
+
+def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
+    base = RotatingKVCache(max_size=4, keep=0)
+    keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+    values = keys + 10
+    base.update_and_fetch(keys, values)
+
+    buffered = BufferedRotatingKVCache.from_cache(base, buffer_size=2)
+    new_keys = mx.array([[[[4.0], [5.0], [6.0]]]])
+    new_values = new_keys + 10
+    out_keys, _ = buffered.update_and_fetch(new_keys, new_values)
+
+    assert buffered.start_position == 0
+    assert buffered.offset == 7
+    assert out_keys.reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+
+    assert buffered.trim(2) == 2
+    assert buffered.offset == 5
+    assert buffered.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_make_prompt_cache_caps_model_kv_cache_when_requested():
+    class FakeModel:
+        def make_cache(self):
+            return [KVCache(), RotatingKVCache(max_size=4, keep=0)]
+
+    caches = make_prompt_cache(FakeModel(), max_kv_size=16)
+
+    assert isinstance(caches[0], RotatingKVCache)
+    assert caches[0].max_size == 16
+    assert caches[0].keep == 4
+    assert isinstance(caches[1], RotatingKVCache)
+    assert caches[1].max_size == 4
 
 
 def test_normalize_batched_shared_kv_states_repacks_left_padded_rows():

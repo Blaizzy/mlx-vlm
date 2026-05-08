@@ -11,6 +11,7 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
+    get_model_path,
     load,
     load_image,
     prepare_inputs,
@@ -382,6 +383,23 @@ def test_load_passes_revision():
         mock_get_model_path.assert_called_with(
             "repo", revision="abc", force_download=False
         )
+
+
+def test_get_model_path_downloads_shadowed_hf_repo(tmp_path, monkeypatch):
+    shadow_root = tmp_path / "mlx-community"
+    shadow_root.mkdir()
+    (shadow_root / "gemma-4-26b-a4b-it-5bit").mkdir()
+    downloaded = tmp_path / "downloaded"
+    downloaded.mkdir()
+
+    def fake_snapshot_download(**kwargs):
+        assert kwargs["repo_id"] == "mlx-community/gemma-4-26b-a4b-it-5bit"
+        return downloaded
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", fake_snapshot_download)
+
+    assert get_model_path("mlx-community/gemma-4-26b-a4b-it-5bit") == downloaded
 
 
 def _make_test_image_bytes():

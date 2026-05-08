@@ -73,6 +73,7 @@ def bidirectional_swa_mask(
     kv_len: int,
     window: int,
     kv_valid_len: Optional[Union[int, mx.array]] = None,
+    key_offset: Union[int, mx.array] = 0,
     dtype: mx.Dtype = mx.float32,
 ) -> Optional[mx.array]:
     """Bidirectional sliding-window mask.
@@ -85,14 +86,16 @@ def bidirectional_swa_mask(
     if (
         isinstance(query_offset, int)
         and (kv_valid_len is None or isinstance(kv_valid_len, int))
+        and isinstance(key_offset, int)
         and kv_len <= window
-        and query_offset + query_len <= kv_len + window
+        and query_offset - key_offset < window
+        and key_offset + kv_len - (query_offset + query_len) < window
     ):
         return None
 
     if isinstance(query_offset, int):
         q_idx = mx.arange(query_offset, query_offset + query_len)[:, None]
-        k_idx = mx.arange(kv_len)[None, :]
+        k_idx = mx.arange(key_offset, key_offset + kv_len)[None, :]
         dist = q_idx - k_idx
         inside = (dist > -window) & (dist < window)
         if kv_valid_len is not None:
@@ -103,7 +106,10 @@ def bidirectional_swa_mask(
         return bias[None, None, :, :]
 
     q_idx = query_offset[:, None] + mx.arange(query_len)[None, :]
-    k_idx = mx.arange(kv_len)[None, None, :]
+    if isinstance(key_offset, mx.array):
+        k_idx = key_offset[:, None, None] + mx.arange(kv_len)[None, None, :]
+    else:
+        k_idx = mx.arange(key_offset, key_offset + kv_len)[None, None, :]
     dist = q_idx[:, :, None] - k_idx
     inside = (dist > -window) & (dist < window)
     if kv_valid_len is not None:
@@ -131,8 +137,18 @@ def make_drafter_masks(
         kv_len = _kv_len(kv)
         kv_valid_len = query_offset
         if layer_type == "sliding_attention":
+            if isinstance(query_offset, int):
+                key_offset = max(query_offset - kv_len, 0)
+            else:
+                key_offset = mx.maximum(query_offset - kv_len, 0)
             masks[layer_type] = bidirectional_swa_mask(
-                query_len, query_offset, kv_len, sliding_window, kv_valid_len, dtype
+                query_len,
+                query_offset,
+                kv_len,
+                sliding_window,
+                kv_valid_len,
+                key_offset,
+                dtype,
             )
         else:
             masks[layer_type] = bidirectional_full_mask(
