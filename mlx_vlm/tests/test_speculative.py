@@ -12,14 +12,17 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
+import mlx_vlm.models.gemma4.language as gemma_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
     _effective_mtp_block_size,
     _format_speculative_stats,
-    _mtp_draft_block_rowwise,
+    _mtp_batch_needs_rollback,
+    _mtp_draft_block_batch,
     _speculative_walk,
     _speculative_walk_batch,
-    _speculative_walk_deferred_greedy,
+    _speculative_walk_deferred_logits,
+    _speculative_walk_deferred_logits_batch,
 )
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.drafters import (
@@ -266,7 +269,7 @@ def test_normalize_batched_shared_kv_states_drops_tail_zero_slack():
     ]
 
 
-def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
+def test_speculative_walk_deferred_logits_stops_after_first_mismatch():
     class FakeEmbed:
         def __init__(self):
             self.calls = 0
@@ -289,7 +292,7 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
         dtype=mx.float32,
     )
     draft_tokens = mx.array([[2, 1, 3]], dtype=mx.int32)
-    accepted, new_tokens = _speculative_walk_deferred_greedy(
+    accepted, new_tokens = _speculative_walk_deferred_logits(
         lm,
         target_hidden,
         draft_tokens,
@@ -307,6 +310,53 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
     assert fake_head.calls == 2
 
 
+def test_speculative_walk_deferred_logits_batch_stops_after_all_rows_resolve():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    fake_head = FakeEmbed()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [
+            [
+                [0, 0, 9, 0, 0],
+                [0, 0, 0, 9, 0],
+                [0, 0, 0, 0, 9],
+                [0, 9, 0, 0, 0],
+            ],
+            [
+                [0, 0, 0, 0, 9],
+                [0, 9, 0, 0, 0],
+                [0, 0, 9, 0, 0],
+                [0, 0, 0, 9, 0],
+            ],
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 1, 4], [0, 1, 2]], dtype=mx.int32)
+    accepted, new_tokens = _speculative_walk_deferred_logits_batch(
+        lm,
+        target_hidden,
+        draft_tokens,
+        lambda logits: mx.argmax(logits, axis=-1),
+        budgets=[4, 4],
+    )
+
+    expected_accepted, expected_tokens = _speculative_walk_batch(
+        draft_tokens, mx.argmax(target_hidden, axis=-1), budgets=[4, 4]
+    )
+    assert accepted == expected_accepted
+    assert new_tokens == expected_tokens
+    assert accepted == [1, 0]
+    assert new_tokens == [[2, 3], [4]]
+    assert fake_head.calls == 2
+
+
 def test_format_speculative_stats_includes_variable_draft_rate():
     stats = _format_speculative_stats(
         SimpleNamespace(accept_lens=[1, 0, 2], draft_lens=[2, 1, 2])
@@ -320,25 +370,68 @@ def test_format_speculative_stats_includes_variable_draft_rate():
 
 
 def test_effective_mtp_block_size_uses_compact_warm_start():
-    assert _effective_mtp_block_size(4, 4, [], 10) == 3
-    assert _effective_mtp_block_size(3, 4, [1, 1], 10) == 2
+    assert _effective_mtp_block_size(4, 4, [], 10) == 4
+    assert _effective_mtp_block_size(3, 4, [1, 1], 10) == 3
 
 
 def test_effective_mtp_block_size_warm_starts_from_config_when_override_is_large():
-    assert _effective_mtp_block_size(8, 4, [], 10) == 3
-    assert _effective_mtp_block_size(6, 4, [], 10) == 3
+    assert _effective_mtp_block_size(8, 4, [], 10) == 4
+    assert _effective_mtp_block_size(6, 4, [], 10) == 4
 
 
 def test_effective_mtp_block_size_shrinks_large_override_to_recent_acceptance():
-    assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 3
-    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 2
+    assert _effective_mtp_block_size(8, 4, [2, 2, 2, 2], 10) == 5
+    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 4
     assert _effective_mtp_block_size(8, 4, [0, 0, 0, 0], 10) == 2
 
 
-def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_binding():
+def test_mtp_batch_needs_rollback_when_only_some_rows_reject():
+    assert _mtp_batch_needs_rollback([1, 1], draft_count=1) is False
+    assert _mtp_batch_needs_rollback([0, 1], draft_count=1) is True
+    assert _mtp_batch_needs_rollback([0, 0], draft_count=1) is True
+
+
+def test_gemma4_batch_rollback_rewinds_offsets_for_early_reject_rows():
+    class FakeBatchCache:
+        def __init__(self):
+            self.keys = mx.array(
+                [[[[10.0], [11.0]]], [[[20.0], [21.0]]]], dtype=mx.float32
+            )
+            self.values = mx.array(
+                [[[[30.0], [31.0]]], [[[40.0], [41.0]]]], dtype=mx.float32
+            )
+            self.offset = mx.array([2, 2], dtype=mx.int32)
+            self.left_padding = mx.array([0, 0], dtype=mx.int32)
+            self._idx = 2
+
+        def trim(self, n):
+            if n > 0:
+                self.keys = self.keys[..., :-n, :]
+                self.values = self.values[..., :-n, :]
+                self.offset = self.offset - n
+                self._idx -= n
+
+    cache = FakeBatchCache()
+
+    gemma_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(),
+        [cache],
+        None,
+        mx.array([0, 1], dtype=mx.int32),
+        block_size=2,
+    )
+
+    assert cache.offset.tolist() == [1, 2]
+    assert cache.left_padding.tolist() == [1, 0]
+    assert cache.keys[:, 0, :, 0].tolist() == [[0.0, 10.0], [20.0, 21.0]]
+    assert cache.values[:, 0, :, 0].tolist() == [[0.0, 30.0], [40.0, 41.0]]
+
+
+def test_mtp_draft_block_batch_uses_one_batched_drafter_call():
     class FakeDraftModel:
         def __init__(self):
             self._shared_kv = None
+            self.calls = 0
 
         def set_shared_kv(
             self, shared_kv_states, kv_offset, position=None, left_padding=None
@@ -355,14 +448,12 @@ def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_bindi
             sampler,
             token_dtype,
         ):
-            batch_size = hidden.shape[0]
             del cache, sampler
-            base = int(
-                next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item()
+            self.calls += 1
+            assert hidden.shape[0] == 2
+            return mx.repeat(last_bonus[:, None], block_size - 1, axis=1).astype(
+                token_dtype
             )
-            bonus = last_bonus if isinstance(last_bonus, int) else int(last_bonus[0].item())
-            row_count = 1 if isinstance(last_bonus, int) else batch_size
-            return mx.full((row_count, block_size - 1), base + bonus, dtype=token_dtype)
 
     draft_model = FakeDraftModel()
     shared_kv = {
@@ -373,17 +464,17 @@ def test_mtp_draft_block_rowwise_uses_per_row_shared_kv_and_restores_batch_bindi
     }
     draft_model.set_shared_kv(shared_kv, kv_offset=11, position=mx.array([11, 12]))
 
-    drafted = _mtp_draft_block_rowwise(
+    drafted = _mtp_draft_block_batch(
         draft_model,
         bonus_tokens=[3, 7],
         hidden=mx.zeros((2, 1, 1), dtype=mx.float32),
         block_size=2,
         sampler=lambda x: x,
         token_dtype=mx.int32,
-        positions=[11, 12],
     )
 
-    assert drafted.tolist() == [[13], [27]]
+    assert draft_model.calls == 1
+    assert drafted.tolist() == [[3], [7]]
     assert next(iter(draft_model._shared_kv.values()))[0].shape[0] == 2
 
 

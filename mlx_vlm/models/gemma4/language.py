@@ -3,6 +3,7 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx_lm.models.cache import dynamic_roll
 from mlx.nn import RMSNorm
 
 from ..base import (
@@ -625,8 +626,8 @@ class LanguageModel(nn.Module):
         """Rewind target KV caches after a speculative-decoding round.
 
         Gemma 4 has only KV/RotatingKV caches (no SSM/GDN), so this is a
-        simple trim + per-row tail-zero. ``gdn_states`` is accepted (and
-        ignored) for API parity with qwen3_5's hook.
+        trim plus per-row left-padding adjustment. ``gdn_states`` is accepted
+        (and ignored) for API parity with qwen3_5's hook.
         """
         del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
         if isinstance(accepted, int):
@@ -636,8 +637,6 @@ class LanguageModel(nn.Module):
         n = max_a + 1
         trim = block_size - n
         is_batch = accepted.size > 1
-        valid_ends = accepted + 1
-
         for c in caches:
             if c is None:
                 continue
@@ -645,14 +644,39 @@ class LanguageModel(nn.Module):
             if trim > 0 and hasattr(c, "trim"):
                 c.trim(trim)
             if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
-                kv_len = c._idx
-                ve = valid_ends.tolist()
-                verify_start = kv_len - n
-                for bi in range(accepted.shape[0]):
-                    start = verify_start + int(ve[bi])
-                    if start < kv_len:
-                        c.keys[bi, :, start:kv_len, :] = 0
-                        c.values[bi, :, start:kv_len, :] = 0
+                extra_left = max_a - accepted
+                needs_row_rewind = bool(mx.any(extra_left).item())
+                if needs_row_rewind and hasattr(c, "left_padding"):
+                    shift = extra_left[:, None]
+                    keep = mx.arange(c._idx)[None, :] >= extra_left[:, None]
+
+                    def roll_and_mask(tensor):
+                        active = tensor[..., : c._idx, :]
+                        mask = keep.astype(tensor.dtype)[:, None, :, None]
+                        active = dynamic_roll(active, shift, axis=2) * mask
+                        if tensor.shape[2] == c._idx:
+                            return active
+                        tensor[..., : c._idx, :] = active
+                        return tensor
+
+                    if isinstance(c.keys, tuple):
+                        c.keys = tuple(roll_and_mask(k) for k in c.keys)
+                        c.values = tuple(roll_and_mask(v) for v in c.values)
+                    else:
+                        c.keys = roll_and_mask(c.keys)
+                        c.values = roll_and_mask(c.values)
+                    c.left_padding = c.left_padding + extra_left
+                    if hasattr(c, "offset"):
+                        c.offset = c.offset - extra_left
+                elif needs_row_rewind and not isinstance(c.keys, tuple):
+                    kv_len = c._idx
+                    verify_start = kv_len - n
+                    valid_ends = (accepted + 1).tolist()
+                    for bi, valid_end in enumerate(valid_ends):
+                        start = verify_start + int(valid_end)
+                        if start < kv_len:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
         return max_a
 
     def sanitize(self, weights):

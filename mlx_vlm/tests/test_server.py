@@ -416,6 +416,21 @@ class TestResponseGenerator:
 
         assert server.get_token_queue_timeout() is None
 
+    def test_speculative_batch_wait_defaults_to_short_window(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_SPECULATIVE_BATCH_WAIT_MS", raising=False)
+
+        assert server.get_speculative_batch_wait() == 0.01
+
+    def test_speculative_batch_wait_reads_env_milliseconds(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_BATCH_WAIT_MS", "25")
+
+        assert server.get_speculative_batch_wait() == 0.025
+
+    def test_speculative_batch_wait_clamps_negative_values(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SPECULATIVE_BATCH_WAIT_MS", "-1")
+
+        assert server.get_speculative_batch_wait() == 0.0
+
     def test_token_iterator_reports_timeout_and_cancels_request(self, monkeypatch):
         gen = self._bare_generator()
         cancelled = []

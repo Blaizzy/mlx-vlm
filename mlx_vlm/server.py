@@ -60,6 +60,7 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_ENABLE_THINKING = False
+DEFAULT_SPECULATIVE_BATCH_WAIT_MS = 10.0
 
 
 def _get_speculative_rounds_batch(draft_kind: str):
@@ -115,6 +116,22 @@ def get_token_queue_timeout():
     if timeout <= 0:
         return None
     return timeout
+
+
+def get_speculative_batch_wait():
+    raw_wait = os.environ.get("MLX_VLM_SPECULATIVE_BATCH_WAIT_MS")
+    if raw_wait is None:
+        return DEFAULT_SPECULATIVE_BATCH_WAIT_MS / 1000.0
+    try:
+        wait_ms = float(raw_wait)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_SPECULATIVE_BATCH_WAIT_MS=%r; falling back to %sms.",
+            raw_wait,
+            DEFAULT_SPECULATIVE_BATCH_WAIT_MS,
+        )
+        return DEFAULT_SPECULATIVE_BATCH_WAIT_MS / 1000.0
+    return max(0.0, wait_ms / 1000.0)
 
 
 def get_server_enable_thinking():
@@ -657,6 +674,7 @@ class ResponseGenerator:
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
+        batch_wait = get_speculative_batch_wait()
 
         while not self._stop:
             try:
@@ -678,6 +696,22 @@ class ResponseGenerator:
                             pending.append(item)
                     except QueueEmpty:
                         break
+
+                if pending and batch_wait > 0:
+                    deadline = time.monotonic() + batch_wait
+                    while True:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            item = self.requests.get(timeout=remaining)
+                            if item is None:
+                                if self._stop:
+                                    break
+                            else:
+                                pending.append(item)
+                        except QueueEmpty:
+                            break
 
                 if not pending:
                     continue

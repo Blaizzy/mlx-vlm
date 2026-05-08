@@ -54,7 +54,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         self._kv_offset: int = 0
         self._position: int = 0
 
-        self.accept_lens: List[int] = []
+        self.accept_lens: List[float] = []
         self.draft_lens: List[int] = []
 
         if config.use_ordered_embeddings:
