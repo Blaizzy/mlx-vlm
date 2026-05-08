@@ -702,9 +702,31 @@ def _effective_mtp_block_size(
     accept_lens: List[int],
     remaining_budget: int,
 ) -> int:
-    """Cap MTP block size by the remaining token budget."""
-    del configured_block_total, accept_lens
-    return min(requested_block_total, remaining_budget)
+    """Choose the MTP block size for the next round.
+
+    Treat user-provided block sizes above the assistant's configured depth as a
+    ceiling. Larger tails are useful only if the prefix reaches the configured
+    depth often enough; otherwise each round pays extra autoregressive drafter
+    forwards for tokens that cannot be accepted.
+    """
+    block_total = min(requested_block_total, remaining_budget)
+    configured_block_total = min(configured_block_total, block_total)
+    if block_total <= configured_block_total or configured_block_total <= 1:
+        return block_total
+
+    if len(accept_lens) < 8:
+        return configured_block_total
+
+    recent = accept_lens[-32:]
+    configured_draft_count = configured_block_total - 1
+    configured_prefix_hits = sum(
+        1 for accepted in recent if accepted >= configured_draft_count
+    )
+    configured_prefix_hit_rate = configured_prefix_hits / len(recent)
+    if configured_prefix_hit_rate < 0.65:
+        return configured_block_total
+
+    return block_total
 
 
 def _mtp_rounds(

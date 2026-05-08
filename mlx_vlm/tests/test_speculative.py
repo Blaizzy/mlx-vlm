@@ -370,7 +370,22 @@ def test_format_speculative_stats_includes_variable_draft_rate():
 
 def test_effective_mtp_block_size_respects_requested_block_size():
     assert _effective_mtp_block_size(4, 4, [], 10) == 4
-    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 8
+    assert _effective_mtp_block_size(3, 4, [], 10) == 3
+
+
+def test_effective_mtp_block_size_treats_oversized_block_as_ceiling():
+    assert _effective_mtp_block_size(8, 4, [], 10) == 4
+    assert _effective_mtp_block_size(8, 4, [1, 1, 0, 1], 10) == 4
+
+
+def test_effective_mtp_block_size_expands_when_prefix_is_reliable():
+    accept_lens = [3, 3, 3, 2, 3, 3, 3, 3]
+    assert _effective_mtp_block_size(8, 4, accept_lens, 10) == 8
+
+
+def test_effective_mtp_block_size_caps_unreliable_oversized_block():
+    accept_lens = [3, 0, 1, 2, 3, 0, 1, 2]
+    assert _effective_mtp_block_size(8, 4, accept_lens, 10) == 4
 
 
 def test_effective_mtp_block_size_caps_to_remaining_budget():
