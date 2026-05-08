@@ -1,8 +1,9 @@
+import codecs
 import json
 from copy import copy
 from functools import partial
 from json import JSONDecodeError
-from typing import List
+from typing import List, Optional
 
 from transformers import AutoTokenizer
 
@@ -278,6 +279,107 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
                 for b in range(start, stop):
                     char_to_bytes[chr(b)] = b
         cls._byte_decoder = char_to_bytes
+
+
+class _ServerTokenStreamer:
+    """Emit server text deltas per token while buffering incomplete UTF-8."""
+
+    def __init__(self, tokenizer, detokenizer):
+        self._tokenizer = tokenizer
+        self._detokenizer = detokenizer
+        self._decoder = None
+        self._started = False
+        self._tokenmap = None
+        self._mode = "delegate"
+        self._trim_space = False
+
+        if isinstance(detokenizer, SPMStreamingDetokenizer):
+            self._mode = "spm"
+            self._tokenmap = detokenizer.tokenmap
+            self._trim_space = detokenizer.trim_space
+            self._is_byte_token = detokenizer.is_byte_token
+            self._byte_value = detokenizer.byte_value
+            self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        elif isinstance(detokenizer, BPEStreamingDetokenizer):
+            self._mode = "bpe"
+            self._tokenmap = detokenizer.tokenmap
+            self._trim_space = detokenizer.trim_space
+            self._byte_decoder = detokenizer._byte_decoder
+            self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def _emit_text(self, text: str) -> str:
+        if text and not self._started and self._trim_space and text[0] == " ":
+            text = text[1:]
+        if text:
+            self._started = True
+        return text
+
+    def _fallback_decode(self, token: int) -> str:
+        try:
+            return self._tokenizer.decode([token])
+        except Exception:
+            return ""
+
+    def _spm_text_for_token(self, token: int) -> str:
+        try:
+            if self._is_byte_token[token]:
+                byte_value = self._byte_value[token]
+                return self._decoder.decode(bytes((byte_value,)), final=False)
+            value = self._tokenmap[token]
+        except (IndexError, TypeError):
+            return self._fallback_decode(token)
+
+        if value is None:
+            return self._fallback_decode(token)
+        return value.replace("\u2581", " ")
+
+    def _bpe_text_for_token(self, token: int) -> str:
+        try:
+            value = self._tokenmap[token]
+        except (IndexError, TypeError):
+            return self._fallback_decode(token)
+
+        if value is None:
+            return self._fallback_decode(token)
+
+        try:
+            token_bytes = bytes(self._byte_decoder[c] for c in value)
+        except KeyError:
+            return self._fallback_decode(token)
+        return self._decoder.decode(token_bytes, final=False)
+
+    def _decode_token(self, token: int) -> str:
+        if self._mode == "spm":
+            return self._emit_text(self._spm_text_for_token(token))
+        if self._mode == "bpe":
+            return self._emit_text(self._bpe_text_for_token(token))
+        return self._fallback_advance(token, finish_reason=None)
+
+    def _fallback_advance(self, token: int, finish_reason: Optional[str]) -> str:
+        if finish_reason == "stop":
+            self._detokenizer.finalize()
+        else:
+            self._detokenizer.add_token(token)
+            if finish_reason is not None:
+                self._detokenizer.finalize()
+        return self._detokenizer.last_segment
+
+    def advance(self, token: int, finish_reason: Optional[str]) -> str:
+        if self._mode == "delegate":
+            return self._fallback_advance(token, finish_reason)
+
+        parts = []
+        if finish_reason != "stop":
+            parts.append(self._decode_token(token))
+        if finish_reason is not None:
+            parts.append(self._emit_text(self._decoder.decode(b"", final=True)))
+        return "".join(parts)
+
+    def finalize(self) -> str:
+        if self._mode == "delegate":
+            self._detokenizer.finalize()
+            return self._detokenizer.last_segment
+        return self._emit_text(self._decoder.decode(b"", final=True))
 
 
 class TokenizerWrapper:

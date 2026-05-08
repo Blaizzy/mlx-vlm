@@ -158,6 +158,21 @@ def test_mtp_drafter_masks_support_batched_offsets():
     assert full[1][0][0][7] == 0.0
 
 
+def test_mtp_drafter_sliding_mask_uses_local_rotating_cache_offset():
+    kv = (mx.zeros((1, 1, 8, 4)), mx.zeros((1, 1, 8, 4)))
+
+    masks = make_drafter_masks(
+        {"sliding_attention": kv},
+        query_len=1,
+        query_offset=128,
+        sliding_window=4,
+    )
+
+    mask = masks["sliding_attention"].tolist()[0][0][0]
+    assert mask[:5] == [-float("inf")] * 5
+    assert mask[5:] == [0.0, 0.0, 0.0]
+
+
 def test_normalize_batched_shared_kv_states_repacks_left_padded_rows():
     keys = mx.array(
         [

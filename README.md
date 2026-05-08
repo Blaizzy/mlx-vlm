@@ -820,6 +820,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/health` - Check server status
+- `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
 - `/unload` - Unload current model from memory
 
 #### Usage Examples
