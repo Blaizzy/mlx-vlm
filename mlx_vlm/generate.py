@@ -772,9 +772,21 @@ def _mtp_rounds_batch(
                 b[orig] = new_tokens_list[j][-1]
             positions[orig] = positions[orig] + accepted_list[j] + 1
 
-        # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
-        # per-row tail-zero on rows that accepted less).
-        if max_a < bs - 1:
+        # Rollback target cache. Two cases:
+        #   (a) max_a < bs - 1: at least one row accepted fewer than the
+        #       full draft block, so the uniform tail of the cache must be
+        #       trimmed.
+        #   (b) per-row variance (some a_i < max_a): rows accepted
+        #       different counts, so each under-accepting row must be
+        #       cyclically shifted to move its garbage K/V slots out of
+        #       the live region (handled in ``rollback_speculative_cache``
+        #       via per-row ``dynamic_roll`` + per-row ``offset`` /
+        #       ``left_padding`` adjustment).
+        # Snapshot left_padding BEFORE rollback so the drafter's
+        # ``set_shared_kv`` normalizes the (pre-rollback) verify snapshot
+        # with the matching layout.
+        pre_rollback_left_padding = _batch_cache_left_padding(prompt_cache)
+        if max_a < bs - 1 or any(a < max_a for a in accepted_list):
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
 
@@ -816,6 +828,13 @@ def _mtp_rounds_batch(
                 V_next = V_next * keep_f
             next_shared_kv[k] = (K_next, V_next)
 
+        # ``snap_left_padding`` is the left_padding to use when normalizing
+        # ``next_shared_kv`` inside ``set_shared_kv``. It must match the
+        # layout of the (pre-rollback) verify snapshot, not the
+        # post-rollback target cache (rollback bumps left_padding for
+        # under-accepting rows, which would over-roll the snapshot).
+        snap_left_padding = pre_rollback_left_padding
+
         # Continuous batching: filter finished sequences. Only safe when
         # the caches expose a .filter() method (e.g. BatchKVCache); the
         # plain KVCache / RotatingKVCache do not, so we keep all rows
@@ -834,6 +853,11 @@ def _mtp_rounds_batch(
                 for k in next_shared_kv:
                     K_next, V_next = next_shared_kv[k]
                     next_shared_kv[k] = (K_next[keep_mx], V_next[keep_mx])
+                if snap_left_padding is not None:
+                    if isinstance(snap_left_padding, mx.array):
+                        snap_left_padding = snap_left_padding[keep_mx]
+                    else:
+                        snap_left_padding = [snap_left_padding[s] for s in keep_slots]
                 active_idx = [active_idx[j] for j in keep_slots]
 
         # Re-bind drafter with new shared_kv and per-row positions.
@@ -846,7 +870,7 @@ def _mtp_rounds_batch(
             next_shared_kv,
             kv_offset=new_kv_offset,
             position=mx.array(positions_active),
-            left_padding=_batch_cache_left_padding(prompt_cache),
+            left_padding=snap_left_padding,
         )
 
         if sum(emitted) % 256 == 0:

@@ -615,9 +615,14 @@ class LanguageModel(nn.Module):
         """Rewind target KV caches after a speculative-decoding round.
 
         Gemma 4 has only KV/RotatingKV caches (no SSM/GDN), so this is a
-        simple trim + per-row tail-zero. ``gdn_states`` is accepted (and
-        ignored) for API parity with qwen3_5's hook.
+        uniform trim plus, in the batched per-row-variance case, a per-row
+        cyclic shift so each row's accepted content stays right-justified to
+        ``_idx`` and per-row ``offset`` correctly reflects ``accepted+1``
+        advance. ``gdn_states`` is accepted (and ignored) for API parity
+        with qwen3_5's hook.
         """
+        from mlx_lm.models.cache import dynamic_roll
+
         del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
@@ -625,8 +630,9 @@ class LanguageModel(nn.Module):
         max_a = int(accepted.max().item())
         n = max_a + 1
         trim = block_size - n
+        accepted_list = [int(a) for a in accepted.tolist()]
         is_batch = accepted.size > 1
-        valid_ends = accepted + 1
+        per_row_variance = is_batch and any(a < max_a for a in accepted_list)
 
         for c in caches:
             if c is None:
@@ -634,15 +640,31 @@ class LanguageModel(nn.Module):
 
             if trim > 0 and hasattr(c, "trim"):
                 c.trim(trim)
-            if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
-                kv_len = c._idx
-                ve = valid_ends.tolist()
-                verify_start = kv_len - n
-                for bi in range(accepted.shape[0]):
-                    start = verify_start + int(ve[bi])
-                    if start < kv_len:
-                        c.keys[bi, :, start:kv_len, :] = 0
-                        c.values[bi, :, start:kv_len, :] = 0
+
+            if (
+                per_row_variance
+                and hasattr(c, "keys")
+                and c.keys is not None
+                and hasattr(c, "left_padding")
+            ):
+                # After trim, the cache offset has advanced uniformly to
+                # old_offset + max_a + 1, but rows that accepted less than
+                # max_a have garbage K/V from rejected drafts in their tail
+                # at slots [old_idx + a + 1, old_idx + max_a + 1). Cyclic-
+                # shift each row forward by (max_a - a) so the garbage moves
+                # into the left-padding region; bump left_padding[i] and
+                # drop offset[i] by the same amount, landing offset[i] at
+                # old_offset[i] + a + 1. Done directly (not via prepare /
+                # finalize) because BatchRotatingKVCache.prepare derives
+                # ``_lengths = mx.array(lengths) + self.offset`` and a single
+                # post-update prepare/finalize would resolve to a no-op.
+                if hasattr(c, "_temporal_order"):
+                    c._temporal_order()
+                row_padding = mx.array([max_a - a for a in accepted_list])
+                c.keys = dynamic_roll(c.keys, row_padding[:, None], axis=2)
+                c.values = dynamic_roll(c.values, row_padding[:, None], axis=2)
+                c.offset = c.offset - row_padding
+                c.left_padding = c.left_padding + row_padding
         return max_a
 
     def sanitize(self, weights):

@@ -12,7 +12,9 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
+import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
+from mlx_lm.models.cache import BatchKVCache
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -139,6 +141,76 @@ def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
 
     assert captured["state"].shape == (2, 3, 5, 4)
     assert float(mx.sum(mx.abs(captured["state"])).item()) == 0.0
+
+
+def _populate_batch_kv_cache(B: int, H: int, D: int, prefill_len: int, verify_len: int):
+    """Build a BatchKVCache prefilled with deterministic K/V sentinels.
+
+    Prefill positions hold value ``p`` for position ``p`` in [0, prefill_len);
+    verify positions hold value ``100 + p`` for position ``p`` in
+    [0, verify_len). Returns the cache plus the reference K array.
+    """
+    cache = BatchKVCache(left_padding=[0] * B)
+    prefill_K = mx.zeros((B, H, prefill_len, D), dtype=mx.float32)
+    for p in range(prefill_len):
+        prefill_K[:, :, p, :] = float(p)
+    cache.update_and_fetch(prefill_K, prefill_K)
+    verify_K = mx.zeros((B, H, verify_len, D), dtype=mx.float32)
+    for p in range(verify_len):
+        verify_K[:, :, p, :] = 100.0 + float(p)
+    cache.update_and_fetch(verify_K, verify_K)
+    return cache
+
+
+def test_gemma4_rollback_per_row_variance_rolls_kv_and_adjusts_offsets():
+    # bs (= draft_block_size) = 4, accepts = [3, 0, 1] gives max_a = 3
+    # so the uniform trim is zero and only the per-row dynamic_roll path
+    # exercises. Each under-accepting row must move its garbage K/V
+    # (rejected drafts) into the left-padding region while keeping its
+    # accepted prefix right-justified to ``_idx``.
+    bs, B, H, D = 4, 3, 2, 4
+    cache = _populate_batch_kv_cache(B, H, D, prefill_len=5, verify_len=bs)
+    accepted = mx.array([3, 0, 1], dtype=mx.int32)
+
+    lm = gemma4_language.LanguageModel.__new__(gemma4_language.LanguageModel)
+    max_a = gemma4_language.LanguageModel.rollback_speculative_cache(
+        lm, [cache], None, accepted, block_size=bs
+    )
+    assert max_a == 3
+
+    # offset[i] = old_offset - (max_a - a_i); left_padding[i] += (max_a - a_i)
+    assert cache.offset.tolist() == [9, 6, 7]
+    assert cache.left_padding.tolist() == [0, 3, 2]
+    # No uniform trim, so _idx is unchanged.
+    assert cache._idx == 9
+
+    K = cache.keys[:, 0, : cache._idx, 0].tolist()
+    # Row 0 (a=3, full accept): unchanged. 5 prefill + 4 verify.
+    assert K[0] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0, 101.0, 102.0, 103.0]
+    # Row 1 (a=0): rolled right by 3. Slots 0..2 are garbage from rejected
+    # drafts now sitting in the left-padding region; live slice [3, 9)
+    # holds the 5 prefill tokens plus the first verify token (a+1=1 kept).
+    assert K[1][3:9] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0]
+    # Row 2 (a=1): rolled right by 2. Live slice [2, 9) holds 5 prefill +
+    # first 2 verify tokens (a+1=2 kept).
+    assert K[2][2:9] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0, 101.0]
+
+
+def test_gemma4_rollback_uniform_no_variance_only_trims():
+    # All rows accept the same count: trim is uniform, no per-row roll.
+    bs, B, H, D = 4, 3, 1, 2
+    cache = _populate_batch_kv_cache(B, H, D, prefill_len=5, verify_len=bs)
+    accepted = mx.array([1, 1, 1], dtype=mx.int32)
+
+    lm = gemma4_language.LanguageModel.__new__(gemma4_language.LanguageModel)
+    max_a = gemma4_language.LanguageModel.rollback_speculative_cache(
+        lm, [cache], None, accepted, block_size=bs
+    )
+    assert max_a == 1
+    # block_size - (max_a + 1) = 2 trimmed uniformly.
+    assert cache._idx == 7
+    assert cache.offset.tolist() == [7, 7, 7]
+    assert cache.left_padding.tolist() == [0, 0, 0]
 
 
 def test_mtp_drafter_masks_support_batched_offsets():
