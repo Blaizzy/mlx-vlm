@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import BatchKVCache
+from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache
 
 import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
@@ -187,12 +187,79 @@ def test_gemma4_rollback_per_row_variance_rolls_kv_and_adjusts_offsets():
     K = cache.keys[:, 0, : cache._idx, 0].tolist()
     # Row 0 (a=3, full accept): unchanged. 5 prefill + 4 verify.
     assert K[0] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0, 101.0, 102.0, 103.0]
-    # Row 1 (a=0): rolled right by 3. Slots 0..2 are garbage from rejected
-    # drafts now sitting in the left-padding region; live slice [3, 9)
-    # holds the 5 prefill tokens plus the first verify token (a+1=1 kept).
+    # BatchKVCache buffer is step-padded (256 slots), so the right-
+    # cyclic shift rotates zeros from the unused tail into the
+    # left-padding head; rejected drafts roll past _idx and are
+    # overwritten on the next update.
+    # Row 1 (a=0): rolled right by 3. Live slice [3, 9) holds the 5
+    # prefill tokens plus the first verify token (a+1=1 kept). Head
+    # slots [0, 3) hold zeros (masked by left_padding=3).
+    assert K[1][:3] == [0.0, 0.0, 0.0]
     assert K[1][3:9] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0]
     # Row 2 (a=1): rolled right by 2. Live slice [2, 9) holds 5 prefill +
     # first 2 verify tokens (a+1=2 kept).
+    assert K[2][:2] == [0.0, 0.0]
+    assert K[2][2:9] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0, 101.0]
+
+
+def _populate_batch_rotating_kv_cache(
+    B: int, H: int, D: int, max_size: int, prefill_len: int, verify_len: int
+):
+    """Build a BatchRotatingKVCache prefilled with deterministic K/V sentinels.
+
+    Same sentinel scheme as ``_populate_batch_kv_cache`` (prefill positions
+    hold ``p``; verify positions hold ``100 + p``). ``max_size`` must be
+    large enough to hold prefill + verify without rotating.
+    """
+    cache = BatchRotatingKVCache(max_size=max_size, left_padding=[0] * B)
+    prefill_K = mx.zeros((B, H, prefill_len, D), dtype=mx.float32)
+    for p in range(prefill_len):
+        prefill_K[:, :, p, :] = float(p)
+    cache.update_and_fetch(prefill_K, prefill_K)
+    verify_K = mx.zeros((B, H, verify_len, D), dtype=mx.float32)
+    for p in range(verify_len):
+        verify_K[:, :, p, :] = 100.0 + float(p)
+    cache.update_and_fetch(verify_K, verify_K)
+    return cache
+
+
+def test_gemma4_rollback_per_row_variance_on_rotating_cache():
+    # Same scenario as the BatchKVCache variant, but on
+    # BatchRotatingKVCache. Half of Gemma 4's layers use this cache type
+    # (sliding-attention), so the rollback's per-row dynamic_roll path
+    # must behave correctly here too. With max_size > prefill+verify,
+    # the buffer is shape[2] == _idx == 9 (no step-padding tail), so
+    # the right-cyclic shift wraps rejected K/V modulo shape[2] into
+    # the head slots — which the bumped left_padding then masks out.
+    bs, B, H, D = 4, 3, 2, 4
+    cache = _populate_batch_rotating_kv_cache(
+        B, H, D, max_size=16, prefill_len=5, verify_len=bs
+    )
+    accepted = mx.array([3, 0, 1], dtype=mx.int32)
+
+    lm = gemma4_language.LanguageModel.__new__(gemma4_language.LanguageModel)
+    max_a = gemma4_language.LanguageModel.rollback_speculative_cache(
+        lm, [cache], None, accepted, block_size=bs
+    )
+    assert max_a == 3
+
+    assert cache.offset.tolist() == [9, 6, 7]
+    assert cache.left_padding.tolist() == [0, 3, 2]
+    assert cache._idx == 9
+    assert cache.rotated is False  # _temporal_order leaves rotated=False
+
+    K = cache.keys[:, 0, : cache._idx, 0].tolist()
+    # Row 0 (a=3, full accept): unchanged.
+    assert K[0] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0, 101.0, 102.0, 103.0]
+    # Row 1 (a=0): rolled right by 3. Buffer is sized exactly to _idx,
+    # so the rejected verify tokens [101, 102, 103] wrap into the head
+    # slots [0, 3) (masked by left_padding=3). Live slice [3, 9) holds
+    # the 5 prefill tokens plus the first verify token (a+1=1 kept).
+    assert K[1][:3] == [101.0, 102.0, 103.0]
+    assert K[1][3:9] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0]
+    # Row 2 (a=1): rolled right by 2. Head [0, 2) holds the rejected
+    # tail [102, 103]; live slice [2, 9) holds 5 prefill + 2 verify.
+    assert K[2][:2] == [102.0, 103.0]
     assert K[2][2:9] == [0.0, 1.0, 2.0, 3.0, 4.0, 100.0, 101.0]
 
 

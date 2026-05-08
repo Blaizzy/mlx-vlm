@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
+from mlx_lm.models.cache import dynamic_roll
 
 from ..base import (
     LanguageModelOutput,
@@ -621,8 +622,6 @@ class LanguageModel(nn.Module):
         advance. ``gdn_states`` is accepted (and ignored) for API parity
         with qwen3_5's hook.
         """
-        from mlx_lm.models.cache import dynamic_roll
-
         del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
@@ -648,16 +647,24 @@ class LanguageModel(nn.Module):
                 and hasattr(c, "left_padding")
             ):
                 # After trim, the cache offset has advanced uniformly to
-                # old_offset + max_a + 1, but rows that accepted less than
-                # max_a have garbage K/V from rejected drafts in their tail
-                # at slots [old_idx + a + 1, old_idx + max_a + 1). Cyclic-
-                # shift each row forward by (max_a - a) so the garbage moves
-                # into the left-padding region; bump left_padding[i] and
-                # drop offset[i] by the same amount, landing offset[i] at
-                # old_offset[i] + a + 1. Done directly (not via prepare /
-                # finalize) because BatchRotatingKVCache.prepare derives
-                # ``_lengths = mx.array(lengths) + self.offset`` and a single
-                # post-update prepare/finalize would resolve to a no-op.
+                # old_offset + max_a + 1, but rows that accepted fewer
+                # than max_a have garbage K/V from rejected drafts in
+                # their tail at slots [old_idx + a + 1, old_idx + max_a
+                # + 1). Right-cyclic-shift each row by (max_a - a) over
+                # the buffer. Depending on cache shape, the rejected K/V
+                # either lands past _idx in unused storage
+                # (BatchKVCache: step-padded, overwritten on the next
+                # update) or wraps modulo shape[2] into the head slots
+                # (BatchRotatingKVCache pre-rotation). Either way,
+                # bumping left_padding[i] by the same shift masks the
+                # new head slots from attention, and dropping offset[i]
+                # leaves the per-row logical length at
+                # old_offset[i] + a + 1. Done directly (not via
+                # prepare / finalize) because
+                # BatchRotatingKVCache.prepare derives
+                # ``_lengths = mx.array(lengths) + self.offset`` and a
+                # single post-update prepare/finalize would resolve to a
+                # no-op.
                 if hasattr(c, "_temporal_order"):
                     c._temporal_order()
                 row_padding = mx.array([max_a - a for a in accepted_list])

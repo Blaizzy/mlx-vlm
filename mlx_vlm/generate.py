@@ -854,10 +854,7 @@ def _mtp_rounds_batch(
                     K_next, V_next = next_shared_kv[k]
                     next_shared_kv[k] = (K_next[keep_mx], V_next[keep_mx])
                 if snap_left_padding is not None:
-                    if isinstance(snap_left_padding, mx.array):
-                        snap_left_padding = snap_left_padding[keep_mx]
-                    else:
-                        snap_left_padding = [snap_left_padding[s] for s in keep_slots]
+                    snap_left_padding = snap_left_padding[keep_mx]
                 active_idx = [active_idx[j] for j in keep_slots]
 
         # Re-bind drafter with new shared_kv and per-row positions.
