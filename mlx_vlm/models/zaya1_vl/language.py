@@ -4,6 +4,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchLinear
 
 from ..base import LanguageModelOutput, create_attention_mask, scaled_dot_product_attention
@@ -24,63 +25,10 @@ def _cache_is_empty(cache) -> bool:
     return cache is None or (hasattr(cache, "empty") and cache.empty())
 
 
-def _position_ids_from_cache(batch_size: int, length: int, cache) -> mx.array:
-    positions = mx.arange(length)
-    if cache is None or not hasattr(cache, "offset"):
-        return mx.broadcast_to(positions[None, :], (batch_size, length))
-
-    offset = cache.offset
-    if isinstance(offset, mx.array):
-        if offset.ndim == 0:
-            offset = offset.reshape(1, 1)
-        else:
-            offset = offset[:, None]
-    else:
-        offset = mx.array(offset).reshape(1, 1)
-    return offset + positions[None, :]
-
-
 def _repeat_kv(x: mx.array, repeats: int) -> mx.array:
     if repeats == 1:
         return x
     return mx.repeat(x, repeats, axis=1)
-
-
-def _rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
-
-
-class ZayaRotaryEmbedding:
-    def __init__(self, config: TextConfig):
-        self.dim = int(config.head_dim * config.rope_parameters["partial_rotary_factor"])
-        self.base = config.rope_parameters["rope_theta"]
-        self.inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
-        )
-
-    def __call__(self, position_ids: mx.array):
-        freqs = position_ids.astype(mx.float32)[..., None] * self.inv_freq
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        return mx.cos(emb), mx.sin(emb)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    cos = mx.expand_dims(cos, axis=1)
-    sin = mx.expand_dims(sin, axis=1)
-    rotary_dim = cos.shape[-1]
-
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (_rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (_rotate_half(k_rot) * sin)
-
-    return (
-        mx.concatenate([q_embed.astype(q.dtype), q_pass], axis=-1),
-        mx.concatenate([k_embed.astype(k.dtype), k_pass], axis=-1),
-    )
 
 
 class ResidualScaling(nn.Module):
@@ -308,7 +256,13 @@ class ZayaAttention(nn.Module):
             bias=config.attention_bias,
         )
         self.qkv = CCA(config, layer_n)
-        self.rotary_emb = ZayaRotaryEmbedding(config)
+        self.rope = initialize_rope(
+            int(config.head_dim * config.rope_parameters["partial_rotary_factor"]),
+            base=config.rope_parameters["rope_theta"],
+            traditional=False,
+            scaling_config=config.rope_parameters,
+            max_position_embeddings=config.max_position_embeddings,
+        )
 
         if config.vision_lora:
             r = config.vision_lora_rank_attn
@@ -339,8 +293,9 @@ class ZayaAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        cos, sin = self.rotary_emb(_position_ids_from_cache(B, L, kv_cache))
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        offset = kv_cache.offset if kv_cache is not None else 0
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
 
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
