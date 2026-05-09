@@ -17,6 +17,11 @@ def swiglu(gate: mx.array, x: mx.array) -> mx.array:
     return (nn.silu(gate.astype(mx.float32)) * x.astype(mx.float32)).astype(gate.dtype)
 
 
+@partial(mx.compile, shapeless=True)
+def gelu(x: mx.array) -> mx.array:
+    return nn.gelu(x.astype(mx.float32)).astype(x.dtype)
+
+
 class PatchMerger(nn.Module):
     def __init__(self, dim: int, context_dim: int, spatial_merge_size: int = 2) -> None:
         super().__init__()
@@ -30,10 +35,7 @@ class PatchMerger(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.ln_q(x).reshape(-1, self.hidden_size)
-        x = self.mlp[0](x)
-        x = self.mlp[1](x.astype(mx.float32)).astype(x.dtype)
-        x = self.mlp[2](x)
-        return x
+        return self.mlp[2](gelu(self.mlp[0](x)))
 
 
 class MLP(nn.Module):
