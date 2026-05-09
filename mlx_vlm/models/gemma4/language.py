@@ -327,9 +327,9 @@ class DecoderLayer(nn.Module):
         self, h: mx.array, per_layer_input: mx.array
     ) -> mx.array:
         if (
-            isinstance(self.per_layer_input_gate, nn.Linear)
-            and isinstance(self.per_layer_projection, nn.Linear)
-            and isinstance(self.post_per_layer_input_norm, RMSNorm)
+            type(self.per_layer_input_gate) is nn.Linear
+            and type(self.per_layer_projection) is nn.Linear
+            and type(self.post_per_layer_input_norm) is RMSNorm
             and "bias" not in self.per_layer_input_gate
             and "bias" not in self.per_layer_projection
             and self.layer_scalar is not None
