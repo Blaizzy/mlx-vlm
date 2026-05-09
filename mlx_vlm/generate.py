@@ -823,6 +823,7 @@ def _mtp_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
+    greedy_sampling: bool = False,
 ) -> Generator[Tuple[int, None], None, None]:
     """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
 
@@ -882,7 +883,13 @@ def _mtp_rounds(
             break
 
         draft_tokens = draft_model.draft_block(
-            b, hidden, None, bs, sampler, token_dtype
+            b,
+            hidden,
+            None,
+            bs,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
         )
         mx.async_eval(draft_tokens)
 
@@ -950,6 +957,12 @@ def _mtp_draft_position(kv_valid_len: Any) -> Any:
     return mx.maximum(mx.array(kv_valid_len, dtype=mx.int32) - 1, 0)
 
 
+def _mtp_draft_kwargs(draft_model: nn.Module, greedy_sampling: bool) -> Dict[str, bool]:
+    if greedy_sampling and getattr(draft_model, "supports_greedy_draft_argmax", False):
+        return {"greedy": True}
+    return {}
+
+
 def _mtp_draft_block_active(
     draft_model,
     bonus_tokens: List[int],
@@ -958,6 +971,7 @@ def _mtp_draft_block_active(
     sampler: Callable[[mx.array], mx.array],
     token_dtype: mx.Dtype,
     positions: List[int],
+    greedy_sampling: bool = False,
 ) -> mx.array:
     """Draft an active MTP batch, falling back to rowwise for mixed positions.
 
@@ -973,6 +987,7 @@ def _mtp_draft_block_active(
             block_size,
             sampler,
             token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
         )
 
     positions_list = [int(position) for position in positions]
@@ -984,6 +999,7 @@ def _mtp_draft_block_active(
             block_size,
             sampler,
             token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
         )
 
     shared_kv = getattr(draft_model, "_shared_kv", None)
@@ -1011,6 +1027,7 @@ def _mtp_draft_block_active(
                 block_size,
                 sampler,
                 token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling),
             )
         )
 
@@ -1038,6 +1055,7 @@ def _mtp_rounds_batch(
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
     eos_token_ids: Optional[set] = None,
+    greedy_sampling: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B > 1).
 
@@ -1122,6 +1140,7 @@ def _mtp_rounds_batch(
             sampler,
             token_dtype,
             positions_active,
+            greedy_sampling=greedy_sampling,
         )
         mx.async_eval(draft_tokens)
 
@@ -1614,6 +1633,7 @@ def generate_step(
         kv_quant_scheme=kv_quant_scheme,
     )
 
+    sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
         sampler = make_sampler(
             temp=temperature,
@@ -1790,6 +1810,7 @@ def generate_step(
                     sampler=sampler,
                     draft_block_size=draft_block_size,
                     token_dtype=input_ids.dtype,
+                    greedy_sampling=sampler_is_greedy,
                 )
             else:
                 mx.eval(y)
@@ -1817,6 +1838,7 @@ def generate_step(
                     draft_block_size=draft_block_size,
                     token_dtype=input_ids.dtype,
                     eos_token_ids=eos_set,
+                    greedy_sampling=sampler_is_greedy,
                 )
             return
 

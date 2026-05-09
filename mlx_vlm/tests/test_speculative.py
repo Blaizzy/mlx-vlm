@@ -34,6 +34,7 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
 )
+from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -403,6 +404,36 @@ def test_mtp_draft_hidden_defaults_to_identity():
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
 
     assert _mtp_draft_hidden(SimpleNamespace(), hidden).tolist() == hidden.tolist()
+
+
+def test_masked_embedder_argmax_matches_full_sparse_logits():
+    cfg = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=2, vocab_size=8),
+        num_centroids=2,
+        centroid_intermediate_top_k=1,
+    )
+    embedder = MaskedEmbedder(cfg)
+    embedder.centroids.weight = mx.array([[1.0, 0.0], [0.0, 1.0]])
+    embedder.token_ordering = mx.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=mx.int32)
+    lm_head_weight = mx.array(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [2.0, 0.0],
+            [0.0, 2.0],
+            [3.0, 0.0],
+            [0.0, 3.0],
+            [4.0, 0.0],
+            [0.0, 4.0],
+        ],
+        dtype=mx.float32,
+    )
+    hidden = mx.array([[[2.0, 0.5], [0.5, 2.0]]], dtype=mx.float32)
+
+    fast = embedder.argmax(hidden, lm_head_weight)
+    full = mx.argmax(embedder(hidden, lm_head_weight), axis=-1)
+
+    assert fast.tolist() == full.tolist()
 
 
 def test_format_speculative_stats_includes_variable_draft_rate():
