@@ -4,10 +4,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
-from ..qwen2_5_vl.vision import VisionModel
 from . import processing_zaya1_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
+from .vision import VisionModel
 
 
 class Model(nn.Module):
