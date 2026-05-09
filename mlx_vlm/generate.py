@@ -54,7 +54,6 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
-MTP_MIN_ACCEPT_STABLE_PREFIX_TOKENS = 64
 
 
 def parse_arguments():
@@ -236,32 +235,6 @@ def parse_arguments():
         type=int,
         default=None,
         help="Override the drafter's configured block size.",
-    )
-    parser.add_argument(
-        "--mtp-approx-verify",
-        action="store_true",
-        help=(
-            "Approximate Gemma 4 MTP mode: trust drafted tokens and use the "
-            "target only to catch up KV cache state. Faster, but not exact."
-        ),
-    )
-    parser.add_argument(
-        "--mtp-approx-verify-period",
-        type=int,
-        default=0,
-        help=(
-            "When --mtp-approx-verify is enabled, run an exact verification "
-            "round every N MTP rounds. 0 means trust every round."
-        ),
-    )
-    parser.add_argument(
-        "--mtp-min-accept",
-        type=int,
-        default=0,
-        help=(
-            "Approximate Gemma 4 MTP acceptance floor. If verifier rejects "
-            "before this many drafted tokens, trust the draft up to this count."
-        ),
     )
     parser.add_argument(
         "--enable-thinking",
@@ -715,112 +688,19 @@ def _mtp_acceptance_walk(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budget: int,
-    min_accept: int = 0,
 ) -> Tuple[int, List[int]]:
     if verify.target_tokens is not None:
         mx.async_eval(verify.target_tokens, verify.hidden)
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, verify.target_tokens, budget
-        )
-        target_tokens = verify.target_tokens
-    else:
-        mx.async_eval(verify.hidden)
-        accepted, new_tokens = _speculative_walk_deferred_greedy(
-            lm,
-            verify.hidden,
-            draft_tokens,
-            sampler,
-            budget,
-        )
-        target_tokens = None
+        return _speculative_walk(draft_tokens, verify.target_tokens, budget)
 
-    forced = min(int(min_accept), draft_tokens.shape[1])
-    if forced <= accepted or accepted == 0:
-        return accepted, new_tokens
-
-    if target_tokens is None:
-        with mx.stream(generation_stream):
-            logits = lm.speculative_logits_from_hidden(
-                verify.hidden[:, forced : forced + 1, :]
-            )
-            bonus = sampler(logits)
-        mx.eval(bonus)
-    else:
-        bonus = target_tokens[:, forced : forced + 1]
-
-    trusted = draft_tokens[:, :forced]
-    if budget > forced:
-        new_tokens = (
-            mx.concatenate([trusted, bonus], axis=1)[:, :budget].reshape(-1).tolist()
-        )
-    else:
-        new_tokens = trusted[:, :budget].reshape(-1).tolist()
-    return forced, new_tokens
-
-
-def _mtp_target_one_token(
-    lm: nn.Module,
-    prompt_cache: List[Any],
-    token: int,
-    sampler: Callable[[mx.array], mx.array],
-    token_dtype: mx.Dtype,
-) -> Tuple[mx.array, int, dict]:
-    token_arr = mx.array([[token]], dtype=token_dtype)
-    shared_kv_sink: dict = {}
-    hidden = lm.model(
-        token_arr,
-        cache=prompt_cache,
-        shared_kv_sink=shared_kv_sink,
-        skip_final_norm=True,
+    mx.async_eval(verify.hidden)
+    return _speculative_walk_deferred_greedy(
+        lm,
+        verify.hidden,
+        draft_tokens,
+        sampler,
+        budget,
     )
-    logits = lm.speculative_logits_from_hidden(hidden[:, -1:, :])
-    target_token = sampler(logits)
-    mx.eval(target_token, hidden)
-    if not shared_kv_sink:
-        shared_kv_sink = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)
-    return hidden[:, -1:, :], int(target_token.reshape(-1).item()), shared_kv_sink
-
-
-def _mtp_verify_sequential_greedy(
-    lm: nn.Module,
-    prompt_cache: List[Any],
-    first_bonus: int,
-    draft_tokens: mx.array,
-    sampler: Callable[[mx.array], mx.array],
-    budget: int,
-    token_dtype: mx.Dtype,
-) -> Tuple[int, List[int], mx.array, dict]:
-    draft_list = [int(token) for token in draft_tokens.reshape(-1).tolist()]
-    accepted = 0
-    new_tokens: List[int] = []
-    current = int(first_bonus)
-    hidden = None
-    shared_kv_states = {}
-
-    for pos in range(len(draft_list) + 1):
-        with mx.stream(generation_stream):
-            hidden, target_token, shared_kv_states = _mtp_target_one_token(
-                lm,
-                prompt_cache,
-                current,
-                sampler,
-                token_dtype,
-            )
-
-        if pos < len(draft_list) and target_token == draft_list[pos]:
-            accepted += 1
-            if len(new_tokens) < budget:
-                new_tokens.append(target_token)
-            current = target_token
-            continue
-
-        if len(new_tokens) < budget:
-            new_tokens.append(target_token)
-        break
-
-    if hidden is None:
-        raise RuntimeError("MTP sequential verification produced no target hidden.")
-    return accepted, new_tokens, hidden, shared_kv_states
 
 
 def _slice_shared_kv_after_reject(shared_kv_states: dict, rejected: int) -> dict:
@@ -839,6 +719,7 @@ def _slice_shared_kv_after_reject(shared_kv_states: dict, rejected: int) -> dict
             next_shared_kv[k] = (K[..., :valid, :], V[..., :valid, :])
     return next_shared_kv
 
+
 def _record_speculative_round(
     draft_model: nn.Module, accepted: float, draft_count: int
 ) -> None:
@@ -854,24 +735,19 @@ def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
 
     rounds = len(accepted_lens)
     mean_accept = sum(accepted_lens) / rounds
-    label = (
-        "Approximate speculative decoding"
-        if getattr(draft_model, "approx_verify", False)
-        else "Speculative decoding"
-    )
     draft_lens = getattr(draft_model, "draft_lens", None) or []
     if len(draft_lens) == rounds and sum(draft_lens) > 0:
         accept_rate = 100 * sum(accepted_lens) / sum(draft_lens)
         mean_draft = sum(draft_lens) / rounds
         return (
-            f"{label}: "
+            "Speculative decoding: "
             f"{mean_accept:.2f} accepted tokens/round "
             f"({accept_rate:.1f}% of drafted, "
             f"avg draft {mean_draft:.2f}) over {rounds} rounds"
         )
 
     return (
-        f"{label}: "
+        "Speculative decoding: "
         f"{mean_accept:.2f} accepted tokens over {rounds} rounds"
     )
 
@@ -942,9 +818,6 @@ def _mtp_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
-    mtp_approx_verify: bool = False,
-    mtp_approx_verify_period: int = 0,
-    mtp_min_accept: int = 0,
 ) -> Generator[Tuple[int, None], None, None]:
     """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
 
@@ -969,8 +842,6 @@ def _mtp_rounds(
     )
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
-    draft_model.approx_verify = bool(mtp_approx_verify or mtp_min_accept > 0)
-    stable_exact_verify = not mtp_approx_verify and mtp_min_accept == 0
 
     # Hidden from prefill is full prompt-length; reduce to a single slot.
     # The semantically-correct choice is the *last* prompt token's hidden:
@@ -1004,80 +875,6 @@ def _mtp_rounds(
         )
         mx.async_eval(draft_tokens)
 
-        round_number = len(draft_model.accept_lens) + 1
-        run_approx_verify = mtp_approx_verify and (
-            mtp_approx_verify_period <= 0
-            or (
-                mtp_approx_verify_period > 1
-                and round_number % mtp_approx_verify_period != 1
-            )
-        )
-        if run_approx_verify:
-            with mx.stream(generation_stream):
-                verify_input = mx.concatenate(
-                    [mx.array([[b]], dtype=token_dtype), draft_tokens[:, :-1]], axis=1
-                )
-                verify = _mtp_verify_target(
-                    lm,
-                    verify_input,
-                    prompt_cache,
-                    sampler,
-                )
-            accepted = bs - 1
-            new_tokens = (
-                draft_tokens[:, : min(bs - 1, max_tokens - emitted)]
-                .reshape(-1)
-                .tolist()
-            )
-            hidden = verify.hidden[:, -1:, :]
-            _record_speculative_round(draft_model, accepted, bs - 1)
-
-            for tok in new_tokens:
-                yield tok, None
-                emitted += 1
-                if emitted >= max_tokens:
-                    return
-
-            b = new_tokens[-1] if new_tokens else b
-            kv_offset = int(prompt_cache[0].offset)
-            draft_model.set_shared_kv(verify.shared_kv_states, kv_offset)
-            if emitted % 256 == 0:
-                mx.clear_cache()
-            continue
-
-        stable_prefix_verify = (
-            not mtp_approx_verify
-            and mtp_min_accept > 1
-            and emitted < MTP_MIN_ACCEPT_STABLE_PREFIX_TOKENS
-        )
-        if stable_exact_verify or stable_prefix_verify:
-            accepted, new_tokens, hidden, next_shared_kv = (
-                _mtp_verify_sequential_greedy(
-                    lm,
-                    prompt_cache,
-                    b,
-                    draft_tokens,
-                    sampler,
-                    max_tokens - emitted,
-                    token_dtype,
-                )
-            )
-            _record_speculative_round(draft_model, accepted, bs - 1)
-
-            for tok in new_tokens:
-                yield tok, None
-                emitted += 1
-                if emitted >= max_tokens:
-                    return
-
-            b = new_tokens[-1] if new_tokens else b
-            kv_offset = int(prompt_cache[0].offset)
-            draft_model.set_shared_kv(next_shared_kv, kv_offset)
-
-            if emitted % 256 == 0:
-                mx.clear_cache()
-            continue
-
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
@@ -1094,9 +891,7 @@ def _mtp_rounds(
             draft_tokens,
             sampler,
             max_tokens - emitted,
-            min_accept=mtp_min_accept,
         )
-        next_hidden = verify.hidden[:, accepted : accepted + 1, :]
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
@@ -1105,20 +900,17 @@ def _mtp_rounds(
             if emitted >= max_tokens:
                 return
 
-        # Hidden for next round: pick the slot of the current bonus.
+        # Hidden for next round: pick the slot of the newly accepted bonus.
+        hidden = verify.hidden[:, accepted : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
-            hidden = next_hidden
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
-            next_shared_kv = _slice_shared_kv_after_reject(
-                verify.shared_kv_states, bs - (accepted + 1)
-            )
-        else:
-            hidden = next_hidden
-            next_shared_kv = verify.shared_kv_states
 
+        next_shared_kv = _slice_shared_kv_after_reject(
+            verify.shared_kv_states, bs - (accepted + 1)
+        )
         kv_offset = int(prompt_cache[0].offset)
         draft_model.set_shared_kv(next_shared_kv, kv_offset)
 
@@ -1731,9 +1523,6 @@ def generate_step(
     draft_model: Optional[nn.Module] = None,
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
-    mtp_approx_verify: bool = False,
-    mtp_approx_verify_period: int = 0,
-    mtp_min_accept: int = 0,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
     **kwargs,
@@ -1781,14 +1570,6 @@ def generate_step(
           speculative path.
         draft_block_size (int, optional): Override the drafter's configured
           block size.
-        mtp_approx_verify (bool): Trust Gemma 4 MTP draft tokens and use target
-          forwards only to catch up cache state. This is not exact greedy
-          decoding.
-        mtp_approx_verify_period (int): If approximate MTP is enabled, run one
-          exact verification round every N rounds. 0 trusts every round.
-        mtp_min_accept (int): Approximate MTP acceptance floor. Drafted tokens
-          before this count are trusted even when target verification rejects
-          earlier.
 
     Yields:
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
@@ -1979,9 +1760,6 @@ def generate_step(
                     sampler=sampler,
                     draft_block_size=draft_block_size,
                     token_dtype=input_ids.dtype,
-                    mtp_approx_verify=mtp_approx_verify,
-                    mtp_approx_verify_period=mtp_approx_verify_period,
-                    mtp_min_accept=mtp_min_accept,
                 )
             else:
                 mx.eval(y)
@@ -4707,9 +4485,6 @@ def main():
             gen_kwargs["draft_kind"] = args.draft_kind
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
-            gen_kwargs["mtp_approx_verify"] = args.mtp_approx_verify
-            gen_kwargs["mtp_approx_verify_period"] = args.mtp_approx_verify_period
-            gen_kwargs["mtp_min_accept"] = args.mtp_min_accept
 
         result = generate(
             model,

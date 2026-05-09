@@ -148,34 +148,30 @@ class Gemma4AssistantDraftModel(nn.Module):
         shared_kv_states: dict,
         position_ids: mx.array,
         cache: Any = None,
-        masks: Optional[dict] = None,
-        offset: Optional[mx.array] = None,
     ) -> Tuple[mx.array, mx.array]:
         del cache
         text_cfg = self.config.text_config
 
         h = self.pre_projection(inputs_embeds)
 
-        if masks is None or offset is None:
-            query_offset = (
-                int(position_ids[0, 0].item())
-                if position_ids.shape[0] == 1
-                else position_ids[:, 0]
-            )
-            if masks is None:
-                masks = make_drafter_masks(
-                    shared_kv_states,
-                    query_len=h.shape[1],
-                    query_offset=query_offset,
-                    sliding_window=text_cfg.sliding_window,
-                    dtype=h.dtype,
-                )
-            if offset is None:
-                offset = (
-                    mx.array(query_offset)
-                    if position_ids.shape[0] == 1
-                    else position_ids[:, 0]
-                )
+        query_len = h.shape[1]
+        query_offset = (
+            int(position_ids[0, 0].item())
+            if position_ids.shape[0] == 1
+            else position_ids[:, 0]
+        )
+        masks = make_drafter_masks(
+            shared_kv_states,
+            query_len=query_len,
+            query_offset=query_offset,
+            sliding_window=text_cfg.sliding_window,
+            dtype=h.dtype,
+        )
+
+        if position_ids.shape[0] == 1:
+            offset = mx.array(query_offset)
+        else:
+            offset = position_ids[:, 0]
 
         for layer in self.model.layers:
             kv = shared_kv_states[layer.layer_type]
@@ -236,21 +232,9 @@ class Gemma4AssistantDraftModel(nn.Module):
             )
         shared_kv = self._shared_kv
         if isinstance(self._position, int):
-            query_offset = self._position
-            position_ids = mx.array([[query_offset]])
-            offset = mx.array(query_offset)
+            position_ids = mx.array([[self._position]])
         else:
-            query_offset = self._position
-            position_ids = query_offset[:, None]
-            offset = query_offset
-        text_cfg = self.config.text_config
-        masks = make_drafter_masks(
-            shared_kv,
-            query_len=1,
-            query_offset=query_offset,
-            sliding_window=text_cfg.sliding_window,
-            dtype=hidden.dtype,
-        )
+            position_ids = self._position[:, None]
 
         if isinstance(last_bonus, int):
             tok = mx.array([[last_bonus]], dtype=token_dtype)
@@ -259,16 +243,11 @@ class Gemma4AssistantDraftModel(nn.Module):
 
         h_prev = hidden
         tokens: List[mx.array] = []
+
         for _ in range(block_size - 1):
             tok_embed = self._input_embed(tok) * self._input_embed_scale
             inputs_embeds = mx.concatenate([tok_embed, h_prev], axis=-1)
-            h_prev, logits = self(
-                inputs_embeds,
-                shared_kv,
-                position_ids,
-                masks=masks,
-                offset=offset,
-            )
+            h_prev, logits = self(inputs_embeds, shared_kv, position_ids)
             tok = sampler(logits)
             tokens.append(tok)
 

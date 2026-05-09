@@ -16,14 +16,7 @@ from mlx_lm.models.cache import (
 
 
 class BufferedRotatingKVCache(RotatingKVCache):
-    """Temporal sliding-window cache with rollback slack for speculative blocks.
-
-    ``RotatingKVCache`` is optimal for one-token decode, but its multi-token
-    path reorders and concatenates the full sliding window on every update.
-    MTP verification updates several tokens at a time and may then roll back
-    part of that block, so keep a small temporal buffer beyond the window and
-    compact only when the buffer fills.
-    """
+    """Temporal sliding-window cache with rollback slack for speculative blocks."""
 
     def __init__(self, max_size: int, keep: int = 0, buffer_size: int = 64):
         super().__init__(max_size=max_size, keep=keep)
@@ -409,19 +402,12 @@ def make_prompt_cache(
 
     Args:
         model (nn.Module): The language model.
-        max_kv_size (Optional[int]): If provided, unbounded ``KVCache`` entries
-            are replaced with ``RotatingKVCache`` entries capped to this size.
+        max_kv_size (Optional[int]): If provided and the model does not have a
+            ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
+            size of ``max_kv_size``
     """
     if hasattr(model, "make_cache"):
-        prompt_cache = model.make_cache()
-        if max_kv_size is None:
-            return prompt_cache
-        return [
-            RotatingKVCache(max_size=max_kv_size, keep=4)
-            if isinstance(entry, KVCache)
-            else entry
-            for entry in prompt_cache
-        ]
+        return model.make_cache()
 
     num_layers = len(model.layers)
 

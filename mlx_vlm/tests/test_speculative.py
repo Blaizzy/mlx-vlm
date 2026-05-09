@@ -14,24 +14,15 @@ import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
-    _MTPVerifyResult,
     _effective_mtp_block_size,
     _format_speculative_stats,
-    _mtp_acceptance_walk,
     _mtp_draft_block_active,
-    _mtp_verify_sequential_greedy,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_deferred_greedy,
     _speculative_walk_deferred_greedy,
 )
-from mlx_vlm.models.cache import (
-    ArraysCache,
-    BufferedRotatingKVCache,
-    KVCache,
-    RotatingKVCache,
-    make_prompt_cache,
-)
+from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -244,20 +235,6 @@ def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     assert buffered.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
 
 
-def test_make_prompt_cache_caps_model_kv_cache_when_requested():
-    class FakeModel:
-        def make_cache(self):
-            return [KVCache(), RotatingKVCache(max_size=4, keep=0)]
-
-    caches = make_prompt_cache(FakeModel(), max_kv_size=16)
-
-    assert isinstance(caches[0], RotatingKVCache)
-    assert caches[0].max_size == 16
-    assert caches[0].keep == 4
-    assert isinstance(caches[1], RotatingKVCache)
-    assert caches[1].max_size == 4
-
-
 def test_normalize_batched_shared_kv_states_repacks_left_padded_rows():
     keys = mx.array(
         [
@@ -364,86 +341,6 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
     assert accepted == 1
     assert new_tokens == [2, 3]
     assert fake_head.calls == 2
-
-
-def test_mtp_min_accept_does_not_force_immediate_rejection():
-    accepted, new_tokens = _mtp_acceptance_walk(
-        SimpleNamespace(),
-        _MTPVerifyResult(
-            hidden=mx.zeros((1, 3, 4)),
-            shared_kv_states={},
-            target_tokens=mx.array([[7, 8, 9]], dtype=mx.int32),
-        ),
-        mx.array([[2, 3]], dtype=mx.int32),
-        lambda logits: mx.argmax(logits, axis=-1),
-        budget=3,
-        min_accept=2,
-    )
-
-    assert accepted == 0
-    assert new_tokens == [7]
-
-
-def test_mtp_min_accept_extends_after_verified_anchor_token():
-    accepted, new_tokens = _mtp_acceptance_walk(
-        SimpleNamespace(),
-        _MTPVerifyResult(
-            hidden=mx.zeros((1, 3, 4)),
-            shared_kv_states={},
-            target_tokens=mx.array([[2, 8, 9]], dtype=mx.int32),
-        ),
-        mx.array([[2, 3]], dtype=mx.int32),
-        lambda logits: mx.argmax(logits, axis=-1),
-        budget=3,
-        min_accept=2,
-    )
-
-    assert accepted == 2
-    assert new_tokens == [2, 3, 9]
-
-
-def test_mtp_verify_sequential_greedy_uses_one_token_target_steps():
-    class FakeTargetModel:
-        def __init__(self):
-            self.inputs = []
-
-        def __call__(self, token, cache, shared_kv_sink, skip_final_norm):
-            del cache, skip_final_norm
-            token_id = int(token.reshape(-1).item())
-            self.inputs.append(token_id)
-            target_by_input = {10: 2, 2: 3}
-            target = target_by_input[token_id]
-            hidden = mx.zeros((1, 1, 5), dtype=mx.float32)
-            hidden[:, :, target] = 10
-            shared_kv_sink["full_attention"] = (
-                mx.array([[[[token_id]]]], dtype=mx.float32),
-                mx.array([[[[target]]]], dtype=mx.float32),
-            )
-            return hidden
-
-    class FakeLM:
-        def __init__(self):
-            self.model = FakeTargetModel()
-
-        def speculative_logits_from_hidden(self, hidden):
-            return hidden
-
-    lm = FakeLM()
-    accepted, new_tokens, hidden, shared_kv = _mtp_verify_sequential_greedy(
-        lm,
-        prompt_cache=[],
-        first_bonus=10,
-        draft_tokens=mx.array([[2, 4]], dtype=mx.int32),
-        sampler=lambda logits: mx.argmax(logits, axis=-1),
-        budget=3,
-        token_dtype=mx.int32,
-    )
-
-    assert accepted == 1
-    assert new_tokens == [2, 3]
-    assert lm.model.inputs == [10, 2]
-    assert int(mx.argmax(hidden, axis=-1).item()) == 3
-    assert shared_kv["full_attention"][0].reshape(-1).tolist() == [2.0]
 
 
 def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():

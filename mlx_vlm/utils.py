@@ -152,17 +152,7 @@ def get_model_path(
         Path: The path to the model.
     """
     model_path = Path(path_or_hf_repo)
-    looks_like_hf_repo = (
-        not model_path.is_absolute()
-        and len(model_path.parts) == 2
-        and not path_or_hf_repo.startswith((".", "~"))
-    )
-    shadowed_hf_repo = (
-        model_path.exists()
-        and looks_like_hf_repo
-        and not (model_path / "config.json").exists()
-    )
-    if not model_path.exists() or shadowed_hf_repo:
+    if not model_path.exists():
         model_path = Path(
             snapshot_download(
                 repo_id=path_or_hf_repo,
