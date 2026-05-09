@@ -23,9 +23,13 @@ class Zaya1VLProcessor(ProcessorMixin):
     def check_argument_for_proper_class(self, argument_name, argument):
         return type(argument)
 
-    def __init__(self, image_processor=None, tokenizer=None, chat_template=None, **kwargs):
+    def __init__(
+        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
+    ):
         self.image_token = (
-            "<image>" if not hasattr(tokenizer, "image_token") else tokenizer.image_token
+            "<image>"
+            if not hasattr(tokenizer, "image_token")
+            else tokenizer.image_token
         )
         self.image_token_id = (
             tokenizer.image_token_id

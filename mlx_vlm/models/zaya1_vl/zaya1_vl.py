@@ -30,7 +30,9 @@ class Model(nn.Module):
         if pixel_values is not None:
             image_grid_thw = kwargs.get("image_grid_thw", None)
             if image_grid_thw is None:
-                raise ValueError("image_grid_thw is required when pixel_values are provided")
+                raise ValueError(
+                    "image_grid_thw is required when pixel_values are provided"
+                )
 
             cached = kwargs.get("cached_image_features", None)
             if cached is not None:
