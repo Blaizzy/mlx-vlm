@@ -29,6 +29,16 @@ def _cache_is_empty(cache) -> bool:
     return cache is None or (hasattr(cache, "empty") and cache.empty())
 
 
+def _cache_position_mask(hidden_states: mx.array, cache) -> Optional[mx.array]:
+    left_padding = getattr(cache, "left_padding", None)
+    if left_padding is None:
+        return None
+
+    size = cache.size() if hasattr(cache, "size") else 0
+    positions = mx.arange(hidden_states.shape[1]) + size
+    return positions[None, :] >= left_padding[:, None]
+
+
 def _causal_conv1d_stack(
     conv_layers, x: mx.array, state, state_size: int, use_state: bool
 ):
@@ -604,7 +614,11 @@ class ZayaModel(nn.Module):
 
         first_kv_cache, _ = _split_cache(cache[0]) if cache else (None, None)
         attn_mask = create_attention_mask(h, first_kv_cache)
-        cca_mask = mask
+        padding_mask = _cache_position_mask(h, first_kv_cache)
+        if mask is not None and getattr(mask, "ndim", 0) == 2:
+            cca_mask = mask if padding_mask is None else mask & padding_mask
+        else:
+            cca_mask = padding_mask
 
         residual = None
         prev_router_hidden_states = None
