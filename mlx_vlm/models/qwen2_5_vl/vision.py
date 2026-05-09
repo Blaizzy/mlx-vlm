@@ -116,8 +116,9 @@ class PatchMerger(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.ln_q(x).reshape(-1, self.hidden_size)
-        for layer in self.mlp:
-            x = layer(x)
+        x = self.mlp[0](x)
+        x = self.mlp[1](x.astype(mx.float32)).astype(x.dtype)
+        x = self.mlp[2](x)
         return x
 
 
@@ -171,7 +172,11 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        hidden_states = (
+            nn.silu(self.gate_proj(x).astype(mx.float32))
+            * self.up_proj(x).astype(mx.float32)
+        ).astype(x.dtype)
+        return self.down_proj(hidden_states)
 
 
 class Qwen2VLVisionBlock(nn.Module):

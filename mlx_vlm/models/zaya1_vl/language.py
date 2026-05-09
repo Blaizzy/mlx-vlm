@@ -91,6 +91,19 @@ class ResidualScaling(nn.Module):
         return residual, hidden_states
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        x = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        return (x * self.weight.astype(mx.float32)).astype(dtype)
+
+
 class CCA(nn.Module):
     def __init__(self, config: TextConfig, layer_number: int):
         super().__init__()
@@ -355,7 +368,7 @@ class ZayaRouter(nn.Module):
         self.down_proj = nn.Linear(
             config.hidden_size, config.zaya_mlp_expansion, bias=True
         )
-        self.rmsnorm_eda = nn.RMSNorm(config.zaya_mlp_expansion, eps=1e-6)
+        self.rmsnorm_eda = RMSNorm(config.zaya_mlp_expansion, eps=1e-6)
         if self.use_eda:
             self.router_states_scale = mx.ones((config.zaya_mlp_expansion,))
 
@@ -508,7 +521,7 @@ class ZayaDecoderATTLayer(nn.Module):
         super().__init__()
         self.config = config
         self.self_attn = ZayaAttention(config, layer_n)
-        self.input_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_epsilon)
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, 2 * layer_n)
 
@@ -534,7 +547,7 @@ class ZayaDecoderMLPLayer(nn.Module):
         super().__init__()
         self.config = config
         self.zaya_block = ZayaBlock(config, layer_n)
-        self.input_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_epsilon)
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, 2 * layer_n + 1)
 
@@ -598,7 +611,7 @@ class ZayaModel(nn.Module):
         ]
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, config.num_hidden_layers)
-        self.final_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.final_norm = RMSNorm(config.hidden_size, eps=config.norm_epsilon)
 
     def __call__(
         self,
@@ -660,6 +673,18 @@ class LanguageModel(nn.Module):
         cache=None,
         **kwargs,
     ):
+        if image_mask is None:
+            image_mask = kwargs.pop("visual_pos_masks", None)
+        else:
+            kwargs.pop("visual_pos_masks", None)
+
+        if image_mask is not None and image_mask.shape[1] != input_ids.shape[1]:
+            first_kv_cache, _ = _split_cache(cache[0]) if cache else (None, None)
+            start = 0
+            if first_kv_cache is not None and hasattr(first_kv_cache, "offset"):
+                start = int(first_kv_cache.offset)
+            image_mask = image_mask[:, start : start + input_ids.shape[1]]
+
         out = self.model(input_ids, inputs_embeds, mask, image_mask, cache)
         if self.args.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(out)
