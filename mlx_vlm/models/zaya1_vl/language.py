@@ -7,7 +7,11 @@ from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchLinear
 
-from ..base import LanguageModelOutput, create_attention_mask, scaled_dot_product_attention
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from .config import ModelConfig, TextConfig
 
 
@@ -25,12 +29,6 @@ def _cache_is_empty(cache) -> bool:
     return cache is None or (hasattr(cache, "empty") and cache.empty())
 
 
-def _repeat_kv(x: mx.array, repeats: int) -> mx.array:
-    if repeats == 1:
-        return x
-    return mx.repeat(x, repeats, axis=1)
-
-
 class ResidualScaling(nn.Module):
     def __init__(self, config: TextConfig, layer_n: int):
         super().__init__()
@@ -42,7 +40,9 @@ class ResidualScaling(nn.Module):
             self.residual_bias = mx.zeros((config.hidden_size,))
 
     def __call__(self, residual: Optional[mx.array], hidden_states: mx.array):
-        hidden_states = (hidden_states + self.hidden_states_bias) * self.hidden_states_scale
+        hidden_states = (
+            hidden_states + self.hidden_states_bias
+        ) * self.hidden_states_scale
         if self.not_first_layer and residual is not None:
             residual = (residual + self.residual_bias) * self.residual_scale
         return residual, hidden_states
@@ -163,7 +163,9 @@ class CCA(nn.Module):
         kv_cache, aux_cache = _split_cache(cache)
 
         if cca_mask is not None and hidden_states.shape[1] > 1:
-            hidden_states = hidden_states * cca_mask[..., None].astype(hidden_states.dtype)
+            hidden_states = hidden_states * cca_mask[..., None].astype(
+                hidden_states.dtype
+            )
 
         hs = hidden_states.transpose(1, 0, 2)
         if hs.shape[0] > 1:
@@ -228,16 +230,16 @@ class CCA(nn.Module):
         query_norm = mx.sqrt(mx.sum(query * query, axis=-1, keepdims=True) + 1e-6)
         key_norm = mx.sqrt(mx.sum(key * key, axis=-1, keepdims=True) + 1e-6)
         query = query * (self.sqrt_head_dim / query_norm)
-        key = (
-            key
-            * (self.sqrt_head_dim / key_norm)
-            * self.temp[None, None, :, None]
-        )
+        key = key * (self.sqrt_head_dim / key_norm) * self.temp[None, None, :, None]
 
         query = query.reshape(*query.shape[:2], self.num_q_heads * self.head_dim)
         key = key.reshape(*key.shape[:2], self.num_kv_heads * self.head_dim)
         value = value.reshape(*value.shape[:2], self.num_kv_heads * self.head_dim)
-        return query.transpose(1, 0, 2), key.transpose(1, 0, 2), value.transpose(1, 0, 2)
+        return (
+            query.transpose(1, 0, 2),
+            key.transpose(1, 0, 2),
+            value.transpose(1, 0, 2),
+        )
 
 
 class ZayaAttention(nn.Module):
@@ -303,13 +305,17 @@ class ZayaAttention(nn.Module):
         if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : k.shape[-2]]
 
-        out = scaled_dot_product_attention(q, k, v, cache=None, scale=self.scale, mask=mask)
+        out = scaled_dot_product_attention(
+            q, k, v, cache=None, scale=self.scale, mask=mask
+        )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         projected = self.o_proj(out)
         if self.config.vision_lora and image_mask is not None:
             addon = self.lora_linear_o[1](self.lora_linear_o[0](out))
-            projected = projected + addon * image_mask[..., None].astype(projected.dtype)
+            projected = projected + addon * image_mask[..., None].astype(
+                projected.dtype
+            )
         return projected
 
 
@@ -324,7 +330,9 @@ class ZayaRouter(nn.Module):
         self.layer_number = layer_number
         self.use_eda = config.zaya_use_eda and layer_number != 0
 
-        self.down_proj = nn.Linear(config.hidden_size, config.zaya_mlp_expansion, bias=True)
+        self.down_proj = nn.Linear(
+            config.hidden_size, config.zaya_mlp_expansion, bias=True
+        )
         self.rmsnorm_eda = nn.RMSNorm(config.zaya_mlp_expansion, eps=1e-6)
         if self.use_eda:
             self.router_states_scale = mx.ones((config.zaya_mlp_expansion,))
@@ -340,7 +348,9 @@ class ZayaRouter(nn.Module):
         if self.use_mod:
             self.balancing_biases[-1] = -1.0
 
-    def __call__(self, hidden_states: mx.array, router_states: Optional[mx.array] = None):
+    def __call__(
+        self, hidden_states: mx.array, router_states: Optional[mx.array] = None
+    ):
         hs = self.down_proj(hidden_states)
         if self.use_eda and router_states is not None:
             hs = hs + router_states * self.router_states_scale
@@ -349,7 +359,9 @@ class ZayaRouter(nn.Module):
         for layer in self.router_mlp:
             hs = layer(hs)
 
-        expert_prob = mx.softmax(hs.astype(mx.float32), axis=-1).astype(hidden_states.dtype)
+        expert_prob = mx.softmax(hs.astype(mx.float32), axis=-1).astype(
+            hidden_states.dtype
+        )
         biased = expert_prob.astype(mx.float32) + self.balancing_biases
         if self.topk == 1:
             expert_choice = mx.expand_dims(mx.argmax(biased, axis=-1), axis=-1)
@@ -360,20 +372,6 @@ class ZayaRouter(nn.Module):
             ]
             route_prob = mx.take_along_axis(expert_prob, expert_choice, axis=-1)
         return route_prob, expert_choice, next_router_states
-
-
-def _switch_linear(linear: SwitchLinear, x: mx.array, indices: mx.array) -> mx.array:
-    if x.ndim == indices.ndim:
-        x = mx.expand_dims(x, (-2, -3))
-    elif x.ndim == indices.ndim + 1:
-        if x.shape[:-1] == indices.shape:
-            x = mx.expand_dims(x, -2)
-        else:
-            x = mx.expand_dims(x, (-2, -3))
-    else:
-        x = mx.expand_dims(x, -2)
-    y = linear(x, indices, sorted_indices=False)
-    return y.squeeze(-2)
 
 
 class ZayaSwitchMLP(nn.Module):
@@ -389,10 +387,16 @@ class ZayaSwitchMLP(nn.Module):
             else config.ffn_hidden_size
         )
         self.linear_fc1 = SwitchLinear(
-            config.hidden_size, self.ffn_hidden_size, config.num_experts, bias=config.add_bias_linear
+            config.hidden_size,
+            self.ffn_hidden_size,
+            config.num_experts,
+            bias=config.add_bias_linear,
         )
         self.linear_fc2 = SwitchLinear(
-            self.ffn_hidden_size_out, config.hidden_size, config.num_experts, bias=config.add_bias_linear
+            self.ffn_hidden_size_out,
+            config.hidden_size,
+            config.num_experts,
+            bias=config.add_bias_linear,
         )
 
         if config.vision_lora:
@@ -402,7 +406,9 @@ class ZayaSwitchMLP(nn.Module):
                 SwitchLinear(r, self.ffn_hidden_size, config.num_experts, bias=False),
             ]
             self.lora_fc2 = [
-                SwitchLinear(self.ffn_hidden_size_out, r, config.num_experts, bias=False),
+                SwitchLinear(
+                    self.ffn_hidden_size_out, r, config.num_experts, bias=False
+                ),
                 SwitchLinear(r, config.hidden_size, config.num_experts, bias=False),
             ]
 
@@ -416,10 +422,17 @@ class ZayaSwitchMLP(nn.Module):
         skip_mask = expert_choice == self.num_experts
         expert_indices = mx.minimum(expert_choice, self.num_experts - 1)
 
-        x = _switch_linear(self.linear_fc1, hidden_states, expert_indices)
+        routed_hidden_states = hidden_states[..., None, None, :]
+        x = self.linear_fc1(
+            routed_hidden_states, expert_indices, sorted_indices=False
+        ).squeeze(-2)
         if self.config.vision_lora and image_mask is not None:
-            addon = _switch_linear(self.lora_fc1[0], hidden_states, expert_indices)
-            addon = _switch_linear(self.lora_fc1[1], addon, expert_indices)
+            addon = self.lora_fc1[0](
+                routed_hidden_states, expert_indices, sorted_indices=False
+            ).squeeze(-2)
+            addon = self.lora_fc1[1](
+                addon[..., None, :], expert_indices, sorted_indices=False
+            ).squeeze(-2)
             x = x + addon * image_mask[..., None, None].astype(x.dtype)
 
         if self.config.gated_linear_unit:
@@ -430,10 +443,16 @@ class ZayaSwitchMLP(nn.Module):
         else:
             x = nn.silu(x)
 
-        y = _switch_linear(self.linear_fc2, x, expert_indices)
+        y = self.linear_fc2(
+            x[..., None, :], expert_indices, sorted_indices=False
+        ).squeeze(-2)
         if self.config.vision_lora and image_mask is not None:
-            addon = _switch_linear(self.lora_fc2[0], x, expert_indices)
-            addon = _switch_linear(self.lora_fc2[1], addon, expert_indices)
+            addon = self.lora_fc2[0](
+                x[..., None, :], expert_indices, sorted_indices=False
+            ).squeeze(-2)
+            addon = self.lora_fc2[1](
+                addon[..., None, :], expert_indices, sorted_indices=False
+            ).squeeze(-2)
             y = y + addon * image_mask[..., None, None].astype(y.dtype)
 
         if self.config.zaya_use_mod:
@@ -553,8 +572,7 @@ class ZayaModel(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
-            ZayaDecoderBlock(config, layer_n=i)
-            for i in range(config.num_hidden_layers)
+            ZayaDecoderBlock(config, layer_n=i) for i in range(config.num_hidden_layers)
         ]
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, config.num_hidden_layers)
@@ -603,7 +621,9 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = ZayaModel(args)
         if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=args.lm_head_bias)
+            self.lm_head = nn.Linear(
+                args.hidden_size, args.vocab_size, bias=args.lm_head_bias
+            )
 
     def __call__(
         self,
@@ -640,7 +660,9 @@ class LanguageModel(nn.Module):
                     if key in sanitized_weights:
                         stacked.append(sanitized_weights.pop(key))
                 if stacked:
-                    sanitized_weights[f"{prefix}.{name}.weight"] = mx.stack(stacked, axis=0)
+                    sanitized_weights[f"{prefix}.{name}.weight"] = mx.stack(
+                        stacked, axis=0
+                    )
 
             if self.args.vision_lora:
                 for lora_name in ("lora_fc1", "lora_fc2"):
