@@ -17,6 +17,7 @@ from mlx_vlm.generate import (
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
+    _mtp_draft_hidden,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_deferred_greedy,
@@ -389,6 +390,19 @@ def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
     assert accepted == [1, 2]
     assert new_tokens == [[2, 1], [0, 2]]
     assert fake_head.calls == 3
+
+
+def test_mtp_draft_hidden_uses_model_hook():
+    hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
+    lm = SimpleNamespace(speculative_draft_hidden=lambda h: h * 2)
+
+    assert _mtp_draft_hidden(lm, hidden).tolist() == [[[2.0, 4.0]]]
+
+
+def test_mtp_draft_hidden_defaults_to_identity():
+    hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
+
+    assert _mtp_draft_hidden(SimpleNamespace(), hidden).tolist() == hidden.tolist()
 
 
 def test_format_speculative_stats_includes_variable_draft_rate():

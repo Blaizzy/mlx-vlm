@@ -545,8 +545,9 @@ class Gemma4TextModel(nn.Module):
 
         # Match HF's `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
         # — the recorded value is the LAST decoder layer's output, captured
-        # BEFORE the final RMSNorm. The drafter's `pre_projection` was trained
-        # against this pre-norm hidden.
+        # BEFORE the final RMSNorm. Speculative verification can reuse this
+        # hidden for deferred logits; MTP drafters normalize it via
+        # LanguageModel.speculative_draft_hidden before consuming it.
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
 
@@ -574,6 +575,9 @@ class LanguageModel(nn.Module):
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         return self.logits_from_hidden(self.model.norm(hidden))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self.model.norm(hidden)
 
     def __call__(
         self,

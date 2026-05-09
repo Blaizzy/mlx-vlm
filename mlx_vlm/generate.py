@@ -604,6 +604,11 @@ def _mtp_verify_target(
     )
 
 
+def _mtp_draft_hidden(lm: nn.Module, hidden: mx.array) -> mx.array:
+    prepare = getattr(lm, "speculative_draft_hidden", None)
+    return prepare(hidden) if callable(prepare) else hidden
+
+
 def _speculative_walk_deferred_greedy(
     lm: nn.Module,
     target_hidden: mx.array,
@@ -853,6 +858,7 @@ def _mtp_rounds(
     # the round-1 acceptance is wasted. We don't replicate that quirk.)
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
+    hidden = _mtp_draft_hidden(lm, hidden)
 
     kv_offset = int(prompt_cache[0].offset)
     draft_model.set_shared_kv(
@@ -906,7 +912,7 @@ def _mtp_rounds(
                 return
 
         # Hidden for next round: pick the slot of the newly accepted bonus.
-        hidden = verify.hidden[:, accepted : accepted + 1, :]
+        hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
@@ -1062,6 +1068,7 @@ def _mtp_rounds_batch(
     # ``_mtp_rounds`` for rationale).
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
+    hidden = _mtp_draft_hidden(lm, hidden)
 
     # Per-row state. ``positions`` stores each row's valid target-KV length.
     # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
@@ -1167,6 +1174,7 @@ def _mtp_rounds_batch(
             hidden = hidden_full[row_idx, col_idx, :][:, None, :]
         else:
             hidden = hidden_full[:, -1:, :]
+        hidden = _mtp_draft_hidden(lm, hidden)
 
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
