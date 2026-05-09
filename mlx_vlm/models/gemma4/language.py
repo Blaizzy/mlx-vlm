@@ -21,7 +21,7 @@ def geglu(gate, x):
 
 
 @mx.compile
-def per_layer_input_residual(
+def compiled_per_layer_input_residual(
     h,
     per_layer_input,
     gate_weight,
@@ -323,6 +323,38 @@ class DecoderLayer(nn.Module):
         # Layer scalar (all text layers)
         self.layer_scalar = mx.ones((1,))
 
+    def _per_layer_input_residual(
+        self, h: mx.array, per_layer_input: mx.array
+    ) -> mx.array:
+        if (
+            isinstance(self.per_layer_input_gate, nn.Linear)
+            and isinstance(self.per_layer_projection, nn.Linear)
+            and isinstance(self.post_per_layer_input_norm, RMSNorm)
+            and "bias" not in self.per_layer_input_gate
+            and "bias" not in self.per_layer_projection
+            and self.layer_scalar is not None
+        ):
+            return compiled_per_layer_input_residual(
+                h,
+                per_layer_input,
+                self.per_layer_input_gate.weight,
+                self.per_layer_projection.weight,
+                self.post_per_layer_input_norm.weight,
+                self.layer_scalar,
+                self.post_per_layer_input_norm.eps,
+            )
+
+        residual = h
+        gate = self.per_layer_input_gate(h)
+        gate = nn.gelu_approx(gate)
+        gate = mx.multiply(gate, per_layer_input)
+        gate = self.per_layer_projection(gate)
+        gate = self.post_per_layer_input_norm(gate)
+        h = residual + gate
+        if self.layer_scalar is not None:
+            h = h * self.layer_scalar
+        return h
+
     def __call__(
         self,
         x: mx.array,
@@ -362,41 +394,14 @@ class DecoderLayer(nn.Module):
         h = residual + h
 
         # Per-layer input gating
-        apply_layer_scalar = self.layer_scalar is not None
         if (
             self.per_layer_input_gate is not None
             and self.per_layer_projection is not None
             and self.post_per_layer_input_norm is not None
             and per_layer_input is not None
         ):
-            if (
-                isinstance(self.per_layer_input_gate, nn.Linear)
-                and isinstance(self.per_layer_projection, nn.Linear)
-                and isinstance(self.post_per_layer_input_norm, RMSNorm)
-                and "bias" not in self.per_layer_input_gate
-                and "bias" not in self.per_layer_projection
-                and self.layer_scalar is not None
-            ):
-                h = per_layer_input_residual(
-                    h,
-                    per_layer_input,
-                    self.per_layer_input_gate.weight,
-                    self.per_layer_projection.weight,
-                    self.post_per_layer_input_norm.weight,
-                    self.layer_scalar,
-                    self.post_per_layer_input_norm.eps,
-                )
-                apply_layer_scalar = False
-            else:
-                residual = h
-                gate = self.per_layer_input_gate(h)
-                gate = nn.gelu_approx(gate)
-                gate = mx.multiply(gate, per_layer_input)
-                gate = self.per_layer_projection(gate)
-                gate = self.post_per_layer_input_norm(gate)
-                h = residual + gate
-
-        if apply_layer_scalar:
+            h = self._per_layer_input_residual(h, per_layer_input)
+        elif self.layer_scalar is not None:
             h = h * self.layer_scalar
 
         return h, shared_kv, offset
