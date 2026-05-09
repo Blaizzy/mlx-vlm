@@ -65,6 +65,10 @@ METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
 
+class PromptTooLongError(ValueError):
+    """Raised when a request exceeds the configured server context budget."""
+
+
 def _get_speculative_rounds_batch(draft_kind: str):
     if draft_kind == "mtp":
         return _mtp_rounds_batch
@@ -153,6 +157,28 @@ def get_max_kv_size(model: str):
         print(f"Model {model} uses QuantizedKVCache, can't set max KV size.")
         return None
     return max_kv_tokens
+
+
+def get_configured_context_limit():
+    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
+    return max_kv_tokens or None
+
+
+def _count_prompt_tokens(raw_inputs: dict) -> int:
+    input_ids = raw_inputs["input_ids"]
+    return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+
+
+def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
+    context_limit = get_configured_context_limit()
+    requested_tokens = prompt_tokens + max(0, int(max_tokens or 0))
+    if context_limit is not None and requested_tokens > context_limit:
+        raise PromptTooLongError(
+            "Request needs "
+            f"{requested_tokens} context tokens "
+            f"({prompt_tokens} prompt + {max_tokens} max generation), "
+            f"but MAX_KV_SIZE is {context_limit}."
+        )
 
 
 def get_quantized_kv_start():
@@ -395,6 +421,13 @@ def _build_metrics_envelope(
 def _server_runtime_snapshot() -> dict:
     config = model_cache.get("config")
     text_config = getattr(config, "text_config", None)
+    native_context_size = getattr(text_config, "max_position_embeddings", None)
+    configured_context_limit = get_configured_context_limit()
+    effective_context_limit = (
+        min(native_context_size, configured_context_limit)
+        if native_context_size is not None and configured_context_limit is not None
+        else configured_context_limit or native_context_size
+    )
     queue_depth = 0
     if response_generator is not None and hasattr(response_generator, "requests"):
         try:
@@ -404,7 +437,9 @@ def _server_runtime_snapshot() -> dict:
     return {
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
-        "loaded_context_size": getattr(text_config, "max_position_embeddings", None),
+        "loaded_context_size": native_context_size,
+        "configured_context_limit": configured_context_limit,
+        "effective_context_limit": effective_context_limit,
         "loaded_tool_parser": (
             _infer_tool_parser_from_processor(model_cache.get("processor"))
             if model_cache.get("processor")
@@ -629,11 +664,8 @@ class ResponseGenerator:
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._cpu_preprocess(prompt, images, audio)
-        prompt_tokens = (
-            raw_inputs["input_ids"].size
-            if hasattr(raw_inputs["input_ids"], "size")
-            else len(raw_inputs["input_ids"])
-        )
+        prompt_tokens = _count_prompt_tokens(raw_inputs)
+        _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
@@ -1187,6 +1219,23 @@ class ResponseGenerator:
         while batch_gen.has_pending_prompts:
             self._step(batch_gen, active)
 
+    def validate_context_budget(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+    ):
+        """Validate request size before opening a streaming response."""
+        if get_configured_context_limit() is None:
+            return
+        self.wait_until_ready()
+        args = args or GenerationArguments(max_tokens=get_server_max_tokens())
+        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        _check_configured_context_budget(
+            _count_prompt_tokens(raw_inputs), args.max_tokens
+        )
+
 
 def suppress_tool_call_content(
     full_output: str,
@@ -1311,6 +1360,38 @@ def _read_tenant_id(http_request) -> Optional[str]:
         return None
     h = http_request.headers
     return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+
+
+async def _preflight_stream_context_budget(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    images: Optional[List] = None,
+    audio: Optional[List] = None,
+    args: GenerationArguments,
+):
+    """Reject over-budget streaming requests before the HTTP stream starts."""
+    if response_generator is None:
+        return
+    try:
+        await asyncio.to_thread(
+            response_generator.validate_context_budget,
+            prompt,
+            images,
+            audio,
+            args,
+        )
+    except PromptTooLongError as e:
+        server_metrics.record_failure(
+            endpoint=endpoint,
+            model=model,
+            stream=True,
+            error=str(e),
+        )
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _as_plain_dict(value):
@@ -2234,6 +2315,14 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 stream=True,
             )
+            await _preflight_stream_context_budget(
+                endpoint="/responses",
+                model=openai_request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=None,
+                args=gen_args,
+            )
 
             async def stream_generator():
                 token_iterator = None
@@ -2632,6 +2721,16 @@ async def responses_endpoint(request: Request):
 
                 return response
 
+            except PromptTooLongError as e:
+                server_metrics.record_failure(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    stream=False,
+                    error=str(e),
+                )
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 server_metrics.record_failure(
                     endpoint="/responses",
@@ -2778,6 +2877,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 endpoint="/chat/completions",
                 model=request.model,
                 stream=True,
+            )
+            await _preflight_stream_context_budget(
+                endpoint="/chat/completions",
+                model=request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=audio if audio else None,
+                args=gen_args,
             )
 
             async def stream_generator():
@@ -3308,6 +3415,16 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                 return result
 
+            except PromptTooLongError as e:
+                server_metrics.record_failure(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=False,
+                    error=str(e),
+                )
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 server_metrics.record_failure(
                     endpoint="/chat/completions",
@@ -3388,6 +3505,8 @@ async def health_check():
         "loaded_model": runtime["loaded_model"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_context_size": runtime["loaded_context_size"],
+        "configured_context_limit": runtime["configured_context_limit"],
+        "effective_context_limit": runtime["effective_context_limit"],
         "loaded_tool_parser": runtime["loaded_tool_parser"],
         "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "apc_enabled": runtime["apc"]["enabled"],
