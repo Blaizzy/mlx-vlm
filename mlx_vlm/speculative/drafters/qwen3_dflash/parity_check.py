@@ -23,7 +23,7 @@ def main():
     p.add_argument("--drafter", default="z-lab/Qwen3.5-4B-DFlash")
     args = p.parse_args()
 
-    model = load_drafter(args.drafter)
+    model, _ = load_drafter(args.drafter)
     cfg = model.config
 
     dummy = _DummyEmbed(cfg.vocab_size, cfg.hidden_size)

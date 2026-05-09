@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -128,12 +128,18 @@ class Experts(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: TextConfig,
+        layer_idx: int,
+        kv_shared_only: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
+        self.kv_shared_only = kv_shared_only
 
         self.head_dim = (
             config.global_head_dim
@@ -158,14 +164,18 @@ class Attention(nn.Module):
         self.scale = 1.0
 
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-        if not self.use_k_eq_v:
-            self.v_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+        if not kv_shared_only:
+            self.k_proj = nn.Linear(dim, self.n_kv_heads * self.head_dim, bias=False)
+            if not self.use_k_eq_v:
+                self.v_proj = nn.Linear(
+                    dim, self.n_kv_heads * self.head_dim, bias=False
+                )
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=False)
 
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
+        if not kv_shared_only:
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.v_norm = RMSNormNoScale(self.head_dim, eps=config.rms_norm_eps)
 
         # RoPE (with partial rotation support)
         layer_key = "sliding_attention" if self.is_sliding else "full_attention"
@@ -234,12 +244,17 @@ class Attention(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, config: TextConfig, layer_idx: int):
+    def __init__(
+        self,
+        config: TextConfig,
+        layer_idx: int,
+        kv_shared_only: bool = False,
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
         self.layer_type = config.layer_types[layer_idx]
-        self.self_attn = Attention(config, layer_idx)
+        self.self_attn = Attention(config, layer_idx, kv_shared_only=kv_shared_only)
         self.mlp = MLP(config, layer_idx)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -349,7 +364,7 @@ class DecoderLayer(nn.Module):
 
 
 class Gemma4TextModel(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, kv_shared_only: bool = False):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
@@ -360,7 +375,8 @@ class Gemma4TextModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_scale = config.hidden_size**0.5
         self.layers = [
-            DecoderLayer(config, layer_idx=i) for i in range(config.num_hidden_layers)
+            DecoderLayer(config, layer_idx=i, kv_shared_only=kv_shared_only)
+            for i in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -451,6 +467,9 @@ class Gemma4TextModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         per_layer_inputs: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[list] = None,
+        shared_kv_sink: Optional[dict] = None,
         **kwargs,
     ):
         if inputs_embeds is None:
@@ -499,6 +518,7 @@ class Gemma4TextModel(nn.Module):
         else:
             per_layer_inputs = [None] * len(self.layers)
 
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, m, prev_idx, pli) in enumerate(
             zip(
@@ -514,8 +534,25 @@ class Gemma4TextModel(nn.Module):
                 h, m, c, per_layer_input=pli, shared_kv=kvs, offset=offset
             )
             intermediates[idx] = (kvs, offset)
+            if hidden_sink is not None and idx in capture_set:
+                hidden_sink.append(h)
 
-        return self.norm(h)
+        if shared_kv_sink is not None:
+            for idx, layer in enumerate(self.layers):
+                kvs, _ = intermediates[idx]
+                if kvs is not None:
+                    shared_kv_sink[layer.layer_type] = kvs
+
+        # Match HF's `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
+        # — the recorded value is the LAST decoder layer's output, captured
+        # BEFORE the final RMSNorm. The drafter's `pre_projection` was trained
+        # against this pre-norm hidden.
+        if hidden_sink is not None and not capture_set:
+            hidden_sink.append(h)
+
+        h = self.norm(h)
+
+        return h
 
 
 class LanguageModel(nn.Module):
@@ -533,20 +570,80 @@ class LanguageModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         per_layer_inputs: Optional[mx.array] = None,
+        capture_layer_ids: Optional[List[int]] = None,
         **kwargs,
     ):
+        hidden_sink: Optional[list] = (
+            []
+            if capture_layer_ids is not None or kwargs.pop("return_hidden", False)
+            else None
+        )
+        shared_kv_sink: Optional[dict] = (
+            {} if kwargs.pop("return_shared_kv", False) else None
+        )
+        # Allow callers to pass pre-allocated sinks directly.
+        hidden_sink = kwargs.pop("hidden_sink", hidden_sink)
+        shared_kv_sink = kwargs.pop("shared_kv_sink", shared_kv_sink)
+
         out = self.model(
             inputs,
             inputs_embeds=inputs_embeds,
             mask=mask,
             cache=cache,
             per_layer_inputs=per_layer_inputs,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+            shared_kv_sink=shared_kv_sink,
             **kwargs,
         )
         out = self.model.embed_tokens.as_linear(out)
         if self.final_logit_softcapping is not None:
             out = logit_softcap(self.final_logit_softcapping, out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(
+            logits=out,
+            hidden_states=hidden_sink,
+            shared_kv_states=shared_kv_sink,
+        )
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        """Rewind target KV caches after a speculative-decoding round.
+
+        Gemma 4 has only KV/RotatingKV caches (no SSM/GDN), so this is a
+        simple trim + per-row tail-zero. ``gdn_states`` is accepted (and
+        ignored) for API parity with qwen3_5's hook.
+        """
+        del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+
+        max_a = int(accepted.max().item())
+        n = max_a + 1
+        trim = block_size - n
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        for c in caches:
+            if c is None:
+                continue
+
+            if trim > 0 and hasattr(c, "trim"):
+                c.trim(trim)
+            if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                kv_len = c._idx
+                ve = valid_ends.tolist()
+                verify_start = kv_len - n
+                for bi in range(accepted.shape[0]):
+                    start = verify_start + int(ve[bi])
+                    if start < kv_len:
+                        c.keys[bi, :, start:kv_len, :] = 0
+                        c.values[bi, :, start:kv_len, :] = 0
+        return max_a
 
     def sanitize(self, weights):
         sanitized = {}
