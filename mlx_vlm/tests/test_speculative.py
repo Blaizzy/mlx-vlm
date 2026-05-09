@@ -432,11 +432,18 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
     class FakeDraftModel:
         def __init__(self):
             self._shared_kv = None
+            self.calls = []
 
         def set_shared_kv(
-            self, shared_kv_states, kv_offset, position=None, left_padding=None
+            self,
+            shared_kv_states,
+            kv_offset,
+            position=None,
+            kv_valid_len=None,
+            left_padding=None,
         ):
-            del kv_offset, position, left_padding
+            del left_padding
+            self.calls.append((kv_offset, position, kv_valid_len))
             self._shared_kv = shared_kv_states
 
         def draft_block(
@@ -465,6 +472,7 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
         )
     }
     draft_model.set_shared_kv(shared_kv, kv_offset=11, position=mx.array([11, 12]))
+    draft_model.calls = []
 
     drafted = _mtp_draft_block_active(
         draft_model,
@@ -478,6 +486,12 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
 
     assert drafted.tolist() == [[13], [27]]
     assert next(iter(draft_model._shared_kv.values()))[0].shape[0] == 2
+    assert draft_model.calls[0] == (11, 10, 11)
+    assert draft_model.calls[1] == (12, 11, 12)
+    restored_kv_offset, restored_position, restored_valid_len = draft_model.calls[2]
+    assert restored_kv_offset == 12
+    assert restored_position.tolist() == [10, 11]
+    assert restored_valid_len.tolist() == [11, 12]
 
 
 def test_mtp_draft_block_active_uses_batched_path_for_aligned_positions():

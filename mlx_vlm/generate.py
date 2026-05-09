@@ -855,7 +855,12 @@ def _mtp_rounds(
         hidden = hidden[:, -1:, :]
 
     kv_offset = int(prompt_cache[0].offset)
-    draft_model.set_shared_kv(shared_kv_states, kv_offset)
+    draft_model.set_shared_kv(
+        shared_kv_states,
+        kv_offset,
+        position=_mtp_draft_position(kv_offset),
+        kv_valid_len=kv_offset,
+    )
 
     b = first_bonus
     emitted = 1  # caller already yielded the first bonus
@@ -912,7 +917,12 @@ def _mtp_rounds(
             verify.shared_kv_states, bs - (accepted + 1)
         )
         kv_offset = int(prompt_cache[0].offset)
-        draft_model.set_shared_kv(next_shared_kv, kv_offset)
+        draft_model.set_shared_kv(
+            next_shared_kv,
+            kv_offset,
+            position=_mtp_draft_position(kv_offset),
+            kv_valid_len=kv_offset,
+        )
 
         if emitted % 256 == 0:
             mx.clear_cache()
@@ -926,6 +936,14 @@ def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
     return None
 
 
+def _mtp_draft_position(kv_valid_len: Any) -> Any:
+    if isinstance(kv_valid_len, int):
+        return max(kv_valid_len - 1, 0)
+    if isinstance(kv_valid_len, mx.array):
+        return mx.maximum(kv_valid_len.astype(mx.int32) - 1, 0)
+    return mx.maximum(mx.array(kv_valid_len, dtype=mx.int32) - 1, 0)
+
+
 def _mtp_draft_block_active(
     draft_model,
     bonus_tokens: List[int],
@@ -937,9 +955,9 @@ def _mtp_draft_block_active(
 ) -> mx.array:
     """Draft an active MTP batch, falling back to rowwise for mixed positions.
 
-    The drafter supports vectorized rows while every active request has the
-    same absolute position. After mixed accepts, positions can diverge; those
-    rows are drafted independently to preserve singleton position semantics.
+    ``positions`` stores each active row's valid target-KV length. The drafter's
+    RoPE position is derived from that length and rows with mixed lengths are
+    drafted independently to preserve singleton position semantics.
     """
     if hidden.shape[0] <= 1:
         return draft_model.draft_block(
@@ -975,7 +993,8 @@ def _mtp_draft_block_active(
         draft_model.set_shared_kv(
             per_row_shared_kv,
             kv_offset=position,
-            position=position,
+            position=_mtp_draft_position(position),
+            kv_valid_len=position,
             left_padding=None,
         )
         rowwise_tokens.append(
@@ -992,7 +1011,8 @@ def _mtp_draft_block_active(
     draft_model.set_shared_kv(
         shared_kv,
         kv_offset=max(positions_list),
-        position=mx.array(positions_list),
+        position=_mtp_draft_position(mx.array(positions_list)),
+        kv_valid_len=mx.array(positions_list),
         left_padding=None,
     )
     return mx.concatenate(rowwise_tokens, axis=0)
@@ -1043,9 +1063,9 @@ def _mtp_rounds_batch(
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
 
-    # Per-row state. ``positions`` is the absolute position id of each
-    # row's pending bonus (= row's logical KV length). All rows start at
-    # ``L_prefill`` and advance by ``accepted_i + 1`` per round.
+    # Per-row state. ``positions`` stores each row's valid target-KV length.
+    # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
+    # round.
     offset0 = prompt_cache[0].offset
     if isinstance(offset0, mx.array):
         L_prefill = int(offset0.max().item())
@@ -1056,7 +1076,8 @@ def _mtp_rounds_batch(
     draft_model.set_shared_kv(
         shared_kv_states,
         kv_offset=L_prefill,
-        position=mx.array(positions),
+        position=_mtp_draft_position(mx.array(positions)),
+        kv_valid_len=mx.array(positions),
         left_padding=_batch_cache_left_padding(prompt_cache),
     )
 
@@ -1245,7 +1266,8 @@ def _mtp_rounds_batch(
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset=new_kv_offset,
-            position=mx.array(positions_active),
+            position=_mtp_draft_position(mx.array(positions_active)),
+            kv_valid_len=mx.array(positions_active),
             left_padding=_batch_cache_left_padding(prompt_cache),
         )
 

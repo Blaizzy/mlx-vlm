@@ -43,6 +43,7 @@ def bidirectional_full_mask(
     query_len: int,
     kv_len: int,
     kv_valid_len: Optional[Union[int, mx.array]] = None,
+    key_offset: Union[int, mx.array] = 0,
     dtype: mx.Dtype = mx.float32,
 ) -> Optional[mx.array]:
     """Full-attention mask.
@@ -53,15 +54,20 @@ def bidirectional_full_mask(
     """
     del query_len
     if kv_valid_len is None or isinstance(kv_valid_len, int):
-        if kv_valid_len is None or kv_valid_len >= kv_len:
+        if kv_valid_len is None:
             return None
-        k_idx = mx.arange(kv_len)
+        if isinstance(key_offset, int) and key_offset + kv_len <= kv_valid_len:
+            return None
+        k_idx = mx.arange(key_offset, key_offset + kv_len)
         inside = k_idx < kv_valid_len
         bias = mx.where(
             inside, mx.array(0.0, dtype=dtype), mx.array(-mx.inf, dtype=dtype)
         )
         return bias[None, None, None, :]
-    k_idx = mx.arange(kv_len)[None, :]
+    if isinstance(key_offset, mx.array):
+        k_idx = key_offset[:, None] + mx.arange(kv_len)[None, :]
+    else:
+        k_idx = mx.arange(key_offset, key_offset + kv_len)[None, :]
     inside = k_idx < kv_valid_len[:, None]
     bias = mx.where(inside, mx.array(0.0, dtype=dtype), mx.array(-mx.inf, dtype=dtype))
     return bias[:, None, None, :]
@@ -130,17 +136,19 @@ def make_drafter_masks(
     query_offset: Union[int, mx.array],
     sliding_window: int,
     dtype: mx.Dtype = mx.float32,
+    kv_valid_len: Optional[Union[int, mx.array]] = None,
 ) -> dict:
     """Build masks per layer-type for the drafter forward."""
+    if kv_valid_len is None:
+        kv_valid_len = query_offset
     masks = {}
     for layer_type, kv in shared_kv_states.items():
         kv_len = _kv_len(kv)
-        kv_valid_len = query_offset
+        if isinstance(kv_valid_len, int):
+            key_offset = max(kv_valid_len - kv_len, 0)
+        else:
+            key_offset = mx.maximum(kv_valid_len - kv_len, 0)
         if layer_type == "sliding_attention":
-            if isinstance(query_offset, int):
-                key_offset = max(query_offset - kv_len, 0)
-            else:
-                key_offset = mx.maximum(query_offset - kv_len, 0)
             masks[layer_type] = bidirectional_swa_mask(
                 query_len,
                 query_offset,
@@ -152,7 +160,7 @@ def make_drafter_masks(
             )
         else:
             masks[layer_type] = bidirectional_full_mask(
-                query_len, kv_len, kv_valid_len, dtype
+                query_len, kv_len, kv_valid_len, key_offset, dtype
             )
     return masks
 

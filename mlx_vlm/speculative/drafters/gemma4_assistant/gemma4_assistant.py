@@ -52,6 +52,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         self._input_embed_scale: float = 1.0
         self._shared_kv: Optional[dict] = None
         self._kv_offset: int = 0
+        self._kv_valid_len = 0
         self._position: int = 0
 
         self.accept_lens: List[int] = []
@@ -109,6 +110,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         self.draft_lens = []
         self._shared_kv = None
         self._kv_offset = 0
+        self._kv_valid_len = 0
         return self.make_cache()
 
     def set_shared_kv(
@@ -116,6 +118,7 @@ class Gemma4AssistantDraftModel(nn.Module):
         shared_kv_states: dict,
         kv_offset,
         position=None,
+        kv_valid_len=None,
         left_padding=None,
     ) -> None:
         if isinstance(kv_offset, int):
@@ -126,12 +129,15 @@ class Gemma4AssistantDraftModel(nn.Module):
                 if not isinstance(kv_offset, mx.array)
                 else int(kv_offset.max().item())
             )
+        if kv_valid_len is None:
+            kv_valid_len = kv_offset
+        self._kv_valid_len = kv_valid_len
         if position is None:
             position = kv_offset
         if left_padding is not None:
             shared_kv_states = normalize_batched_shared_kv_states(
                 shared_kv_states,
-                kv_valid_len=position,
+                kv_valid_len=kv_valid_len,
                 left_padding=left_padding,
             )
         self._shared_kv = shared_kv_states
@@ -166,6 +172,7 @@ class Gemma4AssistantDraftModel(nn.Module):
             query_offset=query_offset,
             sliding_window=text_cfg.sliding_window,
             dtype=h.dtype,
+            kv_valid_len=self._kv_valid_len,
         )
 
         if position_ids.shape[0] == 1:
