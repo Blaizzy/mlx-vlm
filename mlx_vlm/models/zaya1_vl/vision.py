@@ -3,12 +3,9 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..qwen2_5_vl.vision import (
-    Attention,
-    PatchEmbed,
-    VisionModel as Qwen2_5VisionModel,
-    VisionRotaryEmbedding,
-)
+from ..qwen2_5_vl.vision import Attention, PatchEmbed
+from ..qwen2_5_vl.vision import VisionModel as Qwen2_5VisionModel
+from ..qwen2_5_vl.vision import VisionRotaryEmbedding
 from .config import VisionConfig
 
 
@@ -46,9 +43,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(
-            swiglu(self.gate_proj(x), self.up_proj(x))
-        )
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Zaya1VLVisionBlock(nn.Module):

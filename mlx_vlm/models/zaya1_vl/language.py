@@ -373,9 +373,7 @@ class ZayaRouter(nn.Module):
         self.down_proj = nn.Linear(
             config.hidden_size, config.zaya_mlp_expansion, bias=True
         )
-        self.rmsnorm_eda = RMSNorm(
-            config.zaya_mlp_expansion, eps=config.norm_epsilon
-        )
+        self.rmsnorm_eda = RMSNorm(config.zaya_mlp_expansion, eps=config.norm_epsilon)
         if self.use_eda:
             self.router_states_scale = mx.ones((config.zaya_mlp_expansion,))
 
