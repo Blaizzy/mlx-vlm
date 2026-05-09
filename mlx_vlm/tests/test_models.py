@@ -3685,7 +3685,6 @@ class TestModels(unittest.TestCase):
         from mlx_vlm.models import zaya1_vl
         from mlx_vlm.models.zaya1_vl.language import CCA, RMSNorm, ZayaRouter
 
-
         text_config = zaya1_vl.TextConfig(
             model_type="zaya1_vl",
             hidden_size=8,
@@ -3745,11 +3744,12 @@ class TestModels(unittest.TestCase):
         H = text_config.hidden_size
         norm = RMSNorm(H, eps=text_config.norm_epsilon)
         norm.weight = mx.concatenate(
-            [mx.array([1.5, -0.25], dtype=mx.float32), mx.ones((H - 2,), dtype=mx.float32)]
+            [
+                mx.array([1.5, -0.25], dtype=mx.float32),
+                mx.ones((H - 2,), dtype=mx.float32),
+            ]
         )
-        x = mx.pad(
-            mx.array([[1.0, 2.0]], dtype=mx.float16), ((0, 0), (0, H - 2))
-        )
+        x = mx.pad(mx.array([[1.0, 2.0]], dtype=mx.float16), ((0, 0), (0, H - 2)))
         out = norm(x)
 
         x32 = x.astype(mx.float32)
@@ -3763,7 +3763,6 @@ class TestModels(unittest.TestCase):
 
         router = ZayaRouter(text_config, layer_number=1)
         self.assertEqual(router.rmsnorm_eda.eps, text_config.norm_epsilon)
-
 
         cca = CCA(text_config, layer_number=0)
         for linear in (cca.linear_q, cca.linear_k, cca.val_proj1, cca.val_proj2):
