@@ -101,7 +101,7 @@ class RMSNorm(nn.Module):
         dtype = x.dtype
         x = x.astype(mx.float32)
         x = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return (x * self.weight.astype(mx.float32)).astype(dtype)
+        return self.weight * x.astype(dtype)
 
 
 class CCA(nn.Module):
@@ -262,8 +262,13 @@ class CCA(nn.Module):
             *hs.shape[:2], self.num_kv_heads, self.head_dim
         )
 
-        query_norm = mx.sqrt(mx.sum(query * query, axis=-1, keepdims=True) + 1e-6)
-        key_norm = mx.sqrt(mx.sum(key * key, axis=-1, keepdims=True) + 1e-6)
+        norm_eps = mx.finfo(query.dtype).eps
+        query_norm = mx.maximum(
+            mx.sqrt(mx.sum(query * query, axis=-1, keepdims=True)), norm_eps
+        )
+        key_norm = mx.maximum(
+            mx.sqrt(mx.sum(key * key, axis=-1, keepdims=True)), norm_eps
+        )
         query = query * (self.sqrt_head_dim / query_norm)
         key = key * (self.sqrt_head_dim / key_norm) * self.temp[None, None, :, None]
 
@@ -368,7 +373,9 @@ class ZayaRouter(nn.Module):
         self.down_proj = nn.Linear(
             config.hidden_size, config.zaya_mlp_expansion, bias=True
         )
-        self.rmsnorm_eda = RMSNorm(config.zaya_mlp_expansion, eps=1e-6)
+        self.rmsnorm_eda = RMSNorm(
+            config.zaya_mlp_expansion, eps=config.norm_epsilon
+        )
         if self.use_eda:
             self.router_states_scale = mx.ones((config.zaya_mlp_expansion,))
 
