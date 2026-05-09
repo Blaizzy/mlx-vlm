@@ -300,3 +300,154 @@ def test_kind_none_falls_back_to_default_for_missing_config(tmp_path):
     d = tmp_path / "drafter"
     d.mkdir()
     assert resolve_drafter_kind(d, None) == DEFAULT_DRAFTER_KIND
+
+
+def _stub_gemma4_drafter(backbone_hidden_size: int):
+    """Build a Gemma4AssistantDraftModel without running __init__.
+
+    bind() only needs the config and a few tied-embedding hooks, so we skip
+    the heavy decoder-layer construction. This isolates the bind-time
+    validation we want to test.
+    """
+    from mlx_vlm.speculative.drafters.gemma4_assistant.config import (
+        Gemma4AssistantConfig,
+    )
+    from mlx_vlm.speculative.drafters.gemma4_assistant.gemma4_assistant import (
+        Gemma4AssistantDraftModel,
+    )
+
+    drafter = Gemma4AssistantDraftModel.__new__(Gemma4AssistantDraftModel)
+    drafter.config = Gemma4AssistantConfig(
+        backbone_hidden_size=backbone_hidden_size,
+        tie_word_embeddings=True,
+    )
+    drafter.masked_embedding = None
+    drafter.model = SimpleNamespace(embed_tokens=SimpleNamespace(as_linear=lambda h: h))
+    drafter._lm_head_fn = None
+    drafter._input_embed = None
+    drafter._input_embed_scale = 1.0
+    return drafter
+
+
+def _stub_target(hidden_size: int, *, multimodal: bool = True):
+    """Stub a target model exposing the same surface bind() reads."""
+    lang_cfg = SimpleNamespace(hidden_size=hidden_size, layer_types=[])
+    if multimodal:
+        return SimpleNamespace(language_model=SimpleNamespace(config=lang_cfg))
+    return SimpleNamespace(config=lang_cfg)
+
+
+def test_gemma4_drafter_bind_rejects_hidden_size_mismatch():
+    """Wrong drafter for the target should fail fast with a clear message.
+
+    Repro of the production crash: 26B-A4B-it-assistant drafter
+    (backbone_hidden_size=2816) loaded against 31B-it target
+    (hidden_size=5376). Without this guard the mismatch surfaced deep in
+    pre_projection's matmul on the first draft step as
+    ``[matmul] Last dimension of first input with shape (1,1,10752) must
+    match second to last dimension of second input with shape (5632,1024)``.
+    """
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=2816)
+    target = _stub_target(hidden_size=5376)
+    with pytest.raises(ValueError, match="hidden-size mismatch") as exc:
+        drafter.bind(target)
+    msg = str(exc.value)
+    assert "2816" in msg
+    assert "5376" in msg
+    assert "--draft-model" in msg
+
+
+def test_gemma4_drafter_bind_accepts_matching_hidden_size():
+    """Matching pairing (e.g. 31B-it ↔ 31B-it-assistant) must not raise."""
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=5376)
+    target = _stub_target(hidden_size=5376)
+    drafter.bind(target)
+
+
+def test_gemma4_drafter_bind_works_for_language_only_target():
+    """bind() also accepts an unwrapped LanguageModel as the target."""
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=5376)
+    target = _stub_target(hidden_size=5376, multimodal=False)
+    drafter.bind(target)
+
+
+def test_probe_drafter_compat_returns_value_error_on_mismatch():
+    """Helper surfaces the bind-time ValueError so callers can react.
+
+    Used by ``_initialize_model`` to demote to AR on mismatch instead of
+    letting the generation thread crash on the first request. The future
+    per-request drafter API will use the same probe to surface the error
+    back to the client that explicitly opted into the mismatched drafter.
+    """
+    from mlx_vlm.server import _probe_drafter_compat
+
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=2816)
+    target = _stub_target(hidden_size=5376)
+
+    err = _probe_drafter_compat(drafter, target)
+
+    assert isinstance(err, ValueError)
+    assert "hidden-size mismatch" in str(err)
+    assert "2816" in str(err)
+    assert "5376" in str(err)
+
+
+def test_probe_drafter_compat_returns_none_on_match():
+    """Matched pairing must not be flagged as incompatible."""
+    from mlx_vlm.server import _probe_drafter_compat
+
+    drafter = _stub_gemma4_drafter(backbone_hidden_size=5376)
+    target = _stub_target(hidden_size=5376)
+
+    assert _probe_drafter_compat(drafter, target) is None
+
+
+def test_broadcast_exception_to_active_unblocks_streaming_clients():
+    """An exception in _run_speculative must reach every active client.
+
+    Repro of the production hang: when the speculative GPU thread raised
+    a ValueError, the per-request token queue was never signalled, so
+    FastAPI handlers awaited tokens forever. This helper drives the
+    behaviour the streaming iterator at server.py:417-419 relies on
+    (``isinstance(item, Exception): raise item`` followed by ``None``).
+    """
+    from queue import Queue
+
+    from mlx_vlm.server import _broadcast_exception_to_active
+
+    rqueues = {1: Queue(), 2: Queue(), 3: Queue()}
+    finished_uids = {2}  # uid 2 already completed — must not be touched
+    exc = ValueError("mtp drafter ↔ target hidden-size mismatch")
+
+    _broadcast_exception_to_active(rqueues, finished_uids, exc)
+
+    # uid 1 and uid 3 should each see (exc, None) — the iterator raises
+    # on the exception and the None sentinel guards a hang on the next
+    # .get().
+    for uid in (1, 3):
+        assert rqueues[uid].get_nowait() is exc
+        assert rqueues[uid].get_nowait() is None
+        assert rqueues[uid].empty()
+
+    assert rqueues[2].empty()
+
+
+def test_broadcast_exception_to_active_tolerates_full_queue():
+    """A queue raising on .put() must not stop other clients from being unblocked."""
+
+    from mlx_vlm.server import _broadcast_exception_to_active
+
+    class _BrokenQueue:
+        def put(self, _):
+            raise RuntimeError("queue is dead")
+
+    good = SimpleNamespace(puts=[])
+    good.put = good.puts.append
+
+    rqueues = {1: _BrokenQueue(), 2: good}
+    exc = RuntimeError("boom")
+
+    _broadcast_exception_to_active(rqueues, set(), exc)
+
+    # Broken queue did not propagate; good queue still received (exc, None).
+    assert good.puts == [exc, None]
