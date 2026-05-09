@@ -300,9 +300,6 @@ class ZayaAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
 
-        k = _repeat_kv(k, self.num_key_value_groups)
-        v = _repeat_kv(v, self.num_key_value_groups)
-
         if mask is not None and isinstance(mask, mx.array):
             mask = mask[..., : k.shape[-2]]
 
