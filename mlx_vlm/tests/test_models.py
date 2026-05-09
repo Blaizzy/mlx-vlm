@@ -3701,7 +3701,7 @@ class TestModels(unittest.TestCase):
 
     def test_zaya1_vl(self):
         from mlx_vlm.models import zaya1_vl
-        from mlx_vlm.models.zaya1_vl.language import CCA, RMSNorm, ZayaRouter
+        from mlx_vlm.models.zaya1_vl.language import CCA, ZayaRouter
 
         text_config = zaya1_vl.TextConfig(
             model_type="zaya1_vl",
@@ -3741,6 +3741,11 @@ class TestModels(unittest.TestCase):
             vocab_size=32,
         )
         model = zaya1_vl.Model(config)
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(model.language_model.model.final_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.attn.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.zaya_block.router.rmsnorm_eda, nn.RMSNorm)
 
         self.language_test_runner(
             model.language_model,
@@ -3758,28 +3763,8 @@ class TestModels(unittest.TestCase):
             grid_thw=mx.array([[1, 2, 2]], dtype=mx.int64),
         )
 
-        # Numerical test (dims follow text_config)
-        H = text_config.hidden_size
-        norm = RMSNorm(H, eps=text_config.norm_epsilon)
-        norm.weight = mx.concatenate(
-            [
-                mx.array([1.5, -0.25], dtype=mx.float32),
-                mx.ones((H - 2,), dtype=mx.float32),
-            ]
-        )
-        x = mx.pad(mx.array([[1.0, 2.0]], dtype=mx.float16), ((0, 0), (0, H - 2)))
-        out = norm(x)
-
-        x32 = x.astype(mx.float32)
-        expected = x32 * mx.rsqrt(
-            mx.mean(x32 * x32, axis=-1, keepdims=True) + text_config.norm_epsilon
-        )
-        expected = norm.weight * expected.astype(x.dtype)
-        mx.eval(out, expected)
-        self.assertEqual(out.dtype, expected.dtype)
-        self.assertTrue(mx.allclose(out, expected).item())
-
         router = ZayaRouter(text_config, layer_number=1)
+        self.assertIsInstance(router.rmsnorm_eda, nn.RMSNorm)
         self.assertEqual(router.rmsnorm_eda.eps, text_config.norm_epsilon)
 
         cca = CCA(text_config, layer_number=0)

@@ -91,19 +91,6 @@ class ResidualScaling(nn.Module):
         return residual, hidden_states
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
-        x = x.astype(mx.float32)
-        x = x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-        return self.weight * x.astype(dtype)
-
-
 class CCA(nn.Module):
     def __init__(self, config: TextConfig, layer_number: int):
         super().__init__()
@@ -373,7 +360,9 @@ class ZayaRouter(nn.Module):
         self.down_proj = nn.Linear(
             config.hidden_size, config.zaya_mlp_expansion, bias=True
         )
-        self.rmsnorm_eda = RMSNorm(config.zaya_mlp_expansion, eps=config.norm_epsilon)
+        self.rmsnorm_eda = nn.RMSNorm(
+            config.zaya_mlp_expansion, eps=config.norm_epsilon
+        )
         if self.use_eda:
             self.router_states_scale = mx.ones((config.zaya_mlp_expansion,))
 
@@ -526,7 +515,7 @@ class ZayaDecoderATTLayer(nn.Module):
         super().__init__()
         self.config = config
         self.self_attn = ZayaAttention(config, layer_n)
-        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.input_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_epsilon)
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, 2 * layer_n)
 
@@ -552,7 +541,7 @@ class ZayaDecoderMLPLayer(nn.Module):
         super().__init__()
         self.config = config
         self.zaya_block = ZayaBlock(config, layer_n)
-        self.input_norm = RMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.input_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_epsilon)
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, 2 * layer_n + 1)
 
@@ -616,7 +605,7 @@ class ZayaModel(nn.Module):
         ]
         if config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, config.num_hidden_layers)
-        self.final_norm = RMSNorm(config.hidden_size, eps=config.norm_epsilon)
+        self.final_norm = nn.RMSNorm(config.hidden_size, eps=config.norm_epsilon)
 
     def __call__(
         self,
