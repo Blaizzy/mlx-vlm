@@ -1,3 +1,5 @@
+from functools import partial
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -8,6 +10,11 @@ from ..qwen2_5_vl.vision import (
     VisionRotaryEmbedding,
 )
 from .config import VisionConfig
+
+
+@partial(mx.compile, shapeless=True)
+def swiglu(gate: mx.array, x: mx.array) -> mx.array:
+    return (nn.silu(gate.astype(mx.float32)) * x.astype(mx.float32)).astype(gate.dtype)
 
 
 class PatchMerger(nn.Module):
@@ -37,11 +44,9 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim)
 
     def __call__(self, x: mx.array) -> mx.array:
-        hidden_states = (
-            nn.silu(self.gate_proj(x).astype(mx.float32))
-            * self.up_proj(x).astype(mx.float32)
-        ).astype(x.dtype)
-        return self.down_proj(hidden_states)
+        return self.down_proj(
+            swiglu(self.gate_proj(x), self.up_proj(x))
+        )
 
 
 class Zaya1VLVisionBlock(nn.Module):
