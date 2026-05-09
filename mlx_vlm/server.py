@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from . import apc as _apc
+from .models import cache
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -42,6 +43,7 @@ from .generate import (
     _dflash_rounds_batch,
     _make_cache,
     _merge_prefill_prompt_kwargs,
+    _mtp_rounds,
     _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
@@ -59,6 +61,7 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 
 
@@ -84,6 +87,12 @@ def _speculative_hidden_state(draft_kind: str, outputs):
     if draft_kind == "dflash":
         return mx.concatenate(outputs.hidden_states, axis=-1)
     raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+
+
+def _make_speculative_prompt_cache(lm, *, draft_kind: str, batch_size: int, left_padding):
+    if draft_kind == "mtp" and batch_size == 1:
+        return cache.make_prompt_cache(lm)
+    return _make_cache(lm, left_padding)
 
 
 def _get_draft_block_size_from_env():
@@ -115,6 +124,16 @@ def get_token_queue_timeout():
     if timeout <= 0:
         return None
     return timeout
+
+
+def get_speculative_batch_coalesce_s():
+    raw = os.environ.get(
+        "MLX_VLM_SPEC_BATCH_COALESCE_MS", str(DEFAULT_SPECULATIVE_BATCH_COALESCE_MS)
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
 def get_server_enable_thinking():
@@ -494,6 +513,44 @@ class ResponseGenerator:
             )
         return input_ids, gen_kwargs
 
+    def _collect_pending_requests(
+        self,
+        *,
+        active: bool,
+        idle_timeout: float = 0.1,
+        coalesce_s: float = 0.0,
+    ):
+        """Collect the first queued request, then drain immediately available peers."""
+        pending = []
+        should_stop = False
+
+        def append_item(item):
+            nonlocal should_stop
+            if item is None:
+                if self._stop and not pending:
+                    should_stop = True
+                return
+            pending.append(item)
+
+        try:
+            if active:
+                append_item(self.requests.get_nowait())
+            else:
+                append_item(self.requests.get(timeout=idle_timeout))
+        except QueueEmpty:
+            pass
+
+        if pending and coalesce_s > 0:
+            time.sleep(coalesce_s)
+
+        while not should_stop:
+            try:
+                append_item(self.requests.get_nowait())
+            except QueueEmpty:
+                break
+
+        return pending, should_stop
+
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
@@ -521,35 +578,11 @@ class ResponseGenerator:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
-                new_items = []
-                if active:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is None:
-                            if self._stop:
-                                break
-                        else:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        pass
-                else:
-                    try:
-                        item = self.requests.get(timeout=0.1)
-                        if item is None:
-                            if self._stop:
-                                break
-                        else:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        pass
-
-                while True:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is not None:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        break
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(active)
+                )
+                if should_stop:
+                    break
 
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
@@ -661,23 +694,12 @@ class ResponseGenerator:
         while not self._stop:
             try:
                 # --- Phase 1: collect pending requests ---
-                pending = []
-                timeout = 0.1
-                try:
-                    item = self.requests.get(timeout=timeout)
-                    if item is None and self._stop:
-                        break
-                    if item is not None:
-                        pending.append(item)
-                except QueueEmpty:
-                    pass
-                while True:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is not None:
-                            pending.append(item)
-                    except QueueEmpty:
-                        break
+                pending, should_stop = self._collect_pending_requests(
+                    active=False,
+                    coalesce_s=get_speculative_batch_coalesce_s(),
+                )
+                if should_stop:
+                    break
 
                 if not pending:
                     continue
@@ -723,7 +745,12 @@ class ResponseGenerator:
                     prompt_kwargs_list, all_input_ids
                 )
 
-                prompt_cache = _make_cache(lm, left_padding)
+                prompt_cache = _make_speculative_prompt_cache(
+                    lm,
+                    draft_kind=draft_kind,
+                    batch_size=B,
+                    left_padding=left_padding,
+                )
 
                 lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
                 lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
@@ -782,8 +809,30 @@ class ResponseGenerator:
                     draft_block_size=draft_block_size,
                     token_dtype=mx.int32,
                     stop_check=stop_check,
+                    greedy_sampling=all(
+                        pending_args.temperature == 0
+                        for _, _, _, pending_args, _ in pending
+                    ),
                 )
-                if is_mtp:
+                if is_mtp and B == 1:
+                    uid = uids[0]
+                    rounds_iter = (
+                        ([tok], state)
+                        for tok, state in _mtp_rounds(
+                            self.model,
+                            drafter,
+                            prompt_cache,
+                            hidden,
+                            shared_kv_states,
+                            first_bonus=int(first_bonus.reshape(-1).item()),
+                            max_tokens=max_tokens_map[uid],
+                            sampler=sampler,
+                            draft_block_size=draft_block_size,
+                            token_dtype=mx.int32,
+                            greedy_sampling=rounds_kwargs["greedy_sampling"],
+                        )
+                    )
+                elif is_mtp:
                     rounds_iter = rounds_batch(
                         self.model,
                         drafter,
@@ -830,6 +879,8 @@ class ResponseGenerator:
                         if finish is not None:
                             rqueues[uid].put(None)
                             finished_uids.add(uid)
+                    if len(finished_uids) == len(uids):
+                        break
 
                 # Log acceptance stats
                 al = drafter.accept_lens

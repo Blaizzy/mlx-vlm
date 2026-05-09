@@ -83,12 +83,63 @@ def test_speculative_server_hidden_state_concatenates_for_dflash():
     assert result.shape == (1, 1, 8)
 
 
+def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatch):
+    lm = object()
+    unbatched_cache = object()
+    batched_cache = object()
+
+    monkeypatch.setattr(
+        server.cache, "make_prompt_cache", lambda target: unbatched_cache
+    )
+    monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: batched_cache)
+
+    result = server._make_speculative_prompt_cache(
+        lm, draft_kind="mtp", batch_size=1, left_padding=[0]
+    )
+
+    assert result is unbatched_cache
+
+
+def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeypatch):
+    lm = object()
+    batched_cache = object()
+
+    monkeypatch.setattr(
+        server.cache, "make_prompt_cache", lambda target: pytest.fail()
+    )
+    monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: batched_cache)
+
+    assert (
+        server._make_speculative_prompt_cache(
+            lm, draft_kind="mtp", batch_size=2, left_padding=[0, 1]
+        )
+        is batched_cache
+    )
+    assert (
+        server._make_speculative_prompt_cache(
+            lm, draft_kind="dflash", batch_size=1, left_padding=[0]
+        )
+        is batched_cache
+    )
+
+
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):
     monkeypatch.delenv("MLX_VLM_DRAFT_BLOCK_SIZE", raising=False)
     assert server._get_draft_block_size_from_env() is None
 
     monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "3")
     assert server._get_draft_block_size_from_env() == 3
+
+
+def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", raising=False)
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "2.5")
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.0025)
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "bad")
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
 class _RecordingSpeculativeLM:
@@ -147,6 +198,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
     monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
+    monkeypatch.setattr(server, "get_speculative_batch_coalesce_s", lambda: 0.0)
 
     class _FakeDetokenizer:
         def __init__(self):
@@ -167,12 +219,21 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     def fake_rounds(*args, **kwargs):
         del args
+        gen.round_kwargs = kwargs
         gen._stop = True
         yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
 
     monkeypatch.setattr(
         server, "_get_speculative_rounds_batch", lambda kind: fake_rounds
     )
+
+    def fake_single_rounds(*args, **kwargs):
+        del args
+        gen.round_kwargs = kwargs
+        gen._stop = True
+        yield (4, None)
+
+    monkeypatch.setattr(server, "_mtp_rounds", fake_single_rounds)
 
     args = server.GenerationArguments(max_tokens=2, temperature=0)
     for spec in request_specs:
@@ -187,7 +248,28 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
         )
 
     gen._run_speculative()
-    return lm.calls[0]
+    call = lm.calls[0]
+    call["round_kwargs"] = gen.round_kwargs
+    return call
+
+
+def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["round_kwargs"]["greedy_sampling"] is True
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -468,6 +550,27 @@ class TestResponseGenerator:
         with pytest.raises(StopIteration):
             next(token_iter)
         assert cancelled == []
+
+    def test_collect_pending_requests_coalesces_after_first_item(self, monkeypatch):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.requests = Queue()
+        gen._stop = False
+        first = object()
+        second = object()
+        gen.requests.put(first)
+
+        def fake_sleep(seconds):
+            assert seconds == pytest.approx(0.005)
+            gen.requests.put(second)
+
+        monkeypatch.setattr(server.time, "sleep", fake_sleep)
+
+        pending, should_stop = gen._collect_pending_requests(
+            active=False, coalesce_s=0.005
+        )
+
+        assert pending == [first, second]
+        assert should_stop is False
 
     def test_step_uses_streaming_detokenizer_for_utf8_byte_tokens(self):
         class ByteFallbackTokenizer:

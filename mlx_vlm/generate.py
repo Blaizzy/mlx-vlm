@@ -536,7 +536,10 @@ def _mtp_shared_kv_from_prompt_cache(
     for layer, layer_cache in zip(layers, prompt_cache):
         if layer_cache is None or not hasattr(layer_cache, "state"):
             continue
-        keys, values = layer_cache.state
+        state = layer_cache.state
+        if state is None or len(state) < 2:
+            continue
+        keys, values = state[:2]
         if keys is None or values is None:
             continue
         if (

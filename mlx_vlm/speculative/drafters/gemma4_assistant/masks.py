@@ -14,6 +14,12 @@ import mlx.core as mx
 from mlx_lm.models.cache import dynamic_roll
 
 
+def _single_value_or_none(value):
+    if isinstance(value, mx.array) and value.size == 1:
+        return int(value.item())
+    return None
+
+
 def normalize_batched_shared_kv_states(
     shared_kv_states: dict,
     kv_valid_len: Union[int, mx.array],
@@ -100,6 +106,12 @@ def bidirectional_swa_mask(
         return None
 
     if isinstance(query_offset, int):
+        key_offset_scalar = _single_value_or_none(key_offset)
+        if key_offset_scalar is not None:
+            key_offset = key_offset_scalar
+        valid_len_scalar = _single_value_or_none(kv_valid_len)
+        if valid_len_scalar is not None:
+            kv_valid_len = valid_len_scalar
         q_idx = mx.arange(query_offset, query_offset + query_len)[:, None]
         k_idx = mx.arange(key_offset, key_offset + kv_len)[None, :]
         dist = q_idx - k_idx

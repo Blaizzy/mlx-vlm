@@ -18,6 +18,7 @@ from mlx_vlm.generate import (
     _format_speculative_stats,
     _mtp_draft_block_active,
     _mtp_draft_hidden,
+    _mtp_shared_kv_from_prompt_cache,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_deferred_greedy,
@@ -217,6 +218,22 @@ def test_mtp_drafter_sliding_mask_accounts_for_tail_offset():
     assert row[3:] == [0.0, 0.0, 0.0]
 
 
+def test_mtp_drafter_sliding_mask_accepts_single_row_array_offsets():
+    kv = (mx.zeros((1, 1, 6, 4)), mx.zeros((1, 1, 6, 4)))
+
+    masks = make_drafter_masks(
+        {"sliding_attention": kv},
+        query_len=1,
+        query_offset=10,
+        sliding_window=4,
+        kv_valid_len=mx.array([10]),
+    )
+
+    row = masks["sliding_attention"][0, 0, 0].tolist()
+    assert row[:3] == [-float("inf"), -float("inf"), -float("inf")]
+    assert row[3:] == [0.0, 0.0, 0.0]
+
+
 def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     base = RotatingKVCache(max_size=4, keep=0)
     keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
@@ -404,6 +421,19 @@ def test_mtp_draft_hidden_defaults_to_identity():
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
 
     assert _mtp_draft_hidden(SimpleNamespace(), hidden).tolist() == hidden.tolist()
+
+
+def test_mtp_shared_kv_accepts_cache_state_metadata():
+    keys = mx.ones((1, 1, 2, 2), dtype=mx.float32)
+    values = keys + 1
+    layer = SimpleNamespace(layer_type="full_attention")
+    layer_cache = SimpleNamespace(state=(keys, values, "metadata"))
+    lm = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+
+    shared = _mtp_shared_kv_from_prompt_cache(lm, [layer_cache])
+
+    assert shared["full_attention"][0] is keys
+    assert shared["full_attention"][1] is values
 
 
 def test_masked_embedder_argmax_matches_full_sparse_logits():
