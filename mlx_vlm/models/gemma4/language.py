@@ -303,6 +303,25 @@ class DecoderLayer(nn.Module):
 
         # Layer scalar (all text layers)
         self.layer_scalar = mx.ones((1,))
+        self._compiled_per_layer_input_residual = (
+            mx.compile(self._per_layer_input_residual, shapeless=True)
+            if self.hidden_size_per_layer_input
+            else None
+        )
+
+    def _per_layer_input_residual(
+        self, h: mx.array, per_layer_input: mx.array
+    ) -> mx.array:
+        residual = h
+        gate = self.per_layer_input_gate(h)
+        gate = nn.gelu_approx(gate)
+        gate = mx.multiply(gate, per_layer_input)
+        gate = self.per_layer_projection(gate)
+        gate = self.post_per_layer_input_norm(gate)
+        h = residual + gate
+        if self.layer_scalar is not None:
+            h = h * self.layer_scalar
+        return h
 
     def __call__(
         self,
@@ -349,15 +368,8 @@ class DecoderLayer(nn.Module):
             and self.post_per_layer_input_norm is not None
             and per_layer_input is not None
         ):
-            residual = h
-            gate = self.per_layer_input_gate(h)
-            gate = nn.gelu_approx(gate)
-            gate = mx.multiply(gate, per_layer_input)
-            gate = self.per_layer_projection(gate)
-            gate = self.post_per_layer_input_norm(gate)
-            h = residual + gate
-
-        if self.layer_scalar is not None:
+            h = self._compiled_per_layer_input_residual(h, per_layer_input)
+        elif self.layer_scalar is not None:
             h = h * self.layer_scalar
 
         return h, shared_kv, offset
