@@ -3,7 +3,7 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+from ..cache import ArraysCache, CacheList, KVCache
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchLinear
 
@@ -27,6 +27,39 @@ def _split_cache(cache):
 
 def _cache_is_empty(cache) -> bool:
     return cache is None or (hasattr(cache, "empty") and cache.empty())
+
+
+def _causal_conv1d_stack(
+    conv_layers, x: mx.array, state, state_size: int, use_state: bool
+):
+    if use_state:
+        if (
+            state is None
+            or state.shape[0] != x.shape[0]
+            or state.shape[1] != state_size
+        ):
+            state = mx.zeros((x.shape[0], state_size, x.shape[-1]), dtype=x.dtype)
+        conv_input = mx.concatenate([state, x], axis=1)
+        state_source = conv_input
+    else:
+        conv_input = mx.pad(x, ((0, 0), (state_size, 0), (0, 0)))
+        state_source = x
+
+    y = conv_input
+    for conv in conv_layers:
+        y = conv(y)
+
+    if state_size == 0:
+        next_state = mx.zeros((x.shape[0], 0, x.shape[-1]), dtype=x.dtype)
+    else:
+        if state_source.shape[1] < state_size:
+            state_source = mx.pad(
+                state_source,
+                ((0, 0), (state_size - state_source.shape[1], 0), (0, 0)),
+            )
+        next_state = mx.contiguous(state_source[:, -state_size:, :])
+
+    return y, next_state
 
 
 class ResidualScaling(nn.Module):
@@ -121,36 +154,16 @@ class CCA(nn.Module):
 
     def _conv(self, qk_packed0: mx.array, aux_cache, kv_cache):
         x = qk_packed0.transpose(1, 0, 2)
-        use_decode_state = (
-            aux_cache is not None
-            and not _cache_is_empty(kv_cache)
-            and aux_cache[0] is not None
-            and x.shape[1] == 1
+        state = aux_cache[0] if aux_cache is not None else None
+        y, state = _causal_conv1d_stack(
+            self.conv_qk,
+            x,
+            state,
+            self.total_padding,
+            use_state=aux_cache is not None and not _cache_is_empty(kv_cache),
         )
-
-        if use_decode_state:
-            cached = aux_cache[0]
-            if cached.shape[0] != x.shape[0]:
-                cached = mx.zeros(
-                    (x.shape[0], self.cca_time0, x.shape[-1]), dtype=x.dtype
-                )
-            conv_input = mx.concatenate([cached, x], axis=1)
-        else:
-            conv_input = mx.pad(x, ((0, 0), (self.total_padding, 0), (0, 0)))
-
-        y = conv_input
-        for conv in self.conv_qk:
-            y = conv(y)
-
         if aux_cache is not None:
-            tail_source = conv_input if use_decode_state else x
-            if tail_source.shape[1] < self.cca_time0:
-                tail_source = mx.pad(
-                    tail_source,
-                    ((0, 0), (self.cca_time0 - tail_source.shape[1], 0), (0, 0)),
-                )
-            aux_cache[0] = tail_source[:, -self.cca_time0 :, :]
-
+            aux_cache[0] = state
         return y.transpose(1, 0, 2)
 
     def __call__(
@@ -213,9 +226,8 @@ class CCA(nn.Module):
             aux_cache is not None
             and not _cache_is_empty(kv_cache)
             and aux_cache[1] is not None
-            and hs.shape[0] == 1
         ):
-            hs_d = aux_cache[1][None, ...]
+            hs_d = mx.concatenate([aux_cache[1][None, ...], hs[:-1]], axis=0)
         if aux_cache is not None:
             aux_cache[1] = hs[-1]
 
