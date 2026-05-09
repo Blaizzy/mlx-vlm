@@ -1271,12 +1271,13 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                         "quantization": quantization,
                         "quantization_config": quantization,
                     }
                 )
 
+                self.assertEqual(config.vision_config.patch_size, 16)
                 self.assertIn(
                     "language_model.model.layers.0.linear_attn.in_proj_qkv",
                     config.quantization,
@@ -1351,9 +1352,10 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {"eos_token_id": 248044},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                     }
                 )
+                self.assertEqual(config_from_dict.vision_config.patch_size, 16)
                 self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
 
                 explicit = model_module.ModelConfig(
@@ -1403,6 +1405,22 @@ class TestModels(unittest.TestCase):
             num_position_embeddings=144,
             deepstack_visual_indexes=[],
         )
+
+        config_from_dict = qwen3_vl_moe.ModelConfig.from_dict(
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": vars(text_config).copy(),
+                "vision_config": {**vars(vision_config), "patch_size": 16},
+                "image_token_id": 151655,
+                "video_token_id": 151656,
+                "vocab_size": 10_000,
+            }
+        )
+        self.assertIsInstance(config_from_dict.text_config, qwen3_vl_moe.TextConfig)
+        self.assertIsInstance(config_from_dict.vision_config, qwen3_vl_moe.VisionConfig)
+        self.assertEqual(config_from_dict.vision_config.patch_size, 16)
+        model_from_dict = qwen3_vl_moe.Model(config_from_dict)
+        self.assertEqual(model_from_dict.vision_tower.patch_embed.patch_size, 16)
 
         config = qwen3_vl_moe.ModelConfig(
             text_config=text_config,
