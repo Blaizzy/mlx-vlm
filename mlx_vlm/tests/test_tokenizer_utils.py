@@ -14,6 +14,7 @@ from mlx_vlm.tokenizer_utils import (
     _is_spm_decoder_no_space,
     _match,
     _remove_space,
+    make_streaming_detokenizer,
 )
 
 # ============================================================================
@@ -239,6 +240,32 @@ class TestNaiveStreamingDetokenizer:
         detokenizer.finalize()
 
         assert "world" not in detokenizer.text
+
+    def test_copy_returns_reset_instance(self):
+        from copy import copy
+
+        tokenizer = MockTokenizer()
+        detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        detokenizer.add_token(0)
+
+        copied = copy(detokenizer)
+        copied.add_token(1)
+        copied.finalize()
+
+        assert copied.text == "world"
+
+    def test_make_streaming_detokenizer_copies_naive_detokenizer(self):
+        tokenizer = MockTokenizer()
+        processor = type("Processor", (), {})()
+        processor.detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        processor.detokenizer.add_token(0)
+
+        copied = make_streaming_detokenizer(processor)
+        copied.add_token(1)
+        copied.finalize()
+
+        assert copied.text == "world"
+        assert processor.detokenizer.text == "hello"
 
 
 # ============================================================================

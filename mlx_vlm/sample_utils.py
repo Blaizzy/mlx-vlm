@@ -6,11 +6,14 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
     Apply top-p (nucleus) sampling to logits.
 
     Args:
-        logits: The logits from the model's output. Shape [vocab] or [B, vocab].
+        logits: The logits from the model's output. Shape [..., vocab];
+            commonly [vocab], [B, vocab], or [B, T, vocab] (e.g. MTP
+            speculative verify output).
         top_p: The cumulative probability threshold for top-p filtering.
         temperature: Temperature parameter for softmax distribution reshaping.
     Returns:
-        token selected based on the top-p criterion. Shape [] or [B].
+        token selected based on the top-p criterion. Shape matches logits
+        with the trailing vocab axis removed (e.g. [], [B], or [B, T]).
     """
     unbatched = logits.ndim == 1
     if unbatched:
@@ -38,7 +41,7 @@ def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.arr
     )
 
     sampled_pos = mx.random.categorical(mx.log(top_probs))
-    token = mx.take_along_axis(sorted_indices, sampled_pos[:, None], axis=-1).squeeze(
+    token = mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1).squeeze(
         -1
     )
     return token.squeeze(0) if unbatched else token
