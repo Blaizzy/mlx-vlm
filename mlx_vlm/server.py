@@ -29,7 +29,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 from . import apc as _apc
-from .models import cache
 from .generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -50,6 +49,7 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
+from .models import cache
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
@@ -96,7 +96,9 @@ def _speculative_hidden_state(draft_kind: str, outputs):
     raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
 
 
-def _make_speculative_prompt_cache(lm, *, draft_kind: str, batch_size: int, left_padding):
+def _make_speculative_prompt_cache(
+    lm, *, draft_kind: str, batch_size: int, left_padding
+):
     if draft_kind == "mtp" and batch_size == 1:
         return cache.make_prompt_cache(lm)
     return _make_cache(lm, left_padding)
