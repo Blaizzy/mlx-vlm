@@ -15,7 +15,7 @@ import mlx.nn as nn
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
-from mlx_vlm.generate import (
+from mlx_vlm.speculative.utils import (
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_rounds,
@@ -47,7 +47,7 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 
-generate_module = importlib.import_module("mlx_vlm.generate")
+speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -518,16 +518,16 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
 
     lm = LM()
     model = SimpleNamespace(language_model=lm)
-    verify = generate_module._MTPVerifyResult(
+    verify = speculative_utils._MTPVerifyResult(
         hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
         shared_kv_states={},
         gdn_states=None,
     )
 
     with (
-        patch.object(generate_module, "_mtp_verify_target", return_value=verify),
+        patch.object(speculative_utils, "_mtp_verify_target", return_value=verify),
         patch.object(
-            generate_module,
+            speculative_utils,
             "_mtp_acceptance_walk",
             return_value=(0, [9]),
         ),

@@ -40,17 +40,15 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _dflash_rounds_batch,
     _make_cache,
     _merge_prefill_prompt_kwargs,
-    _mtp_rounds,
-    _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
+from .speculative.utils import _dflash_rounds_batch, _mtp_rounds, _mtp_rounds_batch
 from .structured import build_json_schema_logits_processor
 from .tokenizer_utils import make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
