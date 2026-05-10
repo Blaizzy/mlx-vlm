@@ -1014,6 +1014,9 @@ class TestModels(unittest.TestCase):
         self._assert_mrope_decode_uses_cache_idx(
             model.language_model, config.text_config.hidden_size
         )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
+            model.language_model, config.text_config.hidden_size
+        )
 
     def test_qwen2_5_vl(self):
         from mlx_vlm.models import qwen2_5_vl
@@ -1087,6 +1090,9 @@ class TestModels(unittest.TestCase):
 
         # Decode-step RoPE offset must come from cache._idx, not offset.item().
         self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
             model.language_model, config.text_config.hidden_size
         )
 
@@ -1265,12 +1271,13 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                         "quantization": quantization,
                         "quantization_config": quantization,
                     }
                 )
 
+                self.assertEqual(config.vision_config.patch_size, 16)
                 self.assertIn(
                     "language_model.model.layers.0.linear_attn.in_proj_qkv",
                     config.quantization,
@@ -1345,9 +1352,10 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {"eos_token_id": 248044},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                     }
                 )
+                self.assertEqual(config_from_dict.vision_config.patch_size, 16)
                 self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
 
                 explicit = model_module.ModelConfig(
@@ -1397,6 +1405,22 @@ class TestModels(unittest.TestCase):
             num_position_embeddings=144,
             deepstack_visual_indexes=[],
         )
+
+        config_from_dict = qwen3_vl_moe.ModelConfig.from_dict(
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": vars(text_config).copy(),
+                "vision_config": {**vars(vision_config), "patch_size": 16},
+                "image_token_id": 151655,
+                "video_token_id": 151656,
+                "vocab_size": 10_000,
+            }
+        )
+        self.assertIsInstance(config_from_dict.text_config, qwen3_vl_moe.TextConfig)
+        self.assertIsInstance(config_from_dict.vision_config, qwen3_vl_moe.VisionConfig)
+        self.assertEqual(config_from_dict.vision_config.patch_size, 16)
+        model_from_dict = qwen3_vl_moe.Model(config_from_dict)
+        self.assertEqual(model_from_dict.vision_tower.patch_embed.patch_size, 16)
 
         config = qwen3_vl_moe.ModelConfig(
             text_config=text_config,
@@ -1574,6 +1598,60 @@ class TestModels(unittest.TestCase):
         self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
         # Decode position == cache._idx (10), not cache.offset[0].item() (3).
         self.assertEqual(position_ids[0, 0, 0].item(), 10)
+
+    def _assert_mrope_decode_uses_rope_deltas_kwarg(self, language_model, hidden_size):
+        """Shared assertion: under continuous batching, an explicit
+        ``rope_deltas`` kwarg passed by ``GenerationBatch._step()`` must
+        override the mutable ``language_model._rope_deltas`` attribute. The
+        latter can be clobbered mid-decode when a newer request's prefill
+        runs ``get_input_embeddings`` on the same GPU thread.
+        """
+        # Stale per-model state — simulates a newer request having just
+        # prefilled and overwritten ``_rope_deltas``.
+        language_model._rope_deltas = mx.array([[99]])
+        language_model._position_ids = None
+
+        captured = {}
+
+        class _CapturingModel:
+            class _Embed:
+                @staticmethod
+                def as_linear(x):
+                    return x
+
+            embed_tokens = _Embed()
+            # ``fa_idx`` lets the qwen3_5 / qwen3_5_moe cache-indexing path
+            # (``cache[self.model.fa_idx]``) resolve to the stub cache below.
+            fa_idx = 0
+
+            def __call__(self, inputs, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], hidden_size))
+
+        language_model.model = _CapturingModel()
+        language_model.lm_head = lambda x: x
+
+        class _StubCacheWithIdx:
+            def __init__(self):
+                self._idx = 10
+                self.offset = mx.array(3)  # 0-d -> scalar decode branch
+
+        # Caller-supplied kwarg (the row-local delta from ``GenerationBatch``)
+        # disagrees with the stale ``_rope_deltas`` (99). Position must
+        # follow the kwarg.
+        kwarg_delta = mx.array([[5]])
+        language_model(
+            mx.array([[7]]),
+            cache=[_StubCacheWithIdx()],
+            rope_deltas=kwarg_delta,
+        )
+
+        position_ids = captured["position_ids"]
+        self.assertIsNotNone(position_ids)
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        # Position == cache._idx (10) + kwarg delta (5) == 15.
+        # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
+        self.assertEqual(position_ids[0, 0, 0].item(), 15)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
@@ -1765,6 +1843,53 @@ class TestModels(unittest.TestCase):
 
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
+
+    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+        from mlx_vlm.models import lfm2_vl
+
+        text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
+        vision_config = lfm2_vl.VisionConfig()
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_use_layernorm=False,
+        )
+        model = lfm2_vl.Model(config)
+
+        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
+        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+
+    def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
+        from mlx_vlm.models import lfm2_vl
+        from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
+
+        class ExplodingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layernorm branch should be disabled")
+
+        text_config = lfm2_vl.TextConfig(
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            intermediate_size=8,
+            layer_types=["full_attention"],
+        )
+        vision_config = lfm2_vl.VisionConfig(hidden_size=2)
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            downsample_factor=1,
+            projector_hidden_size=3,
+            projector_use_layernorm=False,
+        )
+        projector = Lfm2VlMultiModalProjector(config)
+        projector.layer_norm = ExplodingLayerNorm()
+
+        output = projector(mx.zeros((1, 1, 1, 2)))
+
+        self.assertEqual(output.shape, (1, 1, 1, 4))
 
     def test_mllama(self):
         from mlx_vlm.models import mllama
@@ -3620,6 +3745,92 @@ class TestModels(unittest.TestCase):
         self.assertEqual(
             sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
         )
+
+    def test_zaya1_vl(self):
+        from mlx_vlm.models import zaya1_vl
+        from mlx_vlm.models.zaya1_vl.language import CCA, ZayaRouter
+
+        text_config = zaya1_vl.TextConfig(
+            model_type="zaya1_vl",
+            hidden_size=8,
+            ffn_hidden_size=16,
+            num_hidden_layers=1,
+            num_experts=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_query_groups=1,
+            head_dim=4,
+            zaya_mlp_expansion=4,
+            vocab_size=32,
+            vision_lora=False,
+        )
+        vision_config = zaya1_vl.VisionConfig(
+            model_type="qwen2_5_vl",
+            depth=1,
+            hidden_size=8,
+            intermediate_size=16,
+            out_hidden_size=8,
+            num_heads=2,
+            image_size=4,
+            patch_size=2,
+            in_channels=3,
+            spatial_patch_size=2,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            window_size=4,
+            fullatt_block_indexes=[0],
+        )
+        config = zaya1_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="zaya1_vl",
+            image_token_id=31,
+            vocab_size=32,
+        )
+        model = zaya1_vl.Model(config)
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(model.language_model.model.final_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.attn.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.zaya_block.router.rmsnorm_eda, nn.RMSNorm)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.in_channels,
+            (4, 12),
+            vision_feature_layer=-1,
+            grid_thw=mx.array([[1, 2, 2]], dtype=mx.int64),
+        )
+
+        router = ZayaRouter(text_config, layer_number=1)
+        self.assertIsInstance(router.rmsnorm_eda, nn.RMSNorm)
+        self.assertEqual(router.rmsnorm_eda.eps, text_config.norm_epsilon)
+
+        cca = CCA(text_config, layer_number=0)
+        for linear in (cca.linear_q, cca.linear_k, cca.val_proj1, cca.val_proj2):
+            linear.weight = mx.zeros_like(linear.weight)
+        cca.linear_q.weight[0, 0] = 1e-4
+        cca.linear_k.weight[0, 0] = 1e-4
+        for conv in cca.conv_qk:
+            conv.weight = mx.zeros_like(conv.weight)
+            conv.bias = mx.zeros_like(conv.bias)
+
+        x_cca = mx.zeros((1, 1, text_config.hidden_size), dtype=mx.float32)
+        x_cca[0, 0, 0] = 1.0
+        query, _, _ = cca(x_cca)
+        expected_query = mx.zeros((1, 1, text_config.hidden_size), dtype=mx.float32)
+        for h in range(text_config.num_attention_heads):
+            expected_query[0, 0, h * text_config.head_dim] = 2.0
+        mx.eval(query, expected_query)
+        self.assertTrue(mx.allclose(query, expected_query, rtol=1e-5).item())
 
 
 class TestGetInputEmbeddings(unittest.TestCase):

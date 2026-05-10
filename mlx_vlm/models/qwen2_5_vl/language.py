@@ -504,19 +504,18 @@ class LanguageModel(nn.Module):
                     self._position_ids = position_ids
             else:
                 batch_size, seq_length = inputs.shape
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
                     offsets = cache_offsets[:batch_size]
-                    rope_deltas = (
-                        rope_deltas_kw
-                        if rope_deltas_kw is not None
-                        else self._rope_deltas
-                    )
+                    rope_deltas = rope_deltas_src
                     if rope_deltas.shape[0] > batch_size:
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]
                 else:
                     delta = mx.array(
-                        cache_offset + self._rope_deltas if cache is not None else 0
+                        cache_offset + rope_deltas_src if cache is not None else 0
                     )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)

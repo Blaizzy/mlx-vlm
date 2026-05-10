@@ -234,6 +234,21 @@ def test_mtp_drafter_sliding_mask_accepts_single_row_array_offsets():
     assert row[3:] == [0.0, 0.0, 0.0]
 
 
+def test_mtp_drafter_sliding_mask_uses_local_rotating_cache_offset():
+    kv = (mx.zeros((1, 1, 8, 4)), mx.zeros((1, 1, 8, 4)))
+
+    masks = make_drafter_masks(
+        {"sliding_attention": kv},
+        query_len=1,
+        query_offset=128,
+        sliding_window=4,
+    )
+
+    mask = masks["sliding_attention"].tolist()[0][0][0]
+    assert mask[:5] == [-float("inf")] * 5
+    assert mask[5:] == [0.0, 0.0, 0.0]
+
+
 def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     base = RotatingKVCache(max_size=4, keep=0)
     keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)

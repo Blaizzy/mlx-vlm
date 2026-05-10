@@ -182,6 +182,16 @@ def _kv_len(kv: Tuple[mx.array, mx.array]) -> int:
     return int(K.shape[-2])
 
 
+def _local_window_offset(
+    query_offset: Union[int, mx.array],
+    kv_len: int,
+) -> Union[int, mx.array]:
+    """Map absolute decode positions onto the local rotating-cache window."""
+    if isinstance(query_offset, int):
+        return min(query_offset, kv_len)
+    return mx.minimum(query_offset, kv_len)
+
+
 def _normalize_shared_kv_tensor(
     tensor: mx.array,
     kv_valid_len: Union[int, mx.array],

@@ -806,6 +806,42 @@ class DiskBlockStore:
     def _shard_path(self, shard_id: str) -> Path:
         return self.dir / f"{shard_id}{self.SUFFIX}"
 
+    def _drop_index_for_path(self, path: Path) -> None:
+        with self._index_lock:
+            stale = [h for h, (sp, _) in self._index.items() if sp == path]
+            for h in stale:
+                del self._index[h]
+            stale_exact = [h for h, sp in self._exact_index.items() if sp == path]
+            for h in stale_exact:
+                del self._exact_index[h]
+        with self._mmap_cache_lock:
+            self._mmap_cache.pop(path, None)
+        with self._header_cache_lock:
+            self._header_cache.pop(path, None)
+
+    def _clear_disk_state_after_external_delete(self) -> None:
+        with self._index_lock:
+            self._index.clear()
+            self._exact_index.clear()
+        with self._mmap_cache_lock:
+            self._mmap_cache.clear()
+        with self._header_cache_lock:
+            self._header_cache.clear()
+        self._disk_bytes = 0
+
+    def _ensure_dir(self) -> bool:
+        existed = self.dir.exists()
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(
+                "APC disk: failed to create cache directory %s: %s", self.dir, e
+            )
+            return False
+        if not existed:
+            self._clear_disk_state_after_external_delete()
+        return True
+
     @staticmethod
     def _shard_id_for(block_hashes: Sequence[int]) -> str:
         h = hashlib.sha256()
@@ -823,6 +859,8 @@ class DiskBlockStore:
         """Delete anything in the dir that isn't a canonical shard (left
         over from a crashed write, or files from an older block-per-file
         layout that this class no longer recognises)."""
+        if not self._ensure_dir():
+            return 0
         n = 0
         for p in self.dir.glob(f"*{self.SUFFIX}"):
             if not p.is_file() or self._is_canonical_store_file(p):
@@ -842,6 +880,8 @@ class DiskBlockStore:
         the tensor payload. On a disk with hundreds of cached shards this
         keeps server-startup overhead and Python heap growth minimal.
         """
+        if not self._ensure_dir():
+            return 0
         total = 0
         with self._index_lock:
             self._index.clear()
@@ -904,6 +944,8 @@ class DiskBlockStore:
         are evicted tail-first so a partially-retained store still has a
         useful prefix.
         """
+        if not self._ensure_dir():
+            return 0
         if self.max_bytes is None or self._disk_bytes <= self.max_bytes:
             return 0
         target = int(self.max_bytes * self._EVICT_LOW_WATERMARK)
@@ -977,17 +1019,7 @@ class DiskBlockStore:
             self._disk_bytes -= size
             evicted += 1
             # Drop index + mmap entries pointing at this shard.
-            with self._index_lock:
-                stale = [h for h, (sp, _) in self._index.items() if sp == p]
-                for h in stale:
-                    del self._index[h]
-                stale_exact = [h for h, sp in self._exact_index.items() if sp == p]
-                for h in stale_exact:
-                    del self._exact_index[h]
-            with self._mmap_cache_lock:
-                self._mmap_cache.pop(p, None)
-            with self._header_cache_lock:
-                self._header_cache.pop(p, None)
+            self._drop_index_for_path(p)
         if evicted:
             self.evictions += evicted
             logger.info(
@@ -1001,6 +1033,11 @@ class DiskBlockStore:
     # ---------- Header cache ----------
     def _open_shard_header(self, shard_path: Path):
         """Return parsed safetensors header info for a shard, cached."""
+        if not self._ensure_dir():
+            return None
+        if not shard_path.exists():
+            self._drop_index_for_path(shard_path)
+            return None
         with self._header_cache_lock:
             cached = self._header_cache.get(shard_path)
             if cached is not None:
@@ -1009,6 +1046,7 @@ class DiskBlockStore:
         parsed = _read_safetensors_header(shard_path)
         if parsed is None:
             logger.warning("APC disk shard header read failed for %s", shard_path)
+            self._drop_index_for_path(shard_path)
             return None
         with self._header_cache_lock:
             self._header_cache[shard_path] = parsed
@@ -1020,6 +1058,11 @@ class DiskBlockStore:
     # ---------- mmap cache ----------
     def _open_shard(self, shard_path: Path):
         """Return (arrays_dict, file_metadata) for a shard, mmap-cached."""
+        if not self._ensure_dir():
+            return None
+        if not shard_path.exists():
+            self._drop_index_for_path(shard_path)
+            return None
         with self._mmap_cache_lock:
             cached = self._mmap_cache.get(shard_path)
             if cached is not None:
@@ -1029,6 +1072,7 @@ class DiskBlockStore:
             arrays, metadata = mx.load(str(shard_path), return_metadata=True)
         except Exception as e:
             logger.warning("APC disk shard load failed for %s: %s", shard_path, e)
+            self._drop_index_for_path(shard_path)
             return None
         # Touch recency timestamp so LRU eviction prefers truly-cold shards.
         try:
@@ -2418,6 +2462,8 @@ class DiskBlockStore:
         path: Path,
         snapshot: _DiskExactCacheSnapshot,
     ) -> List[int]:
+        if not self._ensure_dir():
+            raise OSError(f"APC disk cache directory unavailable: {self.dir}")
         metadata: dict[str, str] = {
             "layout": "exact_cache_v1",
             "cache_hash": str(int(snapshot.cache_hash)),
@@ -2543,6 +2589,8 @@ class DiskBlockStore:
         layer_values: List[mx.array],
         block_size: int,
     ) -> None:
+        if not self._ensure_dir():
+            raise OSError(f"APC disk cache directory unavailable: {self.dir}")
         arrays: dict[str, mx.array] = {}
         for l, (k, v) in enumerate(zip(layer_keys, layer_values)):
             arrays[f"k{l}"] = k

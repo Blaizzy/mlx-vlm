@@ -1,10 +1,10 @@
-import inspect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 from ..qwen3_5.config import resolve_qwen_eos_token_id, sanitize_quantization_config
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
+from ..qwen3_vl.config import _config_kwargs, _maybe_deserialize_config
 
 
 @dataclass
@@ -110,11 +110,16 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
+        # Deserialize nested configs before constructing ModelConfig.
+        # Without this, vision_config and text_config remain raw dicts
+        # and their dataclass defaults (e.g. patch_size=14) take precedence
+        # over the values in config.json (e.g. patch_size=16), causing
+        # reshape failures in the vision encoder.
+        params = dict(params)
+        params["vision_config"] = _maybe_deserialize_config(
+            VisionConfig, params.get("vision_config")
         )
+        params["text_config"] = _maybe_deserialize_config(
+            TextConfig, params.get("text_config"), require_all_fields=True
+        )
+        return cls(**_config_kwargs(cls, params))
