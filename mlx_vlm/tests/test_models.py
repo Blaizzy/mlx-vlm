@@ -3773,6 +3773,92 @@ class TestModels(unittest.TestCase):
             sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
         )
 
+    def test_zaya1_vl(self):
+        from mlx_vlm.models import zaya1_vl
+        from mlx_vlm.models.zaya1_vl.language import CCA, ZayaRouter
+
+        text_config = zaya1_vl.TextConfig(
+            model_type="zaya1_vl",
+            hidden_size=8,
+            ffn_hidden_size=16,
+            num_hidden_layers=1,
+            num_experts=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_query_groups=1,
+            head_dim=4,
+            zaya_mlp_expansion=4,
+            vocab_size=32,
+            vision_lora=False,
+        )
+        vision_config = zaya1_vl.VisionConfig(
+            model_type="qwen2_5_vl",
+            depth=1,
+            hidden_size=8,
+            intermediate_size=16,
+            out_hidden_size=8,
+            num_heads=2,
+            image_size=4,
+            patch_size=2,
+            in_channels=3,
+            spatial_patch_size=2,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            window_size=4,
+            fullatt_block_indexes=[0],
+        )
+        config = zaya1_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="zaya1_vl",
+            image_token_id=31,
+            vocab_size=32,
+        )
+        model = zaya1_vl.Model(config)
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(model.language_model.model.final_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.attn.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.zaya_block.router.rmsnorm_eda, nn.RMSNorm)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.in_channels,
+            (4, 12),
+            vision_feature_layer=-1,
+            grid_thw=mx.array([[1, 2, 2]], dtype=mx.int64),
+        )
+
+        router = ZayaRouter(text_config, layer_number=1)
+        self.assertIsInstance(router.rmsnorm_eda, nn.RMSNorm)
+        self.assertEqual(router.rmsnorm_eda.eps, text_config.norm_epsilon)
+
+        cca = CCA(text_config, layer_number=0)
+        for linear in (cca.linear_q, cca.linear_k, cca.val_proj1, cca.val_proj2):
+            linear.weight = mx.zeros_like(linear.weight)
+        cca.linear_q.weight[0, 0] = 1e-4
+        cca.linear_k.weight[0, 0] = 1e-4
+        for conv in cca.conv_qk:
+            conv.weight = mx.zeros_like(conv.weight)
+            conv.bias = mx.zeros_like(conv.bias)
+
+        x_cca = mx.zeros((1, 1, text_config.hidden_size), dtype=mx.float32)
+        x_cca[0, 0, 0] = 1.0
+        query, _, _ = cca(x_cca)
+        expected_query = mx.zeros((1, 1, text_config.hidden_size), dtype=mx.float32)
+        for h in range(text_config.num_attention_heads):
+            expected_query[0, 0, h * text_config.head_dim] = 2.0
+        mx.eval(query, expected_query)
+        self.assertTrue(mx.allclose(query, expected_query, rtol=1e-5).item())
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
