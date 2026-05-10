@@ -5,6 +5,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 """
 
 import json
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,7 @@ import mlx_vlm.models.qwen3_5.language as qwen_language
 from mlx_vlm.generate import (
     _effective_mtp_block_size,
     _format_speculative_stats,
+    _mtp_rounds,
     _mtp_draft_block_active,
     _mtp_draft_hidden,
     _mtp_next_block_size,
@@ -44,6 +46,8 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
 )
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+
+generate_module = importlib.import_module("mlx_vlm.generate")
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -488,6 +492,64 @@ def test_mtp_verify_target_uses_model_logits_hook():
     assert result.shared_kv_states == {"full": ("k", "v")}
     assert result.gdn_states == ["gdn"]
     assert result.target_tokens is target_tokens
+
+
+def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
+    class Draft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=3)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def set_shared_kv(self, *args, **kwargs):
+            pass
+
+        def reset(self, model):
+            pass
+
+        def draft_block(self, *args, **kwargs):
+            return mx.array([[7, 8]], dtype=mx.int32)
+
+    rollback_calls = []
+
+    class LM:
+        def rollback_speculative_cache(self, *args):
+            rollback_calls.append(args)
+
+    lm = LM()
+    model = SimpleNamespace(language_model=lm)
+    verify = generate_module._MTPVerifyResult(
+        hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
+        shared_kv_states={},
+        gdn_states=None,
+    )
+
+    with (
+        patch.object(generate_module, "_mtp_verify_target", return_value=verify),
+        patch.object(
+            generate_module,
+            "_mtp_acceptance_walk",
+            return_value=(0, [9]),
+        ),
+    ):
+        list(
+            _mtp_rounds(
+                model,
+                Draft(),
+                [SimpleNamespace(offset=0)],
+                mx.zeros((1, 1, 2), dtype=mx.float32),
+                {},
+                first_bonus=1,
+                max_tokens=3,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                draft_block_size=3,
+                token_dtype=mx.int32,
+                greedy_sampling=True,
+            )
+        )
+
+    assert rollback_calls
+    assert rollback_calls[0][1] is None
 
 
 def test_mtp_next_block_size_can_prefer_requested_size():
