@@ -135,6 +135,33 @@ def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():
     ]
 
 
+def test_qwen_rollback_speculative_cache_uses_intermediate_states():
+    batch_size = 2
+    accepted = mx.array([0, 1], dtype=mx.int32)
+    caches = [ArraysCache(size=2)]
+    state = mx.arange(batch_size * 3 * 3 * 5 * 4, dtype=mx.float32).reshape(
+        batch_size, 3, 3, 5, 4
+    )
+    gdn_states = [_make_gdn_state(batch_size, 0, init_state=None) + (state,)]
+
+    with patch.object(
+        qwen_language,
+        "gated_delta_state_update",
+        side_effect=AssertionError("state replay should not run"),
+    ):
+        max_a = qwen_language.LanguageModel.rollback_speculative_cache(
+            SimpleNamespace(), caches, gdn_states, accepted, block_size=3
+        )
+
+    assert max_a == 1
+    expected_state = mx.stack([state[0, 0], state[1, 1]])
+    assert caches[0][1].tolist() == expected_state.tolist()
+    assert caches[0][0][:, :, 0].tolist() == [
+        [1.0, 2.0, 3.0],
+        [12.0, 13.0, 14.0],
+    ]
+
+
 def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     accepted = mx.array([1, 0], dtype=mx.int32)
     caches = [ArraysCache(size=2)]

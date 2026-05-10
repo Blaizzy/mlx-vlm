@@ -1022,11 +1022,10 @@ def _mtp_rounds(
         hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
         b = new_tokens[-1] if new_tokens else b
 
-        if accepted < bs - 1:
+        rollback = getattr(lm, "rollback_speculative_cache", None)
+        if callable(rollback) and verify.gdn_states is not None:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify.gdn_states, accepted, bs
-                )
+                rollback(prompt_cache, verify.gdn_states, accepted, bs)
 
         next_shared_kv = _slice_shared_kv_after_reject(
             verify.shared_kv_states, bs - (accepted + 1)

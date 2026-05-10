@@ -13,7 +13,11 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
-from .gated_delta import gated_delta_state_update, gated_delta_update
+from .gated_delta import (
+    gated_delta_state_update,
+    gated_delta_update,
+    gated_delta_update_with_states,
+)
 
 
 class Qwen3_5RotaryEmbedding:
@@ -316,7 +320,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        initial_state = state
+        intermediate_states = None
         if gdn_sink is not None:
+            out, state, intermediate_states = gated_delta_update_with_states(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
             # Tuple layout consumed by ``rollback_speculative_cache`` below.
             gdn_sink.append(
                 (
@@ -327,25 +345,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     b,
                     self.A_log,
                     self.dt_bias,
-                    state,
+                    initial_state,
                     mask,
                     conv_input,
                     self.conv_kernel_size,
+                    intermediate_states,
                 )
             )
-
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
 
         if cache is not None:
             cache[1] = state
@@ -484,6 +503,44 @@ class LanguageModel(nn.Module):
                 ssm_caches.append(c)
 
         if not ssm_caches:
+            return max_a
+
+        if all(len(s) > 11 and s[11] is not None for s in gdn_states):
+            a0 = int(accepted[0].item()) if not is_batch else None
+            for j, c in enumerate(ssm_caches):
+                (
+                    _q,
+                    _k,
+                    _v,
+                    _a,
+                    _b,
+                    _A_log,
+                    _dt_bias,
+                    _init_state,
+                    _mask,
+                    conv_input,
+                    K,
+                    intermediate_states,
+                    *_,
+                ) = gdn_states[j]
+                if is_batch:
+                    acc_list = accepted.tolist()
+                    states = [
+                        intermediate_states[bi, int(acc_list[bi])]
+                        for bi in range(len(acc_list))
+                    ]
+                    c[1] = mx.stack(states, axis=0)
+                    slices = [
+                        conv_input[
+                            bi : bi + 1,
+                            int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
+                        ]
+                        for bi in range(len(acc_list))
+                    ]
+                    c[0] = mx.concatenate(slices, axis=0)
+                else:
+                    c[1] = intermediate_states[:, a0]
+                    c[0] = conv_input[:, a0 + 1 : a0 + K]
             return max_a
 
         # Batch all SSM rollbacks into a single state-only gated delta kernel.
