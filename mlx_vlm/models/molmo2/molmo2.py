@@ -19,7 +19,7 @@ def image_feature_clip_limit(dtype) -> float:
     return dtype_max
 
 
-def sanitize_image_features(image_features: mx.array) -> mx.array:
+def clip_image_features(image_features: mx.array) -> mx.array:
     clip_limit = image_feature_clip_limit(image_features.dtype)
     image_features = mx.where(
         mx.isnan(image_features), mx.zeros_like(image_features), image_features
@@ -302,7 +302,7 @@ class Model(nn.Module):
                 image_features = cached
             else:
                 image_features = self.vision_tower(pixel_values, token_pooling)
-            image_features = sanitize_image_features(image_features)
+            image_features = clip_image_features(image_features)
             is_image_patch = mx.reshape(input_ids, (-1,)) == self.config.image_patch_id
             if int(is_image_patch.sum().item()) != image_features.shape[0]:
                 raise ValueError(
