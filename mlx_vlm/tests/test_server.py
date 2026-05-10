@@ -105,9 +105,7 @@ def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeyp
     lm = object()
     batched_cache = object()
 
-    monkeypatch.setattr(
-        server.cache, "make_prompt_cache", lambda target: pytest.fail()
-    )
+    monkeypatch.setattr(server.cache, "make_prompt_cache", lambda target: pytest.fail())
     monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: batched_cache)
 
     assert (

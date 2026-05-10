@@ -31,11 +31,11 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
 )
+from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
 from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
 )
-from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -487,8 +487,7 @@ def test_format_speculative_stats_includes_variable_draft_rate():
     )
 
     assert (
-        stats
-        == "Speculative decoding: 1.00 accepted tokens/round "
+        stats == "Speculative decoding: 1.00 accepted tokens/round "
         "(60.0% of drafted, avg draft 1.67) over 3 rounds"
     )
 
@@ -547,10 +546,10 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
         ):
             batch_size = hidden.shape[0]
             del cache, sampler
-            base = int(
-                next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item()
+            base = int(next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item())
+            bonus = (
+                last_bonus if isinstance(last_bonus, int) else int(last_bonus[0].item())
             )
-            bonus = last_bonus if isinstance(last_bonus, int) else int(last_bonus[0].item())
             row_count = 1 if isinstance(last_bonus, int) else batch_size
             return mx.full((row_count, block_size - 1), base + bonus, dtype=token_dtype)
 
