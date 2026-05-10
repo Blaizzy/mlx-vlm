@@ -5,6 +5,28 @@ from typing import Dict, List, Optional, Union
 from ..base import BaseModelConfig
 
 
+def _config_kwargs(config_cls, params):
+    return {
+        k: v for k, v in params.items() if k in inspect.signature(config_cls).parameters
+    }
+
+
+def _has_required_config_fields(config_cls, params):
+    return all(
+        name in params
+        for name, param in inspect.signature(config_cls).parameters.items()
+        if param.default is inspect.Parameter.empty
+    )
+
+
+def _maybe_deserialize_config(config_cls, params, *, require_all_fields=False):
+    if not isinstance(params, dict):
+        return params
+    if require_all_fields and not _has_required_config_fields(config_cls, params):
+        return params
+    return config_cls(**_config_kwargs(config_cls, params))
+
+
 @dataclass
 class VisionConfig(BaseModelConfig):
     model_type: str = "qwen3_vl"
@@ -93,11 +115,11 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
-
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
+        params = dict(params)
+        params["vision_config"] = _maybe_deserialize_config(
+            VisionConfig, params.get("vision_config")
         )
+        params["text_config"] = _maybe_deserialize_config(
+            TextConfig, params.get("text_config"), require_all_fields=True
+        )
+        return cls(**_config_kwargs(cls, params))

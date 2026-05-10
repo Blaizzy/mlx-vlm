@@ -156,21 +156,23 @@ def make_drafter_masks(
     masks = {}
     for layer_type, kv in shared_kv_states.items():
         kv_len = _kv_len(kv)
-        if isinstance(kv_valid_len, int):
-            key_offset = max(kv_valid_len - kv_len, 0)
-        else:
-            key_offset = mx.maximum(kv_valid_len - kv_len, 0)
         if layer_type == "sliding_attention":
+            local_query_offset = _local_window_offset(query_offset, kv_len)
+            local_valid_len = _local_window_offset(kv_valid_len, kv_len)
             masks[layer_type] = bidirectional_swa_mask(
                 query_len,
-                query_offset,
+                local_query_offset,
                 kv_len,
                 sliding_window,
-                kv_valid_len,
-                key_offset,
+                local_valid_len,
+                0,
                 dtype,
             )
         else:
+            if isinstance(kv_valid_len, int):
+                key_offset = max(kv_valid_len - kv_len, 0)
+            else:
+                key_offset = mx.maximum(kv_valid_len - kv_len, 0)
             masks[layer_type] = bidirectional_full_mask(
                 query_len, kv_len, kv_valid_len, key_offset, dtype
             )
@@ -180,6 +182,16 @@ def make_drafter_masks(
 def _kv_len(kv: Tuple[mx.array, mx.array]) -> int:
     K, _ = kv
     return int(K.shape[-2])
+
+
+def _local_window_offset(
+    query_offset: Union[int, mx.array],
+    kv_len: int,
+) -> Union[int, mx.array]:
+    """Map absolute decode positions onto the local rotating-cache window."""
+    if isinstance(query_offset, int):
+        return min(query_offset, kv_len)
+    return mx.minimum(query_offset, kv_len)
 
 
 def _normalize_shared_kv_tensor(
