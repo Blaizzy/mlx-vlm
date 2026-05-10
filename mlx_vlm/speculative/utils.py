@@ -1112,7 +1112,8 @@ def _dflash_rounds_batch(
         if draft_block_size is not None
         else int(draft_model.config.block_size)
     )
-    draft_cache = draft_model.reset(model)
+    draft_model.reset(model)
+    draft_caches = [draft_model.make_cache() for _ in range(B)]
 
     # Per-sequence state tracked by ORIGINAL index so the caller sees
     # stable indices in the yielded token lists.
@@ -1120,11 +1121,6 @@ def _dflash_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
-
-    def _reinit_drafter():
-        """Cold-restart the drafter cache after a batch change."""
-        nonlocal draft_cache
-        draft_cache = draft_model.make_cache()
 
     total_emitted = sum(emitted)
 
@@ -1141,9 +1137,22 @@ def _dflash_rounds_batch(
         b_active = [b[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
 
-        # Draft
-        draft_tokens = draft_model.draft_block(
-            b_arr, hidden, draft_cache, bs, sampler, token_dtype
+        # Draft rowwise: the DFlash drafter cache is scalar-offset and has
+        # proven unsafe as a single batched cache on MLX/Metal. Target verify
+        # remains batched below.
+        draft_tokens = mx.concatenate(
+            [
+                draft_model.draft_block(
+                    int(b_active[j]),
+                    hidden[j : j + 1],
+                    draft_caches[active_idx[j]],
+                    bs,
+                    sampler,
+                    token_dtype,
+                )
+                for j in range(n_active)
+            ],
+            axis=0,
         )
         mx.async_eval(draft_tokens)
 
@@ -1220,8 +1229,6 @@ def _dflash_rounds_batch(
             hidden = hidden[keep_mx]
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
-            # Cold-restart drafter for the new batch size
-            _reinit_drafter()
 
         new_total = sum(emitted)
         if new_total // 256 > total_emitted // 256:
@@ -1231,6 +1238,117 @@ def _dflash_rounds_batch(
 
 def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     return _format_speculative_stats(draft_model)
+
+
+def get_speculative_rounds_batch(draft_kind: str):
+    if draft_kind == "mtp":
+        return _mtp_rounds_batch
+    if draft_kind == "dflash":
+        return _dflash_rounds_batch
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+
+
+def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
+    if draft_kind == "mtp":
+        return {"return_hidden": True, "return_shared_kv": True}
+    if draft_kind == "dflash":
+        return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+
+
+def speculative_hidden_state(draft_kind: str, outputs):
+    if draft_kind == "mtp":
+        return outputs.hidden_states[-1]
+    if draft_kind == "dflash":
+        return mx.concatenate(outputs.hidden_states, axis=-1)
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+
+
+def make_speculative_prompt_cache(
+    lm,
+    *,
+    draft_kind: str,
+    batch_size: int,
+    left_padding,
+    make_cache: Callable,
+):
+    if draft_kind == "mtp" and batch_size == 1:
+        return cache.make_prompt_cache(lm)
+    return make_cache(lm, left_padding)
+
+
+def run_speculative_server_rounds(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    draft_kind: str,
+    first_bonus: mx.array,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+    greedy_sampling: bool = False,
+    shared_kv_states: Optional[dict] = None,
+    eos_token_ids: Optional[set] = None,
+) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
+
+    if draft_kind == "mtp":
+        if batch_size == 1:
+            yield from (
+                ([tok], state)
+                for tok, state in _mtp_rounds(
+                    model,
+                    draft_model,
+                    prompt_cache,
+                    hidden,
+                    shared_kv_states,
+                    first_bonus=int(first_bonus.reshape(-1).item()),
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=token_dtype,
+                    greedy_sampling=greedy_sampling,
+                )
+            )
+            return
+
+        yield from _mtp_rounds_batch(
+            model,
+            draft_model,
+            prompt_cache,
+            hidden,
+            shared_kv_states,
+            first_bonus=first_bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+            stop_check=stop_check,
+            eos_token_ids=eos_token_ids,
+            greedy_sampling=greedy_sampling,
+        )
+        return
+
+    if draft_kind == "dflash":
+        yield from _dflash_rounds_batch(
+            model,
+            draft_model,
+            prompt_cache,
+            hidden,
+            first_bonus=first_bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+            stop_check=stop_check,
+        )
+        return
+
+    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
 
 
 def run_speculative_rounds(
