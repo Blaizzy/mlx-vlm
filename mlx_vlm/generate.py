@@ -1023,7 +1023,7 @@ def _mtp_rounds(
         b = new_tokens[-1] if new_tokens else b
 
         rollback = getattr(lm, "rollback_speculative_cache", None)
-        if callable(rollback) and verify.gdn_states is not None:
+        if accepted < bs - 1 and callable(rollback) and verify.gdn_states is not None:
             with mx.stream(generation_stream):
                 rollback(prompt_cache, verify.gdn_states, accepted, bs)
 

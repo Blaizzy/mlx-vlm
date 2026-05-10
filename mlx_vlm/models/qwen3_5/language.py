@@ -525,22 +525,32 @@ class LanguageModel(nn.Module):
                 ) = gdn_states[j]
                 if is_batch:
                     acc_list = accepted.tolist()
+                    state_steps = intermediate_states.shape[1]
                     states = [
-                        intermediate_states[bi, int(acc_list[bi])]
+                        (
+                            intermediate_states[bi, int(acc_list[bi])]
+                            if int(acc_list[bi]) < state_steps
+                            else c[1][bi]
+                        )
                         for bi in range(len(acc_list))
                     ]
                     c[1] = mx.stack(states, axis=0)
                     slices = [
-                        conv_input[
-                            bi : bi + 1,
-                            int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
-                        ]
+                        (
+                            conv_input[
+                                bi : bi + 1,
+                                int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
+                            ]
+                            if int(acc_list[bi]) < state_steps
+                            else c[0][bi : bi + 1]
+                        )
                         for bi in range(len(acc_list))
                     ]
                     c[0] = mx.concatenate(slices, axis=0)
                 else:
-                    c[1] = intermediate_states[:, a0]
-                    c[0] = conv_input[:, a0 + 1 : a0 + K]
+                    if a0 < intermediate_states.shape[1]:
+                        c[1] = intermediate_states[:, a0]
+                        c[0] = conv_input[:, a0 + 1 : a0 + K]
             return max_a
 
         # Batch all SSM rollbacks into a single state-only gated delta kernel.

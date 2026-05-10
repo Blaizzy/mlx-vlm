@@ -65,16 +65,20 @@ def _make_gated_delta_with_states_kernel(has_mask: bool = False):
                 y[dv_idx] = static_cast<InT>(0);
             }}
 
-            for (int i = 0; i < n_per_t; ++i) {{
-                auto s_idx = n_per_t * dk_idx + i;
-                states_[s_idx] = static_cast<StT>(state[i]);
+            if (t < StateT) {{
+                for (int i = 0; i < n_per_t; ++i) {{
+                    auto s_idx = n_per_t * dk_idx + i;
+                    states_[s_idx] = static_cast<StT>(state[i]);
+                }}
             }}
 
             q_ += Hk * Dk;
             k_ += Hk * Dk;
             v_ += Hv * Dv;
             y += Hv * Dv;
-            states_ += Hv * Dv * Dk;
+            if (t < StateT) {{
+                states_ += Hv * Dv * Dk;
+            }}
             g_ += Hv;
             beta_ += Hv;
         }}
@@ -132,8 +136,14 @@ def _gated_delta_with_states_ops(
             y = mx.where(valid[:, None, None], y, 0)
 
         ys.append(y.astype(q.dtype))
-        states.append(state)
-    return mx.stack(ys, axis=1), state, mx.stack(states, axis=1)
+        if t < T - 1:
+            states.append(state)
+    state_steps = max(T - 1, 0)
+    if state_steps == 0:
+        stacked_states = mx.zeros((B, 0, Hv, Dv, state.shape[-1]), dtype=state.dtype)
+    else:
+        stacked_states = mx.stack(states, axis=1)
+    return mx.stack(ys, axis=1), state, stacked_states
 
 
 def gated_delta_update_with_states(
@@ -165,6 +175,14 @@ def gated_delta_update_with_states(
 
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
+    state_steps = max(T - 1, 0)
+    if state_steps == 0:
+        y, state = gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=use_kernel
+        )
+        states = mx.zeros((B, 0, Hv, Dv, Dk), dtype=state.dtype)
+        return y, state, states
+
     input_type = q.dtype
     state_type = state.dtype
     kernel = _gated_delta_with_states_kernel
@@ -184,10 +202,11 @@ def gated_delta_update_with_states(
             ("Dv", Dv),
             ("Hk", Hk),
             ("Hv", Hv),
+            ("StateT", state_steps),
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
-        output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv, Dk)],
+        output_shapes=[(B, T, Hv, Dv), state.shape, (B, state_steps, Hv, Dv, Dk)],
         output_dtypes=[input_type, state_type, state_type],
     )
 
