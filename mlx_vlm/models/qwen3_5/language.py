@@ -624,11 +624,7 @@ class LanguageModel(nn.Module):
         if any(mask is not None for mask in mask_parts):
             replay_mask = mx.concatenate(
                 [
-                    (
-                        mask
-                        if mask is not None
-                        else mx.ones((rows, n), dtype=mx.bool_)
-                    )
+                    (mask if mask is not None else mx.ones((rows, n), dtype=mx.bool_))
                     for mask, rows in zip(mask_parts, layer_batch_sizes)
                 ],
                 axis=0,

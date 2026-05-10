@@ -203,9 +203,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         else:
             bonus = bonus_token[:, None].astype(token_dtype)
 
-        shifted = mx.concatenate(
-            [input_ids[:, 1:].astype(token_dtype), bonus], axis=1
-        )
+        shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
         self._next_position = 0
         h = self._forward_tokens(
             shifted,
@@ -243,9 +241,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
         if new_tokens:
             token_chunks.append(mx.array([[int(new_tokens[-1])]], dtype=token_dtype))
-            hidden_chunks.append(
-                verify_hidden[:, int(accepted) : int(accepted) + 1, :]
-            )
+            hidden_chunks.append(verify_hidden[:, int(accepted) : int(accepted) + 1, :])
 
         if token_chunks:
             tokens = mx.concatenate(token_chunks, axis=1).astype(token_dtype)

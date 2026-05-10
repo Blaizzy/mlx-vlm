@@ -6,7 +6,6 @@ import mlx.nn as nn
 
 from ..models import cache
 
-
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
@@ -150,9 +149,7 @@ def _mtp_verify_without_logits(
         )
         shared_kv_states = _mtp_shared_kv_from_prompt_cache(lm, prompt_cache)
         if shared_kv_states:
-            return _MTPVerifyResult(
-                hidden=hidden, shared_kv_states=shared_kv_states
-            )
+            return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_states)
 
     shared_kv_sink: dict = {}
     hidden = lm.model(
@@ -436,8 +433,7 @@ def _buffer_mtp_target_cache(
         if isinstance(entry, cache.BufferedRotatingKVCache):
             entry.buffer_size = max(entry.buffer_size, buffer_size)
         elif (
-            isinstance(entry, cache.RotatingKVCache)
-            and getattr(entry, "keep", 0) == 0
+            isinstance(entry, cache.RotatingKVCache) and getattr(entry, "keep", 0) == 0
         ):
             prompt_cache[idx] = cache.BufferedRotatingKVCache.from_cache(
                 entry, buffer_size=buffer_size
@@ -1392,7 +1388,9 @@ def run_speculative_rounds(
             )
         else:
             mx.eval(first_token)
-            first_bonus = first_token if first_token.ndim == 1 else first_token.reshape(-1)
+            first_bonus = (
+                first_token if first_token.ndim == 1 else first_token.reshape(-1)
+            )
             yield first_bonus.tolist(), logprobs
             eos = getattr(model.config, "eos_token_id", None)
             if isinstance(eos, int):

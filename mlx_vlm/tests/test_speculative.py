@@ -4,8 +4,8 @@ This file groups drafter-kind resolution, Gemma 4 assistant mask handling,
 and Qwen3.5 DFlash cache rollback coverage in one place.
 """
 
-import json
 import importlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,20 +15,6 @@ import mlx.nn as nn
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
-from mlx_vlm.speculative.utils import (
-    _effective_mtp_block_size,
-    _format_speculative_stats,
-    _mtp_rounds,
-    _mtp_draft_block_active,
-    _mtp_draft_hidden,
-    _mtp_next_block_size,
-    _mtp_shared_kv_from_prompt_cache,
-    _mtp_verify_target,
-    _speculative_walk,
-    _speculative_walk_batch,
-    _speculative_walk_batch_deferred_greedy,
-    _speculative_walk_deferred_greedy,
-)
 from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -36,16 +22,28 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
 )
+from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
 from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
 )
-from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
-from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
-    ModelConfig as Qwen3_5MTPConfig,
-)
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+from mlx_vlm.speculative.utils import (
+    _effective_mtp_block_size,
+    _format_speculative_stats,
+    _mtp_draft_block_active,
+    _mtp_draft_hidden,
+    _mtp_next_block_size,
+    _mtp_rounds,
+    _mtp_shared_kv_from_prompt_cache,
+    _mtp_verify_target,
+    _speculative_walk,
+    _speculative_walk_batch,
+    _speculative_walk_batch_deferred_greedy,
+    _speculative_walk_deferred_greedy,
+)
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
 
@@ -568,7 +566,9 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
 
 
 def test_mtp_next_block_size_can_prefer_requested_size():
-    draft_model = SimpleNamespace(accept_lens=[0] * 16, prefer_requested_block_size=True)
+    draft_model = SimpleNamespace(
+        accept_lens=[0] * 16, prefer_requested_block_size=True
+    )
 
     assert _mtp_next_block_size(draft_model, 6, 3, 5) == 5
 
@@ -622,8 +622,7 @@ def test_format_speculative_stats_includes_variable_draft_rate():
     )
 
     assert (
-        stats
-        == "Speculative decoding: 1.00 accepted tokens/round "
+        stats == "Speculative decoding: 1.00 accepted tokens/round "
         "(60.0% of drafted, avg draft 1.67) over 3 rounds"
     )
 
@@ -686,10 +685,10 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
             del cache, sampler
             self.rounds.append(self._draft_round)
             self._draft_round += 1
-            base = int(
-                next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item()
+            base = int(next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item())
+            bonus = (
+                last_bonus if isinstance(last_bonus, int) else int(last_bonus[0].item())
             )
-            bonus = last_bonus if isinstance(last_bonus, int) else int(last_bonus[0].item())
             row_count = 1 if isinstance(last_bonus, int) else batch_size
             return mx.full((row_count, block_size - 1), base + bonus, dtype=token_dtype)
 

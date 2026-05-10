@@ -111,7 +111,9 @@ def split_qwen3_5_mtp(
     draft_config = {
         "model_type": "qwen3_5_mtp",
         "text_config": text_config,
-        "block_size": int(block_size or text_config.get("mtp_num_hidden_layers", 1) + 2),
+        "block_size": int(
+            block_size or text_config.get("mtp_num_hidden_layers", 1) + 2
+        ),
         "tie_word_embeddings": bool(text_config.get("tie_word_embeddings", True)),
     }
     if any(key.endswith(".scales") for key in selected):
