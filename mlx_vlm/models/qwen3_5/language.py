@@ -4,7 +4,6 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
-from mlx_lm.models.gated_delta import gated_delta_update
 
 from ..base import (
     LanguageModelOutput,
@@ -14,6 +13,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
+from .gated_delta import gated_delta_state_update, gated_delta_update
 
 
 class Qwen3_5RotaryEmbedding:
@@ -486,32 +486,45 @@ class LanguageModel(nn.Module):
         if not ssm_caches:
             return max_a
 
-        # Batch all SSM rollbacks into a single gated_delta_update call
-        # to eliminate per-layer kernel launch overhead (~30 launches → 1).
+        # Batch all SSM rollbacks into a single state-only gated delta kernel.
+        # Rollback does not need the layer output, so this avoids the verifier
+        # replay's q projection and y materialization.
         N = len(ssm_caches)
-        replay_mask = None
-        if is_batch:
-            replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
 
-        q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
+        k_list, v_list, a_list, b_list = [], [], [], []
         A_log_list, dt_bias_list, state_list = [], [], []
+        steps_list = []
+        mask_parts = []
         layer_batch_sizes = []
         conv_data = []
         for j in range(N):
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
-                j
-            ]
-            q = q[:, :n]
+            (
+                _q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                init_state,
+                mask,
+                conv_input,
+                K,
+                *_,
+            ) = gdn_states[j]
             k = k[:, :n]
             v = v[:, :n]
             a = a[:, :n]
             b = b[:, :n]
-            batch_rows = q.shape[0]
-            q_list.append(q)
+            batch_rows = k.shape[0]
             k_list.append(k)
             v_list.append(v)
             a_list.append(a)
             b_list.append(b)
+            if is_batch:
+                steps_list.append(valid_ends.astype(mx.int32))
+            else:
+                steps_list.append(mx.full((batch_rows,), n, dtype=mx.int32))
             A_log_list.append(
                 mx.broadcast_to(A_log[None, None, :], (batch_rows, 1, A_log.shape[0]))
             )
@@ -528,11 +541,9 @@ class LanguageModel(nn.Module):
             state_list.append(init_state)
             layer_batch_sizes.append(batch_rows)
             conv_data.append((conv_input, K))
-            if not is_batch and replay_mask is None and mask is not None:
-                replay_mask = mask[:, :n]
+            mask_parts.append(None if mask is None else mask[:, :n])
 
         # Stack along batch dim: (N, n, H, D) — one kernel launch for all layers.
-        q_bat = mx.concatenate(q_list, axis=0)
         k_bat = mx.concatenate(k_list, axis=0)
         v_bat = mx.concatenate(v_list, axis=0)
         a_bat = mx.concatenate(a_list, axis=0)
@@ -540,17 +551,23 @@ class LanguageModel(nn.Module):
         A_log_bat = mx.concatenate(A_log_list, axis=0)  # (N, 1, Hv)
         dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
         state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
+        steps_bat = mx.concatenate(steps_list, axis=0)
 
-        if replay_mask is not None and replay_mask.shape[0] != q_bat.shape[0]:
-            if q_bat.shape[0] % replay_mask.shape[0] != 0:
-                raise ValueError(
-                    "Replay mask batch does not align with flattened SSM rollback rows."
-                )
-            repeats = q_bat.shape[0] // replay_mask.shape[0]
-            replay_mask = mx.concatenate([replay_mask] * repeats, axis=0)
+        replay_mask = None
+        if any(mask is not None for mask in mask_parts):
+            replay_mask = mx.concatenate(
+                [
+                    (
+                        mask
+                        if mask is not None
+                        else mx.ones((rows, n), dtype=mx.bool_)
+                    )
+                    for mask, rows in zip(mask_parts, layer_batch_sizes)
+                ],
+                axis=0,
+            )
 
-        _, states_out = gated_delta_update(
-            q_bat,
+        states_out = gated_delta_state_update(
             k_bat,
             v_bat,
             a_bat,
@@ -558,6 +575,7 @@ class LanguageModel(nn.Module):
             A_log_bat,
             dt_bias_bat,
             state_bat,
+            steps_bat,
             replay_mask,
             use_kernel=True,
         )

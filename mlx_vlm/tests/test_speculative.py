@@ -99,35 +99,33 @@ def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():
     ]
     captured = {}
 
-    def fake_gated_delta_update(
-        q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True
+    def fake_gated_delta_state_update(
+        k, v, a, b, A_log, dt_bias, state, steps, mask, use_kernel=True
     ):
-        del k, v, a, b, use_kernel
-        captured["q_shape"] = q.shape
+        del v, a, b, use_kernel
+        captured["k_shape"] = k.shape
         captured["A_log_shape"] = A_log.shape
         captured["dt_bias_shape"] = dt_bias.shape
+        captured["steps"] = steps
         captured["mask"] = mask
         row_ids = mx.arange(state.shape[0], dtype=mx.float32).reshape(-1, 1, 1, 1)
-        states_out = mx.broadcast_to(row_ids, state.shape)
-        return mx.zeros((q.shape[0], q.shape[1], 3, 5), dtype=mx.float32), states_out
+        return mx.broadcast_to(row_ids, state.shape)
 
     with patch.object(
-        qwen_language, "gated_delta_update", side_effect=fake_gated_delta_update
+        qwen_language,
+        "gated_delta_state_update",
+        side_effect=fake_gated_delta_state_update,
     ):
         max_a = qwen_language.LanguageModel.rollback_speculative_cache(
             SimpleNamespace(), caches, gdn_states, accepted, block_size=3
         )
 
     assert max_a == 1
-    assert captured["q_shape"] == (4, 2, 3, 4)
+    assert captured["k_shape"] == (4, 2, 3, 4)
     assert captured["A_log_shape"] == (4, 1, 3)
     assert captured["dt_bias_shape"] == (4, 1, 3)
-    assert captured["mask"].tolist() == [
-        [True, False],
-        [True, True],
-        [True, False],
-        [True, True],
-    ]
+    assert captured["steps"].tolist() == [1, 2, 1, 2]
+    assert captured["mask"] is None
     assert caches[0][1][:, 0, 0, 0].tolist() == [0.0, 1.0]
     assert caches[1][1][:, 0, 0, 0].tolist() == [2.0, 3.0]
     assert caches[0][0][:, :, 0].tolist() == [[1.0, 2.0, 3.0], [12.0, 13.0, 14.0]]
@@ -143,15 +141,17 @@ def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     gdn_states = [_make_gdn_state(batch_size=2, layer_offset=0, init_state=None)]
     captured = {}
 
-    def fake_gated_delta_update(
-        q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True
+    def fake_gated_delta_state_update(
+        k, v, a, b, A_log, dt_bias, state, steps, mask, use_kernel=True
     ):
-        del q, k, v, a, b, A_log, dt_bias, mask, use_kernel
+        del k, v, a, b, A_log, dt_bias, steps, mask, use_kernel
         captured["state"] = state
-        return mx.zeros((state.shape[0], 2, 3, 5), dtype=mx.float32), state
+        return state
 
     with patch.object(
-        qwen_language, "gated_delta_update", side_effect=fake_gated_delta_update
+        qwen_language,
+        "gated_delta_state_update",
+        side_effect=fake_gated_delta_state_update,
     ):
         qwen_language.LanguageModel.rollback_speculative_cache(
             SimpleNamespace(), caches, gdn_states, accepted, block_size=3
