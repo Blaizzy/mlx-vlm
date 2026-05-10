@@ -19,7 +19,9 @@ from mlx_vlm.generate import (
     _format_speculative_stats,
     _mtp_draft_block_active,
     _mtp_draft_hidden,
+    _mtp_next_block_size,
     _mtp_shared_kv_from_prompt_cache,
+    _mtp_verify_target,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_deferred_greedy,
@@ -427,6 +429,44 @@ def test_mtp_draft_hidden_defaults_to_identity():
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
 
     assert _mtp_draft_hidden(SimpleNamespace(), hidden).tolist() == hidden.tolist()
+
+
+def test_mtp_verify_target_uses_model_logits_hook():
+    verify_input = mx.array([[7, 8]], dtype=mx.int32)
+    hidden = mx.array([[[1.0, 0.0], [0.0, 1.0]]], dtype=mx.float32)
+    target_tokens = mx.array([[3, 4]], dtype=mx.int32)
+    calls = []
+
+    def verify_logits(inputs, cache, sampler):
+        calls.append((inputs, cache, sampler))
+        return hidden, {"full": ("k", "v")}, ["gdn"], target_tokens
+
+    lm = SimpleNamespace(
+        speculative_verify_logits=verify_logits,
+        speculative_logits_from_hidden=lambda _: (_ for _ in ()).throw(
+            AssertionError("deferred logits should not be used")
+        ),
+    )
+
+    result = _mtp_verify_target(
+        lm,
+        verify_input,
+        prompt_cache=["cache"],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert calls[0][0] is verify_input
+    assert calls[0][1] == ["cache"]
+    assert result.hidden is hidden
+    assert result.shared_kv_states == {"full": ("k", "v")}
+    assert result.gdn_states == ["gdn"]
+    assert result.target_tokens is target_tokens
+
+
+def test_mtp_next_block_size_can_prefer_requested_size():
+    draft_model = SimpleNamespace(accept_lens=[0] * 16, prefer_requested_block_size=True)
+
+    assert _mtp_next_block_size(draft_model, 6, 3, 5) == 5
 
 
 def test_mtp_shared_kv_accepts_cache_state_metadata():

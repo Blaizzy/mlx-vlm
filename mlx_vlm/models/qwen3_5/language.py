@@ -879,6 +879,21 @@ class LanguageModel(nn.Module):
             return self.model.embed_tokens.as_linear(hidden)
         return self.lm_head(hidden)
 
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        return (
+            out.hidden_states[-1],
+            out.shared_kv_states,
+            out.gdn_states,
+            sampler(out.logits),
+        )
+
     def speculative_verify_hidden(self, inputs: mx.array, cache):
         out = self(
             inputs,

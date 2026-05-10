@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ....models.base import create_attention_mask
 from ....models.cache import KVCache
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
 from .config import Qwen3_5MTPConfig
@@ -11,6 +12,7 @@ from .config import Qwen3_5MTPConfig
 
 class Qwen3_5MTPDraftModel(nn.Module):
     supports_greedy_draft_argmax = True
+    prefer_requested_block_size = True
 
     def __init__(self, config: Qwen3_5MTPConfig):
         super().__init__()
@@ -118,13 +120,14 @@ class Qwen3_5MTPDraftModel(nn.Module):
     def _draft_start_position(self):
         return self._next_position
 
-    def _position_ids(self, step: int) -> mx.array:
+    def _position_ids(self, step: int = 0, length: int = 1) -> mx.array:
         start = self._draft_start_position()
+        pos = mx.arange(length, dtype=mx.int32) + step
         if isinstance(start, int):
-            return mx.array([[start + step]], dtype=mx.int32)
+            return (pos + start)[None, :]
         if isinstance(start, mx.array):
-            return (start.astype(mx.int32) + step)[:, None]
-        return (mx.array(start, dtype=mx.int32) + step)[:, None]
+            return start.astype(mx.int32)[:, None] + pos[None, :]
+        return mx.array(start, dtype=mx.int32)[:, None] + pos[None, :]
 
     def _forward_hidden(
         self,
@@ -144,8 +147,32 @@ class Qwen3_5MTPDraftModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         for layer, layer_cache in zip(self.layers, cache):
-            h = layer(h, mask=None, cache=layer_cache, position_ids=position_ids)
+            mask = (
+                create_attention_mask(h, layer_cache)
+                if layer_cache is not None
+                else ("causal" if h.shape[1] > 1 else None)
+            )
+            h = layer(h, mask=mask, cache=layer_cache, position_ids=position_ids)
         return self.norm(h)
+
+    def _forward_tokens(
+        self,
+        tokens: mx.array,
+        hidden: mx.array,
+        token_dtype: mx.Dtype,
+    ) -> mx.array:
+        token_embed = (
+            self._input_embed(tokens.astype(token_dtype)) * self._input_embed_scale
+        )
+        steps = int(tokens.shape[1])
+        position_ids = self._position_ids(length=steps)
+        h = self._forward_hidden(token_embed, hidden, self._cache, position_ids)
+        self._next_position = (
+            self._next_position + steps
+            if isinstance(self._next_position, int)
+            else self._next_position + steps
+        )
+        return h
 
     def _forward_token(
         self,
@@ -153,17 +180,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         hidden: mx.array,
         token_dtype: mx.Dtype,
     ) -> mx.array:
-        token_embed = (
-            self._input_embed(tok.astype(token_dtype)) * self._input_embed_scale
-        )
-        position_ids = self._position_ids(0)
-        h = self._forward_hidden(token_embed, hidden, self._cache, position_ids)
-        self._next_position = (
-            self._next_position + 1
-            if isinstance(self._next_position, int)
-            else self._next_position + 1
-        )
-        return h
+        return self._forward_tokens(tok, hidden, token_dtype)
 
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, greedy: bool) -> None:
         logits = self._lm_head_fn(hidden)
@@ -190,15 +207,12 @@ class Qwen3_5MTPDraftModel(nn.Module):
             [input_ids[:, 1:].astype(token_dtype), bonus], axis=1
         )
         self._next_position = 0
-        h = None
-        for pos in range(shifted.shape[1]):
-            h = self._forward_token(
-                shifted[:, pos : pos + 1],
-                hidden[:, pos : pos + 1, :],
-                token_dtype,
-            )
-        if h is not None:
-            self._set_seed_from_hidden(h, sampler, greedy)
+        h = self._forward_tokens(
+            shifted,
+            hidden[:, : shifted.shape[1], :],
+            token_dtype,
+        )
+        self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
 
     def accept_verified_tokens(
         self,
@@ -221,25 +235,23 @@ class Qwen3_5MTPDraftModel(nn.Module):
                 else self._next_position - trim
             )
 
-        h = None
+        token_chunks = []
+        hidden_chunks = []
         for draft_idx in range(keep_appended, int(accepted)):
-            tok = draft_tokens[:, draft_idx : draft_idx + 1].astype(token_dtype)
-            h = self._forward_token(
-                tok,
-                verify_hidden[:, draft_idx : draft_idx + 1, :],
-                token_dtype,
-            )
+            token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
+            hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
 
         if new_tokens:
-            tok = mx.array([[int(new_tokens[-1])]], dtype=token_dtype)
-            h = self._forward_token(
-                tok,
-                verify_hidden[:, int(accepted) : int(accepted) + 1, :],
-                token_dtype,
+            token_chunks.append(mx.array([[int(new_tokens[-1])]], dtype=token_dtype))
+            hidden_chunks.append(
+                verify_hidden[:, int(accepted) : int(accepted) + 1, :]
             )
 
-        if h is not None:
-            self._set_seed_from_hidden(h, sampler, greedy)
+        if token_chunks:
+            tokens = mx.concatenate(token_chunks, axis=1).astype(token_dtype)
+            hiddens = mx.concatenate(hidden_chunks, axis=1)
+            h = self._forward_tokens(tokens, hiddens, token_dtype)
+            self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
         self._round_appended = 0
 
     def draft_block(

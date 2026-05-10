@@ -609,12 +609,42 @@ def _mtp_verify_without_logits(
     return _MTPVerifyResult(hidden=hidden, shared_kv_states=shared_kv_sink)
 
 
+def _mtp_verify_with_model_method(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    sampler: Callable[[mx.array], mx.array],
+) -> Optional[_MTPVerifyResult]:
+    verify_logits = getattr(lm, "speculative_verify_logits", None)
+    if not callable(verify_logits):
+        return None
+
+    result = verify_logits(verify_input, prompt_cache, sampler)
+    if not isinstance(result, tuple) or len(result) != 4:
+        raise ValueError(
+            "speculative_verify_logits() must return "
+            "(hidden, shared_kv_states, gdn_states, target_tokens)."
+        )
+
+    hidden, shared_kv_states, gdn_states, target_tokens = result
+    return _MTPVerifyResult(
+        hidden=hidden,
+        shared_kv_states=shared_kv_states or {},
+        target_tokens=target_tokens,
+        gdn_states=gdn_states,
+    )
+
+
 def _mtp_verify_target(
     lm: nn.Module,
     verify_input: mx.array,
     prompt_cache: List[Any],
     sampler: Callable[[mx.array], mx.array],
 ) -> _MTPVerifyResult:
+    result = _mtp_verify_with_model_method(lm, verify_input, prompt_cache, sampler)
+    if result is not None:
+        return result
+
     if hasattr(lm, "speculative_logits_from_hidden"):
         result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
         if result is not None:
@@ -820,6 +850,22 @@ def _effective_mtp_block_size(
     return block_total
 
 
+def _mtp_next_block_size(
+    draft_model: nn.Module,
+    requested_block_total: int,
+    configured_block_total: int,
+    remaining_budget: int,
+) -> int:
+    if getattr(draft_model, "prefer_requested_block_size", False):
+        return min(requested_block_total, remaining_budget)
+    return _effective_mtp_block_size(
+        requested_block_total,
+        configured_block_total,
+        draft_model.accept_lens,
+        remaining_budget,
+    )
+
+
 def _buffer_mtp_target_cache(
     prompt_cache: List[Any],
     draft_model: nn.Module,
@@ -915,10 +961,10 @@ def _mtp_rounds(
     emitted = 1  # caller already yielded the first bonus
 
     while emitted < max_tokens:
-        bs = _effective_mtp_block_size(
+        bs = _mtp_next_block_size(
+            draft_model,
             block_total,
             configured_block_total,
-            draft_model.accept_lens,
             max_tokens - emitted + 1,
         )
         if bs <= 1:
@@ -1198,10 +1244,10 @@ def _mtp_rounds_batch(
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = _effective_mtp_block_size(
+        bs = _mtp_next_block_size(
+            draft_model,
             block_total,
             configured_block_total,
-            draft_model.accept_lens,
             min(remaining),
         )
         if bs <= 1:
