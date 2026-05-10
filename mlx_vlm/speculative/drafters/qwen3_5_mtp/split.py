@@ -42,23 +42,23 @@ def _iter_mtp_keys(model_path: Path) -> Iterable[tuple[Path, list[str]]]:
             return
 
     for file in _safetensor_files(model_path):
-        with safe_open(file, framework="pt") as f:
+        with safe_open(file, framework="mlx") as f:
             keys = [key for key in f.keys() if key.startswith("mtp.")]
         if keys:
             yield file, keys
 
 
 def _is_mlx_safetensors(file: Path) -> bool:
-    with safe_open(file, framework="pt") as f:
+    with safe_open(file, framework="mlx") as f:
         metadata = f.metadata() or {}
     return metadata.get("format") == "mlx"
 
 
 def _load_selected_tensors(file: Path, keys: list[str]) -> Dict[str, mx.array]:
     tensors = {}
-    with safe_open(file, framework="pt") as f:
+    with safe_open(file, framework="mlx") as f:
         for key in keys:
-            tensors[key] = mx.array(f.get_tensor(key))
+            tensors[key] = f.get_tensor(key)
     return tensors
 
 
