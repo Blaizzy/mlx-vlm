@@ -1196,18 +1196,27 @@ def suppress_tool_call_content(
 ) -> Tuple[bool, Optional[str]]:
     """Suppress tool-call markup from streamed delta.content.
 
+    When tc_start first appears inside delta_content, the prefix preceding
+    it is real content and is emitted; tc_start onwards is suppressed.
+    Otherwise the entire delta — including the BPE-flushed text that comes
+    bundled with the tool-call special token — would be silently dropped.
+
     Returns updated (in_tool_call, delta_content).
     """
     if not tc_start:
         return in_tool_call, delta_content
-    if not in_tool_call:
-        if tc_start in full_output:
-            return True, None
-
-        if any(full_output.endswith(tc_start[:j]) for j in range(2, len(tc_start))):
-            return False, None
-    else:
+    if in_tool_call:
         return True, None
+    if tc_start in full_output:
+        if delta_content:
+            pre_delta = full_output[:-len(delta_content)]
+            if tc_start not in pre_delta:
+                offset = full_output.find(tc_start) - len(pre_delta)
+                if offset > 0:
+                    return True, delta_content[:offset]
+        return True, None
+    if any(full_output.endswith(tc_start[:j]) for j in range(2, len(tc_start))):
+        return False, None
     return in_tool_call, delta_content
 
 
@@ -2838,12 +2847,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         # Multi-token lookahead window for </think> boundary detection.
                         # The BPE incremental decoder suppresses the </think> special
                         # token (text='') but releases preceding-context bytes on the
-                        # *next* regular token. That next token's .text therefore
-                        # contains the </think> string followed by the first content
-                        # text. We accumulate tokens until we see \n in the combined
-                        # text: Qwen3 always emits \n\n before the response, so \n
-                        # confirms a real boundary. A </think> written inside a code
-                        # example has no following \n and is treated as spurious.
+                        # *next* regular token. That token's .text therefore contains
+                        # the </think> string followed by the first content text.
+                        # We confirm a real boundary when the after-tag portion starts
+                        # with \n\n (Qwen3 always emits \n\n before the response).
                         _THINK_PENDING_MAX = 5   # cap on non-empty tokens before deciding
                         _THINK_PENDING_CAP = 25  # hard cap including all-empty tokens
                         _think_end_pending = 0   # 0 = not pending, >0 = window size
@@ -2887,25 +2894,42 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 #   no \n      → spurious (model was writing about the tag)
                                 _pending_buffer.append(token)
                                 _combined = "".join(t.text for t in _pending_buffer)
-                                _has_newline = "\n" in _combined
                                 _has_content = bool(_combined)
                                 _content_at_cap = _has_content and _think_end_pending >= _THINK_PENDING_MAX
                                 _hard_cap = _think_end_pending >= _THINK_PENDING_CAP
-                                if _has_newline or token.finish_reason or _content_at_cap or _hard_cap:
-                                    if _has_newline:
+                                # Qwen3 always emits \n\n after </think> before the
+                                # response. A single \n can appear inside a code line
+                                # or sentence — check for \n\n *after* the tag.
+                                _confirmed = False
+                                for _chk_tag in ("</think>", "<channel|>"):
+                                    if _chk_tag in _combined:
+                                        _confirmed = _combined.split(_chk_tag, 1)[1].startswith("\n\n")
+                                        break
+                                # When the stream ends with an empty window, the model
+                                # generated </think> as its very last token before hitting
+                                # max_tokens. Treat as a real end (no response tail).
+                                if not _confirmed and token.finish_reason and not _combined:
+                                    _confirmed = True
+                                if _confirmed or token.finish_reason or _content_at_cap or _hard_cap:
+                                    if _confirmed:
                                         in_thinking = False
                                         _thinking_done = True
-                                        # Split on the tag string rather than the first \n
-                                        # because the BPE decoder embeds the </think> text
-                                        # inside the next token's .text value.
+                                        # Split on the tag string to separate the last
+                                        # thinking text (before </think>) from the first
+                                        # content text (after </think>). The BPE decoder
+                                        # embeds both in the next token's .text value.
+                                        thinking_tail = None
                                         tail = None
                                         for _tag in ("</think>", "<channel|>"):
                                             if _tag in _combined:
-                                                tail = _combined.split(_tag, 1)[1].lstrip("\n")
+                                                _parts = _combined.split(_tag, 1)
+                                                thinking_tail = _parts[0].rstrip("\n") or None
+                                                tail = _parts[1].lstrip("\n") or None
                                                 break
-                                        if tail is None:
-                                            tail = _combined.split("\n", 1)[1].lstrip("\n")
-                                        delta_content = tail if tail else None
+                                        if tail is None and "\n" in _combined:
+                                            tail = _combined.split("\n", 1)[1].lstrip("\n") or None
+                                        delta_reasoning = thinking_tail
+                                        delta_content = tail
                                     else:
                                         # Spurious </think> inside thinking content.
                                         delta_reasoning = _combined if _combined else None
@@ -2962,10 +2986,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     ]
                                 )
 
-                            # Skip empty deltas (e.g. suppressed tool-call tokens)
+                            # Skip empty deltas. Empty strings produce SSE chunks
+                            # with no useful payload — many clients (Pi, etc.) treat
+                            # a run of empty chunks as a dead/finished stream.
                             has_payload = (
-                                delta_content is not None
-                                or delta_reasoning is not None
+                                bool(delta_content)
+                                or bool(delta_reasoning)
                                 or token.finish_reason is not None
                                 or chunk_logprobs is not None
                             )
