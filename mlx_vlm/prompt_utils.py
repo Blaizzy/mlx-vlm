@@ -37,6 +37,7 @@ MODEL_CONFIG = {
     "paddleocr_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,

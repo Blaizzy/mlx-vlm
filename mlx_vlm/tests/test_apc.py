@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 
@@ -313,6 +314,43 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     assert warm is not None
     assert matched_tokens == len(token_ids)
     assert manager.stats_snapshot()["pool_used"] == 0
+    manager.close()
+
+
+def test_disk_store_recovers_when_cache_dir_is_deleted(tmp_path):
+    block_size = 16
+    first_tokens = list(range(block_size))
+    second_tokens = list(range(100, 100 + block_size))
+    first_keys, first_values = _make_fake_kv(num_layers=2, seq_len=len(first_tokens))
+    second_keys, second_values = _make_fake_kv(num_layers=2, seq_len=len(second_tokens))
+
+    disk = DiskBlockStore(tmp_path, namespace="unit")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+
+    stored = manager.store_kv_blocks(first_tokens, first_keys, first_values)
+    manager.release(stored)
+    disk._q.join()
+    assert disk.dir.exists()
+    assert any(disk.dir.glob(f"*{disk.SUFFIX}"))
+
+    shutil.rmtree(disk.dir)
+    assert not disk.dir.exists()
+
+    stored = manager.store_kv_blocks(second_tokens, second_keys, second_values)
+    manager.release(stored)
+    disk._q.join()
+
+    assert disk.dir.exists()
+    assert any(disk.dir.glob(f"*{disk.SUFFIX}"))
+    assert disk.disk_bytes > 0
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="unit")
+    manager = APCManager(num_blocks=1, block_size=block_size, disk=disk)
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(second_tokens)
+
+    assert warm is not None
+    assert matched_tokens == len(second_tokens)
     manager.close()
 
 

@@ -1157,6 +1157,44 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertFalse(processor.image_processor.do_image_splitting)
 
 
+class TestMolmoPointProcessor(unittest.TestCase):
+    def test_processor_exposes_image_processor(self):
+        from mlx_vlm.models.molmo_point.processing_molmo_point import (
+            MolmoPointImageProcessor,
+            MolmoPointProcessor,
+        )
+
+        processor = MolmoPointProcessor(_mock_tokenizer())
+
+        self.assertIsInstance(processor.image_processor, MolmoPointImageProcessor)
+
+    def test_processor_uses_image_processor_for_images(self):
+        from mlx_vlm.models.molmo_point.processing_molmo_point import (
+            IMAGE_PROMPT,
+            MolmoPointProcessor,
+        )
+
+        class DummyImageProcessor:
+            def preprocess(self, images):
+                return {
+                    "pixel_values": np.zeros((1, 729, 588), dtype=np.float32),
+                    "image_token_pooling": np.zeros((1, 729), dtype=np.int64),
+                    "image_grids": np.array([[1, 1, 1, 1]], dtype=np.int64),
+                    "image_num_crops": np.array([1], dtype=np.int64),
+                }
+
+        processor = MolmoPointProcessor(
+            _mock_tokenizer(bos_token_id=1, eos_token_id=2),
+            image_processor=DummyImageProcessor(),
+        )
+        result = processor(text=IMAGE_PROMPT, images=_make_image())
+
+        self.assertIn("pixel_values", result)
+        self.assertIn("image_token_pooling", result)
+        self.assertIn("image_grids", result)
+        self.assertIn("image_num_crops", result)
+
+
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
 

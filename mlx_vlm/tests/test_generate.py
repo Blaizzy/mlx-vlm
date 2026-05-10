@@ -503,6 +503,34 @@ class TestBatchGenerator:
         assert stats.prompt_tps == 200.0  # 100 / 0.5
         assert stats.prompt_tokens == 100
 
+    def test_next_reports_prompt_progress_for_completed_prefill(
+        self, mock_model, mock_processor, monkeypatch
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            prefill_batch_size=1,
+            completion_batch_size=1,
+            prefill_step_size=None,
+        )
+        prompt = [1, 2, 3]
+        inputs_embeds = mx.random.normal((1, len(prompt), 8))
+        uids = gen.insert(
+            [prompt],
+            prompt_kwargs=[{"inputs_embeds": inputs_embeds}],
+        )
+        ticks = iter([10.0, 10.2])
+        monkeypatch.setattr(generate_module.time, "perf_counter", lambda: next(ticks))
+
+        prompt_responses, generation_responses = gen.next()
+
+        assert generation_responses == []
+        assert len(prompt_responses) == 1
+        assert prompt_responses[0].uid == uids[0]
+        assert prompt_responses[0].prompt_tokens == len(prompt)
+        assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
+        assert prompt_responses[0].prompt_time == pytest.approx(0.2)
+
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
