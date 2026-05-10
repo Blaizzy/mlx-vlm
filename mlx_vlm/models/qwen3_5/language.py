@@ -762,6 +762,9 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
@@ -853,15 +856,39 @@ class LanguageModel(nn.Module):
             hidden_sink=hidden_sink,
             gdn_sink=gdn_sink,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+        if return_hidden:
+            if hidden_sink is None:
+                hidden_sink = []
+            hidden_sink.append(out)
+
+        if skip_logits:
+            logits = None
+        elif self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
         else:
-            out = self.lm_head(out)
+            logits = self.lm_head(out)
         return LanguageModelOutput(
-            logits=out,
+            logits=logits,
             hidden_states=hidden_sink,
             gdn_states=gdn_sink,
+            shared_kv_states={} if return_shared_kv else None,
         )
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
 
     @property
     def layers(self):

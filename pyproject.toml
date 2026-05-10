@@ -35,6 +35,7 @@ Issues = "https://github.com/Blaizzy/mlx-vlm/issues"
 "mlx_vlm.convert" = "mlx_vlm.convert:main"
 "mlx_vlm.generate" = "mlx_vlm.generate:main"
 "mlx_vlm.server" = "mlx_vlm.server:main"
+"mlx_vlm.split_qwen3_5_mtp" = "mlx_vlm.speculative.drafters.qwen3_5_mtp.split:main"
 
 [tool.setuptools.packages.find]
 include = ["mlx_vlm*"]

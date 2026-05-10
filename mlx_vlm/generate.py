@@ -522,6 +522,7 @@ class _MTPVerifyResult:
     hidden: mx.array
     shared_kv_states: dict
     target_tokens: Optional[mx.array] = None
+    gdn_states: Optional[list] = None
 
 
 def _mtp_shared_kv_from_prompt_cache(
@@ -558,6 +559,31 @@ def _mtp_verify_without_logits(
     verify_input: mx.array,
     prompt_cache: List[Any],
 ) -> Optional[_MTPVerifyResult]:
+    verify_hidden = getattr(lm, "speculative_verify_hidden", None)
+    if callable(verify_hidden):
+        result = verify_hidden(verify_input, prompt_cache)
+        if isinstance(result, tuple):
+            if len(result) == 3:
+                hidden, shared_kv_states, gdn_states = result
+            elif len(result) == 2:
+                hidden, shared_kv_states = result
+                gdn_states = None
+            else:
+                raise ValueError(
+                    "speculative_verify_hidden() must return "
+                    "(hidden, shared_kv_states) or "
+                    "(hidden, shared_kv_states, gdn_states)."
+                )
+        else:
+            hidden = result
+            shared_kv_states = {}
+            gdn_states = None
+        return _MTPVerifyResult(
+            hidden=hidden,
+            shared_kv_states=shared_kv_states or {},
+            gdn_states=gdn_states,
+        )
+
     layers = getattr(getattr(lm, "model", None), "layers", [])
     if len(prompt_cache) == len(layers):
         hidden = lm.model(
@@ -604,6 +630,7 @@ def _mtp_verify_target(
         hidden=verify_out.hidden_states[-1],
         shared_kv_states=verify_out.shared_kv_states,
         target_tokens=sampler(verify_out.logits),
+        gdn_states=verify_out.gdn_states,
     )
 
 
@@ -821,6 +848,7 @@ def _mtp_rounds(
     hidden: mx.array,
     shared_kv_states: dict,
     *,
+    prompt_tokens: Optional[mx.array] = None,
     first_bonus: int,
     max_tokens: int,
     sampler: Callable[[mx.array], mx.array],
@@ -860,11 +888,22 @@ def _mtp_rounds(
     # on the first round picks position 0, which is BOS — they get away with
     # it because subsequent rounds slice into the per-call verify hidden, but
     # the round-1 acceptance is wasted. We don't replicate that quirk.)
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        prefill_draft(
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
+        )
+
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
     hidden = _mtp_draft_hidden(lm, hidden)
 
-    kv_offset = int(prompt_cache[0].offset)
+    kv_offset = _mtp_cache_offset_max(prompt_cache)
     draft_model.set_shared_kv(
         shared_kv_states,
         kv_offset,
@@ -921,18 +960,32 @@ def _mtp_rounds(
             if emitted >= max_tokens:
                 return
 
+        accept_verified = getattr(draft_model, "accept_verified_tokens", None)
+        if callable(accept_verified):
+            accept_verified(
+                verify.hidden,
+                draft_tokens,
+                accepted,
+                new_tokens,
+                sampler,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling),
+            )
+
         # Hidden for next round: pick the slot of the newly accepted bonus.
         hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify.gdn_states, accepted, bs
+                )
 
         next_shared_kv = _slice_shared_kv_after_reject(
             verify.shared_kv_states, bs - (accepted + 1)
         )
-        kv_offset = int(prompt_cache[0].offset)
+        kv_offset = _mtp_cache_offset_max(prompt_cache)
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset,
@@ -950,6 +1003,33 @@ def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
         if left_padding is not None:
             return left_padding
     return None
+
+
+def _mtp_cache_offset(prompt_cache: List[Any]) -> Any:
+    for cache_entry in prompt_cache:
+        offset = getattr(cache_entry, "offset", None)
+        if offset is not None:
+            return offset
+    for cache_entry in prompt_cache:
+        idx = getattr(cache_entry, "_idx", None)
+        if idx is not None:
+            return idx
+    return 0
+
+
+def _mtp_cache_offset_max(prompt_cache: List[Any]) -> int:
+    offset = _mtp_cache_offset(prompt_cache)
+    return int(offset.max().item()) if isinstance(offset, mx.array) else int(offset)
+
+
+def _mtp_cache_positions(
+    prompt_cache: List[Any], batch_size: int
+) -> Tuple[int, List[int]]:
+    offset = _mtp_cache_offset(prompt_cache)
+    if isinstance(offset, mx.array):
+        return int(offset.max().item()), [int(x) for x in offset.tolist()]
+    max_offset = int(offset)
+    return max_offset, [max_offset] * batch_size
 
 
 def _mtp_draft_position(kv_valid_len: Any) -> Any:
@@ -1010,7 +1090,10 @@ def _mtp_draft_block_active(
         raise RuntimeError("MTP drafter missing shared K/V before rowwise draft.")
 
     rowwise_tokens = []
+    draft_round = getattr(draft_model, "_draft_round", None)
     for row_idx, (bonus_token, position) in enumerate(zip(bonus_tokens, positions)):
+        if draft_round is not None:
+            draft_model._draft_round = draft_round
         per_row_shared_kv = {
             layer_type: (keys[row_idx : row_idx + 1], values[row_idx : row_idx + 1])
             for layer_type, (keys, values) in shared_kv.items()
@@ -1034,6 +1117,8 @@ def _mtp_draft_block_active(
             )
         )
 
+    if draft_round is not None:
+        draft_model._draft_round = draft_round + 1
     draft_model.set_shared_kv(
         shared_kv,
         kv_offset=max(positions_list),
@@ -1094,13 +1179,7 @@ def _mtp_rounds_batch(
     # Per-row state. ``positions`` stores each row's valid target-KV length.
     # All rows start at ``L_prefill`` and advance by ``accepted_i + 1`` per
     # round.
-    offset0 = prompt_cache[0].offset
-    if isinstance(offset0, mx.array):
-        L_prefill = int(offset0.max().item())
-        positions = [int(x) for x in offset0.tolist()]
-    else:
-        L_prefill = int(offset0)
-        positions = [L_prefill] * B
+    L_prefill, positions = _mtp_cache_positions(prompt_cache, B)
     draft_model.set_shared_kv(
         shared_kv_states,
         kv_offset=L_prefill,
@@ -1227,7 +1306,9 @@ def _mtp_rounds_batch(
         # per-row tail-zero on rows that accepted less).
         if max_a < bs - 1:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
+                lm.rollback_speculative_cache(
+                    prompt_cache, verify.gdn_states, accepted_arr, bs
+                )
 
         # Slice + tail-zero ``verify.shared_kv_states`` to match the
         # post-rollback target cache. ``set_shared_kv()`` will normalize the
@@ -1289,10 +1370,7 @@ def _mtp_rounds_batch(
 
         # Re-bind drafter with new shared_kv and per-row positions.
         positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
-        offset0 = prompt_cache[0].offset
-        new_kv_offset = (
-            int(offset0.max().item()) if isinstance(offset0, mx.array) else int(offset0)
-        )
+        new_kv_offset = _mtp_cache_offset_max(prompt_cache)
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset=new_kv_offset,
@@ -1808,6 +1886,7 @@ def generate_step(
                     prompt_cache,
                     hidden,
                     shared_kv_states,
+                    prompt_tokens=input_ids,
                     first_bonus=y.item(),
                     max_tokens=max_tokens,
                     sampler=sampler,

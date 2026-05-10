@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
@@ -36,6 +37,11 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     normalize_batched_shared_kv_states,
 )
 from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import (
+    ModelConfig as Qwen3_5MTPConfig,
+)
+from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
+from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -507,7 +513,9 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
     class FakeDraftModel:
         def __init__(self):
             self._shared_kv = None
+            self._draft_round = 4
             self.calls = []
+            self.rounds = []
 
         def set_shared_kv(
             self,
@@ -532,6 +540,8 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
         ):
             batch_size = hidden.shape[0]
             del cache, sampler
+            self.rounds.append(self._draft_round)
+            self._draft_round += 1
             base = int(
                 next(iter(self._shared_kv.values()))[0][0, 0, 0, 0].item()
             )
@@ -560,6 +570,8 @@ def test_mtp_draft_block_active_uses_per_row_shared_kv_for_mixed_positions():
     )
 
     assert drafted.tolist() == [[13], [27]]
+    assert draft_model.rounds == [4, 4]
+    assert draft_model._draft_round == 5
     assert next(iter(draft_model._shared_kv.values()))[0].shape[0] == 2
     assert draft_model.calls[0] == (11, 10, 11)
     assert draft_model.calls[1] == (12, 11, 12)
@@ -654,6 +666,12 @@ def test_kind_none_autodetects_mtp_for_gemma4_assistant(tmp_path):
     assert resolve_drafter_kind(path) == "mtp"
 
 
+def test_kind_none_autodetects_mtp_for_qwen3_5_mtp(tmp_path):
+    path = _make_drafter_dir(tmp_path, "qwen3_5_mtp")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
 def test_kind_none_falls_back_to_default_for_unknown_model_type(tmp_path):
     path = _make_drafter_dir(tmp_path, "qwen3_dflash")
     assert resolve_drafter_kind(path, None) == DEFAULT_DRAFTER_KIND
@@ -663,3 +681,113 @@ def test_kind_none_falls_back_to_default_for_missing_config(tmp_path):
     d = tmp_path / "drafter"
     d.mkdir()
     assert resolve_drafter_kind(d, None) == DEFAULT_DRAFTER_KIND
+
+
+def _tiny_qwen3_5_text_config():
+    return qwen_language.TextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=16,
+        intermediate_size=32,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=1,
+        max_position_embeddings=128,
+        tie_word_embeddings=True,
+        head_dim=8,
+        full_attention_interval=1,
+        rope_parameters={
+            "type": "default",
+            "mrope_section": [1, 0, 0],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+    )
+
+
+def test_qwen3_5_mtp_draft_block_smoke():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
+    hidden = mx.zeros((1, 1, 16), dtype=mx.float32)
+    tokens = drafter.draft_block(
+        7,
+        hidden,
+        None,
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+    )
+    mx.eval(tokens)
+    assert tokens.shape == (1, 2)
+
+
+def test_qwen3_5_mtp_advances_draft_cache_positions():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
+    )
+    drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
+
+    assert drafter._position_ids(0).tolist() == [[4]]
+    assert drafter._position_ids(1).tolist() == [[5]]
+
+
+def test_qwen3_5_mtp_sanitize_strips_prefix_and_offsets_norms():
+    weights = {
+        "mtp.fc.weight": mx.ones((2, 4)),
+        "mtp.pre_fc_norm_hidden.weight": mx.zeros((2,)),
+        "mtp.layers.0.self_attn.q_norm.weight": mx.zeros((2,)),
+    }
+    out = Qwen3_5MTPDraftModel.sanitize(None, weights)
+    assert "fc.weight" in out
+    assert out["pre_fc_norm_hidden.weight"].tolist() == [1.0, 1.0]
+    assert out["layers.0.self_attn.q_norm.weight"].tolist() == [1.0, 1.0]
+
+
+def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5", "text_config": text_config.to_dict()})
+    )
+    mx.save_safetensors(
+        str(source / "mtp.safetensors"),
+        {
+            "mtp.fc.weight": mx.ones((16, 32)),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
+        },
+        metadata={},
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    assert cfg["model_type"] == "qwen3_5_mtp"
+    assert cfg["block_size"] == 3
+    assert "fc.weight" in weights
+    assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
