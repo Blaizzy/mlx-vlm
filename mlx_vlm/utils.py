@@ -346,6 +346,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         mx.eval(model.parameters())
 
     model.eval()
+
+    post_load = getattr(model, "post_load", None)
+    if not lazy and callable(post_load):
+        post_load()
+
     return model
 
 
