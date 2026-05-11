@@ -73,6 +73,27 @@ def _speculative_walk_batch(
     return accepted_list, new_tokens_list
 
 
+def _speculative_walk_batch_uniform_acceptance(
+    draft_tokens: mx.array,
+    target_tokens: mx.array,
+    accepted_list: List[int],
+    budgets: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    """Clamp a batch to the earliest rejection with verifier-token fallback."""
+    accepted = min(accepted_list)
+    new_tokens_list: List[List[int]] = []
+    for i, budget in enumerate(budgets):
+        accepted_prefix = draft_tokens[i : i + 1, :accepted]
+        bonus = target_tokens[i : i + 1, accepted : accepted + 1]
+        new = (
+            mx.concatenate([accepted_prefix, bonus], axis=1)[:, :budget]
+            .reshape(-1)
+            .tolist()
+        )
+        new_tokens_list.append(new)
+    return [accepted] * len(accepted_list), new_tokens_list
+
+
 @dataclass
 class _MTPVerifyResult:
     hidden: mx.array
@@ -842,6 +863,19 @@ def _mtp_rounds_batch(
             accepted_list, new_tokens_list = _speculative_walk_batch(
                 draft_tokens, verify.target_tokens, budgets
             )
+            if (
+                n_active > 1
+                and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+                and len(set(accepted_list)) > 1
+            ):
+                accepted_list, new_tokens_list = (
+                    _speculative_walk_batch_uniform_acceptance(
+                        draft_tokens,
+                        verify.target_tokens,
+                        accepted_list,
+                        budgets,
+                    )
+                )
         else:
             mx.async_eval(hidden_full)
             accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
@@ -862,6 +896,18 @@ def _mtp_rounds_batch(
 
         max_a = max(accepted_list)
         accepted_arr = mx.array(accepted_list)
+
+        accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
+        if callable(accept_verified):
+            accept_verified(
+                hidden_full,
+                draft_tokens,
+                accepted_list,
+                new_tokens_list,
+                sampler,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling),
+            )
 
         # Per-row hidden: each row picks its own accepted slot from
         # hidden_full. Build [B_active, 1, H] with row-i's hidden at
@@ -960,6 +1006,9 @@ def _mtp_rounds_batch(
                 keep_mx = mx.array(keep_slots, dtype=mx.int32)
                 for c in prompt_cache:
                     c.filter(keep_mx)
+                filter_drafter = getattr(draft_model, "filter_batch", None)
+                if callable(filter_drafter):
+                    filter_drafter(keep_mx)
                 hidden = hidden[keep_mx]
                 for k in next_shared_kv:
                     K_next, V_next = next_shared_kv[k]

@@ -13,6 +13,7 @@ from .config import Qwen3_5MTPConfig
 class Qwen3_5MTPDraftModel(nn.Module):
     supports_greedy_draft_argmax = True
     prefer_requested_block_size = True
+    requires_uniform_batch_acceptance = True
 
     def __init__(self, config: Qwen3_5MTPConfig):
         super().__init__()
@@ -249,6 +250,93 @@ class Qwen3_5MTPDraftModel(nn.Module):
             h = self._forward_tokens(tokens, hiddens, token_dtype)
             self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
         self._round_appended = 0
+
+    def accept_verified_tokens_batch(
+        self,
+        verify_hidden: mx.array,
+        draft_tokens: mx.array,
+        accepted: List[int],
+        new_tokens: List[List[int]],
+        sampler,
+        token_dtype: mx.Dtype = mx.int32,
+        greedy: bool = False,
+    ) -> None:
+        """Extend the Qwen MTP drafter cache after a batched verify step.
+
+        Qwen's native MTP drafter uses its own recurrent cache. For now the
+        batched path is restricted to lockstep acceptance so this cache keeps a
+        single scalar offset, matching normal decode's aligned batch invariant.
+        """
+        if len(accepted) <= 1:
+            self.accept_verified_tokens(
+                verify_hidden,
+                draft_tokens,
+                int(accepted[0]),
+                new_tokens[0],
+                sampler,
+                token_dtype,
+                greedy,
+            )
+            return
+
+        accepted_set = {int(a) for a in accepted}
+        if len(accepted_set) != 1:
+            raise ValueError(
+                "Qwen MTP batched cache update requires uniform acceptance."
+            )
+        accepted_i = accepted_set.pop()
+
+        keep_appended = min(accepted_i, self._round_appended)
+        trim = self._round_appended - keep_appended
+        if trim > 0:
+            for cache in self._cache:
+                cache.trim(trim)
+            self._next_position = (
+                self._next_position - trim
+                if isinstance(self._next_position, int)
+                else self._next_position - trim
+            )
+
+        token_chunks = []
+        hidden_chunks = []
+        for draft_idx in range(keep_appended, accepted_i):
+            token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
+            hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
+
+        if all(new_tokens):
+            bonus = mx.array(
+                [[int(row_tokens[-1])] for row_tokens in new_tokens],
+                dtype=token_dtype,
+            )
+            token_chunks.append(bonus)
+            hidden_chunks.append(verify_hidden[:, accepted_i : accepted_i + 1, :])
+
+        if token_chunks:
+            tokens = mx.concatenate(token_chunks, axis=1).astype(token_dtype)
+            hiddens = mx.concatenate(hidden_chunks, axis=1)
+            h = self._forward_tokens(tokens, hiddens, token_dtype)
+            self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
+        self._round_appended = 0
+
+    def filter_batch(self, keep) -> None:
+        """Keep only active rows in Qwen MTP's internal drafter state."""
+        if not isinstance(keep, mx.array):
+            keep = mx.array(keep, dtype=mx.int32)
+
+        for cache in self._cache:
+            if cache.keys is not None:
+                cache.keys = cache.keys[keep]
+                cache.values = cache.values[keep]
+
+        if self._seed_token is not None:
+            self._seed_token = self._seed_token[keep]
+        if self._seed_hidden is not None:
+            self._seed_hidden = self._seed_hidden[keep]
+
+        for attr in ("_next_position", "_kv_valid_len", "_position"):
+            value = getattr(self, attr)
+            if isinstance(value, mx.array) and value.ndim > 0 and value.size > 1:
+                setattr(self, attr, value[keep])
 
     def draft_block(
         self,

@@ -322,7 +322,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         initial_state = state
         intermediate_states = None
-        if gdn_sink is not None:
+        capture_intermediate_states = gdn_sink is not None and B == 1
+        if capture_intermediate_states:
             out, state, intermediate_states = gated_delta_update_with_states(
                 q,
                 k,
@@ -335,7 +336,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mask,
                 use_kernel=not self.training,
             )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+
+        if gdn_sink is not None:
             # Tuple layout consumed by ``rollback_speculative_cache`` below.
+            # Batched MTP uses the replay rollback path because materializing
+            # per-token intermediate GDN states is both expensive and has
+            # different batch semantics from the normal decode path.
             gdn_sink.append(
                 (
                     q,
@@ -351,19 +370,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     self.conv_kernel_size,
                     intermediate_states,
                 )
-            )
-        else:
-            out, state = gated_delta_update(
-                q,
-                k,
-                v,
-                a,
-                b,
-                self.A_log,
-                self.dt_bias,
-                state,
-                mask,
-                use_kernel=not self.training,
             )
 
         if cache is not None:
