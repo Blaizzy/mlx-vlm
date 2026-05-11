@@ -94,12 +94,12 @@ class VitMerger(nn.Module):
         vision_hidden_size: int,
         merged_hidden_size: int = 17216,
         num_heads: int = 16,
-        merge_group_size: int = 2,
+        merge_group_size: tuple[int, int] = (2, 2),
     ):
         super().__init__()
         self.vision_hidden_size = vision_hidden_size
-        self.merge_group_size = merge_group_size
-        self.group_tokens = merge_group_size * merge_group_size
+        self.merge_group_size = tuple(merge_group_size)
+        self.group_tokens = self.merge_group_size[0] * self.merge_group_size[1]
         self.group_hidden_size = vision_hidden_size * self.group_tokens
 
         self.pre_norm = nn.LayerNorm(self.group_hidden_size, eps=1e-6)
@@ -112,20 +112,20 @@ class VitMerger(nn.Module):
     def __call__(
         self, x: mx.array, grid_h: int, grid_w: int
     ) -> tuple[mx.array, int, int]:
-        group = self.merge_group_size
-        if grid_h % group != 0 or grid_w % group != 0:
+        group_h, group_w = self.merge_group_size
+        if grid_h % group_h != 0 or grid_w % group_w != 0:
             raise ValueError(
-                "MiniCPM-V vit_merger requires target grid divisible by 2, "
-                f"got {(grid_h, grid_w)}."
+                "MiniCPM-V vit_merger requires target grid divisible by "
+                f"{self.merge_group_size}, got {(grid_h, grid_w)}."
             )
 
         hidden_dim = int(x.shape[-1])
-        merged_h = grid_h // group
-        merged_w = grid_w // group
+        merged_h = grid_h // group_h
+        merged_w = grid_w // group_w
 
         windows = x.reshape(grid_h, grid_w, hidden_dim)
         windows = windows.reshape(
-            merged_h, group, merged_w, group, hidden_dim
+            merged_h, group_h, merged_w, group_w, hidden_dim
         ).transpose(0, 2, 1, 3, 4)
         windows = windows.reshape(merged_h * merged_w, self.group_tokens, hidden_dim)
 
@@ -146,29 +146,31 @@ class MergerBlock(nn.Module):
     def __init__(self, hidden_size: int, out_size: int):
         super().__init__()
         self.pre_norm = nn.LayerNorm(hidden_size, eps=1e-6)
-        self.mlp = [
-            nn.Linear(hidden_size, hidden_size, bias=True),
-            nn.GELU(approx="precise"),
-            nn.Linear(hidden_size, out_size, bias=True),
-        ]
+        self.linear_1 = nn.Linear(hidden_size, hidden_size, bias=True)
+        self.act = nn.GELU(approx="precise")
+        self.linear_2 = nn.Linear(hidden_size, out_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.pre_norm(x)
-        for layer in self.mlp:
-            x = layer(x)
-        return x
+        x = self.linear_1(x)
+        x = self.act(x)
+        return self.linear_2(x)
 
 
 class Merger(nn.Module):
-    def __init__(self, hidden_size: int, out_size: int, merger_times: int = 1):
+    def __init__(
+        self,
+        hidden_size: int,
+        out_size: int,
+        merger_times: int = 1,
+        merge_kernel_size: tuple[int, int] = (2, 2),
+    ):
         super().__init__()
+        self.merge_kernel_size = tuple(merge_kernel_size)
+        merge_tokens = self.merge_kernel_size[0] * self.merge_kernel_size[1]
         self.mlp = [
             MergerBlock(
-                (
-                    hidden_size * 4
-                    if i == 0
-                    else (hidden_size if i < merger_times else out_size) * 4
-                ),
+                hidden_size * merge_tokens,
                 out_size if i == merger_times - 1 else hidden_size,
             )
             for i in range(merger_times)
@@ -182,19 +184,23 @@ class Merger(nn.Module):
         hidden = x
 
         for layer_idx, layer in enumerate(self.mlp):
-            if cur_h % 2 != 0 or cur_w % 2 != 0:
+            merge_h, merge_w = self.merge_kernel_size
+            if cur_h % merge_h != 0 or cur_w % merge_w != 0:
                 raise ValueError(
-                    "MiniCPM-V merger requires target grid divisible by 2, "
+                    "MiniCPM-V merger requires target grid divisible by "
+                    f"{self.merge_kernel_size}, "
                     f"got {(cur_h, cur_w)} at merge round {layer_idx}."
                 )
 
             inner_dim = int(hidden.shape[-1])
-            merged_h = cur_h // 2
-            merged_w = cur_w // 2
+            merged_h = cur_h // merge_h
+            merged_w = cur_w // merge_w
             hidden = hidden.reshape(cur_h, cur_w, inner_dim)
-            hidden = hidden.reshape(merged_h, 2, merged_w, 2, inner_dim)
+            hidden = hidden.reshape(merged_h, merge_h, merged_w, merge_w, inner_dim)
             hidden = hidden.transpose(0, 2, 1, 3, 4)
-            hidden = hidden.reshape(merged_h * merged_w, inner_dim * 4)
+            hidden = hidden.reshape(
+                merged_h * merged_w, inner_dim * merge_h * merge_w
+            )
             hidden = layer(hidden)
             cur_h, cur_w = merged_h, merged_w
 
@@ -214,14 +220,15 @@ class Model(nn.Module):
         self.vision_tower = VisionModel(config.vision_config)
         self.vit_merger = VitMerger(
             vision_hidden_size=config.vision_config.hidden_size,
-            merged_hidden_size=17216,
+            merged_hidden_size=config.vision_config.window_intermediate_size,
             num_heads=config.vision_config.num_attention_heads,
-            merge_group_size=2,
+            merge_group_size=config.vision_config.window_kernel_size,
         )
         self.merger = Merger(
             hidden_size=config.vision_config.hidden_size,
             out_size=config.text_config.hidden_size,
             merger_times=int(getattr(config, "merger_times", 1) or 1),
+            merge_kernel_size=config.merge_kernel_size,
         )
 
     @property
@@ -416,7 +423,7 @@ class Model(nn.Module):
 
         for key, value in weights.items():
             # MiniCPM-V 4.6 checkpoint namespaces are prefixed with `model.`
-            # and split across language_model / vpm / vit_merger / merger.
+            # and split across language_model / vision_tower / merger.
             if key.startswith("model."):
                 key = key.replace("model.", "", 1)
 
@@ -425,6 +432,10 @@ class Model(nn.Module):
                 mapped_key = key.replace("language_model.", "language_model.model.", 1)
             elif key.startswith("lm_head."):
                 mapped_key = key.replace("lm_head.", "language_model.lm_head.", 1)
+            elif key.startswith("vision_tower.vit_merger."):
+                mapped_key = key.replace("vision_tower.vit_merger.", "vit_merger.", 1)
+            elif key.startswith("vision_tower."):
+                mapped_key = key
             elif key.startswith("vpm."):
                 mapped_key = key.replace("vpm.", "vision_tower.", 1)
             elif key.startswith("vit_merger.") or key.startswith("merger."):

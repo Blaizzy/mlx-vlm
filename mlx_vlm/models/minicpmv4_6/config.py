@@ -27,7 +27,7 @@ class SliceConfig(BaseModelConfig):
 
 @dataclass
 class VisionConfig(BaseModelConfig):
-    model_type: str = "siglip_vision_model"
+    model_type: str = "minicpmv4_6_vision"
     hidden_size: int = 1152
     intermediate_size: int = 4304
     num_hidden_layers: int = 27
@@ -38,6 +38,19 @@ class VisionConfig(BaseModelConfig):
     hidden_act: str = "gelu_pytorch_tanh"
     layer_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
+    window_kernel_size: tuple[int, int] = (2, 2)
+
+    @property
+    def window_hidden_size(self) -> int:
+        return self.hidden_size * self.window_kernel_size[0] * self.window_kernel_size[1]
+
+    @property
+    def window_intermediate_size(self) -> int:
+        return (
+            self.intermediate_size
+            * self.window_kernel_size[0]
+            * self.window_kernel_size[1]
+        )
 
     def __post_init__(self):
         if self.model_type == "siglip":
