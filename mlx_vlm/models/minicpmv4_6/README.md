@@ -1,130 +1,69 @@
 # MiniCPM-V 4.6
 
-`mlx_vlm.models.minicpmv4_6` provides an MLX backend adaptation for **MiniCPM-V 4.6**.
-The language backbone reuses `Qwen3.5`, while the vision stack uses
-`SigLIP2 + MiniCPM NaViT-style bucket positional embeddings`.
+MiniCPM-V 4.6 is an edge-oriented vision-language model for efficient image,
+multi-image, and video understanding. It combines a SigLIP2-400M vision encoder
+with a Qwen3.5-0.8B language model and supports mixed `4x`/`16x` visual token
+compression so applications can trade finer detail for faster inference.
 
-The MiniCPM-V 4.6 vision path implemented here includes the two-stage visual
-compression used by the original model:
+## Model
 
-- `vit_merger`: inserted after ViT layer `6`, reducing the token count by `4x`
-- `merger`: applied after the full ViT output, reducing the token count by another `4x`
-- with the default `downsample_mode="16x"`, a single `448x448` image produces `64` visual tokens
+| Model | Repository |
+|---|---|
+| bf16 | `mlx-community/MiniCPM-V-4.6-bf16` |
+| 4-bit | `mlx-community/MiniCPM-V-4.6-4bit` |
+| 5-bit | `mlx-community/MiniCPM-V-4.6-5bit` |
+| 8-bit | `mlx-community/MiniCPM-V-4.6-8bit` |
+| NVFP4 | `mlx-community/MiniCPM-V-4.6-nvfp4` |
+| MXFP4 | `mlx-community/MiniCPM-V-4.6-mxfp4` |
+| MXFP8 | `mlx-community/MiniCPM-V-4.6-mxfp8` |
 
-## Status
+## Details
 
-The current adaptation covers:
+| | |
+|---|---|
+| **Architecture** | SigLIP2-400M vision encoder + Qwen3.5-0.8B LLM |
+| **Visual Compression** | Mixed `4x`/`16x` downsampling, with `16x` as the default efficient mode |
+| **Modalities** | Text, image, multi-image, video |
+| **Tasks** | Image description, visual question answering, OCR, document understanding, visual reasoning, video understanding |
+| **License** | Apache-2.0 |
+| **Official Card** | [openbmb/MiniCPM-V-4.6](https://huggingface.co/openbmb/MiniCPM-V-4.6) |
 
-- conversion from a local Hugging Face checkpoint into MLX format
-- image inference through the `mlx-vlm` CLI
-- the `slice_mode=false` single-image path
-- the default `slice_mode=true` slicing path
-- video inference through sampled frame processing
-- alignment between `<image_id>...</image_id>`, `<slice>...</slice>`, and `image_bound`
+## CLI Usage
 
-The implementation has been sanity-checked locally on:
-
-- single-image OCR prompts
-- dense infographic-style images
-- multi-panel poster or advertisement layouts
-- short sampled video clips
-
-## Model Checkpoints
-
-The currently validated checkpoints are:
-
-- original Hugging Face checkpoint: `openbmb/MiniCPM-V-4.6`
-- canonical MLX checkpoint: `mlx-community/MiniCPM-V-4.6-bf16`
-- quantized MLX checkpoints:
-  - `mlx-community/MiniCPM-V-4.6-4bit`
-  - `mlx-community/MiniCPM-V-4.6-5bit`
-  - `mlx-community/MiniCPM-V-4.6-8bit`
-  - `mlx-community/MiniCPM-V-4.6-nvfp4`
-  - `mlx-community/MiniCPM-V-4.6-mxfp4`
-  - `mlx-community/MiniCPM-V-4.6-mxfp8`
-
-For ongoing development, it is recommended to keep using
-`mlx-community/MiniCPM-V-4.6-bf16` as the canonical validated MLX checkpoint.
-
-If you prefer a different output directory, simply replace the `--model`
-or `--mlx-path` argument in the commands below.
-
-## Conversion
-
-Use the current CLI entrypoint form to avoid the deprecated
-`python -m mlx_vlm.convert ...` invocation.
-
-If your environment is already activated:
+Image inference:
 
 ```bash
-python -m mlx_vlm convert \
-  --hf-path openbmb/MiniCPM-V-4.6 \
-  --mlx-path MiniCPM-V-4.6-bf16 \
-  --dtype bfloat16
+python -m mlx_vlm.generate \
+    --model mlx-community/MiniCPM-V-4.6-bf16 \
+    --image path/to/image.jpg \
+    --prompt "Describe this image" \
+    --max-tokens 200 \
+    --temperature 0.0
 ```
 
-If you prefer to run without activating the environment first:
+Video inference:
 
 ```bash
-conda run -n mlx-vlm python -m mlx_vlm convert \
-  --hf-path openbmb/MiniCPM-V-4.6 \
-  --mlx-path MiniCPM-V-4.6-bf16 \
-  --dtype bfloat16
+python -m mlx_vlm.generate \
+    --model mlx-community/MiniCPM-V-4.6-bf16 \
+    --video path/to/video.mp4 \
+    --fps 1 \
+    --prompt "Describe what happens in this video." \
+    --max-tokens 300 \
+    --temperature 0.0 \
+    --processor-kwargs '{"max_num_frames": 32, "stack_frames": 1, "max_slice_nums": 1, "use_image_id": false}'
 ```
 
-After conversion, the output directory should contain at least:
-
-- `config.json`
-- `model.safetensors`
-- `tokenizer.json`
-- `tokenizer_config.json`
-- `preprocessor_config.json`
-
-## CLI Inference
-
-### Video Sanity Check
-
-For video inputs, keep the first validation pass small by sampling a few frames
-and disabling slicing:
+Use `downsample_mode="4x"` when a task needs finer visual detail:
 
 ```bash
-python -m mlx_vlm generate \
-  --model mlx-community/MiniCPM-V-4.6-bf16 \
-  --video your-video.mp4 \
-  --fps 0.25 \
-  --prompt "Describe this video briefly." \
-  --max-tokens 120 \
-  --temperature 0 \
-  --processor-kwargs '{"slice_mode": false, "max_num_frames": 4}'
-```
-
-### Quick OCR Sanity Check Without Slicing
-
-For logos, simple OCR tasks, or single-subject images, start with
-`slice_mode=false`:
-
-```bash
-python -m mlx_vlm generate \
-  --model mlx-community/MiniCPM-V-4.6-bf16 \
-  --image your-image.jpg \
-  --prompt "What text appears in this image?" \
-  --max-tokens 80 \
-  --temperature 0 \
-  --processor-kwargs '{"slice_mode": false}'
-```
-
-### Recommended Default for Dense Images
-
-For long images, infographics, collages, posters, and screenshots, the default
-slicing path usually performs better:
-
-```bash
-python -m mlx_vlm generate \
-  --model mlx-community/MiniCPM-V-4.6-bf16 \
-  --image your-dense-image.jpg \
-  --prompt "Describe this image in detail." \
-  --max-tokens 180 \
-  --temperature 0
+python -m mlx_vlm.generate \
+    --model mlx-community/MiniCPM-V-4.6-bf16 \
+    --image path/to/image.jpg \
+    --prompt "Read all visible text." \
+    --max-tokens 300 \
+    --temperature 0.0 \
+    --processor-kwargs '{"downsample_mode": "4x", "max_slice_nums": 36}'
 ```
 
 ## Python Usage
@@ -136,8 +75,8 @@ from mlx_vlm.prompt_utils import apply_chat_template
 model_path = "mlx-community/MiniCPM-V-4.6-bf16"
 model, processor = load(model_path)
 
-images = ["your-image.jpg"]
-prompt = "What text appears in this image?"
+images = ["path/to/image.jpg"]
+prompt = "Describe this image"
 
 formatted_prompt = apply_chat_template(
     processor,
@@ -147,68 +86,42 @@ formatted_prompt = apply_chat_template(
 )
 
 result = generate(
-    model=model,
-    processor=processor,
-    prompt=formatted_prompt,
+    model,
+    processor,
+    formatted_prompt,
     image=images,
-    max_tokens=80,
+    max_tokens=200,
     temperature=0.0,
-    processor_kwargs={"slice_mode": False},
 )
-
 print(result.text)
 ```
 
-## Usage Notes
+## Architecture
 
-### When to Use `slice_mode=false`
-
-This mode is a good fit for:
-
-- logos
-- single-subject product images
-- simple OCR checks
-- low-resolution images with straightforward layout
-
-It keeps prompts shorter, runs faster, and is useful for quick regression checks.
-
-### When to Use the Default Slicing Path
-
-The default slicing behavior is usually better for:
-
-- long images
-- information-dense infographics
-- collage-style advertisements
-- screenshots
-- posters and document understanding
+- **Vision**: SigLIP2-400M image encoder with MiniCPM-V patch packing and a
+  window-attention merger inserted in the vision stack.
+- **Language**: Qwen3.5-0.8B language model backbone for text generation and
+  multimodal reasoning.
+- **Compression**: The default `16x` visual downsampling path is optimized for
+  throughput and lower token cost. The `4x` mode keeps more visual tokens for
+  detail-heavy OCR, charts, documents, and small objects.
+- **Efficiency**: The official model card reports more than 50% lower visual
+  encoding FLOPs from the LLaVA-UHD v4 technique, plus roughly 1.5x token
+  throughput compared with Qwen3.5-0.8B.
+- **Deployment**: The upstream model is designed for broad edge deployment,
+  including iOS, Android, and HarmonyOS.
 
 ## Notes
 
-- This README only documents the supported production path and does not describe
-  temporary debugging switches used during development.
-- `batch_3d_resampler` is not used as an active inference path in this
-  MiniCPM-V 4.6 adaptation.
-- Video inputs are sampled into frame images and then passed through the same
-  MiniCPM-V visual placeholder alignment used by image inference.
-
-## Suggested Verification Commands
-
-After making changes, a minimal regression pass should include at least:
-
-```bash
-python -m mlx_vlm generate \
-  --model mlx-community/MiniCPM-V-4.6-bf16 \
-  --image your-image.jpg \
-  --prompt "What text appears in this image?" \
-  --max-tokens 80 \
-  --temperature 0 \
-  --processor-kwargs '{"slice_mode": false}'
-```
-
-```bash
-python -m py_compile \
-  mlx_vlm/models/minicpmv4_6/minicpmv4_6.py \
-  mlx_vlm/models/minicpmv4_6/processing_minicpmv4_6.py \
-  mlx_vlm/models/minicpmv4_6/vision.py \
-  mlx_vlm/models/minicpmv4_6/config.py
-```
+- The official card highlights strong single-image, multi-image, and video
+  understanding while keeping the model small enough for mobile-oriented use.
+- For evaluation-style prompts, keep thinking disabled when the chat template
+  exposes that option. The official Transformers examples use
+  `enable_thinking=False` for this mode.
+- `downsample_mode` controls placeholder counts during preprocessing and the
+  vision encoder path during generation. Keep it consistent across processing
+  and generation when using low-level APIs.
+- For video, the official card recommends `max_slice_nums=1` and
+  `use_image_id=False`; the MLX video path follows the same practical defaults
+  in the example above.
+- The model weights and upstream code are released under Apache-2.0 by OpenBMB.
