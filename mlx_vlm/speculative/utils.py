@@ -693,7 +693,8 @@ def _mtp_draft_block_active(
         )
 
     positions_list = [int(position) for position in positions]
-    if len(set(positions_list)) == 1:
+    shared_kv = getattr(draft_model, "_shared_kv", None)
+    if len(set(positions_list)) == 1 or shared_kv is None:
         return draft_model.draft_block(
             mx.array(bonus_tokens, dtype=token_dtype),
             hidden,
@@ -703,10 +704,6 @@ def _mtp_draft_block_active(
             token_dtype,
             **_mtp_draft_kwargs(draft_model, greedy_sampling),
         )
-
-    shared_kv = getattr(draft_model, "_shared_kv", None)
-    if shared_kv is None:
-        raise RuntimeError("MTP drafter missing shared K/V before rowwise draft.")
 
     rowwise_tokens = []
     draft_round = getattr(draft_model, "_draft_round", None)

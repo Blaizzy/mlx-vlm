@@ -954,6 +954,8 @@ class ResponseGenerator:
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
+            pending = []
+            rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
                 pending, should_stop = self._collect_pending_requests(
@@ -965,7 +967,6 @@ class ResponseGenerator:
 
                 if not pending:
                     continue
-
                 # --- Phase 2: prefill new batch ---
                 uids = []
                 rqueues = {}
@@ -1162,6 +1163,11 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
+                error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
+                error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
+                for rqueue in error_queues.values():
+                    rqueue.put(e)
+                    rqueue.put(None)
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""

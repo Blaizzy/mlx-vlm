@@ -844,6 +844,40 @@ def test_mtp_draft_block_active_uses_batched_path_for_aligned_positions():
     assert draft_model.calls == [((2,), (2, 1, 1))]
 
 
+def test_mtp_draft_block_active_uses_batched_path_for_mixed_positions_without_shared_kv():
+    class FakeDraftModel:
+        def __init__(self):
+            self.calls = []
+
+        def draft_block(
+            self,
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype,
+        ):
+            del cache, sampler
+            self.calls.append((last_bonus.shape, hidden.shape))
+            return last_bonus[:, None].astype(token_dtype) + mx.arange(block_size - 1)
+
+    draft_model = FakeDraftModel()
+
+    drafted = _mtp_draft_block_active(
+        draft_model,
+        bonus_tokens=[3, 7],
+        hidden=mx.zeros((2, 1, 1), dtype=mx.float32),
+        block_size=3,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+        positions=[11, 12],
+    )
+
+    assert drafted.tolist() == [[3, 4], [7, 8]]
+    assert draft_model.calls == [((2,), (2, 1, 1))]
+
+
 def test_speculative_walk_batch_uniform_acceptance_keeps_exact_tokens():
     draft_tokens = mx.array([[10, 11, 12], [20, 21, 22]], dtype=mx.int32)
     target_tokens = mx.array([[10, 99, 98, 97], [20, 21, 77, 76]], dtype=mx.int32)
