@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_map
 
 
@@ -2047,6 +2048,32 @@ class TestModels(unittest.TestCase):
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
         )
+
+    def test_molmo2_sanitizes_non_finite_image_features(self):
+        from mlx_vlm.models.molmo2.molmo2 import (
+            MAX_FLOAT16_IMAGE_FEATURE,
+            clip_image_features,
+        )
+
+        fp32_features = mx.array(
+            [float("nan"), float("inf"), float("-inf"), 70000.0, -70000.0, 42.0],
+            dtype=mx.float32,
+        )
+        fp16_features = mx.array([70000.0, -70000.0, 42.0], dtype=mx.float16)
+
+        fp32_clipped = np.array(clip_image_features(fp32_features))
+        fp16_clipped = np.array(clip_image_features(fp16_features))
+
+        self.assertTrue(np.isfinite(fp32_clipped).all())
+        self.assertEqual(fp32_clipped[0], 0.0)
+        self.assertEqual(fp32_clipped[3], 70000.0)
+        self.assertEqual(fp32_clipped[4], -70000.0)
+        self.assertEqual(fp32_clipped[5], 42.0)
+        self.assertLessEqual(fp16_clipped[0], MAX_FLOAT16_IMAGE_FEATURE)
+        self.assertGreaterEqual(fp16_clipped[0], MAX_FLOAT16_IMAGE_FEATURE - 16)
+        self.assertGreaterEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE)
+        self.assertLessEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE + 16)
+        self.assertEqual(fp16_clipped[2], 42.0)
 
     def test_florence2(self):
         from mlx_vlm.models import florence2
