@@ -27,6 +27,7 @@ class Qwen3_5RotaryEmbedding:
         inv_freq = 1.0 / (
             self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
         )
+        mx.eval(inv_freq)
         self.inv_freq = inv_freq
 
         self.mrope_section = mrope_section

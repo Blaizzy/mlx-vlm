@@ -3,7 +3,6 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .. import cache
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_vl import Model as Qwen3VLModel
 from ..qwen3_vl import processing_qwen3_vl  # noqa: F401
@@ -32,18 +31,6 @@ class Model(Qwen3VLModel):
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
-
-    def post_load(self):
-        """Materialize state needed by MLX thread-local streams."""
-        input_ids = mx.array([[0]], dtype=mx.int32)
-        embeddings = self.get_input_embeddings(input_ids, None).inputs_embeds
-        outputs = self.language_model(
-            input_ids,
-            inputs_embeds=embeddings,
-            cache=cache.make_prompt_cache(self.language_model),
-        )
-        mx.eval(outputs.logits)
-        mx.clear_cache()
 
     def get_input_embeddings(
         self,
