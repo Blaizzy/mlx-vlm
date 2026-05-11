@@ -368,6 +368,26 @@ def _record_speculative_round(
         draft_model.draft_lens.append(int(draft_count))
 
 
+def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int]) -> int:
+    if draft_block_size is not None:
+        return int(draft_block_size)
+
+    configured = int(draft_model.config.block_size)
+    runtime = getattr(draft_model.config, "runtime_block_size", None)
+    if runtime is None:
+        return configured
+    return min(configured, max(1, int(runtime)))
+
+
+def _dflash_committed_hidden_segments(
+    hidden_full: mx.array, new_tokens_list: List[List[int]]
+) -> List[mx.array]:
+    return [
+        hidden_full[i : i + 1, : len(new_tokens), :]
+        for i, new_tokens in enumerate(new_tokens_list)
+    ]
+
+
 def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
     accepted_lens = getattr(draft_model, "accept_lens", None) or []
     if not accepted_lens:
@@ -492,11 +512,7 @@ def _mtp_rounds(
             "MTP speculative decoding currently only supports gemma4."
         )
 
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
+    block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
 
@@ -777,11 +793,7 @@ def _mtp_rounds_batch(
         )
 
     B = first_bonus.shape[0]
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
+    block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
 
@@ -1054,11 +1066,7 @@ def _dflash_rounds(
         )
 
     target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
+    block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_cache = draft_model.reset(model)
 
     b = first_bonus
@@ -1092,7 +1100,7 @@ def _dflash_rounds(
         accepted, new_tokens = _speculative_walk(
             draft_tokens, target_tokens, max_tokens - emitted
         )
-        draft_model.accept_lens.append(accepted)
+        _record_speculative_round(draft_model, accepted, bs - 1)
 
         # Emit
         for tok in new_tokens:
@@ -1149,11 +1157,7 @@ def _dflash_rounds_batch(
 
     B = first_bonus.shape[0]
     target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
+    block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_model.reset(model)
     draft_caches = [draft_model.make_cache() for _ in range(B)]
 
@@ -1163,6 +1167,7 @@ def _dflash_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
+    hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
 
     total_emitted = sum(emitted)
 
@@ -1186,7 +1191,7 @@ def _dflash_rounds_batch(
             [
                 draft_model.draft_block(
                     int(b_active[j]),
-                    hidden[j : j + 1],
+                    hidden_by_orig[active_idx[j]],
                     draft_caches[active_idx[j]],
                     bs,
                     sampler,
@@ -1219,15 +1224,16 @@ def _dflash_rounds_batch(
         min_accepted = min(accepted_list)
         accepted_arr = mx.array(accepted_list)
 
-        if min_accepted < bs - 1:
-            max_a = int(accepted_arr.max().item())
-            hidden = hidden_full[:, : max_a + 1, :]
-        else:
-            max_a = bs - 1
-            hidden = hidden_full
+        hidden_segments = _dflash_committed_hidden_segments(
+            hidden_full, new_tokens_list
+        )
+        for j in range(n_active):
+            orig = active_idx[j]
+            if hidden_segments[j].shape[1] > 0:
+                hidden_by_orig[orig] = hidden_segments[j]
 
         for a in accepted_list:
-            draft_model.accept_lens.append(a)
+            _record_speculative_round(draft_model, a, bs - 1)
 
         # Emit (map active slots back to original indices)
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
@@ -1267,8 +1273,6 @@ def _dflash_rounds_batch(
             for c in prompt_cache:
                 if hasattr(c, "filter"):
                     c.filter(keep_mx)
-            # Filter hidden
-            hidden = hidden[keep_mx]
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
 

@@ -713,6 +713,36 @@ def test_format_speculative_stats_includes_variable_draft_rate():
     )
 
 
+def test_dflash_block_total_uses_runtime_default_but_honors_override():
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(block_size=16, runtime_block_size=14)
+    )
+
+    assert speculative_utils._dflash_block_total(draft_model, None) == 14
+    assert speculative_utils._dflash_block_total(draft_model, 16) == 16
+
+
+def test_dflash_block_total_falls_back_to_configured_block_size():
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(block_size=16, runtime_block_size=None)
+    )
+
+    assert speculative_utils._dflash_block_total(draft_model, None) == 16
+
+
+def test_dflash_committed_hidden_segments_keep_per_row_lengths():
+    hidden = mx.arange(12, dtype=mx.float32).reshape(2, 3, 2)
+
+    segments = speculative_utils._dflash_committed_hidden_segments(
+        hidden, [[1, 2], [3]]
+    )
+
+    assert segments[0].shape == (1, 2, 2)
+    assert segments[0].tolist() == [[[0.0, 1.0], [2.0, 3.0]]]
+    assert segments[1].shape == (1, 1, 2)
+    assert segments[1].tolist() == [[[6.0, 7.0]]]
+
+
 def test_effective_mtp_block_size_respects_requested_block_size():
     assert _effective_mtp_block_size(4, 4, [], 10) == 4
     assert _effective_mtp_block_size(3, 4, [], 10) == 3

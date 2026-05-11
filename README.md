@@ -141,6 +141,37 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
 ```
 
+DFlash draft-cache windowing is available from the Python API. During
+speculative decoding the target model still verifies every proposed token with
+its full KV cache; this knob only changes the DFlash drafter cache. When
+`draft_window_size` is set, the drafter keeps at most that many recent committed
+tokens in its own KV cache instead of attending over the full generated prefix.
+That reduces draft-side cache length and memory, but it can lower acceptance
+because the drafter has less context than the target verifier. On MLX, the full
+draft cache is usually faster for Qwen3.5 DFlash, so windowing defaults to
+`None`; set it only when you want to experiment with this compact recent-token
+cache tradeoff:
+
+```python
+from mlx_vlm import load
+from mlx_vlm.generate import generate
+from mlx_vlm.speculative.drafters import load_drafter
+
+model, processor = load("Qwen/Qwen3.5-4B")
+draft_model, draft_kind = load_drafter("z-lab/Qwen3.5-4B-DFlash")
+draft_model.config.draft_window_size = 256  # None disables windowing
+
+result = generate(
+    model,
+    processor,
+    "Write a quicksort in Python.",
+    max_tokens=512,
+    temperature=0,
+    draft_model=draft_model,
+    draft_kind=draft_kind,
+)
+```
+
 #### Gemma 4 MTP
 
 [Multi-Token Prediction](https://ai.google.dev/gemma/docs/mtp/mtp): Google's 4-layer "assistant" drafter that shares K/V with the target and drafts multiple tokens autoregressively from a constant position. Pass `--draft-kind mtp` to dispatch the MTP round-loop.
