@@ -234,6 +234,24 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    @property
+    def quant_predicate(self):
+        language_predicate = self.language_model.quant_predicate
+
+        def predicate(path, module):
+            if path.startswith(("vit_merger", "merger")):
+                return False
+            if any(
+                sensitive in path
+                for sensitive in ("linear_attn", "embed_tokens", "lm_head")
+            ):
+                return False
+            if language_predicate is None:
+                return True
+            return language_predicate(path, module)
+
+        return predicate
+
     def _set_position_state(self, input_ids: mx.array):
         batch_size, seq_len = input_ids.shape
         position_ids = mx.arange(seq_len, dtype=mx.int32).reshape(1, 1, -1)
