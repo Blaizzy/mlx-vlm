@@ -1038,4 +1038,4 @@ class MiniCPMVProcessor(ProcessorMixin):
 MiniCPMOImageProcessor = MiniCPMVImageProcessor
 MiniCPMOProcessor = MiniCPMVProcessor
 
-install_auto_processor_patch(["minicpmv4_6", "minicpmv"], MiniCPMVProcessor)
+install_auto_processor_patch(["minicpmv4_6"], MiniCPMVProcessor)

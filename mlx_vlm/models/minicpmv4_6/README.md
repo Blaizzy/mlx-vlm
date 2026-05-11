@@ -1,6 +1,6 @@
 # MiniCPM-V 4.6
 
-`mlx_vlm.models.minicpmv` provides an MLX backend adaptation for **MiniCPM-V 4.6**.
+`mlx_vlm.models.minicpmv4_6` provides an MLX backend adaptation for **MiniCPM-V 4.6**.
 The language backbone reuses `Qwen3.5`, while the vision stack uses
 `SigLIP2 + MiniCPM NaViT-style bucket positional embeddings`.
 
@@ -179,8 +179,8 @@ python -m mlx_vlm generate \
 
 ```bash
 python -m py_compile \
-  mlx_vlm/models/minicpmv/minicpmv.py \
-  mlx_vlm/models/minicpmv/processing_minicpmv.py \
-  mlx_vlm/models/minicpmv/vision.py \
-  mlx_vlm/models/minicpmv/config.py
+  mlx_vlm/models/minicpmv4_6/minicpmv4_6.py \
+  mlx_vlm/models/minicpmv4_6/processing_minicpmv4_6.py \
+  mlx_vlm/models/minicpmv4_6/vision.py \
+  mlx_vlm/models/minicpmv4_6/config.py
 ```

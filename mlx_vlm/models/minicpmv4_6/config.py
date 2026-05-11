@@ -100,7 +100,7 @@ class TextConfig(BaseModelConfig):
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
-    model_type: str = "minicpmv"
+    model_type: str = "minicpmv4_6"
     query_num: int = 64
     image_size: int = 448
     patch_size: int = 14

@@ -259,7 +259,6 @@ class VisionModel(nn.Module):
         if self.model_type not in [
             "siglip_vision_model",
             "siglip",
-            "minicpmv",
             "minicpmv4_6",
         ]:
             raise ValueError(f"Unsupported model type: {self.model_type}")

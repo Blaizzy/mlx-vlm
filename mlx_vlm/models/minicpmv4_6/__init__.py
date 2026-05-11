@@ -1,6 +1,6 @@
 from ..qwen3_5.language import LanguageModel
 from .config import ModelConfig, SliceConfig, TextConfig, VisionConfig
-from .minicpmv import Model
+from .minicpmv4_6 import Model
 from .vision import VisionModel
 
 __all__ = [

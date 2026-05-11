@@ -7,7 +7,7 @@ import numpy as np
 from ..base import InputEmbeddingsFeatures
 from ..qwen3_5.language import LanguageModel as Qwen35LanguageModel
 from .config import ModelConfig
-from .processing_minicpmv import MiniCPMVProcessor  # noqa: F401
+from .processing_minicpmv4_6 import MiniCPMVProcessor  # noqa: F401
 from .vision import VisionModel, check_array_shape
 
 
