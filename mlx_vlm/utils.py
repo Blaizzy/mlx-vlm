@@ -42,7 +42,6 @@ MODEL_REMAPPING = {
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
-    "minicpmv4_6": "minicpmv",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
 }
 
