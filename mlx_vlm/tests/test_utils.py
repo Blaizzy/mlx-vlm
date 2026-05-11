@@ -1,6 +1,7 @@
 import base64
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -10,7 +11,6 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
-    get_class_predicate,
     load,
     load_image,
     prepare_inputs,
@@ -39,9 +39,28 @@ class MockTorch:
 
 class MockProcessor:
     def __init__(self):
-        self.tokenizer = type(
-            "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
-        )()
+        class DummyTokenizer:
+            def __init__(self):
+                self.pad_token = None
+                self.eos_token = "[EOS]"
+
+            def __call__(
+                self,
+                text,
+                add_special_tokens=False,
+                padding=True,
+                padding_side="left",
+                return_tensors="mlx",
+            ):
+                del text, add_special_tokens, padding, padding_side
+                if return_tensors != "mlx":
+                    raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+                return SimpleNamespace(
+                    input_ids=mx.array([[1, 2, 3]]),
+                    attention_mask=mx.array([[7, 8, 9]]),
+                )
+
+        self.tokenizer = DummyTokenizer()
 
     def __call__(
         self, text=None, images=None, audio=None, padding=None, return_tensors="mlx"
@@ -140,43 +159,6 @@ def test_update_module_configs():
 
     assert updated.text_config == "text_config"
     assert updated.vision_config == "vision_config"
-
-
-def test_get_class_predicate():
-    class DummyModule:
-        def __init__(self, shape):
-            self.weight = mx.zeros(shape)
-            self.to_quantized = True
-
-    # Test skip_vision=True
-    pred = get_class_predicate(skip_vision=True)
-    module = DummyModule((10, 64))
-    assert pred("language_model", module) is True
-    assert pred("vision_model", module) is False
-
-    # Test skip_vision=True with weights
-    weights = {
-        "language_model.scales": mx.array([1, 2, 3]),
-        "vision_model.scales": mx.array([4, 5, 6]),
-    }
-    pred = get_class_predicate(skip_vision=True, weights=weights)
-    assert pred("language_model", module) is True
-    assert pred("vision_model", module) is False
-
-    # Test skip_vision=False without weights
-    pred = get_class_predicate(skip_vision=False)
-    assert pred("", module) is True
-    module = DummyModule((10, 63))  # Not divisible by 64
-    assert pred("", module) is False
-
-    # Test skip_vision=False with weights
-    weights = {
-        "language_model.scales": mx.array([1, 2, 3]),
-        "vision_model.scales": mx.array([4, 5, 6, 7]),  # Not divisible by 64
-    }
-    pred = get_class_predicate(skip_vision=False, weights=weights)
-    assert pred("language_model", DummyModule((10, 64))) is True
-    assert pred("vision_model", DummyModule((10, 63))) is False
 
 
 def test_quantize_module():
@@ -302,17 +284,16 @@ def test_prepare_inputs():
             image_token_index=None,
         )
 
-    # Test image token without image present
-    with pytest.raises(
-        ValueError,
-        match="Number of image tokens in prompt_token_ids.*does not match number of images",
-    ):
-        prepare_inputs(
-            processor,
-            images=None,
-            prompts="test with <image> token",
-            image_token_index=None,
-        )
+    # Text-only calls go straight through the tokenizer, so bare image tokens
+    # are not validated here unless actual image inputs are provided.
+    inputs = prepare_inputs(
+        processor,
+        images=None,
+        prompts="test with <image> token",
+        image_token_index=None,
+    )
+    assert "input_ids" in inputs
+    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
 
 
 def test_process_inputs_with_fallback():
@@ -398,7 +379,9 @@ def test_load_passes_revision():
 
         assert model is model_mock
         assert processor is processor_mock
-        mock_get_model_path.assert_called_with("repo", revision="abc")
+        mock_get_model_path.assert_called_with(
+            "repo", revision="abc", force_download=False
+        )
 
 
 def _make_test_image_bytes():
@@ -453,8 +436,10 @@ class TestLoadImage:
     def test_http_url_input(self):
         buf = _make_test_image_bytes()
         mock_response = MagicMock()
-        mock_response.raw = buf
+        mock_response.content = buf.getvalue()
         mock_response.raise_for_status = MagicMock()
+        mock_response.__enter__.return_value = mock_response
+        mock_response.__exit__.return_value = None
 
         with patch("mlx_vlm.utils.requests.get", return_value=mock_response):
             img = load_image("https://example.com/image.png")
@@ -465,7 +450,10 @@ class TestLoadImage:
             "mlx_vlm.utils.requests.get",
             side_effect=Exception("Connection error"),
         ):
-            with pytest.raises(ValueError, match="Failed to load image from URL"):
+            with pytest.raises(
+                ValueError,
+                match=r"Failed to load image from https://example\.com/nonexistent\.png",
+            ):
                 load_image("https://example.com/nonexistent.png")
 
     def test_nonexistent_file_raises(self):

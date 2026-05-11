@@ -4,7 +4,6 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
-from mlx_lm.models.gated_delta import gated_delta_update
 
 from ..base import (
     LanguageModelOutput,
@@ -14,6 +13,11 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
+from .gated_delta import (
+    gated_delta_state_update,
+    gated_delta_update,
+    gated_delta_update_with_states,
+)
 
 
 class Qwen3_5RotaryEmbedding:
@@ -316,7 +320,21 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        initial_state = state
+        intermediate_states = None
         if gdn_sink is not None:
+            out, state, intermediate_states = gated_delta_update_with_states(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
             # Tuple layout consumed by ``rollback_speculative_cache`` below.
             gdn_sink.append(
                 (
@@ -327,25 +345,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     b,
                     self.A_log,
                     self.dt_bias,
-                    state,
+                    initial_state,
                     mask,
                     conv_input,
                     self.conv_kernel_size,
+                    intermediate_states,
                 )
             )
-
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
 
         if cache is not None:
             cache[1] = state
@@ -486,34 +505,112 @@ class LanguageModel(nn.Module):
         if not ssm_caches:
             return max_a
 
-        # Batch all SSM rollbacks into a single gated_delta_update call
-        # to eliminate per-layer kernel launch overhead (~30 launches → 1).
-        N = len(ssm_caches)
-        replay_mask = None
-        if is_batch:
-            replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
+        if all(len(s) > 11 and s[11] is not None for s in gdn_states):
+            a0 = int(accepted[0].item()) if not is_batch else None
+            for j, c in enumerate(ssm_caches):
+                (
+                    _q,
+                    _k,
+                    _v,
+                    _a,
+                    _b,
+                    _A_log,
+                    _dt_bias,
+                    _init_state,
+                    _mask,
+                    conv_input,
+                    K,
+                    intermediate_states,
+                    *_,
+                ) = gdn_states[j]
+                if is_batch:
+                    acc_list = accepted.tolist()
+                    state_steps = intermediate_states.shape[1]
+                    states = [
+                        (
+                            intermediate_states[bi, int(acc_list[bi])]
+                            if int(acc_list[bi]) < state_steps
+                            else c[1][bi]
+                        )
+                        for bi in range(len(acc_list))
+                    ]
+                    c[1] = mx.stack(states, axis=0)
+                    slices = [
+                        (
+                            conv_input[
+                                bi : bi + 1,
+                                int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
+                            ]
+                            if int(acc_list[bi]) < state_steps
+                            else c[0][bi : bi + 1]
+                        )
+                        for bi in range(len(acc_list))
+                    ]
+                    c[0] = mx.concatenate(slices, axis=0)
+                else:
+                    if a0 < intermediate_states.shape[1]:
+                        c[1] = intermediate_states[:, a0]
+                        c[0] = conv_input[:, a0 + 1 : a0 + K]
+            return max_a
 
-        q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
+        # Batch all SSM rollbacks into a single state-only gated delta kernel.
+        # Rollback does not need the layer output, so this avoids the verifier
+        # replay's q projection and y materialization.
+        N = len(ssm_caches)
+
+        k_list, v_list, a_list, b_list = [], [], [], []
         A_log_list, dt_bias_list, state_list = [], [], []
+        steps_list = []
+        mask_parts = []
+        layer_batch_sizes = []
         conv_data = []
         for j in range(N):
-            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
-                j
-            ]
-            q_list.append(q[:, :n])
-            k_list.append(k[:, :n])
-            v_list.append(v[:, :n])
-            a_list.append(a[:, :n])
-            b_list.append(b[:, :n])
-            A_log_list.append(A_log[None, None, :])  # (1, 1, Hv)
-            dt_bias_list.append(dt_bias[None, None, :])  # (1, 1, Hv)
+            (
+                _q,
+                k,
+                v,
+                a,
+                b,
+                A_log,
+                dt_bias,
+                init_state,
+                mask,
+                conv_input,
+                K,
+                *_,
+            ) = gdn_states[j]
+            k = k[:, :n]
+            v = v[:, :n]
+            a = a[:, :n]
+            b = b[:, :n]
+            batch_rows = k.shape[0]
+            k_list.append(k)
+            v_list.append(v)
+            a_list.append(a)
+            b_list.append(b)
+            if is_batch:
+                steps_list.append(valid_ends.astype(mx.int32))
+            else:
+                steps_list.append(mx.full((batch_rows,), n, dtype=mx.int32))
+            A_log_list.append(
+                mx.broadcast_to(A_log[None, None, :], (batch_rows, 1, A_log.shape[0]))
+            )
+            dt_bias_list.append(
+                mx.broadcast_to(
+                    dt_bias[None, None, :], (batch_rows, 1, dt_bias.shape[0])
+                )
+            )
+            if init_state is None:
+                init_state = mx.zeros(
+                    (batch_rows, v.shape[-2], v.shape[-1], k.shape[-1]),
+                    dtype=mx.float32,
+                )
             state_list.append(init_state)
+            layer_batch_sizes.append(batch_rows)
             conv_data.append((conv_input, K))
-            if not is_batch and replay_mask is None and mask is not None:
-                replay_mask = mask[:, :n]
+            mask_parts.append(None if mask is None else mask[:, :n])
 
         # Stack along batch dim: (N, n, H, D) — one kernel launch for all layers.
-        q_bat = mx.concatenate(q_list, axis=0)
         k_bat = mx.concatenate(k_list, axis=0)
         v_bat = mx.concatenate(v_list, axis=0)
         a_bat = mx.concatenate(a_list, axis=0)
@@ -521,12 +618,19 @@ class LanguageModel(nn.Module):
         A_log_bat = mx.concatenate(A_log_list, axis=0)  # (N, 1, Hv)
         dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
         state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
+        steps_bat = mx.concatenate(steps_list, axis=0)
 
-        if replay_mask is not None and replay_mask.shape[0] == 1 and N > 1:
-            replay_mask = mx.broadcast_to(replay_mask, (N, n))
+        replay_mask = None
+        if any(mask is not None for mask in mask_parts):
+            replay_mask = mx.concatenate(
+                [
+                    (mask if mask is not None else mx.ones((rows, n), dtype=mx.bool_))
+                    for mask, rows in zip(mask_parts, layer_batch_sizes)
+                ],
+                axis=0,
+            )
 
-        _, states_out = gated_delta_update(
-            q_bat,
+        states_out = gated_delta_state_update(
             k_bat,
             v_bat,
             a_bat,
@@ -534,14 +638,18 @@ class LanguageModel(nn.Module):
             A_log_bat,
             dt_bias_bat,
             state_bat,
+            steps_bat,
             replay_mask,
             use_kernel=True,
         )
 
         # Scatter results back to individual caches.
         a0 = int(accepted[0].item()) if not is_batch else None
+        state_offset = 0
         for j, c in enumerate(ssm_caches):
-            c[1] = states_out[j : j + 1]
+            batch_rows = layer_batch_sizes[j]
+            c[1] = states_out[state_offset : state_offset + batch_rows]
+            state_offset += batch_rows
             conv_input, K = conv_data[j]
             if is_batch:
                 acc_list = accepted.tolist()
@@ -698,7 +806,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -706,11 +814,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -736,6 +843,9 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
@@ -785,19 +895,18 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
                     offsets = cache_offsets[:batch_size]
-                    rope_deltas = (
-                        rope_deltas_kw
-                        if rope_deltas_kw is not None
-                        else self._rope_deltas
-                    )
+                    rope_deltas = rope_deltas_src
                     if rope_deltas.shape[0] > batch_size:
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]
                 else:
                     delta = mx.array(
-                        cache_offset + self._rope_deltas if cache is not None else 0
+                        cache_offset + rope_deltas_src if cache is not None else 0
                     )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
@@ -827,15 +936,54 @@ class LanguageModel(nn.Module):
             hidden_sink=hidden_sink,
             gdn_sink=gdn_sink,
         )
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+        if return_hidden:
+            if hidden_sink is None:
+                hidden_sink = []
+            hidden_sink.append(out)
+
+        if skip_logits:
+            logits = None
+        elif self.args.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(out)
         else:
-            out = self.lm_head(out)
+            logits = self.lm_head(out)
         return LanguageModelOutput(
-            logits=out,
+            logits=logits,
             hidden_states=hidden_sink,
             gdn_states=gdn_sink,
+            shared_kv_states={} if return_shared_kv else None,
         )
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(hidden)
+        return self.lm_head(hidden)
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+        )
+        return (
+            out.hidden_states[-1],
+            out.shared_kv_states,
+            out.gdn_states,
+            sampler(out.logits),
+        )
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=[],
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[-1], out.shared_kv_states, out.gdn_states
 
     @property
     def layers(self):

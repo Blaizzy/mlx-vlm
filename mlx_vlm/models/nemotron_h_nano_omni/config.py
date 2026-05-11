@@ -41,7 +41,7 @@ class VisionConfig(BaseModelConfig):
 
 
 @dataclass
-class SoundConfig(BaseModelConfig):
+class AudioConfig(BaseModelConfig):
     model_type: str = "parakeet"
     hidden_size: int = 1024
     num_attention_heads: int = 8
@@ -83,7 +83,7 @@ class SoundConfig(BaseModelConfig):
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
-    sound_config: Optional[SoundConfig] = None
+    sound_config: Optional[AudioConfig] = None
     model_type: str = "nemotron_h_nano_omni"
     force_image_size: Optional[int] = None
     downsample_ratio: float = 0.5
@@ -111,7 +111,7 @@ class ModelConfig(BaseModelConfig):
 
         raw_sound_config = params.pop("sound_config", None)
         sound_config = (
-            SoundConfig.from_dict(raw_sound_config)
+            AudioConfig.from_dict(raw_sound_config)
             if raw_sound_config is not None
             else None
         )

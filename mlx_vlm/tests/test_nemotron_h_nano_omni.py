@@ -9,8 +9,8 @@ from mlx_vlm.models.nemotron_h_nano_omni.audio import (
     sanitize_audio_weights,
 )
 from mlx_vlm.models.nemotron_h_nano_omni.config import (
+    AudioConfig,
     ModelConfig,
-    SoundConfig,
     TextConfig,
     VisionConfig,
 )
@@ -56,7 +56,7 @@ def tiny_vision_config():
 
 
 def tiny_sound_config(hidden_size=16):
-    return SoundConfig(
+    return AudioConfig(
         hidden_size=hidden_size,
         num_attention_heads=4,
         num_hidden_layers=1,
@@ -71,7 +71,7 @@ def tiny_sound_config(hidden_size=16):
 
 def test_sound_feature_extractor_shapes_and_masks():
     pytest.importorskip("mlx_audio")
-    config = SoundConfig()
+    config = AudioConfig()
     extractor = SoundFeatureExtractor(config)
     waveform = np.linspace(-0.5, 0.5, 1600, dtype=np.float32)
 

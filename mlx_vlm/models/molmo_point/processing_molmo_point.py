@@ -24,12 +24,51 @@ IMAGE_TOKENS = [
 ]
 
 
+class MolmoPointImageProcessor:
+    """Image processor wrapper for MolmoPoint preprocessing."""
+
+    def __init__(
+        self,
+        max_crops=24,
+        overlap_margins=(4, 4),
+        base_image_input_size=(378, 378),
+        image_patch_size=14,
+        pooling_size=(2, 2),
+        return_pointing_metadata=True,
+        **kwargs,
+    ):
+        self.max_crops = max_crops
+        self.overlap_margins = overlap_margins
+        self.base_image_input_size = base_image_input_size
+        self.image_patch_size = image_patch_size
+        self.pooling_size = pooling_size
+        self.return_pointing_metadata = return_pointing_metadata
+
+    def preprocess(self, images, **kwargs):
+        return preprocess_images(
+            images,
+            max_crops=kwargs.get("max_crops", self.max_crops),
+            overlap_margins=kwargs.get("overlap_margins", self.overlap_margins),
+            base_image_input_size=kwargs.get(
+                "base_image_input_size", self.base_image_input_size
+            ),
+            image_patch_size=kwargs.get("image_patch_size", self.image_patch_size),
+            pooling_size=kwargs.get("pooling_size", self.pooling_size),
+            return_pointing_metadata=kwargs.get(
+                "return_pointing_metadata", self.return_pointing_metadata
+            ),
+        )
+
+    def __call__(self, images, **kwargs):
+        return self.preprocess(images, **kwargs)
+
+
 class MolmoPointProcessor:
     """Processor for MolmoPoint that handles image processing and tokenization."""
 
-    def __init__(self, tokenizer, **kwargs):
+    def __init__(self, tokenizer, image_processor=None, **kwargs):
         self.tokenizer = tokenizer
-        self.image_processor = None  # Not a BaseImageProcessor
+        self.image_processor = image_processor or MolmoPointImageProcessor()
         # Defaults from processor_config.json
         self.image_use_col_tokens = kwargs.get("image_use_col_tokens", True)
         self.use_single_crop_col_tokens = kwargs.get(
@@ -109,16 +148,7 @@ class MolmoPointProcessor:
             if not isinstance(images, list):
                 images = [images]
 
-            # Process images (settings from preprocessor_config.json)
-            img_result = preprocess_images(
-                images,
-                max_crops=24,
-                overlap_margins=[4, 4],
-                base_image_input_size=(378, 378),
-                image_patch_size=14,
-                pooling_size=[2, 2],
-                return_pointing_metadata=True,
-            )
+            img_result = self.image_processor.preprocess(images)
 
             image_grids = img_result["image_grids"]
 

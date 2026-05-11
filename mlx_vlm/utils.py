@@ -13,6 +13,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
+import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -88,16 +89,18 @@ def skip_multimodal_module(path: str) -> bool:
     Returns:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    return (
-        "vision_model" in path
-        or "vision_tower" in path
-        or "vl_connector" in path
-        or "sam_model" in path
-        or "audio_model" in path
-        or "audio_tower" in path
-        or "code_predictor" in path
-        or "img_projector" in path
+    multimodal_modules = (
+        "vision_model",
+        "vision_tower",
+        "vl_connector",
+        "sam_model",
+        "audio_model",
+        "audio_tower",
+        "code_predictor",
+        "img_projector",
+        "multi_modal_projector",
     )
+    return any(module in path for module in multimodal_modules)
 
 
 def get_model_and_args(config: dict):
@@ -226,8 +229,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    import safetensors
-
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
@@ -237,6 +238,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
+
+    has_quantization = "quantization" in config
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
@@ -270,7 +273,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if "quantization" not in config:
+    if not has_quantization:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
@@ -294,6 +297,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization is not None:
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
+
+    if has_quantization:
+        for quantization_key in ("quantization", "quantization_config"):
+            quantization_value = getattr(model_config, quantization_key, None)
+            if quantization_value is not None:
+                config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
@@ -492,7 +501,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         FileNotFoundError: If config.json is not found at the path
     """
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+        model_path = get_model_path(
+            model_path,
+            revision=kwargs.get("revision"),
+            force_download=kwargs.get("force_download", False),
+        )
 
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
@@ -518,7 +531,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+        model_path = get_model_path(
+            model_path,
+            revision=kwargs.get("revision"),
+            force_download=kwargs.get("force_download", False),
+        )
 
     if not kwargs:
         config = load_config(model_path, trust_remote_code=True)
@@ -803,6 +820,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     import base64
 
+    original_source = image_source
     try:
         if not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
@@ -816,15 +834,15 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
         if isinstance(image_source, str) and image_source.startswith(
             ("http://", "https://")
         ):
-            response = requests.get(image_source, stream=True, timeout=timeout)
-            response.raise_for_status()
-            image_source = response.raw
+            with requests.get(image_source, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                image_source = BytesIO(response.content)
 
         image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"Failed to load image from {image_source}: {e}") from e
+        raise ValueError(f"Failed to load image from {original_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
     return image.convert("RGB")

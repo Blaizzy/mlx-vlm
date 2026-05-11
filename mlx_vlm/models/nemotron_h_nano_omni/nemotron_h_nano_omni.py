@@ -121,7 +121,11 @@ class Model(nn.Module):
             ) = self.sound_feature_extractor(sound_clips)
         if not isinstance(input_features, mx.array):
             input_features = mx.array(input_features)
-        input_features = input_features.astype(self.language_model.lm_head.weight.dtype)
+        lm_head = self.language_model.lm_head
+        compute_dtype = (
+            lm_head.scales.dtype if hasattr(lm_head, "scales") else lm_head.weight.dtype
+        )
+        input_features = input_features.astype(compute_dtype)
 
         if feature_attention_mask is not None and not isinstance(
             feature_attention_mask, mx.array

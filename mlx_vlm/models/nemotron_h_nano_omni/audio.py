@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .config import SoundConfig
+from .config import AudioConfig
 
 
 class SquaredReLU(nn.Module):
@@ -14,7 +14,7 @@ class SquaredReLU(nn.Module):
 
 
 class SoundProjection(nn.Module):
-    def __init__(self, config: SoundConfig, llm_hidden_size: int):
+    def __init__(self, config: AudioConfig, llm_hidden_size: int):
         super().__init__()
         self.norm = nn.RMSNorm(config.hidden_size, eps=1e-5)
         self.linear1 = nn.Linear(
@@ -37,7 +37,7 @@ class SoundProjection(nn.Module):
 
 
 class ParakeetEncoderRelPositionalEncoding(nn.Module):
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.max_position_embeddings = config.max_position_embeddings
@@ -67,7 +67,7 @@ class ParakeetEncoderRelPositionalEncoding(nn.Module):
 
 
 class ParakeetEncoderFeedForward(nn.Module):
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         super().__init__()
         self.linear1 = nn.Linear(
             config.hidden_size,
@@ -86,7 +86,7 @@ class ParakeetEncoderFeedForward(nn.Module):
 
 
 class ParakeetEncoderConvolutionModule(nn.Module):
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         super().__init__()
         channels = config.hidden_size
         kernel_size = config.conv_kernel_size
@@ -134,7 +134,7 @@ class ParakeetEncoderConvolutionModule(nn.Module):
 
 
 class ParakeetEncoderAttention(nn.Module):
-    def __init__(self, config: SoundConfig, layer_idx: int):
+    def __init__(self, config: AudioConfig, layer_idx: int):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -238,7 +238,7 @@ class ParakeetEncoderAttention(nn.Module):
 
 
 class ParakeetEncoderSubsamplingConv2D(nn.Module):
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         super().__init__()
         self.kernel_size = config.subsampling_conv_kernel_size
         self.stride = config.subsampling_conv_stride
@@ -319,7 +319,7 @@ class ParakeetEncoderSubsamplingConv2D(nn.Module):
 
 
 class ParakeetEncoderBlock(nn.Module):
-    def __init__(self, config: SoundConfig, layer_idx: int):
+    def __init__(self, config: AudioConfig, layer_idx: int):
         super().__init__()
         self.feed_forward1 = ParakeetEncoderFeedForward(config)
         self.self_attn = ParakeetEncoderAttention(config, layer_idx)
@@ -353,7 +353,7 @@ class ParakeetEncoderBlock(nn.Module):
 
 
 class ParakeetEncoder(nn.Module):
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         super().__init__()
         self.config = config
         self.input_scale = math.sqrt(config.hidden_size) if config.scale_input else 1.0
@@ -411,7 +411,7 @@ class ParakeetEncoder(nn.Module):
 
 
 class SoundEncoder(nn.Module):
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         super().__init__()
         self.config = config
         self.encoder = ParakeetEncoder(config)
@@ -426,7 +426,7 @@ class SoundEncoder(nn.Module):
 
 
 class SoundFeatureExtractor:
-    def __init__(self, config: SoundConfig):
+    def __init__(self, config: AudioConfig):
         self.config = config
         self.sampling_rate = config.sampling_rate
 

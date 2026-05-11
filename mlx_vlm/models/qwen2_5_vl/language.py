@@ -418,7 +418,7 @@ class LanguageModel(nn.Module):
                 mrope_position_deltas.append(
                     llm_positions.max() + 1 - len(total_input_ids[i])
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas)[0]
+            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
         else:
             if attention_mask is not None:
@@ -426,11 +426,10 @@ class LanguageModel(nn.Module):
                 position_ids = mx.where(
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
-                position_ids = mx.expand_dims(position_ids[0], axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-                max_position_ids = position_ids.max(0, keepdims=False)[0].max(
-                    -1, keepdims=True
-                )[0]
+                max_position_ids = position_ids.max(axis=-1, keepdims=True)
+                position_ids = mx.broadcast_to(
+                    position_ids[None, :, :], (3, *position_ids.shape)
+                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
@@ -505,19 +504,18 @@ class LanguageModel(nn.Module):
                     self._position_ids = position_ids
             else:
                 batch_size, seq_length = inputs.shape
+                rope_deltas_src = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
                 if cache_offsets is not None and cache_offsets.size >= batch_size:
                     offsets = cache_offsets[:batch_size]
-                    rope_deltas = (
-                        rope_deltas_kw
-                        if rope_deltas_kw is not None
-                        else self._rope_deltas
-                    )
+                    rope_deltas = rope_deltas_src
                     if rope_deltas.shape[0] > batch_size:
                         rope_deltas = rope_deltas[:batch_size]
                     delta = (offsets + rope_deltas.squeeze(-1))[:, None]
                 else:
                     delta = mx.array(
-                        cache_offset + self._rope_deltas if cache is not None else 0
+                        cache_offset + rope_deltas_src if cache is not None else 0
                     )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
