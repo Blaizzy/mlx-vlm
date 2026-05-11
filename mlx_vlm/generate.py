@@ -3407,6 +3407,7 @@ def main():
                 prompt,
                 args.image,
                 args.audio,
+                args.video,
                 **stream_kwargs,
             ):
                 response += chunk.text
