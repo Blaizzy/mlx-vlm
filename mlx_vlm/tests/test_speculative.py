@@ -27,9 +27,11 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
 )
+from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
 from mlx_vlm.speculative.utils import (
     _effective_mtp_block_size,
     _format_speculative_stats,
@@ -741,6 +743,97 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[0].tolist() == [[[0.0, 1.0], [2.0, 3.0]]]
     assert segments[1].shape == (1, 1, 2)
     assert segments[1].tolist() == [[[6.0, 7.0]]]
+
+
+def test_gemma4_26b_dflash_config_uses_zero_based_capture_layers():
+    config = Gemma4DFlashConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 30,
+            "dflash_config": {"target_layer_ids": [1, 6, 11]},
+        }
+    )
+
+    assert config.target_layer_ids == [0, 5, 10]
+
+
+def test_gemma4_31b_dflash_config_preserves_capture_layers():
+    config = Gemma4DFlashConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 60,
+            "dflash_config": {"target_layer_ids": [1, 12, 23]},
+        }
+    )
+
+    assert config.target_layer_ids == [1, 12, 23]
+
+
+def test_dflash_drafter_uses_bound_target_embedding_scale():
+    class Embed:
+        def __call__(self, inputs):
+            return mx.ones((*inputs.shape, 4), dtype=mx.float32)
+
+        def as_linear(self, hidden):
+            return hidden
+
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    drafter = DFlashDraftModel(config)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=Embed(), embed_scale=2.0)
+    )
+
+    drafter.bind(target)
+
+    embedded = drafter._embed_input_tokens(mx.array([[1, 2]], dtype=mx.int32))
+    assert embedded.tolist() == [[[2.0] * 4, [2.0] * 4]]
+
+
+def test_dflash_config_parses_sliding_attention_metadata():
+    config = ModelConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 16,
+            "final_logit_softcapping": 30.0,
+            "dflash_config": {
+                "target_layer_ids": [0],
+                "mask_token_id": 4,
+            },
+        }
+    )
+
+    assert config.layer_types == ["sliding_attention", "full_attention"]
+    assert config.sliding_window == 16
+    assert config.final_logit_softcapping == 30.0
+    assert config.mask_token_id == 4
 
 
 def test_effective_mtp_block_size_respects_requested_block_size():
