@@ -720,17 +720,21 @@ class MiniCPMVProcessor(ProcessorMixin):
         self.image_token_id = getattr(
             self.tokenizer,
             "image_token_id",
-            self.tokenizer.convert_tokens_to_ids(self.image_token)
-            if self.tokenizer is not None
-            else None,
+            (
+                self.tokenizer.convert_tokens_to_ids(self.image_token)
+                if self.tokenizer is not None
+                else None
+            ),
         )
         self.video_token = getattr(self.tokenizer, "video_token", "<|video_pad|>")
         self.video_token_id = getattr(
             self.tokenizer,
             "video_token_id",
-            self.tokenizer.convert_tokens_to_ids(self.video_token)
-            if self.tokenizer is not None
-            else None,
+            (
+                self.tokenizer.convert_tokens_to_ids(self.video_token)
+                if self.tokenizer is not None
+                else None
+            ),
         )
         super().__init__(
             self.image_processor,
@@ -1211,12 +1215,8 @@ class MiniCPMVProcessor(ProcessorMixin):
         if text is None:
             text = ""
 
-        image_patch_target_sizes = np.asarray(
-            image_patch_target_sizes, dtype=np.int32
-        )
-        video_patch_target_sizes = np.asarray(
-            video_patch_target_sizes, dtype=np.int32
-        )
+        image_patch_target_sizes = np.asarray(image_patch_target_sizes, dtype=np.int32)
+        video_patch_target_sizes = np.asarray(video_patch_target_sizes, dtype=np.int32)
 
         image_blocks = []
         image_start = 0
@@ -1297,9 +1297,7 @@ class MiniCPMVProcessor(ProcessorMixin):
                     video_used += 1
                 else:
                     ids.extend(
-                        self.tokenizer.encode(
-                            text[start:end], add_special_tokens=False
-                        )
+                        self.tokenizer.encode(text[start:end], add_special_tokens=False)
                     )
             else:
                 if image_used < len(image_blocks):
@@ -1309,9 +1307,7 @@ class MiniCPMVProcessor(ProcessorMixin):
                     image_used += 1
                 else:
                     ids.extend(
-                        self.tokenizer.encode(
-                            text[start:end], add_special_tokens=False
-                        )
+                        self.tokenizer.encode(text[start:end], add_special_tokens=False)
                     )
             cursor = end
 
@@ -1490,9 +1486,8 @@ class MiniCPMVProcessor(ProcessorMixin):
                 ids_array = np.array(ids, dtype=np.int32)
                 input_ids_list.append(ids_array)
 
-                sample_pixels = (
-                    list(image_inputs["pixel_values"][i])
-                    + list(video_inputs["pixel_values_videos"][i])
+                sample_pixels = list(image_inputs["pixel_values"][i]) + list(
+                    video_inputs["pixel_values_videos"][i]
                 )
                 image_tgt = np.asarray(image_inputs["tgt_sizes"][i], dtype=np.int32)
                 video_tgt = np.asarray(

@@ -197,9 +197,7 @@ class Merger(nn.Module):
             hidden = hidden.reshape(cur_h, cur_w, inner_dim)
             hidden = hidden.reshape(merged_h, merge_h, merged_w, merge_w, inner_dim)
             hidden = hidden.transpose(0, 2, 1, 3, 4)
-            hidden = hidden.reshape(
-                merged_h * merged_w, inner_dim * merge_h * merge_w
-            )
+            hidden = hidden.reshape(merged_h * merged_w, inner_dim * merge_h * merge_w)
             hidden = layer(hidden)
             cur_h, cur_w = merged_h, merged_w
 

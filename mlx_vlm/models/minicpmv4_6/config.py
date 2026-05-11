@@ -42,7 +42,9 @@ class VisionConfig(BaseModelConfig):
 
     @property
     def window_hidden_size(self) -> int:
-        return self.hidden_size * self.window_kernel_size[0] * self.window_kernel_size[1]
+        return (
+            self.hidden_size * self.window_kernel_size[0] * self.window_kernel_size[1]
+        )
 
     @property
     def window_intermediate_size(self) -> int:
