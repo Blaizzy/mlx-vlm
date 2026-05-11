@@ -944,6 +944,8 @@ class MiniCPMVProcessor(ProcessorMixin):
         end_attr: str,
         end_token: str,
         token_count: int,
+        fill_attr: str,
+        fill_token: str,
     ) -> List[int]:
         def _resolve_token_id(attr_name: str, token_text: str) -> int:
             token_id = getattr(self.tokenizer, attr_name, None)
@@ -957,27 +959,41 @@ class MiniCPMVProcessor(ProcessorMixin):
 
         start_id = _resolve_token_id(start_attr, start_token)
         end_id = _resolve_token_id(end_attr, end_token)
-        unk_id = _resolve_token_id("unk_token_id", "<unk>")
-        if start_id < 0 or end_id < 0 or unk_id < 0:
+        fill_id = _resolve_token_id(fill_attr, fill_token)
+        if start_id < 0 or end_id < 0 or fill_id < 0:
             return []
-        return [start_id] + [unk_id] * int(token_count) + [end_id]
+        return [start_id] + [fill_id] * int(token_count) + [end_id]
 
-    def _build_image_placeholder_ids(self, token_count: int) -> List[int]:
+    def _build_image_placeholder_ids(
+        self,
+        token_count: int,
+        fill_attr: str = "image_token_id",
+        fill_token: Optional[str] = None,
+    ) -> List[int]:
         return self._build_feature_placeholder_ids(
             "im_start_id",
             self.image_processor.im_start,
             "im_end_id",
             self.image_processor.im_end,
             token_count,
+            fill_attr,
+            self.image_token if fill_token is None else fill_token,
         )
 
-    def _build_slice_placeholder_ids(self, token_count: int) -> List[int]:
+    def _build_slice_placeholder_ids(
+        self,
+        token_count: int,
+        fill_attr: str = "image_token_id",
+        fill_token: Optional[str] = None,
+    ) -> List[int]:
         return self._build_feature_placeholder_ids(
             "slice_start_id",
             self.image_processor.slice_start,
             "slice_end_id",
             self.image_processor.slice_end,
             token_count,
+            fill_attr,
+            self.image_token if fill_token is None else fill_token,
         )
 
     def _build_image_id_ids(self, image_idx: int) -> List[int]:
@@ -997,6 +1013,8 @@ class MiniCPMVProcessor(ProcessorMixin):
         token_divisor: int,
         include_image_id: bool = True,
         slice_mode: Optional[bool] = None,
+        fill_attr: str = "image_token_id",
+        fill_token: Optional[str] = None,
     ) -> List[int]:
         if patch_target_sizes.size == 0:
             return []
@@ -1005,7 +1023,11 @@ class MiniCPMVProcessor(ProcessorMixin):
             int(np.prod(target_size, dtype=np.int64) // token_divisor)
             for target_size in np.asarray(patch_target_sizes, dtype=np.int32)
         ]
-        image_placeholder_ids = self._build_image_placeholder_ids(token_counts[0])
+        image_placeholder_ids = self._build_image_placeholder_ids(
+            token_counts[0],
+            fill_attr=fill_attr,
+            fill_token=fill_token,
+        )
         if len(image_placeholder_ids) == 0:
             return []
 
@@ -1021,7 +1043,11 @@ class MiniCPMVProcessor(ProcessorMixin):
             return ids
 
         per_slice_tokens = token_counts[1] if len(token_counts) > 1 else 0
-        slice_placeholder_ids = self._build_slice_placeholder_ids(per_slice_tokens)
+        slice_placeholder_ids = self._build_slice_placeholder_ids(
+            per_slice_tokens,
+            fill_attr=fill_attr,
+            fill_token=fill_token,
+        )
         if len(slice_placeholder_ids) == 0:
             return []
 
@@ -1066,6 +1092,8 @@ class MiniCPMVProcessor(ProcessorMixin):
                 token_divisor,
                 include_image_id=False,
                 slice_mode=getattr(self.video_processor, "slice_mode", False),
+                fill_attr="video_token_id",
+                fill_token=self.video_token,
             )
             if len(frame_ids) == 0:
                 return []

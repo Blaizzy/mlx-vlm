@@ -510,6 +510,8 @@ class TestMiniCPMVProcessor(unittest.TestCase):
         self.assertEqual(result["image_bound"][0].shape, (2, 2))
         self.assertEqual(result["num_frames_per_video"], [[2]])
         self.assertEqual(result["num_patches_per_frame"], [[1, 1]])
+        for start, end in result["image_bound"][0]:
+            self.assertTrue(np.all(result["input_ids"][0, start:end] == 102))
 
     def test_prompt_utils_routes_minicpm_video_messages(self):
         from mlx_vlm.prompt_utils import apply_chat_template
