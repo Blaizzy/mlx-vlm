@@ -109,7 +109,9 @@ class VitMerger(nn.Module):
         self.linear_2 = nn.Linear(merged_hidden_size, vision_hidden_size, bias=True)
         self.act = nn.GELU(approx="precise")
 
-    def __call__(self, x: mx.array, grid_h: int, grid_w: int) -> tuple[mx.array, int, int]:
+    def __call__(
+        self, x: mx.array, grid_h: int, grid_w: int
+    ) -> tuple[mx.array, int, int]:
         group = self.merge_group_size
         if grid_h % group != 0 or grid_w % group != 0:
             raise ValueError(
@@ -162,13 +164,19 @@ class Merger(nn.Module):
         super().__init__()
         self.mlp = [
             MergerBlock(
-                hidden_size * 4 if i == 0 else (hidden_size if i < merger_times else out_size) * 4,
+                (
+                    hidden_size * 4
+                    if i == 0
+                    else (hidden_size if i < merger_times else out_size) * 4
+                ),
                 out_size if i == merger_times - 1 else hidden_size,
             )
             for i in range(merger_times)
         ]
 
-    def __call__(self, x: mx.array, grid_h: int, grid_w: int) -> tuple[mx.array, int, int]:
+    def __call__(
+        self, x: mx.array, grid_h: int, grid_w: int
+    ) -> tuple[mx.array, int, int]:
         cur_h = int(grid_h)
         cur_w = int(grid_w)
         hidden = x
@@ -228,7 +236,9 @@ class Model(nn.Module):
         self.language_model._rope_deltas = mx.zeros((batch_size, 1), dtype=mx.int32)
 
     @staticmethod
-    def _apply_vision_delta(target_states: mx.array, indices_mx: mx.array, features: mx.array) -> mx.array:
+    def _apply_vision_delta(
+        target_states: mx.array, indices_mx: mx.array, features: mx.array
+    ) -> mx.array:
         current = mx.take(target_states, indices_mx, axis=0)
         return target_states.at[indices_mx].add(features - current)
 
@@ -277,16 +287,24 @@ class Model(nn.Module):
                     cur_pixels,
                     tgt_sizes=cur_tgt,
                 )
-                hidden = hidden.astype(self.vision_tower.embeddings.patch_embedding.weight.dtype)
+                hidden = hidden.astype(
+                    self.vision_tower.embeddings.patch_embedding.weight.dtype
+                )
                 grid_h = int(cur_tgt[0, 0].item())
                 grid_w = int(cur_tgt[0, 1].item())
 
                 insert_layer_id = int(getattr(self.config, "insert_layer_id", 6) or 6)
-                use_vit_merger = str(getattr(self.config, "downsample_mode", "16x")) != "4x"
-                for layer_index, encoder_layer in enumerate(self.vision_tower.encoder.layers):
+                use_vit_merger = (
+                    str(getattr(self.config, "downsample_mode", "16x")) != "4x"
+                )
+                for layer_index, encoder_layer in enumerate(
+                    self.vision_tower.encoder.layers
+                ):
                     hidden = encoder_layer(hidden, attention_mask=None)
                     if use_vit_merger and layer_index == insert_layer_id:
-                        merged_hidden, grid_h, grid_w = self.vit_merger(hidden[0], grid_h, grid_w)
+                        merged_hidden, grid_h, grid_w = self.vit_merger(
+                            hidden[0], grid_h, grid_w
+                        )
                         hidden = mx.expand_dims(merged_hidden, axis=0)
 
                 hidden = self.vision_tower.post_layernorm(hidden)
@@ -423,7 +441,11 @@ class Model(nn.Module):
 
             if "position_ids" in key:
                 continue
-            if "conv1d.weight" in key and len(value.shape) == 3 and value.shape[-1] != 1:
+            if (
+                "conv1d.weight" in key
+                and len(value.shape) == 3
+                and value.shape[-1] != 1
+            ):
                 value = value.transpose(0, 2, 1)
             if key.endswith(
                 "embeddings.patch_embedding.weight"

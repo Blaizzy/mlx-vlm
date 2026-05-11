@@ -232,20 +232,15 @@ class SiglipVisionEmbeddings(nn.Module):
             bucket_h = self._build_position_buckets(nb_patches_h, boundaries)
             bucket_w = self._build_position_buckets(nb_patches_w, boundaries)
             pos_ids = (
-                bucket_h[:, None] * self._position_grid_size()
-                + bucket_w[None, :]
+                bucket_h[:, None] * self._position_grid_size() + bucket_w[None, :]
             ).reshape(-1)
             pos_ids = np.array(pos_ids, dtype=np.int32)
 
-            flat_mask = np.array(patch_attention_mask[batch_idx]).reshape(-1)[
-                :seq_len
-            ]
+            flat_mask = np.array(patch_attention_mask[batch_idx]).reshape(-1)[:seq_len]
             valid_indices = np.where(flat_mask)[0]
             valid_len = min(len(valid_indices), len(pos_ids))
             if valid_len > 0:
-                position_ids[batch_idx, valid_indices[:valid_len]] = pos_ids[
-                    :valid_len
-                ]
+                position_ids[batch_idx, valid_indices[:valid_len]] = pos_ids[:valid_len]
 
         position_ids = mx.array(position_ids, dtype=mx.int32)
         embeddings = embeddings + self.position_embedding(position_ids)

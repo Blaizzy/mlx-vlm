@@ -6,11 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
-from transformers import (
-    AddedToken,
-    AutoTokenizer,
-    Qwen2TokenizerFast,
-)
+from transformers import AddedToken, AutoTokenizer, Qwen2TokenizerFast
 from transformers.image_processing_utils import (
     BaseImageProcessor as HFBaseImageProcessor,
 )
@@ -218,7 +214,9 @@ class MiniCPMVImageProcessor(HFBaseImageProcessor):
         return best_grid_size[0] * grid_x, best_grid_size[1] * grid_y
 
     @staticmethod
-    def _split_to_patches(image: Image.Image, grid: Tuple[int, int]) -> List[List[Image.Image]]:
+    def _split_to_patches(
+        image: Image.Image, grid: Tuple[int, int]
+    ) -> List[List[Image.Image]]:
         patches: List[List[Image.Image]] = []
         width, height = image.size
         grid_x = int(width / grid[0])
@@ -242,7 +240,9 @@ class MiniCPMVImageProcessor(HFBaseImageProcessor):
             * original_height
             / float(self.scale_resolution * self.scale_resolution)
         )
-        max_slice_nums = self.max_slice_nums if max_slice_nums is None else int(max_slice_nums)
+        max_slice_nums = (
+            self.max_slice_nums if max_slice_nums is None else int(max_slice_nums)
+        )
         multiple = min(math.ceil(ratio), max_slice_nums)
         if multiple <= 1 or never_split:
             return None
@@ -277,7 +277,9 @@ class MiniCPMVImageProcessor(HFBaseImageProcessor):
         max_slice_nums: Optional[int] = None,
         never_split: bool = False,
     ) -> Tuple[Image.Image, List[List[Image.Image]], Optional[Tuple[int, int]]]:
-        max_slice_nums = self.max_slice_nums if max_slice_nums is None else int(max_slice_nums)
+        max_slice_nums = (
+            self.max_slice_nums if max_slice_nums is None else int(max_slice_nums)
+        )
         original_size = image.size
         best_grid = self.get_sliced_grid(original_size, max_slice_nums, never_split)
         patches: List[List[Image.Image]] = []
@@ -700,7 +702,11 @@ class MiniCPMVProcessor(ProcessorMixin):
         ids.extend(image_placeholder_ids)
 
         grid_x, grid_y = grid
-        if not getattr(self.image_processor, "slice_mode", False) or grid_x <= 0 or grid_y <= 0:
+        if (
+            not getattr(self.image_processor, "slice_mode", False)
+            or grid_x <= 0
+            or grid_y <= 0
+        ):
             return ids
 
         per_slice_tokens = token_counts[1] if len(token_counts) > 1 else 0
@@ -743,7 +749,9 @@ class MiniCPMVProcessor(ProcessorMixin):
         if len(placeholder_ids) == 0:
             # Fallback to text substitution when tokenizer lacks required special token ids.
             fallback = self._inject_image_placeholders(text, num_images)
-            return self.tokenizer.encode(fallback, add_special_tokens=add_special_tokens)
+            return self.tokenizer.encode(
+                fallback, add_special_tokens=add_special_tokens
+            )
 
         per_image_target_sizes: List[np.ndarray] = []
         start = 0
@@ -765,7 +773,9 @@ class MiniCPMVProcessor(ProcessorMixin):
         ]
         if any(len(block) == 0 for block in image_placeholder_blocks):
             fallback = self._inject_image_placeholders(text, num_images)
-            return self.tokenizer.encode(fallback, add_special_tokens=add_special_tokens)
+            return self.tokenizer.encode(
+                fallback, add_special_tokens=add_special_tokens
+            )
 
         ids: List[int] = []
         cursor = 0
@@ -780,7 +790,9 @@ class MiniCPMVProcessor(ProcessorMixin):
                 ids.extend(image_placeholder_blocks[used])
                 used += 1
             else:
-                ids.extend(self.tokenizer.encode(text[start:end], add_special_tokens=False))
+                ids.extend(
+                    self.tokenizer.encode(text[start:end], add_special_tokens=False)
+                )
             cursor = end
 
         if cursor < len(text):
@@ -867,7 +879,9 @@ class MiniCPMVProcessor(ProcessorMixin):
         del return_tensors  # This processor stays numpy/list-native for MLX.
         del kwargs
         if audios is not None or audio is not None:
-            raise ValueError("MiniCPM-V processor is image-only and does not support audio inputs.")
+            raise ValueError(
+                "MiniCPM-V processor is image-only and does not support audio inputs."
+            )
 
         overrides = {}
         if slice_mode is not None:
@@ -897,7 +911,9 @@ class MiniCPMVProcessor(ProcessorMixin):
             batched_images = self._normalize_images(images, batch_size, texts)
             image_inputs = self.image_processor.preprocess(batched_images)
             token_divisor = (
-                4 if getattr(self.image_processor, "downsample_mode", "16x") == "4x" else 16
+                4
+                if getattr(self.image_processor, "downsample_mode", "16x") == "4x"
+                else 16
             )
 
             input_ids_list: List[np.ndarray] = []
@@ -914,7 +930,9 @@ class MiniCPMVProcessor(ProcessorMixin):
                     add_special_tokens=encode_add_special_tokens,
                 )
                 if self.listen_token_id is not None and self.listen_token_id >= 0:
-                    ids = [token_id for token_id in ids if token_id != self.listen_token_id]
+                    ids = [
+                        token_id for token_id in ids if token_id != self.listen_token_id
+                    ]
                 if max_length is not None:
                     ids = ids[:max_length]
 
@@ -985,9 +1003,7 @@ class MiniCPMVProcessor(ProcessorMixin):
         tokenizer_input_names = getattr(self.tokenizer, "model_input_names", [])
         image_input_names = getattr(self.image_processor, "model_input_names", [])
         return list(
-            dict.fromkeys(
-                list(tokenizer_input_names) + list(image_input_names)
-            )
+            dict.fromkeys(list(tokenizer_input_names) + list(image_input_names))
         )
 
     @classmethod
