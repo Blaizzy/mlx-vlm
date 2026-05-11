@@ -19,6 +19,7 @@ The current adaptation covers:
 - image inference through the `mlx-vlm` CLI
 - the `slice_mode=false` single-image path
 - the default `slice_mode=true` slicing path
+- video inference through sampled frame processing
 - alignment between `<image_id>...</image_id>`, `<slice>...</slice>`, and `image_bound`
 
 The implementation has been sanity-checked locally on:
@@ -26,16 +27,24 @@ The implementation has been sanity-checked locally on:
 - single-image OCR prompts
 - dense infographic-style images
 - multi-panel poster or advertisement layouts
+- short sampled video clips
 
-## Model Directories
+## Model Checkpoints
 
-The local directory names used during development are:
+The currently validated checkpoints are:
 
-- original Hugging Face checkpoint: `minicpm-v-4_6-0420-rlaif-thinking`
-- current validated MLX checkpoint: `minicpm-v-4_6-mlx`
+- original Hugging Face checkpoint: `openbmb/MiniCPM-V-4.6`
+- canonical MLX checkpoint: `mlx-community/MiniCPM-V-4.6-bf16`
+- quantized MLX checkpoints:
+  - `mlx-community/MiniCPM-V-4.6-4bit`
+  - `mlx-community/MiniCPM-V-4.6-5bit`
+  - `mlx-community/MiniCPM-V-4.6-8bit`
+  - `mlx-community/MiniCPM-V-4.6-nvfp4`
+  - `mlx-community/MiniCPM-V-4.6-mxfp4`
+  - `mlx-community/MiniCPM-V-4.6-mxfp8`
 
 For ongoing development, it is recommended to keep using
-`minicpm-v-4_6-mlx` as the canonical MLX export directory.
+`mlx-community/MiniCPM-V-4.6-bf16` as the canonical validated MLX checkpoint.
 
 If you prefer a different output directory, simply replace the `--model`
 or `--mlx-path` argument in the commands below.
@@ -49,16 +58,18 @@ If your environment is already activated:
 
 ```bash
 python -m mlx_vlm convert \
-  --hf-path minicpm-v-4_6-0420-rlaif-thinking \
-  --mlx-path minicpm-v-4_6-mlx
+  --hf-path openbmb/MiniCPM-V-4.6 \
+  --mlx-path MiniCPM-V-4.6-bf16 \
+  --dtype bfloat16
 ```
 
 If you prefer to run without activating the environment first:
 
 ```bash
 conda run -n mlx-vlm python -m mlx_vlm convert \
-  --hf-path minicpm-v-4_6-0420-rlaif-thinking \
-  --mlx-path minicpm-v-4_6-mlx
+  --hf-path openbmb/MiniCPM-V-4.6 \
+  --mlx-path MiniCPM-V-4.6-bf16 \
+  --dtype bfloat16
 ```
 
 After conversion, the output directory should contain at least:
@@ -71,6 +82,22 @@ After conversion, the output directory should contain at least:
 
 ## CLI Inference
 
+### Video Sanity Check
+
+For video inputs, keep the first validation pass small by sampling a few frames
+and disabling slicing:
+
+```bash
+python -m mlx_vlm generate \
+  --model mlx-community/MiniCPM-V-4.6-bf16 \
+  --video your-video.mp4 \
+  --fps 0.25 \
+  --prompt "Describe this video briefly." \
+  --max-tokens 120 \
+  --temperature 0 \
+  --processor-kwargs '{"slice_mode": false, "max_num_frames": 4}'
+```
+
 ### Quick OCR Sanity Check Without Slicing
 
 For logos, simple OCR tasks, or single-subject images, start with
@@ -78,7 +105,7 @@ For logos, simple OCR tasks, or single-subject images, start with
 
 ```bash
 python -m mlx_vlm generate \
-  --model minicpm-v-4_6-mlx \
+  --model mlx-community/MiniCPM-V-4.6-bf16 \
   --image your-image.jpg \
   --prompt "What text appears in this image?" \
   --max-tokens 80 \
@@ -93,7 +120,7 @@ slicing path usually performs better:
 
 ```bash
 python -m mlx_vlm generate \
-  --model minicpm-v-4_6-mlx \
+  --model mlx-community/MiniCPM-V-4.6-bf16 \
   --image your-dense-image.jpg \
   --prompt "Describe this image in detail." \
   --max-tokens 180 \
@@ -106,7 +133,7 @@ python -m mlx_vlm generate \
 from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
-model_path = "minicpm-v-4_6-mlx"
+model_path = "mlx-community/MiniCPM-V-4.6-bf16"
 model, processor = load(model_path)
 
 images = ["your-image.jpg"]
@@ -161,7 +188,8 @@ The default slicing behavior is usually better for:
   temporary debugging switches used during development.
 - `batch_3d_resampler` is not used as an active inference path in this
   MiniCPM-V 4.6 adaptation.
-- This document focuses on image inference. Video support is out of scope here.
+- Video inputs are sampled into frame images and then passed through the same
+  MiniCPM-V visual placeholder alignment used by image inference.
 
 ## Suggested Verification Commands
 
@@ -169,7 +197,7 @@ After making changes, a minimal regression pass should include at least:
 
 ```bash
 python -m mlx_vlm generate \
-  --model minicpm-v-4_6-mlx \
+  --model mlx-community/MiniCPM-V-4.6-bf16 \
   --image your-image.jpg \
   --prompt "What text appears in this image?" \
   --max-tokens 80 \

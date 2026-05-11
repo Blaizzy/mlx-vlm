@@ -473,13 +473,234 @@ class MiniCPMVImageProcessor(HFBaseImageProcessor):
         return self.preprocess(images)
 
 
+class MiniCPMVVideoProcessor(MiniCPMVImageProcessor):
+    """Minimal video processor for MiniCPM-V video inference."""
+
+    model_input_names = ["pixel_values_videos", "tgt_sizes_videos"]
+
+    def __init__(
+        self,
+        max_num_frames: int = 128,
+        stack_frames: int = 1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.max_num_frames = int(max_num_frames)
+        self.stack_frames = int(stack_frames)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, Path], **kwargs):
+        model_dir = Path(pretrained_model_name_or_path)
+        cfg = {}
+
+        processor_cfg_path = model_dir / "processor_config.json"
+        if processor_cfg_path.exists():
+            processor_cfg = _load_json(processor_cfg_path)
+            cfg.update(processor_cfg.get("video_processor") or {})
+            if not cfg:
+                cfg.update(processor_cfg.get("image_processor") or {})
+
+        if not cfg:
+            video_cfg_path = model_dir / "video_preprocessor_config.json"
+            image_cfg_path = model_dir / "preprocessor_config.json"
+            if video_cfg_path.exists():
+                cfg.update(_load_json(video_cfg_path))
+            elif image_cfg_path.exists():
+                cfg.update(_load_json(image_cfg_path))
+
+        cfg.update(kwargs)
+        for key in ("processor_class", "image_processor_type", "video_processor_type"):
+            cfg.pop(key, None)
+        return cls(**cfg)
+
+    @staticmethod
+    def _is_frame(value) -> bool:
+        if isinstance(value, Image.Image):
+            return True
+        if isinstance(value, np.ndarray):
+            return value.ndim in (2, 3)
+        return False
+
+    def _to_video_frames(self, video) -> List[Union[Image.Image, np.ndarray]]:
+        if isinstance(video, (list, tuple)):
+            if len(video) == 0:
+                return []
+            if all(self._is_frame(frame) for frame in video):
+                return list(video)
+            video = np.asarray(video)
+
+        if isinstance(video, Image.Image):
+            return [video]
+
+        arr = np.asarray(video)
+        if arr.ndim == 4:
+            if arr.shape[1] in (1, 3) or arr.shape[-1] in (1, 3):
+                return [arr[i] for i in range(arr.shape[0])]
+        if arr.ndim in (2, 3):
+            return [arr]
+        raise ValueError(
+            "MiniCPM-V video inputs must be a frame sequence or a numpy array "
+            f"with shape (T, C, H, W) or (T, H, W, C), got {arr.shape}."
+        )
+
+    @staticmethod
+    def _select_frames(
+        frames: List[Union[Image.Image, np.ndarray]], max_num_frames: int
+    ) -> List[Union[Image.Image, np.ndarray]]:
+        if max_num_frames <= 0 or len(frames) <= max_num_frames:
+            return frames
+        indices = np.linspace(0, len(frames) - 1, max_num_frames).round().astype(int)
+        return [frames[int(i)] for i in indices]
+
+    def _concat_frames_as_image(
+        self, frames: List[Union[Image.Image, np.ndarray]]
+    ) -> Image.Image:
+        pil_frames = [self._to_pil_image(frame) for frame in frames]
+        if len(pil_frames) == 1:
+            return pil_frames[0]
+
+        line_width = 6
+        width, height = pil_frames[0].size
+        count = len(pil_frames)
+
+        if count == 4:
+            rows, cols = 2, 2
+        elif count == 3:
+            rows, cols = (1, 3) if width >= height else (3, 1)
+        elif count == 2:
+            rows, cols = (1, 2) if width >= height else (2, 1)
+        else:
+            rows, cols = 1, count
+
+        canvas_width = cols * width + (cols - 1) * line_width
+        canvas_height = rows * height + (rows - 1) * line_width
+        canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
+
+        for idx, frame in enumerate(pil_frames):
+            row = idx // cols
+            col = idx % cols
+            canvas.paste(
+                frame.resize((width, height)),
+                (col * (width + line_width), row * (height + line_width)),
+            )
+
+        return canvas
+
+    def _stack_frame_units(
+        self,
+        frames: List[Union[Image.Image, np.ndarray]],
+        stack_frames: int,
+    ) -> List[Union[Image.Image, np.ndarray]]:
+        if stack_frames <= 1:
+            return frames
+        units: List[Union[Image.Image, np.ndarray]] = []
+        for start in range(0, len(frames), stack_frames):
+            chunk = frames[start : start + stack_frames]
+            units.append(self._concat_frames_as_image(chunk))
+        return units
+
+    def preprocess(
+        self,
+        videos: List[List],
+        max_num_frames: Optional[int] = None,
+        stack_frames: Optional[int] = None,
+        **kwargs,
+    ) -> Dict[str, List]:
+        del kwargs
+        max_num_frames = (
+            self.max_num_frames if max_num_frames is None else int(max_num_frames)
+        )
+        stack_frames = self.stack_frames if stack_frames is None else int(stack_frames)
+
+        pixel_values: List[List[np.ndarray]] = []
+        tgt_sizes: List[np.ndarray] = []
+        video_sizes: List[List[Tuple[int, int]]] = []
+        grids_videos: List[List[Tuple[int, int]]] = []
+        num_patches_per_frame: List[List[int]] = []
+        num_frames_per_video: List[List[int]] = []
+
+        for sample_videos in videos:
+            sample_pixels: List[np.ndarray] = []
+            sample_tgts: List[np.ndarray] = []
+            sample_sizes: List[Tuple[int, int]] = []
+            sample_grids: List[Tuple[int, int]] = []
+            sample_patch_counts: List[int] = []
+            sample_frame_counts: List[int] = []
+
+            for video in sample_videos:
+                frames = self._to_video_frames(video)
+                frames = self._select_frames(frames, max_num_frames)
+                units = self._stack_frame_units(frames, stack_frames)
+                sample_frame_counts.append(len(units))
+
+                for frame in units:
+                    pil_frame = self._to_pil_image(frame)
+                    sample_sizes.append(pil_frame.size)
+                    if self.slice_mode:
+                        source_image, patches, best_grid = self.slice_image(
+                            pil_frame,
+                            self.max_slice_nums,
+                        )
+                        sliced_images = [source_image]
+                        for row in patches:
+                            sliced_images.extend(row)
+                    else:
+                        best_size = self._find_best_resize(
+                            pil_frame.size,
+                            self.scale_resolution,
+                            self.patch_size,
+                            allow_upscale=True,
+                        )
+                        sliced_images = [
+                            pil_frame.resize(
+                                best_size, resample=Image.Resampling.BICUBIC
+                            )
+                        ]
+                        best_grid = None
+
+                    sample_grids.append(best_grid if best_grid is not None else (0, 0))
+                    sample_patch_counts.append(len(sliced_images))
+
+                    for sliced_image in sliced_images:
+                        pixels, tgt, _ = self._preprocess_resized(sliced_image)
+                        sample_pixels.append(pixels)
+                        sample_tgts.append(tgt)
+
+            pixel_values.append(sample_pixels)
+            if sample_tgts:
+                tgt_sizes.append(np.stack(sample_tgts, axis=0).astype(np.int32))
+            else:
+                tgt_sizes.append(np.zeros((0, 2), dtype=np.int32))
+            video_sizes.append(sample_sizes)
+            grids_videos.append(sample_grids)
+            num_patches_per_frame.append(sample_patch_counts)
+            num_frames_per_video.append(sample_frame_counts)
+
+        return {
+            "pixel_values_videos": pixel_values,
+            "tgt_sizes_videos": tgt_sizes,
+            "target_sizes_videos": tgt_sizes,
+            "video_sizes": video_sizes,
+            "grids_videos": grids_videos,
+            "num_patches_per_frame": num_patches_per_frame,
+            "num_frames_per_video": num_frames_per_video,
+        }
+
+    def __call__(self, videos: List[List], **kwargs):
+        return self.preprocess(videos, **kwargs)
+
+
 class MiniCPMVProcessor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
     valid_kwargs = ["chat_template"]
 
-    _IMAGE_MARKER_PATTERN = re.compile(r"<image>\./</image>|<image>")
+    _IMAGE_MARKER_PATTERN = re.compile(r"<image>\./</image>|<image>|<\|image_pad\|>")
+    _VIDEO_MARKER_PATTERN = re.compile(r"<video>|<\|video_pad\|>")
+    _MULTIMODAL_MARKER_PATTERN = re.compile(
+        r"<image>\./</image>|<image>|<\|image_pad\|>|<video>|<\|video_pad\|>"
+    )
 
     def __init__(
         self,
@@ -488,11 +709,29 @@ class MiniCPMVProcessor(ProcessorMixin):
         chat_template=None,
         **kwargs,
     ):
+        video_processor = kwargs.pop("video_processor", None)
         self.image_processor = image_processor or MiniCPMVImageProcessor()
+        self.video_processor = video_processor or MiniCPMVVideoProcessor()
         self.tokenizer = tokenizer
         self.image_feature_size = self.image_processor.image_feature_size
 
         self._ensure_tokenizer_attrs()
+        self.image_token = getattr(self.tokenizer, "image_token", "<|image_pad|>")
+        self.image_token_id = getattr(
+            self.tokenizer,
+            "image_token_id",
+            self.tokenizer.convert_tokens_to_ids(self.image_token)
+            if self.tokenizer is not None
+            else None,
+        )
+        self.video_token = getattr(self.tokenizer, "video_token", "<|video_pad|>")
+        self.video_token_id = getattr(
+            self.tokenizer,
+            "video_token_id",
+            self.tokenizer.convert_tokens_to_ids(self.video_token)
+            if self.tokenizer is not None
+            else None,
+        )
         super().__init__(
             self.image_processor,
             self.tokenizer,
@@ -510,6 +749,12 @@ class MiniCPMVProcessor(ProcessorMixin):
             "slice_end": "</slice>",
             "im_id_start": "<image_id>",
             "im_id_end": "</image_id>",
+            "image_start_token": "<image>",
+            "image_end_token": "</image>",
+            "slice_start_token": "<slice>",
+            "slice_end_token": "</slice>",
+            "image_id_start_token": "<image_id>",
+            "image_id_end_token": "</image_id>",
         }
 
         for attr, token in token_map.items():
@@ -520,6 +765,19 @@ class MiniCPMVProcessor(ProcessorMixin):
                 setattr(
                     self.tokenizer, id_attr, self.tokenizer.convert_tokens_to_ids(token)
                 )
+
+        for attr, token in {
+            "image_token": "<|image_pad|>",
+            "video_token": "<|video_pad|>",
+        }.items():
+            if not hasattr(self.tokenizer, attr):
+                setattr(self.tokenizer, attr, token)
+            id_attr = f"{attr}_id"
+            if not hasattr(self.tokenizer, id_attr):
+                token_id = self.tokenizer.convert_tokens_to_ids(
+                    getattr(self.tokenizer, attr)
+                )
+                setattr(self.tokenizer, id_attr, token_id)
 
         listen_token_id = self.tokenizer.convert_tokens_to_ids("<|listen|>")
         unk_token_id = getattr(self.tokenizer, "unk_token_id", None)
@@ -555,6 +813,10 @@ class MiniCPMVProcessor(ProcessorMixin):
     @classmethod
     def _count_image_markers(cls, text: str) -> int:
         return len(cls._IMAGE_MARKER_PATTERN.findall(text or ""))
+
+    @classmethod
+    def _count_video_markers(cls, text: str) -> int:
+        return len(cls._VIDEO_MARKER_PATTERN.findall(text or ""))
 
     def _normalize_images(
         self,
@@ -597,6 +859,54 @@ class MiniCPMVProcessor(ProcessorMixin):
             return out
 
         return [list(images)] + [[] for _ in range(batch_size - 1)]
+
+    @staticmethod
+    def _looks_like_frame_sequence(value) -> bool:
+        if not isinstance(value, (list, tuple)) or len(value) == 0:
+            return False
+        for item in value:
+            if isinstance(item, Image.Image):
+                continue
+            if isinstance(item, np.ndarray) and item.ndim in (2, 3):
+                continue
+            return False
+        return True
+
+    def _normalize_videos(
+        self,
+        videos,
+        batch_size: int,
+        texts: List[str],
+    ) -> List[List]:
+        if videos is None:
+            return [[] for _ in range(batch_size)]
+
+        if isinstance(
+            videos, (Image.Image, np.ndarray)
+        ) or self._looks_like_frame_sequence(videos):
+            out = [[] for _ in range(batch_size)]
+            out[0] = [videos]
+            return out
+
+        if not isinstance(videos, list) or len(videos) == 0:
+            return [[] for _ in range(batch_size)]
+
+        if batch_size == 1:
+            return [list(videos)]
+
+        if len(videos) == batch_size:
+            return [[video] for video in videos]
+
+        expected = [self._count_video_markers(text) for text in texts]
+        if sum(expected) == len(videos):
+            out = []
+            idx = 0
+            for count in expected:
+                out.append(videos[idx : idx + count])
+                idx += count
+            return out
+
+        return [list(videos)] + [[] for _ in range(batch_size - 1)]
 
     def _inject_image_placeholders(self, text: str, num_images: int) -> str:
         if num_images <= 0:
@@ -685,6 +995,8 @@ class MiniCPMVProcessor(ProcessorMixin):
         grid: Tuple[int, int],
         image_idx: int,
         token_divisor: int,
+        include_image_id: bool = True,
+        slice_mode: Optional[bool] = None,
     ) -> List[int]:
         if patch_target_sizes.size == 0:
             return []
@@ -698,15 +1010,14 @@ class MiniCPMVProcessor(ProcessorMixin):
             return []
 
         ids = []
-        ids.extend(self._build_image_id_ids(image_idx))
+        if include_image_id:
+            ids.extend(self._build_image_id_ids(image_idx))
         ids.extend(image_placeholder_ids)
 
         grid_x, grid_y = grid
-        if (
-            not getattr(self.image_processor, "slice_mode", False)
-            or grid_x <= 0
-            or grid_y <= 0
-        ):
+        if slice_mode is None:
+            slice_mode = getattr(self.image_processor, "slice_mode", False)
+        if not slice_mode or grid_x <= 0 or grid_y <= 0:
             return ids
 
         per_slice_tokens = token_counts[1] if len(token_counts) > 1 else 0
@@ -721,6 +1032,45 @@ class MiniCPMVProcessor(ProcessorMixin):
                 ids.extend(slice_placeholder_ids)
             if row_idx != grid_y - 1:
                 ids.extend(newline_ids)
+        return ids
+
+    def _build_placeholder_ids_for_video(
+        self,
+        video_target_sizes: np.ndarray,
+        frame_grids: Sequence[Tuple[int, int]],
+        num_patches_per_frame: Sequence[int],
+        video_idx: int,
+        token_divisor: int,
+    ) -> List[int]:
+        if np.asarray(video_target_sizes).size == 0:
+            return []
+
+        ids = []
+        ids.extend(self._build_image_id_ids(video_idx))
+
+        start = 0
+        for frame_idx, count in enumerate(num_patches_per_frame):
+            end = start + int(count)
+            frame_target_sizes = np.asarray(
+                video_target_sizes[start:end], dtype=np.int32
+            )
+            start = end
+            if frame_target_sizes.size == 0:
+                continue
+
+            grid = frame_grids[frame_idx] if frame_idx < len(frame_grids) else (0, 0)
+            frame_ids = self._build_placeholder_ids_for_image(
+                frame_target_sizes,
+                grid,
+                frame_idx,
+                token_divisor,
+                include_image_id=False,
+                slice_mode=getattr(self.video_processor, "slice_mode", False),
+            )
+            if len(frame_ids) == 0:
+                return []
+            ids.extend(frame_ids)
+
         return ids
 
     def _encode_with_image_placeholders(
@@ -816,6 +1166,151 @@ class MiniCPMVProcessor(ProcessorMixin):
                     ids = [int(bos_id)] + ids
         return ids
 
+    def _encode_with_multimodal_placeholders(
+        self,
+        text: str,
+        image_patch_target_sizes: np.ndarray,
+        image_grids: Sequence[Tuple[int, int]],
+        num_patches_per_image: Sequence[int],
+        video_patch_target_sizes: np.ndarray,
+        video_grids: Sequence[Tuple[int, int]],
+        num_patches_per_frame: Sequence[int],
+        num_frames_per_video: Sequence[int],
+        image_token_divisor: int,
+        video_token_divisor: int,
+        add_special_tokens: bool,
+    ) -> Tuple[List[int], List[int]]:
+        if text is None:
+            text = ""
+
+        image_patch_target_sizes = np.asarray(
+            image_patch_target_sizes, dtype=np.int32
+        )
+        video_patch_target_sizes = np.asarray(
+            video_patch_target_sizes, dtype=np.int32
+        )
+
+        image_blocks = []
+        image_start = 0
+        for image_idx, count in enumerate(num_patches_per_image):
+            image_end = image_start + int(count)
+            block = self._build_placeholder_ids_for_image(
+                image_patch_target_sizes[image_start:image_end],
+                image_grids[image_idx] if image_idx < len(image_grids) else (0, 0),
+                image_idx,
+                image_token_divisor,
+            )
+            if len(block) == 0:
+                raise ValueError(
+                    "MiniCPM-V tokenizer is missing image placeholder token ids."
+                )
+            image_blocks.append((block, list(range(image_start, image_end))))
+            image_start = image_end
+
+        image_patch_total = int(image_start)
+        video_blocks = []
+        frame_start = 0
+        video_patch_start = 0
+        for video_idx, frame_count in enumerate(num_frames_per_video):
+            frame_end = frame_start + int(frame_count)
+            frame_patch_counts = list(num_patches_per_frame[frame_start:frame_end])
+            patch_count = int(sum(frame_patch_counts))
+            video_patch_end = video_patch_start + patch_count
+            block = self._build_placeholder_ids_for_video(
+                video_patch_target_sizes[video_patch_start:video_patch_end],
+                video_grids[frame_start:frame_end],
+                frame_patch_counts,
+                video_idx,
+                video_token_divisor,
+            )
+            if len(block) == 0:
+                raise ValueError(
+                    "MiniCPM-V tokenizer is missing video placeholder token ids."
+                )
+            feature_indices = list(
+                range(
+                    image_patch_total + video_patch_start,
+                    image_patch_total + video_patch_end,
+                )
+            )
+            video_blocks.append((block, feature_indices))
+            frame_start = frame_end
+            video_patch_start = video_patch_end
+
+        if not image_blocks and not video_blocks:
+            return (
+                self.tokenizer.encode(text, add_special_tokens=add_special_tokens),
+                [],
+            )
+
+        ids: List[int] = []
+        feature_order: List[int] = []
+        cursor = 0
+        image_used = 0
+        video_used = 0
+
+        for match in self._MULTIMODAL_MARKER_PATTERN.finditer(text):
+            start, end = match.span()
+            marker = match.group(0)
+            if start > cursor:
+                ids.extend(
+                    self.tokenizer.encode(text[cursor:start], add_special_tokens=False)
+                )
+
+            if marker in (
+                "<video>",
+                "<|video_pad|>",
+                getattr(self, "video_token", ""),
+            ):
+                if video_used < len(video_blocks):
+                    block, indices = video_blocks[video_used]
+                    ids.extend(block)
+                    feature_order.extend(indices)
+                    video_used += 1
+                else:
+                    ids.extend(
+                        self.tokenizer.encode(
+                            text[start:end], add_special_tokens=False
+                        )
+                    )
+            else:
+                if image_used < len(image_blocks):
+                    block, indices = image_blocks[image_used]
+                    ids.extend(block)
+                    feature_order.extend(indices)
+                    image_used += 1
+                else:
+                    ids.extend(
+                        self.tokenizer.encode(
+                            text[start:end], add_special_tokens=False
+                        )
+                    )
+            cursor = end
+
+        if cursor < len(text):
+            ids.extend(self.tokenizer.encode(text[cursor:], add_special_tokens=False))
+
+        leading_ids: List[int] = []
+        leading_order: List[int] = []
+        for block, indices in image_blocks[image_used:]:
+            leading_ids.extend(block)
+            leading_order.extend(indices)
+        for block, indices in video_blocks[video_used:]:
+            leading_ids.extend(block)
+            leading_order.extend(indices)
+        if leading_ids:
+            ids = leading_ids + ids
+            feature_order = leading_order + feature_order
+
+        if add_special_tokens:
+            if hasattr(self.tokenizer, "build_inputs_with_special_tokens"):
+                ids = self.tokenizer.build_inputs_with_special_tokens(ids)
+            else:
+                bos_id = getattr(self.tokenizer, "bos_token_id", None)
+                if bos_id is not None and (len(ids) == 0 or ids[0] != int(bos_id)):
+                    ids = [int(bos_id)] + ids
+        return ids, feature_order
+
     def _compute_image_bounds(self, input_ids: np.ndarray) -> np.ndarray:
         start_ids = np.array(
             [self.tokenizer.im_start_id, self.tokenizer.slice_start_id], dtype=np.int32
@@ -863,6 +1358,7 @@ class MiniCPMVProcessor(ProcessorMixin):
         self,
         text: Union[str, List[str]] = None,
         images=None,
+        videos=None,
         audios=None,
         audio=None,
         add_special_tokens: bool = False,
@@ -874,14 +1370,14 @@ class MiniCPMVProcessor(ProcessorMixin):
         max_slice_nums: Optional[int] = None,
         use_image_id: Optional[bool] = None,
         pack_image_by_patch: Optional[bool] = None,
+        max_num_frames: Optional[int] = None,
+        stack_frames: Optional[int] = None,
         **kwargs,
     ) -> Dict:
         del return_tensors  # This processor stays numpy/list-native for MLX.
         del kwargs
         if audios is not None or audio is not None:
-            raise ValueError(
-                "MiniCPM-V processor is image-only and does not support audio inputs."
-            )
+            raise ValueError("MiniCPM-V processor does not support audio inputs.")
 
         overrides = {}
         if slice_mode is not None:
@@ -893,13 +1389,26 @@ class MiniCPMVProcessor(ProcessorMixin):
         if pack_image_by_patch is not None:
             overrides["pack_image_by_patch"] = self._coerce_bool(pack_image_by_patch)
 
+        video_overrides = dict(overrides)
+        if max_num_frames is not None:
+            video_overrides["max_num_frames"] = int(max_num_frames)
+        if stack_frames is not None:
+            video_overrides["stack_frames"] = int(stack_frames)
+
         old_values = {
             name: getattr(self.image_processor, name)
             for name in overrides
             if hasattr(self.image_processor, name)
         }
+        old_video_values = {
+            name: getattr(self.video_processor, name)
+            for name in video_overrides
+            if hasattr(self.video_processor, name)
+        }
         for name, value in overrides.items():
             setattr(self.image_processor, name, value)
+        for name, value in video_overrides.items():
+            setattr(self.video_processor, name, value)
 
         # MiniCPM chat templates already include control tokens.
         # Adding tokenizer-level special tokens here can destabilize decoding.
@@ -909,24 +1418,38 @@ class MiniCPMVProcessor(ProcessorMixin):
             texts = self._normalize_text(text)
             batch_size = len(texts)
             batched_images = self._normalize_images(images, batch_size, texts)
+            batched_videos = self._normalize_videos(videos, batch_size, texts)
             image_inputs = self.image_processor.preprocess(batched_images)
-            token_divisor = (
+            video_inputs = self.video_processor.preprocess(batched_videos)
+            image_token_divisor = (
                 4
                 if getattr(self.image_processor, "downsample_mode", "16x") == "4x"
+                else 16
+            )
+            video_token_divisor = (
+                4
+                if getattr(self.video_processor, "downsample_mode", "16x") == "4x"
                 else 16
             )
 
             input_ids_list: List[np.ndarray] = []
             image_bounds_list: List[np.ndarray] = []
+            pixel_values_list: List[List[np.ndarray]] = []
+            tgt_sizes_list: List[np.ndarray] = []
 
             for i, prompt in enumerate(texts):
                 prompt = self._strip_think_prefix(prompt)
-                ids = self._encode_with_image_placeholders(
+                ids, feature_order = self._encode_with_multimodal_placeholders(
                     prompt,
-                    patch_target_sizes=image_inputs["tgt_sizes"][i],
+                    image_patch_target_sizes=image_inputs["tgt_sizes"][i],
                     image_grids=image_inputs["grids"][i],
                     num_patches_per_image=image_inputs["num_patches_per_image"][i],
-                    token_divisor=token_divisor,
+                    video_patch_target_sizes=video_inputs["tgt_sizes_videos"][i],
+                    video_grids=video_inputs["grids_videos"][i],
+                    num_patches_per_frame=video_inputs["num_patches_per_frame"][i],
+                    num_frames_per_video=video_inputs["num_frames_per_video"][i],
+                    image_token_divisor=image_token_divisor,
+                    video_token_divisor=video_token_divisor,
                     add_special_tokens=encode_add_special_tokens,
                 )
                 if self.listen_token_id is not None and self.listen_token_id >= 0:
@@ -938,8 +1461,32 @@ class MiniCPMVProcessor(ProcessorMixin):
 
                 ids_array = np.array(ids, dtype=np.int32)
                 input_ids_list.append(ids_array)
+
+                sample_pixels = (
+                    list(image_inputs["pixel_values"][i])
+                    + list(video_inputs["pixel_values_videos"][i])
+                )
+                image_tgt = np.asarray(image_inputs["tgt_sizes"][i], dtype=np.int32)
+                video_tgt = np.asarray(
+                    video_inputs["tgt_sizes_videos"][i], dtype=np.int32
+                )
+                if image_tgt.size > 0 and video_tgt.size > 0:
+                    sample_tgt = np.concatenate([image_tgt, video_tgt], axis=0)
+                elif image_tgt.size > 0:
+                    sample_tgt = image_tgt
+                elif video_tgt.size > 0:
+                    sample_tgt = video_tgt
+                else:
+                    sample_tgt = np.zeros((0, 2), dtype=np.int32)
+
+                if feature_order:
+                    sample_pixels = [sample_pixels[idx] for idx in feature_order]
+                    sample_tgt = sample_tgt[np.asarray(feature_order, dtype=np.int32)]
+                pixel_values_list.append(sample_pixels)
+                tgt_sizes_list.append(sample_tgt.astype(np.int32))
+
                 image_bounds = self._compute_image_bounds(ids_array)
-                expected_features = len(image_inputs["pixel_values"][i])
+                expected_features = len(sample_pixels)
                 if expected_features != int(image_bounds.shape[0]):
                     raise ValueError(
                         "MiniCPM-V image placeholder count does not match processed "
@@ -966,16 +1513,22 @@ class MiniCPMVProcessor(ProcessorMixin):
             return {
                 "input_ids": padded_input_ids,
                 "attention_mask": attention_mask,
-                "pixel_values": image_inputs["pixel_values"],
+                "pixel_values": pixel_values_list,
                 "image_sizes": image_inputs["image_sizes"],
-                "tgt_sizes": image_inputs["tgt_sizes"],
+                "video_sizes": video_inputs["video_sizes"],
+                "tgt_sizes": tgt_sizes_list,
                 "grids": image_inputs["grids"],
+                "grids_videos": video_inputs["grids_videos"],
                 "num_patches_per_image": image_inputs["num_patches_per_image"],
+                "num_patches_per_frame": video_inputs["num_patches_per_frame"],
+                "num_frames_per_video": video_inputs["num_frames_per_video"],
                 "image_bound": image_bounds_list,
             }
         finally:
             for name, value in old_values.items():
                 setattr(self.image_processor, name, value)
+            for name, value in old_video_values.items():
+                setattr(self.video_processor, name, value)
 
     def apply_chat_template(self, *args, **kwargs):
         add_generation_prompt = bool(kwargs.get("add_generation_prompt", False))
@@ -1002,8 +1555,13 @@ class MiniCPMVProcessor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = getattr(self.tokenizer, "model_input_names", [])
         image_input_names = getattr(self.image_processor, "model_input_names", [])
+        video_input_names = getattr(self.video_processor, "model_input_names", [])
         return list(
-            dict.fromkeys(list(tokenizer_input_names) + list(image_input_names))
+            dict.fromkeys(
+                list(tokenizer_input_names)
+                + list(image_input_names)
+                + list(video_input_names)
+            )
         )
 
     @classmethod
@@ -1043,8 +1601,12 @@ class MiniCPMVProcessor(ProcessorMixin):
         image_processor = MiniCPMVImageProcessor.from_pretrained(
             pretrained_model_name_or_path, **hf_kwargs
         )
+        video_processor = MiniCPMVVideoProcessor.from_pretrained(
+            pretrained_model_name_or_path, **hf_kwargs
+        )
         return cls(
             image_processor=image_processor,
+            video_processor=video_processor,
             tokenizer=tokenizer,
             chat_template=chat_template,
         )
@@ -1052,6 +1614,7 @@ class MiniCPMVProcessor(ProcessorMixin):
 
 # Backward-compatible aliases for any existing internal imports.
 MiniCPMOImageProcessor = MiniCPMVImageProcessor
+MiniCPMOVideoProcessor = MiniCPMVVideoProcessor
 MiniCPMOProcessor = MiniCPMVProcessor
 
 install_auto_processor_patch(["minicpmv4_6"], MiniCPMVProcessor)
