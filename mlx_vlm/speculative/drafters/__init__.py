@@ -10,6 +10,7 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp"}
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
     "gemma4_assistant": "mtp",
+    "qwen3_5_mtp": "mtp",
 }
 
 DEFAULT_DRAFTER_KIND = "dflash"

@@ -81,6 +81,9 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
         self._tokenizer.decode([0])
         self.reset()
 
+    def __copy__(self):
+        return type(self)(self._tokenizer)
+
     def reset(self):
         self.offset = 0
         self._tokens = []

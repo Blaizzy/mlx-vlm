@@ -15,6 +15,173 @@ from mlx_lm.models.cache import (
 )
 
 
+class BufferedRotatingKVCache(RotatingKVCache):
+    """Temporal sliding-window cache with rollback slack for speculative blocks."""
+
+    def __init__(self, max_size: int, keep: int = 0, buffer_size: int = 64):
+        super().__init__(max_size=max_size, keep=keep)
+        self.buffer_size = max(0, int(buffer_size))
+        self.start_position = 0
+
+    @classmethod
+    def from_cache(
+        cls, other: RotatingKVCache, buffer_size: int = 64
+    ) -> "BufferedRotatingKVCache":
+        cache = cls(other.max_size, other.keep, buffer_size=buffer_size)
+        cache.offset = int(other.offset)
+        if other.keys is None:
+            return cache
+
+        keys = other._temporal_order(other.keys)
+        values = other._temporal_order(other.values)
+        keep = min(int(keys.shape[2]), other.max_size)
+        if keep < int(keys.shape[2]):
+            keys = keys[..., -keep:, :]
+            values = values[..., -keep:, :]
+
+        cache.start_position = cache.offset - keep
+        cache._idx = keep
+        capacity = cache._capacity_for(keep)
+        k_shape = (*keys.shape[:2], capacity, keys.shape[-1])
+        v_shape = (*values.shape[:2], capacity, values.shape[-1])
+        cache.keys = mx.zeros(k_shape, dtype=keys.dtype)
+        cache.values = mx.zeros(v_shape, dtype=values.dtype)
+        cache.keys[..., :keep, :] = keys
+        cache.values[..., :keep, :] = values
+        return cache
+
+    def _target_size(self, incoming: int = 0) -> int:
+        return self.max_size + max(self.buffer_size, incoming)
+
+    def _capacity_for(self, needed: int) -> int:
+        target = max(needed, self._target_size())
+        return ((target + self.step - 1) // self.step) * self.step
+
+    def _planned_drop(self, incoming: int) -> int:
+        needed = self._idx + incoming
+        target_size = self._target_size(incoming)
+        if needed <= target_size:
+            return 0
+        target_start = max(0, self.offset - self.max_size + 1)
+        return min(max(0, target_start - self.start_position), self._idx)
+
+    def _compact(self, drop: int) -> None:
+        if drop <= 0:
+            return
+        keep = self._idx - drop
+        keys = self.keys[..., drop : self._idx, :]
+        values = self.values[..., drop : self._idx, :]
+        capacity = self.keys.shape[2]
+        new_keys = mx.zeros((*keys.shape[:2], capacity, keys.shape[-1]), keys.dtype)
+        new_values = mx.zeros(
+            (*values.shape[:2], capacity, values.shape[-1]), values.dtype
+        )
+        new_keys[..., :keep, :] = keys
+        new_values[..., :keep, :] = values
+        self.keys = new_keys
+        self.values = new_values
+        self.start_position += drop
+        self._idx = keep
+
+    def _ensure_capacity(self, keys: mx.array, values: mx.array, needed: int) -> None:
+        if self.keys is not None and needed <= self.keys.shape[2]:
+            return
+
+        capacity = self._capacity_for(needed)
+        k_shape = (*keys.shape[:2], capacity, keys.shape[-1])
+        v_shape = (*values.shape[:2], capacity, values.shape[-1])
+        new_keys = mx.zeros(k_shape, dtype=keys.dtype)
+        new_values = mx.zeros(v_shape, dtype=values.dtype)
+        if self.keys is not None and self._idx > 0:
+            new_keys[..., : self._idx, :] = self.keys[..., : self._idx, :]
+            new_values[..., : self._idx, :] = self.values[..., : self._idx, :]
+        self.keys = new_keys
+        self.values = new_values
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if self.keep:
+            return super().update_and_fetch(keys, values)
+
+        incoming = int(keys.shape[2])
+        drop = self._planned_drop(incoming)
+        self._compact(drop)
+        needed = self._idx + incoming
+        self._ensure_capacity(keys, values, needed)
+
+        self.keys[..., self._idx : needed, :] = keys
+        self.values[..., self._idx : needed, :] = values
+        self._idx = needed
+        self.offset += incoming
+        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+    def trim(self, n):
+        n = min(int(n), self._idx, self.offset)
+        self.offset -= n
+        self._idx -= n
+        return n
+
+    def is_trimmable(self):
+        return True
+
+    def make_mask(
+        self, N: int, window_size: Optional[int] = None, return_array: bool = False
+    ):
+        if self.keep:
+            return super().make_mask(
+                N, window_size=window_size, return_array=return_array
+            )
+
+        window_size = window_size or self.max_size
+        drop = self._planned_drop(N)
+        start = self.start_position + drop
+        end = self.offset + N
+        key_len = end - start
+        if N == 1 and key_len <= window_size and not return_array:
+            return None
+
+        q_idx = mx.arange(self.offset, end)[:, None]
+        k_idx = mx.arange(start, end)[None, :]
+        mask = (q_idx >= k_idx) & (q_idx < k_idx + window_size)
+        if N > 1 and key_len <= window_size and not return_array:
+            return "causal"
+        return mask
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+    @state.setter
+    def state(self, v):
+        self.keys, self.values = v
+        self._idx = 0 if self.keys is None else int(self.keys.shape[2])
+        self.start_position = max(0, int(self.offset) - self._idx)
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(
+                str,
+                (
+                    self.keep,
+                    self.max_size,
+                    self.offset,
+                    self._idx,
+                    self.start_position,
+                    self.buffer_size,
+                ),
+            )
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        vals = list(map(int, v))
+        self.keep, self.max_size, self.offset, self._idx = vals[:4]
+        self.start_position = vals[4] if len(vals) > 4 else 0
+        self.buffer_size = vals[5] if len(vals) > 5 else 64
+
+
 class BatchQuantizedKVCache(_BaseCache):
     """Batch-aware quantized KV cache for continuous batching.
 
