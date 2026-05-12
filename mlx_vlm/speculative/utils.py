@@ -394,21 +394,24 @@ def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
         return None
 
     rounds = len(accepted_lens)
-    mean_accept = sum(accepted_lens) / rounds
+    accepted_drafts = sum(accepted_lens)
+    mean_accept = accepted_drafts / rounds
+    mean_accepted_tokens = (accepted_drafts + rounds) / rounds
     draft_lens = getattr(draft_model, "draft_lens", None) or []
     if len(draft_lens) == rounds and sum(draft_lens) > 0:
-        accept_rate = 100 * sum(accepted_lens) / sum(draft_lens)
+        accept_rate = 100 * accepted_drafts / sum(draft_lens)
         mean_draft = sum(draft_lens) / rounds
         return (
             "Speculative decoding: "
-            f"{mean_accept:.2f} accepted tokens/round "
-            f"({accept_rate:.1f}% of drafted, "
+            f"{mean_accepted_tokens:.2f} accepted tokens/round "
+            f"({mean_accept:.2f} accepted drafts/round, "
+            f"{accept_rate:.1f}% of drafted, "
             f"avg draft {mean_draft:.2f}) over {rounds} rounds"
         )
 
     return (
         "Speculative decoding: "
-        f"{mean_accept:.2f} accepted tokens over {rounds} rounds"
+        f"{mean_accepted_tokens:.2f} accepted tokens over {rounds} rounds"
     )
 
 

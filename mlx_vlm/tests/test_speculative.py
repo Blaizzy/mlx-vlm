@@ -7,7 +7,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 import importlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -715,8 +715,9 @@ def test_format_speculative_stats_includes_variable_draft_rate():
     )
 
     assert (
-        stats == "Speculative decoding: 1.00 accepted tokens/round "
-        "(60.0% of drafted, avg draft 1.67) over 3 rounds"
+        stats == "Speculative decoding: 2.00 accepted tokens/round "
+        "(1.00 accepted drafts/round, 60.0% of drafted, "
+        "avg draft 1.67) over 3 rounds"
     )
 
 
@@ -1062,7 +1063,7 @@ def test_eagle3_config_uses_speculators_fields():
     )
 
     assert cfg.model_type == "eagle3"
-    assert cfg.block_size == 4
+    assert cfg.block_size == 5
     assert cfg.target_layer_ids == [2, 30, 57]
     assert cfg.capture_layer_ids == [1, 29, 56]
     assert cfg.transformer_layer_config.hidden_size == 8
@@ -1075,6 +1076,67 @@ def test_eagle3_prefill_uses_mlx_capture_layer_indexes():
     assert speculative_prefill_kwargs("eagle3", drafter) == {
         "capture_layer_ids": [1, 29, 56]
     }
+
+
+def test_eagle3_accept_replays_committed_tokens_with_verifier_hidden():
+    cfg = Eagle3Config(
+        draft_vocab_size=8,
+        transformer_layer_config=Eagle3TextConfig(
+            hidden_size=4,
+            intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=4,
+            vocab_size=16,
+        ),
+    )
+    drafter = Eagle3DraftModel(cfg)
+
+    class FakeCache:
+        def __init__(self):
+            self.trimmed = []
+
+        def trim(self, n):
+            self.trimmed.append(n)
+
+    fake_cache = FakeCache()
+    drafter._cache = [fake_cache]
+    drafter._round_appended = 2
+    drafter._next_position = 7
+    calls = {}
+
+    def fake_forward(self, tokens, hiddens, token_dtype):
+        calls["tokens"] = tokens
+        calls["hiddens"] = hiddens
+        calls["token_dtype"] = token_dtype
+        return mx.zeros((1, tokens.shape[1], self.hidden_size), dtype=mx.float32)
+
+    def fake_seed(self, hidden, sampler, token_dtype, greedy):
+        calls["seed_shape"] = hidden.shape
+        calls["greedy"] = greedy
+
+    drafter._forward_tokens = MethodType(fake_forward, drafter)
+    drafter._set_seed_from_hidden = MethodType(fake_seed, drafter)
+
+    verify_hidden = mx.arange(4 * 12, dtype=mx.float32).reshape(1, 4, 12)
+    draft_tokens = mx.array([[10, 11, 12]], dtype=mx.int32)
+
+    drafter.accept_verified_tokens(
+        verify_hidden,
+        draft_tokens,
+        accepted=2,
+        new_tokens=[10, 11, 99],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+
+    assert fake_cache.trimmed == [2]
+    assert drafter._next_position == 5
+    assert calls["tokens"].tolist() == [[10, 11, 99]]
+    assert calls["hiddens"].tolist() == verify_hidden[:, :3, :].tolist()
+    assert calls["greedy"] is True
 
 
 def test_eagle3_draft_vocab_mapping_uses_d2t_offsets():

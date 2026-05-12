@@ -47,7 +47,7 @@ class Eagle3Config(BaseModelConfig):
     norm_before_fc: bool = False
     embed_requires_grad: bool = False
     eagle_aux_hidden_state_layer_ids: Optional[List[int]] = None
-    block_size: int = 4
+    block_size: int = 5
     target_layer_ids: List[int] = field(default_factory=list)
     capture_layer_ids: List[int] = field(default_factory=list)
 
@@ -81,7 +81,11 @@ class Eagle3Config(BaseModelConfig):
         if proposal_methods:
             speculative_tokens = proposal_methods[0].get("speculative_tokens")
             if speculative_tokens is not None:
-                flat.setdefault("block_size", int(speculative_tokens) + 1)
+                # SGLang's top-k=1 EAGLE path verifies one draft-extend token
+                # plus ``speculative_num_steps`` autoregressive draft forwards.
+                # ``block_size`` includes the verifier bonus slot, so add two:
+                # one for the draft-extend token and one for the bonus.
+                flat.setdefault("block_size", int(speculative_tokens) + 2)
 
         if "model_type" not in flat:
             flat["model_type"] = flat.get("speculators_model_type", "eagle3")

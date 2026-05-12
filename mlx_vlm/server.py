@@ -932,13 +932,12 @@ class ResponseGenerator:
                 gc.collect()
 
     def _run_speculative(self):
-        """GPU thread loop with DFlash or Gemma 4 MTP speculative decoding.
+        """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
 
         Collects incoming requests, prefills them as a batch with the
-        per-family hooks (``capture_layer_ids`` for DFlash; ``return_hidden``
-        + ``return_shared_kv`` for MTP), then runs the matching round-loop
-        for decode. Finished sequences are filtered out automatically by
-        the round-loop's ``stop_check`` callback.
+        per-family hooks, then runs the matching round-loop for decode.
+        Finished sequences are filtered out automatically by the round-loop's
+        ``stop_check`` callback.
         """
         from mlx_lm.sample_utils import make_sampler as _make_sampler
 
@@ -1138,9 +1137,9 @@ class ResponseGenerator:
                 # Log acceptance stats
                 al = drafter.accept_lens
                 if al:
-                    mean_a = sum(al) / len(al)
+                    mean_a = (sum(al) + len(al)) / len(al)
                     print(
-                        f"[{'MTP' if is_mtp else 'DFlash'}] batch={B} "
+                        f"[{draft_kind.upper()}] batch={B} "
                         f"tokens={sum(len(token_lists[u]) for u in uids)} "
                         f"accept={mean_a:.2f} rounds={len(al)}"
                     )

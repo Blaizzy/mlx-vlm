@@ -207,36 +207,8 @@ class Eagle3DraftModel(nn.Module):
         self.draft_lens: List[int] = []
 
     def bind(self, target_model) -> "Eagle3DraftModel":
-        embed = self._find_target_embedding(target_model)
-        if embed is not None:
-            weight = getattr(embed, "weight", None)
-            if weight is not None and tuple(weight.shape) == (
-                self.target_vocab_size,
-                self.hidden_size,
-            ):
-                # SGLang feeds EAGLE-3 with the verifier token embedding. The
-                # checkpoint may carry a copy, but sharing the verifier module
-                # avoids subtle conversion drift.
-                self.embed_tokens = embed
+        del target_model
         return self
-
-    def _find_target_embedding(self, target_model):
-        candidates = [target_model]
-        for attr in ("language_model", "model"):
-            obj = getattr(target_model, attr, None)
-            if obj is not None:
-                candidates.append(obj)
-        lm = getattr(target_model, "language_model", None)
-        if lm is not None:
-            obj = getattr(lm, "model", None)
-            if obj is not None:
-                candidates.append(obj)
-
-        for obj in candidates:
-            embed = getattr(obj, "embed_tokens", None)
-            if embed is not None:
-                return embed
-        return None
 
     def make_cache(self) -> List[KVCache]:
         return [KVCache() for _ in self.layers]
@@ -380,8 +352,11 @@ class Eagle3DraftModel(nn.Module):
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
     ) -> None:
-        keep_appended = min(int(accepted), self._round_appended)
-        trim = self._round_appended - keep_appended
+        # SGLang runs a draft-extend pass after verification using the
+        # verifier hidden states for the accepted output tokens. Drop the
+        # speculative K/V entries, which were built from draft-predicted
+        # hiddens, and replay the committed tokens with verifier hiddens.
+        trim = self._round_appended
         if trim > 0:
             for cache in self._cache:
                 cache.trim(trim)
@@ -394,7 +369,7 @@ class Eagle3DraftModel(nn.Module):
         token_chunks = []
         hidden_chunks = []
         accepted = int(accepted)
-        for draft_idx in range(keep_appended, accepted):
+        for draft_idx in range(accepted):
             token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
             hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
 
@@ -438,8 +413,7 @@ class Eagle3DraftModel(nn.Module):
             )
         accepted_i = accepted_set.pop()
 
-        keep_appended = min(accepted_i, self._round_appended)
-        trim = self._round_appended - keep_appended
+        trim = self._round_appended
         if trim > 0:
             for cache in self._cache:
                 cache.trim(trim)
@@ -451,7 +425,7 @@ class Eagle3DraftModel(nn.Module):
 
         token_chunks = []
         hidden_chunks = []
-        for draft_idx in range(keep_appended, accepted_i):
+        for draft_idx in range(accepted_i):
             token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
             hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
 
