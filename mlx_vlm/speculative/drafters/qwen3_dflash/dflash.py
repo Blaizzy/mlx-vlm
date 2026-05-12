@@ -2,7 +2,6 @@ from typing import List
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_causal_mask
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.qwen3 import MLP as Qwen3MLP
 from mlx_lm.models.rope_utils import initialize_rope
@@ -79,18 +78,12 @@ class DFlashAttention(nn.Module):
         ctx_keys = rope(ctx_keys, offset=cache.offset)
         prop_keys = rope(prop_keys, offset=cache.offset + S)
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
-        ctx_len = keys.shape[2]
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
+        # DFlash denoises the whole proposed block at once, so draft-block
+        # self-attention is intentionally non-causal. Sliding layers already
+        # limit resident prefix context through the rotating cache above.
         mask = None
-        if self.is_sliding:
-            mask = (
-                "causal"
-                if ctx_len + L <= self.sliding_window
-                else create_causal_mask(
-                    L, offset=ctx_len, window_size=self.sliding_window
-                )
-            )
         o = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )

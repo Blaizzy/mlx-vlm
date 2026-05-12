@@ -27,7 +27,7 @@ class DFlashConfig(BaseModelConfig):
     layer_types: List[str] = field(default_factory=list)
     sliding_window: Optional[int] = None
     final_logit_softcapping: Optional[float] = None
-    runtime_block_size: int | None = 14
+    runtime_block_size: int | None = None
     draft_window_size: int | None = None
 
     @classmethod

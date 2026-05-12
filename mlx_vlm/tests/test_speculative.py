@@ -33,6 +33,7 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
 from mlx_vlm.speculative.utils import (
+    _dflash_next_block_size,
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
@@ -711,6 +712,57 @@ def test_dflash_block_total_falls_back_to_configured_block_size():
     assert speculative_utils._dflash_block_total(draft_model, None) == 16
 
 
+def test_dflash_config_defaults_to_checkpoint_block_size():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    draft_model = SimpleNamespace(config=config)
+
+    assert config.runtime_block_size is None
+    assert speculative_utils._dflash_block_total(draft_model, None) == 16
+
+
+def test_dflash_next_block_size_starts_at_requested_ceiling():
+    draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 16
+
+
+def test_dflash_next_block_size_backs_off_on_low_acceptance():
+    draft_model = SimpleNamespace(accept_lens=[1, 2], draft_lens=[15, 7])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 4
+
+
+def test_dflash_next_block_size_grows_after_full_prefix_hits():
+    draft_model = SimpleNamespace(accept_lens=[3, 3, 3, 3], draft_lens=[3, 3, 3, 3])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 6
+
+
+def test_dflash_next_block_size_does_not_grow_on_middling_acceptance():
+    draft_model = SimpleNamespace(accept_lens=[3, 2, 1, 3], draft_lens=[3, 3, 3, 3])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 4
+
+
+def test_dflash_next_block_size_can_prefer_requested_size():
+    draft_model = SimpleNamespace(
+        accept_lens=[0] * 4,
+        draft_lens=[15] * 4,
+        prefer_requested_block_size=True,
+    )
+
+    assert _dflash_next_block_size(draft_model, 16, 8) == 8
+
+
 def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     hidden = mx.arange(12, dtype=mx.float32).reshape(2, 3, 2)
 
@@ -724,7 +776,7 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
-def test_gemma4_26b_dflash_config_uses_zero_based_capture_layers():
+def test_gemma4_26b_dflash_config_preserves_capture_layers():
     config = Gemma4DFlashConfig.from_dict(
         {
             "hidden_size": 4,
@@ -739,7 +791,8 @@ def test_gemma4_26b_dflash_config_uses_zero_based_capture_layers():
         }
     )
 
-    assert config.target_layer_ids == [0, 5, 10]
+    assert config.target_layer_ids == [1, 6, 11]
+    assert config.runtime_block_size is None
 
 
 def test_gemma4_31b_dflash_config_preserves_capture_layers():
@@ -758,6 +811,51 @@ def test_gemma4_31b_dflash_config_preserves_capture_layers():
     )
 
     assert config.target_layer_ids == [1, 12, 23]
+    assert config.runtime_block_size is None
+
+
+def test_gemma4_dflash_config_honors_runtime_block_override():
+    config = Gemma4DFlashConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 30,
+            "dflash_config": {
+                "target_layer_ids": [1, 6, 11],
+                "runtime_block_size": 12,
+            },
+        }
+    )
+
+    assert config.target_layer_ids == [1, 6, 11]
+    assert config.runtime_block_size == 12
+
+
+def test_generic_dflash_config_parses_gemma4_metadata_without_runtime_cap():
+    config = ModelConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 30,
+            "dflash_config": {
+                "mask_token_id": 4,
+                "target_layer_ids": [1, 6, 11],
+            },
+        }
+    )
+
+    assert config.target_layer_ids == [1, 6, 11]
+    assert config.runtime_block_size is None
 
 
 def test_dflash_drafter_uses_bound_target_embedding_scale():

@@ -379,6 +379,57 @@ def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int])
     return min(configured, max(1, int(runtime)))
 
 
+def _dflash_next_block_size(
+    draft_model: nn.Module,
+    requested_block_total: int,
+    remaining_budget: int,
+) -> int:
+    """Choose the next DFlash verify block size from recent acceptance.
+
+    DFlash checkpoints advertise a trained block size, usually 16. Treat that
+    as the ceiling and back off quickly when deeper positions are mostly
+    rejected. When acceptance is strong at the current depth, grow back toward
+    the configured ceiling.
+    """
+    block_total = min(requested_block_total, remaining_budget)
+    if block_total <= 1:
+        return block_total
+    if getattr(draft_model, "prefer_requested_block_size", False):
+        return block_total
+
+    accept_lens = getattr(draft_model, "accept_lens", None) or []
+    draft_lens = getattr(draft_model, "draft_lens", None) or []
+    recent = [
+        (float(a), int(d))
+        for a, d in zip(accept_lens[-8:], draft_lens[-8:])
+        if int(d) > 0
+    ]
+    if not recent:
+        return block_total
+
+    current = min(block_total, max(2, recent[-1][1] + 1))
+    min_total = min(block_total, 4)
+    drafted = sum(d for _, d in recent)
+    accepted = sum(a for a, _ in recent)
+    accept_rate = accepted / drafted
+    mean_accept = accepted / len(recent)
+
+    if accept_rate < 0.30 or mean_accept < 2.0:
+        if current >= 8:
+            return max(min_total, min(block_total, current // 2))
+        return max(min_total, min(block_total, current - 2))
+
+    if accept_rate < 0.50:
+        return max(min_total, min(block_total, current - 2))
+
+    full_hits = sum(1 for a, d in recent if a >= d)
+    full_hit_rate = full_hits / len(recent)
+    if accept_rate >= 0.85 and full_hit_rate >= 0.75:
+        return min(block_total, current + 2)
+
+    return min(block_total, current)
+
+
 def _dflash_committed_hidden_segments(
     hidden_full: mx.array, new_tokens_list: List[List[int]]
 ) -> List[mx.array]:
@@ -1073,7 +1124,11 @@ def _dflash_rounds(
     emitted = 1  # the first bonus has already been yielded by the caller
 
     while emitted < max_tokens:
-        bs = min(block_total, max_tokens - emitted + 1)
+        bs = _dflash_next_block_size(
+            draft_model,
+            block_total,
+            max_tokens - emitted + 1,
+        )
         if bs <= 1:
             break
 
@@ -1176,7 +1231,7 @@ def _dflash_rounds_batch(
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = min(block_total, min(remaining))
+        bs = _dflash_next_block_size(draft_model, block_total, min(remaining))
         if bs <= 1:
             break
 
