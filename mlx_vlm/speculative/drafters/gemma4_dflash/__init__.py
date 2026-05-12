@@ -5,14 +5,11 @@ from ..qwen3_dflash.dflash import DFlashDraftModel, DFlashKVCache
 class Gemma4DFlashConfig(DFlashConfig):
     @classmethod
     def from_dict(cls, params: dict) -> "Gemma4DFlashConfig":
-        config = super().from_dict(params)
-        if config.num_target_layers == 30:
-            # The 26B-A4B DFlash checkpoint publishes one-based target layer ids
-            # for the MLX Gemma4 capture path.
-            config.target_layer_ids = [
-                max(0, layer_id - 1) for layer_id in config.target_layer_ids
-            ]
-        return config
+        flat = dict(params)
+        dflash_cfg = dict(flat.get("dflash_config", None) or {})
+        dflash_cfg.setdefault("mask_token_id", 4)
+        flat["dflash_config"] = dflash_cfg
+        return super().from_dict(flat)
 
     from_hf_dict = from_dict
 
