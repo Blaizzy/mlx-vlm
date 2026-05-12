@@ -21,18 +21,20 @@ def _speculative_walk(
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
     """
-    draft_list = [int(token) for token in draft_tokens.reshape(-1).tolist()]
-    target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
-    accepted = 0
-    for draft_token, target_token in zip(draft_list, target_list):
-        if draft_token != target_token:
-            break
-        accepted += 1
-
-    new_tokens = draft_list[:accepted]
-    if len(new_tokens) < budget:
-        new_tokens.append(target_list[accepted])
-    new_tokens = new_tokens[:budget]
+    n_draft = draft_tokens.shape[1]
+    mismatch = draft_tokens[:, :n_draft] != target_tokens[:, :n_draft]
+    mismatch = mismatch.reshape(-1)
+    has_mismatch = bool(mx.any(mismatch).item())
+    accepted = (
+        int(mx.argmax(mismatch.astype(mx.int32)).item()) if has_mismatch else n_draft
+    )
+    accepted_prefix = draft_tokens[:, :accepted]
+    bonus = target_tokens[:, accepted : accepted + 1]
+    new_tokens = (
+        mx.concatenate([accepted_prefix, bonus], axis=1)[:, :budget]
+        .reshape(-1)
+        .tolist()
+    )
     return accepted, new_tokens
 
 
@@ -98,14 +100,6 @@ class _MTPVerifyResult:
     shared_kv_states: dict
     target_tokens: Optional[mx.array] = None
     gdn_states: Optional[list] = None
-
-
-@dataclass
-class _Eagle3VerifyResult:
-    hidden: mx.array
-    target_tokens: Optional[mx.array]
-    gdn_states: Optional[list]
-    target_hidden: Optional[mx.array] = None
 
 
 def _mtp_shared_kv_from_prompt_cache(
@@ -262,32 +256,25 @@ def _speculative_walk_deferred_greedy(
     draft_list = [int(x) for x in draft_tokens.reshape(-1).tolist()]
     accepted = 0
     new_tokens: List[int] = []
-    pos = 0
-    chunk_size = 2
 
-    while pos < n_draft + 1:
-        end = min(pos + chunk_size, n_draft + 1)
+    for pos in range(n_draft + 1):
         with mx.stream(generation_stream):
             logits = lm.speculative_logits_from_hidden(
-                target_hidden[:, pos:end, :]
+                target_hidden[:, pos : pos + 1, :]
             )
-            target_tokens = sampler(logits)
-        mx.eval(target_tokens)
+            target_token = sampler(logits)
+        mx.eval(target_token)
+        token = int(target_token.reshape(-1).item())
 
-        for offset, token in enumerate(target_tokens.reshape(-1).tolist()):
-            pos_i = pos + offset
-            token = int(token)
-            if pos_i < n_draft and token == draft_list[pos_i]:
-                accepted += 1
-                if len(new_tokens) < budget:
-                    new_tokens.append(token)
-                continue
-
+        if pos < n_draft and token == draft_list[pos]:
+            accepted += 1
             if len(new_tokens) < budget:
                 new_tokens.append(token)
-            return accepted, new_tokens
+            continue
 
-        pos = end
+        if len(new_tokens) < budget:
+            new_tokens.append(token)
+        break
 
     return accepted, new_tokens
 
@@ -1145,29 +1132,7 @@ def _eagle3_verify_target(
     prompt_cache: List[Any],
     sampler: Callable[[mx.array], mx.array],
     target_layer_ids: List[int],
-    greedy_sampling: bool = False,
-) -> _Eagle3VerifyResult:
-    if (
-        greedy_sampling
-        and callable(getattr(lm, "speculative_logits_from_hidden", None))
-        and hasattr(lm, "model")
-    ):
-        hidden_sink: List[mx.array] = []
-        target_hidden = lm.model(
-            verify_input,
-            cache=prompt_cache,
-            capture_layer_ids=target_layer_ids,
-            hidden_sink=hidden_sink,
-            skip_final_norm=True,
-        )
-        hidden = mx.concatenate(hidden_sink, axis=-1)
-        return _Eagle3VerifyResult(
-            hidden=hidden,
-            target_tokens=None,
-            gdn_states=None,
-            target_hidden=target_hidden,
-        )
-
+):
     verify_out = lm(
         verify_input,
         cache=prompt_cache,
@@ -1175,11 +1140,7 @@ def _eagle3_verify_target(
     )
     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
     target_tokens = sampler(verify_out.logits)
-    return _Eagle3VerifyResult(
-        hidden=hidden,
-        target_tokens=target_tokens,
-        gdn_states=verify_out.gdn_states,
-    )
+    return hidden, target_tokens, verify_out.gdn_states
 
 
 def _eagle3_capture_layer_ids(draft_model: nn.Module) -> List[int]:
@@ -1261,33 +1222,20 @@ def _eagle3_rounds(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
-            verify = _eagle3_verify_target(
+            verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
                 lm,
                 verify_input,
                 prompt_cache,
                 sampler,
                 target_layer_ids,
-                greedy_sampling,
             )
-        if verify.target_tokens is not None:
-            mx.async_eval(verify.target_tokens, verify.hidden)
-        else:
-            mx.async_eval(verify.hidden, verify.target_hidden)
+        mx.async_eval(target_tokens, verify_hidden)
 
-        if verify.target_tokens is not None:
-            accepted, new_tokens = _speculative_walk(
-                draft_tokens,
-                verify.target_tokens,
-                max_tokens - emitted,
-            )
-        else:
-            accepted, new_tokens = _speculative_walk_deferred_greedy(
-                lm,
-                verify.target_hidden,
-                draft_tokens,
-                sampler,
-                max_tokens - emitted,
-            )
+        accepted, new_tokens = _speculative_walk(
+            draft_tokens,
+            target_tokens,
+            max_tokens - emitted,
+        )
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
@@ -1299,7 +1247,7 @@ def _eagle3_rounds(
         accept_verified = getattr(draft_model, "accept_verified_tokens", None)
         if callable(accept_verified):
             accept_verified(
-                verify.hidden,
+                verify_hidden,
                 draft_tokens,
                 accepted,
                 new_tokens,
@@ -1308,14 +1256,12 @@ def _eagle3_rounds(
                 **_mtp_draft_kwargs(draft_model, greedy_sampling),
             )
 
-        hidden = verify.hidden[:, accepted : accepted + 1, :]
+        hidden = verify_hidden[:, accepted : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
             with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify.gdn_states, accepted, bs
-                )
+                lm.rollback_speculative_cache(prompt_cache, gdn_states, accepted, bs)
 
         if emitted % 256 == 0:
             mx.clear_cache()
@@ -1404,66 +1350,30 @@ def _eagle3_rounds_batch(
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify = _eagle3_verify_target(
+            verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
                 lm,
                 verify_input,
                 prompt_cache,
                 sampler,
                 target_layer_ids,
-                greedy_sampling,
             )
-        if verify.target_tokens is not None:
-            mx.async_eval(verify.target_tokens, verify.hidden)
-        else:
-            mx.async_eval(verify.hidden, verify.target_hidden)
+        mx.async_eval(target_tokens, verify_hidden)
 
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        if verify.target_tokens is not None:
-            accepted_list, new_tokens_list = _speculative_walk_batch(
-                draft_tokens, verify.target_tokens, budgets
-            )
-        else:
-            accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
-                lm,
-                verify.target_hidden,
-                draft_tokens,
-                sampler,
-                budgets,
-            )
+        accepted_list, new_tokens_list = _speculative_walk_batch(
+            draft_tokens, target_tokens, budgets
+        )
         if (
             n_active > 1
             and getattr(draft_model, "requires_uniform_batch_acceptance", False)
             and len(set(accepted_list)) > 1
         ):
-            if verify.target_tokens is not None:
-                (
-                    accepted_list,
-                    new_tokens_list,
-                ) = _speculative_walk_batch_uniform_acceptance(
-                    draft_tokens,
-                    verify.target_tokens,
-                    accepted_list,
-                    budgets,
-                )
-            else:
-                accepted = min(accepted_list)
-                with mx.stream(generation_stream):
-                    logits = lm.speculative_logits_from_hidden(
-                        verify.target_hidden[:, accepted : accepted + 1, :]
-                    )
-                    bonus_tokens = sampler(logits)
-                mx.eval(bonus_tokens)
-                bonus_list = [
-                    int(token) for token in bonus_tokens.reshape(-1).tolist()
-                ]
-                draft_lists = [
-                    [int(token) for token in row] for row in draft_tokens.tolist()
-                ]
-                new_tokens_list = [
-                    (draft_lists[i][:accepted] + [bonus_list[i]])[: budgets[i]]
-                    for i in range(n_active)
-                ]
-                accepted_list = [accepted] * n_active
+            accepted_list, new_tokens_list = _speculative_walk_batch_uniform_acceptance(
+                draft_tokens,
+                target_tokens,
+                accepted_list,
+                budgets,
+            )
         _record_speculative_round(
             draft_model,
             sum(accepted_list) / len(accepted_list),
@@ -1473,7 +1383,7 @@ def _eagle3_rounds_batch(
         accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
         if callable(accept_verified):
             accept_verified(
-                verify.hidden,
+                verify_hidden,
                 draft_tokens,
                 accepted_list,
                 new_tokens_list,
@@ -1484,7 +1394,7 @@ def _eagle3_rounds_batch(
 
         row_idx = mx.arange(n_active)
         col_idx = mx.array(accepted_list)
-        hidden = verify.hidden[row_idx, col_idx, :][:, None, :]
+        hidden = verify_hidden[row_idx, col_idx, :][:, None, :]
 
         max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
         for pos in range(max_new):
@@ -1513,7 +1423,7 @@ def _eagle3_rounds_batch(
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
                     prompt_cache,
-                    verify.gdn_states,
+                    gdn_states,
                     mx.array(accepted_list),
                     bs,
                 )
