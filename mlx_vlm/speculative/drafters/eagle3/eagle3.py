@@ -202,6 +202,7 @@ class Eagle3DraftModel(nn.Module):
         self._seed_hidden: Optional[mx.array] = None
         self._next_position: Any = 1
         self._round_appended = 0
+        self._adaptive_block_size: Optional[int] = None
 
         self.accept_lens: List[int] = []
         self.draft_lens: List[int] = []
@@ -222,6 +223,7 @@ class Eagle3DraftModel(nn.Module):
         self._seed_hidden = None
         self._next_position = 1
         self._round_appended = 0
+        self._adaptive_block_size = None
         return self._cache
 
     def _prepare_target_hidden(self, hidden: mx.array) -> mx.array:

@@ -8,6 +8,8 @@ from ..models import cache
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
+_EAGLE3_DEFAULT_MAX_BLOCK_SIZE = 12
+
 
 def _speculative_walk(
     draft_tokens: mx.array,
@@ -377,6 +379,77 @@ def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int])
     if runtime is None:
         return configured
     return min(configured, max(1, int(runtime)))
+
+
+def _eagle3_block_settings(
+    draft_model: nn.Module,
+    draft_block_size: Optional[int],
+) -> Tuple[int, int, bool]:
+    configured = int(draft_model.config.block_size)
+    if draft_block_size is not None:
+        return int(draft_block_size), configured, False
+
+    auto_max = getattr(
+        draft_model.config, "adaptive_max_block_size", _EAGLE3_DEFAULT_MAX_BLOCK_SIZE
+    )
+    auto_max = max(configured, int(auto_max))
+    return auto_max, configured, auto_max > configured
+
+
+def _eagle3_block_tiers(configured_block_total: int, max_block_total: int) -> List[int]:
+    tiers = [configured_block_total]
+    for tier in (8, 12, 16):
+        if configured_block_total < tier < max_block_total:
+            tiers.append(tier)
+    if max_block_total not in tiers:
+        tiers.append(max_block_total)
+    return sorted(set(max(2, int(tier)) for tier in tiers))
+
+
+def _eagle3_next_block_size(
+    draft_model: nn.Module,
+    max_block_total: int,
+    configured_block_total: int,
+    remaining_budget: int,
+    *,
+    adaptive: bool,
+) -> int:
+    if not adaptive:
+        return min(max_block_total, remaining_budget)
+
+    tiers = _eagle3_block_tiers(configured_block_total, max_block_total)
+    current = getattr(draft_model, "_adaptive_block_size", None)
+    if current is None:
+        current = tiers[0]
+
+    accepted = getattr(draft_model, "accept_lens", None) or []
+    drafted = getattr(draft_model, "draft_lens", None) or []
+    if len(accepted) >= 6 and len(drafted) >= 6:
+        recent_accept = [int(a) for a in accepted[-6:]]
+        recent_draft = [max(1, int(d)) for d in drafted[-6:]]
+        mean_output = sum(a + 1 for a in recent_accept) / len(recent_accept)
+        full_rate = sum(
+            1 for a, d in zip(recent_accept, recent_draft) if a >= d
+        ) / len(recent_accept)
+
+        tier_idx = tiers.index(min(tiers, key=lambda tier: abs(tier - current)))
+        # Probe a wider EAGLE window once after the checkpoint's conservative
+        # depth; some Gemma 4 continuations only expose long accept runs there.
+        if (
+            len(accepted) == 6
+            and current == configured_block_total
+            and len(tiers) > 1
+        ):
+            tier_idx = len(tiers) - 1
+        elif mean_output < 2.0 or (mean_output < 3.0 and full_rate == 0):
+            tier_idx = max(0, tier_idx - 1)
+        elif full_rate >= 0.33 or mean_output >= current * 0.75:
+            tier_idx = min(len(tiers) - 1, tier_idx + 1)
+        current = tiers[tier_idx]
+
+    current = min(current, max_block_total, remaining_budget)
+    draft_model._adaptive_block_size = current
+    return current
 
 
 def _dflash_committed_hidden_segments(
@@ -1175,8 +1248,9 @@ def _eagle3_rounds(
         )
 
     target_layer_ids = _eagle3_capture_layer_ids(draft_model)
-    block_total = _dflash_block_total(draft_model, draft_block_size)
-    configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
+    block_total, configured_block_total, adaptive_block_size = _eagle3_block_settings(
+        draft_model, draft_block_size
+    )
     draft_cache = draft_model.reset(model)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
@@ -1197,11 +1271,12 @@ def _eagle3_rounds(
     emitted = 1
 
     while emitted < max_tokens:
-        bs = _mtp_next_block_size(
+        bs = _eagle3_next_block_size(
             draft_model,
             block_total,
             configured_block_total,
             max_tokens - emitted + 1,
+            adaptive=adaptive_block_size,
         )
         if bs <= 1:
             break
@@ -1296,8 +1371,9 @@ def _eagle3_rounds_batch(
 
     B = first_bonus.shape[0]
     target_layer_ids = _eagle3_capture_layer_ids(draft_model)
-    block_total = _dflash_block_total(draft_model, draft_block_size)
-    configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
+    block_total, configured_block_total, adaptive_block_size = _eagle3_block_settings(
+        draft_model, draft_block_size
+    )
     draft_cache = draft_model.reset(model)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
@@ -1324,11 +1400,12 @@ def _eagle3_rounds_batch(
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
         ]
-        bs = _mtp_next_block_size(
+        bs = _eagle3_next_block_size(
             draft_model,
             block_total,
             configured_block_total,
             min(remaining),
+            adaptive=adaptive_block_size,
         )
         if bs <= 1:
             break

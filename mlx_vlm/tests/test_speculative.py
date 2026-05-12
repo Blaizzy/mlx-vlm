@@ -36,6 +36,8 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPCo
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.utils import (
+    _eagle3_block_settings,
+    _eagle3_next_block_size,
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
@@ -1076,6 +1078,83 @@ def test_eagle3_prefill_uses_mlx_capture_layer_indexes():
     assert speculative_prefill_kwargs("eagle3", drafter) == {
         "capture_layer_ids": [1, 29, 56]
     }
+
+
+def test_eagle3_adaptive_block_size_grows_and_backs_off():
+    cfg = Eagle3Config(
+        block_size=5,
+        transformer_layer_config=Eagle3TextConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            vocab_size=32,
+        ),
+    )
+    drafter = SimpleNamespace(config=cfg, accept_lens=[], draft_lens=[])
+    block_total, configured, adaptive = _eagle3_block_settings(drafter, None)
+
+    assert (block_total, configured, adaptive) == (12, 5, True)
+    assert (
+        _eagle3_next_block_size(
+            drafter, block_total, configured, 128, adaptive=adaptive
+        )
+        == 5
+    )
+
+    drafter.accept_lens = [0, 0, 1, 1, 0, 1]
+    drafter.draft_lens = [4, 4, 4, 4, 4, 4]
+    assert (
+        _eagle3_next_block_size(
+            drafter, block_total, configured, 128, adaptive=adaptive
+        )
+        == 12
+    )
+
+    drafter.accept_lens = [4, 0, 4, 0, 4, 0, 4]
+    drafter.draft_lens = [4, 4, 4, 4, 4, 4, 4]
+    drafter._adaptive_block_size = 5
+    assert (
+        _eagle3_next_block_size(
+            drafter, block_total, configured, 128, adaptive=adaptive
+        )
+        == 8
+    )
+
+    drafter.accept_lens = [0, 0, 0, 1, 1, 1]
+    drafter.draft_lens = [11, 11, 11, 11, 11, 11]
+    drafter._adaptive_block_size = 12
+    assert (
+        _eagle3_next_block_size(
+            drafter, block_total, configured, 128, adaptive=adaptive
+        )
+        == 8
+    )
+
+    drafter.accept_lens.extend([0, 0, 0, 0, 0, 0])
+    drafter.draft_lens.extend([7, 7, 7, 7, 7, 7])
+    assert (
+        _eagle3_next_block_size(
+            drafter, block_total, configured, 128, adaptive=adaptive
+        )
+        == 5
+    )
+
+
+def test_eagle3_user_block_size_disables_adaptive_block_size():
+    cfg = Eagle3Config(block_size=5)
+    drafter = SimpleNamespace(config=cfg, accept_lens=[0] * 6, draft_lens=[15] * 6)
+    block_total, configured, adaptive = _eagle3_block_settings(drafter, 16)
+
+    assert (block_total, configured, adaptive) == (16, 5, False)
+    assert (
+        _eagle3_next_block_size(
+            drafter, block_total, configured, 128, adaptive=adaptive
+        )
+        == 16
+    )
 
 
 def test_eagle3_accept_replays_committed_tokens_with_verifier_hidden():
