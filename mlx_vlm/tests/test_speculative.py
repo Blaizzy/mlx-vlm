@@ -213,14 +213,7 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
         return out, next_state
 
-    with (
-        patch.object(
-            qwen_language,
-            "gated_delta_update_with_states",
-            side_effect=AssertionError("batched verify must not capture states"),
-        ),
-        patch.object(qwen_language, "gated_delta_update", side_effect=fake_update),
-    ):
+    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
         out = layer(
             mx.zeros((2, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -232,7 +225,7 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
     assert sink[0][11] is None
 
 
-def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
+def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -244,29 +237,15 @@ def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
     )
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
-    intermediate = mx.zeros((1, 3, 2, 4, 4), dtype=mx.float32)
 
-    def fake_update_with_states(
-        q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True
-    ):
+    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        return out, next_state, intermediate
+        return out, next_state
 
-    with (
-        patch.object(
-            qwen_language,
-            "gated_delta_update",
-            side_effect=AssertionError("singleton verify should use state capture"),
-        ),
-        patch.object(
-            qwen_language,
-            "gated_delta_update_with_states",
-            side_effect=fake_update_with_states,
-        ),
-    ):
+    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
         out = layer(
             mx.zeros((1, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -275,7 +254,7 @@ def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11] is intermediate
+    assert sink[0][11] is None
 
 
 def test_speculative_walk_accepts_until_first_mismatch():
