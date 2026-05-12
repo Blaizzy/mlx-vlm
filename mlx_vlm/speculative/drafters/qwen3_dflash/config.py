@@ -23,6 +23,8 @@ class DFlashConfig(BaseModelConfig):
     mask_token_id: int = 248070
     target_layer_ids: List[int] = field(default_factory=lambda: [1, 8, 15, 22, 29])
     num_target_layers: int = 32
+    runtime_block_size: int | None = 14
+    draft_window_size: int | None = None
 
     @classmethod
     def from_dict(cls, params: dict) -> "DFlashConfig":
@@ -32,6 +34,10 @@ class DFlashConfig(BaseModelConfig):
             flat["mask_token_id"] = dflash_cfg["mask_token_id"]
         if "target_layer_ids" in dflash_cfg:
             flat["target_layer_ids"] = list(dflash_cfg["target_layer_ids"])
+        if "runtime_block_size" in dflash_cfg:
+            flat["runtime_block_size"] = dflash_cfg["runtime_block_size"]
+        if "draft_window_size" in dflash_cfg:
+            flat["draft_window_size"] = dflash_cfg["draft_window_size"]
         sig = inspect.signature(cls).parameters
         return cls(**{k: v for k, v in flat.items() if k in sig})
 
