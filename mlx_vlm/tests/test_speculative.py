@@ -27,6 +27,11 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
 )
+from mlx_vlm.speculative.drafters.eagle3 import (
+    Eagle3DraftModel,
+    ModelConfig as Eagle3Config,
+    TextConfig as Eagle3TextConfig,
+)
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -44,7 +49,9 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_batch_deferred_greedy,
     _speculative_walk_batch_uniform_acceptance,
     _speculative_walk_deferred_greedy,
+    speculative_prefill_kwargs,
 )
+from mlx_vlm.utils import get_model_and_args
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
 
@@ -979,6 +986,21 @@ def test_kind_none_autodetects_mtp_for_qwen3_5_mtp(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "mtp"
 
 
+def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
+    path = tmp_path / "drafter"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps({"speculators_model_type": "eagle3"}))
+    assert resolve_drafter_kind(path, None) == "eagle3"
+    assert resolve_drafter_kind(path, "dflash") == "eagle3"
+
+
+def test_model_loader_uses_speculators_model_type_for_eagle3_config():
+    arch, model_type = get_model_and_args({"speculators_model_type": "eagle3"})
+
+    assert model_type == "eagle3"
+    assert arch.Model is Eagle3DraftModel
+
+
 def test_kind_none_falls_back_to_default_for_unknown_model_type(tmp_path):
     path = _make_drafter_dir(tmp_path, "qwen3_dflash")
     assert resolve_drafter_kind(path, None) == DEFAULT_DRAFTER_KIND
@@ -1016,6 +1038,64 @@ def _tiny_qwen3_5_text_config():
             "partial_rotary_factor": 0.25,
         },
     )
+
+
+def test_eagle3_config_uses_speculators_fields():
+    cfg = Eagle3Config.from_dict(
+        {
+            "speculators_model_type": "eagle3",
+            "eagle_aux_hidden_state_layer_ids": [2, 30, 57],
+            "speculators_config": {
+                "proposal_methods": [{"speculative_tokens": 3}],
+            },
+            "transformer_layer_config": {
+                "model_type": "llama",
+                "hidden_size": 8,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "vocab_size": 32,
+            },
+        }
+    )
+
+    assert cfg.model_type == "eagle3"
+    assert cfg.block_size == 4
+    assert cfg.target_layer_ids == [2, 30, 57]
+    assert cfg.capture_layer_ids == [1, 29, 56]
+    assert cfg.transformer_layer_config.hidden_size == 8
+
+
+def test_eagle3_prefill_uses_mlx_capture_layer_indexes():
+    cfg = Eagle3Config(eagle_aux_hidden_state_layer_ids=[2, 30, 57])
+    drafter = SimpleNamespace(config=cfg)
+
+    assert speculative_prefill_kwargs("eagle3", drafter) == {
+        "capture_layer_ids": [1, 29, 56]
+    }
+
+
+def test_eagle3_draft_vocab_mapping_uses_d2t_offsets():
+    cfg = Eagle3Config(
+        draft_vocab_size=4,
+        transformer_layer_config=Eagle3TextConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=4,
+            vocab_size=16,
+        ),
+    )
+    model = Eagle3DraftModel(cfg)
+    model.d2t = mx.array([0, 4, 8, 12], dtype=mx.int32)
+
+    mapped = model._draft_to_target(mx.array([[0, 1, 3]], dtype=mx.int32), mx.int32)
+
+    assert mapped.tolist() == [[0, 5, 15]]
 
 
 def test_qwen3_5_mtp_draft_block_smoke():

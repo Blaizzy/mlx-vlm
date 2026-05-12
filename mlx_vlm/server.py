@@ -1100,6 +1100,7 @@ class ResponseGenerator:
                     ),
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
+                    prompt_tokens=input_mx,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
@@ -3663,8 +3664,8 @@ def main():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "mtp"],
-        help="Drafter family — 'dflash' or 'mtp' (Gemma 4). "
+        choices=["dflash", "eagle3", "mtp"],
+        help="Drafter family — 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(

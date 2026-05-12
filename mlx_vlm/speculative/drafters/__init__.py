@@ -4,11 +4,12 @@ from typing import Optional, Tuple
 
 from .qwen3_dflash import DFlashDraftModel
 
-KNOWN_DRAFTER_KINDS = {"dflash", "mtp"}
+KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
+    "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
     "qwen3_5_mtp": "mtp",
 }
@@ -23,7 +24,8 @@ def _peek_drafter_model_type(model_path) -> Optional[str]:
     weights. Returns ``None`` if the config can't be read."""
     try:
         with open(model_path / "config.json") as f:
-            return json.load(f).get("model_type")
+            config = json.load(f)
+            return config.get("model_type") or config.get("speculators_model_type")
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 

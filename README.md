@@ -109,12 +109,12 @@ Requests can override the server default with `enable_thinking: true` or `enable
 
 ### Speculative Decoding
 
-Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Two drafter families are supported.
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.
 
 | Flag | Description |
 |------|-------------|
 | `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family — `dflash` (default) or `mtp` (Gemma 4) |
+| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4) |
 | `--draft-block-size` | Override the drafter's configured block size |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
@@ -200,6 +200,21 @@ Supported pairings (target ↔ drafter):
 | `mlx-community/gemma-4-31B-it-bf16`         | `mlx-community/gemma-4-31B-it-assistant-bf16`        |
 
 Measured speedups (greedy, byte-identical output): up to **3.94×** on 26B-A4B and **2.29×** on 31B at B=4. See [`mlx_vlm/speculative/drafters/gemma4_assistant/README.md`](mlx_vlm/speculative/drafters/gemma4_assistant/README.md) for full sweeps and architecture notes.
+
+#### Gemma 4 EAGLE-3
+
+[EAGLE-3](https://sgl-project.github.io/SpecForge/concepts/EAGLE3.html) drafts from three target hidden-state captures with a lightweight one-layer speculator. The Red Hat Speculators checkpoint auto-detects as `--draft-kind eagle3`.
+
+```sh
+mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3 \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
+  --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3
+```
 
 ### Chat UI with Gradio
 
@@ -317,8 +332,8 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
 
 - `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
-- `--draft-kind`: Drafter family — `dflash` (default) or `mtp` (Gemma 4)
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)

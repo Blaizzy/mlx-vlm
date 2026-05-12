@@ -1123,6 +1123,327 @@ def _dflash_rounds(
             mx.clear_cache()
 
 
+def _eagle3_verify_target(
+    lm: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    sampler: Callable[[mx.array], mx.array],
+    target_layer_ids: List[int],
+):
+    verify_out = lm(
+        verify_input,
+        cache=prompt_cache,
+        capture_layer_ids=target_layer_ids,
+    )
+    hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
+    target_tokens = sampler(verify_out.logits)
+    return hidden, target_tokens, verify_out.gdn_states
+
+
+def _eagle3_capture_layer_ids(draft_model: nn.Module) -> List[int]:
+    return list(
+        getattr(
+            draft_model.config,
+            "capture_layer_ids",
+            draft_model.config.target_layer_ids,
+        )
+    )
+
+
+def _eagle3_rounds(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    prompt_tokens: Optional[mx.array] = None,
+    first_bonus: int,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+    greedy_sampling: bool = False,
+) -> Generator[Tuple[int, None], None, None]:
+    """Linear top-1 EAGLE-3 speculative-decoding round loop."""
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache."
+        )
+
+    target_layer_ids = _eagle3_capture_layer_ids(draft_model)
+    block_total = _dflash_block_total(draft_model, draft_block_size)
+    configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
+    draft_cache = draft_model.reset(model)
+
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        prefill_draft(
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
+        )
+
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+
+    b = first_bonus
+    emitted = 1
+
+    while emitted < max_tokens:
+        bs = _mtp_next_block_size(
+            draft_model,
+            block_total,
+            configured_block_total,
+            max_tokens - emitted + 1,
+        )
+        if bs <= 1:
+            break
+
+        draft_tokens = draft_model.draft_block(
+            b,
+            hidden,
+            draft_cache,
+            bs,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
+        )
+        mx.async_eval(draft_tokens)
+
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate(
+                [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                axis=1,
+            )
+            verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
+                lm,
+                verify_input,
+                prompt_cache,
+                sampler,
+                target_layer_ids,
+            )
+        mx.async_eval(target_tokens, verify_hidden)
+
+        accepted, new_tokens = _speculative_walk(
+            draft_tokens,
+            target_tokens,
+            max_tokens - emitted,
+        )
+        _record_speculative_round(draft_model, accepted, bs - 1)
+
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
+        accept_verified = getattr(draft_model, "accept_verified_tokens", None)
+        if callable(accept_verified):
+            accept_verified(
+                verify_hidden,
+                draft_tokens,
+                accepted,
+                new_tokens,
+                sampler,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling),
+            )
+
+        hidden = verify_hidden[:, accepted : accepted + 1, :]
+        b = new_tokens[-1] if new_tokens else b
+
+        if accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(prompt_cache, gdn_states, accepted, bs)
+
+        if emitted % 256 == 0:
+            mx.clear_cache()
+
+
+def _eagle3_rounds_batch(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    *,
+    prompt_tokens: Optional[mx.array] = None,
+    first_bonus: mx.array,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+    eos_token_ids: Optional[set] = None,
+    greedy_sampling: bool = False,
+) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    """Batched linear EAGLE-3 round loop.
+
+    The EAGLE-3 drafter owns a recurrent KV cache, so mixed per-row acceptance
+    is clamped to the earliest rejection to keep the draft cache aligned.
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache."
+        )
+
+    B = first_bonus.shape[0]
+    target_layer_ids = _eagle3_capture_layer_ids(draft_model)
+    block_total = _dflash_block_total(draft_model, draft_block_size)
+    configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
+    draft_cache = draft_model.reset(model)
+
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        prefill_draft(
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
+        )
+
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+
+    b = first_bonus.tolist()
+    emitted = [1] * B
+    finished = [False] * B
+    active_idx = list(range(B))
+
+    while len(active_idx) > 0:
+        remaining = [
+            max(1, max_tokens - emitted[active_idx[j]] + 1)
+            for j in range(len(active_idx))
+        ]
+        bs = _mtp_next_block_size(
+            draft_model,
+            block_total,
+            configured_block_total,
+            min(remaining),
+        )
+        if bs <= 1:
+            break
+
+        n_active = len(active_idx)
+        b_active = [b[active_idx[j]] for j in range(n_active)]
+        b_arr = mx.array(b_active, dtype=token_dtype)
+
+        draft_tokens = draft_model.draft_block(
+            b_arr,
+            hidden,
+            draft_cache,
+            bs,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, greedy_sampling),
+        )
+        mx.async_eval(draft_tokens)
+
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+            verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
+                lm,
+                verify_input,
+                prompt_cache,
+                sampler,
+                target_layer_ids,
+            )
+        mx.async_eval(target_tokens, verify_hidden)
+
+        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+        accepted_list, new_tokens_list = _speculative_walk_batch(
+            draft_tokens, target_tokens, budgets
+        )
+        if (
+            n_active > 1
+            and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+            and len(set(accepted_list)) > 1
+        ):
+            accepted_list, new_tokens_list = _speculative_walk_batch_uniform_acceptance(
+                draft_tokens,
+                target_tokens,
+                accepted_list,
+                budgets,
+            )
+        _record_speculative_round(
+            draft_model,
+            sum(accepted_list) / len(accepted_list),
+            bs - 1,
+        )
+
+        accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
+        if callable(accept_verified):
+            accept_verified(
+                verify_hidden,
+                draft_tokens,
+                accepted_list,
+                new_tokens_list,
+                sampler,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, greedy_sampling),
+            )
+
+        row_idx = mx.arange(n_active)
+        col_idx = mx.array(accepted_list)
+        hidden = verify_hidden[row_idx, col_idx, :][:, None, :]
+
+        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
+        for pos in range(max_new):
+            tokens_out: List[Optional[int]] = [None] * B
+            for j in range(n_active):
+                orig = active_idx[j]
+                if pos < len(new_tokens_list[j]) and not finished[orig]:
+                    tok = new_tokens_list[j][pos]
+                    tokens_out[orig] = tok
+                    emitted[orig] += 1
+                    if emitted[orig] >= max_tokens:
+                        finished[orig] = True
+                    if eos_token_ids is not None and tok in eos_token_ids:
+                        finished[orig] = True
+                    if stop_check is not None and stop_check(orig, tok):
+                        finished[orig] = True
+            yield tokens_out, None
+
+        for j in range(n_active):
+            orig = active_idx[j]
+            if new_tokens_list[j]:
+                b[orig] = new_tokens_list[j][-1]
+
+        max_a = max(accepted_list)
+        if max_a < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(
+                    prompt_cache,
+                    gdn_states,
+                    mx.array(accepted_list),
+                    bs,
+                )
+
+        cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
+        if all(finished[active_idx[j]] for j in range(n_active)):
+            break
+        if cache_filterable:
+            keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
+            if len(keep_slots) < n_active:
+                keep_mx = mx.array(keep_slots, dtype=mx.int32)
+                for c in prompt_cache:
+                    c.filter(keep_mx)
+                filter_drafter = getattr(draft_model, "filter_batch", None)
+                if callable(filter_drafter):
+                    filter_drafter(keep_mx)
+                hidden = hidden[keep_mx]
+                active_idx = [active_idx[j] for j in keep_slots]
+
+        if sum(emitted) % 256 == 0:
+            mx.clear_cache()
+
+
 def _dflash_rounds_batch(
     model: nn.Module,
     draft_model: nn.Module,
@@ -1287,27 +1608,37 @@ def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
 
 
 def get_speculative_rounds_batch(draft_kind: str):
+    if draft_kind == "eagle3":
+        return _eagle3_rounds_batch
     if draft_kind == "mtp":
         return _mtp_rounds_batch
     if draft_kind == "dflash":
         return _dflash_rounds_batch
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+    )
 
 
 def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
     if draft_kind == "mtp":
         return {"return_hidden": True, "return_shared_kv": True}
+    if draft_kind == "eagle3":
+        return {"capture_layer_ids": _eagle3_capture_layer_ids(drafter)}
     if draft_kind == "dflash":
         return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+    )
 
 
 def speculative_hidden_state(draft_kind: str, outputs):
     if draft_kind == "mtp":
         return outputs.hidden_states[-1]
-    if draft_kind == "dflash":
+    if draft_kind in ("dflash", "eagle3"):
         return mx.concatenate(outputs.hidden_states, axis=-1)
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+    )
 
 
 def make_speculative_prompt_cache(
@@ -1339,8 +1670,46 @@ def run_speculative_server_rounds(
     greedy_sampling: bool = False,
     shared_kv_states: Optional[dict] = None,
     eos_token_ids: Optional[set] = None,
+    prompt_tokens: Optional[mx.array] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
+
+    if draft_kind == "eagle3":
+        if batch_size == 1:
+            yield from (
+                ([tok], state)
+                for tok, state in _eagle3_rounds(
+                    model,
+                    draft_model,
+                    prompt_cache,
+                    hidden,
+                    prompt_tokens=prompt_tokens,
+                    first_bonus=int(first_bonus.reshape(-1).item()),
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=token_dtype,
+                    greedy_sampling=greedy_sampling,
+                )
+            )
+            return
+
+        yield from _eagle3_rounds_batch(
+            model,
+            draft_model,
+            prompt_cache,
+            hidden,
+            prompt_tokens=prompt_tokens,
+            first_bonus=first_bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+            stop_check=stop_check,
+            eos_token_ids=eos_token_ids,
+            greedy_sampling=greedy_sampling,
+        )
+        return
 
     if draft_kind == "mtp":
         if batch_size == 1:
@@ -1394,7 +1763,9 @@ def run_speculative_server_rounds(
         )
         return
 
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
+    raise ValueError(
+        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+    )
 
 
 def run_speculative_rounds(
@@ -1465,9 +1836,55 @@ def run_speculative_rounds(
             )
         return
 
+    if draft_kind == "eagle3":
+        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
+        if B == 1:
+            mx.eval(first_token)
+            bonus = first_token.item()
+            yield bonus, logprobs
+            yield from _eagle3_rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                prompt_tokens=input_ids,
+                first_bonus=bonus,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
+                greedy_sampling=sampler_is_greedy,
+            )
+        else:
+            mx.eval(first_token)
+            first_bonus = first_token.squeeze(-1)
+            yield first_bonus.tolist(), logprobs
+            eos = getattr(model.config, "eos_token_id", None)
+            if isinstance(eos, int):
+                eos_set = {eos}
+            elif eos is None:
+                eos_set = None
+            else:
+                eos_set = set(int(x) for x in eos)
+            yield from _eagle3_rounds_batch(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                prompt_tokens=input_ids,
+                first_bonus=first_bonus,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=input_ids.dtype,
+                eos_token_ids=eos_set,
+                greedy_sampling=sampler_is_greedy,
+            )
+        return
+
     if draft_kind != "dflash":
         raise ValueError(
-            f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']"
+            f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
         )
 
     hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)

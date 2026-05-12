@@ -113,7 +113,10 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"].lower()
+    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    if raw_model_type is None:
+        raise KeyError("model_type")
+    model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 

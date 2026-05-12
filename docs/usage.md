@@ -35,7 +35,7 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
-## Speculative Decoding (DFlash)
+## Speculative Decoding
 
 Speed up generation 2–3× using a lightweight drafter model that predicts multiple tokens per round, verified in parallel by the target model.
 
@@ -47,6 +47,16 @@ python -m mlx_vlm.generate \
     --draft-model z-lab/Qwen3.5-4B-DFlash \
     --prompt "Write a quicksort in Python." \
     --max-tokens 512 --temperature 0 --enable-thinking
+```
+
+EAGLE-3 speculators are also supported and auto-detected from Speculators configs:
+
+```bash
+python -m mlx_vlm.generate \
+    --model mlx-community/gemma-4-31B-it-bf16 \
+    --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3 \
+    --prompt "Write a concise note about speculative decoding." \
+    --max-tokens 256 --temperature 0
 ```
 
 Works with images too:

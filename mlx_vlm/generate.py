@@ -226,8 +226,9 @@ def parse_arguments():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "mtp"],
+        choices=["dflash", "eagle3", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
+        "'eagle3' (Speculators/SGLang EAGLE-3), "
         "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
@@ -576,6 +577,14 @@ def generate_step(
             # (per layer-type) rather than per-layer hidden captures.
             kwargs["return_hidden"] = True
             kwargs["return_shared_kv"] = True
+        elif draft_kind == "eagle3":
+            kwargs["capture_layer_ids"] = list(
+                getattr(
+                    draft_model.config,
+                    "capture_layer_ids",
+                    draft_model.config.target_layer_ids,
+                )
+            )
         else:
             kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
         prefill_step_size = None
