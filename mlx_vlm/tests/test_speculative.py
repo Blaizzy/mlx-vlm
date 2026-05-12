@@ -729,10 +729,10 @@ def test_dflash_config_defaults_to_checkpoint_block_size():
     assert speculative_utils._dflash_block_total(draft_model, None) == 16
 
 
-def test_dflash_next_block_size_starts_with_small_pilot_block():
+def test_dflash_next_block_size_starts_at_requested_ceiling():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 3
+    assert _dflash_next_block_size(draft_model, 16, 20) == 16
 
 
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
@@ -744,25 +744,13 @@ def test_dflash_next_block_size_backs_off_on_low_acceptance():
 def test_dflash_next_block_size_grows_after_full_prefix_hits():
     draft_model = SimpleNamespace(accept_lens=[3, 3, 3, 3], draft_lens=[3, 3, 3, 3])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 5
-
-
-def test_dflash_next_block_size_requires_high_acceptance_to_grow():
-    draft_model = SimpleNamespace(accept_lens=[2, 2, 1, 2], draft_lens=[2, 2, 2, 2])
-
-    assert _dflash_next_block_size(draft_model, 16, 20) == 3
-
-
-def test_dflash_next_block_size_requires_full_recent_hits_to_grow():
-    draft_model = SimpleNamespace(accept_lens=[2, 2, 2, 1], draft_lens=[2, 2, 2, 2])
-
-    assert _dflash_next_block_size(draft_model, 16, 20) == 3
+    assert _dflash_next_block_size(draft_model, 16, 20) == 6
 
 
 def test_dflash_next_block_size_does_not_grow_on_middling_acceptance():
     draft_model = SimpleNamespace(accept_lens=[3, 2, 1, 3], draft_lens=[3, 3, 3, 3])
 
-    assert _dflash_next_block_size(draft_model, 16, 20) == 3
+    assert _dflash_next_block_size(draft_model, 16, 20) == 4
 
 
 def test_dflash_next_block_size_can_prefer_requested_size():
