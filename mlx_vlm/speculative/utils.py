@@ -405,27 +405,27 @@ def _dflash_next_block_size(
         if int(d) > 0
     ]
     if not recent:
-        return block_total
+        return min(block_total, 3)
 
     current = min(block_total, max(2, recent[-1][1] + 1))
-    min_total = min(block_total, 4)
+    min_total = min(block_total, 3)
     drafted = sum(d for _, d in recent)
     accepted = sum(a for a, _ in recent)
     accept_rate = accepted / drafted
     mean_accept = accepted / len(recent)
-
-    if accept_rate < 0.30 or mean_accept < 2.0:
-        if current >= 8:
-            return max(min_total, min(block_total, current // 2))
-        return max(min_total, min(block_total, current - 2))
-
-    if accept_rate < 0.50:
-        return max(min_total, min(block_total, current - 2))
-
     full_hits = sum(1 for a, d in recent if a >= d)
     full_hit_rate = full_hits / len(recent)
-    if accept_rate >= 0.85 and full_hit_rate >= 0.75:
-        return min(block_total, current + 2)
+
+    if accept_rate < 0.75 or mean_accept < 1.5:
+        if current >= 8:
+            return max(min_total, min(block_total, current // 2))
+        return max(min_total, min(block_total, current - 1))
+
+    if current > 3 and (accept_rate < 0.85 or full_hit_rate < 0.80):
+        return max(min_total, min(block_total, current - 1))
+
+    if accept_rate >= 0.98 and full_hit_rate >= 1.0:
+        return min(block_total, current + 1)
 
     return min(block_total, current)
 
