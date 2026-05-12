@@ -1206,6 +1206,25 @@ def _eagle3_verify_target(
     sampler: Callable[[mx.array], mx.array],
     target_layer_ids: List[int],
 ):
+    if verify_input.shape[1] > 1 and "gemma4" in type(lm).__module__:
+        hidden_chunks = []
+        target_chunks = []
+        gdn_states = None
+        for pos in range(int(verify_input.shape[1])):
+            verify_out = lm(
+                verify_input[:, pos : pos + 1],
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
+            hidden_chunks.append(mx.concatenate(verify_out.hidden_states, axis=-1))
+            target_chunks.append(sampler(verify_out.logits))
+            gdn_states = verify_out.gdn_states
+        return (
+            mx.concatenate(hidden_chunks, axis=1),
+            mx.concatenate(target_chunks, axis=1),
+            gdn_states,
+        )
+
     verify_out = lm(
         verify_input,
         cache=prompt_cache,
