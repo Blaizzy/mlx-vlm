@@ -504,7 +504,7 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
     assert new_tokens == expected_tokens
     assert accepted == 1
     assert new_tokens == [2, 3]
-    assert fake_head.calls == 2
+    assert fake_head.calls == 1
 
 
 def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
