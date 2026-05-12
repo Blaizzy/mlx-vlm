@@ -1,4 +1,5 @@
 import inspect
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -1296,6 +1297,29 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
+        if not mx.metal.is_available():
+            self.skipTest("requires Metal streams")
+
+        from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+
+        rotary = Qwen3_5RotaryEmbedding(dim=8)
+        errors = []
+
+        def worker():
+            try:
+                y = mx.ones((rotary.inv_freq.shape[0],), dtype=mx.float32)
+                y = y * rotary.inv_freq
+                mx.eval(y)
+            except Exception as e:
+                errors.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
 
     def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
         from mlx_vlm.models import qwen3_5, qwen3_5_moe

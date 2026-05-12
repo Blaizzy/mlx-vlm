@@ -46,7 +46,35 @@ class MaskedEmbedder(nn.Module):
         to ``min(selected_logits) - 1``.
         """
         B, L = hidden_states.shape[:2]
+        selected_canonical, selected_logits = self._selected_logits(
+            hidden_states, lm_head_weight
+        )
 
+        mask_value = float(selected_logits.min().item()) - 1.0
+
+        # Scatter selected_logits into a full-vocab tensor at canonical positions.
+        scatter_idx = selected_canonical.reshape(B, L, -1)  # [B, L, top_k*vsc]
+        out = mx.full(
+            (B, L, self.vocab_size),
+            vals=mask_value,
+            dtype=hidden_states.dtype,
+        )
+        # mlx.put_along_axis writes ``src`` at ``index`` along ``axis``.
+        return mx.put_along_axis(out, scatter_idx, selected_logits, axis=-1)
+
+    def argmax(self, hidden_states: mx.array, lm_head_weight: mx.array) -> mx.array:
+        """Return greedy tokens without materializing full-vocab logits."""
+        selected_canonical, selected_logits = self._selected_logits(
+            hidden_states, lm_head_weight
+        )
+        best = mx.argmax(selected_logits, axis=-1)[..., None]
+        selected_canonical = selected_canonical.reshape(*hidden_states.shape[:2], -1)
+        return mx.take_along_axis(selected_canonical, best, axis=-1).squeeze(-1)
+
+    def _selected_logits(
+        self, hidden_states: mx.array, lm_head_weight: mx.array
+    ) -> tuple[mx.array, mx.array]:
+        B, L = hidden_states.shape[:2]
         # Cluster scores → top-K cluster indices.
         centroid_logits = self.centroids(hidden_states)  # [B, L, num_centroids]
         topk_idx = mx.argpartition(centroid_logits, kth=-self.top_k, axis=-1)[
@@ -75,15 +103,4 @@ class MaskedEmbedder(nn.Module):
         ).squeeze(
             -2
         )  # [B, L, top_k*vsc]
-
-        mask_value = float(selected_logits.min().item()) - 1.0
-
-        # Scatter selected_logits into a full-vocab tensor at canonical positions.
-        scatter_idx = selected_canonical.reshape(B, L, -1)  # [B, L, top_k*vsc]
-        out = mx.full(
-            (B, L, self.vocab_size),
-            vals=mask_value,
-            dtype=hidden_states.dtype,
-        )
-        # mlx.put_along_axis writes ``src`` at ``index`` along ``axis``.
-        return mx.put_along_axis(out, scatter_idx, selected_logits, axis=-1)
+        return selected_canonical, selected_logits

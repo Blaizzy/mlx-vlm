@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
+import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
@@ -45,26 +46,32 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
 
 
 def test_speculative_server_dispatches_mtp_batch_loop():
-    assert server._get_speculative_rounds_batch("mtp") is server._mtp_rounds_batch
+    assert (
+        speculative_utils.get_speculative_rounds_batch("mtp")
+        is speculative_utils._mtp_rounds_batch
+    )
 
 
 def test_speculative_server_keeps_dflash_default_batch_loop():
-    assert server._get_speculative_rounds_batch("dflash") is server._dflash_rounds_batch
+    assert (
+        speculative_utils.get_speculative_rounds_batch("dflash")
+        is speculative_utils._dflash_rounds_batch
+    )
 
 
 def test_speculative_server_rejects_unknown_draft_kind():
     with pytest.raises(ValueError):
-        server._get_speculative_rounds_batch("nope")
+        speculative_utils.get_speculative_rounds_batch("nope")
 
 
 def test_speculative_server_prefill_kwargs_are_drafter_specific():
     drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[1, 2, 3]))
 
-    assert server._speculative_prefill_kwargs("mtp", drafter) == {
+    assert speculative_utils.speculative_prefill_kwargs("mtp", drafter) == {
         "return_hidden": True,
         "return_shared_kv": True,
     }
-    assert server._speculative_prefill_kwargs("dflash", drafter) == {
+    assert speculative_utils.speculative_prefill_kwargs("dflash", drafter) == {
         "capture_layer_ids": [1, 2, 3],
     }
 
@@ -73,15 +80,65 @@ def test_speculative_server_hidden_state_picks_last_layer_for_mtp():
     h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     out = SimpleNamespace(hidden_states=h)
 
-    assert server._speculative_hidden_state("mtp", out) is h[-1]
+    assert speculative_utils.speculative_hidden_state("mtp", out) is h[-1]
 
 
 def test_speculative_server_hidden_state_concatenates_for_dflash():
     h = [mx.zeros((1, 1, 4)), mx.ones((1, 1, 4))]
     out = SimpleNamespace(hidden_states=h)
 
-    result = server._speculative_hidden_state("dflash", out)
+    result = speculative_utils.speculative_hidden_state("dflash", out)
     assert result.shape == (1, 1, 8)
+
+
+def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatch):
+    lm = object()
+    unbatched_cache = object()
+    batched_cache = object()
+
+    monkeypatch.setattr(
+        speculative_utils.cache, "make_prompt_cache", lambda target: unbatched_cache
+    )
+
+    result = speculative_utils.make_speculative_prompt_cache(
+        lm,
+        draft_kind="mtp",
+        batch_size=1,
+        left_padding=[0],
+        make_cache=lambda *args, **kwargs: batched_cache,
+    )
+
+    assert result is unbatched_cache
+
+
+def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeypatch):
+    lm = object()
+    batched_cache = object()
+
+    monkeypatch.setattr(
+        speculative_utils.cache, "make_prompt_cache", lambda target: pytest.fail()
+    )
+
+    assert (
+        speculative_utils.make_speculative_prompt_cache(
+            lm,
+            draft_kind="mtp",
+            batch_size=2,
+            left_padding=[0, 1],
+            make_cache=lambda *args, **kwargs: batched_cache,
+        )
+        is batched_cache
+    )
+    assert (
+        speculative_utils.make_speculative_prompt_cache(
+            lm,
+            draft_kind="dflash",
+            batch_size=1,
+            left_padding=[0],
+            make_cache=lambda *args, **kwargs: batched_cache,
+        )
+        is batched_cache
+    )
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):
@@ -90,6 +147,17 @@ def test_speculative_server_reads_draft_block_size_env(monkeypatch):
 
     monkeypatch.setenv("MLX_VLM_DRAFT_BLOCK_SIZE", "3")
     assert server._get_draft_block_size_from_env() == 3
+
+
+def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", raising=False)
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "2.5")
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.0025)
+
+    monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "bad")
+    assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
 class _RecordingSpeculativeLM:
@@ -148,6 +216,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
     monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
+    monkeypatch.setattr(server, "get_speculative_batch_coalesce_s", lambda: 0.0)
 
     class _FakeDetokenizer:
         def __init__(self):
@@ -168,12 +237,11 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     def fake_rounds(*args, **kwargs):
         del args
+        gen.round_kwargs = kwargs
         gen._stop = True
         yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
 
-    monkeypatch.setattr(
-        server, "_get_speculative_rounds_batch", lambda kind: fake_rounds
-    )
+    monkeypatch.setattr(server, "run_speculative_server_rounds", fake_rounds)
 
     args = server.GenerationArguments(max_tokens=2, temperature=0)
     for spec in request_specs:
@@ -188,7 +256,28 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
         )
 
     gen._run_speculative()
-    return lm.calls[0]
+    call = lm.calls[0]
+    call["round_kwargs"] = gen.round_kwargs
+    return call
+
+
+def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["round_kwargs"]["greedy_sampling"] is True
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -454,6 +543,64 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
+
+
+def test_chat_completions_streaming_forwards_explicit_sampling_args(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            captured["prompt"] = prompt
+            captured["images"] = images
+            captured["audio"] = audio
+            captured["args"] = args
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="done", token=1, logprobs=0.0, finish_reason="stop"
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "max_tokens": 12,
+                "top_k": 40,
+                "min_p": 0.08,
+                "repetition_penalty": 1.15,
+                "logit_bias": {"12": -1.5},
+            },
+        )
+
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    assert captured["args"].max_tokens == 12
+    assert captured["args"].top_k == 40
+    assert captured["args"].min_p == 0.08
+    assert captured["args"].repetition_penalty == 1.15
+    assert captured["args"].logit_bias == {12: -1.5}
 
 
 def test_chat_completions_endpoint_flattens_text_content_parts(client):
@@ -760,6 +907,27 @@ class TestResponseGenerator:
         with pytest.raises(StopIteration):
             next(token_iter)
         assert cancelled == []
+
+    def test_collect_pending_requests_coalesces_after_first_item(self, monkeypatch):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.requests = Queue()
+        gen._stop = False
+        first = object()
+        second = object()
+        gen.requests.put(first)
+
+        def fake_sleep(seconds):
+            assert seconds == pytest.approx(0.005)
+            gen.requests.put(second)
+
+        monkeypatch.setattr(server.time, "sleep", fake_sleep)
+
+        pending, should_stop = gen._collect_pending_requests(
+            active=False, coalesce_s=0.005
+        )
+
+        assert pending == [first, second]
+        assert should_stop is False
 
     def test_step_streams_spm_subword_tokens_immediately(self):
         class SentencePieceTokenizer:
