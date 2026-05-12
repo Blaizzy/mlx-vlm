@@ -13,10 +13,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
-from .gated_delta import (
-    gated_delta_state_update,
-    gated_delta_update,
-)
+from .gated_delta import gated_delta_state_update, gated_delta_update
 
 
 class Qwen3_5RotaryEmbedding:
