@@ -1,9 +1,11 @@
 import inspect
+import threading
 import unittest
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_map
 
 
@@ -1271,12 +1273,13 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                         "quantization": quantization,
                         "quantization_config": quantization,
                     }
                 )
 
+                self.assertEqual(config.vision_config.patch_size, 16)
                 self.assertIn(
                     "language_model.model.layers.0.linear_attn.in_proj_qkv",
                     config.quantization,
@@ -1294,6 +1297,29 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
+        if not mx.metal.is_available():
+            self.skipTest("requires Metal streams")
+
+        from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+
+        rotary = Qwen3_5RotaryEmbedding(dim=8)
+        errors = []
+
+        def worker():
+            try:
+                y = mx.ones((rotary.inv_freq.shape[0],), dtype=mx.float32)
+                y = y * rotary.inv_freq
+                mx.eval(y)
+            except Exception as e:
+                errors.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
 
     def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
         from mlx_vlm.models import qwen3_5, qwen3_5_moe
@@ -1351,9 +1377,10 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {"eos_token_id": 248044},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                     }
                 )
+                self.assertEqual(config_from_dict.vision_config.patch_size, 16)
                 self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
 
                 explicit = model_module.ModelConfig(
@@ -1403,6 +1430,22 @@ class TestModels(unittest.TestCase):
             num_position_embeddings=144,
             deepstack_visual_indexes=[],
         )
+
+        config_from_dict = qwen3_vl_moe.ModelConfig.from_dict(
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": vars(text_config).copy(),
+                "vision_config": {**vars(vision_config), "patch_size": 16},
+                "image_token_id": 151655,
+                "video_token_id": 151656,
+                "vocab_size": 10_000,
+            }
+        )
+        self.assertIsInstance(config_from_dict.text_config, qwen3_vl_moe.TextConfig)
+        self.assertIsInstance(config_from_dict.vision_config, qwen3_vl_moe.VisionConfig)
+        self.assertEqual(config_from_dict.vision_config.patch_size, 16)
+        model_from_dict = qwen3_vl_moe.Model(config_from_dict)
+        self.assertEqual(model_from_dict.vision_tower.patch_embed.patch_size, 16)
 
         config = qwen3_vl_moe.ModelConfig(
             text_config=text_config,
@@ -1826,6 +1869,53 @@ class TestModels(unittest.TestCase):
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
 
+    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+        from mlx_vlm.models import lfm2_vl
+
+        text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
+        vision_config = lfm2_vl.VisionConfig()
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_use_layernorm=False,
+        )
+        model = lfm2_vl.Model(config)
+
+        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
+        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+
+    def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
+        from mlx_vlm.models import lfm2_vl
+        from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
+
+        class ExplodingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layernorm branch should be disabled")
+
+        text_config = lfm2_vl.TextConfig(
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            intermediate_size=8,
+            layer_types=["full_attention"],
+        )
+        vision_config = lfm2_vl.VisionConfig(hidden_size=2)
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            downsample_factor=1,
+            projector_hidden_size=3,
+            projector_use_layernorm=False,
+        )
+        projector = Lfm2VlMultiModalProjector(config)
+        projector.layer_norm = ExplodingLayerNorm()
+
+        output = projector(mx.zeros((1, 1, 1, 2)))
+
+        self.assertEqual(output.shape, (1, 1, 1, 4))
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 
@@ -1982,6 +2072,32 @@ class TestModels(unittest.TestCase):
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
         )
+
+    def test_molmo2_sanitizes_non_finite_image_features(self):
+        from mlx_vlm.models.molmo2.molmo2 import (
+            MAX_FLOAT16_IMAGE_FEATURE,
+            clip_image_features,
+        )
+
+        fp32_features = mx.array(
+            [float("nan"), float("inf"), float("-inf"), 70000.0, -70000.0, 42.0],
+            dtype=mx.float32,
+        )
+        fp16_features = mx.array([70000.0, -70000.0, 42.0], dtype=mx.float16)
+
+        fp32_clipped = np.array(clip_image_features(fp32_features))
+        fp16_clipped = np.array(clip_image_features(fp16_features))
+
+        self.assertTrue(np.isfinite(fp32_clipped).all())
+        self.assertEqual(fp32_clipped[0], 0.0)
+        self.assertEqual(fp32_clipped[3], 70000.0)
+        self.assertEqual(fp32_clipped[4], -70000.0)
+        self.assertEqual(fp32_clipped[5], 42.0)
+        self.assertLessEqual(fp16_clipped[0], MAX_FLOAT16_IMAGE_FEATURE)
+        self.assertGreaterEqual(fp16_clipped[0], MAX_FLOAT16_IMAGE_FEATURE - 16)
+        self.assertGreaterEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE)
+        self.assertLessEqual(fp16_clipped[1], -MAX_FLOAT16_IMAGE_FEATURE + 16)
+        self.assertEqual(fp16_clipped[2], 42.0)
 
     def test_florence2(self):
         from mlx_vlm.models import florence2
@@ -3680,6 +3796,92 @@ class TestModels(unittest.TestCase):
         self.assertEqual(
             sanitized[f"{prefix}.unembed_out.weight"].shape, (H, v_head, kv_rank)
         )
+
+    def test_zaya1_vl(self):
+        from mlx_vlm.models import zaya1_vl
+        from mlx_vlm.models.zaya1_vl.language import CCA, ZayaRouter
+
+        text_config = zaya1_vl.TextConfig(
+            model_type="zaya1_vl",
+            hidden_size=8,
+            ffn_hidden_size=16,
+            num_hidden_layers=1,
+            num_experts=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_query_groups=1,
+            head_dim=4,
+            zaya_mlp_expansion=4,
+            vocab_size=32,
+            vision_lora=False,
+        )
+        vision_config = zaya1_vl.VisionConfig(
+            model_type="qwen2_5_vl",
+            depth=1,
+            hidden_size=8,
+            intermediate_size=16,
+            out_hidden_size=8,
+            num_heads=2,
+            image_size=4,
+            patch_size=2,
+            in_channels=3,
+            spatial_patch_size=2,
+            spatial_merge_size=2,
+            temporal_patch_size=1,
+            window_size=4,
+            fullatt_block_indexes=[0],
+        )
+        config = zaya1_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="zaya1_vl",
+            image_token_id=31,
+            vocab_size=32,
+        )
+        model = zaya1_vl.Model(config)
+        layer = model.language_model.model.layers[0]
+        self.assertIsInstance(model.language_model.model.final_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.attn.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.input_norm, nn.RMSNorm)
+        self.assertIsInstance(layer.mlp.zaya_block.router.rmsnorm_eda, nn.RMSNorm)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.out_hidden_size,
+            config.vision_config.in_channels,
+            (4, 12),
+            vision_feature_layer=-1,
+            grid_thw=mx.array([[1, 2, 2]], dtype=mx.int64),
+        )
+
+        router = ZayaRouter(text_config, layer_number=1)
+        self.assertIsInstance(router.rmsnorm_eda, nn.RMSNorm)
+        self.assertEqual(router.rmsnorm_eda.eps, text_config.norm_epsilon)
+
+        cca = CCA(text_config, layer_number=0)
+        for linear in (cca.linear_q, cca.linear_k, cca.val_proj1, cca.val_proj2):
+            linear.weight = mx.zeros_like(linear.weight)
+        cca.linear_q.weight[0, 0] = 1e-4
+        cca.linear_k.weight[0, 0] = 1e-4
+        for conv in cca.conv_qk:
+            conv.weight = mx.zeros_like(conv.weight)
+            conv.bias = mx.zeros_like(conv.bias)
+
+        x_cca = mx.zeros((1, 1, text_config.hidden_size), dtype=mx.float32)
+        x_cca[0, 0, 0] = 1.0
+        query, _, _ = cca(x_cca)
+        expected_query = mx.zeros((1, 1, text_config.hidden_size), dtype=mx.float32)
+        for h in range(text_config.num_attention_heads):
+            expected_query[0, 0, h * text_config.head_dim] = 2.0
+        mx.eval(query, expected_query)
+        self.assertTrue(mx.allclose(query, expected_query, rtol=1e-5).item())
 
 
 class TestGetInputEmbeddings(unittest.TestCase):

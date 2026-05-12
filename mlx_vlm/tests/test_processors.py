@@ -409,6 +409,126 @@ class TestDotsVLProcessor(unittest.TestCase):
         self.assertIsInstance(processor.video_processor, DotsDummyVideoProcessor)
 
 
+class TestMiniCPMVProcessor(unittest.TestCase):
+    class _Tokenizer:
+        model_input_names = ["input_ids", "attention_mask"]
+        eos_token = "<eos>"
+        pad_token = "<pad>"
+        pad_token_id = 0
+        unk_token_id = 99
+        image_token = "<|image_pad|>"
+        image_token_id = 101
+        video_token = "<|video_pad|>"
+        video_token_id = 102
+
+        _ids = {
+            "<image>": 11,
+            "</image>": 12,
+            "<slice>": 13,
+            "</slice>": 14,
+            "<image_id>": 15,
+            "</image_id>": 16,
+            "<unk>": 99,
+            "<|image_pad|>": 101,
+            "<|video_pad|>": 102,
+            "<|listen|>": 99,
+            "\n": 2,
+        }
+
+        def convert_tokens_to_ids(self, token):
+            return self._ids.get(token, 1)
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            ids = []
+            specials = sorted(self._ids, key=len, reverse=True)
+            index = 0
+            while index < len(text):
+                for token in specials:
+                    if text.startswith(token, index):
+                        ids.append(self._ids[token])
+                        index += len(token)
+                        break
+                else:
+                    if not text[index].isspace():
+                        ids.append(1)
+                    index += 1
+            return ids
+
+        def build_inputs_with_special_tokens(self, ids):
+            return ids
+
+        def batch_decode(self, ids, **kwargs):
+            return ["decoded"] * len(ids)
+
+        def decode(self, ids, **kwargs):
+            return "decoded"
+
+    def _make_processor(self):
+        from mlx_vlm.models.minicpmv4_6.processing_minicpmv4_6 import (
+            MiniCPMVImageProcessor,
+            MiniCPMVProcessor,
+            MiniCPMVVideoProcessor,
+        )
+
+        p = MiniCPMVProcessor.__new__(MiniCPMVProcessor)
+        p.image_processor = MiniCPMVImageProcessor(
+            slice_mode=False,
+            use_image_id=False,
+            scale_resolution=56,
+            patch_size=14,
+        )
+        p.video_processor = MiniCPMVVideoProcessor(
+            slice_mode=False,
+            use_image_id=False,
+            scale_resolution=56,
+            patch_size=14,
+        )
+        p.tokenizer = self._Tokenizer()
+        p.image_feature_size = p.image_processor.image_feature_size
+        p._ensure_tokenizer_attrs()
+        p.image_token = p.tokenizer.image_token
+        p.image_token_id = p.tokenizer.image_token_id
+        p.video_token = p.tokenizer.video_token
+        p.video_token_id = p.tokenizer.video_token_id
+        return p
+
+    def test_video_marker_expands_to_frame_bounds(self):
+        p = self._make_processor()
+        video = np.zeros((2, 3, 16, 16), dtype=np.uint8)
+
+        result = p(
+            text=["<|video_pad|> Describe this."],
+            videos=[video],
+            slice_mode=False,
+            max_num_frames=2,
+            padding=False,
+        )
+
+        self.assertEqual(len(result["pixel_values"][0]), 2)
+        self.assertEqual(result["tgt_sizes"][0].shape, (2, 2))
+        self.assertEqual(result["image_bound"][0].shape, (2, 2))
+        self.assertEqual(result["num_frames_per_video"], [[2]])
+        self.assertEqual(result["num_patches_per_frame"], [[1, 1]])
+        for start, end in result["image_bound"][0]:
+            self.assertTrue(np.all(result["input_ids"][0, start:end] == 102))
+
+    def test_prompt_utils_routes_minicpm_video_messages(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        messages = apply_chat_template(
+            processor=None,
+            config={"model_type": "minicpmv4_6"},
+            prompt="Describe this video",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+        )
+
+        self.assertEqual(messages[0]["content"][0]["type"], "video")
+        self.assertEqual(messages[0]["content"][1]["type"], "text")
+
+
 class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.smolvlm.processing_smolvlm import SmolVLMProcessor
@@ -1155,6 +1275,44 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
         self.assertTrue(processor.image_processor.do_resize)
         self.assertFalse(processor.image_processor.do_image_splitting)
+
+
+class TestMolmoPointProcessor(unittest.TestCase):
+    def test_processor_exposes_image_processor(self):
+        from mlx_vlm.models.molmo_point.processing_molmo_point import (
+            MolmoPointImageProcessor,
+            MolmoPointProcessor,
+        )
+
+        processor = MolmoPointProcessor(_mock_tokenizer())
+
+        self.assertIsInstance(processor.image_processor, MolmoPointImageProcessor)
+
+    def test_processor_uses_image_processor_for_images(self):
+        from mlx_vlm.models.molmo_point.processing_molmo_point import (
+            IMAGE_PROMPT,
+            MolmoPointProcessor,
+        )
+
+        class DummyImageProcessor:
+            def preprocess(self, images):
+                return {
+                    "pixel_values": np.zeros((1, 729, 588), dtype=np.float32),
+                    "image_token_pooling": np.zeros((1, 729), dtype=np.int64),
+                    "image_grids": np.array([[1, 1, 1, 1]], dtype=np.int64),
+                    "image_num_crops": np.array([1], dtype=np.int64),
+                }
+
+        processor = MolmoPointProcessor(
+            _mock_tokenizer(bos_token_id=1, eos_token_id=2),
+            image_processor=DummyImageProcessor(),
+        )
+        result = processor(text=IMAGE_PROMPT, images=_make_image())
+
+        self.assertIn("pixel_values", result)
+        self.assertIn("image_token_pooling", result)
+        self.assertIn("image_grids", result)
+        self.assertIn("image_num_crops", result)
 
 
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────

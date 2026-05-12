@@ -5,6 +5,7 @@ import mlx.nn as nn
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.qwen3 import MLP as Qwen3MLP
 
+from ....models.cache import BufferedRotatingKVCache
 from .config import DFlashConfig
 
 
@@ -88,6 +89,7 @@ class DFlashDraftModel(nn.Module):
         self.embed_tokens = None
         self.lm_head = None
         self.accept_lens: List[int] = []
+        self.draft_lens: List[int] = []
 
     def bind(self, target_model) -> "DFlashDraftModel":
         if hasattr(target_model, "embed_tokens"):
@@ -116,11 +118,18 @@ class DFlashDraftModel(nn.Module):
         return self
 
     def make_cache(self) -> List[KVCache]:
+        window = getattr(self.config, "draft_window_size", None)
+        if window is not None and int(window) > 0:
+            return [
+                BufferedRotatingKVCache(max_size=int(window), buffer_size=64)
+                for _ in self.layers
+            ]
         return [KVCache() for _ in self.layers]
 
     def reset(self, target_model) -> List[KVCache]:
         self.bind(target_model)
         self.accept_lens = []
+        self.draft_lens = []
         return self.make_cache()
 
     def draft_block(
@@ -144,10 +153,11 @@ class DFlashDraftModel(nn.Module):
             block = mx.concatenate(
                 [last_bonus[:, None].astype(token_dtype), masks], axis=1
             )
-        draft_logits = self(block, hidden, cache)
-        return sampler(draft_logits[:, 1 - block_size :])
+        draft_hidden = self._hidden(block, hidden, cache)
+        draft_logits = self.lm_head(draft_hidden[:, 1:])
+        return sampler(draft_logits)
 
-    def __call__(
+    def _hidden(
         self,
         inputs: mx.array,
         target_hidden: mx.array,
@@ -157,7 +167,15 @@ class DFlashDraftModel(nn.Module):
         h_ctx = self.hidden_norm(self.fc(target_hidden))
         for layer, c in zip(self.layers, cache):
             h = layer(h, h_ctx, self.rope, c)
-        return self.lm_head(self.norm(h))
+        return self.norm(h)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        target_hidden: mx.array,
+        cache: List[KVCache],
+    ) -> mx.array:
+        return self.lm_head(self._hidden(inputs, target_hidden, cache))
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
