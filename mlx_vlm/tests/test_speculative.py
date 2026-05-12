@@ -38,6 +38,7 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.utils import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
+    _eagle3_verify_greedy_until_reject,
     _eagle3_verify_target,
     _effective_mtp_block_size,
     _format_speculative_stats,
@@ -1084,6 +1085,7 @@ def test_eagle3_prefill_uses_mlx_capture_layer_indexes():
 def test_eagle3_adaptive_block_size_grows_and_backs_off():
     cfg = Eagle3Config(
         block_size=5,
+        adaptive_max_block_size=12,
         transformer_layer_config=Eagle3TextConfig(
             hidden_size=8,
             intermediate_size=16,
@@ -1144,6 +1146,13 @@ def test_eagle3_adaptive_block_size_grows_and_backs_off():
     )
 
 
+def test_eagle3_default_block_size_stays_at_checkpoint_depth():
+    cfg = Eagle3Config(block_size=5)
+    drafter = SimpleNamespace(config=cfg, accept_lens=[], draft_lens=[])
+
+    assert _eagle3_block_settings(drafter, None) == (5, 5, False)
+
+
 def test_eagle3_user_block_size_disables_adaptive_block_size():
     cfg = Eagle3Config(block_size=5)
     drafter = SimpleNamespace(config=cfg, accept_lens=[0] * 6, draft_lens=[15] * 6)
@@ -1158,7 +1167,7 @@ def test_eagle3_user_block_size_disables_adaptive_block_size():
     )
 
 
-def test_eagle3_gemma4_verification_uses_single_token_steps():
+def test_eagle3_gemma4_verification_seeds_then_batches_tail():
     class FakeGemma4LM:
         __module__ = "mlx_vlm.models.gemma4.language"
 
@@ -1176,19 +1185,65 @@ def test_eagle3_gemma4_verification_uses_single_token_steps():
             )
 
     lm = FakeGemma4LM()
+    next_token = 0
+
+    def sampler(logits):
+        nonlocal next_token
+        width = int(logits.shape[1])
+        out = mx.arange(next_token + 1, next_token + width + 1, dtype=mx.int32)
+        next_token += width
+        return out[None, :]
 
     hidden, target_tokens, gdn_states = _eagle3_verify_target(
         lm,
         mx.array([[10, 11, 12]], dtype=mx.int32),
         prompt_cache=[],
-        sampler=lambda logits: mx.array([[len(lm.calls)]], dtype=mx.int32),
+        sampler=sampler,
         target_layer_ids=[1],
     )
 
-    assert lm.calls == [[[10]], [[11]], [[12]]]
+    assert lm.calls == [[[10]], [[11, 12]]]
     assert hidden.squeeze(-1).tolist() == [[10.0, 11.0, 12.0]]
     assert target_tokens.tolist() == [[1, 2, 3]]
     assert gdn_states is None
+
+
+def test_eagle3_gemma4_exact_verification_stops_at_reject():
+    class FakeGemma4LM:
+        __module__ = "mlx_vlm.models.gemma4.language"
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, inputs, cache, capture_layer_ids):
+            del cache, capture_layer_ids
+            self.calls.append(inputs.tolist())
+            hidden = inputs.astype(mx.float32)[..., None]
+            return SimpleNamespace(
+                hidden_states=[hidden * 10, hidden * 100],
+                logits=mx.zeros((*inputs.shape, 4), dtype=mx.float32),
+                gdn_states=["gdn", len(self.calls)],
+            )
+
+    lm = FakeGemma4LM()
+    targets = iter([5, 9])
+
+    hidden, accepted, new_tokens, gdn_states = _eagle3_verify_greedy_until_reject(
+        lm,
+        first_bonus=4,
+        draft_tokens=mx.array([[5, 6, 7]], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=lambda logits: mx.array([[next(targets)]], dtype=mx.int32),
+        target_layer_ids=[1, 2],
+        token_dtype=mx.int32,
+        budget=4,
+    )
+
+    assert lm.calls == [[[4]], [[5]]]
+    assert accepted == 1
+    assert new_tokens == [5, 9]
+    assert hidden.tolist() == [[[40.0, 400.0], [50.0, 500.0]]]
+    assert gdn_states == ["gdn", 2]
 
 
 def test_eagle3_accept_replays_committed_tokens_with_verifier_hidden():

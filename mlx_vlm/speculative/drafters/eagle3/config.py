@@ -48,6 +48,7 @@ class Eagle3Config(BaseModelConfig):
     embed_requires_grad: bool = False
     eagle_aux_hidden_state_layer_ids: Optional[List[int]] = None
     block_size: int = 5
+    adaptive_max_block_size: Optional[int] = None
     target_layer_ids: List[int] = field(default_factory=list)
     capture_layer_ids: List[int] = field(default_factory=list)
 

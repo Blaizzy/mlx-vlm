@@ -368,12 +368,12 @@ class Eagle3DraftModel(nn.Module):
                 else self._next_position - trim
             )
 
+        accepted = int(accepted)
         token_chunks = []
         hidden_chunks = []
-        accepted = int(accepted)
-        for draft_idx in range(accepted):
-            token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
-            hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
+        if accepted > 0:
+            token_chunks.append(draft_tokens[:, :accepted])
+            hidden_chunks.append(verify_hidden[:, :accepted, :])
 
         if new_tokens:
             token_chunks.append(mx.array([[int(new_tokens[-1])]], dtype=token_dtype))
@@ -427,9 +427,9 @@ class Eagle3DraftModel(nn.Module):
 
         token_chunks = []
         hidden_chunks = []
-        for draft_idx in range(accepted_i):
-            token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
-            hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
+        if accepted_i > 0:
+            token_chunks.append(draft_tokens[:, :accepted_i])
+            hidden_chunks.append(verify_hidden[:, :accepted_i, :])
 
         if all(new_tokens):
             bonus = mx.array(

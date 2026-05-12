@@ -8,8 +8,6 @@ from ..models import cache
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
-_EAGLE3_DEFAULT_MAX_BLOCK_SIZE = 12
-
 
 def _speculative_walk(
     draft_tokens: mx.array,
@@ -23,21 +21,18 @@ def _speculative_walk(
     Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
     truncated to ``budget``.
     """
-    n_draft = draft_tokens.shape[1]
-    mismatch = draft_tokens[:, :n_draft] != target_tokens[:, :n_draft]
-    mismatch = mismatch.reshape(-1)
-    has_mismatch = bool(mx.any(mismatch).item())
-    accepted = (
-        int(mx.argmax(mismatch.astype(mx.int32)).item()) if has_mismatch else n_draft
-    )
-    accepted_prefix = draft_tokens[:, :accepted]
-    bonus = target_tokens[:, accepted : accepted + 1]
-    new_tokens = (
-        mx.concatenate([accepted_prefix, bonus], axis=1)[:, :budget]
-        .reshape(-1)
-        .tolist()
-    )
-    return accepted, new_tokens
+    n_draft = int(draft_tokens.shape[1])
+    draft_row = draft_tokens.reshape(-1).tolist()[:n_draft]
+    target_row = target_tokens.reshape(-1).tolist()
+
+    accepted = n_draft
+    for i, (draft_tok, target_tok) in enumerate(zip(draft_row, target_row)):
+        if draft_tok != target_tok:
+            accepted = i
+            break
+
+    new_tokens = draft_row[:accepted] + target_row[accepted : accepted + 1]
+    return accepted, new_tokens[:budget]
 
 
 def _speculative_walk_batch(
@@ -50,28 +45,23 @@ def _speculative_walk_batch(
     Returns ``(accepted_list, new_tokens_list)`` where each entry
     corresponds to one sequence in the batch.
     """
-    B = draft_tokens.shape[0]
-    n_draft = draft_tokens.shape[1]
-    mismatch = draft_tokens[:, :n_draft] != target_tokens[:, :n_draft]
-    has_mismatch = mx.any(mismatch, axis=1)
-    first_mismatch = mx.argmax(mismatch.astype(mx.int32), axis=1)
-    accepted_arr = mx.where(
-        has_mismatch,
-        first_mismatch,
-        mx.full((B,), n_draft, dtype=mx.int32),
-    )
-    accepted_list = [int(x) for x in accepted_arr.tolist()]
+    B = int(draft_tokens.shape[0])
+    n_draft = int(draft_tokens.shape[1])
+    draft_rows = draft_tokens.tolist()
+    target_rows = target_tokens.tolist()
+    accepted_list = []
     new_tokens_list: List[List[int]] = []
     for i in range(B):
-        accepted = accepted_list[i]
-        accepted_prefix = draft_tokens[i : i + 1, :accepted]
-        bonus = target_tokens[i : i + 1, accepted : accepted + 1]
-        new = (
-            mx.concatenate([accepted_prefix, bonus], axis=1)[:, : budgets[i]]
-            .reshape(-1)
-            .tolist()
-        )
-        new_tokens_list.append(new)
+        accepted = n_draft
+        for j, (draft_tok, target_tok) in enumerate(
+            zip(draft_rows[i][:n_draft], target_rows[i])
+        ):
+            if draft_tok != target_tok:
+                accepted = j
+                break
+        accepted_list.append(accepted)
+        new_tokens = draft_rows[i][:accepted] + target_rows[i][accepted : accepted + 1]
+        new_tokens_list.append(new_tokens[: budgets[i]])
     return accepted_list, new_tokens_list
 
 
@@ -389,9 +379,9 @@ def _eagle3_block_settings(
     if draft_block_size is not None:
         return int(draft_block_size), configured, False
 
-    auto_max = getattr(
-        draft_model.config, "adaptive_max_block_size", _EAGLE3_DEFAULT_MAX_BLOCK_SIZE
-    )
+    auto_max = getattr(draft_model.config, "adaptive_max_block_size", None)
+    if auto_max is None:
+        return configured, configured, False
     auto_max = max(configured, int(auto_max))
     return auto_max, configured, auto_max > configured
 
@@ -1207,18 +1197,28 @@ def _eagle3_verify_target(
     target_layer_ids: List[int],
 ):
     if verify_input.shape[1] > 1 and "gemma4" in type(lm).__module__:
-        hidden_chunks = []
-        target_chunks = []
-        gdn_states = None
-        for pos in range(int(verify_input.shape[1])):
-            verify_out = lm(
-                verify_input[:, pos : pos + 1],
+        # Gemma 4's quantized cached forward can pick a different greedy token
+        # for the first query in a multi-token verify block. Decode that seed
+        # position exactly; the single-sequence Gemma path below uses a stricter
+        # early-exit verifier for full serial equivalence.
+        first_out = lm(
+            verify_input[:, :1],
+            cache=prompt_cache,
+            capture_layer_ids=target_layer_ids,
+        )
+        hidden_chunks = [mx.concatenate(first_out.hidden_states, axis=-1)]
+        target_chunks = [sampler(first_out.logits)]
+        gdn_states = first_out.gdn_states
+
+        if verify_input.shape[1] > 1:
+            tail_out = lm(
+                verify_input[:, 1:],
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
             )
-            hidden_chunks.append(mx.concatenate(verify_out.hidden_states, axis=-1))
-            target_chunks.append(sampler(verify_out.logits))
-            gdn_states = verify_out.gdn_states
+            hidden_chunks.append(mx.concatenate(tail_out.hidden_states, axis=-1))
+            target_chunks.append(sampler(tail_out.logits))
+            gdn_states = tail_out.gdn_states
         return (
             mx.concatenate(hidden_chunks, axis=1),
             mx.concatenate(target_chunks, axis=1),
@@ -1233,6 +1233,69 @@ def _eagle3_verify_target(
     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
     target_tokens = sampler(verify_out.logits)
     return hidden, target_tokens, verify_out.gdn_states
+
+
+def _eagle3_verify_greedy_until_reject(
+    lm: nn.Module,
+    first_bonus: int,
+    draft_tokens: mx.array,
+    prompt_cache: List[Any],
+    sampler: Callable[[mx.array], mx.array],
+    target_layer_ids: List[int],
+    token_dtype: mx.Dtype,
+    budget: int,
+) -> Tuple[mx.array, int, List[int], Any]:
+    """Verify a linear EAGLE path exactly, stopping at first rejection.
+
+    This keeps Gemma 4's target KV cache in the committed state directly:
+    the verifier feeds the previous bonus and then only accepted draft tokens.
+    The rejected draft token is never appended to the target cache.
+    """
+
+    draft_row = draft_tokens.reshape(-1).tolist()
+    hidden_by_layer: Optional[List[List[mx.array]]] = None
+    new_tokens: List[int] = []
+    accepted = 0
+    gdn_states = None
+    token = int(first_bonus)
+
+    for pos in range(len(draft_row) + 1):
+        verify_out = lm(
+            mx.array([[token]], dtype=token_dtype),
+            cache=prompt_cache,
+            capture_layer_ids=target_layer_ids,
+        )
+        if hidden_by_layer is None:
+            hidden_by_layer = [[] for _ in verify_out.hidden_states]
+        for layer_hidden, chunks in zip(verify_out.hidden_states, hidden_by_layer):
+            chunks.append(layer_hidden)
+        target_token = int(sampler(verify_out.logits).reshape(-1).item())
+        gdn_states = verify_out.gdn_states
+
+        if pos == len(draft_row):
+            if len(new_tokens) < budget:
+                new_tokens.append(target_token)
+            break
+
+        draft_token = int(draft_row[pos])
+        if draft_token != target_token:
+            if len(new_tokens) < budget:
+                new_tokens.append(target_token)
+            break
+
+        accepted += 1
+        if len(new_tokens) < budget:
+            new_tokens.append(draft_token)
+        token = draft_token
+
+    if hidden_by_layer is None:
+        raise RuntimeError("EAGLE-3 verification did not produce hidden states.")
+
+    hidden = mx.concatenate(
+        [mx.concatenate(chunks, axis=1) for chunks in hidden_by_layer],
+        axis=-1,
+    )
+    return hidden, accepted, new_tokens, gdn_states
 
 
 def _eagle3_capture_layer_ids(draft_model: nn.Module) -> List[int]:
@@ -1311,25 +1374,43 @@ def _eagle3_rounds(
         )
         mx.async_eval(draft_tokens)
 
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens],
-                axis=1,
-            )
-            verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
-                lm,
-                verify_input,
-                prompt_cache,
-                sampler,
-                target_layer_ids,
-            )
-        mx.async_eval(target_tokens, verify_hidden)
+        cache_is_committed = False
+        if "gemma4" in type(lm).__module__:
+            with mx.stream(generation_stream):
+                verify_hidden, accepted, new_tokens, gdn_states = (
+                    _eagle3_verify_greedy_until_reject(
+                        lm,
+                        b,
+                        draft_tokens,
+                        prompt_cache,
+                        sampler,
+                        target_layer_ids,
+                        token_dtype,
+                        max_tokens - emitted,
+                    )
+                )
+            cache_is_committed = True
+            mx.async_eval(verify_hidden)
+        else:
+            with mx.stream(generation_stream):
+                verify_input = mx.concatenate(
+                    [mx.array([[b]], dtype=token_dtype), draft_tokens],
+                    axis=1,
+                )
+                verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    target_layer_ids,
+                )
+            mx.async_eval(target_tokens, verify_hidden)
 
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens,
-            target_tokens,
-            max_tokens - emitted,
-        )
+            accepted, new_tokens = _speculative_walk(
+                draft_tokens,
+                target_tokens,
+                max_tokens - emitted,
+            )
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
@@ -1353,7 +1434,7 @@ def _eagle3_rounds(
         hidden = verify_hidden[:, accepted : accepted + 1, :]
         b = new_tokens[-1] if new_tokens else b
 
-        if accepted < bs - 1:
+        if accepted < bs - 1 and not cache_is_committed:
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(prompt_cache, gdn_states, accepted, bs)
 
