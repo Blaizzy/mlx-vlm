@@ -27,10 +27,13 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
 )
+from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
 from mlx_vlm.speculative.utils import (
+    _dflash_next_block_size,
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
@@ -211,14 +214,7 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
         return out, next_state
 
-    with (
-        patch.object(
-            qwen_language,
-            "gated_delta_update_with_states",
-            side_effect=AssertionError("batched verify must not capture states"),
-        ),
-        patch.object(qwen_language, "gated_delta_update", side_effect=fake_update),
-    ):
+    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
         out = layer(
             mx.zeros((2, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -230,7 +226,7 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
     assert sink[0][11] is None
 
 
-def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
+def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -242,29 +238,15 @@ def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
     )
     layer = qwen_language.Qwen3_5GatedDeltaNet(config)
     sink = []
-    intermediate = mx.zeros((1, 3, 2, 4, 4), dtype=mx.float32)
 
-    def fake_update_with_states(
-        q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True
-    ):
+    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
         del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
         B, S = q.shape[:2]
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        return out, next_state, intermediate
+        return out, next_state
 
-    with (
-        patch.object(
-            qwen_language,
-            "gated_delta_update",
-            side_effect=AssertionError("singleton verify should use state capture"),
-        ),
-        patch.object(
-            qwen_language,
-            "gated_delta_update_with_states",
-            side_effect=fake_update_with_states,
-        ),
-    ):
+    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
         out = layer(
             mx.zeros((1, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -273,7 +255,7 @@ def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11] is intermediate
+    assert sink[0][11] is None
 
 
 def test_speculative_walk_accepts_until_first_mismatch():
@@ -730,6 +712,57 @@ def test_dflash_block_total_falls_back_to_configured_block_size():
     assert speculative_utils._dflash_block_total(draft_model, None) == 16
 
 
+def test_dflash_config_defaults_to_checkpoint_block_size():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    draft_model = SimpleNamespace(config=config)
+
+    assert config.runtime_block_size is None
+    assert speculative_utils._dflash_block_total(draft_model, None) == 16
+
+
+def test_dflash_next_block_size_starts_at_requested_ceiling():
+    draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 16
+
+
+def test_dflash_next_block_size_backs_off_on_low_acceptance():
+    draft_model = SimpleNamespace(accept_lens=[1, 2], draft_lens=[15, 7])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 4
+
+
+def test_dflash_next_block_size_grows_after_full_prefix_hits():
+    draft_model = SimpleNamespace(accept_lens=[3, 3, 3, 3], draft_lens=[3, 3, 3, 3])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 6
+
+
+def test_dflash_next_block_size_does_not_grow_on_middling_acceptance():
+    draft_model = SimpleNamespace(accept_lens=[3, 2, 1, 3], draft_lens=[3, 3, 3, 3])
+
+    assert _dflash_next_block_size(draft_model, 16, 20) == 4
+
+
+def test_dflash_next_block_size_can_prefer_requested_size():
+    draft_model = SimpleNamespace(
+        accept_lens=[0] * 4,
+        draft_lens=[15] * 4,
+        prefer_requested_block_size=True,
+    )
+
+    assert _dflash_next_block_size(draft_model, 16, 8) == 8
+
+
 def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     hidden = mx.arange(12, dtype=mx.float32).reshape(2, 3, 2)
 
@@ -741,6 +774,143 @@ def test_dflash_committed_hidden_segments_keep_per_row_lengths():
     assert segments[0].tolist() == [[[0.0, 1.0], [2.0, 3.0]]]
     assert segments[1].shape == (1, 1, 2)
     assert segments[1].tolist() == [[[6.0, 7.0]]]
+
+
+def test_gemma4_26b_dflash_config_preserves_capture_layers():
+    config = Gemma4DFlashConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 30,
+            "dflash_config": {"target_layer_ids": [1, 6, 11]},
+        }
+    )
+
+    assert config.target_layer_ids == [1, 6, 11]
+    assert config.runtime_block_size is None
+
+
+def test_gemma4_31b_dflash_config_preserves_capture_layers():
+    config = Gemma4DFlashConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 60,
+            "dflash_config": {"target_layer_ids": [1, 12, 23]},
+        }
+    )
+
+    assert config.target_layer_ids == [1, 12, 23]
+    assert config.runtime_block_size is None
+
+
+def test_gemma4_dflash_config_honors_runtime_block_override():
+    config = Gemma4DFlashConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 30,
+            "dflash_config": {
+                "target_layer_ids": [1, 6, 11],
+                "runtime_block_size": 12,
+            },
+        }
+    )
+
+    assert config.target_layer_ids == [1, 6, 11]
+    assert config.runtime_block_size == 12
+
+
+def test_generic_dflash_config_parses_gemma4_metadata_without_runtime_cap():
+    config = ModelConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 262144,
+            "num_target_layers": 30,
+            "dflash_config": {
+                "mask_token_id": 4,
+                "target_layer_ids": [1, 6, 11],
+            },
+        }
+    )
+
+    assert config.target_layer_ids == [1, 6, 11]
+    assert config.runtime_block_size is None
+
+
+def test_dflash_drafter_uses_bound_target_embedding_scale():
+    class Embed:
+        def __call__(self, inputs):
+            return mx.ones((*inputs.shape, 4), dtype=mx.float32)
+
+        def as_linear(self, hidden):
+            return hidden
+
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+    drafter = DFlashDraftModel(config)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=Embed(), embed_scale=2.0)
+    )
+
+    drafter.bind(target)
+
+    embedded = drafter._embed_input_tokens(mx.array([[1, 2]], dtype=mx.int32))
+    assert embedded.tolist() == [[[2.0] * 4, [2.0] * 4]]
+
+
+def test_dflash_config_parses_sliding_attention_metadata():
+    config = ModelConfig.from_dict(
+        {
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 16,
+            "final_logit_softcapping": 30.0,
+            "dflash_config": {
+                "target_layer_ids": [0],
+                "mask_token_id": 4,
+            },
+        }
+    )
+
+    assert config.layer_types == ["sliding_attention", "full_attention"]
+    assert config.sliding_window == 16
+    assert config.final_logit_softcapping == 30.0
+    assert config.mask_token_id == 4
 
 
 def test_effective_mtp_block_size_respects_requested_block_size():
