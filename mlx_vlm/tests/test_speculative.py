@@ -15,6 +15,7 @@ import mlx.nn as nn
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
+import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -617,9 +618,9 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
     )
 
     with (
-        patch.object(speculative_utils, "_mtp_verify_target", return_value=verify),
+        patch.object(mtp_utils, "_mtp_verify_target", return_value=verify),
         patch.object(
-            speculative_utils,
+            mtp_utils,
             "_mtp_acceptance_walk",
             return_value=(0, [9]),
         ),
