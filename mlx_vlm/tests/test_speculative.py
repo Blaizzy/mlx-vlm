@@ -39,10 +39,7 @@ from mlx_vlm.speculative.utils import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
     _eagle3_verify_target_hot,
-    _eagle3_verify_greedy_until_reject,
-    _eagle3_verify_mode,
     _eagle3_verify_target,
-    _eagle3_verify_target_cache_replay,
     _effective_mtp_block_size,
     _format_speculative_stats,
     _mtp_draft_block_active,
@@ -1170,38 +1167,6 @@ def test_eagle3_user_block_size_disables_adaptive_block_size():
     )
 
 
-def test_eagle3_verify_mode_auto_uses_hot_for_greedy_gemma4(monkeypatch):
-    class FakeGemma4LM:
-        __module__ = "mlx_vlm.models.gemma4.language"
-
-    monkeypatch.delenv("MLX_VLM_EAGLE3_VERIFY_MODE", raising=False)
-    drafter = SimpleNamespace(config=SimpleNamespace(verify_mode=None))
-
-    assert _eagle3_verify_mode(FakeGemma4LM(), drafter, True) == "hot"
-    assert _eagle3_verify_mode(FakeGemma4LM(), drafter, False) == "exact"
-
-
-def test_eagle3_verify_mode_env_can_force_exact(monkeypatch):
-    class FakeGemma4LM:
-        __module__ = "mlx_vlm.models.gemma4.language"
-
-    monkeypatch.setenv("MLX_VLM_EAGLE3_VERIFY_MODE", "exact")
-    drafter = SimpleNamespace(config=SimpleNamespace(verify_mode=None))
-
-    assert _eagle3_verify_mode(FakeGemma4LM(), drafter, True) == "exact"
-
-
-def test_eagle3_verify_mode_rejects_unknown(monkeypatch):
-    class FakeLM:
-        __module__ = "mlx_vlm.models.llama.language"
-
-    monkeypatch.setenv("MLX_VLM_EAGLE3_VERIFY_MODE", "turbo")
-    drafter = SimpleNamespace(config=SimpleNamespace(verify_mode=None))
-
-    with pytest.raises(ValueError, match="Unsupported EAGLE-3 verify mode"):
-        _eagle3_verify_mode(FakeLM(), drafter, True)
-
-
 def test_eagle3_gemma4_verification_seeds_then_batches_tail():
     class FakeGemma4LM:
         __module__ = "mlx_vlm.models.gemma4.language"
@@ -1294,167 +1259,6 @@ def test_eagle3_hot_verifier_uses_draft_vocab_and_eos():
     # d2t maps draft ids [0, 1] to target ids [1, 2], and EOS id 4 is appended.
     assert target_tokens.tolist() == [[1, 4]]
     assert gdn_states is None
-
-
-def test_eagle3_gemma4_exact_verification_stops_at_reject():
-    class FakeGemma4LM:
-        __module__ = "mlx_vlm.models.gemma4.language"
-
-        def __init__(self):
-            self.calls = []
-
-        def __call__(self, inputs, cache, capture_layer_ids):
-            del cache, capture_layer_ids
-            self.calls.append(inputs.tolist())
-            hidden = inputs.astype(mx.float32)[..., None]
-            return SimpleNamespace(
-                hidden_states=[hidden * 10, hidden * 100],
-                logits=mx.zeros((*inputs.shape, 4), dtype=mx.float32),
-                gdn_states=["gdn", len(self.calls)],
-            )
-
-    lm = FakeGemma4LM()
-    targets = iter([5, 9])
-
-    hidden, accepted, new_tokens, gdn_states = _eagle3_verify_greedy_until_reject(
-        lm,
-        first_bonus=4,
-        draft_tokens=mx.array([[5, 6, 7]], dtype=mx.int32),
-        prompt_cache=[],
-        sampler=lambda logits: mx.array([[next(targets)]], dtype=mx.int32),
-        target_layer_ids=[1, 2],
-        token_dtype=mx.int32,
-        budget=4,
-    )
-
-    assert lm.calls == [[[4]], [[5]]]
-    assert accepted == 1
-    assert new_tokens == [5, 9]
-    assert hidden.tolist() == [[[40.0, 400.0], [50.0, 500.0]]]
-    assert gdn_states == ["gdn", 2]
-
-
-def test_eagle3_guarded_replay_accepts_block_after_first_match():
-    class FakeGemma4LM:
-        __module__ = "mlx_vlm.models.gemma4.language"
-
-        def __init__(self):
-            self.model_calls = []
-            self.logit_inputs = []
-
-        def model(self, inputs, cache, capture_layer_ids, hidden_sink):
-            del cache, capture_layer_ids
-            self.model_calls.append(inputs.tolist())
-            hidden = inputs.astype(mx.float32)[..., None]
-            hidden_sink.extend([hidden * 10, hidden * 100])
-            return hidden
-
-        def logits_from_hidden(self, hidden):
-            self.logit_inputs.append(hidden.tolist())
-            return mx.zeros((*hidden.shape[:2], 4), dtype=mx.float32)
-
-    lm = FakeGemma4LM()
-
-    hidden, accepted, new_tokens, gdn_states = _eagle3_verify_target_cache_replay(
-        lm,
-        first_bonus=4,
-        draft_tokens=mx.array([[5, 6, 7]], dtype=mx.int32),
-        prompt_cache=[],
-        sampler=lambda logits: mx.array([[5, 6, 99]], dtype=mx.int32),
-        target_layer_ids=[1, 2],
-        token_dtype=mx.int32,
-        budget=4,
-        guard_tokens=2,
-    )
-
-    assert lm.model_calls == [[[4, 5, 6, 7]]]
-    assert len(lm.logit_inputs) == 1
-    assert accepted == 3
-    assert new_tokens == [5, 6, 7, 99]
-    assert hidden.tolist() == [
-        [[40.0, 400.0], [50.0, 500.0], [60.0, 600.0], [70.0, 700.0]]
-    ]
-    assert gdn_states is None
-
-
-def test_eagle3_guarded_replay_trims_after_first_reject():
-    class FakeGemma4LM:
-        __module__ = "mlx_vlm.models.gemma4.language"
-
-        def model(self, inputs, cache, capture_layer_ids, hidden_sink):
-            del cache, capture_layer_ids
-            hidden = inputs.astype(mx.float32)[..., None]
-            hidden_sink.append(hidden)
-            return hidden
-
-        def logits_from_hidden(self, hidden):
-            return mx.zeros((*hidden.shape[:2], 4), dtype=mx.float32)
-
-    class FakeCache:
-        def __init__(self):
-            self.trimmed = []
-
-        def trim(self, n):
-            self.trimmed.append(n)
-
-    fake_cache = FakeCache()
-
-    hidden, accepted, new_tokens, _ = _eagle3_verify_target_cache_replay(
-        FakeGemma4LM(),
-        first_bonus=4,
-        draft_tokens=mx.array([[5, 6, 7]], dtype=mx.int32),
-        prompt_cache=[fake_cache],
-        sampler=lambda logits: mx.array([[9, 99]], dtype=mx.int32),
-        target_layer_ids=[1],
-        token_dtype=mx.int32,
-        budget=4,
-        guard_tokens=2,
-    )
-
-    assert fake_cache.trimmed == [3]
-    assert accepted == 0
-    assert new_tokens == [9]
-    assert hidden.tolist() == [[[4.0]]]
-
-
-def test_eagle3_guarded_replay_trims_after_second_reject():
-    class FakeGemma4LM:
-        __module__ = "mlx_vlm.models.gemma4.language"
-
-        def model(self, inputs, cache, capture_layer_ids, hidden_sink):
-            del cache, capture_layer_ids
-            hidden = inputs.astype(mx.float32)[..., None]
-            hidden_sink.append(hidden)
-            return hidden
-
-        def logits_from_hidden(self, hidden):
-            return mx.zeros((*hidden.shape[:2], 4), dtype=mx.float32)
-
-    class FakeCache:
-        def __init__(self):
-            self.trimmed = []
-
-        def trim(self, n):
-            self.trimmed.append(n)
-
-    fake_cache = FakeCache()
-
-    hidden, accepted, new_tokens, _ = _eagle3_verify_target_cache_replay(
-        FakeGemma4LM(),
-        first_bonus=4,
-        draft_tokens=mx.array([[5, 6, 7]], dtype=mx.int32),
-        prompt_cache=[fake_cache],
-        sampler=lambda logits: mx.array([[5, 9, 99]], dtype=mx.int32),
-        target_layer_ids=[1],
-        token_dtype=mx.int32,
-        budget=4,
-        guard_tokens=2,
-    )
-
-    assert fake_cache.trimmed == [2]
-    assert accepted == 1
-    assert new_tokens == [5, 9]
-    assert hidden.tolist() == [[[4.0], [5.0]]]
 
 
 def test_eagle3_accept_replays_committed_tokens_with_verifier_hidden():
