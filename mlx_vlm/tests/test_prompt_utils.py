@@ -1,6 +1,6 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import extract_text_from_content
+from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
 
 
 class TestExtractTextFromContent:
@@ -389,3 +389,23 @@ class TestExtractTextFromContentEdgeCases:
         ]
         result = extract_text_from_content(content)
         assert result == "Actual content"
+
+
+def test_apply_chat_template_uses_generic_text_model_fallback():
+    class TextProcessor:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True
+        ):
+            assert add_generation_prompt is True
+            assert messages == [{"role": "user", "content": "Hello"}]
+            return "templated"
+
+    result = apply_chat_template(
+        TextProcessor(),
+        {"model_type": "llama"},
+        "Hello",
+    )
+
+    assert result == "templated"

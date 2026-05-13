@@ -21,6 +21,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .models.text_only import TextOnlyModel
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -103,7 +104,7 @@ def skip_multimodal_module(path: str) -> bool:
     return any(module in path for module in multimodal_modules)
 
 
-def get_model_and_args(config: dict):
+def get_model_and_args(config: dict, log_unsupported: bool = True):
     """
     Retrieve the model object based on the configuration.
 
@@ -136,7 +137,8 @@ def get_model_and_args(config: dict):
             continue
 
     msg = f"Model type {model_type} not supported. Error: {last_err}"
-    logging.error(msg)
+    if log_unsupported:
+        logging.error(msg)
     raise ValueError(msg)
 
 
@@ -235,7 +237,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
-    model_class, _ = get_model_and_args(config=config)
+    try:
+        model_class, _ = get_model_and_args(config=config, log_unsupported=False)
+    except ValueError as exc:
+        try:
+            return load_text_model(model_path, config, lazy=lazy, **kwargs)
+        except ValueError as lm_exc:
+            if "not supported" not in str(lm_exc).lower():
+                raise
+            raise exc
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -352,6 +362,30 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     return model
 
 
+def load_text_model(
+    model_path: Path,
+    config: Dict[str, Any],
+    lazy: bool = False,
+    **kwargs,
+) -> TextOnlyModel:
+    """Load a text-only model and wrap it in mlx-vlm's runtime interface."""
+    from mlx_lm import utils as mlx_lm_utils
+
+    model_config = dict(kwargs.get("model_config") or {})
+    if kwargs.get("quantize_activations", False):
+        model_config["quantize_activations"] = True
+
+    lm_model, lm_config = mlx_lm_utils.load_model(
+        model_path,
+        lazy=lazy,
+        strict=kwargs.get("strict", True),
+        model_config=model_config or None,
+    )
+    if "eos_token_id" in config and "eos_token_id" not in lm_config:
+        lm_config["eos_token_id"] = config["eos_token_id"]
+    return TextOnlyModel(lm_model, lm_config)
+
+
 def sanitize_weights(model_obj, weights, config=None):
     """Helper function to sanitize weights if the model has a sanitize method"""
     if hasattr(model_obj, "sanitize"):
@@ -421,7 +455,14 @@ def load(
     )
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
-        model = apply_lora_layers(model, adapter_path)
+        if getattr(model, "_is_text_model", False):
+            from mlx_lm.utils import load_adapters
+
+            model.language_model._model = load_adapters(
+                model.language_model._model, adapter_path
+            )
+        else:
+            model = apply_lora_layers(model, adapter_path)
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
@@ -545,7 +586,10 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     else:
         config = load_config(model_path, **kwargs)
 
-    model_class, _ = get_model_and_args(config)
+    try:
+        model_class, _ = get_model_and_args(config, log_unsupported=False)
+    except ValueError:
+        return None
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
@@ -563,9 +607,21 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    except Exception as processor_exc:
+        try:
+            config = load_config(model_path, **kwargs)
+            get_model_and_args(config, log_unsupported=False)
+        except (ValueError, FileNotFoundError):
+            processor = load_tokenizer(model_path, tokenizer_config_extra=kwargs)
+        else:
+            raise processor_exc
     if add_detokenizer:
-        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+        if hasattr(processor, "detokenizer") and not hasattr(processor, "tokenizer"):
+            detokenizer_class = None
+        else:
+            detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
         # Get the tokenizer object
         tokenizer_obj = (
@@ -573,12 +629,15 @@ def load_processor(
         )
 
         # Instantiate the detokenizer
-        processor.detokenizer = detokenizer_class(tokenizer_obj)
+        if detokenizer_class is not None:
+            processor.detokenizer = detokenizer_class(tokenizer_obj)
 
         # Determine the EOS token IDs, prioritizing the function argument
-        final_eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
-        )
+        final_eos_token_ids = eos_token_ids
+        if final_eos_token_ids is None:
+            final_eos_token_ids = getattr(tokenizer_obj, "eos_token_ids", None)
+        if final_eos_token_ids is None:
+            final_eos_token_ids = getattr(tokenizer_obj, "eos_token_id", None)
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
