@@ -3,7 +3,7 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+from .common import _record_speculative_round, generation_stream
 
 
 def _eagle3_walk(
@@ -68,14 +68,6 @@ def _eagle3_walk_batch_uniform_acceptance(
         )
         new_tokens_list.append(new)
     return [accepted] * len(accepted_list), new_tokens_list
-
-
-def _record_eagle3_round(
-    draft_model: nn.Module, accepted: float, draft_count: int
-) -> None:
-    draft_model.accept_lens.append(accepted)
-    if hasattr(draft_model, "draft_lens"):
-        draft_model.draft_lens.append(int(draft_count))
 
 
 def _eagle3_draft_kwargs(draft_model: nn.Module, greedy_sampling: bool) -> dict:
@@ -436,7 +428,7 @@ def _eagle3_rounds(
             target_tokens,
             max_tokens - emitted,
         )
-        _record_eagle3_round(draft_model, accepted, bs - 1)
+        _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
             yield tok, None
@@ -571,7 +563,7 @@ def _eagle3_rounds_batch(
                 accepted_list,
                 budgets,
             )
-        _record_eagle3_round(
+        _record_speculative_round(
             draft_model,
             sum(accepted_list) / len(accepted_list),
             bs - 1,
