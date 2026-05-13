@@ -13,11 +13,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
-from .gated_delta import (
-    gated_delta_state_update,
-    gated_delta_update,
-    gated_delta_update_with_states,
-)
+from .gated_delta import gated_delta_state_update, gated_delta_update
 
 
 class Qwen3_5RotaryEmbedding:
@@ -322,40 +318,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         initial_state = state
-        intermediate_states = None
-        capture_intermediate_states = gdn_sink is not None and B == 1
-        if capture_intermediate_states:
-            out, state, intermediate_states = gated_delta_update_with_states(
-                q,
-                k,
-                v,
-                a,
-                b,
-                self.A_log,
-                self.dt_bias,
-                state,
-                mask,
-                use_kernel=not self.training,
-            )
-        else:
-            out, state = gated_delta_update(
-                q,
-                k,
-                v,
-                a,
-                b,
-                self.A_log,
-                self.dt_bias,
-                state,
-                mask,
-                use_kernel=not self.training,
-            )
+        out, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            state,
+            mask,
+            use_kernel=not self.training,
+        )
 
         if gdn_sink is not None:
             # Tuple layout consumed by ``rollback_speculative_cache`` below.
-            # Batched MTP uses the replay rollback path because materializing
-            # per-token intermediate GDN states is both expensive and has
-            # different batch semantics from the normal decode path.
+            # Speculative rollback reconstructs the accepted state with the
+            # state-only GDN kernel; materializing every per-token state here
+            # slows down the target verify pass.
             gdn_sink.append(
                 (
                     q,
@@ -369,7 +349,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     mask,
                     conv_input,
                     self.conv_kernel_size,
-                    intermediate_states,
+                    None,
                 )
             )
 

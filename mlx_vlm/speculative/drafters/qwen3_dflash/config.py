@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List, Optional
 
 from ....models.base import BaseModelConfig
 
@@ -17,13 +17,17 @@ class DFlashConfig(BaseModelConfig):
     vocab_size: int = 248320
     max_position_embeddings: int = 262144
     rope_theta: float = 10000000.0
+    rope_scaling: Optional[dict[str, Any]] = None
     attention_bias: bool = False
     tie_word_embeddings: bool = True
     block_size: int = 16
     mask_token_id: int = 248070
     target_layer_ids: List[int] = field(default_factory=lambda: [1, 8, 15, 22, 29])
     num_target_layers: int = 32
-    runtime_block_size: int | None = 14
+    layer_types: List[str] = field(default_factory=list)
+    sliding_window: Optional[int] = None
+    final_logit_softcapping: Optional[float] = None
+    runtime_block_size: int | None = None
     draft_window_size: int | None = None
 
     @classmethod
