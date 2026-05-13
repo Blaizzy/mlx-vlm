@@ -242,11 +242,12 @@ def parse_arguments():
         "--draft-verify-mode",
         type=str,
         default=None,
-        choices=["auto", "block", "exact", "guarded", "trust"],
-        help="EAGLE-3 verifier mode. 'auto' uses guarded fast verification "
+        choices=["auto", "block", "exact", "guarded", "hot", "trust"],
+        help="EAGLE-3 verifier mode. 'auto' uses hot-vocabulary verification "
         "for greedy Gemma 4 and block verification elsewhere; 'exact' "
-        "preserves target-greedy output; 'guarded' verifies the first draft "
-        "token then trusts the block; 'trust' trusts the whole draft block.",
+        "preserves target-greedy output; 'hot' verifies against the EAGLE "
+        "hot vocabulary plus EOS; 'guarded' verifies a short draft prefix "
+        "then trusts the block; 'trust' trusts the whole draft block.",
     )
     parser.add_argument(
         "--enable-thinking",

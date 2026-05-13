@@ -208,7 +208,27 @@ class Eagle3DraftModel(nn.Module):
         self.draft_lens: List[int] = []
 
     def bind(self, target_model) -> "Eagle3DraftModel":
-        del target_model
+        inner = None
+        if hasattr(target_model, "embed_tokens"):
+            inner = target_model
+        elif hasattr(target_model, "model") and hasattr(
+            target_model.model, "embed_tokens"
+        ):
+            inner = target_model.model
+        elif (
+            hasattr(target_model, "language_model")
+            and hasattr(target_model.language_model, "model")
+            and hasattr(target_model.language_model.model, "embed_tokens")
+        ):
+            inner = target_model.language_model.model
+
+        if inner is not None:
+            target_embed = inner.embed_tokens
+            weight = getattr(target_embed, "weight", None)
+            if weight is not None and tuple(weight.shape) == tuple(
+                self.embed_tokens.weight.shape
+            ):
+                self.embed_tokens = target_embed
         return self
 
     def make_cache(self) -> List[KVCache]:

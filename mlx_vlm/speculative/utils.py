@@ -10,7 +10,7 @@ from ..models import cache
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 _EAGLE3_VERIFY_MODE_ENV = "MLX_VLM_EAGLE3_VERIFY_MODE"
-_EAGLE3_VERIFY_MODES = {"auto", "block", "exact", "guarded", "trust"}
+_EAGLE3_VERIFY_MODES = {"auto", "block", "exact", "guarded", "hot", "trust"}
 
 
 def _speculative_walk(
@@ -422,18 +422,14 @@ def _eagle3_next_block_size(
         recent_accept = [int(a) for a in accepted[-6:]]
         recent_draft = [max(1, int(d)) for d in drafted[-6:]]
         mean_output = sum(a + 1 for a in recent_accept) / len(recent_accept)
-        full_rate = sum(
-            1 for a, d in zip(recent_accept, recent_draft) if a >= d
-        ) / len(recent_accept)
+        full_rate = sum(1 for a, d in zip(recent_accept, recent_draft) if a >= d) / len(
+            recent_accept
+        )
 
         tier_idx = tiers.index(min(tiers, key=lambda tier: abs(tier - current)))
         # Probe a wider EAGLE window once after the checkpoint's conservative
         # depth; some Gemma 4 continuations only expose long accept runs there.
-        if (
-            len(accepted) == 6
-            and current == configured_block_total
-            and len(tiers) > 1
-        ):
+        if len(accepted) == 6 and current == configured_block_total and len(tiers) > 1:
             tier_idx = len(tiers) - 1
         elif mean_output < 2.0 or (mean_output < 3.0 and full_rate == 0):
             tier_idx = max(0, tier_idx - 1)
@@ -1320,15 +1316,15 @@ def _eagle3_verify_target_cache_replay(
     token_dtype: mx.Dtype,
     budget: int,
     *,
-    guard_first: bool,
+    guard_tokens: int,
 ) -> Tuple[mx.array, int, List[int], Any]:
     """Fast EAGLE verifier that replays drafted tokens through target K/V.
 
     This is an optimistic verifier for greedy decoding. It uses the target body
     to keep K/V and target hidden states aligned with emitted tokens, but avoids
-    running the target lm-head at every accepted position. ``guard_first`` checks
-    the first draft token against the target before trusting the rest of the
-    block; without it, the whole draft block is trusted.
+    running the target lm-head at every accepted position. ``guard_tokens`` checks
+    a short prefix of draft tokens against the target before trusting the rest of
+    the block; a value of zero trusts the whole draft block.
     """
 
     if not hasattr(lm, "model") or not hasattr(lm, "logits_from_hidden"):
@@ -1360,27 +1356,180 @@ def _eagle3_verify_target_cache_replay(
     hidden = mx.concatenate(hidden_sink, axis=-1)
     draft_row = draft_tokens.reshape(-1).tolist()
 
-    if guard_first:
+    guard_tokens = min(max(int(guard_tokens), 0), int(draft_tokens.shape[1]))
+    if guard_tokens > 0:
+        logit_positions = list(range(guard_tokens))
+        if int(verify_input.shape[1]) - 1 not in logit_positions:
+            logit_positions.append(int(verify_input.shape[1]) - 1)
         logits_input = mx.concatenate(
-            [final_hidden[:, :1, :], final_hidden[:, -1:, :]],
+            [final_hidden[:, pos : pos + 1, :] for pos in logit_positions],
             axis=1,
         )
-        target_first, bonus = [
+        sampled = [
             int(tok) for tok in sampler(lm.logits_from_hidden(logits_input)).tolist()[0]
         ]
-        if int(draft_row[0]) != target_first:
-            _trim_target_cache(prompt_cache, int(verify_input.shape[1]) - 1)
-            return hidden[:, :1, :], 0, [target_first][:budget], None
+        bonus = sampled[-1]
+        for guard_idx, target_token in enumerate(sampled[:guard_tokens]):
+            if int(draft_row[guard_idx]) != target_token:
+                _trim_target_cache(prompt_cache, int(draft_tokens.shape[1]) - guard_idx)
+                return (
+                    hidden[:, : guard_idx + 1, :],
+                    guard_idx,
+                    (draft_row[:guard_idx] + [target_token])[:budget],
+                    None,
+                )
     else:
         bonus = int(
-            sampler(lm.logits_from_hidden(final_hidden[:, -1:, :]))
-            .reshape(-1)
-            .item()
+            sampler(lm.logits_from_hidden(final_hidden[:, -1:, :])).reshape(-1).item()
         )
 
     accepted = int(draft_tokens.shape[1])
     new_tokens = draft_row + [bonus]
     return hidden, accepted, new_tokens[:budget], None
+
+
+def _eagle3_eos_token_ids(lm: nn.Module) -> List[int]:
+    config = getattr(lm, "config", None)
+    eos = getattr(config, "eos_token_id", None)
+    if eos is None:
+        return []
+    if isinstance(eos, (list, tuple, set)):
+        return [int(tok) for tok in eos if tok is not None]
+    return [int(eos)]
+
+
+def _eagle3_hot_token_ids(
+    lm: nn.Module,
+    draft_model: nn.Module,
+    eos_token_ids: Optional[List[int]] = None,
+) -> Optional[mx.array]:
+    d2t = getattr(draft_model, "d2t", None)
+    if d2t is None:
+        return None
+
+    eos_ids = eos_token_ids if eos_token_ids is not None else _eagle3_eos_token_ids(lm)
+    cache_key = tuple(eos_ids)
+    cached_key = getattr(draft_model, "_hot_token_ids_cache_key", None)
+    cached_ids = getattr(draft_model, "_hot_token_ids_cache", None)
+    if cached_ids is not None and cached_key == cache_key:
+        return cached_ids
+
+    hot_ids = mx.arange(d2t.shape[0], dtype=mx.int32) + d2t.astype(mx.int32)
+    if eos_ids:
+        hot_ids = mx.concatenate([hot_ids, mx.array(eos_ids, dtype=mx.int32)], axis=0)
+    hot_ids = hot_ids.astype(mx.int32)
+    draft_model._hot_token_ids_cache_key = cache_key
+    draft_model._hot_token_ids_cache = hot_ids
+    return hot_ids
+
+
+def _eagle3_hot_logits_from_hidden(
+    lm: nn.Module,
+    draft_model: nn.Module,
+    hidden: mx.array,
+    hot_ids: mx.array,
+) -> mx.array:
+    embed = lm.model.embed_tokens
+    cache_key = (id(embed), int(hot_ids.shape[0]))
+    cached_key = getattr(draft_model, "_hot_lm_head_cache_key", None)
+    cached_head = getattr(draft_model, "_hot_lm_head_cache", None)
+
+    if cached_head is None or cached_key != cache_key:
+        if hasattr(embed, "scales"):
+            cached_head = (
+                embed.weight[hot_ids],
+                embed.scales[hot_ids],
+                embed.biases[hot_ids] if hasattr(embed, "biases") else None,
+                embed.group_size,
+                embed.bits,
+                getattr(embed, "mode", "affine"),
+                True,
+            )
+        else:
+            cached_head = (embed.weight[hot_ids], None, None, None, None, None, False)
+        draft_model._hot_lm_head_cache_key = cache_key
+        draft_model._hot_lm_head_cache = cached_head
+
+    weight, scales, biases, group_size, bits, mode, quantized = cached_head
+
+    if quantized:
+        logits = mx.quantized_matmul(
+            hidden,
+            weight,
+            scales=scales,
+            biases=biases,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+    else:
+        logits = hidden @ weight.T
+
+    softcap = getattr(lm, "final_logit_softcapping", None)
+    if softcap is not None:
+        logits = mx.tanh(logits / softcap) * softcap
+    return logits
+
+
+def _eagle3_verify_target_hot(
+    lm: nn.Module,
+    draft_model: nn.Module,
+    verify_input: mx.array,
+    prompt_cache: List[Any],
+    sampler: Callable[[mx.array], mx.array],
+    target_layer_ids: List[int],
+    eos_token_ids: Optional[List[int]] = None,
+) -> Optional[Tuple[mx.array, mx.array, Any]]:
+    """Verify a Gemma 4 EAGLE block against the draft hot vocabulary.
+
+    This mirrors SGLang's practical bias toward compact candidate sets: the
+    expensive target body still runs once for the whole block, but the verifier
+    projects only the EAGLE hot vocabulary plus EOS tokens instead of Gemma 4's
+    full 262k vocabulary. It is greedy-only and intentionally falls back when a
+    target model does not expose the tied embedding projection.
+    """
+
+    if not hasattr(lm, "model") or not hasattr(lm, "logits_from_hidden"):
+        return None
+
+    hot_ids = _eagle3_hot_token_ids(lm, draft_model, eos_token_ids)
+    if hot_ids is None:
+        return None
+
+    hidden_sink: List[mx.array] = []
+    final_hidden = lm.model(
+        verify_input,
+        cache=prompt_cache,
+        capture_layer_ids=target_layer_ids,
+        hidden_sink=hidden_sink,
+    )
+    if not hidden_sink:
+        raise RuntimeError("EAGLE-3 verification did not produce hidden states.")
+
+    hidden = mx.concatenate(hidden_sink, axis=-1)
+    hot_logits = _eagle3_hot_logits_from_hidden(lm, draft_model, final_hidden, hot_ids)
+    hot_idx = mx.argmax(hot_logits, axis=-1).astype(mx.int32)
+    target_tokens = hot_ids[hot_idx]
+
+    draft_tokens = verify_input[:, 1:]
+    accepted, _ = _speculative_walk(
+        draft_tokens,
+        target_tokens,
+        int(draft_tokens.shape[1]) + 1,
+    )
+    full_pos = min(int(accepted), int(target_tokens.shape[1]) - 1)
+    full_token = sampler(
+        lm.logits_from_hidden(final_hidden[:, full_pos : full_pos + 1])
+    )
+    pieces = []
+    if full_pos > 0:
+        pieces.append(target_tokens[:, :full_pos])
+    pieces.append(full_token)
+    if full_pos + 1 < int(target_tokens.shape[1]):
+        pieces.append(target_tokens[:, full_pos + 1 :])
+    target_tokens = mx.concatenate(pieces, axis=1) if len(pieces) > 1 else pieces[0]
+    return hidden, target_tokens, None
 
 
 def _eagle3_capture_layer_ids(draft_model: nn.Module) -> List[int]:
@@ -1413,7 +1562,7 @@ def _eagle3_verify_mode(
         return mode
 
     if "gemma4" in type(lm).__module__:
-        return "guarded" if greedy_sampling else "exact"
+        return "hot" if greedy_sampling else "exact"
     return "block"
 
 
@@ -1443,6 +1592,13 @@ def _eagle3_rounds(
     block_total, configured_block_total, adaptive_block_size = _eagle3_block_settings(
         draft_model, draft_block_size
     )
+    if verify_mode == "hot" and draft_block_size is None:
+        # The hot-vocabulary verifier is fastest and most stable when it uses
+        # one draft token per target replay. Wider blocks are still available
+        # explicitly via --draft-block-size for benchmark sweeps.
+        block_total = min(block_total, 2)
+        configured_block_total = min(configured_block_total, block_total)
+        adaptive_block_size = False
     draft_cache = draft_model.reset(model)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
@@ -1513,7 +1669,7 @@ def _eagle3_rounds(
                         target_layer_ids,
                         token_dtype,
                         max_tokens - emitted,
-                        guard_first=verify_mode == "guarded",
+                        guard_tokens=2 if verify_mode == "guarded" else 0,
                     )
                 )
             cache_is_committed = True
@@ -1524,13 +1680,29 @@ def _eagle3_rounds(
                     [mx.array([[b]], dtype=token_dtype), draft_tokens],
                     axis=1,
                 )
-                verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
-                    lm,
-                    verify_input,
-                    prompt_cache,
-                    sampler,
-                    target_layer_ids,
-                )
+                if verify_mode == "hot":
+                    hot_verify = _eagle3_verify_target_hot(
+                        lm,
+                        draft_model,
+                        verify_input,
+                        prompt_cache,
+                        sampler,
+                        target_layer_ids,
+                        _eagle3_eos_token_ids(model),
+                    )
+                else:
+                    hot_verify = None
+
+                if hot_verify is None:
+                    verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
+                        lm,
+                        verify_input,
+                        prompt_cache,
+                        sampler,
+                        target_layer_ids,
+                    )
+                else:
+                    verify_hidden, target_tokens, gdn_states = hot_verify
             mx.async_eval(target_tokens, verify_hidden)
 
             accepted, new_tokens = _speculative_walk(
