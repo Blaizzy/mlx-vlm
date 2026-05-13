@@ -239,6 +239,16 @@ def parse_arguments():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--draft-verify-mode",
+        type=str,
+        default=None,
+        choices=["auto", "block", "exact", "guarded", "trust"],
+        help="EAGLE-3 verifier mode. 'auto' uses guarded fast verification "
+        "for greedy Gemma 4 and block verification elsewhere; 'exact' "
+        "preserves target-greedy output; 'guarded' verifies the first draft "
+        "token then trusts the block; 'trust' trusts the whole draft block.",
+    )
+    parser.add_argument(
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
@@ -3333,6 +3343,8 @@ def main():
                 f"using {resolved_kind!r} instead of {args.draft_kind!r}."
             )
         args.draft_kind = resolved_kind
+        if args.draft_verify_mode is not None and hasattr(draft_model, "config"):
+            draft_model.config.verify_mode = args.draft_verify_mode
 
     prompt = args.prompt
 

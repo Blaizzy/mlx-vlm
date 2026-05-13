@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
@@ -7,6 +8,9 @@ import mlx.nn as nn
 from ..models import cache
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
+
+_EAGLE3_VERIFY_MODE_ENV = "MLX_VLM_EAGLE3_VERIFY_MODE"
+_EAGLE3_VERIFY_MODES = {"auto", "block", "exact", "guarded", "trust"}
 
 
 def _speculative_walk(
@@ -1298,6 +1302,87 @@ def _eagle3_verify_greedy_until_reject(
     return hidden, accepted, new_tokens, gdn_states
 
 
+def _trim_target_cache(prompt_cache: List[Any], trim: int) -> None:
+    if trim <= 0:
+        return
+    for c in prompt_cache:
+        if c is not None and hasattr(c, "trim"):
+            c.trim(trim)
+
+
+def _eagle3_verify_target_cache_replay(
+    lm: nn.Module,
+    first_bonus: int,
+    draft_tokens: mx.array,
+    prompt_cache: List[Any],
+    sampler: Callable[[mx.array], mx.array],
+    target_layer_ids: List[int],
+    token_dtype: mx.Dtype,
+    budget: int,
+    *,
+    guard_first: bool,
+) -> Tuple[mx.array, int, List[int], Any]:
+    """Fast EAGLE verifier that replays drafted tokens through target K/V.
+
+    This is an optimistic verifier for greedy decoding. It uses the target body
+    to keep K/V and target hidden states aligned with emitted tokens, but avoids
+    running the target lm-head at every accepted position. ``guard_first`` checks
+    the first draft token against the target before trusting the rest of the
+    block; without it, the whole draft block is trusted.
+    """
+
+    if not hasattr(lm, "model") or not hasattr(lm, "logits_from_hidden"):
+        return _eagle3_verify_greedy_until_reject(
+            lm,
+            first_bonus,
+            draft_tokens,
+            prompt_cache,
+            sampler,
+            target_layer_ids,
+            token_dtype,
+            budget,
+        )
+
+    verify_input = mx.concatenate(
+        [mx.array([[first_bonus]], dtype=token_dtype), draft_tokens],
+        axis=1,
+    )
+    hidden_sink: List[mx.array] = []
+    final_hidden = lm.model(
+        verify_input,
+        cache=prompt_cache,
+        capture_layer_ids=target_layer_ids,
+        hidden_sink=hidden_sink,
+    )
+    if not hidden_sink:
+        raise RuntimeError("EAGLE-3 verification did not produce hidden states.")
+
+    hidden = mx.concatenate(hidden_sink, axis=-1)
+    draft_row = draft_tokens.reshape(-1).tolist()
+
+    if guard_first:
+        logits_input = mx.concatenate(
+            [final_hidden[:, :1, :], final_hidden[:, -1:, :]],
+            axis=1,
+        )
+        target_first, bonus = [
+            int(tok) for tok in sampler(lm.logits_from_hidden(logits_input)).tolist()[0]
+        ]
+        if int(draft_row[0]) != target_first:
+            _trim_target_cache(prompt_cache, int(verify_input.shape[1]) - 1)
+            return hidden[:, :1, :], 0, [target_first][:budget], None
+    else:
+        bonus = int(
+            sampler(lm.logits_from_hidden(final_hidden[:, -1:, :]))
+            .reshape(-1)
+            .item()
+        )
+
+    accepted = int(draft_tokens.shape[1])
+    new_tokens = draft_row + [bonus]
+    return hidden, accepted, new_tokens[:budget], None
+
+
 def _eagle3_capture_layer_ids(draft_model: nn.Module) -> List[int]:
     return list(
         getattr(
@@ -1306,6 +1391,30 @@ def _eagle3_capture_layer_ids(draft_model: nn.Module) -> List[int]:
             draft_model.config.target_layer_ids,
         )
     )
+
+
+def _eagle3_verify_mode(
+    lm: nn.Module,
+    draft_model: nn.Module,
+    greedy_sampling: bool,
+) -> str:
+    mode = (
+        getattr(getattr(draft_model, "config", None), "verify_mode", None)
+        or os.environ.get(_EAGLE3_VERIFY_MODE_ENV)
+        or "auto"
+    )
+    mode = str(mode).strip().lower()
+    if mode not in _EAGLE3_VERIFY_MODES:
+        raise ValueError(
+            f"Unsupported EAGLE-3 verify mode {mode!r}. "
+            f"Use one of {sorted(_EAGLE3_VERIFY_MODES)}."
+        )
+    if mode != "auto":
+        return mode
+
+    if "gemma4" in type(lm).__module__:
+        return "guarded" if greedy_sampling else "exact"
+    return "block"
 
 
 def _eagle3_rounds(
@@ -1330,6 +1439,7 @@ def _eagle3_rounds(
         )
 
     target_layer_ids = _eagle3_capture_layer_ids(draft_model)
+    verify_mode = _eagle3_verify_mode(lm, draft_model, greedy_sampling)
     block_total, configured_block_total, adaptive_block_size = _eagle3_block_settings(
         draft_model, draft_block_size
     )
@@ -1375,7 +1485,7 @@ def _eagle3_rounds(
         mx.async_eval(draft_tokens)
 
         cache_is_committed = False
-        if "gemma4" in type(lm).__module__:
+        if verify_mode == "exact":
             with mx.stream(generation_stream):
                 verify_hidden, accepted, new_tokens, gdn_states = (
                     _eagle3_verify_greedy_until_reject(
@@ -1387,6 +1497,23 @@ def _eagle3_rounds(
                         target_layer_ids,
                         token_dtype,
                         max_tokens - emitted,
+                    )
+                )
+            cache_is_committed = True
+            mx.async_eval(verify_hidden)
+        elif verify_mode in {"guarded", "trust"}:
+            with mx.stream(generation_stream):
+                verify_hidden, accepted, new_tokens, gdn_states = (
+                    _eagle3_verify_target_cache_replay(
+                        lm,
+                        b,
+                        draft_tokens,
+                        prompt_cache,
+                        sampler,
+                        target_layer_ids,
+                        token_dtype,
+                        max_tokens - emitted,
+                        guard_first=verify_mode == "guarded",
                     )
                 )
             cache_is_committed = True
