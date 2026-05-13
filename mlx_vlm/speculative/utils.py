@@ -5,15 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..models import cache
-from .eagle3 import (
-    _eagle3_block_settings,
-    _eagle3_capture_layer_ids,
-    _eagle3_next_block_size,
-    _eagle3_rounds,
-    _eagle3_rounds_batch,
-    _eagle3_verify_target,
-    _eagle3_verify_target_hot,
-)
+from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 

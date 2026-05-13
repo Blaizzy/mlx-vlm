@@ -22,26 +22,26 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
 )
+from mlx_vlm.speculative.drafters.eagle3 import Eagle3DraftModel
+from mlx_vlm.speculative.drafters.eagle3 import ModelConfig as Eagle3Config
+from mlx_vlm.speculative.drafters.eagle3 import TextConfig as Eagle3TextConfig
 from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
 from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
     normalize_batched_shared_kv_states,
-)
-from mlx_vlm.speculative.drafters.eagle3 import (
-    Eagle3DraftModel,
-    ModelConfig as Eagle3Config,
-    TextConfig as Eagle3TextConfig,
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
-from mlx_vlm.speculative.utils import (
+from mlx_vlm.speculative.eagle3 import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
     _eagle3_verify_target,
     _eagle3_verify_target_hot,
+)
+from mlx_vlm.speculative.utils import (
     _dflash_next_block_size,
     _effective_mtp_block_size,
     _format_speculative_stats,
