@@ -1315,6 +1315,66 @@ class TestMolmoPointProcessor(unittest.TestCase):
         self.assertIn("image_num_crops", result)
 
 
+class TestNemotronHNanoOmniProcessor(unittest.TestCase):
+    def test_native_processor_handles_stripped_auto_map(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.utils import load_processor, prepare_inputs
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / "config.json").write_text(
+                json.dumps({"model_type": "NemotronH_Nano_Omni_Reasoning_V3"})
+            )
+            (model_dir / "processor_config.json").write_text(
+                json.dumps(
+                    {"processor_class": "NemotronH_Nano_Omni_Reasoning_V3Processor"}
+                )
+            )
+            (model_dir / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor_type": (
+                            "NemotronH_Nano_Omni_Reasoning_V3ImageProcessor"
+                        ),
+                        "patch_size": 16,
+                        "downsample_ratio": 0.5,
+                        "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+                        "norm_std": [0.26862954, 0.26130258, 0.27577711],
+                        "min_num_patches": 64,
+                        "max_num_patches": 64,
+                        "max_model_len": 128,
+                    }
+                )
+            )
+
+            importlib.import_module("mlx_vlm.models.nemotron_h_nano_omni")
+
+            with patch(
+                "transformers.AutoTokenizer.from_pretrained",
+                return_value=_mock_tokenizer(image_token_id=18),
+            ):
+                processor = load_processor(tmpdir, add_detokenizer=False)
+
+            result = prepare_inputs(
+                processor,
+                images=[_make_image()],
+                prompts="<image>\nDescribe this image.",
+                image_token_index=processor.image_token_id,
+            )
+
+        self.assertEqual(
+            processor.__class__.__name__,
+            "NemotronHNanoOmniProcessor",
+        )
+        self.assertIn("pixel_values", result)
+        self.assertIn("num_tokens", result)
+        self.assertGreater(int(result["num_tokens"][0].item()), 0)
+
+
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
 
