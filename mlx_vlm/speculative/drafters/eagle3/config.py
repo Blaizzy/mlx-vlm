@@ -70,9 +70,6 @@ class Eagle3Config(BaseModelConfig):
                 n = int(text.num_hidden_layers)
                 self.target_layer_ids = [2, n // 2, max(n - 3, 0)]
         if not self.capture_layer_ids:
-            # Speculators stores HF-style hidden-state indexes, where 0 is the
-            # embedding output and layer N's output is index N + 1. MLX capture
-            # hooks are decoder-layer output indexes, so shift by one.
             self.capture_layer_ids = [max(int(i) - 1, 0) for i in self.target_layer_ids]
 
     @classmethod
@@ -83,10 +80,6 @@ class Eagle3Config(BaseModelConfig):
         if proposal_methods:
             speculative_tokens = proposal_methods[0].get("speculative_tokens")
             if speculative_tokens is not None:
-                # SGLang's top-k=1 EAGLE path verifies one draft-extend token
-                # plus ``speculative_num_steps`` autoregressive draft forwards.
-                # ``block_size`` includes the verifier bonus slot, so add two:
-                # one for the draft-extend token and one for the bonus.
                 flat.setdefault("block_size", int(speculative_tokens) + 2)
 
         if "model_type" not in flat:

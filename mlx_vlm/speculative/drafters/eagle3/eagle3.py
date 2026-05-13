@@ -374,10 +374,6 @@ class Eagle3DraftModel(nn.Module):
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
     ) -> None:
-        # SGLang runs a draft-extend pass after verification using the
-        # verifier hidden states for the accepted output tokens. Drop the
-        # speculative K/V entries, which were built from draft-predicted
-        # hiddens, and replay the committed tokens with verifier hiddens.
         trim = self._round_appended
         if trim > 0:
             for cache in self._cache:

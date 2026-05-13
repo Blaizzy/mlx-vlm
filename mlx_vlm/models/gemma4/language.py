@@ -451,10 +451,6 @@ class Gemma4TextModel(nn.Module):
         masks = []
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
-                # The symbolic "causal" mask is only position-correct for
-                # uncached prefill. With a non-empty KV cache and multiple
-                # query tokens, use an explicit offset-aware mask so the first
-                # query token can attend to the cached prefix.
                 return_array = (
                     h.shape[1] > 1
                     and c is not None

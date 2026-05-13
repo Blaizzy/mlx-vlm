@@ -1426,7 +1426,6 @@ def test_eagle3_hot_verifier_uses_draft_vocab_and_eos():
     )
 
     assert hidden.tolist() == [[[0.0, 1.0], [1.0, 2.0]]]
-    # d2t maps draft ids [0, 1] to target ids [1, 2], and EOS id 4 is appended.
     assert target_tokens.tolist() == [[1, 4]]
     assert gdn_states is None
 

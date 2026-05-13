@@ -136,8 +136,6 @@ def _eagle3_next_block_size(
         )
 
         tier_idx = tiers.index(min(tiers, key=lambda tier: abs(tier - current)))
-        # Probe a wider EAGLE window once after the checkpoint's conservative
-        # depth; some Gemma 4 continuations only expose long accept runs there.
         if len(accepted) == 6 and current == configured_block_total and len(tiers) > 1:
             tier_idx = len(tiers) - 1
         elif mean_output < 2.0 or (mean_output < 3.0 and full_rate == 0):
@@ -159,10 +157,6 @@ def _eagle3_verify_target(
     target_layer_ids: List[int],
 ):
     if verify_input.shape[1] > 1 and "gemma4" in type(lm).__module__:
-        # Gemma 4's quantized cached forward can pick a different greedy token
-        # for the first query in a multi-token verify block. Decode that seed
-        # position exactly; the single-sequence Gemma path below uses a stricter
-        # early-exit verifier for full serial equivalence.
         first_out = lm(
             verify_input[:, :1],
             cache=prompt_cache,
@@ -290,15 +284,6 @@ def _eagle3_verify_target_hot(
     target_layer_ids: List[int],
     eos_token_ids: Optional[List[int]] = None,
 ) -> Optional[Tuple[mx.array, mx.array, Any]]:
-    """Verify a Gemma 4 EAGLE block against the draft hot vocabulary.
-
-    This mirrors SGLang's practical bias toward compact candidate sets: the
-    expensive target body still runs once for the whole block, but the verifier
-    projects only the EAGLE hot vocabulary plus EOS tokens instead of Gemma 4's
-    full 262k vocabulary. It is greedy-only and intentionally falls back when a
-    target model does not expose the tied embedding projection.
-    """
-
     if not hasattr(lm, "model") or not hasattr(lm, "logits_from_hidden"):
         return None
 
@@ -365,7 +350,6 @@ def _eagle3_rounds(
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
 ) -> Generator[Tuple[int, None], None, None]:
-    """Linear top-1 EAGLE-3 speculative-decoding round loop."""
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
@@ -377,9 +361,6 @@ def _eagle3_rounds(
         draft_model, draft_block_size
     )
     if draft_block_size is None:
-        # The hot-vocabulary verifier is fastest and most stable when it uses
-        # one draft token per target replay. Wider blocks are still available
-        # explicitly via --draft-block-size for benchmark sweeps.
         block_total = min(block_total, 2)
         configured_block_total = min(configured_block_total, block_total)
         adaptive_block_size = False
@@ -502,11 +483,6 @@ def _eagle3_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
-    """Batched linear EAGLE-3 round loop.
-
-    The EAGLE-3 drafter owns a recurrent KV cache, so mixed per-row acceptance
-    is clamped to the earliest rejection to keep the draft cache aligned.
-    """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
