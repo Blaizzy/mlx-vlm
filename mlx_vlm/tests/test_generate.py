@@ -18,6 +18,7 @@ from mlx_vlm.generate import (
     GenerationBatch,
     GenerationResult,
     _left_pad_prompts,
+    _merge_prefill_prompt_kwargs,
     _prime_cached_prefix_rope_state,
     normalize_resize_shape,
 )
@@ -631,6 +632,12 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         assert response.texts == ["Response 1", "Response 2"]
         mock_generate_batch.assert_called_once()
+
+    def test_merge_prefill_prompt_kwargs_allows_text_only_prompts(self):
+        inputs_embeds, kwargs = _merge_prefill_prompt_kwargs([{}, {}], [[1, 2], [3]])
+
+        assert inputs_embeds is None
+        assert kwargs == {}
 
     def test_generate_batch_splits_batched_prompt_kwargs_per_row(
         self, mock_model, mock_processor

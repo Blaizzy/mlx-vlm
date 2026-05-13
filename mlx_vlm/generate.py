@@ -652,6 +652,9 @@ def generate_step(
         )
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
+        prefill_length = (
+            inputs_embeds.shape[1] if inputs_embeds is not None else input_ids.shape[1]
+        )
         checkpoint_len = (
             int(prompt_cache_checkpoint_len)
             if prompt_cache_checkpoint is not None
@@ -660,17 +663,15 @@ def generate_step(
         )
         checkpoint_done = False
         should_chunk = (
-            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
-        ) or (
-            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
-        )
+            prefill_step_size is not None and prefill_length > prefill_step_size
+        ) or (checkpoint_len is not None and 0 < checkpoint_len < prefill_length)
         if prefill_step_size is not None and should_chunk:
-            # Chunked prefill with embeddings
-            total_tokens = inputs_embeds.shape[1]
+            # Chunked prefill with embeddings for VLMs, or token ids for text models.
+            total_tokens = prefill_length
             processed_tokens = 0
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
-                while inputs_embeds.shape[1] > 1:
-                    n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                while prefill_length > 1:
+                    n_to_process = min(prefill_step_size, prefill_length - 1)
                     if (
                         checkpoint_len is not None
                         and not checkpoint_done
@@ -678,12 +679,14 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_len
                     ):
                         n_to_process = checkpoint_len - processed_tokens
+                    call_kwargs = dict(kwargs)
+                    if inputs_embeds is not None:
+                        call_kwargs["inputs_embeds"] = inputs_embeds[:, :n_to_process]
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
-                        inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
-                        **kwargs,
+                        **call_kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
@@ -695,8 +698,10 @@ def generate_step(
                     ):
                         prompt_cache_checkpoint(processed_tokens, prompt_cache)
                         checkpoint_done = True
-                    inputs_embeds = inputs_embeds[:, n_to_process:]
+                    if inputs_embeds is not None:
+                        inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
+                    prefill_length -= n_to_process
                     mx.clear_cache()
                     pbar.update(n_to_process)
 
@@ -1381,6 +1386,24 @@ def _merge_prefill_prompt_kwargs(
     lengths = [len(ids) for ids in input_ids]
     max_length = max(lengths)
 
+    has_embeds = [
+        kw is not None and kw.get("inputs_embeds") is not None
+        for kw in prompt_kwargs_list
+    ]
+    if not any(has_embeds):
+        merged_kwargs: dict = {}
+        for kw in prompt_kwargs_list:
+            if not kw:
+                continue
+            for k, v in kw.items():
+                if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
+                    continue
+                if k not in merged_kwargs:
+                    merged_kwargs[k] = v
+        return None, merged_kwargs
+    if not all(has_embeds):
+        raise ValueError("Cannot batch prompts with mixed inputs_embeds availability")
+
     row_embeds: List[mx.array] = []
     embed_dtype = None
     embed_dim = None
@@ -1999,8 +2022,10 @@ class PromptProcessingBatch:
 
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
-        if self._inputs_embeds is None or self.prefill_step_size is None:
+        if self.prefill_step_size is None:
             return self._next_apc_checkpoint_column() is not None
+        if self._inputs_embeds is None:
+            return self._input_ids.shape[1] > self.prefill_step_size
         if self._next_apc_checkpoint_column() is not None:
             return True
         return self._inputs_embeds.shape[1] > self.prefill_step_size
@@ -2097,25 +2122,33 @@ class PromptProcessingBatch:
         if not self.needs_processing():
             return 0
 
-        step = self.prefill_step_size or self._inputs_embeds.shape[1]
-        n = min(step, self._inputs_embeds.shape[1] - 1)
+        prompt_len = (
+            self._inputs_embeds.shape[1]
+            if self._inputs_embeds is not None
+            else self._input_ids.shape[1]
+        )
+        step = self.prefill_step_size or prompt_len
+        n = min(step, prompt_len - 1)
         checkpoint_col = self._next_apc_checkpoint_column()
         if checkpoint_col is not None:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
         prompt_kwargs = self._prompt_kwargs_for_step(n)
+        call_kwargs = dict(prompt_kwargs)
+        if self._inputs_embeds is not None:
+            call_kwargs["inputs_embeds"] = self._inputs_embeds[:, :n]
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
-            **prompt_kwargs,
+            **call_kwargs,
         )
         mx.eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
-        self._inputs_embeds = self._inputs_embeds[:, n:]
+        if self._inputs_embeds is not None:
+            self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         for k in self._prompt_length_aware_keys:
             self._prompt_kwargs[k] = self._prompt_kwargs[k][:, n:, ...]
@@ -2147,8 +2180,12 @@ class PromptProcessingBatch:
         output = self.model(
             self._input_ids,
             cache=self.prompt_cache,
-            inputs_embeds=self._inputs_embeds,
             **self._prompt_kwargs,
+            **(
+                {"inputs_embeds": self._inputs_embeds}
+                if self._inputs_embeds is not None
+                else {}
+            ),
         )
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
@@ -2589,7 +2626,7 @@ class BatchGenerator:
         suffix_embeds_per_row: List[mx.array] = []
         for i, kw in enumerate(prompt_kwargs_list):
             if kw is None or kw.get("inputs_embeds") is None:
-                raise ValueError("APC mixed prefill requires precomputed inputs_embeds")
+                return None
             full = kw["inputs_embeds"]  # [1, full_len, D]
             suff = full[:, prefix_lens[i] :, :]
             pad = right_pad_per_row[i]
