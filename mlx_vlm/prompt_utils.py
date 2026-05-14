@@ -19,6 +19,7 @@ class MessageFormat(Enum):
     IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
+    TEXT_ONLY = "text_only"
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
@@ -89,6 +90,7 @@ MODEL_CONFIG = {
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "laguna": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -269,6 +271,7 @@ class MessageFormatter:
             ),
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
+            MessageFormat.TEXT_ONLY: self._format_text_only,
             MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>"
             * num_images
             + prompt,
@@ -313,6 +316,19 @@ class MessageFormatter:
             content = image_tokens + content if image_first else content + image_tokens
 
         return {"role": role, "content": content}
+
+    def _format_text_only(
+        self,
+        prompt: str,
+        role: str,
+        skip_image_token: bool,
+        skip_audio_token: bool,
+        num_images: int,
+        num_audios: int,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Format a regular text-only chat message."""
+        return {"role": role, "content": prompt}
 
     def _format_list_with_image_type(
         self,

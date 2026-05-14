@@ -173,6 +173,21 @@ class TestApplyChatTemplateIntegration:
                 }
             ]
 
+    def test_laguna_formats_text_only_chat_message(self):
+        """Laguna should use regular role/content messages with no image tokens."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            "Make a program to find pi",
+            return_messages=True,
+        )
+
+        assert result == [
+            {"role": "user", "content": "Make a program to find pi"}
+        ]
+
     def test_multimodal_message_does_not_include_base64_in_prompt(self):
         """Critical regression test: base64 should NOT appear in formatted messages.
 

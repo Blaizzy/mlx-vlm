@@ -119,6 +119,46 @@ class TestModels(unittest.TestCase):
 
             self.assertEqual(hidden_states.dtype, t)
 
+    def test_laguna_language_model(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            layer_types=["full_attention", "sliding_attention"],
+            num_attention_heads_per_layer=[4, 4],
+            sliding_window=8,
+            mlp_layer_types=["dense", "sparse"],
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+        )
+
+        model = laguna.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "KVCache")
+        self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
+
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
 
