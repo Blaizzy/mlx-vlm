@@ -431,29 +431,10 @@ def test_load_model_routes_text_models_through_existing_loader():
     assert getattr(model, "_is_text_model", False) is True
 
 
-def test_load_processor_falls_back_to_tokenizer_for_text_models():
-    class TokenizerOnly:
-        eos_token_id = 2
-        pad_token = None
-        eos_token = "</s>"
-
-        def __init__(self):
-            self.detokenizer = MagicMock()
-
-        def encode(self, text, add_special_tokens=False):
-            return [1, 2]
-
-    tokenizer = TokenizerOnly()
-
-    with (
-        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError),
-        patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
-        patch("mlx_vlm.utils.load_tokenizer", return_value=tokenizer),
-    ):
-        processor = load_processor(Path("/tmp/model"), eos_token_ids=2)
-
-    assert processor is tokenizer
-    assert processor.stopping_criteria(2) is True
+def test_load_processor_propagates_auto_processor_errors():
+    with patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError):
+        with pytest.raises(ValueError):
+            load_processor(Path("/tmp/model"), eos_token_ids=2)
 
 
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():

@@ -600,24 +600,9 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    try:
-        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
-    except Exception as processor_exc:
-        try:
-            config = load_config(model_path, **kwargs)
-            model_class, _ = get_model_and_args(config)
-        except (ValueError, FileNotFoundError):
-            processor = load_tokenizer(model_path, tokenizer_config_extra=kwargs)
-        else:
-            if getattr(model_class, "_is_text_model_arch", False):
-                processor = load_tokenizer(model_path, tokenizer_config_extra=kwargs)
-            else:
-                raise processor_exc
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
-        if hasattr(processor, "detokenizer") and not hasattr(processor, "tokenizer"):
-            detokenizer_class = None
-        else:
-            detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
         # Get the tokenizer object
         tokenizer_obj = (
@@ -625,15 +610,12 @@ def load_processor(
         )
 
         # Instantiate the detokenizer
-        if detokenizer_class is not None:
-            processor.detokenizer = detokenizer_class(tokenizer_obj)
+        processor.detokenizer = detokenizer_class(tokenizer_obj)
 
         # Determine the EOS token IDs, prioritizing the function argument
-        final_eos_token_ids = eos_token_ids
-        if final_eos_token_ids is None:
-            final_eos_token_ids = getattr(tokenizer_obj, "eos_token_ids", None)
-        if final_eos_token_ids is None:
-            final_eos_token_ids = getattr(tokenizer_obj, "eos_token_id", None)
+        final_eos_token_ids = eos_token_ids or getattr(
+            tokenizer_obj, "eos_token_ids", None
+        ) or getattr(tokenizer_obj, "eos_token_id", None)
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
