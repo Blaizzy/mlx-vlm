@@ -12,6 +12,7 @@ from mlx_lm.utils import quantize_model
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    get_model_and_args,
     load,
     load_image,
     load_model,
@@ -387,29 +388,48 @@ def test_load_passes_revision():
         )
 
 
-def test_load_model_falls_back_to_mlx_lm_text_model():
-    wrapped_model = MagicMock()
+def test_get_model_and_args_routes_text_only_configs():
+    model_class, model_type = get_model_and_args({"model_type": "llama"})
+
+    assert model_class.__name__ == "mlx_vlm.models.text_only"
+    assert model_type == "text_only"
+
+
+def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
+    with pytest.raises(ValueError):
+        get_model_and_args(
+            {"model_type": "unknown-vlm", "vision_config": {"hidden_size": 16}},
+            log_unsupported=False,
+        )
+
+
+def test_load_model_routes_text_models_through_existing_loader():
     safe_open = MagicMock()
     safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeLM(nn.Module):
+        def __init__(self, args):
+            super().__init__()
+            self.model = nn.Linear(2, 2, bias=False)
+
+        def __call__(self, inputs, cache=None):
+            return self.model(inputs)
 
     with (
         patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch("mlx_vlm.utils.mx.load", return_value={}),
+        patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
         patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
-        patch(
-            "mlx_vlm.utils.get_model_and_args",
-            side_effect=ValueError("Model type llama not supported."),
-        ),
-        patch(
-            "mlx_vlm.utils.load_text_model",
-            return_value=wrapped_model,
-        ) as mock_text_load,
+        patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),
     ):
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
 
-    assert model is wrapped_model
-    mock_text_load.assert_called_once()
+    assert getattr(model, "_is_text_model", False) is True
 
 
 def test_load_processor_falls_back_to_tokenizer_for_text_models():
@@ -428,6 +448,7 @@ def test_load_processor_falls_back_to_tokenizer_for_text_models():
 
     with (
         patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError),
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
         patch("mlx_vlm.utils.load_tokenizer", return_value=tokenizer),
     ):
         processor = load_processor(Path("/tmp/model"), eos_token_ids=2)

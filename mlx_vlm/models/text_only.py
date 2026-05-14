@@ -7,10 +7,12 @@ import mlx.nn as nn
 
 from .base import InputEmbeddingsFeatures, LanguageModelOutput
 
+_is_text_model_arch = True
+
 
 @dataclass
-class TextOnlyConfig:
-    """Attribute-style config wrapper for text-only models."""
+class AttributeConfig:
+    """Attribute-style config wrapper."""
 
     values: Dict[str, Any]
 
@@ -20,6 +22,40 @@ class TextOnlyConfig:
 
     def to_dict(self):
         return dict(self.values)
+
+
+class TextConfig(AttributeConfig):
+    @classmethod
+    def from_dict(cls, params):
+        return cls(dict(params or {}))
+
+
+class ModelConfig(AttributeConfig):
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params or {})
+        from mlx_lm.utils import _get_classes
+
+        model_class, model_args_class = _get_classes(params)
+        return cls(params, model_class, model_args_class)
+
+    def __init__(self, values, model_class, model_args_class):
+        self.model_class = model_class
+        self.model_args_class = model_args_class
+        super().__init__(values)
+        self.text_config = TextConfig.from_dict(values.get("text_config", {}))
+
+    def __post_init__(self):
+        for key, value in self.values.items():
+            if key in {
+                "text_config",
+                "vision_config",
+                "audio_config",
+                "projector_config",
+                "perceiver_config",
+            }:
+                continue
+            setattr(self, key, value)
 
 
 class LanguageModel(nn.Module):
@@ -141,15 +177,30 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(logits=logits)
 
 
-class TextOnlyModel(nn.Module):
+class Model(nn.Module):
     """VLM-shaped wrapper around a text-only model."""
 
     _is_text_model = True
 
-    def __init__(self, model: nn.Module, config: Dict[str, Any]):
+    def __init__(self, model_or_config, config: Optional[Dict[str, Any]] = None):
         super().__init__()
-        self.config = TextOnlyConfig(config)
+        if isinstance(model_or_config, ModelConfig):
+            self.config = model_or_config
+            model_args = self.config.model_args_class.from_dict(self.config.values)
+            model = self.config.model_class(model_args)
+        else:
+            model = model_or_config
+            self.config = AttributeConfig(dict(config or {}))
         self.language_model = LanguageModel(model)
+
+    def sanitize(self, weights):
+        model = self.language_model._model
+        if hasattr(model, "sanitize"):
+            return model.sanitize(weights)
+        return weights
+
+    def load_weights(self, weights, *args, **kwargs):
+        return self.language_model._model.load_weights(weights, *args, **kwargs)
 
     def get_input_embeddings(
         self,
@@ -192,3 +243,6 @@ class TextOnlyModel(nn.Module):
     @property
     def layers(self):
         return self.language_model.layers
+
+
+TextOnlyModel = Model
