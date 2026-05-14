@@ -173,8 +173,8 @@ class TestApplyChatTemplateIntegration:
                 }
             ]
 
-    def test_laguna_formats_text_only_chat_message(self):
-        """Laguna should use regular role/content messages with no image tokens."""
+    def test_text_only_formats_regular_chat_message(self):
+        """Text-only models should use regular role/content messages with no image tokens."""
         from mlx_vlm.prompt_utils import apply_chat_template
 
         result = apply_chat_template(
