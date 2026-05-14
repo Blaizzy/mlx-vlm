@@ -545,6 +545,84 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
 
 
+def test_chat_completions_endpoint_forwards_json_object_processor(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='{"ok": true}',
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+    logits_processor = lambda tokens, logits: logits
+
+    monkeypatch.setattr(server, "response_generator", None)
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+        patch.object(
+            server,
+            "build_json_schema_logits_processor",
+            return_value=logits_processor,
+        ) as mock_build,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Return JSON"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_build.call_args.args[1] == {"type": "object"}
+    assert mock_generate.call_args.kwargs["logits_processors"] == [logits_processor]
+
+
+def test_responses_endpoint_forwards_json_object_processor(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='{"ok": true}',
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+    logits_processor = lambda tokens, logits: logits
+
+    monkeypatch.setattr(server, "response_generator", None)
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+        patch.object(
+            server,
+            "build_json_schema_logits_processor",
+            return_value=logits_processor,
+        ) as mock_build,
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": "Return JSON",
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_build.call_args.args[1] == {"type": "object"}
+    assert mock_generate.call_args.kwargs["logits_processors"] == [logits_processor]
+
+
 def test_chat_completions_streaming_forwards_explicit_sampling_args(
     client, monkeypatch
 ):
@@ -1548,6 +1626,22 @@ class TestResponseGenerator:
 
         assert schema["properties"]["animal"]["type"] == "string"
 
+    def test_extract_chat_response_format_json_object(self):
+        req = SimpleNamespace(
+            response_format={"type": "json_object"},
+            text=None,
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
+    def test_extract_responses_text_format_json_object(self):
+        req = SimpleNamespace(
+            response_format=None,
+            text={"format": {"type": "json_object"}},
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
     def test_extract_responses_text_format_json_schema(self):
         req = SimpleNamespace(
             response_format=None,
@@ -1577,6 +1671,21 @@ class TestResponseGenerator:
                     "schema": {"type": "object"},
                 },
             },
+            text=None,
+        )
+        proc = SimpleNamespace(tokenizer=object())
+
+        with patch.object(
+            server, "build_json_schema_logits_processor", return_value="processor"
+        ) as mock_build:
+            processors = server._build_structured_logits_processors(req, proc)
+
+        assert processors == ["processor"]
+        assert mock_build.call_args.args[1] == {"type": "object"}
+
+    def test_build_structured_logits_processors_for_json_object(self):
+        req = SimpleNamespace(
+            response_format={"type": "json_object"},
             text=None,
         )
         proc = SimpleNamespace(tokenizer=object())
