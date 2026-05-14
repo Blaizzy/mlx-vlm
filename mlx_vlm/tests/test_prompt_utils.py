@@ -184,9 +184,7 @@ class TestApplyChatTemplateIntegration:
             return_messages=True,
         )
 
-        assert result == [
-            {"role": "user", "content": "Make a program to find pi"}
-        ]
+        assert result == [{"role": "user", "content": "Make a program to find pi"}]
 
     def test_tool_call_arguments_json_string_is_normalized(self):
         """OpenAI-style JSON-string tool call arguments should become dicts."""
