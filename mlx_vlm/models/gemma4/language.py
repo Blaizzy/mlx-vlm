@@ -451,11 +451,18 @@ class Gemma4TextModel(nn.Module):
         masks = []
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
+                return_array = (
+                    h.shape[1] > 1
+                    and c is not None
+                    and int(mx.max(mx.array(c.offset)).item()) > 0
+                )
                 if l.layer_type == "full_attention":
-                    mask["full_attention"] = create_attention_mask(h, c)
+                    mask["full_attention"] = create_attention_mask(
+                        h, c, return_array=return_array
+                    )
                 elif l.layer_type == "sliding_attention":
                     mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                        h, c, window_size=self.window_size, return_array=return_array
                     )
             masks.append(mask[l.layer_type])
         return masks

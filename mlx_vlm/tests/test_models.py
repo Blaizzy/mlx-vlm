@@ -1298,6 +1298,28 @@ class TestModels(unittest.TestCase):
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
 
+    def test_qwen3_5_sanitize_key_routes_nested_visual_weights(self):
+        from mlx_vlm.models.qwen3_5.qwen3_5 import sanitize_key
+
+        self.assertEqual(
+            sanitize_key("model.language_model.visual.blocks.0.attn.qkv.weight"),
+            "vision_tower.blocks.0.attn.qkv.weight",
+        )
+        self.assertEqual(
+            sanitize_key(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+            ),
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+        )
+        self.assertEqual(
+            sanitize_key("model.visual.blocks.0.attn.qkv.weight"),
+            "vision_tower.blocks.0.attn.qkv.weight",
+        )
+        self.assertEqual(
+            sanitize_key("lm_head.weight"),
+            "language_model.lm_head.weight",
+        )
+
     def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
         if not mx.metal.is_available():
             self.skipTest("requires Metal streams")
