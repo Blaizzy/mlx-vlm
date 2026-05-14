@@ -399,7 +399,6 @@ def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
     with pytest.raises(ValueError):
         get_model_and_args(
             {"model_type": "unknown-vlm", "vision_config": {"hidden_size": 16}},
-            log_unsupported=False,
         )
 
 

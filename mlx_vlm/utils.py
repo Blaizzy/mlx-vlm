@@ -103,7 +103,7 @@ def skip_multimodal_module(path: str) -> bool:
     return any(module in path for module in multimodal_modules)
 
 
-def get_model_and_args(config: dict, log_unsupported: bool = True):
+def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
 
@@ -140,8 +140,7 @@ def get_model_and_args(config: dict, log_unsupported: bool = True):
         return arch, "text_only"
 
     msg = f"Model type {model_type} not supported. Error: {last_err}"
-    if log_unsupported:
-        logging.error(msg)
+    logging.error(msg)
     raise ValueError(msg)
 
 
@@ -258,7 +257,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
-    model_class, _ = get_model_and_args(config=config, log_unsupported=False)
+    model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -581,7 +580,7 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
         config = load_config(model_path, **kwargs)
 
     try:
-        model_class, _ = get_model_and_args(config, log_unsupported=False)
+        model_class, _ = get_model_and_args(config)
     except ValueError:
         return None
     image_processor = None
@@ -606,7 +605,7 @@ def load_processor(
     except Exception as processor_exc:
         try:
             config = load_config(model_path, **kwargs)
-            model_class, _ = get_model_and_args(config, log_unsupported=False)
+            model_class, _ = get_model_and_args(config)
         except (ValueError, FileNotFoundError):
             processor = load_tokenizer(model_path, tokenizer_config_extra=kwargs)
         else:
