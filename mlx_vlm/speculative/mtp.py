@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from ..models import cache
 from .common import (
+    _batch_cache_left_padding,
     _dflash_block_total,
     _record_speculative_round,
     _speculative_walk,
@@ -499,14 +500,6 @@ def _mtp_rounds(
 
         if emitted % 256 == 0:
             mx.clear_cache()
-
-
-def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
-    for cache_entry in prompt_cache:
-        left_padding = getattr(cache_entry, "left_padding", None)
-        if left_padding is not None:
-            return left_padding
-    return None
 
 
 def _mtp_cache_offset(prompt_cache: List[Any]) -> Any:

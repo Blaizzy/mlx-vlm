@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -100,6 +100,14 @@ def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int])
     if runtime is None:
         return configured
     return min(configured, max(1, int(runtime)))
+
+
+def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
+    for cache_entry in prompt_cache:
+        left_padding = getattr(cache_entry, "left_padding", None)
+        if left_padding is not None:
+            return left_padding
+    return None
 
 
 def _format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
