@@ -52,6 +52,13 @@ def test_speculative_server_dispatches_mtp_batch_loop():
     )
 
 
+def test_speculative_server_dispatches_eagle3_batch_loop():
+    assert (
+        speculative_utils.get_speculative_rounds_batch("eagle3")
+        is speculative_utils._eagle3_rounds_batch
+    )
+
+
 def test_speculative_server_keeps_dflash_default_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("dflash")
