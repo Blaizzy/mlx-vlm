@@ -167,6 +167,53 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
+    def repo(repo_id, file_names):
+        return SimpleNamespace(
+            repo_id=repo_id,
+            repo_type="model",
+            last_modified=123.0,
+            refs={
+                "main": SimpleNamespace(
+                    files=[
+                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
+                        for file_name in file_names
+                    ]
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        lambda: SimpleNamespace(
+            repos=[
+                repo(
+                    "local/single-file-model",
+                    ["config.json", "model.safetensors", "tokenizer_config.json"],
+                ),
+                repo(
+                    "local/sharded-model",
+                    [
+                        "config.json",
+                        "model.safetensors.index.json",
+                        "tokenizer_config.json",
+                    ],
+                ),
+                repo("missing/weights", ["config.json", "tokenizer_config.json"]),
+            ]
+        ),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    ids = {model["id"] for model in response.json()["data"]}
+    assert "local/single-file-model" in ids
+    assert "local/sharded-model" in ids
+    assert "missing/weights" not in ids
+
+
 class _RecordingSpeculativeLM:
     def __init__(self, draft_kind):
         self.calls = []
