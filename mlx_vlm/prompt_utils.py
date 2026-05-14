@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -151,6 +152,31 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     if hasattr(item, "role") and hasattr(item, "content"):
         return getattr(item, "role", "user"), getattr(item, "content", "")
     return None
+
+
+def _normalize_tool_call_arguments(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a message and convert OpenAI JSON-string tool arguments to dicts."""
+    normalized = dict(message)
+    tool_calls = normalized.get("tool_calls")
+    if tool_calls is None:
+        return normalized
+
+    normalized_calls = []
+    for tool_call in tool_calls:
+        tool_call = dict(tool_call) if isinstance(tool_call, dict) else tool_call
+        if isinstance(tool_call, dict) and "function" in tool_call:
+            function = dict(tool_call["function"])
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    function["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = {}
+            tool_call["function"] = function
+        normalized_calls.append(tool_call)
+
+    normalized["tool_calls"] = normalized_calls
+    return normalized
 
 
 class MessageBuilder:
@@ -718,17 +744,21 @@ def apply_chat_template(
         )
     elif isinstance(prompt, dict):
         # Single dict prompt
-        content = extract_text_from_content(prompt["content"])
-        messages.append(
-            get_message_json(
-                model_type,
-                content,
-                prompt["role"],
-                num_images=num_images,
-                num_audios=num_audios,
-                **kwargs,
+        role = prompt.get("role", "user")
+        if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
+            messages.append(_normalize_tool_call_arguments(prompt))
+        else:
+            content = extract_text_from_content(prompt["content"])
+            messages.append(
+                get_message_json(
+                    model_type,
+                    content,
+                    role,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
             )
-        )
     elif isinstance(prompt, list):
         # List of prompts — find the last user message to place image/audio tokens
         last_user_idx = -1
@@ -761,7 +791,7 @@ def apply_chat_template(
                     "tool_calls" in p or "tool_call_id" in p or role == "tool"
                 )
                 if has_tool_metadata:
-                    messages.append(p)
+                    messages.append(_normalize_tool_call_arguments(p))
                 else:
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)
