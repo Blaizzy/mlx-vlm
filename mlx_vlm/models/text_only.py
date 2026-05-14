@@ -38,11 +38,6 @@ class LanguageModel(nn.Module):
     def layers(self):
         if hasattr(self._model, "layers"):
             return self._model.layers
-        inner = self.model
-        if hasattr(inner, "layers"):
-            return inner.layers
-        if hasattr(inner, "h"):
-            return inner.h
         return []
 
     def make_cache(self):
@@ -81,7 +76,7 @@ class LanguageModel(nn.Module):
                 return getattr(module, attr)
         return None
 
-    def input_embeddings(self, input_ids: mx.array) -> mx.array:
+    def input_embeds(self, input_ids: mx.array) -> mx.array:
         embedding = self._token_embedding()
         if embedding is None:
             raise ValueError(
@@ -172,7 +167,7 @@ class TextOnlyModel(nn.Module):
         if input_ids is None:
             raise ValueError("input_ids are required for text-only models.")
         return InputEmbeddingsFeatures(
-            inputs_embeds=self.language_model.input_embeddings(input_ids)
+            inputs_embeds=self.language_model.input_embeds(input_ids)
         )
 
     def __call__(
