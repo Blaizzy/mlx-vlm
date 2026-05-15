@@ -152,13 +152,7 @@ def _has_config(config: dict, key: str) -> bool:
 def _is_text_only_config(config: dict) -> bool:
     return not any(
         _has_config(config, key)
-        for key in (
-            "vision_config",
-            "vision_tower",
-            "mm_vision_tower",
-            "audio_config",
-            "dflash_config",
-        )
+        for key in ("vision_config", "audio_config", "dflash_config")
     )
 
 
@@ -613,9 +607,11 @@ def load_processor(
         processor.detokenizer = detokenizer_class(tokenizer_obj)
 
         # Determine the EOS token IDs, prioritizing the function argument
-        final_eos_token_ids = eos_token_ids or getattr(
-            tokenizer_obj, "eos_token_ids", None
-        ) or getattr(tokenizer_obj, "eos_token_id", None)
+        final_eos_token_ids = (
+            eos_token_ids
+            or getattr(tokenizer_obj, "eos_token_ids", None)
+            or getattr(tokenizer_obj, "eos_token_id", None)
+        )
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
