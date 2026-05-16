@@ -13,7 +13,11 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
-from .gated_delta import gated_delta_state_update, gated_delta_update
+from .gated_delta import (
+    gated_delta_state_update,
+    gated_delta_update,
+    gated_delta_update_with_states,
+)
 
 
 class Qwen3_5RotaryEmbedding:
@@ -157,6 +161,7 @@ class Qwen3_5Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -198,9 +203,26 @@ class Qwen3_5Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if target_verify and L > 1:
+            prefix_len = keys.shape[-2] - L
+            output = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        queries[:, :, i : i + 1, :],
+                        keys[:, :, : prefix_len + i + 1, :],
+                        values[:, :, : prefix_len + i + 1, :],
+                        cache=cache,
+                        scale=self.scale,
+                        mask=None,
+                    )
+                    for i in range(L)
+                ],
+                axis=2,
+            )
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output * mx.sigmoid(gate))
@@ -261,6 +283,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+    def _causal_conv1d_verify(self, conv_input: mx.array, steps: int) -> mx.array:
+        if steps <= 1:
+            return self.conv1d(conv_input)
+
+        K = self.conv_kernel_size
+        B = conv_input.shape[0]
+        windows = mx.concatenate(
+            [conv_input[:, offset : offset + K, :] for offset in range(steps)],
+            axis=0,
+        )
+        out = self.conv1d(windows)[:, 0, :]
+        return out.reshape(steps, B, -1).transpose(1, 0, 2)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -299,7 +334,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
             cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
-        conv_out = nn.silu(self.conv1d(conv_input))
+        if gdn_sink is not None:
+            conv_out = nn.silu(self._causal_conv1d_verify(conv_input, S))
+        else:
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
             t.reshape(B, S, h, d)
@@ -318,24 +356,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         initial_state = state
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        if gdn_sink is not None:
+            out, state, intermediate_states = gated_delta_update_with_states(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+            intermediate_states = None
 
         if gdn_sink is not None:
-            # Tuple layout consumed by ``rollback_speculative_cache`` below.
-            # Speculative rollback reconstructs the accepted state with the
-            # state-only GDN kernel; materializing every per-token state here
-            # slows down the target verify pass.
             gdn_sink.append(
                 (
                     q,
@@ -349,7 +398,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     mask,
                     conv_input,
                     self.conv_kernel_size,
-                    None,
+                    intermediate_states,
                 )
             )
 
@@ -384,13 +433,20 @@ class Qwen3_5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
         gdn_sink: Optional[list] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         if self.is_linear:
             r = self.linear_attn(
                 self.input_layernorm(x), mask, cache, gdn_sink=gdn_sink
             )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+            r = self.self_attn(
+                self.input_layernorm(x),
+                mask,
+                cache,
+                position_ids,
+                target_verify=target_verify,
+            )
         h = x + r
         return h + self.mlp(self.post_attention_layernorm(h))
 
@@ -433,7 +489,14 @@ class Qwen3_5Model(nn.Module):
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask, c, position_ids, gdn_sink=gdn_sink)
+            h = layer(
+                h,
+                mask,
+                c,
+                position_ids,
+                gdn_sink=gdn_sink,
+                target_verify=gdn_sink is not None,
+            )
             if hidden_sink is not None and i in capture_set:
                 hidden_sink.append(h)
 

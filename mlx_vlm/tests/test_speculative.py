@@ -206,7 +206,7 @@ def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     assert float(mx.sum(mx.abs(captured["state"])).item()) == 0.0
 
 
-def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
+def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -224,9 +224,12 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
         B, S = q.shape[:2]
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        return out, next_state
+        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        return out, next_state, states
 
-    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
+    with patch.object(
+        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+    ):
         out = layer(
             mx.zeros((2, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -235,10 +238,10 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
 
     mx.eval(out)
     assert out.shape == (2, 3, 16)
-    assert sink[0][11] is None
+    assert sink[0][11].shape == (2, 3, 2, 4, 4)
 
 
-def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
+def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -256,9 +259,12 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
         B, S = q.shape[:2]
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        return out, next_state
+        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        return out, next_state, states
 
-    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
+    with patch.object(
+        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+    ):
         out = layer(
             mx.zeros((1, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -267,7 +273,7 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11] is None
+    assert sink[0][11].shape == (1, 3, 2, 4, 4)
 
 
 def test_speculative_walk_accepts_until_first_mismatch():
@@ -643,6 +649,67 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
 
     assert rollback_calls
     assert rollback_calls[0][1] is None
+
+
+def test_mtp_rounds_commits_gdn_states_after_full_accept():
+    class Draft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=3)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def set_shared_kv(self, *args, **kwargs):
+            pass
+
+        def reset(self, model):
+            pass
+
+        def draft_block(self, *args, **kwargs):
+            return mx.array([[7, 8]], dtype=mx.int32)
+
+    rollback_calls = []
+
+    class LM:
+        def rollback_speculative_cache(self, *args):
+            rollback_calls.append(args)
+
+        def speculative_draft_hidden(self, hidden):
+            return hidden
+
+    gdn_states = [tuple([None] * 11 + [mx.zeros((1, 3, 1, 1, 1))])]
+    verify = speculative_utils._MTPVerifyResult(
+        hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
+        shared_kv_states={},
+        gdn_states=gdn_states,
+    )
+
+    with (
+        patch.object(mtp_utils, "_mtp_verify_target", return_value=verify),
+        patch.object(
+            mtp_utils,
+            "_mtp_acceptance_walk",
+            return_value=(2, [7, 8]),
+        ),
+    ):
+        list(
+            _mtp_rounds(
+                SimpleNamespace(language_model=LM()),
+                Draft(),
+                [SimpleNamespace(offset=0)],
+                mx.zeros((1, 1, 2), dtype=mx.float32),
+                {},
+                first_bonus=1,
+                max_tokens=5,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                draft_block_size=3,
+                token_dtype=mx.int32,
+                greedy_sampling=True,
+            )
+        )
+
+    assert rollback_calls
+    assert rollback_calls[0][1] is gdn_states
+    assert rollback_calls[0][2] == 2
 
 
 def test_mtp_next_block_size_can_prefer_requested_size():
