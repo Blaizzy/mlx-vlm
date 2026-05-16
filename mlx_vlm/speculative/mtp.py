@@ -24,6 +24,28 @@ class _MTPVerifyResult:
     gdn_states: Optional[list] = None
 
 
+def _copy_rng_state() -> List[mx.array]:
+    mx.eval(*mx.random.state)
+    return [mx.array(state.tolist(), dtype=state.dtype) for state in mx.random.state]
+
+
+def _restore_rng_state(state: List[mx.array]) -> None:
+    for i, value in enumerate(state):
+        mx.random.state[i] = mx.array(value.tolist(), dtype=value.dtype)
+    mx.eval(*mx.random.state)
+
+
+def _eval_draft_sampler_state(draft_model: nn.Module) -> None:
+    targets = []
+    for attr in ("_seed_token",):
+        value = getattr(draft_model, attr, None)
+        if isinstance(value, mx.array):
+            targets.append(value)
+    targets.extend(mx.random.state)
+    if targets:
+        mx.eval(*targets)
+
+
 def _mtp_shared_kv_from_prompt_cache(
     lm: nn.Module,
     prompt_cache: List[Any],
@@ -137,10 +159,13 @@ def _mtp_verify_target(
     verify_input: mx.array,
     prompt_cache: List[Any],
     sampler: Callable[[mx.array], mx.array],
+    *,
+    sample_target_tokens: bool = True,
 ) -> _MTPVerifyResult:
-    result = _mtp_verify_with_model_method(lm, verify_input, prompt_cache, sampler)
-    if result is not None:
-        return result
+    if sample_target_tokens:
+        result = _mtp_verify_with_model_method(lm, verify_input, prompt_cache, sampler)
+        if result is not None:
+            return result
 
     if hasattr(lm, "speculative_logits_from_hidden"):
         result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
@@ -184,7 +209,10 @@ def _speculative_walk_deferred_greedy(
             logits = lm.speculative_logits_from_hidden(
                 target_hidden[:, pos : pos + 1, :]
             )
-            target_token = sampler(logits)
+            if logits.ndim == 3 and logits.shape[1] == 1:
+                logits = logits[:, 0, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            target_token = sampler(logprobs)
         mx.eval(target_token)
         token = int(target_token.reshape(-1).item())
 
@@ -224,7 +252,10 @@ def _speculative_walk_batch_deferred_greedy(
             logits = lm.speculative_logits_from_hidden(
                 target_hidden[:, pos : pos + 1, :]
             )
-            target_tokens = sampler(logits)
+            if logits.ndim == 3 and logits.shape[1] == 1:
+                logits = logits[:, 0, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            target_tokens = sampler(logprobs)
         mx.eval(target_tokens)
         target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
 
@@ -385,6 +416,9 @@ def _mtp_rounds(
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     draft_model.reset(model)
+    preserve_target_rng = not greedy_sampling
+    target_rng_state = _copy_rng_state() if preserve_target_rng else None
+    draft_rng_state = _copy_rng_state() if preserve_target_rng else None
 
     # Hidden from prefill is full prompt-length; reduce to a single slot.
     # The semantically-correct choice is the *last* prompt token's hidden:
@@ -396,6 +430,9 @@ def _mtp_rounds(
     # the round-1 acceptance is wasted. We don't replicate that quirk.)
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
+        if preserve_target_rng:
+            target_rng_state = _copy_rng_state()
+            _restore_rng_state(draft_rng_state)
         prefill_draft(
             prompt_tokens,
             hidden,
@@ -404,6 +441,10 @@ def _mtp_rounds(
             token_dtype,
             **_mtp_draft_kwargs(draft_model, greedy_sampling),
         )
+        if preserve_target_rng:
+            _eval_draft_sampler_state(draft_model)
+            draft_rng_state = _copy_rng_state()
+            _restore_rng_state(target_rng_state)
 
     if hidden.shape[1] > 1:
         hidden = hidden[:, -1:, :]
@@ -430,6 +471,9 @@ def _mtp_rounds(
         if bs <= 1:
             break
 
+        if preserve_target_rng:
+            target_rng_state = _copy_rng_state()
+            _restore_rng_state(draft_rng_state)
         draft_tokens = draft_model.draft_block(
             b,
             hidden,
@@ -439,7 +483,12 @@ def _mtp_rounds(
             token_dtype,
             **_mtp_draft_kwargs(draft_model, greedy_sampling),
         )
-        mx.async_eval(draft_tokens)
+        if preserve_target_rng:
+            mx.eval(draft_tokens, *mx.random.state)
+            draft_rng_state = _copy_rng_state()
+            _restore_rng_state(target_rng_state)
+        else:
+            mx.async_eval(draft_tokens)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
@@ -450,6 +499,7 @@ def _mtp_rounds(
                 verify_input,
                 prompt_cache,
                 sampler,
+                sample_target_tokens=greedy_sampling,
             )
         accepted, new_tokens = _mtp_acceptance_walk(
             lm,
@@ -458,6 +508,8 @@ def _mtp_rounds(
             sampler,
             max_tokens - emitted,
         )
+        if preserve_target_rng:
+            target_rng_state = _copy_rng_state()
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
@@ -468,6 +520,9 @@ def _mtp_rounds(
 
         accept_verified = getattr(draft_model, "accept_verified_tokens", None)
         if callable(accept_verified):
+            if preserve_target_rng:
+                target_rng_state = _copy_rng_state()
+                _restore_rng_state(draft_rng_state)
             accept_verified(
                 verify.hidden,
                 draft_tokens,
@@ -477,6 +532,10 @@ def _mtp_rounds(
                 token_dtype,
                 **_mtp_draft_kwargs(draft_model, greedy_sampling),
             )
+            if preserve_target_rng:
+                _eval_draft_sampler_state(draft_model)
+                draft_rng_state = _copy_rng_state()
+                _restore_rng_state(target_rng_state)
 
         # Hidden for next round: pick the slot of the newly accepted bonus.
         hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
