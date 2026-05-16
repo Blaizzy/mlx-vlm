@@ -57,6 +57,64 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
+def get_kv_cache_materialize_interval():
+    raw = os.environ.get("MLX_VLM_KV_CACHE_MATERIALIZE_INTERVAL", "50")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 50
+
+
+def _iter_cache_arrays(value, seen=None):
+    if seen is None:
+        seen = set()
+
+    if value is None:
+        return
+
+    if isinstance(value, mx.array):
+        ident = id(value)
+        if ident not in seen:
+            seen.add(ident)
+            yield value
+        return
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_cache_arrays(item, seen)
+        return
+
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_cache_arrays(item, seen)
+        return
+
+    ident = id(value)
+    if ident in seen:
+        return
+    seen.add(ident)
+
+    for attr in (
+        "keys",
+        "values",
+        "offset",
+        "left_padding",
+        "lengths",
+        "cache",
+        "_cached_state",
+        "_shadow_keys",
+        "_shadow_values",
+    ):
+        if hasattr(value, attr):
+            yield from _iter_cache_arrays(getattr(value, attr), seen)
+
+
+def materialize_generation_cache(prompt_cache) -> None:
+    arrays = list(_iter_cache_arrays(prompt_cache))
+    if arrays:
+        mx.eval(*arrays)
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
@@ -2854,7 +2912,14 @@ class BatchGenerator:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
-            if self._steps_counter % 512 == 0:
+            materialize_interval = get_kv_cache_materialize_interval()
+            if (
+                materialize_interval > 0
+                and self._steps_counter % materialize_interval == 0
+            ):
+                materialize_generation_cache(self._generation_batch.prompt_cache)
+                mx.clear_cache()
+            elif self._steps_counter % 512 == 0:
                 mx.clear_cache()
 
         if len(self._generation_batch) >= self.completion_batch_size:
