@@ -157,14 +157,23 @@ class Attention(nn.Module):
         )
 
         kv_seq_len = keys.shape[-2]
+        # Use cache._idx (the Python-int cursor) when available so the mask
+        # slice matches the cache size after update_and_fetch. cache.offset is
+        # per-row in batched mode, where max(offset) < _idx if any row carries
+        # left padding — slicing on it then under-sizes the mask.
+        if cache is not None:
+            cache_size = cache._idx if hasattr(cache, "_idx") else cache.offset
+        else:
+            cache_size = 0
 
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
+            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            offset_for_pos = cache.offset if cache is not None else 0
+            position_ids = mx.arange(offset_for_pos, offset_for_pos + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
         else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            kv_seq_len += cache_size
 
         cos, sin = self.rotary_emb(values, position_ids)
 

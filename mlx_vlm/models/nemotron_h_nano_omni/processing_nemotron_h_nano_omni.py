@@ -103,6 +103,17 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
         )
 
         kwargs.pop("use_fast", None)
+        hub_kwargs = {
+            key: kwargs[key]
+            for key in (
+                "revision",
+                "cache_dir",
+                "force_download",
+                "local_files_only",
+                "token",
+            )
+            if key in kwargs
+        }
 
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
@@ -115,7 +126,9 @@ class NemotronHNanoOmniProcessor(ProcessorMixin):
                 with open(local) as f:
                     return json.load(f)
             try:
-                path = hf_hub_download(str(pretrained_model_name_or_path), name)
+                path = hf_hub_download(
+                    str(pretrained_model_name_or_path), name, **hub_kwargs
+                )
                 with open(path) as f:
                     return json.load(f)
             except Exception:

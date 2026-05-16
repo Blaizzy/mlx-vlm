@@ -5,6 +5,7 @@ from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.models.base import scaled_dot_product_attention
 from mlx_vlm.models.cache import ArraysCache, KVCache
 from mlx_vlm.turboquant import (
+    BatchTurboQuantKVCache,
     TurboQuantKVCache,
     _build_codec,
     _TurboQuantMSECodec,
@@ -126,6 +127,61 @@ def test_turboquant_skips_non_kv_cache_entries():
 
     assert isinstance(prompt_cache[0], ArraysCache)
     assert isinstance(prompt_cache[1], TurboQuantKVCache)
+
+
+def test_batch_turboquant_extend_supports_uniform_single_item_offsets():
+    keys = mx.ones((1, 2, 3, 8), dtype=mx.float16)
+    values = mx.ones((1, 2, 3, 8), dtype=mx.float16)
+    first = BatchTurboQuantKVCache([0], bits=3.5)
+    second = BatchTurboQuantKVCache([0], bits=3.5)
+
+    first.update_and_fetch(keys, values)
+    second.update_and_fetch(keys, values)
+    first.extend(second)
+
+    assert first.offset.tolist() == [3, 3]
+    assert first.left_padding.tolist() == [0, 0]
+
+
+def test_batch_turboquant_extend_supports_empty_uniform_offsets():
+    first = BatchTurboQuantKVCache([0], bits=3.5)
+    second = BatchTurboQuantKVCache([0], bits=3.5)
+
+    first.extend(second)
+
+    assert first.offset.tolist() == [0, 0]
+    assert first.left_padding.tolist() == [0, 0]
+
+
+def test_batch_turboquant_filter_supports_uniform_single_item_offsets():
+    keys = mx.ones((1, 2, 3, 8), dtype=mx.float16)
+    values = mx.ones((1, 2, 3, 8), dtype=mx.float16)
+    cache = BatchTurboQuantKVCache([0], bits=3.5)
+
+    cache.update_and_fetch(keys, values)
+    cache.filter(mx.array([0]))
+
+    assert cache.offset.tolist() == [3]
+    assert cache.left_padding.tolist() == [0]
+
+
+def test_batch_turboquant_extend_pads_shorter_uniform_batch():
+    longer = BatchTurboQuantKVCache([0], bits=3.5)
+    shorter = BatchTurboQuantKVCache([0], bits=3.5)
+
+    longer.update_and_fetch(
+        mx.ones((1, 2, 5, 8), dtype=mx.float16),
+        mx.ones((1, 2, 5, 8), dtype=mx.float16),
+    )
+    shorter.update_and_fetch(
+        mx.ones((1, 2, 3, 8), dtype=mx.float16),
+        mx.ones((1, 2, 3, 8), dtype=mx.float16),
+    )
+    longer.extend(shorter)
+
+    assert longer.offset.tolist() == [5, 3]
+    assert longer.left_padding.tolist() == [0, 2]
+    assert longer._idx == 5
 
 
 def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():

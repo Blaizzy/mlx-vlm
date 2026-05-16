@@ -3,6 +3,8 @@ import codecs
 import contextlib
 import functools
 import json
+import logging
+import os
 import time
 import warnings
 from collections.abc import Sequence
@@ -17,8 +19,11 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
+from . import apc as _apc
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .speculative.utils import format_speculative_stats, run_speculative_rounds
+from .tokenizer_utils import make_streaming_detokenizer
 from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
 from .utils import (
     StoppingCriteria,
@@ -27,6 +32,8 @@ from .utils import (
     load,
     prepare_inputs,
 )
+
+logger = logging.getLogger("mlx_vlm.generate")
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -218,8 +225,12 @@ def parse_arguments():
     parser.add_argument(
         "--draft-kind",
         type=str,
-        default="dflash",
-        help="Drafter family. Currently only 'dflash' is supported.",
+        default=None,
+        choices=["dflash", "eagle3", "mtp"],
+        help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
+        "'eagle3' (Speculators/SGLang EAGLE-3), "
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -404,298 +415,44 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
-def _speculative_walk(
-    draft_tokens: mx.array,
-    target_tokens: mx.array,
-    budget: int,
-) -> Tuple[int, List[int]]:
-    """Exact-greedy speculative-decoding walk.
-
-    Accept drafted tokens up to the first mismatch with the target's
-    greedy choice, then take the target's bonus at that position.
-    Returns ``(accepted_count, new_tokens)`` with ``new_tokens``
-    truncated to ``budget``.
-    """
-    n_draft = draft_tokens.shape[1]
-    combined = mx.concatenate(
-        [draft_tokens.reshape(-1), target_tokens.reshape(-1)]
-    ).tolist()
-    d = combined[:n_draft]
-    t = combined[n_draft:]
-    accepted = next((i for i in range(len(d)) if d[i] != t[i]), len(d))
-    new_tokens = (d[:accepted] + [t[accepted]])[:budget]
-    return accepted, new_tokens
-
-
-def _speculative_walk_batch(
-    draft_tokens: mx.array,
-    target_tokens: mx.array,
-    budgets: List[int],
-) -> Tuple[List[int], List[List[int]]]:
-    """Per-sequence speculative walk for B > 1.
-
-    Returns ``(accepted_list, new_tokens_list)`` where each entry
-    corresponds to one sequence in the batch.
-    """
-    B = draft_tokens.shape[0]
-    n_draft = draft_tokens.shape[1]
-    combined = mx.concatenate(
-        [draft_tokens.reshape(B, -1), target_tokens.reshape(B, -1)], axis=1
-    ).tolist()
-    accepted_list: List[int] = []
-    new_tokens_list: List[List[int]] = []
-    for i in range(B):
-        d = combined[i][:n_draft]
-        t = combined[i][n_draft:]
-        acc = next((j for j in range(len(d)) if d[j] != t[j]), len(d))
-        new = (d[:acc] + [t[acc]])[: budgets[i]]
-        accepted_list.append(acc)
-        new_tokens_list.append(new)
-    return accepted_list, new_tokens_list
-
-
-def _dflash_rounds(
+def _prime_cached_prefix_rope_state(
     model: nn.Module,
-    draft_model: nn.Module,
-    prompt_cache: List[Any],
-    hidden: mx.array,
-    *,
-    first_bonus: int,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    draft_block_size: Optional[int] = None,
-    token_dtype: mx.Dtype = mx.int32,
-) -> Generator[Tuple[int, None], None, None]:
-    """DFlash speculative-decoding **round loop**.
+    full_input_ids: mx.array,
+    mask: Optional[mx.array],
+    kwargs: Dict[str, Any],
+) -> bool:
+    """Prime Qwen-style mRoPE metadata before a cached-prefix trim.
 
-    draft → verify → walk → rollback. ``generate_step`` is responsible
-    for prefill, sampling the first bonus token, and packaging the
-    captured hidden states into ``hidden``.
+    Qwen VL language models keep ``_rope_deltas`` on the model object and use
+    it when continuing from a non-empty KV cache. If APC trims the prompt to
+    only the uncached suffix, the suffix alone is not enough to recompute the
+    original prompt's RoPE delta, so derive it from the full prompt first.
     """
-    lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "Speculative decoding with a DFlash drafter currently only "
-            "supports mlx_vlm.models.qwen3_5."
+    lm = getattr(model, "language_model", None)
+    get_rope_index = getattr(lm, "get_rope_index", None)
+    if not callable(get_rope_index):
+        return True
+    if not (hasattr(lm, "_rope_deltas") or hasattr(lm, "_position_ids")):
+        return True
+    try:
+        position_ids, rope_deltas = get_rope_index(
+            full_input_ids,
+            kwargs.get("image_grid_thw", None),
+            kwargs.get("video_grid_thw", None),
+            mask,
         )
-
-    target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
-    draft_cache = draft_model.reset(model)
-
-    b = first_bonus
-    emitted = 1  # the first bonus has already been yielded by the caller
-
-    while emitted < max_tokens:
-        bs = min(block_total, max_tokens - emitted + 1)
-        if bs <= 1:
-            break
-
-        draft_tokens = draft_model.draft_block(
-            b, hidden, draft_cache, bs, sampler, token_dtype
+    except Exception as e:
+        logger.warning(
+            "Could not prime cached-prefix RoPE state; falling back to cold prefill: %s",
+            e,
         )
-        mx.async_eval(draft_tokens)
-
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens],
-                axis=1,
-            )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden)
-
-        # Walk
-        accepted, new_tokens = _speculative_walk(
-            draft_tokens, target_tokens, max_tokens - emitted
-        )
-        draft_model.accept_lens.append(accepted)
-
-        # Emit
-        for tok in new_tokens:
-            yield tok, None
-            emitted += 1
-            if emitted >= max_tokens:
-                return
-
-        if accepted < bs - 1:
-            hidden = hidden[:, : accepted + 1, :]
-        b = new_tokens[-1] if new_tokens else b
-
-        if accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted, bs
-                )
-
-        if emitted % 256 == 0:
-            mx.clear_cache()
-
-
-def _dflash_rounds_batch(
-    model: nn.Module,
-    draft_model: nn.Module,
-    prompt_cache: List[Any],
-    hidden: mx.array,
-    *,
-    first_bonus: mx.array,
-    max_tokens: int,
-    sampler: Callable[[mx.array], mx.array],
-    draft_block_size: Optional[int] = None,
-    token_dtype: mx.Dtype = mx.int32,
-    stop_check: Optional[Callable[[int, int], bool]] = None,
-) -> Generator[Tuple[List[Optional[int]], None], None, None]:
-    """Batch DFlash speculative-decoding round loop (B > 1).
-
-    Supports continuous batching: when a sequence finishes (EOS or
-    max_tokens), it is filtered out of the target caches and the
-    drafter cache is reinitialized for the new batch size.
-
-    ``stop_check(seq_idx, token_id) -> bool`` is an optional callback
-    that returns True to stop a sequence (e.g. EOS detection).
-
-    Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
-    token for sequence ``i`` (or ``None`` if that sequence has nothing
-    to emit this step).
-    """
-    lm = model.language_model if hasattr(model, "language_model") else model
-    if not hasattr(lm, "rollback_speculative_cache"):
-        raise RuntimeError(
-            f"{type(lm).__name__} does not implement " "rollback_speculative_cache."
-        )
-
-    B = first_bonus.shape[0]
-    target_layer_ids = list(draft_model.config.target_layer_ids)
-    block_total = (
-        draft_block_size
-        if draft_block_size is not None
-        else int(draft_model.config.block_size)
-    )
-    draft_cache = draft_model.reset(model)
-
-    # Per-sequence state tracked by ORIGINAL index so the caller sees
-    # stable indices in the yielded token lists.
-    b = first_bonus.tolist()  # active bonus tokens
-    emitted = [1] * B
-    finished = [False] * B
-    active_idx = list(range(B))  # maps active-slot → original-index
-
-    def _reinit_drafter():
-        """Cold-restart the drafter cache after a batch change."""
-        nonlocal draft_cache
-        draft_cache = draft_model.make_cache()
-
-    total_emitted = sum(emitted)
-
-    while len(active_idx) > 0:
-        remaining = [
-            max(1, max_tokens - emitted[active_idx[j]] + 1)
-            for j in range(len(active_idx))
-        ]
-        bs = min(block_total, min(remaining))
-        if bs <= 1:
-            break
-
-        n_active = len(active_idx)
-        b_active = [b[active_idx[j]] for j in range(n_active)]
-        b_arr = mx.array(b_active, dtype=token_dtype)
-
-        # Draft
-        draft_tokens = draft_model.draft_block(
-            b_arr, hidden, draft_cache, bs, sampler, token_dtype
-        )
-        mx.async_eval(draft_tokens)
-
-        # Verify
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
-            hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
-            target_tokens = sampler(verify_out.logits)
-        mx.async_eval(target_tokens, hidden_full)
-
-        # Walk (per-sequence)
-        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
-        accepted_list, new_tokens_list = _speculative_walk_batch(
-            draft_tokens, target_tokens, budgets
-        )
-
-        min_accepted = min(accepted_list)
-        accepted_arr = mx.array(accepted_list)
-
-        if min_accepted < bs - 1:
-            max_a = int(accepted_arr.max().item())
-            hidden = hidden_full[:, : max_a + 1, :]
-        else:
-            max_a = bs - 1
-            hidden = hidden_full
-
-        for a in accepted_list:
-            draft_model.accept_lens.append(a)
-
-        # Emit (map active slots back to original indices)
-        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
-        for pos in range(max_new):
-            tokens_out: List[Optional[int]] = [None] * B
-            for j in range(n_active):
-                orig = active_idx[j]
-                if pos < len(new_tokens_list[j]) and not finished[orig]:
-                    tok = new_tokens_list[j][pos]
-                    tokens_out[orig] = tok
-                    emitted[orig] += 1
-                    if emitted[orig] >= max_tokens:
-                        finished[orig] = True
-                    if stop_check is not None and stop_check(orig, tok):
-                        finished[orig] = True
-            yield tokens_out, None
-
-        # Update bonus tokens
-        for j in range(n_active):
-            orig = active_idx[j]
-            if new_tokens_list[j]:
-                b[orig] = new_tokens_list[j][-1]
-
-        if min_accepted < bs - 1:
-            with mx.stream(generation_stream):
-                lm.rollback_speculative_cache(
-                    prompt_cache, verify_out.gdn_states, accepted_arr, bs
-                )
-
-        # --- Continuous batching: filter out finished sequences ---
-        keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
-        if len(keep_slots) < n_active:
-            if len(keep_slots) == 0:
-                break
-            # Filter target caches (BatchKVCache supports this)
-            keep_mx = mx.array(keep_slots, dtype=mx.int32)
-            for c in prompt_cache:
-                if hasattr(c, "filter"):
-                    c.filter(keep_mx)
-            # Filter hidden
-            hidden = hidden[keep_mx]
-            # Update active index mapping
-            active_idx = [active_idx[j] for j in keep_slots]
-            # Cold-restart drafter for the new batch size
-            _reinit_drafter()
-
-        new_total = sum(emitted)
-        if new_total // 256 > total_emitted // 256:
-            mx.clear_cache()
-        total_emitted = new_total
+        return False
+    if hasattr(lm, "_position_ids"):
+        lm._position_ids = position_ids
+    if hasattr(lm, "_rope_deltas"):
+        lm._rope_deltas = rope_deltas
+    kwargs["rope_deltas"] = rope_deltas
+    return True
 
 
 def generate_step(
@@ -724,6 +481,8 @@ def generate_step(
     draft_model: Optional[nn.Module] = None,
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
+    prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
+    prompt_cache_checkpoint_len: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -783,6 +542,7 @@ def generate_step(
         kv_quant_scheme=kv_quant_scheme,
     )
 
+    sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
         sampler = make_sampler(
             temp=temperature,
@@ -812,7 +572,21 @@ def generate_step(
     # Speculative decoding setup
     last_outputs = None
     if draft_model is not None:
-        kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
+        if draft_kind == "mtp":
+            # MTP drafter consumes target's last-layer hidden + shared K/V
+            # (per layer-type) rather than per-layer hidden captures.
+            kwargs["return_hidden"] = True
+            kwargs["return_shared_kv"] = True
+        elif draft_kind == "eagle3":
+            kwargs["capture_layer_ids"] = list(
+                getattr(
+                    draft_model.config,
+                    "capture_layer_ids",
+                    draft_model.config.target_layer_ids,
+                )
+            )
+        else:
+            kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
         prefill_step_size = None
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
@@ -859,7 +633,7 @@ def generate_step(
             else:
                 kwargs = {}
 
-            return y, logprobs.squeeze(0)
+            return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
     with mx.stream(generation_stream):
         # Get input embeddings (handles both multimodal and text-only)
@@ -878,12 +652,32 @@ def generate_step(
         )
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
-        if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
+        checkpoint_len = (
+            int(prompt_cache_checkpoint_len)
+            if prompt_cache_checkpoint is not None
+            and prompt_cache_checkpoint_len is not None
+            else None
+        )
+        checkpoint_done = False
+        should_chunk = (
+            prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
+        ) or (
+            checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
+        )
+        if prefill_step_size is not None and should_chunk:
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
+            processed_tokens = 0
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+                    if (
+                        checkpoint_len is not None
+                        and not checkpoint_done
+                        and processed_tokens < checkpoint_len
+                        and processed_tokens + n_to_process > checkpoint_len
+                    ):
+                        n_to_process = checkpoint_len - processed_tokens
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -893,6 +687,14 @@ def generate_step(
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
+                    processed_tokens += n_to_process
+                    if (
+                        checkpoint_len is not None
+                        and not checkpoint_done
+                        and processed_tokens == checkpoint_len
+                    ):
+                        prompt_cache_checkpoint(processed_tokens, prompt_cache)
+                        checkpoint_done = True
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -906,41 +708,20 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
-        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
-        B = input_ids.shape[0]
-        if draft_kind != "dflash":
-            raise ValueError(
-                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
-            )
-        if B == 1:
-            mx.eval(y)
-            yield y.item(), logprobs
-            yield from _dflash_rounds(
-                model,
-                draft_model,
-                prompt_cache,
-                hidden,
-                first_bonus=y.item(),
-                max_tokens=max_tokens,
-                sampler=sampler,
-                draft_block_size=draft_block_size,
-                token_dtype=input_ids.dtype,
-            )
-        else:
-            mx.eval(y)
-            first_bonus = y.squeeze(-1)
-            yield first_bonus.tolist(), logprobs
-            yield from _dflash_rounds_batch(
-                model,
-                draft_model,
-                prompt_cache,
-                hidden,
-                first_bonus=first_bonus,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                draft_block_size=draft_block_size,
-                token_dtype=input_ids.dtype,
-            )
+        yield from run_speculative_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            input_ids,
+            y,
+            logprobs,
+            last_outputs,
+            draft_kind=draft_kind,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            sampler_is_greedy=sampler_is_greedy,
+        )
         return
 
     n = 0
@@ -1018,6 +799,9 @@ def stream_generate(
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
+    prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
+    apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -1057,37 +841,153 @@ def stream_generate(
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn
-    prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
+    apc_blocks_in_use: List[_apc.APCBlock] = []
+    apc_extra_hash = 0
+    apc_mode: Optional[str] = None
+
+    if apc_manager is not None:
+        apc_mode = _apc.model_apc_mode(model.language_model)
+        if apc_mode is None:
+            apc_manager = None
+
+    if apc_manager is not None:
+        image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
+        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            reused_prefix_len = prefix_len
-            # Trim to only new tokens
-            input_ids = input_ids[:, prefix_len:]
-            # Only skip vision if no image tokens in the new (trimmed) tokens
-            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
-                model.config, "image_token_index", None
+            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                reused_prefix_len = prefix_len
+                # Trim to only new tokens
+                input_ids = input_ids[:, prefix_len:]
+                # Only skip vision if no image tokens in the new (trimmed) tokens
+                image_token_id = getattr(
+                    model.config, "image_token_id", None
+                ) or getattr(model.config, "image_token_index", None)
+                new_ids = input_ids.flatten().tolist()
+                has_image_in_new = (
+                    image_token_id is not None and image_token_id in new_ids
+                )
+                if not has_image_in_new:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                # Reuse the saved KV cache (trimmed to prefix length)
+                kv_cache = prompt_cache_state.cache
+                # Trim cache to prefix_len in case it includes generated tokens
+                for c in kv_cache:
+                    if hasattr(c, "keys") and c.keys is not None:
+                        cached_len = c.keys.shape[2]
+                        if cached_len > prefix_len:
+                            c.keys = c.keys[:, :, :prefix_len, :]
+                            c.values = c.values[:, :, :prefix_len, :]
+                            if hasattr(c, "offset"):
+                                c.offset = prefix_len
+                kwargs["prompt_cache"] = kv_cache
+
+    # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
+    # PromptCacheState didn't already produce a hit.
+    if apc_manager is not None and reused_prefix_len == 0:
+        if apc_mode == "exact":
+            exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
+                full_input_ids_list,
+                extra_hash=apc_extra_hash,
             )
-            new_ids = input_ids.flatten().tolist()
-            has_image_in_new = image_token_id is not None and image_token_id in new_ids
-            if not has_image_in_new:
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
-            kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens
-            for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2]
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[:, :, :prefix_len, :]
-                        c.values = c.values[:, :, :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
-            kwargs["prompt_cache"] = kv_cache
+            if (
+                exact_prompt_cache is not None
+                and exact_prefix_len > 0
+                and exact_prefix_len < input_ids.shape[1]
+                and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+            ):
+                reused_prefix_len = exact_prefix_len
+                input_ids = input_ids[:, exact_prefix_len:]
+                image_token_id = getattr(
+                    model.config, "image_token_id", None
+                ) or getattr(model.config, "image_token_index", None)
+                new_ids = input_ids.flatten().tolist()
+                if image_token_id is None or image_token_id not in new_ids:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                kwargs["prompt_cache"] = exact_prompt_cache
+        else:
+            matched_blocks, prefix_len = apc_manager.lookup_prefix(
+                full_input_ids_list, extra_hash=apc_extra_hash
+            )
+            exact_prompt_cache = None
+            exact_prefix_len = 0
+            if prefix_len < input_ids.shape[1]:
+                exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
+                    full_input_ids_list,
+                    extra_hash=apc_extra_hash,
+                    min_prefix_tokens=prefix_len,
+                )
+            disk_prompt_cache = None
+            disk_prefix_len = 0
+            if max(prefix_len, exact_prefix_len) < input_ids.shape[1]:
+                disk_prompt_cache, disk_prefix_len = (
+                    apc_manager.lookup_prefix_disk_cache(
+                        full_input_ids_list,
+                        extra_hash=apc_extra_hash,
+                        min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                        allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+                    )
+                )
+            if (
+                disk_prefix_len > max(prefix_len, exact_prefix_len)
+                and disk_prefix_len < input_ids.shape[1]
+            ):
+                if matched_blocks:
+                    apc_manager.release(matched_blocks)
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    reused_prefix_len = disk_prefix_len
+                    input_ids = input_ids[:, disk_prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = disk_prompt_cache
+            elif (
+                exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
+            ):
+                if matched_blocks:
+                    apc_manager.release(matched_blocks)
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    reused_prefix_len = exact_prefix_len
+                    input_ids = input_ids[:, exact_prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = exact_prompt_cache
+            elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
+                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                    apc_blocks_in_use = matched_blocks
+                    reused_prefix_len = prefix_len
+                    input_ids = input_ids[:, prefix_len:]
+                    image_token_id = getattr(
+                        model.config, "image_token_id", None
+                    ) or getattr(model.config, "image_token_index", None)
+                    new_ids = input_ids.flatten().tolist()
+                    if image_token_id is None or image_token_id not in new_ids:
+                        pixel_values = None
+                        kwargs.pop("cached_image_features", None)
+                    kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
+                        matched_blocks,
+                        min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                    )
+                else:
+                    apc_manager.release(matched_blocks)
+            elif matched_blocks:
+                # Full match (no new tokens to compute) — release; fall through to normal path
+                apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
@@ -1118,10 +1018,32 @@ def stream_generate(
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
     with wired_limit(model, [generation_stream]):
-        detokenizer = processor.detokenizer
-        detokenizer.reset()
+        detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
-        gen = generate_step(input_ids, model, pixel_values, mask, **kwargs)
+        exact_checkpoint_len = None
+        exact_checkpoint = None
+        if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
+            exact_checkpoint_len = max(
+                1,
+                len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
+            )
+
+            def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
+                apc_manager.store_exact_cache(
+                    full_input_ids_list[:prefix_len],
+                    prompt_cache,
+                    extra_hash=apc_extra_hash,
+                )
+
+        gen = generate_step(
+            input_ids,
+            model,
+            pixel_values,
+            mask,
+            prompt_cache_checkpoint=exact_checkpoint,
+            prompt_cache_checkpoint_len=exact_checkpoint_len,
+            **kwargs,
+        )
         tic = time.perf_counter()
 
         generated_tokens = []
@@ -1130,6 +1052,19 @@ def stream_generate(
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
+                if (
+                    apc_manager is not None
+                    and apc_mode == "exact"
+                    and reused_prefix_len == 0
+                ):
+                    try:
+                        apc_manager.store_exact_cache(
+                            full_input_ids_list,
+                            tracked_cache,
+                            extra_hash=apc_extra_hash,
+                        )
+                    except Exception as e:
+                        logger.warning("APC exact-cache store failed: %s", e)
 
             generated_tokens.append(token)
 
@@ -1170,11 +1105,47 @@ def stream_generate(
         )
 
         # Save cache state for potential reuse on next turn
+        all_ids: Optional[List[int]] = None
         if prompt_cache_state is not None:
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
             prompt_cache_state.update(all_ids, tracked_cache)
+
+        # APC: harvest new blocks from the post-generation KV state.
+        if apc_manager is not None and apc_mode == "block":
+            try:
+                if all_ids is None:
+                    all_ids = full_input_ids_list + [
+                        t.item() if hasattr(t, "item") else t for t in generated_tokens
+                    ]
+                # Snapshot keys/values up to the live offset for each layer.
+                layer_keys: List[mx.array] = []
+                layer_values: List[mx.array] = []
+                ok = True
+                for c in tracked_cache:
+                    k = getattr(c, "keys", None)
+                    v = getattr(c, "values", None)
+                    off = getattr(c, "offset", None)
+                    if k is None or v is None or off is None:
+                        ok = False
+                        break
+                    layer_keys.append(k[..., :off, :])
+                    layer_values.append(v[..., :off, :])
+                if ok and layer_keys:
+                    new_blocks = apc_manager.store_kv_blocks(
+                        all_ids,
+                        layer_keys,
+                        layer_values,
+                        extra_hash=apc_extra_hash,
+                        skip_first_n_tokens=reused_prefix_len,
+                    )
+                    apc_manager.release(apc_blocks_in_use + new_blocks)
+                else:
+                    apc_manager.release(apc_blocks_in_use)
+            except Exception as e:
+                logger.warning("APC store failed: %s", e)
+                apc_manager.release(apc_blocks_in_use)
 
         # Cleanup after generation
         mx.clear_cache()
@@ -1330,6 +1301,128 @@ def _left_pad_prompts(prompts, max_length=None):
     return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
+def _right_pad_prompts(prompts, max_length=None):
+    if max_length is None:
+        max_length = max(len(p) for p in prompts)
+
+    return mx.array([list(p) + [0] * (max_length - len(p)) for p in prompts])
+
+
+_SEQUENCE_ALIGNED_PROMPT_KWARGS = {
+    "attention_mask",
+    "decoder_inputs_embeds",
+    "deepstack_visual_embeds",
+    "visual_pos_masks",
+    "per_layer_inputs",
+    "full_text_row_masked_out_mask",
+    "position_ids",
+    "pos_hw",
+}
+
+APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+
+
+def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
+    if v.shape[0] == batch_size:
+        return v[row_idx : row_idx + 1]
+    return v[:1]
+
+
+def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[dict]:
+    """Normalize batched prompt kwargs into one dict per batch row.
+
+    ``model.get_input_embeddings()`` commonly returns batch-sized tensors
+    (notably ``inputs_embeds``). ``BatchGenerator.insert()`` stores prompt
+    kwargs per sequence, so passing the same batched dict for every row causes
+    the prompt builder to concatenate those batched tensors ``batch_size``
+    times, effectively squaring the batch dimension.
+    """
+    if batch_size <= 1:
+        return [prompt_kwargs or {}]
+
+    rows = [{} for _ in range(batch_size)]
+    for k, v in (prompt_kwargs or {}).items():
+        if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+            for i in range(batch_size):
+                rows[i][k] = _prompt_kwarg_row(v, i, batch_size)
+        else:
+            for row in rows:
+                row[k] = v
+    return rows
+
+
+def _is_sequence_aligned_prompt_kwarg(
+    key: str, v: mx.array, sequence_length: int
+) -> bool:
+    return (
+        key in _SEQUENCE_ALIGNED_PROMPT_KWARGS
+        and v.ndim >= 2
+        and v.shape[1] == sequence_length
+    )
+
+
+def _pad_sequence_aligned_prompt_kwarg(
+    v: mx.array, target_length: int, *, left: bool
+) -> mx.array:
+    pad = target_length - v.shape[1]
+    if pad <= 0:
+        return v
+    pad_shape = (v.shape[0], pad) + tuple(v.shape[2:])
+    pad_v = mx.zeros(pad_shape, dtype=v.dtype)
+    parts = [pad_v, v] if left else [v, pad_v]
+    return mx.concatenate(parts, axis=1)
+
+
+def _merge_prefill_prompt_kwargs(
+    prompt_kwargs_list: List[Optional[dict]],
+    input_ids: List[List[int]],
+) -> Tuple[mx.array, dict]:
+    """Batch per-row prompt kwargs for a left-padded prefill forward."""
+    lengths = [len(ids) for ids in input_ids]
+    max_length = max(lengths)
+
+    row_embeds: List[mx.array] = []
+    embed_dtype = None
+    embed_dim = None
+    for kw, length in zip(prompt_kwargs_list, lengths):
+        if not kw or kw.get("inputs_embeds") is None:
+            raise ValueError("inputs_embeds is required")
+        embeds = kw["inputs_embeds"]  # [1, length, D]
+        embed_dtype = embeds.dtype
+        embed_dim = embeds.shape[-1]
+        if length < max_length:
+            pad = mx.zeros(
+                (embeds.shape[0], max_length - length, embed_dim),
+                dtype=embed_dtype,
+            )
+            embeds = mx.concatenate([pad, embeds], axis=1)
+        row_embeds.append(embeds)
+    inputs_embeds = mx.concatenate(row_embeds, axis=0)
+
+    merged_kwargs: dict = {}
+    per_row_keys: dict = {}
+    batch_size = len(prompt_kwargs_list)
+    for i, (kw, length) in enumerate(zip(prompt_kwargs_list, lengths)):
+        if not kw:
+            continue
+        for k, v in kw.items():
+            if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
+                continue
+            if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                row_v = _prompt_kwarg_row(v, i, batch_size)
+                if _is_sequence_aligned_prompt_kwarg(k, row_v, length):
+                    row_v = _pad_sequence_aligned_prompt_kwarg(
+                        row_v, max_length, left=True
+                    )
+                per_row_keys.setdefault(k, []).append(row_v)
+            elif k not in merged_kwargs:
+                merged_kwargs[k] = v
+    for k, vs in per_row_keys.items():
+        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+
+    return inputs_embeds, merged_kwargs
+
+
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -1458,6 +1551,16 @@ class BatchResponse:
     texts: List[str]
     stats: BatchStats
     image_sizes: Optional[List[Tuple[int, int]]] = None
+
+
+@dataclass
+class PromptProgress:
+    """Per-request prompt processing metrics for continuous batching."""
+
+    uid: int
+    prompt_tokens: int
+    prompt_tps: float = 0.0
+    prompt_time: float = 0.0
 
 
 class GenerationBatch:
@@ -1788,18 +1891,42 @@ class PromptProcessingBatch:
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+        warm_cache: Optional[List[Any]] = None,
+        apc_meta: Optional[List[dict]] = None,
+        apc_manager: Optional["_apc.APCManager"] = None,
+        right_pad_per_row: Optional[List[int]] = None,
+        suffix_lens: Optional[List[int]] = None,
+        apc_mode: Optional[str] = None,
     ):
         self.model = model
         self.uids = uids
+        self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
-        left_padding = [max_length - l for l in lengths]
-        self._total_prompt_tokens = sum(lengths)
+        # ``input_ids`` here are the per-row prefill inputs — for warm-start
+        # rows this is the suffix, for cold rows the full prompt. When
+        # ``right_pad_per_row`` is set the rows are right-padded (used in
+        # mixed warm/cold prefill so suffix RoPE positions align). Otherwise
+        # we left-pad as before.
+        self._right_pad_per_row = right_pad_per_row
+        self._suffix_lens = suffix_lens or lengths
+        self._left_padding_per_row: List[int]
 
-        self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
+        if right_pad_per_row is not None:
+            # Right-pad each row to max_length (so the last `pad[i]` cells are
+            # right-pad and need to be rolled into left-pad by finalize()).
+            left_padding = [0] * len(input_ids)
+            self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
+        else:
+            left_padding = [max_length - l for l in lengths]
+            self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
+        self._left_padding_per_row = list(left_padding)
+        self._total_prompt_tokens = sum(lengths)
+        self._processed_prompt_columns = 0
+
         self.logits_processors = logits_processors or []
         self._token_context = (
             [list(ids) for ids in input_ids]
@@ -1807,43 +1934,211 @@ class PromptProcessingBatch:
             else []
         )
         self._inputs_embeds = inputs_embeds
-        self._prompt_kwargs = prompt_kwargs
+        self._prompt_kwargs = prompt_kwargs or {}
+        self._prompt_length_aware_keys: List[str] = []
+        if self._prompt_kwargs and self._inputs_embeds is not None:
+            prompt_batch = self._inputs_embeds.shape[0]
+            prompt_len = self._inputs_embeds.shape[1]
+            for k, v in self._prompt_kwargs.items():
+                if (
+                    isinstance(v, mx.array)
+                    and v.ndim >= 2
+                    and v.shape[0] == prompt_batch
+                    and v.shape[1] == prompt_len
+                ):
+                    self._prompt_length_aware_keys.append(k)
 
-        self.prompt_cache = _make_cache(
-            model,
-            left_padding,
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            kv_quant_scheme=kv_quant_scheme,
-        )
+        # APC metadata used for post-prefill block harvest (per-row).
+        self._apc_meta = apc_meta or []
+        self._apc_manager = apc_manager
+        self._apc_mode = apc_mode
+        self._apc_harvest_enabled = True
+        self._prompt_time_s = 0.0
+        self._prompt_tokens_per_row: List[int] = []
+        for idx, suffix_len in enumerate(lengths):
+            full_input_ids = None
+            if idx < len(self._apc_meta) and self._apc_meta[idx] is not None:
+                full_input_ids = self._apc_meta[idx].get("full_input_ids")
+            self._prompt_tokens_per_row.append(
+                len(full_input_ids) if full_input_ids is not None else suffix_len
+            )
+
+        if warm_cache is not None:
+            self.prompt_cache = warm_cache
+        else:
+            self.prompt_cache = _make_cache(
+                model,
+                left_padding,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                kv_quant_scheme=kv_quant_scheme,
+            )
+
+        # Declare per-row right-padding on each cache so finalize() can roll
+        # it into left-padding once the prefill forward pass is complete.
+        if right_pad_per_row is not None and any(right_pad_per_row):
+            for c in self.prompt_cache:
+                prepare = getattr(c, "prepare", None)
+                if not callable(prepare):
+                    self._apc_harvest_enabled = False
+                    self._release_apc_meta_blocks()
+                    raise RuntimeError(
+                        "APC mixed prefill requires a prompt cache with prepare()"
+                    )
+                prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
 
     def __len__(self):
         return len(self.uids)
 
+    def _release_apc_meta_blocks(self):
+        if self._apc_manager is None:
+            return
+        for meta in self._apc_meta:
+            if meta is not None:
+                self._apc_manager.release(meta.get("apc_blocks", []))
+
     def needs_processing(self):
         """True if prompt needs chunked processing before generate()."""
         if self._inputs_embeds is None or self.prefill_step_size is None:
-            return False
+            return self._next_apc_checkpoint_column() is not None
+        if self._next_apc_checkpoint_column() is not None:
+            return True
         return self._inputs_embeds.shape[1] > self.prefill_step_size
+
+    def _apc_checkpoint_column_for_meta(
+        self, batch_idx: int, meta: dict
+    ) -> Optional[int]:
+        checkpoint_len = int(meta.get("checkpoint_len") or 0)
+        if (
+            self._apc_mode != "exact"
+            or checkpoint_len <= 0
+            or meta.get("checkpoint_done")
+        ):
+            return None
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        if checkpoint_len <= prefix_len:
+            meta["checkpoint_done"] = True
+            return None
+        if self._right_pad_per_row is not None:
+            suffix_checkpoint = checkpoint_len - prefix_len
+            if suffix_checkpoint >= self._suffix_lens[batch_idx]:
+                return None
+            return suffix_checkpoint
+        return self._left_padding_per_row[batch_idx] + checkpoint_len
+
+    def _next_apc_checkpoint_column(self) -> Optional[int]:
+        if (
+            self._apc_manager is None
+            or self._apc_mode != "exact"
+            or not self._apc_meta
+            or self._inputs_embeds is None
+        ):
+            return None
+        start = self._processed_prompt_columns
+        end = start + self._inputs_embeds.shape[1]
+        next_col: Optional[int] = None
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None:
+                continue
+            col = self._apc_checkpoint_column_for_meta(batch_idx, meta)
+            if col is None or col <= start or col >= end:
+                continue
+            next_col = col if next_col is None else min(next_col, col)
+        return next_col
+
+    def _row_real_tokens_processed(self, batch_idx: int) -> int:
+        meta = self._apc_meta[batch_idx]
+        prefix_len = int(meta.get("prefix_len", 0) or 0)
+        if self._right_pad_per_row is not None:
+            suffix_done = min(
+                self._suffix_lens[batch_idx],
+                max(0, self._processed_prompt_columns),
+            )
+            return prefix_len + suffix_done
+        real_done = (
+            self._processed_prompt_columns - self._left_padding_per_row[batch_idx]
+        )
+        return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
+
+    def _store_apc_exact_checkpoints(self) -> None:
+        if self._apc_manager is None or self._apc_mode != "exact":
+            return
+        for batch_idx, meta in enumerate(self._apc_meta):
+            if meta is None or meta.get("checkpoint_done"):
+                continue
+            checkpoint_len = int(meta.get("checkpoint_len") or 0)
+            if checkpoint_len <= 0:
+                continue
+            if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
+                continue
+            prompt_cache = _apc.extract_prompt_cache_from_batch(
+                self.prompt_cache,
+                batch_idx,
+            )
+            if prompt_cache is None:
+                continue
+            self._apc_manager.store_exact_cache(
+                meta["full_input_ids"][:checkpoint_len],
+                prompt_cache,
+                extra_hash=meta.get("extra_hash", 0),
+            )
+            meta["checkpoint_done"] = True
+
+    def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
+        if n is None or not self._prompt_length_aware_keys:
+            return self._prompt_kwargs
+        out = dict(self._prompt_kwargs)
+        for k in self._prompt_length_aware_keys:
+            out[k] = out[k][:, :n, ...]
+        return out
 
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
             return 0
 
-        n = min(self.prefill_step_size, self._inputs_embeds.shape[1] - 1)
+        step = self.prefill_step_size or self._inputs_embeds.shape[1]
+        n = min(step, self._inputs_embeds.shape[1] - 1)
+        checkpoint_col = self._next_apc_checkpoint_column()
+        if checkpoint_col is not None:
+            n = min(n, checkpoint_col - self._processed_prompt_columns)
+        if n <= 0:
+            return 0
+        prompt_kwargs = self._prompt_kwargs_for_step(n)
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
-            **self._prompt_kwargs,
+            **prompt_kwargs,
         )
         mx.eval([c.state for c in self.prompt_cache])
+        self._processed_prompt_columns += n
+        self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
+        for k in self._prompt_length_aware_keys:
+            self._prompt_kwargs[k] = self._prompt_kwargs[k][:, n:, ...]
         mx.clear_cache()
         return n
+
+    def record_prompt_time(self, elapsed_s: float) -> None:
+        self._prompt_time_s += max(0.0, float(elapsed_s))
+
+    def prompt_progress(self) -> List[PromptProgress]:
+        if self._prompt_time_s <= 0:
+            return []
+        return [
+            PromptProgress(
+                uid=uid,
+                prompt_tokens=prompt_tokens,
+                prompt_tps=prompt_tokens / self._prompt_time_s,
+                prompt_time=self._prompt_time_s,
+            )
+            for uid, prompt_tokens in zip(
+                self._prompt_uids, self._prompt_tokens_per_row
+            )
+        ]
 
     def generate(
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
@@ -1856,7 +2151,16 @@ class PromptProcessingBatch:
             **self._prompt_kwargs,
         )
         logits = output.logits if hasattr(output, "logits") else output
-        logits = logits[:, -1, :]
+        if self._right_pad_per_row is not None and any(self._right_pad_per_row):
+            # Per-row last *real* token sits at index (seq - 1 - right_pad[i]).
+            seq = logits.shape[1]
+            last_idx = mx.array(
+                [seq - 1 - p for p in self._right_pad_per_row], dtype=mx.int32
+            )[:, None, None]
+            last_idx = mx.broadcast_to(last_idx, (logits.shape[0], 1, logits.shape[-1]))
+            logits = mx.take_along_axis(logits, last_idx, axis=1).squeeze(1)
+        else:
+            logits = logits[:, -1, :]
         if self.logits_processors and any(self.logits_processors):
             processed_logits = []
             for i in range(logits.shape[0]):
@@ -1871,6 +2175,34 @@ class PromptProcessingBatch:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         first_tokens = sampler(logprobs)
+
+        mx.async_eval(first_tokens)
+
+        # Roll any right-padding into left-padding so the cache decoded by
+        # GenerationBatch sees a canonical layout.
+        if self._right_pad_per_row is not None and any(self._right_pad_per_row):
+            for c in self.prompt_cache:
+                finalize = getattr(c, "finalize", None)
+                if not callable(finalize):
+                    self._apc_harvest_enabled = False
+                    self._release_apc_meta_blocks()
+                    raise RuntimeError(
+                        "APC mixed prefill requires a prompt cache with finalize()"
+                    )
+                finalize()
+        if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
+            c0 = self.prompt_cache[0] if self.prompt_cache else None
+            if c0 is not None:
+                off = getattr(c0, "offset", None)
+                lp = getattr(c0, "left_padding", None)
+                logger.warning(
+                    "post-prefill cache[0]: _idx=%s offset=%s left_padding=%s right_pad_per_row=%s suffix_lens=%s",
+                    getattr(c0, "_idx", None),
+                    off.tolist() if hasattr(off, "tolist") else off,
+                    lp.tolist() if hasattr(lp, "tolist") else lp,
+                    self._right_pad_per_row,
+                    self._suffix_lens,
+                )
 
         gen_batch = GenerationBatch(
             model=self.model,
@@ -1903,12 +2235,86 @@ class PromptProcessingBatch:
         language_model = getattr(self.model, "language_model", self.model)
         rope_deltas = self._capture_rope_deltas(language_model, len(gen_batch.uids))
         if rope_deltas is not None:
+            # Normalize to shape (B, 1) so extend/filter stay consistent.
+            if rope_deltas.ndim == 0:
+                rope_deltas = rope_deltas.reshape(1, 1)
+            elif rope_deltas.ndim == 1:
+                rope_deltas = rope_deltas[:, None]
+            # When a warm-start batch reuses the model's cached _rope_deltas
+            # (computed during a previous prefill with a smaller batch), the
+            # batch dim won't match this prompt batch's row count. Realign
+            # so extend()/filter() down the line stay consistent with the
+            # generation batch's row count.
+            target_b = first_tokens.shape[0]
+            if rope_deltas.shape[0] != target_b:
+                if rope_deltas.shape[0] == 1:
+                    rope_deltas = mx.broadcast_to(
+                        rope_deltas, (target_b, rope_deltas.shape[1])
+                    )
+                elif rope_deltas.shape[0] < target_b:
+                    pad = target_b - rope_deltas.shape[0]
+                    rope_deltas = mx.concatenate(
+                        [
+                            rope_deltas,
+                            mx.broadcast_to(
+                                rope_deltas[-1:],
+                                (pad, rope_deltas.shape[1]),
+                            ),
+                        ],
+                        axis=0,
+                    )
+                else:
+                    rope_deltas = rope_deltas[:target_b]
             gen_batch._rope_deltas = rope_deltas
+
+        # APC: harvest the post-prefill K/V into hashed blocks. Done after the
+        # final prefill forward but before the cache references are released
+        # so the block tensors snapshot the prompt prefix.
+        if (
+            self._apc_manager is not None
+            and self._apc_meta
+            and self._apc_harvest_enabled
+        ):
+            try:
+                for batch_idx, meta in enumerate(self._apc_meta):
+                    if meta is None:
+                        continue
+                    if self._apc_mode == "exact":
+                        prompt_cache = _apc.extract_prompt_cache_from_batch(
+                            self.prompt_cache,
+                            batch_idx,
+                        )
+                        if prompt_cache is not None:
+                            self._apc_manager.store_exact_cache(
+                                meta["full_input_ids"],
+                                prompt_cache,
+                                extra_hash=meta.get("extra_hash", 0),
+                            )
+                        self._apc_manager.release(meta.get("apc_blocks", []))
+                    else:
+                        new_blocks = _apc.harvest_blocks_from_batch_cache(
+                            self._apc_manager,
+                            self.prompt_cache,
+                            batch_idx,
+                            meta["full_input_ids"],
+                            extra_hash=meta.get("extra_hash", 0),
+                            skip_first_n_tokens=meta.get("prefix_len", 0),
+                        )
+                        self._apc_manager.release(
+                            meta.get("apc_blocks", []) + new_blocks
+                        )
+            except Exception as e:
+                logger.warning("APC harvest failed during batched prefill: %s", e)
+                # Best effort — release any acquired prefix blocks.
+                for meta in self._apc_meta:
+                    if meta is not None:
+                        self._apc_manager.release(meta.get("apc_blocks", []))
 
         self.uids = []
         self.prompt_cache = []
         self._token_context = []
         self.logits_processors = []
+        self._apc_meta = []
         return gen_batch
 
     @property
@@ -1941,7 +2347,7 @@ class BatchGenerator:
     Continuous batching with separate prompt processing and generation phases.
 
     next() returns (prompt_responses, generation_responses) where:
-    - prompt_responses is currently always [] (reserved for progress tracking)
+    - prompt_responses contains completed prompt-batch timing stats
     - generation_responses is a list of GenerationBatch.Response objects
     """
 
@@ -1967,6 +2373,7 @@ class BatchGenerator:
             List[Callable[[mx.array, mx.array], mx.array]]
         ] = None,
         stream=None,
+        apc_manager: Optional["_apc.APCManager"] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -1978,6 +2385,16 @@ class BatchGenerator:
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
+        # APC: opt-out for KV-quantized caches. Plain KV models use block APC;
+        # mixed/custom cache models use exact prompt-cache snapshots.
+        self.apc_mode = None
+        if apc_manager is not None and kv_bits is not None:
+            apc_manager = None
+        if apc_manager is not None:
+            self.apc_mode = _apc.model_apc_mode(model)
+            if self.apc_mode is None:
+                apc_manager = None
+        self.apc_manager = apc_manager
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -2008,6 +2425,309 @@ class BatchGenerator:
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
+
+    # ---------------- APC integration helpers ----------------
+    # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
+    # the merged kwargs are passed to the language model forward.
+    _APC_PRIVATE_KEYS = APC_PRIVATE_PROMPT_KEYS
+
+    def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
+        """Salt for the APC hash chain."""
+        if self.apc_manager is None:
+            return 0
+        if prompt_kwargs is None:
+            prompt_kwargs = {}
+        img = prompt_kwargs.get("_apc_image_hash")
+        if img is None:
+            pixel_values = prompt_kwargs.get("pixel_values")
+            img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
+        tenant = prompt_kwargs.get("_apc_tenant")
+        return _apc.tenant_scoped_hash(tenant, img)
+
+    def _apc_pick_for(self, sequence) -> Optional[dict]:
+        """Look up an APC prefix for ``sequence``. Returns dict with matched
+        blocks + suffix metadata when there is a usable hit, else None.
+        """
+        if self.apc_manager is None:
+            return None
+        uid, ids_list, max_toks, prompt_kwargs, lps = sequence
+        if not ids_list or len(ids_list) < 2:
+            return None
+        # v1/v2: don't trim a prefix that contains image tokens — re-running
+        # vision merging on the suffix is the cheap path here.
+        image_token_id = getattr(self.model.config, "image_token_id", None) or getattr(
+            self.model.config, "image_token_index", None
+        )
+        extra_hash = self._apc_extra_hash(prompt_kwargs or {})
+        apc_mode = getattr(self, "apc_mode", "block")
+        if apc_mode == "exact":
+            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
+                ids_list,
+                extra_hash=extra_hash,
+            )
+            if (
+                exact_cache is not None
+                and exact_prefix_len > 0
+                and exact_prefix_len < len(ids_list)
+            ):
+                if (
+                    image_token_id is not None
+                    and image_token_id in ids_list[:exact_prefix_len]
+                ):
+                    return None
+                return {
+                    "matched_blocks": [],
+                    "warm_cache": exact_cache,
+                    "prefix_len": exact_prefix_len,
+                    "extra_hash": extra_hash,
+                    "full_input_ids": list(ids_list),
+                }
+            return None
+        matched, prefix_len = self.apc_manager.lookup_prefix(
+            ids_list, extra_hash=extra_hash
+        )
+        exact_cache = None
+        exact_prefix_len = 0
+        if prefix_len < len(ids_list):
+            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
+                ids_list,
+                extra_hash=extra_hash,
+                min_prefix_tokens=prefix_len,
+            )
+        warm_cache = None
+        disk_prefix_len = 0
+        if max(prefix_len, exact_prefix_len) < len(ids_list):
+            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
+                ids_list,
+                extra_hash=extra_hash,
+                min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+            )
+        if disk_prefix_len > max(
+            prefix_len, exact_prefix_len
+        ) and disk_prefix_len < len(ids_list):
+            if matched:
+                self.apc_manager.release(matched)
+            if (
+                image_token_id is not None
+                and image_token_id in ids_list[:disk_prefix_len]
+            ):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": warm_cache,
+                "prefix_len": disk_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
+            if matched:
+                self.apc_manager.release(matched)
+            if (
+                image_token_id is not None
+                and image_token_id in ids_list[:exact_prefix_len]
+            ):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": exact_cache,
+                "prefix_len": exact_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if prefix_len > 0 and prefix_len < len(ids_list):
+            if image_token_id is not None and image_token_id in ids_list[:prefix_len]:
+                self.apc_manager.release(matched)
+                return None
+            return {
+                "matched_blocks": matched,
+                "prefix_len": prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        if matched:
+            self.apc_manager.release(matched)
+        return None
+
+    def _build_mixed_prompt_batch(
+        self, sequences: List[tuple]
+    ) -> Optional["PromptProcessingBatch"]:
+        """Build a multi-row PromptProcessingBatch admitting ``sequences``.
+
+        Each row is independently looked up in APC. Warm rows have their
+        suffixes prefilled against pre-populated K/V; cold rows prefill from
+        scratch in the same batch. Right-padding aligns RoPE positions
+        across rows with different prefix/suffix lengths.
+
+        Returns ``None`` if APC is disabled (in which case the caller should
+        use the cold-only path).
+        """
+        if self.apc_manager is None:
+            return None
+
+        picks: List[Optional[dict]] = [self._apc_pick_for(s) for s in sequences]
+        any_warm = any(p is not None for p in picks)
+        if not any_warm:
+            return None  # caller falls back to cold-only path
+
+        uids = [s[0] for s in sequences]
+        full_ids = [list(s[1]) for s in sequences]
+        max_tokens_list = [s[2] for s in sequences]
+        prompt_kwargs_list = [s[3] for s in sequences]
+        logits_processors = [s[4] for s in sequences]
+
+        # Per-row prefix length and suffix tokens
+        prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
+        suffix_ids_list = [full_ids[i][prefix_lens[i] :] for i in range(len(sequences))]
+        suffix_lens = [len(s) for s in suffix_ids_list]
+
+        max_suffix_len = max(suffix_lens)
+        right_pad_per_row = [max_suffix_len - s for s in suffix_lens]
+
+        # Source inputs_embeds: every row's prompt_kwargs holds the full-prompt
+        # embeddings. Slice to suffix per-row, right-pad to max_suffix_len, stack.
+        suffix_embeds_per_row: List[mx.array] = []
+        for i, kw in enumerate(prompt_kwargs_list):
+            if kw is None or kw.get("inputs_embeds") is None:
+                raise ValueError("APC mixed prefill requires precomputed inputs_embeds")
+            full = kw["inputs_embeds"]  # [1, full_len, D]
+            suff = full[:, prefix_lens[i] :, :]
+            pad = right_pad_per_row[i]
+            if pad > 0:
+                pad_emb = mx.zeros(
+                    (suff.shape[0], pad, suff.shape[-1]), dtype=suff.dtype
+                )
+                suff = mx.concatenate([suff, pad_emb], axis=1)
+            suffix_embeds_per_row.append(suff)
+        inputs_embeds = mx.concatenate(suffix_embeds_per_row, axis=0)
+
+        # Merge prompt-side kwargs (excluding inputs_embeds, which we've just
+        # rebuilt). Per-batch tensors get concatenated across rows; scalars
+        # take the first row's value (matches the existing cold-only path).
+        # APC-private keys (e.g. tenant salt) are dropped — they're consumed
+        # in _apc_extra_hash, never forwarded to the model.
+        merged_kwargs: dict = {}
+        per_row_keys: dict = {}
+        batch_size = len(prompt_kwargs_list)
+        for i, kw in enumerate(prompt_kwargs_list):
+            if not kw:
+                continue
+            full_len = len(full_ids[i])
+            prefix_len = prefix_lens[i]
+            right_pad = right_pad_per_row[i]
+            for k, v in kw.items():
+                if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
+                    continue
+                if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                    row_v = _prompt_kwarg_row(v, i, batch_size)
+                    if _is_sequence_aligned_prompt_kwarg(k, row_v, full_len):
+                        row_v = row_v[:, prefix_len:, ...]
+                        row_v = _pad_sequence_aligned_prompt_kwarg(
+                            row_v,
+                            max_suffix_len,
+                            left=False,
+                        )
+                    per_row_keys.setdefault(k, []).append(row_v)
+                elif k not in merged_kwargs:
+                    merged_kwargs[k] = v
+        for k, vs in per_row_keys.items():
+            merged_kwargs[k] = mx.concatenate(vs, axis=0)
+
+        apc_mode = getattr(self, "apc_mode", "block")
+        if apc_mode == "exact":
+            row_caches = [
+                p["warm_cache"] if p is not None else self.model.make_cache()
+                for p in picks
+            ]
+            warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
+                row_caches,
+                prefix_lens,
+            )
+            if warm_cache is None:
+                return None
+        else:
+            # Build the multi-row warm cache (zeros for cold rows, K/V for warm).
+            num_layers = (
+                len(self.model.make_cache())
+                if hasattr(self.model, "make_cache")
+                else len(self.model.layers)
+            )
+            warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
+                picks, num_layers=num_layers
+            )
+
+        apc_meta = [
+            {
+                "full_input_ids": full_ids[i],
+                "prefix_len": prefix_lens[i],
+                "extra_hash": (
+                    picks[i]["extra_hash"]
+                    if picks[i]
+                    else self._apc_extra_hash(prompt_kwargs_list[i] or {})
+                ),
+                "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
+                "checkpoint_len": (
+                    max(
+                        1,
+                        len(full_ids[i]) - self.apc_manager.exact_cache_guard_tokens,
+                    )
+                    if apc_mode == "exact"
+                    else 0
+                ),
+            }
+            for i in range(len(sequences))
+        ]
+
+        return PromptProcessingBatch(
+            model=self.model,
+            uids=uids,
+            input_ids=suffix_ids_list,
+            max_tokens=max_tokens_list,
+            inputs_embeds=inputs_embeds,
+            prompt_kwargs=merged_kwargs,
+            logits_processors=logits_processors,
+            prefill_step_size=self.prefill_step_size,
+            kv_bits=self.kv_bits,
+            kv_group_size=self.kv_group_size,
+            kv_quant_scheme=self.kv_quant_scheme,
+            warm_cache=warm_cache,
+            apc_meta=apc_meta,
+            apc_manager=self.apc_manager,
+            right_pad_per_row=right_pad_per_row,
+            suffix_lens=suffix_lens,
+            apc_mode=apc_mode,
+        )
+
+    def _build_apc_meta_for_cold(
+        self,
+        input_ids_list: List[List[int]],
+        prompt_kwargs_list: List[Optional[dict]],
+    ) -> Optional[List[Optional[dict]]]:
+        """Build per-row harvest metadata for a cold-prefill batch so the
+        produced K/V are added to APC after prefill.
+        """
+        if self.apc_manager is None:
+            return None
+        meta: List[Optional[dict]] = []
+        for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):
+            extra_hash = self._apc_extra_hash(kw or {})
+            meta.append(
+                {
+                    "full_input_ids": list(ids_list),
+                    "prefix_len": 0,
+                    "extra_hash": extra_hash,
+                    "apc_blocks": [],
+                    "checkpoint_len": (
+                        max(
+                            1,
+                            len(ids_list) - self.apc_manager.exact_cache_guard_tokens,
+                        )
+                        if getattr(self, "apc_mode", "block") == "exact"
+                        else 0
+                    ),
+                }
+            )
+        return meta
 
     @property
     def stream(self):
@@ -2112,6 +2832,19 @@ class BatchGenerator:
         stats.peak_memory = mx.get_peak_memory() / 1e9
         return stats
 
+    @staticmethod
+    def _record_prompt_batch_time(prompt_batch, elapsed_s: float) -> None:
+        recorder = getattr(prompt_batch, "record_prompt_time", None)
+        if callable(recorder):
+            recorder(elapsed_s)
+
+    @staticmethod
+    def _prompt_batch_progress(prompt_batch) -> List[PromptProgress]:
+        progress = getattr(prompt_batch, "prompt_progress", None)
+        if callable(progress):
+            return progress()
+        return []
+
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
@@ -2131,7 +2864,9 @@ class BatchGenerator:
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
@@ -2142,7 +2877,10 @@ class BatchGenerator:
                 compute_logprobs=self.compute_logprobs,
                 top_logprobs_k=self.top_logprobs_k,
             )
-            self._prompt_time_counter += time.perf_counter() - tic
+            elapsed = time.perf_counter() - tic
+            self._prompt_time_counter += elapsed
+            self._record_prompt_batch_time(self._prompt_batch, elapsed)
+            prompt_responses = self._prompt_batch_progress(self._prompt_batch)
             self._generation_batch.extend(gen_batch)
             self._prompt_batch = None
             mx.clear_cache()
@@ -2151,8 +2889,46 @@ class BatchGenerator:
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
         if self._unprocessed_sequences and num_to_add >= self.prefill_batch_size:
+            # Take up to prefill_batch_size pending sequences. If APC is on
+            # and at least one of them has a prefix hit, build a mixed
+            # warm/cold PromptProcessingBatch with right-padded suffixes so
+            # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
+            if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
+                logger.warning(
+                    "APC admit n=%d (pending=%d)",
+                    n,
+                    len(self._unprocessed_sequences),
+                )
+            mixed = self._build_mixed_prompt_batch(sequences)
+            if mixed is not None:
+                self._unprocessed_sequences = self._unprocessed_sequences[n:]
+                self._prompt_batch = mixed
+                self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
+                if self._prompt_batch.needs_processing():
+                    tic = time.perf_counter()
+                    nstep = self._prompt_batch.prompt_step()
+                    elapsed = time.perf_counter() - tic
+                    self._prompt_time_counter += elapsed
+                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                else:
+                    tic = time.perf_counter()
+                    gen_batch = self._prompt_batch.generate(
+                        self.sampler,
+                        self.tokenizer.stopping_criteria,
+                        compute_logprobs=self.compute_logprobs,
+                        top_logprobs_k=self.top_logprobs_k,
+                    )
+                    elapsed = time.perf_counter() - tic
+                    self._prompt_time_counter += elapsed
+                    self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                    prompt_responses = self._prompt_batch_progress(self._prompt_batch)
+                    self._generation_batch.extend(gen_batch)
+                    self._prompt_batch = None
+                    mx.clear_cache()
+                return prompt_responses, generation_responses
+
             self._unprocessed_sequences = self._unprocessed_sequences[n:]
 
             uids = [s[0] for s in sequences]
@@ -2161,23 +2937,12 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
 
-            inputs_embeds = None
-            merged_kwargs = {}
-            for kw in prompt_kwargs_list:
-                if kw:
-                    inputs_embeds = kw.get("inputs_embeds", inputs_embeds)
-                    merged_kwargs = {
-                        k: v for k, v in kw.items() if k != "inputs_embeds"
-                    }
-                    break
+            inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
+                prompt_kwargs_list, input_ids
+            )
 
-            if inputs_embeds is None:
-                raise ValueError("inputs_embeds is required")
-
-            batch_size = len(uids)
-            for key, value in merged_kwargs.items():
-                if isinstance(value, mx.array) and value.ndim > 0:
-                    merged_kwargs[key] = value[:batch_size]
+            # APC: also harvest cold-prefill prefixes so future requests hit.
+            apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
 
             self._prompt_batch = PromptProcessingBatch(
                 model=self.model,
@@ -2191,13 +2956,18 @@ class BatchGenerator:
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
+                apc_meta=apc_meta,
+                apc_manager=self.apc_manager,
+                apc_mode=self.apc_mode,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
             if self._prompt_batch.needs_processing():
                 tic = time.perf_counter()
                 n = self._prompt_batch.prompt_step()
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
             else:
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(
@@ -2206,7 +2976,10 @@ class BatchGenerator:
                     compute_logprobs=self.compute_logprobs,
                     top_logprobs_k=self.top_logprobs_k,
                 )
-                self._prompt_time_counter += time.perf_counter() - tic
+                elapsed = time.perf_counter() - tic
+                self._prompt_time_counter += elapsed
+                self._record_prompt_batch_time(self._prompt_batch, elapsed)
+                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 self._generation_batch.extend(gen_batch)
                 self._prompt_batch = None
                 mx.clear_cache()
@@ -2495,7 +3268,7 @@ def _generate_batch(
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
-        prompt_kwargs=[gen_kwargs] * len(input_ids),
+        prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
         logits_processors=logits_processors,
     )
     results = {uid: [] for uid in uids}
@@ -2548,8 +3321,18 @@ def main():
     if args.draft_model is not None:
         from .speculative.drafters import load_drafter
 
-        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
-        draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
+        print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
+        draft_model, resolved_kind = load_drafter(
+            args.draft_model, kind=args.draft_kind
+        )
+        if args.draft_kind is None:
+            print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+        elif resolved_kind != args.draft_kind:
+            print(
+                f"  → drafter requires --draft-kind={resolved_kind!r}; "
+                f"using {resolved_kind!r} instead of {args.draft_kind!r}."
+            )
+        args.draft_kind = resolved_kind
 
     prompt = args.prompt
 
@@ -2633,6 +3416,7 @@ def main():
                 prompt,
                 args.image,
                 args.audio,
+                args.video,
                 **stream_kwargs,
             ):
                 response += chunk.text
@@ -2679,12 +3463,9 @@ def main():
             print(result.text)
 
         if draft_model is not None:
-            lens = getattr(draft_model, "accept_lens", None) or []
-            if lens:
-                mean_accept = round(sum(lens) / len(lens), 2)
-                print(
-                    f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds"
-                )
+            stats = format_speculative_stats(draft_model)
+            if stats is not None:
+                print(stats)
 
 
 if __name__ == "__main__":
