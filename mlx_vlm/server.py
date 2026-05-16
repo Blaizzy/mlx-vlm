@@ -2773,6 +2773,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if "adapter_path" in request.model_fields_set
             else _INHERIT_ADAPTER
         )
+
         model, processor, config = get_cached_model(request.model, adapter_path)
 
         kwargs = {}
@@ -3458,19 +3459,21 @@ def models_endpoint():
     """
     Return list of locally downloaded MLX models.
     """
-
-    required_files = {"config.json", "tokenizer_config.json"}
+    # Required configuration files
+    required_files = ["config.json", "tokenizer_config.json"]
+    # Must have either sharded weights index or single-file weights
+    weight_files = ["model.safetensors.index.json", "model.safetensors"]
 
     def probably_mlx_lm(repo):
         if repo.repo_type != "model":
             return False
         if "main" not in repo.refs:
             return False
+
         file_names = {f.file_path.name for f in repo.refs["main"].files}
-        has_weights = "model.safetensors.index.json" in file_names or any(
-            file_name.endswith(".safetensors") for file_name in file_names
-        )
-        return required_files.issubset(file_names) and has_weights
+        has_config = all(f in file_names for f in required_files)
+        has_weights = any(f in file_names for f in weight_files)
+        return has_config and has_weights
 
     # Scan the cache directory for downloaded mlx models
     hf_cache_info = scan_cache_dir()
@@ -3481,6 +3484,16 @@ def models_endpoint():
         {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
         for repo in downloaded_models
     ]
+
+    # Prioritize currently loaded model at the top of the list
+    global model_cache
+    active_id = model_cache.get("model_path")
+    if active_id:
+        # Move to front or add if missing from scan
+        models = [m for m in models if m["id"] != active_id]
+        models.insert(
+            0, {"id": active_id, "object": "model", "created": int(time.time())}
+        )
 
     response = {"object": "list", "data": models}
 

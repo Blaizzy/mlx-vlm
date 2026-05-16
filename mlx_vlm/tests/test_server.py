@@ -1787,3 +1787,46 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+def test_models_endpoint_discovery_logic():
+    from unittest.mock import MagicMock, patch
+    import time
+    # Mocking the nested structures of huggingface_hub.scan_cache_dir
+    def create_mock_repo(repo_id, filenames):
+        repo = MagicMock()
+        repo.repo_id = repo_id
+        repo.repo_type = "model"
+        repo.last_modified = 123456789
+        
+        files = []
+        for f in filenames:
+            mock_file = MagicMock()
+            mock_file.file_path.name = f
+            files.append(mock_file)
+            
+        repo.refs = {"main": MagicMock(files=files)}
+        return repo
+
+    # 1. Sharded Model (Should be discovered)
+    sharded_repo = create_mock_repo("org/sharded", ["config.json", "tokenizer_config.json", "model.safetensors.index.json"])
+    
+    # 2. Single-file Model (Our FIX: Should now be discovered)
+    single_repo = create_mock_repo("org/single", ["config.json", "tokenizer_config.json", "model.safetensors"])
+    
+    # 3. Invalid Model (Missing weights - Should NOT be discovered)
+    invalid_repo = create_mock_repo("org/invalid", ["config.json", "tokenizer_config.json"])
+
+    mock_cache = MagicMock()
+    mock_cache.repos = [sharded_repo, single_repo, invalid_repo]
+
+    with patch("mlx_vlm.server.scan_cache_dir", return_value=mock_cache):
+        # We also mock model_cache to avoid errors with global state
+        with patch.dict("mlx_vlm.server.model_cache", {}):
+            response = server.models_endpoint()
+            model_ids = [m["id"] for m in response["data"]]
+            
+            assert "org/sharded" in model_ids
+            assert "org/single" in model_ids
+            assert "org/invalid" not in model_ids
+            assert len(model_ids) == 2
