@@ -873,6 +873,9 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
+            if generation_config and config.get("model_type") == "diffusion_gemma4":
+                config["generation_config"] = generation_config
+
             for key in GENERATION_CONFIG_DEFAULT_KEYS:
                 if key in generation_config:
                     config[key] = generation_config[key]
