@@ -43,9 +43,9 @@ from .generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
     generate,
-    normalize_resize_shape,
-    stream_generate,
 )
+from .generate import generation_stream as batch_generation_stream
+from .generate import normalize_resize_shape, stream_generate
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
 from .speculative.utils import (
@@ -827,7 +827,7 @@ class ResponseGenerator:
             self._run_speculative()
             return
 
-        generation_stream = mx.default_stream(mx.default_device())
+        generation_stream = batch_generation_stream
 
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
@@ -941,7 +941,7 @@ class ResponseGenerator:
         """
         from mlx_lm.sample_utils import make_sampler as _make_sampler
 
-        generation_stream = mx.default_stream(mx.default_device())
+        generation_stream = batch_generation_stream
 
         lm = self.model.language_model
         drafter = self.draft_model

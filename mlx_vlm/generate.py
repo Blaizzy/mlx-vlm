@@ -623,7 +623,7 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
-            logprobs = logits - mx.logsumexp(logits)
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             y = sampler(logprobs)
 
             if outputs.cross_attention_states is not None:
@@ -704,7 +704,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.async_eval(y)
+    mx.async_eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
@@ -728,7 +728,7 @@ def generate_step(
     while True:
         if n != max_tokens:
             next_y, next_logprobs = _step(y[None])
-            mx.async_eval(next_y)
+            mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)
         if n == max_tokens:
@@ -1607,6 +1607,7 @@ class GenerationBatch:
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
+        self._ensure_token_context()
 
         self._current_tokens = None
         self._current_lps = None
@@ -1620,6 +1621,17 @@ class GenerationBatch:
 
     def __len__(self):
         return len(self.uids)
+
+    def _ensure_token_context(self, *, force: bool = False):
+        if not (force or (self.logits_processors and any(self.logits_processors))):
+            if not self.logits_processors:
+                self.token_context = []
+            return
+        if len(self.token_context) < len(self.uids):
+            missing = len(self.uids) - len(self.token_context)
+            self.token_context.extend([[] for _ in range(missing)])
+        elif len(self.token_context) > len(self.uids):
+            self.token_context = self.token_context[: len(self.uids)]
 
     def _step(self):
         """Perform one generation step with double buffering."""
@@ -1639,8 +1651,7 @@ class GenerationBatch:
 
         if self.logits_processors and any(self.logits_processors):
             last_tokens = inputs.tolist()
-            if not self.token_context:
-                self.token_context = [[] for _ in self.uids]
+            self._ensure_token_context()
             for i, token in enumerate(last_tokens):
                 self.token_context[i].append(token)
 
@@ -1706,15 +1717,57 @@ class GenerationBatch:
             mx.eval(inputs)
             return inputs.tolist(), None, None, None
 
+    def _eval_pending_state(self):
+        """Materialize lazy decode outputs before mutating batch-owned state."""
+        targets = []
+
+        def append_arrays(value):
+            if isinstance(value, mx.array):
+                targets.append(value)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    append_arrays(item)
+
+        append_arrays(
+            (
+                self._current_tokens,
+                self._current_lps,
+                self._next_tokens,
+                self._next_lps,
+                self._next_top_idx,
+                self._next_top_lp,
+                self._rope_deltas,
+            )
+        )
+        for c in self.prompt_cache:
+            try:
+                append_arrays(c.state)
+            except (AttributeError, TypeError):
+                pass
+
+        if targets:
+            mx.eval(*targets)
+
     def extend(self, other: "GenerationBatch"):
         """Extend this batch with another generation batch."""
         self_was_empty = len(self.uids) == 0
+        if not self_was_empty and len(other.uids) > 0:
+            self._eval_pending_state()
+            other._eval_pending_state()
+
+        self_has_processors = self.logits_processors and any(self.logits_processors)
+        other_has_processors = other.logits_processors and any(other.logits_processors)
+        if self_has_processors or other_has_processors:
+            self._ensure_token_context(force=bool(other_has_processors))
+            other._ensure_token_context(force=bool(self_has_processors))
+
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
         self._num_tokens.extend(other._num_tokens)
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
+        self._ensure_token_context()
 
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
@@ -1765,6 +1818,9 @@ class GenerationBatch:
 
     def filter(self, keep: List[int]):
         """Filter the batch to keep only the specified indices."""
+        if len(keep) < len(self.uids):
+            self._eval_pending_state()
+
         self.uids = [self.uids[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]

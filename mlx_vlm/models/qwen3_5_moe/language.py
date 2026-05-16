@@ -70,6 +70,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
@@ -77,7 +78,13 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
                 self.input_layernorm(x), mask, cache, gdn_sink=gdn_sink
             )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+            r = self.self_attn(
+                self.input_layernorm(x),
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
