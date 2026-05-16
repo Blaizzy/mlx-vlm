@@ -113,7 +113,10 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"].lower()
+    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    if raw_model_type is None:
+        raise KeyError("model_type")
+    model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
@@ -132,9 +135,25 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
+    if _is_text_only_config(config):
+        arch = importlib.import_module("mlx_vlm.models.text_only")
+        return arch, "text_only"
+
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
+
+
+def _has_config(config: dict, key: str) -> bool:
+    value = config.get(key)
+    return value is not None and value != {}
+
+
+def _is_text_only_config(config: dict) -> bool:
+    return not any(
+        _has_config(config, key)
+        for key in ("vision_config", "audio_config", "dflash_config")
+    )
 
 
 def get_model_path(
@@ -308,6 +327,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        quantized_model = (
+            model.language_model._model
+            if getattr(model, "_is_text_model", False)
+            else model
+        )
 
         def get_class_predicate(p, m):
             # Always skip vision and audio models
@@ -325,7 +349,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             return f"{p}.scales" in weights
 
         nn.quantize(
-            model,
+            quantized_model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
@@ -542,7 +566,10 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     else:
         config = load_config(model_path, **kwargs)
 
-    model_class, _ = get_model_and_args(config)
+    try:
+        model_class, _ = get_model_and_args(config)
+    except ValueError:
+        return None
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
@@ -560,7 +587,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -574,7 +601,9 @@ def load_processor(
 
         # Determine the EOS token IDs, prioritizing the function argument
         final_eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+            eos_token_ids
+            or getattr(tokenizer_obj, "eos_token_ids", None)
+            or getattr(tokenizer_obj, "eos_token_id", None)
         )
 
         # Create and assign the StoppingCriteria

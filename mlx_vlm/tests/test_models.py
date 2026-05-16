@@ -1,4 +1,5 @@
 import inspect
+import threading
 import unittest
 from types import SimpleNamespace
 
@@ -117,6 +118,46 @@ class TestModels(unittest.TestCase):
                 self.assertEqual(hidden_states.shape[-1], vision_hidden_size)
 
             self.assertEqual(hidden_states.dtype, t)
+
+    def test_laguna_language_model(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            layer_types=["full_attention", "sliding_attention"],
+            num_attention_heads_per_layer=[4, 4],
+            sliding_window=8,
+            mlp_layer_types=["dense", "sparse"],
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+        )
+
+        model = laguna.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "KVCache")
+        self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
@@ -1296,6 +1337,51 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_sanitize_key_routes_nested_visual_weights(self):
+        from mlx_vlm.models.qwen3_5.qwen3_5 import sanitize_key
+
+        self.assertEqual(
+            sanitize_key("model.language_model.visual.blocks.0.attn.qkv.weight"),
+            "vision_tower.blocks.0.attn.qkv.weight",
+        )
+        self.assertEqual(
+            sanitize_key(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+            ),
+            "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
+        )
+        self.assertEqual(
+            sanitize_key("model.visual.blocks.0.attn.qkv.weight"),
+            "vision_tower.blocks.0.attn.qkv.weight",
+        )
+        self.assertEqual(
+            sanitize_key("lm_head.weight"),
+            "language_model.lm_head.weight",
+        )
+
+    def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
+        if not mx.metal.is_available():
+            self.skipTest("requires Metal streams")
+
+        from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+
+        rotary = Qwen3_5RotaryEmbedding(dim=8)
+        errors = []
+
+        def worker():
+            try:
+                y = mx.ones((rotary.inv_freq.shape[0],), dtype=mx.float32)
+                y = y * rotary.inv_freq
+                mx.eval(y)
+            except Exception as e:
+                errors.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(errors, [])
 
     def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
         from mlx_vlm.models import qwen3_5, qwen3_5_moe

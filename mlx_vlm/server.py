@@ -40,16 +40,20 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _dflash_rounds_batch,
     _make_cache,
     _merge_prefill_prompt_kwargs,
-    _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
+from .speculative.utils import (
+    make_speculative_prompt_cache,
+    run_speculative_server_rounds,
+    speculative_hidden_state,
+    speculative_prefill_kwargs,
+)
 from .structured import build_json_schema_logits_processor
 from .tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
@@ -60,6 +64,7 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
@@ -67,30 +72,6 @@ METRICS_RECENT_LIMIT = 32
 
 class PromptTooLongError(ValueError):
     """Raised when a request exceeds the configured server context budget."""
-
-
-def _get_speculative_rounds_batch(draft_kind: str):
-    if draft_kind == "mtp":
-        return _mtp_rounds_batch
-    if draft_kind == "dflash":
-        return _dflash_rounds_batch
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
-    if draft_kind == "mtp":
-        return {"return_hidden": True, "return_shared_kv": True}
-    if draft_kind == "dflash":
-        return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _speculative_hidden_state(draft_kind: str, outputs):
-    if draft_kind == "mtp":
-        return outputs.hidden_states[-1]
-    if draft_kind == "dflash":
-        return mx.concatenate(outputs.hidden_states, axis=-1)
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
 
 
 def _get_draft_block_size_from_env():
@@ -122,6 +103,16 @@ def get_token_queue_timeout():
     if timeout <= 0:
         return None
     return timeout
+
+
+def get_speculative_batch_coalesce_s():
+    raw = os.environ.get(
+        "MLX_VLM_SPEC_BATCH_COALESCE_MS", str(DEFAULT_SPECULATIVE_BATCH_COALESCE_MS)
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
 def get_server_enable_thinking():
@@ -781,6 +772,44 @@ class ResponseGenerator:
             )
         return input_ids, gen_kwargs
 
+    def _collect_pending_requests(
+        self,
+        *,
+        active: bool,
+        idle_timeout: float = 0.1,
+        coalesce_s: float = 0.0,
+    ):
+        """Collect the first queued request, then drain immediately available peers."""
+        pending = []
+        should_stop = False
+
+        def append_item(item):
+            nonlocal should_stop
+            if item is None:
+                if self._stop and not pending:
+                    should_stop = True
+                return
+            pending.append(item)
+
+        try:
+            if active:
+                append_item(self.requests.get_nowait())
+            else:
+                append_item(self.requests.get(timeout=idle_timeout))
+        except QueueEmpty:
+            pass
+
+        if pending and coalesce_s > 0:
+            time.sleep(coalesce_s)
+
+        while not should_stop:
+            try:
+                append_item(self.requests.get_nowait())
+            except QueueEmpty:
+                break
+
+        return pending, should_stop
+
     def _run(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
@@ -808,35 +837,11 @@ class ResponseGenerator:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
-                new_items = []
-                if active:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is None:
-                            if self._stop:
-                                break
-                        else:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        pass
-                else:
-                    try:
-                        item = self.requests.get(timeout=0.1)
-                        if item is None:
-                            if self._stop:
-                                break
-                        else:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        pass
-
-                while True:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is not None:
-                            new_items.append(item)
-                    except QueueEmpty:
-                        break
+                new_items, should_stop = self._collect_pending_requests(
+                    active=bool(active)
+                )
+                if should_stop:
+                    break
 
                 # Drop abandoned requests before doing more work.
                 cancelled = self._drain_cancellations()
@@ -927,13 +932,12 @@ class ResponseGenerator:
                 gc.collect()
 
     def _run_speculative(self):
-        """GPU thread loop with DFlash or Gemma 4 MTP speculative decoding.
+        """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
 
         Collects incoming requests, prefills them as a batch with the
-        per-family hooks (``capture_layer_ids`` for DFlash; ``return_hidden``
-        + ``return_shared_kv`` for MTP), then runs the matching round-loop
-        for decode. Finished sequences are filtered out automatically by
-        the round-loop's ``stop_check`` callback.
+        per-family hooks, then runs the matching round-loop for decode.
+        Finished sequences are filtered out automatically by the round-loop's
+        ``stop_check`` callback.
         """
         from mlx_lm.sample_utils import make_sampler as _make_sampler
 
@@ -943,36 +947,25 @@ class ResponseGenerator:
         drafter = self.draft_model
         draft_kind = self.draft_kind
         is_mtp = draft_kind == "mtp"
-        rounds_batch = _get_speculative_rounds_batch(draft_kind)
-        prefill_kwargs = _speculative_prefill_kwargs(draft_kind, drafter)
+        prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
+            pending = []
+            rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
-                pending = []
-                timeout = 0.1
-                try:
-                    item = self.requests.get(timeout=timeout)
-                    if item is None and self._stop:
-                        break
-                    if item is not None:
-                        pending.append(item)
-                except QueueEmpty:
-                    pass
-                while True:
-                    try:
-                        item = self.requests.get_nowait()
-                        if item is not None:
-                            pending.append(item)
-                    except QueueEmpty:
-                        break
+                pending, should_stop = self._collect_pending_requests(
+                    active=False,
+                    coalesce_s=get_speculative_batch_coalesce_s(),
+                )
+                if should_stop:
+                    break
 
                 if not pending:
                     continue
-
                 # --- Phase 2: prefill new batch ---
                 uids = []
                 rqueues = {}
@@ -1020,7 +1013,13 @@ class ResponseGenerator:
                     prompt_kwargs_list, all_input_ids
                 )
 
-                prompt_cache = _make_cache(lm, left_padding)
+                prompt_cache = make_speculative_prompt_cache(
+                    lm,
+                    draft_kind=draft_kind,
+                    batch_size=B,
+                    left_padding=left_padding,
+                    make_cache=_make_cache,
+                )
 
                 lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
                 lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
@@ -1028,7 +1027,7 @@ class ResponseGenerator:
                 prompt_started = time.perf_counter()
                 with mx.stream(generation_stream):
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
-                hidden = _speculative_hidden_state(draft_kind, out)
+                hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
@@ -1082,32 +1081,26 @@ class ResponseGenerator:
                         return True
                     return False
 
-                rounds_kwargs = dict(
+                rounds_iter = run_speculative_server_rounds(
+                    self.model,
+                    drafter,
+                    prompt_cache,
+                    hidden,
+                    draft_kind=draft_kind,
                     first_bonus=first_bonus,
                     max_tokens=max_tok,
                     sampler=sampler,
                     draft_block_size=draft_block_size,
                     token_dtype=mx.int32,
                     stop_check=stop_check,
+                    greedy_sampling=all(
+                        pending_args.temperature == 0
+                        for _, _, _, pending_args, _ in pending
+                    ),
+                    shared_kv_states=shared_kv_states,
+                    eos_token_ids=eos_set,
+                    prompt_tokens=input_mx,
                 )
-                if is_mtp:
-                    rounds_iter = rounds_batch(
-                        self.model,
-                        drafter,
-                        prompt_cache,
-                        hidden,
-                        shared_kv_states,
-                        eos_token_ids=eos_set,
-                        **rounds_kwargs,
-                    )
-                else:
-                    rounds_iter = rounds_batch(
-                        self.model,
-                        drafter,
-                        prompt_cache,
-                        hidden,
-                        **rounds_kwargs,
-                    )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
                         if tok is None:
@@ -1138,13 +1131,15 @@ class ResponseGenerator:
                         if finish is not None:
                             rqueues[uid].put(None)
                             finished_uids.add(uid)
+                    if len(finished_uids) == len(uids):
+                        break
 
                 # Log acceptance stats
                 al = drafter.accept_lens
                 if al:
-                    mean_a = sum(al) / len(al)
+                    mean_a = (sum(al) + len(al)) / len(al)
                     print(
-                        f"[{'MTP' if is_mtp else 'DFlash'}] batch={B} "
+                        f"[{draft_kind.upper()}] batch={B} "
                         f"tokens={sum(len(token_lists[u]) for u in uids)} "
                         f"accept={mean_a:.2f} rounds={len(al)}"
                     )
@@ -1168,6 +1163,11 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
+                error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
+                error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
+                for rqueue in error_queues.values():
+                    rqueue.put(e)
+                    rqueue.put(None)
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
@@ -3459,7 +3459,7 @@ def models_endpoint():
     Return list of locally downloaded MLX models.
     """
 
-    files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+    required_files = {"config.json", "tokenizer_config.json"}
 
     def probably_mlx_lm(repo):
         if repo.repo_type != "model":
@@ -3467,7 +3467,10 @@ def models_endpoint():
         if "main" not in repo.refs:
             return False
         file_names = {f.file_path.name for f in repo.refs["main"].files}
-        return all(f in file_names for f in files)
+        has_weights = "model.safetensors.index.json" in file_names or any(
+            file_name.endswith(".safetensors") for file_name in file_names
+        )
+        return required_files.issubset(file_names) and has_weights
 
     # Scan the cache directory for downloaded mlx models
     hf_cache_info = scan_cache_dir()
@@ -3663,8 +3666,8 @@ def main():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "mtp"],
-        help="Drafter family — 'dflash' or 'mtp' (Gemma 4). "
+        choices=["dflash", "eagle3", "mtp"],
+        help="Drafter family — 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(

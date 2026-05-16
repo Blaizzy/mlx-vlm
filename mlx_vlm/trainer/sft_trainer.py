@@ -28,6 +28,26 @@ def _flat_seq_len(value):
     return np.array(_squeeze_leading_batch_dim(value)).reshape(-1).shape[0]
 
 
+def _collate_arrays(values):
+    """Stack same-shaped arrays, or concatenate variable-length feature rows."""
+    try:
+        return mx.stack(values)
+    except ValueError:
+        first = values[0]
+        if (
+            isinstance(first, mx.array)
+            and first.ndim > 1
+            and all(
+                isinstance(v, mx.array)
+                and v.ndim == first.ndim
+                and v.shape[1:] == first.shape[1:]
+                for v in values
+            )
+        ):
+            return mx.concatenate(values, axis=0)
+        raise
+
+
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
@@ -212,7 +232,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
-                pixel_values_batch = mx.stack(
+                pixel_values_batch = _collate_arrays(
                     [_squeeze_leading_batch_dim(item["pixel_values"]) for item in items]
                 )
 
@@ -231,7 +251,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
                 if isinstance(vals[0], mx.array):
                     try:
-                        batch[k] = mx.stack(vals)
+                        batch[k] = _collate_arrays(vals)
                     except Exception:
                         batch[k] = vals[0]
                 else:
