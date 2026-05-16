@@ -1308,6 +1308,76 @@ def process_tool_calls(model_output: str, tool_module, tools):
     return dict(calls=called_tools, remaining_text=remaining)
 
 
+def resolve_tool_choice(request) -> Tuple[Optional[List[Any]], bool]:
+    """Return (tools_for_template, parse_tool_calls) for an OpenAI request."""
+    tools = getattr(request, "tools", None)
+    tool_choice = getattr(request, "tool_choice", None)
+
+    if tool_choice is None:
+        return tools, bool(tools)
+    if tool_choice == "none":
+        return None, False
+    if tool_choice == "auto":
+        if not tools:
+            raise HTTPException(
+                status_code=400,
+                detail="tool_choice='auto' requires tools.",
+            )
+        return tools, True
+    if not tools:
+        raise HTTPException(status_code=400, detail="tool_choice requires tools.")
+    if tool_choice == "required":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "tool_choice='required' is not supported because this server cannot "
+                "force the loaded model to call a tool."
+            ),
+        )
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            function = tool_choice.get("function")
+            name = function.get("name") if isinstance(function, dict) else None
+            detail = (
+                f"Named function tool_choice for '{name}' is not supported."
+                if name
+                else "Named function tool_choice is not supported."
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{detail} This server cannot force the loaded model to call a "
+                    "specific tool."
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported tool_choice object. Only 'none' and 'auto' are supported.",
+        )
+    raise HTTPException(
+        status_code=400,
+        detail="Unsupported tool_choice. Only 'none' and 'auto' are supported.",
+    )
+
+
+def response_tool_call_items(tool_calls: List[dict]) -> List[dict]:
+    """Convert chat-style tool calls into Responses API output items."""
+    items = []
+    for tool_call in tool_calls:
+        function = tool_call.get("function", {})
+        items.append(
+            {
+                "type": "function_call",
+                "id": tool_call.get("id"),
+                "call_id": tool_call.get("id"),
+                "name": function.get("name"),
+                "arguments": function.get("arguments", "{}"),
+                "status": "completed",
+            }
+        )
+    return items
+
+
 def _build_gen_args(
     request, processor=None, tenant_id: Optional[str] = None
 ) -> GenerationArguments:
@@ -1824,6 +1894,10 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    tools: Optional[List[Any]] = Field(None, description="Available tool definitions.")
+    tool_choice: Optional[Union[str, dict]] = Field(
+        None, description="Tool selection policy."
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -2043,6 +2117,10 @@ class VLMRequest(FlexibleBaseModel):
     response_format: Optional[Any] = Field(
         None, description="OpenAI-compatible response_format for structured outputs."
     )
+    tools: Optional[List[Any]] = Field(None, description="Available tool definitions.")
+    tool_choice: Optional[Union[str, dict]] = Field(
+        None, description="Tool selection policy."
+    )
 
     @field_validator("resize_shape", mode="before")
     @classmethod
@@ -2208,6 +2286,8 @@ async def responses_endpoint(request: Request):
     openai_request = OpenAIRequest(**body)
 
     try:
+        tools, parse_tool_calls = resolve_tool_choice(openai_request)
+
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(openai_request.model)
 
@@ -2286,12 +2366,19 @@ async def responses_endpoint(request: Request):
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_module = (
+            load_tool_module(tool_parser_type)
+            if parse_tool_calls and tool_parser_type
+            else None
+        )
 
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
+            tools=tools,
             **gen_args.to_template_kwargs(),
         )
 
@@ -2465,6 +2552,12 @@ async def responses_endpoint(request: Request):
 
                     # Split thinking from content for final events
                     _, clean_text = _split_thinking(full_text)
+                    parsed_tool_calls = []
+                    if tool_module is not None:
+                        tc = process_tool_calls(full_text, tool_module, tools)
+                        if tc["calls"]:
+                            parsed_tool_calls = tc["calls"]
+                            _, clean_text = _split_thinking(tc["remaining_text"] or "")
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -2486,8 +2579,13 @@ async def responses_endpoint(request: Request):
                     yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
 
                     # Send response.completed event (to match the openai pipeline)
+                    output_items = [final_message_item] + response_tool_call_items(
+                        parsed_tool_calls
+                    )
                     finish_reason = finish_reason or (
-                        "stop" if usage_stats["output_tokens"] > 0 else None
+                        "tool_calls"
+                        if parsed_tool_calls
+                        else ("stop" if usage_stats["output_tokens"] > 0 else None)
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
@@ -2511,13 +2609,16 @@ async def responses_endpoint(request: Request):
                         image_count=len(images),
                         structured_output=bool(gen_args.logits_processors),
                         thinking_enabled=bool(gen_args.enable_thinking),
+                        tool_parser=tool_parser_type,
+                        tool_calls=bool(parsed_tool_calls),
                     )
                     server_metrics.record_success(envelope)
                     metrics_finalized = True
                     completed_response = base_response.model_copy(
                         update={
                             "status": "completed",
-                            "output": [final_message_item],
+                            "output": output_items,
+                            "output_text": clean_text,
                             "usage": {
                                 "input_tokens": usage_stats["input_tokens"],
                                 "output_tokens": usage_stats["output_tokens"],
@@ -2648,6 +2749,12 @@ async def responses_endpoint(request: Request):
                 gc.collect()
 
                 reasoning, content = _split_thinking(full_text)
+                parsed_tool_calls = []
+                if tool_module is not None:
+                    tc = process_tool_calls(full_text, tool_module, tools)
+                    if tc["calls"]:
+                        parsed_tool_calls = tc["calls"]
+                        reasoning, content = _split_thinking(tc["remaining_text"] or "")
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -2668,7 +2775,8 @@ async def responses_endpoint(request: Request):
                             ],
                             "reasoning": reasoning,
                         }
-                    ],
+                    ]
+                    + response_tool_call_items(parsed_tool_calls),
                     output_text=content,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
@@ -2712,10 +2820,14 @@ async def responses_endpoint(request: Request):
                     prompt_tps=prompt_tps,
                     generation_tps=generation_tps,
                     peak_memory_gb=peak_memory or None,
-                    finish_reason=finish_reason,
+                    finish_reason=(
+                        "tool_calls" if parsed_tool_calls else finish_reason
+                    ),
                     image_count=len(images),
                     structured_output=bool(gen_args.logits_processors),
                     thinking_enabled=bool(gen_args.enable_thinking),
+                    tool_parser=tool_parser_type,
+                    tool_calls=bool(parsed_tool_calls),
                 )
                 server_metrics.record_success(envelope)
 
@@ -2768,6 +2880,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
     request_start = time.perf_counter()
     try:
+        tools, parse_tool_calls = resolve_tool_choice(request)
+
         adapter_path = (
             request.adapter_path
             if "adapter_path" in request.model_fields_set
@@ -2839,9 +2953,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             processed_messages.append(msg)
 
         # Detect tool parser from chat template
-        tools = getattr(request, "tools", None)
         tool_parser_type = _infer_tool_parser_from_processor(processor)
-        tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
+        tool_module = (
+            load_tool_module(tool_parser_type)
+            if parse_tool_calls and tool_parser_type
+            else None
+        )
 
         try:
             gen_args = _build_gen_args(
