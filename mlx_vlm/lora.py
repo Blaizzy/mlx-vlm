@@ -161,6 +161,76 @@ def main(args):
         split=args.split,
     )
 
+    # Auto-detect assistant/end-turn/user token IDs for train_on_completions
+    if args.train_on_completions:
+        tokenizer = getattr(processor, "tokenizer", processor)
+        if args.assistant_id is None or args.end_turn_id is None or args.user_id is None:
+            # Probe the chat template with a minimal conversation
+            probe = [
+                {"role": "user", "content": "U"},
+                {"role": "assistant", "content": "A"},
+            ]
+            try:
+                probe_text = tokenizer.apply_chat_template(
+                    probe, tokenize=False, add_generation_prompt=False
+                )
+                probe_ids = tokenizer.encode(probe_text)
+
+                # Only match role tokens after a special token (contains
+                # < and >) to avoid matching "model"/"user" in content.
+                role_keywords = {"model", "assistant", "bot"}
+                user_keywords = {"user", "human"}
+                end_turn_markers = {"<turn|>", "<|im_end|>", "<end_of_utterance>"}
+
+                prev_is_special = False
+                for idx, tid in enumerate(probe_ids):
+                    decoded = tokenizer.decode([tid])
+                    stripped = decoded.strip()
+                    cleaned = stripped.lower().strip("<>|")
+                    is_special = "<" in stripped and ">" in stripped
+
+                    if prev_is_special and not is_special:
+                        if cleaned in role_keywords and args.assistant_id is None:
+                            args.assistant_id = tid
+                            logger.info(
+                                f"Auto-detected assistant_id: {tid} ({repr(stripped)})"
+                            )
+                        if cleaned in user_keywords and args.user_id is None:
+                            args.user_id = tid
+                            logger.info(
+                                f"Auto-detected user_id: {tid} ({repr(stripped)})"
+                            )
+
+                    prev_is_special = is_special
+
+                    if stripped in end_turn_markers:
+                        if args.end_turn_id is None:
+                            args.end_turn_id = tid
+                            logger.info(
+                                f"Auto-detected end_turn_id: {tid} ({repr(stripped)})"
+                            )
+
+            except Exception as e:
+                logger.warning(f"Auto-detection failed: {e}")
+
+        if args.assistant_id is None:
+            args.assistant_id = 77091
+            logger.warning(
+                f"Could not auto-detect assistant_id, using default {args.assistant_id}. "
+                f"Set --assistant-id explicitly for your model."
+            )
+
+        if args.end_turn_id is None and args.user_id is None:
+            logger.warning(
+                "No end_turn_id or user_id detected. Multi-turn masking may not "
+                "work correctly. Set --end-turn-id or --user-id explicitly."
+            )
+
+        logger.info(
+            f"train_on_completions: assistant_id={args.assistant_id}, "
+            f"end_turn_id={args.end_turn_id}, user_id={args.user_id}"
+        )
+
     # Calculate training iterations
     if args.epochs is not None:
         iters = (len(dataset) // args.batch_size) * args.epochs
@@ -225,6 +295,8 @@ def main(args):
             args=training_args,
             train_on_completions=args.train_on_completions,
             assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
         )
     else:
         training_args = TrainingArgs(
@@ -250,6 +322,8 @@ def main(args):
             args=training_args,
             train_on_completions=args.train_on_completions,
             assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
         )
 
     logger.info(
@@ -293,7 +367,19 @@ if __name__ == "__main__":
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--train-on-completions", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--assistant-id", type=int, default=77091)
+    parser.add_argument(
+        "--assistant-id", type=int, default=None,
+        help="Token ID marking assistant turn start. Auto-detected if not set.",
+    )
+    parser.add_argument(
+        "--end-turn-id", type=int, default=None,
+        help="Token ID marking end of a turn. Auto-detected if not set.",
+    )
+    parser.add_argument(
+        "--user-id", type=int, default=None,
+        help="Token ID marking user turn start. Used as fallback turn boundary "
+             "when --end-turn-id is unavailable. Auto-detected if not set.",
+    )
 
     # LoRA arguments
     parser.add_argument("--lora-alpha", type=float, default=16)
