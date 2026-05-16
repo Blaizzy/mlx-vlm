@@ -438,6 +438,7 @@ def install_auto_processor_patch(target_model_types, processor_cls):
             is_torch_available,
             is_torchvision_available,
         )
+
         is_torch_available.cache_clear()
         is_torchvision_available.cache_clear()
     except (ImportError, AttributeError):
