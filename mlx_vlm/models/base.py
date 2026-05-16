@@ -427,6 +427,22 @@ def install_auto_processor_patch(target_model_types, processor_cls):
     """
     from transformers import AutoProcessor as _HF_AutoProcessor
 
+    # Refresh transformers' @lru_cache-backed availability checks so a mid-run
+    # `pip install torch` is picked up at the next model load. Without this,
+    # a long-running process (notebook, mlx_vlm.server) that started without
+    # torch keeps the cached `is_torch_available()=False` result, and fast
+    # image processors stay bound to DummyObjects even after torch is
+    # installed. See issue #1131.
+    try:
+        from transformers.utils.import_utils import (
+            is_torch_available,
+            is_torchvision_available,
+        )
+        is_torch_available.cache_clear()
+        is_torchvision_available.cache_clear()
+    except (ImportError, AttributeError):
+        pass
+
     if isinstance(target_model_types, str):
         target_model_types = [target_model_types]
     target_model_types = {t.lower() for t in target_model_types}
