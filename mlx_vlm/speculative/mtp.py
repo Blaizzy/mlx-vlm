@@ -161,12 +161,6 @@ def _mtp_verify_target(
     )
 
 
-def _mtp_has_gdn_commit_states(gdn_states: Optional[list]) -> bool:
-    return bool(gdn_states) and all(
-        len(state) > 11 and state[11] is not None for state in gdn_states
-    )
-
-
 def _mtp_draft_hidden(lm: nn.Module, hidden: mx.array) -> mx.array:
     prepare = getattr(lm, "speculative_draft_hidden", None)
     return prepare(hidden) if callable(prepare) else hidden
@@ -489,10 +483,7 @@ def _mtp_rounds(
         b = new_tokens[-1] if new_tokens else b
 
         rollback = getattr(lm, "rollback_speculative_cache", None)
-        if (
-            callable(rollback)
-            and (accepted < bs - 1 or _mtp_has_gdn_commit_states(verify.gdn_states))
-        ):
+        if accepted < bs - 1 and callable(rollback):
             with mx.stream(generation_stream):
                 rollback(prompt_cache, verify.gdn_states, accepted, bs)
 
@@ -828,7 +819,7 @@ def _mtp_rounds_batch(
 
         # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
         # per-row tail-zero on rows that accepted less).
-        if max_a < bs - 1 or _mtp_has_gdn_commit_states(verify.gdn_states):
+        if max_a < bs - 1:
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
                     prompt_cache, verify.gdn_states, accepted_arr, bs

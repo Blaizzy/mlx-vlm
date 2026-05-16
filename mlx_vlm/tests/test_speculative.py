@@ -651,7 +651,7 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
     assert rollback_calls[0][1] is None
 
 
-def test_mtp_rounds_commits_gdn_states_after_full_accept():
+def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
     class Draft:
         def __init__(self):
             self.config = SimpleNamespace(block_size=3)
@@ -707,9 +707,7 @@ def test_mtp_rounds_commits_gdn_states_after_full_accept():
             )
         )
 
-    assert rollback_calls
-    assert rollback_calls[0][1] is gdn_states
-    assert rollback_calls[0][2] == 2
+    assert rollback_calls == []
 
 
 def test_mtp_next_block_size_can_prefer_requested_size():
