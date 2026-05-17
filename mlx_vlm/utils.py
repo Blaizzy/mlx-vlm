@@ -216,11 +216,12 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     config = load_config(model_path, **kwargs)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
+    weight_files = sorted(
         wf
         for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+        if Path(wf).name != "model-mtp.safetensors"
+        and not wf.endswith("consolidated.safetensors")
+    )
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")

@@ -370,11 +370,11 @@ def test_load_passes_revision():
         patch(
             "mlx_vlm.utils.load_model",
             return_value=model_mock,
-        ) as mock_load_model,
+        ),
         patch(
             "mlx_vlm.utils.load_processor",
             return_value=processor_mock,
-        ) as mock_load_processor,
+        ),
         patch("mlx_vlm.utils.load_image_processor", return_value=None),
     ):
         mock_get_model_path.return_value = Path("/tmp/model")
@@ -429,6 +429,60 @@ def test_load_model_routes_text_models_through_existing_loader():
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
 
     assert getattr(model, "_is_text_model", False) is True
+
+
+def test_load_model_ignores_model_mtp_sidecar_for_base_weights():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            del config
+            return cls()
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            del config
+            self.model = nn.Linear(2, 2, bias=False)
+            self.loaded_names = []
+
+        def load_weights(self, weights, *args, **kwargs):
+            del args, kwargs
+            self.loaded_names = [name for name, _ in weights]
+
+    class FakeModelModule:
+        ModelConfig = FakeConfig
+        Model = FakeModel
+
+    weight_files = [
+        "/tmp/model/model-mtp.safetensors",
+        "/tmp/model/model-00002-of-00002.safetensors",
+        "/tmp/model/model-00001-of-00002.safetensors",
+    ]
+
+    def fake_load(path):
+        name = Path(path).name
+        if name == "model-mtp.safetensors":
+            return {"language_model.mtp.fc.weight": mx.ones((2, 2))}
+        return {f"{name}.weight": mx.zeros((2, 2))}
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
+        patch("mlx_vlm.utils.glob.glob", return_value=weight_files),
+        patch("mlx_vlm.utils.mx.load", side_effect=fake_load) as mx_load,
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch("mlx_vlm.utils.get_model_and_args", return_value=(FakeModelModule, None)),
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+
+    loaded_paths = [Path(call.args[0]).name for call in mx_load.call_args_list]
+    assert loaded_paths == [
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+    ]
+    assert "language_model.mtp.fc.weight" not in model.loaded_names
 
 
 def test_load_delegates_adapter_loading_to_trainer_entrypoint():
