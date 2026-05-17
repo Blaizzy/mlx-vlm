@@ -452,7 +452,8 @@ class EncoderLayer(nn.Module):
         self.fc2 = nn.Linear(config.encoder_ffn_dim, d)
         self.final_layer_norm = nn.LayerNorm(d, eps=config.layer_norm_eps)
         activation = _resolve_activation(config.encoder_activation_function)
-        assert activation is not None, "encoder_activation_function must be set"
+        if activation is None:
+            raise ValueError("encoder_activation_function must be set")
         self.activation = activation
 
     def __call__(self, x: mx.array, pos_embed: Optional[mx.array]) -> mx.array:
@@ -646,15 +647,23 @@ class EncoderInputProj(nn.Module):
 # ─── Vision tower ───
 
 
-class VisionModel(nn.Module):
-    """Backbone -> per-level input projection -> hybrid encoder."""
+class VisionTower(nn.Module):
+    """Backbone -> per-level input projection -> hybrid encoder.
+
+    This is the real vision module; `VisionModel` below is the framework
+    stub that mlx-vlm's loader looks up by name.
+    """
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
         self.config = config
         # `ModelConfig.__post_init__` resolves backbone_config into a
         # `RTDetrResNetConfig` regardless of how it was passed in.
-        assert isinstance(config.backbone_config, RTDetrResNetConfig)
+        if not isinstance(config.backbone_config, RTDetrResNetConfig):
+            raise TypeError(
+                "config.backbone_config must be RTDetrResNetConfig after "
+                f"ModelConfig.__post_init__, got {type(config.backbone_config).__name__}"
+            )
         self.backbone = Backbone(config.backbone_config)
         self.encoder_input_proj = [
             EncoderInputProj(in_c, config.encoder_hidden_dim, eps=config.batch_norm_eps)
@@ -666,6 +675,23 @@ class VisionModel(nn.Module):
         c_features = self.backbone(pixel_values)
         proj = tuple(p(c) for p, c in zip(self.encoder_input_proj, c_features))
         return self.hybrid_encoder(proj)
+
+
+class VisionModel(nn.Module):
+    """Framework-compatibility stub.
+
+    mlx-vlm's loader (`mlx_vlm.utils.load_model`) instantiates
+    `model_class.VisionModel(model_config.vision_config)` purely to call
+    its `sanitize` method. The real vision module lives at
+    `Model.vision` (a `VisionTower`); weight sanitization is handled by
+    `Model.sanitize` so this stub is a no-op.
+    """
+
+    def __init__(self, config=None) -> None:
+        super().__init__()
+
+    def __call__(self, *args, **kwargs):
+        return None
 
     @staticmethod
     def sanitize(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

@@ -79,6 +79,13 @@ class MSDeformableAttention(nn.Module):
         self.n_points = config.decoder_n_points
         self.head_dim = d // n_heads
         self.offset_scale = config.decoder_offset_scale
+        # HF supports "default" (sampling locations in [0,1] then mapped to
+        # [-1,1] for grid_sample) and "discrete" (locations used as-is).
+        if config.decoder_method not in ("default", "discrete"):
+            raise ValueError(
+                f"Unsupported decoder_method {config.decoder_method!r}; "
+                "expected 'default' or 'discrete'"
+            )
         self.method = config.decoder_method
 
         self.sampling_offsets = nn.Linear(

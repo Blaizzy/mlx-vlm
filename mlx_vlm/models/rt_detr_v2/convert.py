@@ -92,16 +92,6 @@ def is_training_only(key: str) -> bool:
     return any(re.search(p, stripped) for p in TRAINING_ONLY_PATTERNS)
 
 
-_DTYPE_MAP = {
-    "float32": "float32",
-    "fp32": "float32",
-    "bfloat16": "bfloat16",
-    "bf16": "bfloat16",
-    "float16": "float16",
-    "fp16": "float16",
-}
-
-
 def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
     """Convert a HuggingFace RT-DETRv2 checkpoint to MLX format.
 
@@ -109,7 +99,8 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
         hf_path: HF repo id (e.g. "docling-project/docling-layout-heron")
             or a local directory containing model.safetensors + config.json.
         output: destination directory for the MLX checkpoint.
-        dtype: target dtype for the saved weights (default bfloat16).
+        dtype: target dtype for the saved weights. One of the names in
+            `mlx_vlm.utils.MODEL_CONVERSION_DTYPES`. Default bfloat16.
     Returns:
         Path to the written output directory.
     """
@@ -117,13 +108,17 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
         import mlx.core as mx
         import safetensors.torch
         from huggingface_hub import snapshot_download
+
+        from ...utils import MODEL_CONVERSION_DTYPES
     except ImportError as e:
         print(f"Missing dependency: {e}", file=sys.stderr)
         sys.exit(2)
 
-    if dtype not in _DTYPE_MAP:
-        raise ValueError(f"Unsupported dtype {dtype!r}; pick from {list(_DTYPE_MAP)}")
-    mlx_dtype = getattr(mx, _DTYPE_MAP[dtype])
+    if dtype not in MODEL_CONVERSION_DTYPES:
+        raise ValueError(
+            f"Unsupported dtype {dtype!r}; expected one of {MODEL_CONVERSION_DTYPES}"
+        )
+    mlx_dtype = getattr(mx, dtype)
 
     src = Path(hf_path)
     if not src.exists():
@@ -138,9 +133,6 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
     out = Path(output)
     out.mkdir(parents=True, exist_ok=True)
 
-    # Load + sanitize + cast.
-    import numpy as np
-
     raw = safetensors.torch.load_file(str(ckpt_file))
     print(f"Loaded {len(raw)} tensors from {ckpt_file}")
     sanitized: Dict[str, mx.array] = {}
@@ -150,16 +142,17 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
             n_dropped += 1
             continue
         new_k = rename(k)
-        arr = mx.array(np.asarray(v.float()))
+        arr = mx.array(v.detach().cpu().numpy())
         if new_k.endswith(".conv.weight") and arr.ndim == 4:
             arr = arr.transpose(0, 2, 3, 1)
         sanitized[new_k] = arr.astype(mlx_dtype)
-    print(
-        f"  renamed {len(sanitized)} tensors, dropped {n_dropped}, " f"cast to {dtype}"
-    )
+    print(f"  renamed {len(sanitized)} tensors, dropped {n_dropped}, cast to {dtype}")
 
     weights_path = out / "model.safetensors"
-    mx.save_safetensors(str(weights_path), sanitized)
+    # `metadata={"format": "mlx"}` is what `mlx_vlm.utils.load_model` keys on
+    # to skip `Model.sanitize` — without it the loader would re-run the
+    # rename + NCHW->NHWC transpose pipeline against already-MLX weights.
+    mx.save_safetensors(str(weights_path), sanitized, metadata={"format": "mlx"})
     print(f"  wrote {weights_path} ({weights_path.stat().st_size / 1e6:.1f} MB)")
 
     # Copy config.json + preprocessor_config.json + any tokenizer files.
@@ -175,25 +168,27 @@ def convert(hf_path: str, output: str, dtype: str = "bfloat16") -> Path:
 
 
 def _verify(out: Path) -> None:
-    """Smoke-test the converted checkpoint via the framework loader."""
+    """Smoke-test the converted checkpoint via the framework loader.
+
+    Goes through `mlx_vlm.utils.load_model` (not raw `mx.load`) so the
+    sanitize-metadata path is exercised — a saved file without
+    `metadata['format'] = 'mlx'` would re-trigger `Model.sanitize`
+    and double-transpose conv weights, and this verify catches it.
+    """
     import mlx.core as mx
 
-    from . import Model, ModelConfig
+    from ...utils import load_model
 
     config = json.loads((out / "config.json").read_text())
-    cfg = ModelConfig.from_dict(config)
-    model = Model(cfg)
-    # `mx.load` returns either a dict or (weights, metadata); for
-    # safetensors files we always get the dict form.
-    weights = mx.load(str(out / "model.safetensors"))
-    assert isinstance(weights, dict)
-    model.load_weights(list(weights.items()))
+    model = load_model(out)
     model.eval()
 
     size = config.get("image_size") or 640
-    pixel = mx.zeros((1, size, size, 3), dtype=mx.float32)
+    # Random input rather than zeros: zeros let weight-transpose bugs hide
+    # because biases dominate.
+    pixel = mx.random.normal((1, size, size, 3), dtype=mx.float32)
     out_dict = model(pixel)
-    mx.eval(out_dict["pred_logits"])
+    mx.eval(out_dict["pred_logits"], out_dict["pred_boxes"])
     print(
         f"  verified forward: pred_logits {tuple(out_dict['pred_logits'].shape)}, "
         f"pred_boxes {tuple(out_dict['pred_boxes'].shape)}"
@@ -201,6 +196,8 @@ def _verify(out: Path) -> None:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    from ...utils import MODEL_CONVERSION_DTYPES
+
     parser = argparse.ArgumentParser(description="Convert HF RT-DETRv2 -> MLX.")
     parser.add_argument(
         "--hf-path",
@@ -213,7 +210,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--dtype",
         default="bfloat16",
-        choices=list(_DTYPE_MAP.keys()),
+        choices=MODEL_CONVERSION_DTYPES,
         help="Target dtype for saved weights (default bfloat16)",
     )
     args = parser.parse_args(argv)

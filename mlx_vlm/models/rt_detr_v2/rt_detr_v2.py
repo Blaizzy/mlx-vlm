@@ -16,12 +16,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import ModelConfig
-from .convert import DROP_PATTERNS, TRAINING_ONLY_PATTERNS  # noqa: F401
-from .convert import is_training_only as _is_training_only  # noqa: F401
 from .convert import rename as _rename
 from .convert import should_drop as _should_drop
 from .transformer import MLP, Decoder, generate_anchors
-from .vision import VisionModel
+from .vision import VisionTower
 
 
 class _DecoderInputProj(nn.Module):
@@ -62,7 +60,7 @@ class Model(nn.Module):
         super().__init__()
         self.config = config
 
-        self.vision = VisionModel(config)
+        self.vision = VisionTower(config)
 
         d = config.d_model
         eps = config.batch_norm_eps
