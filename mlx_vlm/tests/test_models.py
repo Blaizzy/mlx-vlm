@@ -6303,5 +6303,125 @@ class TestSam3(unittest.TestCase):
         self.assertEqual(sin.shape, (64, 64))
 
 
+class TestRTDetrV2(unittest.TestCase):
+    def test_config_from_dict(self):
+        """Flat HF config dict resolves into nested sub-configs."""
+        from mlx_vlm.models.rt_detr_v2 import ModelConfig, RTDetrResNetConfig
+
+        hf_like = {
+            "model_type": "rt_detr_v2",
+            "image_size": 64,
+            "num_labels": 10,
+            "backbone_config": {
+                "model_type": "rt_detr_resnet",
+                "depths": [1, 1, 2, 1],
+                "hidden_sizes": [10, 20, 30, 40],
+            },
+            "encoder_hidden_dim": 32,
+            "encoder_in_channels": [20, 30, 40],
+            "encoder_attention_heads": 2,
+            "encoder_ffn_dim": 64,
+            "d_model": 32,
+            "num_queries": 30,
+            "decoder_layers": 2,
+            "decoder_attention_heads": 2,
+            "decoder_ffn_dim": 64,
+            "decoder_in_channels": [32, 32, 32],
+        }
+        cfg = ModelConfig.from_dict(hf_like)
+        self.assertEqual(cfg.model_type, "rt_detr_v2")
+        self.assertEqual(cfg.num_labels, 10)
+        self.assertIsInstance(cfg.backbone_config, RTDetrResNetConfig)
+        self.assertEqual(cfg.backbone_config.depths, [1, 1, 2, 1])
+        # __post_init__ rebuilds the sub-configs from flat fields
+        self.assertEqual(cfg._hybrid_encoder_config.encoder_hidden_dim, 32)
+        self.assertEqual(cfg._transformer_config.d_model, 32)
+        self.assertEqual(cfg._transformer_config.num_queries, 30)
+        self.assertEqual(cfg._transformer_config.num_labels, 10)
+        # framework-compat hooks
+        self.assertIsNone(cfg.text_config)
+        self.assertIsNone(cfg.vision_config)
+
+    def test_forward_shapes(self):
+        """End-to-end forward on a tiny config returns the documented shapes."""
+        from mlx_vlm.models.rt_detr_v2 import Model, ModelConfig
+
+        cfg = ModelConfig.from_dict(
+            {
+                "model_type": "rt_detr_v2",
+                "image_size": 64,
+                "num_labels": 10,
+                "backbone_config": {
+                    "model_type": "rt_detr_resnet",
+                    "depths": [1, 1, 2, 1],
+                    "hidden_sizes": [10, 20, 30, 40],
+                },
+                "encoder_hidden_dim": 32,
+                "encoder_in_channels": [20, 30, 40],
+                "encoder_attention_heads": 2,
+                "encoder_ffn_dim": 64,
+                "d_model": 32,
+                "num_queries": 30,
+                "decoder_layers": 2,
+                "decoder_attention_heads": 2,
+                "decoder_ffn_dim": 64,
+                "decoder_in_channels": [32, 32, 32],
+            }
+        )
+        model = Model(cfg)
+        model.eval()
+
+        pixel = mx.random.normal((2, 64, 64, 3))
+        out = model(pixel)
+        mx.eval(out["pred_logits"], out["pred_boxes"])
+
+        self.assertEqual(out["pred_logits"].shape, (2, 30, 10))
+        self.assertEqual(out["pred_boxes"].shape, (2, 30, 4))
+        # intermediate trajectories cover all decoder layers
+        self.assertEqual(out["intermediate_logits"].shape, (2, 2, 30, 10))
+        self.assertEqual(out["intermediate_reference_points"].shape, (2, 2, 30, 4))
+
+    def test_sanitize_renames_and_transposes(self):
+        """`Model.sanitize` rewrites HF keys and transposes NCHW conv weights."""
+        from mlx_vlm.models.rt_detr_v2 import Model
+
+        raw = {
+            # NCHW conv weight under the HF backbone prefix -> NHWC under
+            # vision.backbone after sanitize
+            "model.backbone.model.embedder.embedder.0.convolution.weight": mx.zeros(
+                (8, 3, 7, 7)
+            ),
+            # encoder body: `normalization` -> `bn`
+            "model.encoder.0.normalization.weight": mx.ones((16,)),
+            # vd downsampling shortcut: Sequential index 1 -> proj
+            "model.backbone.model.encoder.stages.1.layers.0.shortcut.1.convolution.weight": mx.zeros(
+                (16, 8, 1, 1)
+            ),
+            # num_batches_tracked must be dropped
+            "model.backbone.model.embedder.embedder.0.normalization.num_batches_tracked": mx.array(
+                0
+            ),
+        }
+        sanitized = Model.sanitize(raw)
+
+        self.assertNotIn(
+            "model.backbone.model.embedder.embedder.0.normalization.num_batches_tracked",
+            sanitized,
+        )
+        self.assertIn("vision.backbone.embedder.embedder.0.conv.weight", sanitized)
+        # NCHW (8, 3, 7, 7) -> NHWC (8, 7, 7, 3)
+        self.assertEqual(
+            sanitized["vision.backbone.embedder.embedder.0.conv.weight"].shape,
+            (8, 7, 7, 3),
+        )
+        # `.normalization.` rename under the encoder body
+        self.assertIn("vision.hybrid_encoder.0.bn.weight", sanitized)
+        # vd shortcut Sequential[1] -> proj
+        self.assertIn(
+            "vision.backbone.encoder.stages.1.layers.0.shortcut.proj.conv.weight",
+            sanitized,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
