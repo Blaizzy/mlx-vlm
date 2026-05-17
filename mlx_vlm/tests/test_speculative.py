@@ -12,7 +12,9 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 import pytest
+from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
@@ -664,6 +666,40 @@ def test_mtp_shared_kv_accepts_cache_state_metadata():
 
     assert shared["full_attention"][0] is keys
     assert shared["full_attention"][1] is values
+
+
+def test_masked_embedder_token_ordering_is_buffer_not_parameter():
+    """token_ordering is a static cluster->vocab-id index, not a learnable param.
+
+    Regression for a silent fine-tuning bug: nn.Module treats every mx.array
+    attribute as a trainable parameter, so AdamW's tree_map walked
+    token_ordering and applied `param - lr * m / (sqrt(v) + eps)`. Type
+    promotion converted int32 -> float32, and the next gather in
+    `_selected_logits` raised `indices must be integral`.
+
+    The fix is `self.freeze(keys="token_ordering", recurse=False)` in
+    `__init__`. This test confirms (a) token_ordering is absent from
+    trainable_parameters and (b) an AdamW step does not change its dtype or
+    contents.
+    """
+    cfg = SimpleNamespace(
+        text_config=SimpleNamespace(hidden_size=2, vocab_size=8),
+        num_centroids=2,
+        centroid_intermediate_top_k=1,
+    )
+    embedder = MaskedEmbedder(cfg)
+    embedder.token_ordering = mx.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=mx.int32)
+    original = mx.array(embedder.token_ordering.tolist(), dtype=mx.int32)
+
+    trainable_paths = {p for p, _ in tree_flatten(embedder.trainable_parameters())}
+    assert "token_ordering" not in trainable_paths
+
+    optimizer = optim.AdamW(learning_rate=1e-3)
+    grads = tree_map(lambda p: mx.zeros_like(p), embedder.trainable_parameters())
+    optimizer.update(embedder, grads)
+
+    assert embedder.token_ordering.dtype == mx.int32
+    assert (embedder.token_ordering == original).all().item()
 
 
 def test_masked_embedder_argmax_matches_full_sparse_logits():

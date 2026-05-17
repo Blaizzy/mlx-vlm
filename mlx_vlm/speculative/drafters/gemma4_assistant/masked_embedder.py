@@ -34,7 +34,16 @@ class MaskedEmbedder(nn.Module):
         # ``token_ordering[c * vocab_size_per_centroid : (c+1) * vocab_size_per_centroid]``
         # holds the canonical token IDs assigned to centroid ``c``.
         # Loaded from checkpoint as int64; cast to int32 for indexing.
+        #
+        # This is a static integer buffer, not a learnable parameter — it indexes
+        # into ``lm_head_weight`` and ``ordering[topk_idx]``. ``nn.Module`` treats
+        # every ``mx.array`` attribute as a trainable parameter by default, so we
+        # explicitly freeze it. Without this, an AdamW step (or any optimizer
+        # that does ``param - lr * m / (sqrt(v) + eps)``) silently promotes the
+        # int32 dtype to float32 via type promotion, and the next
+        # ``ordering[topk_idx]`` gather throws ``indices must be integral``.
         self.token_ordering = mx.zeros((self.vocab_size,), dtype=mx.int32)
+        self.freeze(keys="token_ordering", recurse=False)
 
     def __call__(self, hidden_states: mx.array, lm_head_weight: mx.array) -> mx.array:
         """Compute sparse logits over the full vocab.
