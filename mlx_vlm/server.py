@@ -3459,7 +3459,7 @@ def models_endpoint():
     Return list of locally downloaded MLX models.
     """
 
-    files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
+    required_files = {"config.json", "tokenizer_config.json"}
 
     def probably_mlx_lm(repo):
         if repo.repo_type != "model":
@@ -3467,7 +3467,10 @@ def models_endpoint():
         if "main" not in repo.refs:
             return False
         file_names = {f.file_path.name for f in repo.refs["main"].files}
-        return all(f in file_names for f in files)
+        has_weights = "model.safetensors.index.json" in file_names or any(
+            file_name.endswith(".safetensors") for file_name in file_names
+        )
+        return required_files.issubset(file_names) and has_weights
 
     # Scan the cache directory for downloaded mlx models
     hf_cache_info = scan_cache_dir()

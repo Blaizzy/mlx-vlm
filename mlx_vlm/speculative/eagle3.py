@@ -3,7 +3,11 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+from .common import (
+    _batch_cache_left_padding,
+    _record_speculative_round,
+    generation_stream,
+)
 
 
 def _eagle3_walk(
@@ -50,6 +54,18 @@ def _eagle3_walk_batch(
     return accepted_list, new_tokens_list
 
 
+def _eagle3_accept_counts(draft_tokens: mx.array, target_tokens: mx.array) -> mx.array:
+    n_draft = int(draft_tokens.shape[1])
+    mismatches = draft_tokens != target_tokens[:, :n_draft]
+    first_mismatch = mx.argmax(mismatches.astype(mx.int32), axis=1)
+    has_mismatch = mx.any(mismatches, axis=1)
+    return mx.where(
+        has_mismatch,
+        first_mismatch,
+        mx.full((int(draft_tokens.shape[0]),), n_draft, dtype=mx.int32),
+    ).astype(mx.int32)
+
+
 def _eagle3_walk_batch_uniform_acceptance(
     draft_tokens: mx.array,
     target_tokens: mx.array,
@@ -68,14 +84,6 @@ def _eagle3_walk_batch_uniform_acceptance(
         )
         new_tokens_list.append(new)
     return [accepted] * len(accepted_list), new_tokens_list
-
-
-def _record_eagle3_round(
-    draft_model: nn.Module, accepted: float, draft_count: int
-) -> None:
-    draft_model.accept_lens.append(accepted)
-    if hasattr(draft_model, "draft_lens"):
-        draft_model.draft_lens.append(int(draft_count))
 
 
 def _eagle3_draft_kwargs(draft_model: nn.Module, greedy_sampling: bool) -> dict:
@@ -307,22 +315,18 @@ def _eagle3_verify_target_hot(
     target_tokens = hot_ids[hot_idx]
 
     draft_tokens = verify_input[:, 1:]
-    accepted, _ = _eagle3_walk(
-        draft_tokens,
+    full_pos = mx.minimum(
+        _eagle3_accept_counts(draft_tokens, target_tokens),
+        int(target_tokens.shape[1]) - 1,
+    )
+    full_hidden = mx.take_along_axis(final_hidden, full_pos[:, None, None], axis=1)
+    full_token = sampler(lm.logits_from_hidden(full_hidden)).astype(target_tokens.dtype)
+    target_tokens = mx.put_along_axis(
         target_tokens,
-        int(draft_tokens.shape[1]) + 1,
+        full_pos[:, None],
+        full_token,
+        axis=1,
     )
-    full_pos = min(int(accepted), int(target_tokens.shape[1]) - 1)
-    full_token = sampler(
-        lm.logits_from_hidden(final_hidden[:, full_pos : full_pos + 1])
-    )
-    pieces = []
-    if full_pos > 0:
-        pieces.append(target_tokens[:, :full_pos])
-    pieces.append(full_token)
-    if full_pos + 1 < int(target_tokens.shape[1]):
-        pieces.append(target_tokens[:, full_pos + 1 :])
-    target_tokens = mx.concatenate(pieces, axis=1) if len(pieces) > 1 else pieces[0]
     return hidden, target_tokens, None
 
 
@@ -436,7 +440,7 @@ def _eagle3_rounds(
             target_tokens,
             max_tokens - emitted,
         )
-        _record_eagle3_round(draft_model, accepted, bs - 1)
+        _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
             yield tok, None
@@ -490,11 +494,25 @@ def _eagle3_rounds_batch(
         )
 
     B = first_bonus.shape[0]
+    cache_left_padding = _batch_cache_left_padding(prompt_cache)
+    if cache_left_padding is None:
+        left_padding = [0] * int(B)
+    else:
+        padding_values = (
+            cache_left_padding.tolist()
+            if hasattr(cache_left_padding, "tolist")
+            else cache_left_padding
+        )
+        left_padding = [int(pad) for pad in padding_values]
     target_layer_ids = _eagle3_capture_layer_ids(draft_model)
     block_total, configured_block_total, adaptive_block_size = _eagle3_block_settings(
         draft_model, draft_block_size
     )
-    draft_cache = draft_model.reset(model)
+    if draft_block_size is None:
+        block_total = min(block_total, 2)
+        configured_block_total = min(configured_block_total, block_total)
+        adaptive_block_size = False
+    draft_cache = draft_model.reset(model, left_padding=left_padding)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
@@ -514,6 +532,7 @@ def _eagle3_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
+    cache_slots = list(range(B))
 
     while len(active_idx) > 0:
         remaining = [
@@ -531,6 +550,13 @@ def _eagle3_rounds_batch(
             break
 
         n_active = len(active_idx)
+        draft_batch_size = getattr(draft_model, "batch_size", lambda: None)()
+        if draft_batch_size is not None and draft_batch_size != n_active:
+            filter_drafter = getattr(draft_model, "filter_batch", None)
+            if callable(filter_drafter):
+                filter_drafter(mx.array(cache_slots, dtype=mx.int32))
+                cache_slots = list(range(n_active))
+
         b_active = [b[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
 
@@ -547,13 +573,25 @@ def _eagle3_rounds_batch(
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
+            hot_verify = _eagle3_verify_target_hot(
                 lm,
+                draft_model,
                 verify_input,
                 prompt_cache,
                 sampler,
                 target_layer_ids,
+                _eagle3_eos_token_ids(model),
             )
+            if hot_verify is None:
+                verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    target_layer_ids,
+                )
+            else:
+                verify_hidden, target_tokens, gdn_states = hot_verify
         mx.async_eval(target_tokens, verify_hidden)
 
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
@@ -571,7 +609,7 @@ def _eagle3_rounds_batch(
                 accepted_list,
                 budgets,
             )
-        _record_eagle3_round(
+        _record_speculative_round(
             draft_model,
             sum(accepted_list) / len(accepted_list),
             bs - 1,
@@ -615,8 +653,7 @@ def _eagle3_rounds_batch(
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
 
-        max_a = max(accepted_list)
-        if max_a < bs - 1:
+        if any(accepted < bs - 1 for accepted in accepted_list):
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
                     prompt_cache,
@@ -625,20 +662,20 @@ def _eagle3_rounds_batch(
                     bs,
                 )
 
-        cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
         if all(finished[active_idx[j]] for j in range(n_active)):
             break
-        if cache_filterable:
-            keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
-            if len(keep_slots) < n_active:
-                keep_mx = mx.array(keep_slots, dtype=mx.int32)
+        keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
+        if len(keep_slots) < n_active:
+            keep_mx = mx.array(keep_slots, dtype=mx.int32)
+            if all(hasattr(c, "filter") for c in prompt_cache):
                 for c in prompt_cache:
                     c.filter(keep_mx)
-                filter_drafter = getattr(draft_model, "filter_batch", None)
-                if callable(filter_drafter):
-                    filter_drafter(keep_mx)
-                hidden = hidden[keep_mx]
-                active_idx = [active_idx[j] for j in keep_slots]
+            filter_drafter = getattr(draft_model, "filter_batch", None)
+            if callable(filter_drafter):
+                filter_drafter(keep_mx)
+            hidden = hidden[keep_mx]
+            active_idx = [active_idx[j] for j in keep_slots]
+            cache_slots = [cache_slots[j] for j in keep_slots]
 
         if sum(emitted) % 256 == 0:
             mx.clear_cache()

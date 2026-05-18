@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ....models.base import create_attention_mask, scaled_dot_product_attention
-from ....models.cache import KVCache
+from ....models.cache import BatchKVCache, KVCache
 from .config import Eagle3Config, TextConfig
 
 
@@ -155,7 +155,7 @@ class DecoderLayer(nn.Module):
 class Eagle3DraftModel(nn.Module):
     supports_greedy_draft_argmax = True
     prefer_requested_block_size = True
-    requires_uniform_batch_acceptance = True
+    requires_uniform_batch_acceptance = False
 
     def __init__(self, config: Eagle3Config):
         super().__init__()
@@ -201,6 +201,7 @@ class Eagle3DraftModel(nn.Module):
         self._seed_token: Optional[mx.array] = None
         self._seed_hidden: Optional[mx.array] = None
         self._next_position: Any = 1
+        self._left_padding: Optional[mx.array] = None
         self._round_appended = 0
         self._adaptive_block_size: Optional[int] = None
 
@@ -231,14 +232,24 @@ class Eagle3DraftModel(nn.Module):
                 self.embed_tokens = target_embed
         return self
 
-    def make_cache(self) -> List[KVCache]:
+    def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
+        if left_padding is not None:
+            return [BatchKVCache(left_padding) for _ in self.layers]
         return [KVCache() for _ in self.layers]
 
-    def reset(self, target_model) -> List[KVCache]:
+    def reset(
+        self, target_model, left_padding: Optional[List[int]] = None
+    ) -> List[KVCache]:
         self.bind(target_model)
         self.accept_lens = []
         self.draft_lens = []
-        self._cache = self.make_cache()
+        shifted_left_padding = None
+        if left_padding is not None:
+            shifted_left_padding = [max(0, int(pad) - 1) for pad in left_padding]
+            self._left_padding = mx.array(left_padding, dtype=mx.int32)
+        else:
+            self._left_padding = None
+        self._cache = self.make_cache(shifted_left_padding)
         self._seed_token = None
         self._seed_hidden = None
         self._next_position = 1
@@ -321,7 +332,10 @@ class Eagle3DraftModel(nn.Module):
             bonus = bonus_token[:, None].astype(token_dtype)
 
         shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
-        self._next_position = 1
+        if self._left_padding is not None:
+            self._next_position = 1 - self._left_padding
+        else:
+            self._next_position = 1
         h = self._forward_tokens(
             shifted,
             hidden[:, : shifted.shape[1], :],
@@ -424,13 +438,6 @@ class Eagle3DraftModel(nn.Module):
             )
             return
 
-        accepted_set = {int(a) for a in accepted}
-        if len(accepted_set) != 1:
-            raise ValueError(
-                "EAGLE-3 batched cache update requires uniform acceptance."
-            )
-        accepted_i = accepted_set.pop()
-
         trim = self._round_appended
         if trim > 0:
             for cache in self._cache:
@@ -441,40 +448,105 @@ class Eagle3DraftModel(nn.Module):
                 else self._next_position - trim
             )
 
-        token_chunks = []
-        hidden_chunks = []
-        if accepted_i > 0:
-            token_chunks.append(draft_tokens[:, :accepted_i])
-            hidden_chunks.append(verify_hidden[:, :accepted_i, :])
+        lengths = [len(row_tokens) for row_tokens in new_tokens]
+        max_len = max(lengths) if lengths else 0
+        if max_len > 0:
+            token_rows = []
+            hidden_rows = []
+            for row, row_tokens in enumerate(new_tokens):
+                accepted_i = int(accepted[row])
+                row_hidden = []
+                for pos, tok in enumerate(row_tokens):
+                    token_rows.append(int(tok))
+                    hidden_pos = min(pos, accepted_i)
+                    row_hidden.append(
+                        verify_hidden[row : row + 1, hidden_pos : hidden_pos + 1, :]
+                    )
 
-        if all(new_tokens):
-            bonus = mx.array(
-                [[int(row_tokens[-1])] for row_tokens in new_tokens],
-                dtype=token_dtype,
+                pad = max_len - len(row_tokens)
+                if pad:
+                    token_rows.extend([0] * pad)
+                    row_hidden.append(
+                        mx.zeros(
+                            (1, pad, verify_hidden.shape[-1]),
+                            dtype=verify_hidden.dtype,
+                        )
+                    )
+                hidden_rows.append(mx.concatenate(row_hidden, axis=1))
+
+            tokens = mx.array(token_rows, dtype=token_dtype).reshape(
+                len(new_tokens), max_len
             )
-            token_chunks.append(bonus)
-            hidden_chunks.append(verify_hidden[:, accepted_i : accepted_i + 1, :])
+            hiddens = mx.concatenate(hidden_rows, axis=0)
+            right_padding = [max_len - length for length in lengths]
+            if any(right_padding):
+                for cache in self._cache:
+                    prepare = getattr(cache, "prepare", None)
+                    if callable(prepare):
+                        prepare(right_padding=right_padding, lengths=lengths)
 
-        if token_chunks:
-            tokens = mx.concatenate(token_chunks, axis=1).astype(token_dtype)
-            hiddens = mx.concatenate(hidden_chunks, axis=1)
             h = self._forward_tokens(tokens, hiddens, token_dtype)
-            self._set_seed_from_hidden(h[:, -1:, :], sampler, token_dtype, greedy)
+
+            if any(right_padding):
+                for cache in self._cache:
+                    finalize = getattr(cache, "finalize", None)
+                    if callable(finalize):
+                        finalize()
+                if (
+                    isinstance(self._next_position, mx.array)
+                    and self._next_position.ndim > 0
+                ):
+                    self._next_position = self._next_position - mx.array(
+                        right_padding, dtype=mx.int32
+                    )
+
+            last_idx = mx.array([length - 1 for length in lengths], dtype=mx.int32)
+            last_hidden = mx.take_along_axis(h, last_idx[:, None, None], axis=1)
+            self._set_seed_from_hidden(last_hidden, sampler, token_dtype, greedy)
         self._round_appended = 0
 
     def filter_batch(self, keep) -> None:
         if not isinstance(keep, mx.array):
             keep = mx.array(keep, dtype=mx.int32)
+        eval_targets = []
         for cache in self._cache:
-            if cache.keys is not None:
+            cache_filter = getattr(cache, "filter", None)
+            if callable(cache_filter):
+                cache_filter(keep)
+                keys = getattr(cache, "keys", None)
+                values = getattr(cache, "values", None)
+                if keys is not None:
+                    eval_targets.extend([keys, values])
+            elif cache.keys is not None:
                 cache.keys = cache.keys[keep]
                 cache.values = cache.values[keep]
+                eval_targets.extend([cache.keys, cache.values])
         if self._seed_token is not None:
             self._seed_token = self._seed_token[keep]
+            eval_targets.append(self._seed_token)
         if self._seed_hidden is not None:
             self._seed_hidden = self._seed_hidden[keep]
+            eval_targets.append(self._seed_hidden)
+        if self._left_padding is not None:
+            self._left_padding = self._left_padding[keep]
+            eval_targets.append(self._left_padding)
         if isinstance(self._next_position, mx.array) and self._next_position.ndim > 0:
             self._next_position = self._next_position[keep]
+            eval_targets.append(self._next_position)
+        if eval_targets:
+            mx.eval(*eval_targets)
+
+    def batch_size(self) -> Optional[int]:
+        for cache in self._cache:
+            keys = getattr(cache, "keys", None)
+            if keys is not None:
+                return int(keys.shape[0])
+            left_padding = getattr(cache, "left_padding", None)
+            if left_padding is not None:
+                return int(left_padding.shape[0])
+        if self._seed_token is not None:
+            return int(self._seed_token.shape[0])
+        return None
 
     def sanitize(self, weights: dict) -> dict:
         out = {}

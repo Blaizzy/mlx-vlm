@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -19,6 +20,7 @@ class MessageFormat(Enum):
     IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
+    TEXT_ONLY = "text_only"
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
@@ -89,6 +91,7 @@ MODEL_CONFIG = {
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "laguna": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -149,6 +152,31 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     if hasattr(item, "role") and hasattr(item, "content"):
         return getattr(item, "role", "user"), getattr(item, "content", "")
     return None
+
+
+def _normalize_tool_call_arguments(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a message and convert OpenAI JSON-string tool arguments to dicts."""
+    normalized = dict(message)
+    tool_calls = normalized.get("tool_calls")
+    if tool_calls is None:
+        return normalized
+
+    normalized_calls = []
+    for tool_call in tool_calls:
+        tool_call = dict(tool_call) if isinstance(tool_call, dict) else tool_call
+        if isinstance(tool_call, dict) and "function" in tool_call:
+            function = dict(tool_call["function"])
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    function["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = {}
+            tool_call["function"] = function
+        normalized_calls.append(tool_call)
+
+    normalized["tool_calls"] = normalized_calls
+    return normalized
 
 
 class MessageBuilder:
@@ -269,6 +297,7 @@ class MessageFormatter:
             ),
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
+            MessageFormat.TEXT_ONLY: self._format_text_only,
             MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>"
             * num_images
             + prompt,
@@ -313,6 +342,19 @@ class MessageFormatter:
             content = image_tokens + content if image_first else content + image_tokens
 
         return {"role": role, "content": content}
+
+    def _format_text_only(
+        self,
+        prompt: str,
+        role: str,
+        skip_image_token: bool,
+        skip_audio_token: bool,
+        num_images: int,
+        num_audios: int,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Format a regular text-only chat message."""
+        return {"role": role, "content": prompt}
 
     def _format_list_with_image_type(
         self,
@@ -686,6 +728,32 @@ def apply_chat_template(
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
+    # Use standard formatting for text-only models.
+    if model_type not in MODEL_CONFIG:
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, dict):
+            msg = dict(prompt)
+            msg["content"] = extract_text_from_content(msg.get("content", ""))
+            messages = [msg]
+        elif isinstance(prompt, list):
+            messages = []
+            for item in prompt:
+                if isinstance(item, str):
+                    messages.append({"role": "user", "content": item})
+                elif (role_content := _get_role_content(item)) is not None:
+                    role, content = role_content
+                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    if role != "tool":
+                        msg["content"] = extract_text_from_content(content)
+                    messages.append(msg)
+        else:
+            messages = [{"role": "user", "content": str(prompt)}]
+
+        if return_messages:
+            return messages
+        return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
+
     # Build messages from prompts
     messages = []
 
@@ -702,17 +770,21 @@ def apply_chat_template(
         )
     elif isinstance(prompt, dict):
         # Single dict prompt
-        content = extract_text_from_content(prompt["content"])
-        messages.append(
-            get_message_json(
-                model_type,
-                content,
-                prompt["role"],
-                num_images=num_images,
-                num_audios=num_audios,
-                **kwargs,
+        role = prompt.get("role", "user")
+        if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
+            messages.append(_normalize_tool_call_arguments(prompt))
+        else:
+            content = extract_text_from_content(prompt["content"])
+            messages.append(
+                get_message_json(
+                    model_type,
+                    content,
+                    role,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
             )
-        )
     elif isinstance(prompt, list):
         # List of prompts — find the last user message to place image/audio tokens
         last_user_idx = -1
@@ -745,7 +817,7 @@ def apply_chat_template(
                     "tool_calls" in p or "tool_call_id" in p or role == "tool"
                 )
                 if has_tool_metadata:
-                    messages.append(p)
+                    messages.append(_normalize_tool_call_arguments(p))
                 else:
                     # Handle multimodal content: extract only text, skip image/audio URLs
                     content = extract_text_from_content(content)
