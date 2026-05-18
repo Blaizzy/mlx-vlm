@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
-import mlx_vlm.server_app.generation as server_generation
+import mlx_vlm.server.generation as server_generation
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
