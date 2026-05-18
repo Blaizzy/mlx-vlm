@@ -450,6 +450,185 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
 
 
+def test_responses_previous_response_id_replays_stored_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    first = SimpleNamespace(text="First answer", prompt_tokens=3, generation_tokens=2)
+    second = SimpleNamespace(text="Second answer", prompt_tokens=7, generation_tokens=2)
+
+    with (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt") as mock_template,
+        patch.object(server, "generate", side_effect=[first, second]),
+    ):
+        first_response = client.post(
+            "/v1/responses", json={"model": "demo", "input": "First"}
+        )
+        assert first_response.status_code == 200
+        previous_response_id = first_response.json()["id"]
+
+        second_response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "previous_response_id": previous_response_id,
+                "input": "Second",
+            },
+        )
+
+    assert second_response.status_code == 200
+    replayed_messages = mock_template.call_args_list[1].args[2]
+    assert replayed_messages == [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "First answer"},
+        {"role": "user", "content": "Second"},
+    ]
+    retrieved = client.get(f"/v1/responses/{previous_response_id}")
+    assert retrieved.status_code == 200
+    input_items = client.get(f"/v1/responses/{previous_response_id}/input_items")
+    assert input_items.status_code == 200
+    assert input_items.json()["data"][0]["content"][0]["text"] == "First"
+
+
+def test_responses_endpoint_returns_function_call_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+        prompt_tokens=8,
+        generation_tokens=4,
+    )
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt") as mock_template,
+        patch.object(server, "generate", return_value=result),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "weather?",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output"][0]["type"] == "function_call"
+    assert payload["output"][0]["name"] == "get_weather"
+    assert payload["output"][0]["arguments"] == '{"location": "SF"}'
+    assert mock_template.call_args.kwargs["tools"][0]["function"]["name"] == "get_weather"
+
+
+def test_responses_endpoint_returns_native_shell_call_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
+        prompt_tokens=8,
+        generation_tokens=4,
+    )
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "run pwd",
+                "tools": [{"type": "shell"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output"][0]["type"] == "shell_call"
+    assert payload["output"][0]["action"] == {"type": "exec", "command": "pwd"}
+
+
+def test_responses_streaming_emits_native_tool_call_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text='<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
+            prompt_tokens=8,
+            generation_tokens=4,
+            prompt_tps=None,
+            generation_tps=None,
+            peak_memory=0.0,
+        )
+    ]
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+        patch.object(server, "response_generator", None),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "run pwd",
+                "stream": True,
+                "tools": [{"type": "shell"}],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"type": "shell_call"' in body
+    assert '"command": "pwd"' in body
+    assert "<tool_call>" not in body
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [

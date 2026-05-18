@@ -1797,7 +1797,7 @@ class OpenAIRequest(FlexibleBaseModel):
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
     """
 
-    input: Union[str, List[ChatMessage]] = Field(
+    input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
     model: str = Field(..., description="The model to use for generation.")
@@ -1832,6 +1832,17 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     text: Optional[Any] = Field(
         None, description="Responses API text format configuration."
+    )
+    instructions: Optional[str] = Field(
+        None, description="System/developer instructions for this response."
+    )
+    previous_response_id: Optional[str] = Field(
+        None, description="ID of a previous response whose input/output items should be included."
+    )
+    tools: Optional[List[Any]] = Field(None, description="Responses API tool definitions.")
+    tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    store: Optional[bool] = Field(
+        True, description="Whether to store this response for later retrieval."
     )
 
 
@@ -1898,6 +1909,12 @@ class OpenAIResponse(BaseModel):
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
+    previous_response_id: Optional[str] = Field(
+        None, description="ID of the previous response used for this response."
+    )
+    store: Optional[bool] = Field(
+        True, description="Whether this response is stored for later retrieval."
+    )
 
 
 class BaseStreamEvent(BaseModel):
@@ -1931,7 +1948,7 @@ class ResponseInProgressEvent(BaseStreamEvent):
 class ResponseOutputItemAddedEvent(BaseStreamEvent):
     type: Literal["response.output_item.added"]
     output_index: int
-    item: MessageItem
+    item: Any
 
 
 class ResponseContentPartAddedEvent(BaseStreamEvent):
@@ -1969,7 +1986,7 @@ class ResponseContentPartDoneEvent(BaseStreamEvent):
 class ResponseOutputItemDoneEvent(BaseStreamEvent):
     type: Literal["response.output_item.done"]
     output_index: int
-    item: MessageItem
+    item: Any
 
 
 class ResponseCompletedEvent(BaseStreamEvent):
@@ -1988,6 +2005,330 @@ StreamEvent = Union[
     ResponseOutputItemDoneEvent,
     ResponseCompletedEvent,
 ]
+
+
+RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
+
+
+@dataclass
+class StoredResponse:
+    response: Dict[str, Any]
+    input_items: List[Dict[str, Any]]
+    output_items: List[Dict[str, Any]]
+    previous_response_id: Optional[str] = None
+
+
+response_store: Dict[str, StoredResponse] = {}
+response_store_order: deque = deque()
+response_store_lock = Lock()
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
+
+
+def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload, default=_jsonable)}\n\n"
+
+
+def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_value}],
+            }
+        ]
+    if not isinstance(input_value, list):
+        raise HTTPException(status_code=400, detail="Invalid input format.")
+
+    items = []
+    for item in input_value:
+        item = _as_plain_dict(item)
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Invalid input format.")
+        item_type = item.get("type")
+        if item_type is None and item.get("role") is not None:
+            item = {**item, "type": "message"}
+        items.append(item)
+    return items
+
+
+def _response_call_to_chat_tool_call(item: Dict[str, Any]) -> Dict[str, Any]:
+    call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}"
+    name = item.get("name")
+    arguments = item.get("arguments")
+    if item.get("type") == "shell_call":
+        name = name or "shell"
+        action = item.get("action") or {}
+        arguments = arguments or json.dumps(action, ensure_ascii=False)
+    elif item.get("type") == "apply_patch_call":
+        name = name or "apply_patch"
+        arguments = arguments or item.get("patch") or item.get("input") or "{}"
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+    return {
+        "type": "function",
+        "id": call_id,
+        "function": {"name": name or "tool", "arguments": arguments},
+    }
+
+
+def _append_response_item_to_prompt(
+    item: Dict[str, Any],
+    chat_messages: List[Dict[str, Any]],
+    images: List[Any],
+):
+    item_type = item.get("type")
+    if item_type == "message":
+        role = item.get("role") or "user"
+        content = item.get("content")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                part = _as_plain_dict(part)
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type in ("input_text", "output_text", "text"):
+                    text_parts.append(str(part.get("text", "")))
+                elif part_type == "input_image":
+                    image = part.get("image_url") or part.get("file_id")
+                    if image:
+                        images.append(image)
+                elif part_type == "image_url":
+                    image_url = part.get("image_url")
+                    images.append(
+                        image_url.get("url") if isinstance(image_url, dict) else image_url
+                    )
+            content = "\n".join(p for p in text_parts if p)
+        chat_messages.append({"role": role, "content": content or ""})
+        return
+
+    if item_type in ("function_call", "shell_call", "apply_patch_call"):
+        chat_messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_response_call_to_chat_tool_call(item)],
+            }
+        )
+        return
+
+    if item_type in (
+        "function_call_output",
+        "shell_call_output",
+        "apply_patch_call_output",
+        "tool_result",
+    ):
+        output = item.get("output", item.get("content", ""))
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+        chat_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": item.get("call_id") or item.get("tool_call_id"),
+                "content": output,
+            }
+        )
+
+
+def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not previous_response_id:
+        return []
+    chain: List[StoredResponse] = []
+    seen = set()
+    current_id = previous_response_id
+    with response_store_lock:
+        while current_id:
+            if current_id in seen:
+                break
+            seen.add(current_id)
+            stored = response_store.get(current_id)
+            if stored is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Previous response not found: {current_id}",
+                )
+            chain.append(stored)
+            current_id = stored.previous_response_id
+
+    items: List[Dict[str, Any]] = []
+    for stored in reversed(chain):
+        items.extend(stored.input_items)
+        items.extend(stored.output_items)
+    return items
+
+
+def _response_items_to_chat(
+    items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Any]]:
+    chat_messages: List[Dict[str, Any]] = []
+    images: List[Any] = []
+    for item in items:
+        _append_response_item_to_prompt(item, chat_messages, images)
+    return chat_messages, images
+
+
+def _store_response(
+    response: OpenAIResponse,
+    input_items: List[Dict[str, Any]],
+    output_items: List[Dict[str, Any]],
+    previous_response_id: Optional[str],
+):
+    if getattr(response, "store", True) is False:
+        return
+    payload = response.model_dump(exclude_none=True)
+    with response_store_lock:
+        response_store[response.id] = StoredResponse(
+            response=payload,
+            input_items=input_items,
+            output_items=output_items,
+            previous_response_id=previous_response_id,
+        )
+        response_store_order.append(response.id)
+        while len(response_store_order) > RESPONSE_STORE_LIMIT:
+            old_id = response_store_order.popleft()
+            response_store.pop(old_id, None)
+
+
+def _response_tool_to_chat_tool(tool: Any) -> Optional[Dict[str, Any]]:
+    tool = _as_plain_dict(tool)
+    if not isinstance(tool, dict):
+        return None
+    tool_type = tool.get("type")
+    if tool_type == "function" and isinstance(tool.get("function"), dict):
+        return tool
+    if tool_type == "function":
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "parameters": tool.get("parameters") or {},
+            },
+        }
+    if tool_type == "shell":
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name") or "shell",
+                "description": tool.get("description") or "Run a shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    if tool_type == "apply_patch":
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name") or "apply_patch",
+                "description": tool.get("description") or "Apply a patch to files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"patch": {"type": "string"}},
+                    "required": ["patch"],
+                },
+            },
+        }
+    return None
+
+
+def _response_tool_registry(tools: Optional[List[Any]]) -> Tuple[List[Any], Dict[str, str]]:
+    chat_tools = []
+    registry: Dict[str, str] = {}
+    for tool in tools or []:
+        plain = _as_plain_dict(tool)
+        chat_tool = _response_tool_to_chat_tool(plain)
+        if chat_tool is None:
+            continue
+        chat_tools.append(chat_tool)
+        function = chat_tool.get("function", {})
+        name = function.get("name")
+        if name:
+            registry[name] = (plain or {}).get("type", "function")
+    return chat_tools, registry
+
+
+def _tool_call_to_response_item(
+    call: Dict[str, Any],
+    registry: Dict[str, str],
+) -> Dict[str, Any]:
+    function = call.get("function", {})
+    name = function.get("name") or "tool"
+    arguments = function.get("arguments") or "{}"
+    call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
+    tool_type = registry.get(name, "function")
+    if tool_type == "shell":
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            parsed = {"command": arguments}
+        command = parsed.get("command", parsed) if isinstance(parsed, dict) else parsed
+        return {
+            "id": f"sh_{uuid.uuid4().hex}",
+            "type": "shell_call",
+            "call_id": call_id,
+            "status": "completed",
+            "action": {"type": "exec", "command": command},
+        }
+    if tool_type == "apply_patch":
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            parsed = {"patch": arguments}
+        patch = parsed.get("patch", parsed) if isinstance(parsed, dict) else parsed
+        return {
+            "id": f"apc_{uuid.uuid4().hex}",
+            "type": "apply_patch_call",
+            "call_id": call_id,
+            "status": "completed",
+            "patch": patch,
+        }
+    return {
+        "id": f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": "completed",
+    }
+
+
+def _response_output_items_from_text(
+    full_text: str,
+    message_id: str,
+    tool_module: Any,
+    chat_tools: List[Any],
+    tool_registry: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
+    reasoning, content = _split_thinking(full_text)
+    if tool_module is not None and chat_tools:
+        tc = process_tool_calls(full_text, tool_module, chat_tools)
+        if tc["calls"]:
+            items = [
+                _tool_call_to_response_item(call, tool_registry) for call in tc["calls"]
+            ]
+            _, remaining = _split_thinking(tc.get("remaining_text") or "")
+            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
+            return items, remaining, reasoning, "tool_calls"
+    item = {
+        "id": message_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": content, "annotations": []}],
+    }
+    if reasoning:
+        item["reasoning"] = reasoning
+    return [item], content, reasoning, "stop"
+
 
 # Models for /chat/completion endpoint
 
@@ -3170,6 +3511,111 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
 # OpenAI compatile endpoints
 
 
+@app.post("/responses/input_tokens")
+@app.post("/v1/responses/input_tokens", include_in_schema=False)
+async def responses_input_tokens_endpoint(request: Request):
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
+    try:
+        model, processor, config = get_cached_model(openai_request.model)
+        del model
+        current_input_items = _normalize_response_input(openai_request.input)
+        prompt_items = (
+            _response_chain_items(openai_request.previous_response_id)
+            + current_input_items
+        )
+        chat_messages, images = _response_items_to_chat(prompt_items)
+        if openai_request.instructions:
+            chat_messages.insert(
+                0, {"role": "system", "content": openai_request.instructions}
+            )
+        chat_tools, _ = _response_tool_registry(openai_request.tools)
+        gen_args = _build_gen_args(
+            openai_request, processor, tenant_id=_read_tenant_id(request)
+        )
+        template_kwargs = gen_args.to_template_kwargs()
+        if openai_request.tool_choice is not None:
+            template_kwargs["tool_choice"] = openai_request.tool_choice
+        formatted_prompt = apply_chat_template(
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            tools=chat_tools or None,
+            **template_kwargs,
+        )
+        if response_generator is not None:
+            raw_inputs = await asyncio.to_thread(
+                response_generator._cpu_preprocess,
+                formatted_prompt,
+                images if images else None,
+                None,
+            )
+        else:
+            image_token_index = getattr(config, "image_token_index", None)
+            raw_inputs = prepare_inputs(
+                processor,
+                images=images if images else None,
+                prompts=formatted_prompt,
+                image_token_index=image_token_index,
+            )
+        return {"input_tokens": _count_prompt_tokens(raw_inputs)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/responses/{response_id}")
+@app.get("/v1/responses/{response_id}", include_in_schema=False)
+async def responses_retrieve_endpoint(response_id: str):
+    with response_store_lock:
+        stored = response_store.get(response_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    return stored.response
+
+
+@app.delete("/responses/{response_id}")
+@app.delete("/v1/responses/{response_id}", include_in_schema=False)
+async def responses_delete_endpoint(response_id: str):
+    with response_store_lock:
+        existed = response_store.pop(response_id, None) is not None
+    if not existed:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    return {"id": response_id, "object": "response.deleted", "deleted": True}
+
+
+@app.post("/responses/{response_id}/cancel")
+@app.post("/v1/responses/{response_id}/cancel", include_in_schema=False)
+async def responses_cancel_endpoint(response_id: str):
+    with response_store_lock:
+        stored = response_store.get(response_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    response = dict(stored.response)
+    if response.get("status") == "in_progress":
+        response["status"] = "cancelled"
+    return response
+
+
+@app.get("/responses/{response_id}/input_items")
+@app.get("/v1/responses/{response_id}/input_items", include_in_schema=False)
+async def responses_input_items_endpoint(response_id: str):
+    with response_store_lock:
+        stored = response_store.get(response_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    data = stored.input_items
+    return {
+        "object": "list",
+        "data": data,
+        "first_id": data[0].get("id") if data else None,
+        "last_id": data[-1].get("id") if data else None,
+        "has_more": False,
+    }
+
+
 @app.post("/responses")
 @app.post("/v1/responses", include_in_schema=False)
 async def responses_endpoint(request: Request):
@@ -3237,72 +3683,25 @@ async def responses_endpoint(request: Request):
 
         kwargs = {}
 
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
-
-        else:
+        if openai_request.input is None:
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
+
+        current_input_items = _normalize_response_input(openai_request.input)
+        prompt_items = (
+            _response_chain_items(openai_request.previous_response_id)
+            + current_input_items
+        )
+        chat_messages, images = _response_items_to_chat(prompt_items)
+        instructions = openai_request.instructions
+        if instructions:
+            chat_messages.insert(0, {"role": "system", "content": instructions})
+        elif chat_messages and chat_messages[0].get("role") in ("system", "developer"):
+            instructions = chat_messages[0].get("content")
+
+        chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
+        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
             gen_args = _build_gen_args(
@@ -3311,12 +3710,17 @@ async def responses_endpoint(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        template_kwargs = gen_args.to_template_kwargs()
+        if openai_request.tool_choice is not None:
+            template_kwargs["tool_choice"] = openai_request.tool_choice
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
-            **gen_args.to_template_kwargs(),
+            tools=chat_tools or None,
+            **template_kwargs,
         )
 
         logger.debug(
@@ -3371,6 +3775,8 @@ async def responses_endpoint(request: Request):
                         output_text="",
                         temperature=openai_request.temperature,
                         top_p=openai_request.top_p,
+                        previous_response_id=openai_request.previous_response_id,
+                        store=openai_request.store,
                         usage={
                             "input_tokens": 0,  # get prompt tokens
                             "output_tokens": 0,
@@ -3403,6 +3809,12 @@ async def responses_endpoint(request: Request):
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
+                    in_tool_call = False
+                    tc_start = (
+                        tool_module.tool_call_start
+                        if tool_module is not None and chat_tools
+                        else None
+                    )
 
                     if response_generator is not None:
                         # generate() blocks on _cpu_preprocess + queue.get;
@@ -3430,6 +3842,9 @@ async def responses_endpoint(request: Request):
                             output_tokens += 1
                             delta = token.text
                             full_text += delta
+                            in_tool_call, delta = suppress_tool_call_content(
+                                full_text, in_tool_call, tc_start, delta
+                            )
                             token_times.append(time.perf_counter())
                             peak_memory = max(
                                 peak_memory,
@@ -3441,8 +3856,9 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": output_tokens,
                             }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            if delta is not None:
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
                             if token.finish_reason:
                                 finish_reason = token.finish_reason
@@ -3470,6 +3886,9 @@ async def responses_endpoint(request: Request):
 
                             delta = chunk.text
                             full_text += delta
+                            in_tool_call, delta = suppress_tool_call_content(
+                                full_text, in_tool_call, tc_start, delta
+                            )
                             token_times.append(time.perf_counter())
                             prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
                             generation_tps = getattr(
@@ -3484,11 +3903,22 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": chunk.generation_tokens,
                             }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            if delta is not None:
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
-                    # Split thinking from content for final events
-                    _, clean_text = _split_thinking(full_text)
+                    output_items, clean_text, _, output_finish_reason = (
+                        _response_output_items_from_text(
+                            full_text,
+                            message_id,
+                            tool_module,
+                            chat_tools,
+                            tool_registry,
+                        )
+                    )
+                    tool_output_items = [
+                        item for item in output_items if item.get("type") != "message"
+                    ]
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -3505,12 +3935,38 @@ async def responses_endpoint(request: Request):
                         type="message",
                         status="completed",
                         role="assistant",
-                        content=[final_content_part],
+                        content=[final_content_part] if clean_text else [],
                     )
                     yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
 
+                    completed_output = []
+                    if clean_text:
+                        completed_output.append(final_message_item.model_dump())
+                    completed_output.extend(tool_output_items)
+                    for output_index, tool_item in enumerate(tool_output_items, start=1):
+                        yield _sse_event(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": output_index,
+                                "item": tool_item,
+                            },
+                        )
+                        yield _sse_event(
+                            "response.output_item.done",
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": output_index,
+                                "item": tool_item,
+                            },
+                        )
+
                     # Send response.completed event (to match the openai pipeline)
-                    finish_reason = finish_reason or (
+                    finish_reason = (
+                        "tool_calls"
+                        if output_finish_reason == "tool_calls"
+                        else finish_reason
+                    ) or (
                         "stop" if usage_stats["output_tokens"] > 0 else None
                     )
                     envelope = _build_metrics_envelope(
@@ -3541,14 +3997,21 @@ async def responses_endpoint(request: Request):
                     completed_response = base_response.model_copy(
                         update={
                             "status": "completed",
-                            "output": [final_message_item],
-                            "usage": {
-                                "input_tokens": usage_stats["input_tokens"],
-                                "output_tokens": usage_stats["output_tokens"],
-                                "total_tokens": usage_stats["input_tokens"]
+                            "output": completed_output,
+                            "output_text": clean_text,
+                            "usage": OpenAIUsage(
+                                input_tokens=usage_stats["input_tokens"],
+                                output_tokens=usage_stats["output_tokens"],
+                                total_tokens=usage_stats["input_tokens"]
                                 + usage_stats["output_tokens"],
-                            },
+                            ),
                         }
+                    )
+                    _store_response(
+                        completed_response,
+                        current_input_items,
+                        completed_output,
+                        openai_request.previous_response_id,
                     )
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
@@ -3657,6 +4120,7 @@ async def responses_endpoint(request: Request):
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
                         apc_manager=apc_manager,
+                        apc_tenant=gen_args.tenant_id,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -3671,7 +4135,17 @@ async def responses_endpoint(request: Request):
                 mx.clear_cache()
                 gc.collect()
 
-                reasoning, content = _split_thinking(full_text)
+                output_items, content, reasoning, output_finish_reason = (
+                    _response_output_items_from_text(
+                        full_text,
+                        message_id,
+                        tool_module,
+                        chat_tools,
+                        tool_registry,
+                    )
+                )
+                if output_finish_reason == "tool_calls":
+                    finish_reason = "tool_calls"
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -3681,26 +4155,23 @@ async def responses_endpoint(request: Request):
                     instructions=instructions,
                     max_output_tokens=openai_request.max_output_tokens,
                     model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": content,
-                                }
-                            ],
-                            "reasoning": reasoning,
-                        }
-                    ],
+                    output=output_items,
                     output_text=content,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
+                    previous_response_id=openai_request.previous_response_id,
+                    store=openai_request.store,
                     usage={
                         "input_tokens": prompt_tokens,
                         "output_tokens": output_tokens,
                         "total_tokens": prompt_tokens + output_tokens,
                     },
+                )
+                _store_response(
+                    response,
+                    current_input_items,
+                    output_items,
+                    openai_request.previous_response_id,
                 )
 
                 elapsed = time.perf_counter() - request_start
