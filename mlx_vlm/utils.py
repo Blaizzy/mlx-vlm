@@ -370,11 +370,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate(
-                skip_vision=skip_vision,
-                weights=weights,
-                quantization_config=config["quantization"],
-            ),
+            class_predicate=get_class_predicate,
         )
 
     if kwargs.get("quantize_activations", False):
