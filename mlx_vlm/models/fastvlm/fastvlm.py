@@ -212,11 +212,11 @@ class Model(nn.Module):
                     )
                     key = key.replace("patch_embed", "patch_embed.blocks")
                 return key
-            if "lm_head" in key:
-                return key
             if "mm_projector" in key:
                 return key.replace("model.", "")
             if "language_model" not in key:
+                # Includes lm_head.weight on untied checkpoints (e.g. 7B);
+                # LanguageModel.sanitize handles dropping it for tied configs.
                 return "language_model." + key
             return key
 
