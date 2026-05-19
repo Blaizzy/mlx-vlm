@@ -833,13 +833,106 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
                     "type": "function",
                     "function": {
                         "name": "get_weather",
-                        "arguments": {"location": "SF"},
+                        "arguments": json.dumps({"location": "SF"}, ensure_ascii=False),
                     },
                 }
             ],
         },
         {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
     ]
+
+
+def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkeypatch):
+    monkeypatch.setattr(server, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=5,
+        generation_tokens=2,
+        prompt_tps=0.0,
+        generation_tps=0.0,
+        peak_memory=0.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "render_chart",
+                                "input": {"kind": "bar"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [
+                                    {"type": "text", "text": "Rendered chart."},
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": "aW1n",
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                ],
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {
+                        "name": "render_chart",
+                        "arguments": json.dumps({"kind": "bar"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_1",
+            "content": [
+                {"type": "text", "text": "Rendered chart."},
+                {"type": "image"},
+            ],
+            "name": None,
+        },
+    ]
+    assert mock_generate.call_args.kwargs["image"] == ["data:image/png;base64,aW1n"]
 
 
 def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch):
