@@ -42,6 +42,7 @@ from .anthropic import (
     _anthropic_stop_reason,
     _anthropic_system_text,
     _anthropic_tool_choice_to_openai,
+    _anthropic_tool_result_content_to_openai,
     _anthropic_tool_result_content_to_text,
     _anthropic_tool_to_openai,
     _anthropic_tool_use_to_openai,

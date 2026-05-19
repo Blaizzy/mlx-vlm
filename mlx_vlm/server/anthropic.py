@@ -114,32 +114,58 @@ def _anthropic_image_source_to_ref(source: Any) -> Optional[str]:
     return None
 
 
-def _anthropic_tool_result_content_to_text(content: Any) -> str:
+def _anthropic_tool_result_content_to_openai(
+    content: Any, images: Optional[List[str]] = None
+) -> Union[str, List[Dict[str, Any]]]:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
+        text_parts = []
+        content_parts: List[Dict[str, Any]] = []
+        saw_image = False
+
+        def append_text(text: Any) -> None:
+            if text:
+                text_parts.append(str(text))
+                content_parts.append({"type": "text", "text": str(text)})
+
         for item in content:
             if isinstance(item, dict):
                 item_type = item.get("type")
                 if item_type == "text":
-                    text = item.get("text")
-                    if text:
-                        parts.append(str(text))
+                    append_text(item.get("text"))
                 elif item_type == "document":
                     source = _as_plain_dict(item.get("source"))
                     if isinstance(source, dict) and source.get("type") == "text":
-                        data = source.get("data")
-                        if data:
-                            parts.append(str(data))
+                        append_text(source.get("data"))
+                elif item_type == "image":
+                    image_ref = _anthropic_image_source_to_ref(item.get("source"))
+                    if image_ref:
+                        saw_image = True
+                        if images is not None:
+                            images.append(image_ref)
+                        content_parts.append({"type": "image"})
                 elif item.get("content"):
-                    parts.append(str(item["content"]))
+                    append_text(item["content"])
             elif item is not None:
-                parts.append(str(item))
-        return "\n".join(parts).strip()
+                append_text(item)
+        if saw_image:
+            return content_parts
+        return "\n".join(text_parts).strip()
     return str(content)
+
+
+def _anthropic_tool_result_content_to_text(content: Any) -> str:
+    converted = _anthropic_tool_result_content_to_openai(content)
+    if isinstance(converted, list):
+        return "\n".join(
+            str(item.get("text", ""))
+            for item in converted
+            if item.get("type") == "text"
+        ).strip()
+    return converted
 
 
 def _anthropic_tool_to_openai(tool: Any) -> Optional[Dict[str, Any]]:
@@ -203,7 +229,7 @@ def _anthropic_tool_use_to_openai(block: Dict[str, Any]) -> Dict[str, Any]:
         "type": "function",
         "function": {
             "name": block.get("name", ""),
-            "arguments": block.get("input") or {},
+            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
         },
     }
 
@@ -259,8 +285,8 @@ def _anthropic_content_blocks_to_text_and_tools(
                 {
                     "role": "tool",
                     "tool_call_id": item.get("tool_use_id"),
-                    "content": _anthropic_tool_result_content_to_text(
-                        item.get("content")
+                    "content": _anthropic_tool_result_content_to_openai(
+                        item.get("content"), images
                     ),
                     "name": item.get("name"),
                 }
