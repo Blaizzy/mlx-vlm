@@ -36,6 +36,7 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPCo
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
+from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.eagle3 import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
@@ -62,6 +63,40 @@ from mlx_vlm.speculative.utils import (
 from mlx_vlm.utils import get_model_and_args
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
+
+
+def test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream():
+    logits = mx.zeros((1, 8), dtype=mx.float32)
+
+    def sampler(values):
+        return mx.random.categorical(values)
+
+    mx.random.seed(123)
+    expected_first = sampler(logits)
+    mx.eval(expected_first)
+    expected_second = sampler(logits)
+    mx.eval(expected_second)
+
+    draft_model = SimpleNamespace(_seed_token=None)
+
+    def draft_prefill():
+        draft_model._seed_token = sampler(logits)
+
+    mx.random.seed(123)
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=True)
+    first = sampler(logits)
+    mx.eval(first)
+    sampler_rng.target_sampled()
+
+    sampler_rng.draft_call(draft_prefill)
+
+    second = sampler(logits)
+    mx.eval(second)
+    sampler_rng.target_sampled()
+
+    assert first.tolist() == expected_first.tolist()
+    assert second.tolist() == expected_second.tolist()
+    assert draft_model._seed_token is not None
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
