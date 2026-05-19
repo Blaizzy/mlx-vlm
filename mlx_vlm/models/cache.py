@@ -1,4 +1,3 @@
-import os
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
@@ -14,62 +13,6 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
     _BaseCache,
 )
-
-
-def _kv_cache_materialize_interval() -> int:
-    raw = os.environ.get("MLX_VLM_KV_CACHE_MATERIALIZE_INTERVAL", "50")
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return 50
-
-
-def _flatten_mx_arrays(value):
-    if isinstance(value, mx.array):
-        yield value
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _flatten_mx_arrays(item)
-
-
-def _materialize_kv_cache(*values) -> None:
-    arrays = []
-    for value in values:
-        arrays.extend(_flatten_mx_arrays(value))
-    if arrays:
-        mx.eval(*arrays)
-
-
-def _should_materialize_kv_cache(position: int, num_steps: int) -> bool:
-    interval = _kv_cache_materialize_interval()
-    if interval == 0:
-        return False
-    return num_steps > 1 or (position > 0 and position % interval == 0)
-
-
-_original_kv_cache_update_and_fetch = KVCache.update_and_fetch
-_original_batch_kv_cache_update_and_fetch = BatchKVCache.update_and_fetch
-
-
-def _materializing_kv_cache_update_and_fetch(self, keys, values):
-    out = _original_kv_cache_update_and_fetch(self, keys, values)
-    if _should_materialize_kv_cache(int(self.offset), int(keys.shape[2])):
-        _materialize_kv_cache(self.keys, self.values)
-    return out
-
-
-def _materializing_batch_kv_cache_update_and_fetch(self, keys, values):
-    out = _original_batch_kv_cache_update_and_fetch(self, keys, values)
-    if _should_materialize_kv_cache(int(self._idx), int(keys.shape[2])):
-        _materialize_kv_cache(self.keys, self.values, self.offset, self.left_padding)
-    return out
-
-
-# Long continuous-batching decodes otherwise keep thousands of lazy cache-update
-# graphs alive. On Metal this can hit the resource-count limit long before
-# memory is exhausted, especially for BF16 20B+ models.
-KVCache.update_and_fetch = _materializing_kv_cache_update_and_fetch
-BatchKVCache.update_and_fetch = _materializing_batch_kv_cache_update_and_fetch
 
 
 class BufferedRotatingKVCache(RotatingKVCache):
@@ -169,8 +112,6 @@ class BufferedRotatingKVCache(RotatingKVCache):
         self.values[..., self._idx : needed, :] = values
         self._idx = needed
         self.offset += incoming
-        if _should_materialize_kv_cache(int(self._idx), incoming):
-            _materialize_kv_cache(self.keys, self.values)
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
 
     def trim(self, n):
@@ -314,11 +255,6 @@ class BatchQuantizedKVCache(_BaseCache):
         for i in range(len(self.keys)):
             self.keys[i][..., prev : self._idx, :] = q_keys[i]
             self.values[i][..., prev : self._idx, :] = q_values[i]
-
-        if _should_materialize_kv_cache(int(self._idx), int(num_steps)):
-            _materialize_kv_cache(
-                self.keys, self.values, self.offset, self.left_padding
-            )
 
         return (
             tuple(k[..., : self._idx, :] for k in self.keys),
@@ -514,8 +450,6 @@ class SimpleKVCache:
             self.values = mx.concatenate([self.values, values], axis=2)
 
         self.cache_length += keys.shape[2]
-        if _should_materialize_kv_cache(int(self.cache_length), int(keys.shape[2])):
-            _materialize_kv_cache(self.keys, self.values)
         return self.keys, self.values
 
     def fetch(self):
@@ -581,9 +515,6 @@ class SlidingWindowCache(_BaseCache):
                 self.keys = keys[:, :, -self.max_size :, :]
                 self.values = values[:, :, -self.max_size :, :]
             self.offset = self.max_size
-
-        if _should_materialize_kv_cache(int(self.offset), int(seq_len)):
-            _materialize_kv_cache(self.keys, self.values)
 
         return self.keys, self.values
 
@@ -651,9 +582,6 @@ class StaticKVCache(_BaseCache):
                 :, :, :actual_seq_len, :
             ]
             self.offset = end_pos
-
-        if _should_materialize_kv_cache(int(self.offset), int(seq_len)):
-            _materialize_kv_cache(self.keys, self.values)
 
         return self.keys, self.values
 
