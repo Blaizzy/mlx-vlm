@@ -2854,7 +2854,8 @@ class BatchGenerator:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
-            if self._steps_counter % 512 == 0:
+            if self._steps_counter % 50 == 0:
+                mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
 
         if len(self._generation_batch) >= self.completion_batch_size:
