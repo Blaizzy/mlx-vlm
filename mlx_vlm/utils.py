@@ -409,6 +409,7 @@ def load(
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     revision: Optional[str] = None,
+    strict: bool = True,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -425,6 +426,8 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
+        strict (bool): Whether or not to raise an exception if weights don't
+            match. Default: ``True``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -440,7 +443,7 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, strict=strict, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
