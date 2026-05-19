@@ -1,7 +1,7 @@
 from typing import Optional
 
 import mlx.core as mx
-from mlx_lm.models.gated_delta import compute_g, gated_delta_update
+from mlx_lm.models.gated_delta import compute_g
 
 
 def _make_gated_delta_with_states_kernel(has_mask: bool = False):
