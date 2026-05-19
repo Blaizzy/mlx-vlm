@@ -662,14 +662,24 @@ class LanguageModel(nn.Module):
         batch_size, seq_length = input_ids.shape
         position_ids = mx.arange(seq_length, dtype=mx.int32)
         position_ids = mx.broadcast_to(position_ids[None, :], (batch_size, seq_length))
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
-        vision_start_token_id = self.config.vision_start_token_id
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
         ):
+            # All four config reads below are Qwen3.5-VL-specific:
+            # ``spatial_merge_size`` lives on ``vision_config`` (Siglip +
+            # spatial merger), and ``image_token_id`` / ``video_token_id`` /
+            # ``vision_start_token_id`` are Qwen3.5-VL's vision-marker token
+            # ids. VLMs that reuse the qwen3_5 text backbone with a different
+            # vision encoder (e.g. MiniCPM-V 4.6's perceiver resampler) inject
+            # features via ``inputs_embeds`` and never pass ``image_grid_thw``
+            # / ``video_grid_thw``, so they land in the else branch below and
+            # never need any of these values. Reading them at function entry
+            # raises AttributeError on those configs.
+            spatial_merge_size = self.config.vision_config.spatial_merge_size
+            image_token_id = self.config.image_token_id
+            video_token_id = self.config.video_token_id
+            vision_start_token_id = self.config.vision_start_token_id
             total_input_ids = input_ids
             if attention_mask is None:
                 attention_mask = mx.ones_like(input_ids)
