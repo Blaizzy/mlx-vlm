@@ -7,14 +7,12 @@ generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
 def _copy_rng_state() -> List[mx.array]:
-    mx.eval(*mx.random.state)
-    return [mx.array(state.tolist(), dtype=state.dtype) for state in mx.random.state]
+    return [mx.array(state) for state in mx.random.state]
 
 
 def _restore_rng_state(state: List[mx.array]) -> None:
     for i, value in enumerate(state):
-        mx.random.state[i] = mx.array(value.tolist(), dtype=value.dtype)
-    mx.eval(*mx.random.state)
+        mx.random.state[i] = value
 
 
 def _append_arrays(value: Any, arrays: List[mx.array]) -> None:
@@ -66,7 +64,7 @@ class _SpeculativeSamplerRNG:
         arrays = _draft_sampler_state_arrays(self.draft_model)
         arrays.extend(mx.random.state)
         if arrays:
-            mx.eval(*arrays)
+            mx.async_eval(*arrays)
 
         self._draft_rng_state = _copy_rng_state()
         _restore_rng_state(self._target_rng_state)
@@ -90,7 +88,7 @@ class _SpeculativeSamplerRNG:
         arrays.extend(_draft_sampler_state_arrays(self.draft_model))
         arrays.extend(mx.random.state)
         if arrays:
-            mx.eval(*arrays)
+            mx.async_eval(*arrays)
 
         self._draft_rng_state = _copy_rng_state()
         _restore_rng_state(self._target_rng_state)
@@ -114,7 +112,7 @@ class _SpeculativeSamplerRNG:
             _append_arrays(value, arrays)
         arrays.extend(mx.random.state)
         if arrays:
-            mx.eval(*arrays)
+            mx.async_eval(*arrays)
         self._target_rng_state = _copy_rng_state()
 
 
