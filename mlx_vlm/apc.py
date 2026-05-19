@@ -102,6 +102,65 @@ def _copy_mlx_array(x: mx.array) -> mx.array:
     return mx.contiguous(mx.array(x, dtype=x.dtype))
 
 
+def _mlx_dtype_bytes(dtype: Any) -> int:
+    """Best-effort byte width for an mx.array dtype. Returns 0 if unknown."""
+    for attr in ("size", "itemsize"):
+        v = getattr(dtype, attr, None)
+        if isinstance(v, int) and v > 0:
+            return v
+    name = str(dtype).lower()
+    if "bfloat16" in name or "float16" in name or "int16" in name or "uint16" in name:
+        return 2
+    if "float32" in name or "int32" in name or "uint32" in name:
+        return 4
+    if "float64" in name or "int64" in name or "uint64" in name:
+        return 8
+    if name.endswith("int8") or name.endswith("uint8") or name.endswith("bool"):
+        return 1
+    return 0
+
+
+def _mlx_array_bytes(a: "mx.array") -> int:
+    """Byte size of an mx.array, with a shape*itemsize fallback."""
+    nb = getattr(a, "nbytes", None)
+    if isinstance(nb, int) and nb > 0:
+        return nb
+    itemsize = getattr(a, "itemsize", None)
+    if not isinstance(itemsize, int) or itemsize <= 0:
+        itemsize = _mlx_dtype_bytes(getattr(a, "dtype", None))
+    if not itemsize:
+        return 0
+    n = 1
+    for d in tuple(a.shape):
+        n *= int(d)
+    return int(n * itemsize)
+
+
+def _estimate_block_kv_bytes(
+    layer_keys: Sequence["mx.array"],
+    layer_values: Sequence["mx.array"],
+    block_size: int,
+) -> int:
+    """Estimate per-block warm-memory cost (K + V bytes for one APC block)
+    from full-cache input shapes, without needing to slice the tensors."""
+    if not layer_keys or not layer_values or block_size <= 0:
+        return 0
+    dtype_bytes = _mlx_dtype_bytes(getattr(layer_keys[0], "dtype", None))
+    if dtype_bytes <= 0:
+        return 0
+    total = 0
+    for arr in list(layer_keys) + list(layer_values):
+        shape = tuple(arr.shape)
+        if len(shape) < 2:
+            continue
+        nondim = 1
+        for d in shape[:-2]:
+            nondim *= int(d)
+        head_dim = int(shape[-1])
+        total += dtype_bytes * nondim * block_size * head_dim
+    return total
+
+
 def _pad_kv_for_capacity(
     keys: mx.array,
     values: mx.array,
@@ -2721,6 +2780,21 @@ class APCManager:
         self._max_pool_tensors = max(
             0, int(os.environ.get("APC_MAX_POOL_TENSORS", "450000"))
         )
+        # Hard byte cap on the warm-memory APCBlock pool. Once adding another
+        # block would push the pool's K/V bytes over this, the block is sent
+        # to disk only (when ``APC_DISK_PATH`` is set) and the in-memory
+        # store is skipped. ``APC_NUM_BLOCKS`` is still the upper bound on
+        # block count; this is an independent bytes-based bound that lets
+        # users cap warm RAM in GB without having to translate to blocks.
+        # Set to 0 to disable (default).
+        max_warm_gb = float(os.environ.get("APC_MAX_WARM_GB", "0") or 0)
+        self._max_warm_bytes = (
+            int(max_warm_gb * (1 << 30)) if max_warm_gb > 0 else 0
+        )
+        # Estimated bytes per APCBlock; populated lazily from the first
+        # store_kv_blocks call so the cap can be enforced without knowing
+        # the model's KV geometry up front.
+        self._per_block_bytes: int = 0
         # Optional compact warm-memory tier for long KV-only prefixes. When a
         # prompt reaches this many full-block tokens, store one layer-major
         # prompt-cache snapshot instead of thousands of per-block tensors. This
@@ -3085,6 +3159,10 @@ class APCManager:
             new_blocks: List[APCBlock] = []
             disk_blocks: List[_DiskLayerMajorBlock] = []
             per_block_tensors = len(layer_keys) + len(layer_values)
+            if self._max_warm_bytes > 0 and self._per_block_bytes <= 0:
+                self._per_block_bytes = _estimate_block_kv_bytes(
+                    layer_keys, layer_values, self.block_size
+                )
             token_tuple = tuple(int(t) for t in token_ids[:layer_major_prefix_tokens])
             layer_major_stored = False
             if (
@@ -3160,6 +3238,23 @@ class APCManager:
                         break
                     parent = h
                     continue
+                if (
+                    self._max_warm_bytes > 0
+                    and self._per_block_bytes > 0
+                    and (len(self.hash_table) + 1) * self._per_block_bytes
+                    > self._max_warm_bytes
+                ):
+                    logger.debug(
+                        "APC warm-memory byte cap reached "
+                        "(%.2f GB); routing block %d/%d to disk only",
+                        self._max_warm_bytes / (1 << 30),
+                        i,
+                        n_full,
+                    )
+                    if self.disk is None:
+                        break
+                    parent = h
+                    continue
                 b = self._evict_lru()
                 if b is None:
                     logger.debug(
@@ -3191,6 +3286,12 @@ class APCManager:
                 new_blocks.append(b)
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
+                if self._max_warm_bytes > 0 and self._per_block_bytes <= 0:
+                    measured = sum(
+                        _mlx_array_bytes(arr) for arr in k_slabs
+                    ) + sum(_mlx_array_bytes(arr) for arr in v_slabs)
+                    if measured > 0:
+                        self._per_block_bytes = measured
                 parent = h
             if self.disk is not None and disk_blocks:
                 try:
@@ -3207,6 +3308,15 @@ class APCManager:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
+            if self._per_block_bytes > 0:
+                snap["warm_bytes"] = (
+                    len(self.hash_table) * self._per_block_bytes
+                )
+                snap["warm_bytes_per_block"] = self._per_block_bytes
+            else:
+                snap["warm_bytes"] = 0
+                snap["warm_bytes_per_block"] = 0
+            snap["warm_max_bytes"] = self._max_warm_bytes
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -3665,10 +3775,13 @@ def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
         except Exception as e:
             logger.warning("APC disk tier disabled (init failed): %s", e)
 
+    max_warm_gb = float(os.environ.get("APC_MAX_WARM_GB", "0") or 0)
+    warm_cap = f"{max_warm_gb:.1f} GB" if max_warm_gb > 0 else "unbounded"
     logger.info(
-        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s)",
+        "APC enabled (block_size=%d, num_blocks=%d, warm_cap=%s, hash=%s, disk=%s)",
         block_size,
         num_blocks,
+        warm_cap,
         "sha256" if _hash_use_sha256() else "fast",
         bool(disk),
     )

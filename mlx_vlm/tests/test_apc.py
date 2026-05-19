@@ -13,6 +13,7 @@ from mlx_vlm.apc import (
     APCManager,
     DiskBlockStore,
     _copy_mlx_array,
+    _estimate_block_kv_bytes,
     _hash_tokens,
     extract_prompt_cache_from_batch,
     from_env,
@@ -314,6 +315,76 @@ def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     assert warm is not None
     assert matched_tokens == len(token_ids)
     assert manager.stats_snapshot()["pool_used"] == 0
+    manager.close()
+
+
+def test_apc_max_warm_gb_routes_overflow_to_disk(tmp_path, monkeypatch):
+    monkeypatch.delenv("APC_MAX_POOL_TENSORS", raising=False)
+    monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "4")
+
+    block_size = 16
+    n_blocks = 4
+    token_ids = list(range(n_blocks * block_size))
+    layer_keys, layer_values = _make_fake_kv(
+        num_layers=2, seq_len=len(token_ids)
+    )
+
+    one_block_bytes = _estimate_block_kv_bytes(
+        layer_keys, layer_values, block_size
+    )
+    assert one_block_bytes > 0
+    max_warm_bytes = one_block_bytes * 2 + one_block_bytes // 2
+
+    disk = DiskBlockStore(tmp_path, namespace="unit_warm_gb")
+    manager = APCManager(num_blocks=16, block_size=block_size, disk=disk)
+    manager._max_warm_bytes = max_warm_bytes
+
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+
+    assert len(stored) == 2, "expected only blocks that fit under the warm cap"
+    snap = manager.stats_snapshot()
+    assert snap["pool_used"] == 2
+    assert snap["warm_max_bytes"] == max_warm_bytes
+    assert snap["warm_bytes_per_block"] > 0
+    assert snap["warm_bytes"] == 2 * snap["warm_bytes_per_block"]
+    assert snap["warm_bytes"] <= max_warm_bytes
+
+    manager.release(stored)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="unit_warm_gb")
+    manager = APCManager(num_blocks=16, block_size=block_size, disk=disk)
+    warm, matched_tokens = manager.lookup_prefix_disk_cache(token_ids)
+
+    assert warm is not None
+    assert matched_tokens == len(token_ids), (
+        "all blocks should be restorable from disk even though warm memory "
+        "stopped after the cap was hit"
+    )
+    manager.close()
+
+
+def test_from_env_parses_max_warm_gb(monkeypatch):
+    monkeypatch.setenv("APC_ENABLED", "1")
+    monkeypatch.setenv("APC_BLOCK_SIZE", "16")
+    monkeypatch.setenv("APC_NUM_BLOCKS", "4")
+    monkeypatch.delenv("APC_DISK_PATH", raising=False)
+
+    monkeypatch.setenv("APC_MAX_WARM_GB", "0")
+    manager = from_env()
+    assert manager is not None
+    assert manager._max_warm_bytes == 0
+    snap = manager.stats_snapshot()
+    assert snap["warm_max_bytes"] == 0
+    manager.close()
+
+    monkeypatch.setenv("APC_MAX_WARM_GB", "2.5")
+    manager = from_env()
+    assert manager is not None
+    assert manager._max_warm_bytes == int(2.5 * (1 << 30))
+    snap = manager.stats_snapshot()
+    assert snap["warm_max_bytes"] == int(2.5 * (1 << 30))
     manager.close()
 
 

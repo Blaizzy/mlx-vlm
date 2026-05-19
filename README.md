@@ -663,6 +663,19 @@ APC_DISK_SHARD_MAX_BLOCKS=256 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
 ```
 
+Cap warm memory in GB and spill the rest to disk — once the in-memory pool
+reaches `APC_MAX_WARM_GB`, new blocks are written to disk only and the
+warmest existing blocks stay resident in RAM:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=8192 \
+APC_MAX_WARM_GB=4 \
+APC_DISK_PATH=~/.cache/mlx-vlm/caching \
+APC_DISK_MAX_GB=20 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
 Repeated requests with the same long prefix will hit APC automatically:
 
 ```sh
@@ -698,6 +711,7 @@ Common APC environment variables:
 | `APC_DISK_PATH` | unset | Directory for persistent disk shards |
 | `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
+| `APC_MAX_WARM_GB` | `0` | Warm-memory cap in GB. `0` means uncapped (bounded only by `APC_NUM_BLOCKS`); above this, new blocks are written to disk only |
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
 | `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
