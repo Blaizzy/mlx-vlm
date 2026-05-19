@@ -460,8 +460,12 @@ def test_responses_previous_response_id_replays_stored_items(client):
     second = SimpleNamespace(text="Second answer", prompt_tokens=7, generation_tokens=2)
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
-        patch.object(server, "apply_chat_template", return_value="prompt") as mock_template,
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
         patch.object(server, "generate", side_effect=[first, second]),
     ):
         first_response = client.post(
@@ -511,8 +515,12 @@ def test_responses_endpoint_returns_function_call_items(client):
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
-        patch.object(server, "apply_chat_template", return_value="prompt") as mock_template,
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
         patch.object(server, "generate", return_value=result),
         patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
         patch.object(server, "load_tool_module", return_value=tool_module),
@@ -540,7 +548,9 @@ def test_responses_endpoint_returns_function_call_items(client):
     assert payload["output"][0]["type"] == "function_call"
     assert payload["output"][0]["name"] == "get_weather"
     assert payload["output"][0]["arguments"] == '{"location": "SF"}'
-    assert mock_template.call_args.kwargs["tools"][0]["function"]["name"] == "get_weather"
+    assert (
+        mock_template.call_args.kwargs["tools"][0]["function"]["name"] == "get_weather"
+    )
 
 
 def test_responses_endpoint_returns_native_shell_call_items(client):
@@ -561,7 +571,9 @@ def test_responses_endpoint_returns_native_shell_call_items(client):
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(server, "generate", return_value=result),
         patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
@@ -605,7 +617,9 @@ def test_responses_streaming_emits_native_tool_call_items(client):
     )
 
     with (
-        patch.object(server, "get_cached_model", return_value=(model, processor, config)),
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
         patch.object(server, "apply_chat_template", return_value="prompt"),
         patch.object(server, "stream_generate", return_value=iter(chunks)),
         patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),

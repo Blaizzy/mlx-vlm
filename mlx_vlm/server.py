@@ -1837,9 +1837,12 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="System/developer instructions for this response."
     )
     previous_response_id: Optional[str] = Field(
-        None, description="ID of a previous response whose input/output items should be included."
+        None,
+        description="ID of a previous response whose input/output items should be included.",
     )
-    tools: Optional[List[Any]] = Field(None, description="Responses API tool definitions.")
+    tools: Optional[List[Any]] = Field(
+        None, description="Responses API tool definitions."
+    )
     tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
@@ -2102,7 +2105,9 @@ def _append_response_item_to_prompt(
                 elif part_type == "image_url":
                     image_url = part.get("image_url")
                     images.append(
-                        image_url.get("url") if isinstance(image_url, dict) else image_url
+                        image_url.get("url")
+                        if isinstance(image_url, dict)
+                        else image_url
                     )
             content = "\n".join(p for p in text_parts if p)
         chat_messages.append({"role": role, "content": content or ""})
@@ -2240,7 +2245,9 @@ def _response_tool_to_chat_tool(tool: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _response_tool_registry(tools: Optional[List[Any]]) -> Tuple[List[Any], Dict[str, str]]:
+def _response_tool_registry(
+    tools: Optional[List[Any]],
+) -> Tuple[List[Any], Dict[str, str]]:
     chat_tools = []
     registry: Dict[str, str] = {}
     for tool in tools or []:
@@ -3943,7 +3950,9 @@ async def responses_endpoint(request: Request):
                     if clean_text:
                         completed_output.append(final_message_item.model_dump())
                     completed_output.extend(tool_output_items)
-                    for output_index, tool_item in enumerate(tool_output_items, start=1):
+                    for output_index, tool_item in enumerate(
+                        tool_output_items, start=1
+                    ):
                         yield _sse_event(
                             "response.output_item.added",
                             {
@@ -3966,9 +3975,7 @@ async def responses_endpoint(request: Request):
                         "tool_calls"
                         if output_finish_reason == "tool_calls"
                         else finish_reason
-                    ) or (
-                        "stop" if usage_stats["output_tokens"] > 0 else None
-                    )
+                    ) or ("stop" if usage_stats["output_tokens"] > 0 else None)
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
                         model=openai_request.model,
