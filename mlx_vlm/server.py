@@ -1,5 +1,7 @@
 import argparse
 import asyncio
+import base64
+import binascii
 import gc
 import json
 import logging
@@ -12,6 +14,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -68,6 +71,8 @@ DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
+_AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
+_AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
 
 
 class PromptTooLongError(ValueError):
@@ -1733,6 +1738,43 @@ class ResponseInputAudioParam(TypedDict, total=False):
         Literal["input_audio"]
     ]  # The type of the input item. Always `input_audio`.
     input_audio: Required[InputAudio]
+
+
+def _looks_like_audio_reference(value: str) -> bool:
+    return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
+        _AUDIO_REFERENCE_SUFFIXES
+    )
+
+
+def _decode_input_audio_data(input_audio: InputAudio):
+    data = input_audio["data"]
+    if not isinstance(data, str):
+        return data
+
+    stripped = data.strip()
+    if stripped.startswith("data:"):
+        prefix, separator, encoded = stripped.partition(",")
+        if (
+            separator == ","
+            and ";base64" in prefix
+            and prefix.startswith("data:audio/")
+        ):
+            try:
+                return BytesIO(base64.b64decode(encoded, validate=True))
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="input_audio data URI is not valid base64 audio",
+                ) from exc
+        return data
+
+    if _looks_like_audio_reference(stripped):
+        return data
+
+    try:
+        return BytesIO(base64.b64decode(stripped, validate=True))
+    except (binascii.Error, ValueError):
+        return data
 
 
 class ImageUrl(TypedDict, total=False):
@@ -3832,7 +3874,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         elif item_type == "image_url":
                             images.append(item["image_url"]["url"])
                         elif item_type == "input_audio":
-                            audio.append(item["input_audio"]["data"])
+                            audio.append(_decode_input_audio_data(item["input_audio"]))
                 msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
