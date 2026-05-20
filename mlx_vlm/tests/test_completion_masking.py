@@ -145,10 +145,38 @@ class FakeTokenizer:
         return self.token_map[ids[0]]
 
 
+class FakeGemmaTokenizer:
+    token_map = {
+        1: "<start_of_turn>",
+        2: "<end_of_turn>",
+        10: "user",
+        11: "model",
+        20: "U",
+        21: "A",
+    }
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False):
+        return "unused"
+
+    def encode(self, text):
+        return [1, 10, 20, 2, 1, 11, 21, 2]
+
+    def decode(self, ids):
+        return self.token_map[ids[0]]
+
+
 class TestResolveCompletionTokenIds(unittest.TestCase):
     def test_detects_role_and_end_turn_ids(self):
         assistant_id, end_turn_id, user_id = resolve_completion_token_ids(
             FakeTokenizer()
+        )
+        self.assertEqual(assistant_id, 11)
+        self.assertEqual(end_turn_id, 2)
+        self.assertEqual(user_id, 10)
+
+    def test_detects_gemma_role_and_end_turn_ids(self):
+        assistant_id, end_turn_id, user_id = resolve_completion_token_ids(
+            FakeGemmaTokenizer()
         )
         self.assertEqual(assistant_id, 11)
         self.assertEqual(end_turn_id, 2)

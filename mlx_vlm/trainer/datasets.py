@@ -79,7 +79,12 @@ def resolve_completion_token_ids(
 
     role_keywords = {"model", "assistant", "bot"}
     user_keywords = {"user", "human"}
-    end_turn_markers = {"<turn|>", "<|im_end|>", "<end_of_utterance>"}
+    end_turn_markers = {
+        "<turn|>",
+        "<|im_end|>",
+        "<end_of_turn>",
+        "<end_of_utterance>",
+    }
 
     prev_is_special = False
     for tid in probe_ids:
