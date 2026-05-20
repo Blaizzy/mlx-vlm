@@ -1,3 +1,4 @@
+import json
 import time
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -449,6 +450,199 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
 
 
+def test_responses_previous_response_id_replays_stored_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    first = SimpleNamespace(text="First answer", prompt_tokens=3, generation_tokens=2)
+    second = SimpleNamespace(text="Second answer", prompt_tokens=7, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", side_effect=[first, second]),
+    ):
+        first_response = client.post(
+            "/v1/responses", json={"model": "demo", "input": "First"}
+        )
+        assert first_response.status_code == 200
+        previous_response_id = first_response.json()["id"]
+
+        second_response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "previous_response_id": previous_response_id,
+                "input": "Second",
+            },
+        )
+
+    assert second_response.status_code == 200
+    replayed_messages = mock_template.call_args_list[1].args[2]
+    assert replayed_messages == [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "content": "First answer"},
+        {"role": "user", "content": "Second"},
+    ]
+    retrieved = client.get(f"/v1/responses/{previous_response_id}")
+    assert retrieved.status_code == 200
+    input_items = client.get(f"/v1/responses/{previous_response_id}/input_items")
+    assert input_items.status_code == 200
+    assert input_items.json()["data"][0]["content"][0]["text"] == "First"
+
+
+def test_responses_endpoint_returns_function_call_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+        prompt_tokens=8,
+        generation_tokens=4,
+    )
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "weather?",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output"][0]["type"] == "function_call"
+    assert payload["output"][0]["name"] == "get_weather"
+    assert payload["output"][0]["arguments"] == '{"location": "SF"}'
+    assert (
+        mock_template.call_args.kwargs["tools"][0]["function"]["name"] == "get_weather"
+    )
+
+
+def test_responses_endpoint_returns_native_shell_call_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
+        prompt_tokens=8,
+        generation_tokens=4,
+    )
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "run pwd",
+                "tools": [{"type": "shell"}],
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["output"][0]["type"] == "shell_call"
+    assert payload["output"][0]["action"] == {"type": "exec", "command": "pwd"}
+
+
+def test_responses_streaming_emits_native_tool_call_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        SimpleNamespace(
+            text='<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
+            prompt_tokens=8,
+            generation_tokens=4,
+            prompt_tps=None,
+            generation_tps=None,
+            peak_memory=0.0,
+        )
+    ]
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+        patch.object(server, "response_generator", None),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "run pwd",
+                "stream": True,
+                "tools": [{"type": "shell"}],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"type": "shell_call"' in body
+    assert '"command": "pwd"' in body
+    assert "<tool_call>" not in body
+
+
 @pytest.mark.parametrize(
     ("path", "payload"),
     [
@@ -703,6 +897,403 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
             "content": "First text block. Second text block.",
         }
     ]
+
+
+def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
+    monkeypatch.setattr(server, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "system": "You are concise.",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe it."},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "url",
+                                    "url": "https://example.com/image.png",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["type"] == "message"
+    assert payload["role"] == "assistant"
+    assert payload["content"] == [{"type": "text", "text": "done"}]
+    assert payload["stop_reason"] == "end_turn"
+    assert payload["usage"] == {"input_tokens": 8, "output_tokens": 4}
+    assert mock_template.call_args.args[2] == [
+        {"role": "system", "content": "You are concise."},
+        {"role": "user", "content": "Describe it."},
+    ]
+    assert mock_generate.call_args.kwargs["image"] == ["https://example.com/image.png"]
+    assert mock_generate.call_args.kwargs["max_tokens"] == 12
+
+
+def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
+    monkeypatch.setattr(server, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=5,
+        generation_tokens=2,
+        prompt_tps=0.0,
+        generation_tps=0.0,
+        peak_memory=0.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "get_weather",
+                                "input": {"location": "SF"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": "72F",
+                            }
+                        ],
+                    },
+                ],
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": json.dumps({"location": "SF"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
+    ]
+
+
+def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkeypatch):
+    monkeypatch.setattr(server, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=5,
+        generation_tokens=2,
+        prompt_tps=0.0,
+        generation_tps=0.0,
+        peak_memory=0.0,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "render_chart",
+                                "input": {"kind": "bar"},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [
+                                    {"type": "text", "text": "Rendered chart."},
+                                    {
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": "image/png",
+                                            "data": "aW1n",
+                                        },
+                                    },
+                                ],
+                            }
+                        ],
+                    },
+                ],
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "toolu_1",
+                    "type": "function",
+                    "function": {
+                        "name": "render_chart",
+                        "arguments": json.dumps({"kind": "bar"}, ensure_ascii=False),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "toolu_1",
+            "content": [
+                {"type": "text", "text": "Rendered chart."},
+                {"type": "image"},
+            ],
+            "name": None,
+        },
+    ]
+    assert mock_generate.call_args.kwargs["image"] == ["data:image/png;base64,aW1n"]
+
+
+def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch):
+    monkeypatch.setattr(server, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+        prompt_tokens=7,
+        generation_tokens=6,
+        prompt_tps=0.0,
+        generation_tps=0.0,
+        peak_memory=0.0,
+    )
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                            "required": ["location"],
+                        },
+                    }
+                ],
+                "max_tokens": 8,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["stop_reason"] == "tool_use"
+    assert payload["content"][0]["type"] == "tool_use"
+    assert payload["content"][0]["name"] == "get_weather"
+    assert payload["content"][0]["input"] == {"location": "SF"}
+
+
+def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                [
+                    server.StreamingToken(
+                        text="Hel", token=1, logprobs=0.0, finish_reason=None
+                    ),
+                    server.StreamingToken(
+                        text="lo", token=2, logprobs=0.0, finish_reason="stop"
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: message_start" in body
+    assert "event: content_block_start" in body
+    assert "event: content_block_delta" in body
+    assert '"text": "Hel"' in body
+    assert "event: message_delta" in body
+    assert '"stop_reason": "end_turn"' in body
+    assert "event: message_stop" in body
+
+
+def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                [
+                    server.StreamingToken(
+                        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+                "max_tokens": 4,
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"type": "tool_use"' in body
+    assert '"name": "get_weather"' in body
+    assert '"type": "input_json_delta"' in body
+    assert '"partial_json": "{\\"location\\": \\"SF\\"}"' in body
+    assert '"stop_reason": "tool_use"' in body
 
 
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):

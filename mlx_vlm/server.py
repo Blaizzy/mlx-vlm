@@ -15,7 +15,7 @@ from datetime import datetime
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -23,7 +23,7 @@ import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
@@ -1797,7 +1797,7 @@ class OpenAIRequest(FlexibleBaseModel):
     Using this structure : https://github.com/openai/openai-python/blob/main/src/openai/resources/responses/responses.py
     """
 
-    input: Union[str, List[ChatMessage]] = Field(
+    input: Union[str, List[Any]] = Field(
         ..., description="Input text or list of chat messages."
     )
     model: str = Field(..., description="The model to use for generation.")
@@ -1832,6 +1832,20 @@ class OpenAIRequest(FlexibleBaseModel):
     )
     text: Optional[Any] = Field(
         None, description="Responses API text format configuration."
+    )
+    instructions: Optional[str] = Field(
+        None, description="System/developer instructions for this response."
+    )
+    previous_response_id: Optional[str] = Field(
+        None,
+        description="ID of a previous response whose input/output items should be included.",
+    )
+    tools: Optional[List[Any]] = Field(
+        None, description="Responses API tool definitions."
+    )
+    tool_choice: Optional[Any] = Field(None, description="Tool choice policy.")
+    store: Optional[bool] = Field(
+        True, description="Whether to store this response for later retrieval."
     )
 
 
@@ -1898,6 +1912,12 @@ class OpenAIResponse(BaseModel):
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
+    previous_response_id: Optional[str] = Field(
+        None, description="ID of the previous response used for this response."
+    )
+    store: Optional[bool] = Field(
+        True, description="Whether this response is stored for later retrieval."
+    )
 
 
 class BaseStreamEvent(BaseModel):
@@ -1931,7 +1951,7 @@ class ResponseInProgressEvent(BaseStreamEvent):
 class ResponseOutputItemAddedEvent(BaseStreamEvent):
     type: Literal["response.output_item.added"]
     output_index: int
-    item: MessageItem
+    item: Any
 
 
 class ResponseContentPartAddedEvent(BaseStreamEvent):
@@ -1969,7 +1989,7 @@ class ResponseContentPartDoneEvent(BaseStreamEvent):
 class ResponseOutputItemDoneEvent(BaseStreamEvent):
     type: Literal["response.output_item.done"]
     output_index: int
-    item: MessageItem
+    item: Any
 
 
 class ResponseCompletedEvent(BaseStreamEvent):
@@ -1988,6 +2008,334 @@ StreamEvent = Union[
     ResponseOutputItemDoneEvent,
     ResponseCompletedEvent,
 ]
+
+
+RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
+
+
+@dataclass
+class StoredResponse:
+    response: Dict[str, Any]
+    input_items: List[Dict[str, Any]]
+    output_items: List[Dict[str, Any]]
+    previous_response_id: Optional[str] = None
+
+
+response_store: Dict[str, StoredResponse] = {}
+response_store_order: deque = deque()
+response_store_lock = Lock()
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    return value
+
+
+def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(payload, default=_jsonable)}\n\n"
+
+
+def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": input_value}],
+            }
+        ]
+    if not isinstance(input_value, list):
+        raise HTTPException(status_code=400, detail="Invalid input format.")
+
+    items = []
+    for item in input_value:
+        item = _as_plain_dict(item)
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Invalid input format.")
+        item_type = item.get("type")
+        if item_type is None and item.get("role") is not None:
+            item = {**item, "type": "message"}
+        items.append(item)
+    return items
+
+
+def _response_call_to_chat_tool_call(item: Dict[str, Any]) -> Dict[str, Any]:
+    call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}"
+    name = item.get("name")
+    arguments = item.get("arguments")
+    if item.get("type") == "shell_call":
+        name = name or "shell"
+        action = item.get("action") or {}
+        arguments = arguments or json.dumps(action, ensure_ascii=False)
+    elif item.get("type") == "apply_patch_call":
+        name = name or "apply_patch"
+        arguments = arguments or item.get("patch") or item.get("input") or "{}"
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments or {}, ensure_ascii=False)
+    return {
+        "type": "function",
+        "id": call_id,
+        "function": {"name": name or "tool", "arguments": arguments},
+    }
+
+
+def _append_response_item_to_prompt(
+    item: Dict[str, Any],
+    chat_messages: List[Dict[str, Any]],
+    images: List[Any],
+):
+    item_type = item.get("type")
+    if item_type == "message":
+        role = item.get("role") or "user"
+        content = item.get("content")
+        if isinstance(content, list):
+            text_parts = []
+            for part in content:
+                part = _as_plain_dict(part)
+                if not isinstance(part, dict):
+                    continue
+                part_type = part.get("type")
+                if part_type in ("input_text", "output_text", "text"):
+                    text_parts.append(str(part.get("text", "")))
+                elif part_type == "input_image":
+                    image = part.get("image_url") or part.get("file_id")
+                    if image:
+                        images.append(image)
+                elif part_type == "image_url":
+                    image_url = part.get("image_url")
+                    images.append(
+                        image_url.get("url")
+                        if isinstance(image_url, dict)
+                        else image_url
+                    )
+            content = "\n".join(p for p in text_parts if p)
+        chat_messages.append({"role": role, "content": content or ""})
+        return
+
+    if item_type in ("function_call", "shell_call", "apply_patch_call"):
+        chat_messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [_response_call_to_chat_tool_call(item)],
+            }
+        )
+        return
+
+    if item_type in (
+        "function_call_output",
+        "shell_call_output",
+        "apply_patch_call_output",
+        "tool_result",
+    ):
+        output = item.get("output", item.get("content", ""))
+        if not isinstance(output, str):
+            output = json.dumps(output, ensure_ascii=False)
+        chat_messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": item.get("call_id") or item.get("tool_call_id"),
+                "content": output,
+            }
+        )
+
+
+def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not previous_response_id:
+        return []
+    chain: List[StoredResponse] = []
+    seen = set()
+    current_id = previous_response_id
+    with response_store_lock:
+        while current_id:
+            if current_id in seen:
+                break
+            seen.add(current_id)
+            stored = response_store.get(current_id)
+            if stored is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Previous response not found: {current_id}",
+                )
+            chain.append(stored)
+            current_id = stored.previous_response_id
+
+    items: List[Dict[str, Any]] = []
+    for stored in reversed(chain):
+        items.extend(stored.input_items)
+        items.extend(stored.output_items)
+    return items
+
+
+def _response_items_to_chat(
+    items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Any]]:
+    chat_messages: List[Dict[str, Any]] = []
+    images: List[Any] = []
+    for item in items:
+        _append_response_item_to_prompt(item, chat_messages, images)
+    return chat_messages, images
+
+
+def _store_response(
+    response: OpenAIResponse,
+    input_items: List[Dict[str, Any]],
+    output_items: List[Dict[str, Any]],
+    previous_response_id: Optional[str],
+):
+    if getattr(response, "store", True) is False:
+        return
+    payload = response.model_dump(exclude_none=True)
+    with response_store_lock:
+        response_store[response.id] = StoredResponse(
+            response=payload,
+            input_items=input_items,
+            output_items=output_items,
+            previous_response_id=previous_response_id,
+        )
+        response_store_order.append(response.id)
+        while len(response_store_order) > RESPONSE_STORE_LIMIT:
+            old_id = response_store_order.popleft()
+            response_store.pop(old_id, None)
+
+
+def _response_tool_to_chat_tool(tool: Any) -> Optional[Dict[str, Any]]:
+    tool = _as_plain_dict(tool)
+    if not isinstance(tool, dict):
+        return None
+    tool_type = tool.get("type")
+    if tool_type == "function" and isinstance(tool.get("function"), dict):
+        return tool
+    if tool_type == "function":
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name"),
+                "description": tool.get("description"),
+                "parameters": tool.get("parameters") or {},
+            },
+        }
+    if tool_type == "shell":
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name") or "shell",
+                "description": tool.get("description") or "Run a shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        }
+    if tool_type == "apply_patch":
+        return {
+            "type": "function",
+            "function": {
+                "name": tool.get("name") or "apply_patch",
+                "description": tool.get("description") or "Apply a patch to files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"patch": {"type": "string"}},
+                    "required": ["patch"],
+                },
+            },
+        }
+    return None
+
+
+def _response_tool_registry(
+    tools: Optional[List[Any]],
+) -> Tuple[List[Any], Dict[str, str]]:
+    chat_tools = []
+    registry: Dict[str, str] = {}
+    for tool in tools or []:
+        plain = _as_plain_dict(tool)
+        chat_tool = _response_tool_to_chat_tool(plain)
+        if chat_tool is None:
+            continue
+        chat_tools.append(chat_tool)
+        function = chat_tool.get("function", {})
+        name = function.get("name")
+        if name:
+            registry[name] = (plain or {}).get("type", "function")
+    return chat_tools, registry
+
+
+def _tool_call_to_response_item(
+    call: Dict[str, Any],
+    registry: Dict[str, str],
+) -> Dict[str, Any]:
+    function = call.get("function", {})
+    name = function.get("name") or "tool"
+    arguments = function.get("arguments") or "{}"
+    call_id = call.get("id") or f"call_{uuid.uuid4().hex}"
+    tool_type = registry.get(name, "function")
+    if tool_type == "shell":
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            parsed = {"command": arguments}
+        command = parsed.get("command", parsed) if isinstance(parsed, dict) else parsed
+        return {
+            "id": f"sh_{uuid.uuid4().hex}",
+            "type": "shell_call",
+            "call_id": call_id,
+            "status": "completed",
+            "action": {"type": "exec", "command": command},
+        }
+    if tool_type == "apply_patch":
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except Exception:
+            parsed = {"patch": arguments}
+        patch = parsed.get("patch", parsed) if isinstance(parsed, dict) else parsed
+        return {
+            "id": f"apc_{uuid.uuid4().hex}",
+            "type": "apply_patch_call",
+            "call_id": call_id,
+            "status": "completed",
+            "patch": patch,
+        }
+    return {
+        "id": f"fc_{uuid.uuid4().hex}",
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": "completed",
+    }
+
+
+def _response_output_items_from_text(
+    full_text: str,
+    message_id: str,
+    tool_module: Any,
+    chat_tools: List[Any],
+    tool_registry: Dict[str, str],
+) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
+    reasoning, content = _split_thinking(full_text)
+    if tool_module is not None and chat_tools:
+        tc = process_tool_calls(full_text, tool_module, chat_tools)
+        if tc["calls"]:
+            items = [
+                _tool_call_to_response_item(call, tool_registry) for call in tc["calls"]
+            ]
+            _, remaining = _split_thinking(tc.get("remaining_text") or "")
+            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
+            return items, remaining, reasoning, "tool_calls"
+    item = {
+        "id": message_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": content, "annotations": []}],
+    }
+    if reasoning:
+        item["reasoning"] = reasoning
+    return [item], content, reasoning, "stop"
+
 
 # Models for /chat/completion endpoint
 
@@ -2129,6 +2477,68 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats] = None
 
 
+# Models for Anthropic-compatible /v1/messages endpoint
+
+
+class AnthropicMessageParam(FlexibleBaseModel):
+    role: Literal["user", "assistant"]
+    content: Union[str, List[Any]]
+
+
+class AnthropicRequest(FlexibleBaseModel):
+    model: str = Field(..., description="The model to use for generation.")
+    messages: List[AnthropicMessageParam]
+    max_tokens: int = Field(
+        default_factory=get_server_max_tokens,
+        description="Maximum number of tokens to generate.",
+    )
+    system: Optional[Union[str, List[Any]]] = None
+    stream: bool = False
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    stop_sequences: Optional[List[str]] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
+    metadata: Optional[Any] = None
+    thinking: Optional[Any] = None
+    output_config: Optional[Any] = None
+    adapter_path: Optional[str] = None
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    enable_thinking: Optional[bool] = None
+    thinking_budget: Optional[int] = None
+    thinking_start_token: Optional[str] = None
+    response_format: Optional[Any] = None
+
+
+class AnthropicUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class AnthropicMessageResponse(BaseModel):
+    id: str
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    content: List[Any]
+    model: str
+    stop_reason: Optional[
+        Literal[
+            "end_turn",
+            "max_tokens",
+            "stop_sequence",
+            "tool_use",
+            "pause_turn",
+            "refusal",
+        ]
+    ] = None
+    stop_sequence: Optional[str] = None
+    usage: AnthropicUsage = Field(default_factory=AnthropicUsage)
+
+
 # Models for /models endpoint
 
 
@@ -2143,7 +2553,1089 @@ class ModelsResponse(BaseModel):
     data: List[ModelInfo]
 
 
+def _anthropic_error_response(
+    status_code: int, message: str, error_type: str = "invalid_request_error"
+):
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+        headers={"request-id": f"req_{uuid.uuid4().hex}"},
+    )
+
+
+def _sse_event(event: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _anthropic_system_text(system: Optional[Union[str, List[Any]]]) -> Optional[str]:
+    if system is None:
+        return None
+    if isinstance(system, str):
+        return system
+    parts = []
+    for item in system:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text = item.get("text")
+            if text:
+                parts.append(str(text))
+        elif item is not None:
+            parts.append(str(item))
+    return "\n".join(parts).strip() or None
+
+
+def _anthropic_image_source_to_ref(source: Any) -> Optional[str]:
+    source = _as_plain_dict(source)
+    if not isinstance(source, dict):
+        return None
+    source_type = source.get("type")
+    if source_type == "url":
+        return source.get("url")
+    if source_type == "base64":
+        media_type = source.get("media_type") or "image/png"
+        data = source.get("data")
+        if data:
+            return f"data:{media_type};base64,{data}"
+    return None
+
+
+def _anthropic_tool_result_content_to_openai(
+    content: Any, images: Optional[List[str]] = None
+) -> Union[str, List[Dict[str, Any]]]:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        content_parts: List[Dict[str, Any]] = []
+        saw_image = False
+
+        def append_text(text: Any) -> None:
+            if text:
+                text_parts.append(str(text))
+                content_parts.append({"type": "text", "text": str(text)})
+
+        for item in content:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "text":
+                    append_text(item.get("text"))
+                elif item_type == "document":
+                    source = _as_plain_dict(item.get("source"))
+                    if isinstance(source, dict) and source.get("type") == "text":
+                        append_text(source.get("data"))
+                elif item_type == "image":
+                    image_ref = _anthropic_image_source_to_ref(item.get("source"))
+                    if image_ref:
+                        saw_image = True
+                        if images is not None:
+                            images.append(image_ref)
+                        content_parts.append({"type": "image"})
+                elif item.get("content"):
+                    append_text(item["content"])
+            elif item is not None:
+                append_text(item)
+        if saw_image:
+            return content_parts
+        return "\n".join(text_parts).strip()
+    return str(content)
+
+
+def _anthropic_tool_to_openai(tool: Any) -> Optional[Dict[str, Any]]:
+    tool = _as_plain_dict(tool)
+    if not isinstance(tool, dict):
+        return None
+    name = tool.get("name")
+    input_schema = tool.get("input_schema")
+    if not name or input_schema is None:
+        # Anthropic server tools (web_search, code_execution, etc.) cannot be
+        # executed by this local server, so they are accepted but not surfaced
+        # to model chat templates.
+        return None
+    function = {
+        "name": name,
+        "description": tool.get("description", ""),
+        "parameters": input_schema,
+    }
+    if tool.get("strict") is not None:
+        function["strict"] = tool.get("strict")
+    return {"type": "function", "function": function}
+
+
+def _anthropic_tools_to_openai(
+    tools: Optional[List[Any]],
+) -> Optional[List[Dict[str, Any]]]:
+    if not tools:
+        return None
+    converted = []
+    for tool in tools:
+        converted_tool = _anthropic_tool_to_openai(tool)
+        if converted_tool is not None:
+            converted.append(converted_tool)
+    return converted or None
+
+
+def _anthropic_tool_choice_to_openai(tool_choice: Any) -> Optional[Any]:
+    tool_choice = _as_plain_dict(tool_choice)
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        return tool_choice
+    if not isinstance(tool_choice, dict):
+        return None
+    choice_type = tool_choice.get("type")
+    if choice_type in ("auto", "none"):
+        return choice_type
+    if choice_type == "any":
+        return "required"
+    if choice_type == "tool" and tool_choice.get("name"):
+        return {
+            "type": "function",
+            "function": {"name": tool_choice["name"]},
+        }
+    return None
+
+
+def _anthropic_tool_use_to_openai(block: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": block.get("id") or f"toolu_{uuid.uuid4().hex}",
+        "type": "function",
+        "function": {
+            "name": block.get("name", ""),
+            "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+        },
+    }
+
+
+def _openai_tool_call_to_anthropic(call: Any) -> Dict[str, Any]:
+    call = _as_plain_dict(call) or {}
+    function = _as_plain_dict(call.get("function")) or {}
+    arguments = function.get("arguments", {})
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments) if arguments else {}
+        except json.JSONDecodeError:
+            arguments = {}
+    return {
+        "type": "tool_use",
+        "id": call.get("id") or f"toolu_{uuid.uuid4().hex}",
+        "name": function.get("name", ""),
+        "input": arguments if isinstance(arguments, dict) else {},
+    }
+
+
+def _anthropic_content_blocks_to_text_and_tools(
+    role: str,
+    content: Union[str, List[Any]],
+    images: List[str],
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if isinstance(content, str):
+        return content, [], []
+
+    text_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    tool_results: List[Dict[str, Any]] = []
+    for raw_item in content or []:
+        item = _as_plain_dict(raw_item)
+        if not isinstance(item, dict):
+            if item is not None:
+                text_parts.append(str(item))
+            continue
+
+        item_type = item.get("type")
+        if item_type == "text":
+            text = item.get("text")
+            if text:
+                text_parts.append(str(text))
+        elif item_type == "image" and role == "user":
+            image_ref = _anthropic_image_source_to_ref(item.get("source"))
+            if image_ref:
+                images.append(image_ref)
+        elif item_type == "tool_use" and role == "assistant":
+            tool_calls.append(_anthropic_tool_use_to_openai(item))
+        elif item_type == "tool_result" and role == "user":
+            tool_results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.get("tool_use_id"),
+                    "content": _anthropic_tool_result_content_to_openai(
+                        item.get("content"), images
+                    ),
+                    "name": item.get("name"),
+                }
+            )
+        elif item_type in ("thinking", "redacted_thinking"):
+            continue
+        elif item.get("text"):
+            text_parts.append(str(item["text"]))
+
+    return "\n".join(text_parts).strip(), tool_calls, tool_results
+
+
+def _anthropic_messages_to_internal(
+    request: AnthropicRequest,
+) -> Tuple[
+    List[Dict[str, Any]], List[str], Optional[List[Dict[str, Any]]], Optional[Any]
+]:
+    images: List[str] = []
+    processed_messages: List[Dict[str, Any]] = []
+
+    system_text = _anthropic_system_text(request.system)
+    if system_text:
+        processed_messages.append({"role": "system", "content": system_text})
+
+    for message in request.messages:
+        content_text, tool_calls, tool_results = (
+            _anthropic_content_blocks_to_text_and_tools(
+                message.role, message.content, images
+            )
+        )
+        if content_text or tool_calls or not tool_results:
+            msg: Dict[str, Any] = {"role": message.role, "content": content_text}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+                if not content_text:
+                    msg["content"] = None
+            processed_messages.append(msg)
+        processed_messages.extend(tool_results)
+
+    tools = _anthropic_tools_to_openai(request.tools)
+    tool_choice = _anthropic_tool_choice_to_openai(request.tool_choice)
+    return processed_messages, images, tools, tool_choice
+
+
+def _anthropic_request_with_derived_fields(
+    request: AnthropicRequest,
+) -> AnthropicRequest:
+    thinking = _as_plain_dict(request.thinking)
+    if request.enable_thinking is None and isinstance(thinking, dict):
+        thinking_type = thinking.get("type")
+        if thinking_type in ("enabled", "adaptive"):
+            request.enable_thinking = True
+        elif thinking_type == "disabled":
+            request.enable_thinking = False
+    if request.thinking_budget is None and isinstance(thinking, dict):
+        budget = thinking.get("budget_tokens")
+        if budget is not None:
+            request.thinking_budget = int(budget)
+
+    output_config = _as_plain_dict(request.output_config)
+    if request.response_format is None and isinstance(output_config, dict):
+        fmt = _as_plain_dict(output_config.get("format"))
+        if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+            request.response_format = {
+                "type": "json_schema",
+                "json_schema": {"schema": fmt.get("schema", {})},
+            }
+    return request
+
+
+def _anthropic_stop_reason(
+    finish_reason: Optional[str],
+    tool_calls: bool = False,
+    stop_sequence: Optional[str] = None,
+) -> str:
+    if tool_calls:
+        return "tool_use"
+    if stop_sequence is not None:
+        return "stop_sequence"
+    if finish_reason == "length":
+        return "max_tokens"
+    if finish_reason == "tool_calls":
+        return "tool_use"
+    return "end_turn"
+
+
+def _apply_stop_sequences(
+    text: str, stop_sequences: Optional[List[str]]
+) -> Tuple[str, Optional[str]]:
+    if not text or not stop_sequences:
+        return text, None
+    best_index = None
+    best_sequence = None
+    for sequence in stop_sequences:
+        if not sequence:
+            continue
+        index = text.find(sequence)
+        if index >= 0 and (best_index is None or index < best_index):
+            best_index = index
+            best_sequence = sequence
+    if best_index is None:
+        return text, None
+    return text[:best_index], best_sequence
+
+
+def _anthropic_content_from_generation(
+    full_text: str,
+    parsed_tool_calls: Optional[List[Any]] = None,
+    include_thinking: bool = False,
+) -> List[Dict[str, Any]]:
+    reasoning, content = _split_thinking(full_text)
+    blocks: List[Dict[str, Any]] = []
+    if include_thinking and reasoning:
+        blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+    if content:
+        blocks.append({"type": "text", "text": content})
+    if parsed_tool_calls:
+        blocks.extend(
+            _openai_tool_call_to_anthropic(call) for call in parsed_tool_calls
+        )
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+    return blocks
+
+
+# Anthropic-compatible endpoints
+
+
+@app.post("/messages")
+@app.post("/v1/messages", include_in_schema=False)
+async def anthropic_messages_endpoint(http_request: Request):
+    request_start = time.perf_counter()
+    try:
+        body = await http_request.json()
+        request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
+    except Exception as e:
+        return _anthropic_error_response(400, f"Invalid request body: {e}")
+
+    try:
+        adapter_path = (
+            request.adapter_path
+            if "adapter_path" in request.model_fields_set
+            else _INHERIT_ADAPTER
+        )
+        model, processor, config = get_cached_model(request.model, adapter_path)
+
+        processed_messages, images, tools, tool_choice = (
+            _anthropic_messages_to_internal(request)
+        )
+        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
+
+        try:
+            gen_args = _build_gen_args(
+                request, processor, tenant_id=_read_tenant_id(http_request)
+            )
+        except Exception as e:
+            return _anthropic_error_response(400, str(e))
+
+        template_kwargs = gen_args.to_template_kwargs()
+        if tool_choice is not None:
+            template_kwargs["tool_choice"] = tool_choice
+
+        formatted_prompt = apply_chat_template(
+            processor,
+            config,
+            processed_messages,
+            num_images=len(images),
+            tools=tools,
+            **template_kwargs,
+        )
+
+        logger.debug(
+            "anthropic messages request: model=%s images=%d max_tokens=%s "
+            "temp=%s stream=%s tools=%d",
+            request.model,
+            len(images),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            request.stream,
+            len(tools or []),
+        )
+
+        if request.stream:
+            server_metrics.begin_request(
+                endpoint="/v1/messages",
+                model=request.model,
+                stream=True,
+            )
+            await _preflight_stream_context_budget(
+                endpoint="/v1/messages",
+                model=request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=None,
+                args=gen_args,
+            )
+
+            async def stream_generator():
+                token_iterator = None
+                token_iter = None
+                metrics_finalized = False
+                token_times: List[float] = []
+                prompt_tps = None
+                generation_tps = None
+                peak_memory = 0.0
+                prompt_tokens = 0
+                output_tokens = 0
+                finish_reason = None
+                message_id = f"msg_{uuid.uuid4().hex}"
+                block_index = 0
+                open_block_type = None
+                full_output = ""
+                text_output = ""
+                in_thinking = False
+                accumulated = ""
+                in_tool_call = False
+                tc_start = tool_module.tool_call_start if tool_module else None
+
+                def close_open_block():
+                    nonlocal open_block_type, block_index
+                    if open_block_type is None:
+                        return ""
+                    event = _sse_event(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": block_index},
+                    )
+                    open_block_type = None
+                    block_index += 1
+                    return event
+
+                def open_block(block_type: str):
+                    nonlocal open_block_type
+                    if open_block_type == block_type:
+                        return ""
+                    event = close_open_block()
+                    content_block: Dict[str, Any]
+                    if block_type == "thinking":
+                        content_block = {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        }
+                    else:
+                        content_block = {"type": "text", "text": ""}
+                    open_block_type = block_type
+                    return event + _sse_event(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": block_index,
+                            "content_block": content_block,
+                        },
+                    )
+
+                try:
+                    if response_generator is not None:
+                        ctx, token_iter = await asyncio.to_thread(
+                            response_generator.generate,
+                            formatted_prompt,
+                            images if images else None,
+                            None,
+                            gen_args,
+                        )
+                        prompt_tokens = ctx.prompt_tokens
+
+                        def _next_token():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
+
+                        token_source = "continuous_batching"
+                    else:
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=formatted_prompt,
+                            image=images,
+                            temperature=request.temperature,
+                            max_tokens=gen_args.max_tokens,
+                            top_p=request.top_p,
+                            vision_cache=model_cache.get("vision_cache"),
+                            logits_processors=gen_args.logits_processors,
+                            apc_manager=apc_manager,
+                            apc_tenant=gen_args.tenant_id,
+                        )
+
+                        def _next_token():
+                            try:
+                                return next(token_iterator)
+                            except StopIteration:
+                                return None
+
+                        token_source = "generate"
+
+                    start_message = AnthropicMessageResponse(
+                        id=message_id,
+                        content=[],
+                        model=request.model,
+                        stop_reason=None,
+                        usage={
+                            "input_tokens": prompt_tokens,
+                            "output_tokens": 0,
+                        },
+                    )
+                    yield _sse_event(
+                        "message_start",
+                        {
+                            "type": "message_start",
+                            "message": start_message.model_dump(),
+                        },
+                    )
+
+                    while True:
+                        token = await asyncio.to_thread(_next_token)
+                        if token is None:
+                            break
+                        if not hasattr(token, "text"):
+                            continue
+
+                        output_tokens += 1
+                        delta = token.text
+                        full_output += delta
+                        accumulated += delta
+                        token_times.append(time.perf_counter())
+                        prompt_tps = getattr(token, "prompt_tps", prompt_tps)
+                        generation_tps = getattr(
+                            token, "generation_tps", generation_tps
+                        )
+                        peak_memory = max(
+                            peak_memory,
+                            float(getattr(token, "peak_memory", 0.0) or 0.0),
+                        )
+                        if prompt_tokens == 0:
+                            prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
+
+                        delta_reasoning = None
+                        delta_content = None
+                        if not in_thinking and (
+                            "<|channel>thought" in accumulated
+                            or "<think>" in accumulated
+                        ):
+                            in_thinking = True
+                            accumulated = ""
+                        elif in_thinking and (
+                            "<channel|>" in accumulated or "</think>" in accumulated
+                        ):
+                            if open_block_type == "thinking":
+                                yield _sse_event(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {
+                                            "type": "signature_delta",
+                                            "signature": "",
+                                        },
+                                    },
+                                )
+                            yield close_open_block()
+                            in_thinking = False
+                            accumulated = ""
+                        elif in_thinking:
+                            delta_reasoning = delta
+                        elif not in_thinking and (
+                            "<|channel>" in accumulated or "<think" in accumulated
+                        ):
+                            pass
+                        else:
+                            delta_content = delta
+
+                        in_tool_call, delta_content = suppress_tool_call_content(
+                            full_output, in_tool_call, tc_start, delta_content
+                        )
+
+                        if delta_reasoning is not None and gen_args.enable_thinking:
+                            yield open_block("thinking")
+                            yield _sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "thinking_delta",
+                                        "thinking": delta_reasoning,
+                                    },
+                                },
+                            )
+                        elif delta_content:
+                            text_output += delta_content
+                            yield open_block("text")
+                            yield _sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "text_delta",
+                                        "text": delta_content,
+                                    },
+                                },
+                            )
+
+                        if getattr(token, "finish_reason", None):
+                            finish_reason = token.finish_reason
+                            break
+
+                    yield close_open_block()
+
+                    parsed_tool_calls = None
+                    if tool_module is not None and tools:
+                        tc = process_tool_calls(full_output, tool_module, tools)
+                        if tc["calls"]:
+                            parsed_tool_calls = tc["calls"]
+
+                    if parsed_tool_calls:
+                        for call in parsed_tool_calls:
+                            tool_block = _openai_tool_call_to_anthropic(call)
+                            input_json = json.dumps(
+                                tool_block.get("input") or {}, ensure_ascii=False
+                            )
+                            yield _sse_event(
+                                "content_block_start",
+                                {
+                                    "type": "content_block_start",
+                                    "index": block_index,
+                                    "content_block": {
+                                        "type": "tool_use",
+                                        "id": tool_block["id"],
+                                        "name": tool_block["name"],
+                                        "input": {},
+                                    },
+                                },
+                            )
+                            if input_json:
+                                yield _sse_event(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": input_json,
+                                        },
+                                    },
+                                )
+                            yield _sse_event(
+                                "content_block_stop",
+                                {
+                                    "type": "content_block_stop",
+                                    "index": block_index,
+                                },
+                            )
+                            block_index += 1
+
+                    stop_sequence = None
+                    if not parsed_tool_calls:
+                        _, stop_sequence = _apply_stop_sequences(
+                            text_output, request.stop_sequences
+                        )
+
+                    anth_stop_reason = _anthropic_stop_reason(
+                        finish_reason,
+                        tool_calls=bool(parsed_tool_calls),
+                        stop_sequence=stop_sequence,
+                    )
+                    yield _sse_event(
+                        "message_delta",
+                        {
+                            "type": "message_delta",
+                            "delta": {
+                                "stop_reason": anth_stop_reason,
+                                "stop_sequence": stop_sequence,
+                            },
+                            "usage": {"output_tokens": output_tokens},
+                        },
+                    )
+                    yield _sse_event("message_stop", {"type": "message_stop"})
+
+                    completion_tokens = max(
+                        0, output_tokens - _count_thinking_tag_tokens(full_output)
+                    )
+                    envelope = _build_metrics_envelope(
+                        endpoint="/v1/messages",
+                        model=request.model,
+                        stream=True,
+                        backend=token_source,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        generated_tokens=output_tokens,
+                        request_elapsed_s=time.perf_counter() - request_start,
+                        request_started_s=request_start,
+                        token_times=token_times,
+                        prompt_tps=prompt_tps,
+                        generation_tps=generation_tps,
+                        peak_memory_gb=peak_memory or None,
+                        finish_reason=anth_stop_reason,
+                        image_count=len(images),
+                        structured_output=bool(gen_args.logits_processors),
+                        thinking_enabled=bool(gen_args.enable_thinking),
+                        tool_parser=tool_parser_type,
+                        tool_calls=bool(parsed_tool_calls),
+                    )
+                    server_metrics.record_success(envelope)
+                    metrics_finalized = True
+
+                except Exception as e:
+                    if not metrics_finalized:
+                        server_metrics.record_failure(
+                            endpoint="/v1/messages",
+                            model=request.model,
+                            stream=True,
+                            error=str(e),
+                        )
+                        metrics_finalized = True
+                    yield _sse_event(
+                        "error",
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": str(e),
+                            },
+                        },
+                    )
+                finally:
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
+                    if not metrics_finalized:
+                        server_metrics.record_failure(
+                            endpoint="/v1/messages",
+                            model=request.model,
+                            stream=True,
+                            error="stream_closed_before_completion",
+                        )
+                    mx.clear_cache()
+                    gc.collect()
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "request-id": f"req_{uuid.uuid4().hex}",
+                },
+            )
+
+        server_metrics.begin_request(
+            endpoint="/v1/messages",
+            model=request.model,
+            stream=False,
+        )
+        try:
+            full_text = ""
+            prompt_tokens = 0
+            output_tokens = 0
+            peak_memory = 0.0
+            token_times: List[float] = []
+            prompt_tps = None
+            generation_tps = None
+            finish_reason = None
+
+            if response_generator is not None:
+
+                def _blocking_generate():
+                    text = ""
+                    ot = 0
+                    tt: List[float] = []
+                    ptps = None
+                    pm = 0.0
+                    fr = None
+                    ctx, token_iter = response_generator.generate(
+                        prompt=formatted_prompt,
+                        images=images if images else None,
+                        audio=None,
+                        args=gen_args,
+                    )
+                    for tok in token_iter:
+                        text += tok.text
+                        ot += 1
+                        tt.append(time.perf_counter())
+                        ptps = getattr(tok, "prompt_tps", ptps)
+                        pm = max(pm, float(getattr(tok, "peak_memory", 0.0) or 0.0))
+                        if tok.finish_reason:
+                            fr = tok.finish_reason
+                            break
+                    try:
+                        token_iter.close()
+                    except Exception:
+                        pass
+                    return ctx.prompt_tokens, text, ot, tt, ptps, pm, fr
+
+                (
+                    prompt_tokens,
+                    full_text,
+                    output_tokens,
+                    token_times,
+                    prompt_tps,
+                    peak_memory,
+                    finish_reason,
+                ) = await asyncio.to_thread(_blocking_generate)
+            else:
+                result = generate(
+                    model=model,
+                    processor=processor,
+                    prompt=formatted_prompt,
+                    image=images,
+                    verbose=logger.isEnabledFor(logging.DEBUG),
+                    vision_cache=model_cache.get("vision_cache"),
+                    apc_manager=apc_manager,
+                    **gen_args.to_generate_kwargs(),
+                )
+                full_text = result.text
+                prompt_tokens = result.prompt_tokens
+                output_tokens = result.generation_tokens
+                prompt_tps = getattr(result, "prompt_tps", None)
+                generation_tps = getattr(result, "generation_tps", None)
+                peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
+                finish_reason = "stop"
+
+            parsed_tool_calls = None
+            response_text = full_text
+            if tool_module is not None and tools:
+                tc = process_tool_calls(full_text, tool_module, tools)
+                if tc["calls"]:
+                    parsed_tool_calls = tc["calls"]
+                    response_text = tc["remaining_text"] or ""
+
+            response_text, stop_sequence = _apply_stop_sequences(
+                response_text, request.stop_sequences
+            )
+            content_blocks = _anthropic_content_from_generation(
+                response_text,
+                parsed_tool_calls=parsed_tool_calls,
+                include_thinking=bool(gen_args.enable_thinking),
+            )
+            stop_reason = _anthropic_stop_reason(
+                finish_reason,
+                tool_calls=bool(parsed_tool_calls),
+                stop_sequence=stop_sequence,
+            )
+            response = AnthropicMessageResponse(
+                id=f"msg_{uuid.uuid4().hex}",
+                content=content_blocks,
+                model=request.model,
+                stop_reason=stop_reason,
+                stop_sequence=stop_sequence,
+                usage={
+                    "input_tokens": prompt_tokens,
+                    "output_tokens": output_tokens,
+                },
+            )
+
+            completion_tokens = max(
+                0, output_tokens - _count_thinking_tag_tokens(full_text)
+            )
+            envelope = _build_metrics_envelope(
+                endpoint="/v1/messages",
+                model=request.model,
+                stream=False,
+                backend=(
+                    "continuous_batching"
+                    if response_generator is not None
+                    else "generate"
+                ),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                generated_tokens=output_tokens,
+                request_elapsed_s=time.perf_counter() - request_start,
+                request_started_s=request_start,
+                token_times=token_times,
+                prompt_tps=prompt_tps,
+                generation_tps=generation_tps,
+                peak_memory_gb=peak_memory or None,
+                finish_reason=stop_reason,
+                image_count=len(images),
+                structured_output=bool(gen_args.logits_processors),
+                thinking_enabled=bool(gen_args.enable_thinking),
+                tool_parser=tool_parser_type,
+                tool_calls=bool(parsed_tool_calls),
+            )
+            server_metrics.record_success(envelope)
+            mx.clear_cache()
+            gc.collect()
+            return response
+
+        except PromptTooLongError as e:
+            server_metrics.record_failure(
+                endpoint="/v1/messages",
+                model=request.model,
+                stream=False,
+                error=str(e),
+            )
+            mx.clear_cache()
+            gc.collect()
+            return _anthropic_error_response(400, str(e))
+        except Exception as e:
+            server_metrics.record_failure(
+                endpoint="/v1/messages",
+                model=request.model,
+                stream=False,
+                error=str(e),
+            )
+            traceback.print_exc()
+            mx.clear_cache()
+            gc.collect()
+            return _anthropic_error_response(
+                500, f"Generation failed: {e}", "api_error"
+            )
+
+    except Exception as e:
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        return _anthropic_error_response(500, str(e), "api_error")
+
+
+@app.post("/messages/count_tokens")
+@app.post("/v1/messages/count_tokens", include_in_schema=False)
+async def anthropic_count_tokens_endpoint(http_request: Request):
+    try:
+        body = await http_request.json()
+        request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
+        model, processor, config = get_cached_model(request.model)
+        processed_messages, images, tools, tool_choice = (
+            _anthropic_messages_to_internal(request)
+        )
+        gen_args = _build_gen_args(
+            request, processor, tenant_id=_read_tenant_id(http_request)
+        )
+        template_kwargs = gen_args.to_template_kwargs()
+        if tool_choice is not None:
+            template_kwargs["tool_choice"] = tool_choice
+        formatted_prompt = apply_chat_template(
+            processor,
+            config,
+            processed_messages,
+            num_images=len(images),
+            tools=tools,
+            **template_kwargs,
+        )
+        if response_generator is not None:
+            raw_inputs = await asyncio.to_thread(
+                response_generator._cpu_preprocess,
+                formatted_prompt,
+                images if images else None,
+                None,
+            )
+        else:
+            image_token_index = getattr(config, "image_token_index", None)
+            raw_inputs = prepare_inputs(
+                processor,
+                images=images if images else None,
+                prompts=formatted_prompt,
+                image_token_index=image_token_index,
+            )
+        return {"input_tokens": _count_prompt_tokens(raw_inputs)}
+    except Exception as e:
+        return _anthropic_error_response(400, str(e))
+
+
 # OpenAI compatile endpoints
+
+
+@app.post("/responses/input_tokens")
+@app.post("/v1/responses/input_tokens", include_in_schema=False)
+async def responses_input_tokens_endpoint(request: Request):
+    body = await request.json()
+    openai_request = OpenAIRequest(**body)
+    try:
+        model, processor, config = get_cached_model(openai_request.model)
+        del model
+        current_input_items = _normalize_response_input(openai_request.input)
+        prompt_items = (
+            _response_chain_items(openai_request.previous_response_id)
+            + current_input_items
+        )
+        chat_messages, images = _response_items_to_chat(prompt_items)
+        if openai_request.instructions:
+            chat_messages.insert(
+                0, {"role": "system", "content": openai_request.instructions}
+            )
+        chat_tools, _ = _response_tool_registry(openai_request.tools)
+        gen_args = _build_gen_args(
+            openai_request, processor, tenant_id=_read_tenant_id(request)
+        )
+        template_kwargs = gen_args.to_template_kwargs()
+        if openai_request.tool_choice is not None:
+            template_kwargs["tool_choice"] = openai_request.tool_choice
+        formatted_prompt = apply_chat_template(
+            processor,
+            config,
+            chat_messages,
+            num_images=len(images),
+            tools=chat_tools or None,
+            **template_kwargs,
+        )
+        if response_generator is not None:
+            raw_inputs = await asyncio.to_thread(
+                response_generator._cpu_preprocess,
+                formatted_prompt,
+                images if images else None,
+                None,
+            )
+        else:
+            image_token_index = getattr(config, "image_token_index", None)
+            raw_inputs = prepare_inputs(
+                processor,
+                images=images if images else None,
+                prompts=formatted_prompt,
+                image_token_index=image_token_index,
+            )
+        return {"input_tokens": _count_prompt_tokens(raw_inputs)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/responses/{response_id}")
+@app.get("/v1/responses/{response_id}", include_in_schema=False)
+async def responses_retrieve_endpoint(response_id: str):
+    with response_store_lock:
+        stored = response_store.get(response_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    return stored.response
+
+
+@app.delete("/responses/{response_id}")
+@app.delete("/v1/responses/{response_id}", include_in_schema=False)
+async def responses_delete_endpoint(response_id: str):
+    with response_store_lock:
+        existed = response_store.pop(response_id, None) is not None
+    if not existed:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    return {"id": response_id, "object": "response.deleted", "deleted": True}
+
+
+@app.post("/responses/{response_id}/cancel")
+@app.post("/v1/responses/{response_id}/cancel", include_in_schema=False)
+async def responses_cancel_endpoint(response_id: str):
+    with response_store_lock:
+        stored = response_store.get(response_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    response = dict(stored.response)
+    if response.get("status") == "in_progress":
+        response["status"] = "cancelled"
+    return response
+
+
+@app.get("/responses/{response_id}/input_items")
+@app.get("/v1/responses/{response_id}/input_items", include_in_schema=False)
+async def responses_input_items_endpoint(response_id: str):
+    with response_store_lock:
+        stored = response_store.get(response_id)
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Response not found.")
+    data = stored.input_items
+    return {
+        "object": "list",
+        "data": data,
+        "first_id": data[0].get("id") if data else None,
+        "last_id": data[-1].get("id") if data else None,
+        "has_more": False,
+    }
 
 
 @app.post("/responses")
@@ -2213,72 +3705,25 @@ async def responses_endpoint(request: Request):
 
         kwargs = {}
 
-        chat_messages = []
-        images = []
-        instructions = None
-        if openai_request.input:
-            if isinstance(openai_request.input, str):
-                # If input is a string, treat it as a single text message
-                chat_messages.append({"role": "user", "content": openai_request.input})
-            elif isinstance(openai_request.input, list):
-                # If input is a list, treat it as a series of chat messages
-                for message in openai_request.input:
-                    if isinstance(message, ChatMessage):
-                        if isinstance(message.content, str):
-                            chat_messages.append(
-                                {"role": message.role, "content": message.content}
-                            )
-                            if message.role == "system":
-                                instructions = message.content
-                        elif isinstance(message.content, list):
-                            # Handle list of content items
-                            for item in message.content:
-                                if isinstance(item, dict):
-                                    if item["type"] == "input_text":
-                                        chat_messages.append(
-                                            {
-                                                "role": message.role,
-                                                "content": item["text"],
-                                            }
-                                        )
-                                        if message.role == "system":
-                                            instructions = item["text"]
-                                    # examples for multiple images (https://platform.openai.com/docs/guides/images?api-mode=responses)
-                                    elif item["type"] == "input_image":
-                                        images.append(item["image_url"])
-                                    else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
-                                        )
-                                        raise HTTPException(
-                                            status_code=400,
-                                            detail="Invalid input item type.",
-                                        )
-                                else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
-                                    )
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="Missing type in input item.",
-                                    )
-                        else:
-                            print("Invalid message content format.")
-                            raise HTTPException(
-                                status_code=400, detail="Invalid input format."
-                            )
-                    else:
-                        print("not a ChatMessage")
-                        raise HTTPException(
-                            status_code=400, detail="Invalid input format."
-                        )
-            else:
-                print("neither string not list")
-                raise HTTPException(status_code=400, detail="Invalid input format.")
-
-        else:
+        if openai_request.input is None:
             print("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
+
+        current_input_items = _normalize_response_input(openai_request.input)
+        prompt_items = (
+            _response_chain_items(openai_request.previous_response_id)
+            + current_input_items
+        )
+        chat_messages, images = _response_items_to_chat(prompt_items)
+        instructions = openai_request.instructions
+        if instructions:
+            chat_messages.insert(0, {"role": "system", "content": instructions})
+        elif chat_messages and chat_messages[0].get("role") in ("system", "developer"):
+            instructions = chat_messages[0].get("content")
+
+        chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
+        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
             gen_args = _build_gen_args(
@@ -2287,12 +3732,17 @@ async def responses_endpoint(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        template_kwargs = gen_args.to_template_kwargs()
+        if openai_request.tool_choice is not None:
+            template_kwargs["tool_choice"] = openai_request.tool_choice
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
             chat_messages,
             num_images=len(images),
-            **gen_args.to_template_kwargs(),
+            tools=chat_tools or None,
+            **template_kwargs,
         )
 
         logger.debug(
@@ -2347,6 +3797,8 @@ async def responses_endpoint(request: Request):
                         output_text="",
                         temperature=openai_request.temperature,
                         top_p=openai_request.top_p,
+                        previous_response_id=openai_request.previous_response_id,
+                        store=openai_request.store,
                         usage={
                             "input_tokens": 0,  # get prompt tokens
                             "output_tokens": 0,
@@ -2379,6 +3831,12 @@ async def responses_endpoint(request: Request):
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
+                    in_tool_call = False
+                    tc_start = (
+                        tool_module.tool_call_start
+                        if tool_module is not None and chat_tools
+                        else None
+                    )
 
                     if response_generator is not None:
                         # generate() blocks on _cpu_preprocess + queue.get;
@@ -2406,6 +3864,9 @@ async def responses_endpoint(request: Request):
                             output_tokens += 1
                             delta = token.text
                             full_text += delta
+                            in_tool_call, delta = suppress_tool_call_content(
+                                full_text, in_tool_call, tc_start, delta
+                            )
                             token_times.append(time.perf_counter())
                             peak_memory = max(
                                 peak_memory,
@@ -2417,8 +3878,9 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": output_tokens,
                             }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            if delta is not None:
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
                             if token.finish_reason:
                                 finish_reason = token.finish_reason
@@ -2446,6 +3908,9 @@ async def responses_endpoint(request: Request):
 
                             delta = chunk.text
                             full_text += delta
+                            in_tool_call, delta = suppress_tool_call_content(
+                                full_text, in_tool_call, tc_start, delta
+                            )
                             token_times.append(time.perf_counter())
                             prompt_tps = getattr(chunk, "prompt_tps", prompt_tps)
                             generation_tps = getattr(
@@ -2460,11 +3925,22 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": chunk.generation_tokens,
                             }
 
-                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                            if delta is not None:
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
 
-                    # Split thinking from content for final events
-                    _, clean_text = _split_thinking(full_text)
+                    output_items, clean_text, _, output_finish_reason = (
+                        _response_output_items_from_text(
+                            full_text,
+                            message_id,
+                            tool_module,
+                            chat_tools,
+                            tool_registry,
+                        )
+                    )
+                    tool_output_items = [
+                        item for item in output_items if item.get("type") != "message"
+                    ]
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -2481,14 +3957,40 @@ async def responses_endpoint(request: Request):
                         type="message",
                         status="completed",
                         role="assistant",
-                        content=[final_content_part],
+                        content=[final_content_part] if clean_text else [],
                     )
                     yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
 
+                    completed_output = []
+                    if clean_text:
+                        completed_output.append(final_message_item.model_dump())
+                    completed_output.extend(tool_output_items)
+                    for output_index, tool_item in enumerate(
+                        tool_output_items, start=1
+                    ):
+                        yield _sse_event(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": output_index,
+                                "item": tool_item,
+                            },
+                        )
+                        yield _sse_event(
+                            "response.output_item.done",
+                            {
+                                "type": "response.output_item.done",
+                                "output_index": output_index,
+                                "item": tool_item,
+                            },
+                        )
+
                     # Send response.completed event (to match the openai pipeline)
-                    finish_reason = finish_reason or (
-                        "stop" if usage_stats["output_tokens"] > 0 else None
-                    )
+                    finish_reason = (
+                        "tool_calls"
+                        if output_finish_reason == "tool_calls"
+                        else finish_reason
+                    ) or ("stop" if usage_stats["output_tokens"] > 0 else None)
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
                         model=openai_request.model,
@@ -2517,14 +4019,21 @@ async def responses_endpoint(request: Request):
                     completed_response = base_response.model_copy(
                         update={
                             "status": "completed",
-                            "output": [final_message_item],
-                            "usage": {
-                                "input_tokens": usage_stats["input_tokens"],
-                                "output_tokens": usage_stats["output_tokens"],
-                                "total_tokens": usage_stats["input_tokens"]
+                            "output": completed_output,
+                            "output_text": clean_text,
+                            "usage": OpenAIUsage(
+                                input_tokens=usage_stats["input_tokens"],
+                                output_tokens=usage_stats["output_tokens"],
+                                total_tokens=usage_stats["input_tokens"]
                                 + usage_stats["output_tokens"],
-                            },
+                            ),
                         }
+                    )
+                    _store_response(
+                        completed_response,
+                        current_input_items,
+                        completed_output,
+                        openai_request.previous_response_id,
                     )
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
@@ -2633,6 +4142,7 @@ async def responses_endpoint(request: Request):
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=model_cache.get("vision_cache"),
                         apc_manager=apc_manager,
+                        apc_tenant=gen_args.tenant_id,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -2647,7 +4157,17 @@ async def responses_endpoint(request: Request):
                 mx.clear_cache()
                 gc.collect()
 
-                reasoning, content = _split_thinking(full_text)
+                output_items, content, reasoning, output_finish_reason = (
+                    _response_output_items_from_text(
+                        full_text,
+                        message_id,
+                        tool_module,
+                        chat_tools,
+                        tool_registry,
+                    )
+                )
+                if output_finish_reason == "tool_calls":
+                    finish_reason = "tool_calls"
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -2657,26 +4177,23 @@ async def responses_endpoint(request: Request):
                     instructions=instructions,
                     max_output_tokens=openai_request.max_output_tokens,
                     model=openai_request.model,
-                    output=[
-                        {
-                            "role": "assistant",
-                            "content": [
-                                {
-                                    "type": "output_text",
-                                    "text": content,
-                                }
-                            ],
-                            "reasoning": reasoning,
-                        }
-                    ],
+                    output=output_items,
                     output_text=content,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
+                    previous_response_id=openai_request.previous_response_id,
+                    store=openai_request.store,
                     usage={
                         "input_tokens": prompt_tokens,
                         "output_tokens": output_tokens,
                         "total_tokens": prompt_tokens + output_tokens,
                     },
+                )
+                _store_response(
+                    response,
+                    current_input_items,
+                    output_items,
+                    openai_request.previous_response_id,
                 )
 
                 elapsed = time.perf_counter() - request_start
