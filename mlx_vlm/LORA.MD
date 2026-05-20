@@ -157,9 +157,11 @@ python lora.py --dataset your_dataset \
 - `--max-seq-length`: Maximum sequence length (default: 2048)
 - `--grad-checkpoint`: Enable gradient checkpointing to reduce memory usage
 - `--grad-clip`: Gradient clipping value (optional)
-- `--train-on-completions`: Only compute loss on assistant responses
+- `--train-on-completions`: Only compute loss on assistant response tokens
 - `--gradient-accumulation-steps`: Accumulate gradients over n batches (default: 1)
-- `--assistant-id`: Token ID for assistant role (default: 77091)
+- `--assistant-id`: Token ID marking assistant turn start. Auto-detected if omitted; falls back to 77091 when detection fails.
+- `--end-turn-id`: Token ID marking the end of a turn. Auto-detected if omitted.
+- `--user-id`: Token ID marking user turn start. Used as a fallback turn boundary when `--end-turn-id` is unavailable; auto-detected if omitted.
 
 ### LoRA Arguments
 - `--lora-rank`: LoRA rank (default: 8)
