@@ -292,13 +292,14 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        if self.model_type != "mistral4" or not getattr(
+        is_mistral4_moe = self.model_type == "mistral4" and getattr(
             self.config, "n_routed_experts", 0
-        ):
-            return None
+        )
 
         def predicate(path, _):
-            if path.endswith("mlp.gate"):
+            if "lm_head" in path:
+                return False
+            if is_mistral4_moe and path.endswith("mlp.gate"):
                 return {"group_size": 64, "bits": 8}
             return True
 

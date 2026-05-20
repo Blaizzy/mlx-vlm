@@ -1,3 +1,4 @@
+import json
 from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
@@ -16,8 +17,10 @@ class MessageFormat(Enum):
     IMAGE_TOKEN_PIPE = "image_token_pipe"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
+    IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
+    TEXT_ONLY = "text_only"
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
@@ -37,12 +40,14 @@ MODEL_CONFIG = {
     "paddleocr_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen2_vl": MessageFormat.LIST_WITH_IMAGE,
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
+    "minicpmv4_6": MessageFormat.IMAGE_TOKEN_WRAPPED,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -50,7 +55,10 @@ MODEL_CONFIG = {
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
@@ -58,6 +66,8 @@ MODEL_CONFIG = {
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
+    "granite_vision": MessageFormat.LIST_WITH_IMAGE,
+    "granite4_vision": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -74,12 +84,14 @@ MODEL_CONFIG = {
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
+    "laguna": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -140,6 +152,31 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     if hasattr(item, "role") and hasattr(item, "content"):
         return getattr(item, "role", "user"), getattr(item, "content", "")
     return None
+
+
+def _normalize_tool_call_arguments(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy a message and convert OpenAI JSON-string tool arguments to dicts."""
+    normalized = dict(message)
+    tool_calls = normalized.get("tool_calls")
+    if tool_calls is None:
+        return normalized
+
+    normalized_calls = []
+    for tool_call in tool_calls:
+        tool_call = dict(tool_call) if isinstance(tool_call, dict) else tool_call
+        if isinstance(tool_call, dict) and "function" in tool_call:
+            function = dict(tool_call["function"])
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    function["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = {}
+            tool_call["function"] = function
+        normalized_calls.append(tool_call)
+
+    normalized["tool_calls"] = normalized_calls
+    return normalized
 
 
 class MessageBuilder:
@@ -220,8 +257,10 @@ class MessageFormatter:
             "qwen3_5",
             "qwen3_5_moe",
             "qwen3_omni_moe",
+            "gemma4",
+            "minicpmv4_6",
         ] and kwargs.get("video"):
-            return self._format_video_message(prompt, kwargs)
+            return self._format_video_message(prompt, role, **kwargs)
 
         # Route to appropriate formatter
         formatter_map = {
@@ -253,8 +292,12 @@ class MessageFormatter:
             MessageFormat.IMAGE_TOKEN_NEWLINE: partial(
                 self._format_with_token, token="<image>\n"
             ),
+            MessageFormat.IMAGE_TOKEN_WRAPPED: partial(
+                self._format_with_token, token="(<image>./</image>)\n"
+            ),
             MessageFormat.NUMBERED_IMAGE_TOKENS: self._format_numbered_tokens,
             MessageFormat.PROMPT_ONLY: lambda *args, **kw: prompt,
+            MessageFormat.TEXT_ONLY: self._format_text_only,
             MessageFormat.PROMPT_WITH_IMAGE_TOKEN: lambda *args, **kw: "<image>"
             * num_images
             + prompt,
@@ -299,6 +342,19 @@ class MessageFormatter:
             content = image_tokens + content if image_first else content + image_tokens
 
         return {"role": role, "content": content}
+
+    def _format_text_only(
+        self,
+        prompt: str,
+        role: str,
+        skip_image_token: bool,
+        skip_audio_token: bool,
+        num_images: int,
+        num_audios: int,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Format a regular text-only chat message."""
+        return {"role": role, "content": prompt}
 
     def _format_list_with_image_type(
         self,
@@ -407,18 +463,31 @@ class MessageFormatter:
         num_audios: int = 0,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Format a video message with text."""
-        return {
-            "role": role,
-            "content": [
-                MessageBuilder.video_message(
-                    kwargs["video"],
-                    kwargs.get("max_pixels", 224 * 224),
-                    kwargs.get("fps", 1),
-                ),
-                MessageBuilder.text_message(prompt),
-            ],
-        }
+        """Format a video message with text.
+
+        Accepts either a single path in ``video=`` or a list of paths; emits
+        one ``{"type": "video", ...}`` content item per video, followed by the
+        text. ``fps`` may be a scalar (applied to all) or a list of the same
+        length as the videos.
+        """
+        videos = kwargs["video"]
+        if not isinstance(videos, list):
+            videos = [videos]
+
+        max_pixels = kwargs.get("max_pixels", 224 * 224)
+        fps = kwargs.get("fps", 1)
+        fps_list = fps if isinstance(fps, list) else [fps] * len(videos)
+        if len(fps_list) != len(videos):
+            raise ValueError(
+                f"Got {len(fps_list)} fps values for {len(videos)} videos."
+            )
+
+        content = [
+            MessageBuilder.video_message(v, max_pixels, f)
+            for v, f in zip(videos, fps_list)
+        ]
+        content.append(MessageBuilder.text_message(prompt))
+        return {"role": role, "content": content}
 
 
 def get_message_json(
@@ -563,11 +632,11 @@ def get_chat_template(
         for message in normalized:
             role = message.get("role", "user")
             content = message.get("content", "")
-            if role in ("system", "user", "assistant"):
+            if role in ("system", "user", "assistant", "tool"):
                 prefix = role.capitalize()
                 lines.append(f"{prefix}: {content}" if content else f"{prefix}:")
             else:
-                lines.append(content)
+                lines.append(content if content else "")
 
         if add_generation_prompt:
             lines.append("Assistant:")
@@ -659,6 +728,32 @@ def apply_chat_template(
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
+    # Use standard formatting for text-only models.
+    if model_type not in MODEL_CONFIG:
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        elif isinstance(prompt, dict):
+            msg = dict(prompt)
+            msg["content"] = extract_text_from_content(msg.get("content", ""))
+            messages = [msg]
+        elif isinstance(prompt, list):
+            messages = []
+            for item in prompt:
+                if isinstance(item, str):
+                    messages.append({"role": "user", "content": item})
+                elif (role_content := _get_role_content(item)) is not None:
+                    role, content = role_content
+                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    if role != "tool":
+                        msg["content"] = extract_text_from_content(content)
+                    messages.append(msg)
+        else:
+            messages = [{"role": "user", "content": str(prompt)}]
+
+        if return_messages:
+            return messages
+        return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
+
     # Build messages from prompts
     messages = []
 
@@ -675,17 +770,21 @@ def apply_chat_template(
         )
     elif isinstance(prompt, dict):
         # Single dict prompt
-        content = extract_text_from_content(prompt["content"])
-        messages.append(
-            get_message_json(
-                model_type,
-                content,
-                prompt["role"],
-                num_images=num_images,
-                num_audios=num_audios,
-                **kwargs,
+        role = prompt.get("role", "user")
+        if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
+            messages.append(_normalize_tool_call_arguments(prompt))
+        else:
+            content = extract_text_from_content(prompt["content"])
+            messages.append(
+                get_message_json(
+                    model_type,
+                    content,
+                    role,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
+                )
             )
-        )
     elif isinstance(prompt, list):
         # List of prompts — find the last user message to place image/audio tokens
         last_user_idx = -1
@@ -693,7 +792,7 @@ def apply_chat_template(
             if isinstance(p, str):
                 last_user_idx = i
             elif (rc := _get_role_content(p)) is not None:
-                if rc[0] not in ("system", "assistant"):
+                if rc[0] not in ("system", "assistant", "tool"):
                     last_user_idx = i
 
         for i, p in enumerate(prompt):
@@ -712,23 +811,31 @@ def apply_chat_template(
                 )
             elif (role_content := _get_role_content(p)) is not None:
                 role, content = role_content
-                # Handle multimodal content: extract only text, skip image/audio URLs
-                content = extract_text_from_content(content)
-                is_target = i == last_user_idx
-                messages.append(
-                    get_message_json(
-                        model_type,
-                        content,
-                        role,
-                        skip_image_token=not is_target
-                        or role in ["system", "assistant"],
-                        skip_audio_token=not is_target
-                        or role in ["system", "assistant"],
-                        num_images=num_images,
-                        num_audios=num_audios,
-                        **kwargs,
-                    )
+                # Tool-calling messages: pass through as-is to preserve
+                # tool_calls, tool_call_id, name for the Jinja template.
+                has_tool_metadata = isinstance(p, dict) and (
+                    "tool_calls" in p or "tool_call_id" in p or role == "tool"
                 )
+                if has_tool_metadata:
+                    messages.append(_normalize_tool_call_arguments(p))
+                else:
+                    # Handle multimodal content: extract only text, skip image/audio URLs
+                    content = extract_text_from_content(content)
+                    is_target = i == last_user_idx
+                    messages.append(
+                        get_message_json(
+                            model_type,
+                            content,
+                            role,
+                            skip_image_token=not is_target
+                            or role in ["system", "assistant"],
+                            skip_audio_token=not is_target
+                            or role in ["system", "assistant"],
+                            num_images=num_images,
+                            num_audios=num_audios,
+                            **kwargs,
+                        )
+                    )
 
     if return_messages:
         return messages

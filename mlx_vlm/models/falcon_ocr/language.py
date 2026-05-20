@@ -3,7 +3,11 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import LanguageModelOutput, scaled_dot_product_attention
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
@@ -27,8 +31,12 @@ def apply_rotary_emb_1d(
     xk_r = xk.astype(mx.float32).reshape(*shape_k, d // 2, 2)
     xq_0, xq_1 = xq_r[..., 0], xq_r[..., 1]
     xk_0, xk_1 = xk_r[..., 0], xk_r[..., 1]
-    c = cos.reshape(1, 1, -1, cos.shape[-1])
-    s = sin.reshape(1, 1, -1, sin.shape[-1])
+    if cos.ndim == 2:
+        c = cos.reshape(1, 1, -1, cos.shape[-1])
+        s = sin.reshape(1, 1, -1, sin.shape[-1])
+    else:
+        c = cos.reshape(cos.shape[0], 1, -1, cos.shape[-1])
+        s = sin.reshape(sin.shape[0], 1, -1, sin.shape[-1])
     oq = mx.stack([xq_0 * c - xq_1 * s, xq_0 * s + xq_1 * c], axis=-1)
     ok = mx.stack([xk_0 * c - xk_1 * s, xk_0 * s + xk_1 * c], axis=-1)
     return oq.reshape(*shape_q, d).astype(dtype), ok.reshape(*shape_k, d).astype(dtype)
@@ -283,14 +291,23 @@ class FalconOCRTransformerModel(nn.Module):
         B, L, _ = h.shape
 
         if position_ids is None:
-            offset = 0
             if cache[0] is not None:
                 offset = cache[0].offset
                 if isinstance(offset, mx.array):
-                    offset = offset.item()
-            position_ids = mx.arange(offset, offset + L)
+                    if offset.ndim > 0 and offset.size > 1:
+                        base = mx.maximum(offset, 0).reshape(-1, 1)
+                        position_ids = base + mx.arange(L).reshape(1, -1)
+                    else:
+                        off = (offset if offset.ndim == 0 else offset[0]).item()
+                        position_ids = mx.arange(off, off + L)
+                else:
+                    position_ids = mx.arange(offset, offset + L)
+            else:
+                position_ids = mx.arange(L)
 
-        if position_ids.ndim > 1:
+        if position_ids.ndim == 2:
+            pos_t = position_ids  # (B, L)
+        elif position_ids.ndim > 1:
             pos_t = position_ids.reshape(-1)[:L]
         else:
             pos_t = position_ids[:L]
@@ -301,6 +318,9 @@ class FalconOCRTransformerModel(nn.Module):
         cos_2d, sin_2d = None, None
         if pos_hw is not None:
             cos_2d, sin_2d = compute_golden_freqs(self.freqs_cis_golden, pos_hw)
+
+        if mask is None and cache[0] is not None:
+            mask = create_attention_mask(h, cache[0], return_array=True)
 
         for layer, c in zip(self.layers, cache):
             h = layer(
@@ -325,10 +345,7 @@ class LanguageModel(nn.Module):
         self.model = FalconOCRTransformerModel(args, config)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-        self._rope_delta = None
-        self._position_ids = None
-        self._pos_hw = None
-        self._full_attn_mask = None
+        self._rope_deltas = None
 
     def __call__(
         self,
@@ -340,14 +357,27 @@ class LanguageModel(nn.Module):
     ):
         kwargs.pop("image_grid_hw", None)
         kwargs.pop("pixel_values", None)
+        position_ids = kwargs.pop("position_ids", None)
+        pos_hw = kwargs.pop("pos_hw", None)
+        rope_deltas = kwargs.pop("rope_deltas", None)
+        full_attn_mask = kwargs.pop("attention_mask_4d", None)
+        if rope_deltas is not None:
+            self._rope_deltas = rope_deltas
+        else:
+            rope_deltas = self._rope_deltas
 
-        cache_offset = 0
-        if cache and cache[0] is not None:
-            offset = cache[0].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
+        # Use ``cache._idx`` — the Python-int token counter — instead of
+        # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
+        c0 = cache[0] if cache and cache[0] is not None else None
+        offset = c0.offset if c0 is not None else 0
+        is_batch = isinstance(offset, mx.array) and offset.size > 1
+        if c0 is not None and hasattr(c0, "_idx"):
+            cache_offset = int(c0._idx)
+        elif isinstance(offset, mx.array):
+            cache_offset = int(offset[0].item()) if offset.size > 0 else 0
+        else:
+            cache_offset = int(offset)
+        cache_offset = max(cache_offset, 0)
 
         if inputs_embeds is not None:
             L = inputs_embeds.shape[1]
@@ -356,20 +386,37 @@ class LanguageModel(nn.Module):
         else:
             L = 1
 
-        position_ids = None
-        pos_hw = None
+        if inputs_embeds is not None and not is_batch:
+            if position_ids is not None:
+                if position_ids.ndim == 2:
+                    position_ids = position_ids[:, cache_offset : cache_offset + L]
+                else:
+                    position_ids = position_ids[cache_offset : cache_offset + L]
+            if pos_hw is not None:
+                pos_hw = pos_hw[:, cache_offset : cache_offset + L, :]
+        elif (cache_offset > 0 or is_batch) and rope_deltas is not None:
+            base_offset = (
+                offset.reshape(-1, 1)
+                if is_batch
+                else mx.array([[cache_offset]], dtype=mx.int32)
+            )
+            rd = rope_deltas
+            if rd.ndim < 2:
+                rd = rd.reshape(-1, 1)
+            if rd.shape[0] != base_offset.shape[0]:
+                rd = (
+                    mx.broadcast_to(rd[:1], base_offset.shape)
+                    if rd.shape[0] < base_offset.shape[0]
+                    else rd[: base_offset.shape[0]]
+                )
+            start = base_offset + rd.astype(base_offset.dtype)
+            position_ids = start + mx.arange(L, dtype=start.dtype).reshape(1, -1)
+        else:
+            position_ids = None
 
-        if self._position_ids is not None and inputs_embeds is not None:
-            position_ids = self._position_ids[cache_offset : cache_offset + L]
-            if self._pos_hw is not None:
-                pos_hw = self._pos_hw[:, cache_offset : cache_offset + L, :]
-        elif self._rope_delta is not None and cache_offset > 0:
-            start = cache_offset + self._rope_delta
-            position_ids = mx.arange(start, start + L, dtype=mx.int32)
-
-        if mask is None and self._full_attn_mask is not None and L > 1:
+        if mask is None and full_attn_mask is not None and L > 1:
             end = cache_offset + L
-            mask = self._full_attn_mask[:, :, cache_offset:end, :end]
+            mask = full_attn_mask[:, :, cache_offset:end, :end]
 
         out = self.model(
             inputs,
@@ -386,6 +433,58 @@ class LanguageModel(nn.Module):
         return LanguageModelOutput(
             logits=out.astype(self.model.embed_tokens.weight.dtype)
         )
+
+    def get_rope_index(
+        self,
+        input_ids: mx.array,
+        image_grid_hw=None,
+    ):
+        config = self.config
+        single_ids = input_ids[0] if input_ids.ndim == 2 else input_ids
+        ids = single_ids.reshape(-1).tolist()
+        start_id = config.image_cls_token_id
+        end_id = config.img_end_id
+
+        pos_t = []
+        in_image = False
+        next_pos = 0
+        for tok in ids:
+            if tok == start_id and not in_image:
+                in_image = True
+            pos_t.append(next_pos)
+            if not in_image:
+                next_pos += 1
+            if tok == end_id and in_image:
+                in_image = False
+                next_pos += 1
+
+        position_ids = mx.array(pos_t, dtype=mx.int32)
+        delta = int(mx.max(position_ids).item()) + 1 - len(ids)
+
+        grid_hws = None
+        if image_grid_hw is not None:
+            if isinstance(image_grid_hw, mx.array):
+                grid_hws = image_grid_hw.tolist()
+            elif isinstance(image_grid_hw, list):
+                grid_hws = image_grid_hw
+            if grid_hws:
+                grid_hws = [tuple(int(x) for x in g) for g in grid_hws]
+                if input_ids.ndim == 2:
+                    grid_hws = grid_hws[:1]
+
+        pos_hw = compute_pos_hw(
+            single_ids.reshape(-1),
+            image_token_id=config.img_id,
+            image_grid_hws=grid_hws,
+        )
+
+        full_attn_mask = create_falcon_ocr_mask(
+            single_ids if single_ids.ndim == 1 else single_ids[0],
+            config.image_cls_token_id,
+            config.img_end_id,
+        )
+
+        return position_ids, pos_hw, delta, full_attn_mask
 
     @property
     def layers(self):

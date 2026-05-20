@@ -3,6 +3,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -12,6 +13,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
+import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -41,6 +43,7 @@ MODEL_REMAPPING = {
     "granite4_vision": "granite4_vision",
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
+    "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -86,16 +89,18 @@ def skip_multimodal_module(path: str) -> bool:
     Returns:
         bool: True if the module is multimodal and should skip quantization, False otherwise
     """
-    return (
-        "vision_model" in path
-        or "vision_tower" in path
-        or "vl_connector" in path
-        or "sam_model" in path
-        or "audio_model" in path
-        or "audio_tower" in path
-        or "code_predictor" in path
-        or "img_projector" in path
+    multimodal_modules = (
+        "vision_model",
+        "vision_tower",
+        "vl_connector",
+        "sam_model",
+        "audio_model",
+        "audio_tower",
+        "code_predictor",
+        "img_projector",
+        "multi_modal_projector",
     )
+    return any(module in path for module in multimodal_modules)
 
 
 def get_model_and_args(config: dict):
@@ -108,18 +113,47 @@ def get_model_and_args(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"].lower()
+    raw_model_type = config.get("model_type") or config.get("speculators_model_type")
+    if raw_model_type is None:
+        raise KeyError("model_type")
+    model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
-    try:
-        arch = importlib.import_module(f"mlx_vlm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported. Error: {e}"
-        logging.error(msg)
-        raise ValueError(msg)
+    is_dflash = config.get("dflash_config", None) is not None
+    if is_dflash:
+        model_type += "_dflash"
 
-    return arch, model_type
+    last_err: Optional[ImportError] = None
+    for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
+        try:
+            arch = importlib.import_module(f"{pkg}.{model_type}")
+            return arch, model_type
+        except ImportError as e:
+            if model_type not in str(e):
+                raise
+            last_err = e
+            continue
+
+    if _is_text_only_config(config):
+        arch = importlib.import_module("mlx_vlm.models.text_only")
+        return arch, "text_only"
+
+    msg = f"Model type {model_type} not supported. Error: {last_err}"
+    logging.error(msg)
+    raise ValueError(msg)
+
+
+def _has_config(config: dict, key: str) -> bool:
+    value = config.get(key)
+    return value is not None and value != {}
+
+
+def _is_text_only_config(config: dict) -> bool:
+    return not any(
+        _has_config(config, key)
+        for key in ("vision_config", "audio_config", "dflash_config")
+    )
 
 
 def get_model_path(
@@ -171,9 +205,6 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
 
     Returns:
         nn.Module: The loaded and initialized model.
@@ -199,7 +230,7 @@ Create safetensors using the following code:
 ```
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-model_id= "<huggingface_model_id>"
+model_id = "<huggingface_model_id>"
 model = AutoModelForCausalLM.from_pretrained(model_id)
 processor = AutoProcessor.from_pretrained(model_id)
 
@@ -217,8 +248,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    import safetensors
-
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
@@ -228,6 +257,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("text_config", config.pop("llm_config", {}))
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
+
+    has_quantization = "quantization" in config
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
@@ -248,18 +279,20 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             weights = sanitize_weights(model.code2wav, weights)
             weights = sanitize_weights(model.talker, weights)
         else:
-            weights = sanitize_weights(
-                model_class.VisionModel, weights, model_config.vision_config
-            )
-            weights = sanitize_weights(
-                model_class.LanguageModel, weights, model_config.text_config
-            )
+            if hasattr(model_class, "VisionModel"):
+                weights = sanitize_weights(
+                    model_class.VisionModel, weights, model_config.vision_config
+                )
+            if hasattr(model_class, "LanguageModel"):
+                weights = sanitize_weights(
+                    model_class.LanguageModel, weights, model_config.text_config
+                )
             if hasattr(model_class, "AudioModel"):
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
-    if not "quantization" in config:
+    if not has_quantization:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:
             text_config = config.get("text_config", {})
@@ -284,10 +317,21 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
 
+    if has_quantization:
+        for quantization_key in ("quantization", "quantization_config"):
+            quantization_value = getattr(model_config, quantization_key, None)
+            if quantization_value is not None:
+                config[quantization_key] = quantization_value
+
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        quantized_model = (
+            model.language_model._model
+            if getattr(model, "_is_text_model", False)
+            else model
+        )
 
         def get_class_predicate(p, m):
             # Always skip vision and audio models
@@ -305,7 +349,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             return f"{p}.scales" in weights
 
         nn.quantize(
-            model,
+            quantized_model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
@@ -365,13 +409,14 @@ def load(
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     revision: Optional[str] = None,
+    strict: bool = True,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
     Load the model and tokenizer from a given path or a huggingface repository.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         adapter_path (str, optional): Path to the LoRA adapters. If provided, applies LoRA layers
@@ -381,10 +426,8 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
-        quantize_activations (bool, optional): If True, convert QuantizedLinear layers
-            to QQLinear layers for activation quantization. Only supported for models
-            quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
-
+        strict (bool): Whether or not to raise an exception if weights don't
+            match. Default: ``True``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -400,7 +443,7 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, strict=strict, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -414,6 +457,59 @@ def load(
 
     if image_processor is not None:
         processor.image_processor = image_processor
+
+    return model, processor
+
+
+def sharded_load(
+    repo,
+    tensor_group: Optional[mx.distributed.Group] = None,
+    pipeline_group: Optional[mx.distributed.Group] = None,
+):
+    # Get model path with everything but weight safetensors
+    model_path = get_model_path(repo)
+
+    # Lazy load model to figure out what type of sharding we can do and which
+    # weights we need to download.
+    model = load_model(model_path, lazy=True, strict=False)
+    config = model.config.to_dict()
+
+    has_tensor_parallel = hasattr(model, "shard")
+
+    if tensor_group is not None and not has_tensor_parallel:
+        raise ValueError(
+            "The model does not support tensor parallelism but a tensor_group was provided"
+        )
+
+    if tensor_group is None and pipeline_group is None:
+        if has_tensor_parallel:
+            tensor_group = mx.distributed.init()
+
+    processor = load_processor(
+        model_path, True, eos_token_ids=config.get("eos_token_id", None)
+    )
+
+    image_processor = load_image_processor(model_path)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+
+    if tensor_group is not None:
+        model.shard(tensor_group)
+
+    if pipeline_group is not None:
+        lm = model.language_model
+        # The underlying model (e.g. DeepseekV3Model) has PipelineMixin
+        inner = lm.model if hasattr(lm, "model") else lm
+        if not hasattr(inner, "pipeline"):
+            raise ValueError("The model does not support pipeline parallelism")
+        inner.pipeline(pipeline_group)
+
+    print("Materializing")
+    mx.eval(model.language_model.parameters())
+    model.eval()
+
+    # Synchronize processes to avoid timeout
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
 
     return model, processor
 
@@ -432,7 +528,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         FileNotFoundError: If config.json is not found at the path
     """
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+        model_path = get_model_path(
+            model_path,
+            revision=kwargs.get("revision"),
+            force_download=kwargs.get("force_download", False),
+        )
 
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
@@ -458,14 +558,21 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
     if isinstance(model_path, str):
-        model_path = get_model_path(model_path)
+        model_path = get_model_path(
+            model_path,
+            revision=kwargs.get("revision"),
+            force_download=kwargs.get("force_download", False),
+        )
 
     if not kwargs:
         config = load_config(model_path, trust_remote_code=True)
     else:
         config = load_config(model_path, **kwargs)
 
-    model_class, _ = get_model_and_args(config)
+    try:
+        model_class, _ = get_model_and_args(config)
+    except ValueError:
+        return None
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
@@ -483,7 +590,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -497,7 +604,9 @@ def load_processor(
 
         # Determine the EOS token IDs, prioritizing the function argument
         final_eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+            eos_token_ids
+            or getattr(tokenizer_obj, "eos_token_ids", None)
+            or getattr(tokenizer_obj, "eos_token_id", None)
         )
 
         # Create and assign the StoppingCriteria
@@ -743,6 +852,7 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
     import base64
 
+    original_source = image_source
     try:
         if not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
@@ -756,15 +866,15 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
         if isinstance(image_source, str) and image_source.startswith(
             ("http://", "https://")
         ):
-            response = requests.get(image_source, stream=True, timeout=timeout)
-            response.raise_for_status()
-            image_source = response.raw
+            with requests.get(image_source, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                image_source = BytesIO(response.content)
 
         image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:
-        raise ValueError(f"Failed to load image from {image_source}: {e}") from e
+        raise ValueError(f"Failed to load image from {original_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
     return image.convert("RGB")
@@ -785,55 +895,6 @@ def process_image(img, resize_shape, image_processor):
     if resize_shape is not None and not isinstance(image_processor, BaseImageProcessor):
         img = resize_image(img, resize_shape)
     return img
-
-
-def _resample_fft(signal: np.ndarray, n_target: int) -> np.ndarray:
-    """FFT-based resampling for a 1D signal (matches scipy.signal.resample)."""
-    n_orig = len(signal)
-    if n_orig == n_target:
-        return signal
-
-    X = np.fft.rfft(signal)
-    m = min(n_target, n_orig)
-    m2 = m // 2 + 1
-
-    # Truncate to relevant frequency bins
-    X = X[:m2].copy()
-
-    # Account for unpaired Nyquist bin (matches scipy exactly)
-    if m % 2 == 0 and n_target != n_orig:
-        X[m // 2] *= 2.0 if n_target < n_orig else 0.5
-
-    s_fac = n_orig / n_target
-    resampled = np.fft.irfft(X / s_fac, n=n_target)
-    return resampled.astype(signal.dtype)
-
-
-def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-    """Resample audio using FFT (matches scipy.signal.resample)."""
-    if orig_sr == target_sr:
-        return audio
-
-    ratio = target_sr / orig_sr
-
-    if audio.ndim == 1:
-        new_length = int(len(audio) * ratio)
-        resampled = _resample_fft(audio, new_length)
-
-    elif audio.ndim == 2:
-        if audio.shape[0] < audio.shape[1]:
-            audio = audio.T
-
-        n_samples, n_channels = audio.shape
-        new_length = int(n_samples * ratio)
-
-        resampled = np.zeros((new_length, n_channels), dtype=audio.dtype)
-        for i in range(n_channels):
-            resampled[:, i] = _resample_fft(audio[:, i], new_length)
-    else:
-        raise ValueError(f"Audio array has unsupported shape: {audio.shape}")
-
-    return resampled
 
 
 def read_audio(file) -> tuple:
@@ -990,29 +1051,100 @@ def load_audio(
     Helper function to load audio from either a URL, file path, or numpy array.
     """
     if isinstance(file, np.ndarray):
-        return file
+        audio = file.astype(np.float32, copy=False)
+        return audio.mean(axis=1) if audio.ndim > 1 else audio
+
+    from mlx_audio.audio_io import read as read_audio
+    from mlx_audio.utils import resample_audio
+
     if isinstance(file, Path):
         file = str(file)
     if isinstance(file, str) and file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
-            audio, sample_rate = read_audio(BytesIO(response.content))
+            audio, sample_rate = read_audio(BytesIO(response.content), dtype="float32")
         except Exception as e:
             raise ValueError(
                 f"Failed to load audio from URL: {file} with error {e}"
             ) from e
     else:
-        audio, sample_rate = read_audio(file)
+        audio, sample_rate = read_audio(file, dtype="float32")
 
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
-    return np.array(audio).mean(axis=1)
+    audio = np.asarray(audio, dtype=np.float32)
+    return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
 def normalize_audio_features(features: mx.array) -> mx.array:
     """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
     return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
+
+
+def load_video(
+    video_path: str,
+    fps: float = 2.0,
+    nframes: Optional[int] = None,
+    min_frames: int = 4,
+    max_frames: int = 768,
+    frame_factor: int = 2,
+) -> Tuple[np.ndarray, float]:
+    """Read a video file as a (T, C, H, W) numpy array.
+
+    Uniformly samples ``nframes`` frames — either a fixed count or derived
+    from ``fps`` — and returns the sampled frames alongside the effective
+    sampling fps.
+    """
+    import cv2
+
+    if video_path.startswith("file://"):
+        video_path = video_path[7:]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
+
+    def _round(n):
+        return round(n / frame_factor) * frame_factor
+
+    def _floor(n):
+        return math.floor(n / frame_factor) * frame_factor
+
+    def _ceil(n):
+        return math.ceil(n / frame_factor) * frame_factor
+
+    if nframes is not None:
+        n = _round(nframes)
+    else:
+        lo = _ceil(min_frames)
+        hi = _floor(min(max_frames, total_frames))
+        n = total_frames / video_fps * fps
+        n = min(max(n, lo), hi, total_frames)
+        n = _floor(n)
+    if not (frame_factor <= n <= total_frames):
+        cap.release()
+        raise ValueError(
+            f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
+        )
+
+    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
+    frames = []
+    for idx in indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    if not frames:
+        raise ValueError("No frames read from the video.")
+
+    video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
+    sample_fps = n / max(total_frames, 1e-6) * video_fps
+    return video_np, sample_fps
 
 
 def process_inputs(
@@ -1090,6 +1222,7 @@ def prepare_inputs(
     processor,
     images=None,
     audio=None,
+    videos=None,
     prompts=None,
     image_token_index=None,
     resize_shape=None,
@@ -1105,7 +1238,10 @@ def prepare_inputs(
         not hasattr(images, "__len__") or len(images) > 0
     )
     has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
-    if not has_images and not has_audio:
+    has_videos = videos is not None and (
+        not hasattr(videos, "__len__") or len(videos) > 0
+    )
+    if not has_images and not has_audio and not has_videos:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1253,6 +1389,22 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
+    video_fps = None
+    if has_videos:
+        if not isinstance(videos, list):
+            videos = [videos]
+        fps_hint = kwargs.pop("fps", 2.0)
+        loaded, video_fps = [], []
+        for v in videos:
+            arr, s_fps = (
+                load_video(str(v), fps=fps_hint)
+                if isinstance(v, (str, bytes))
+                else (v, fps_hint)
+            )
+            loaded.append(arr)
+            video_fps.append(s_fps)
+        videos = loaded
+
     model_inputs = {}
 
     if hasattr(processor, "image_processor") and isinstance(
@@ -1291,12 +1443,18 @@ def prepare_inputs(
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+        extra = {}
+        if has_videos:
+            extra["videos"] = videos
+            if video_fps is not None:
+                extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            **extra,
             **kwargs,
         )
 
@@ -1416,13 +1574,17 @@ class StoppingCriteria:
             raise ValueError("Processor is not provided")
 
         if new_eos_token_ids is not None:
-            if isinstance(new_eos_token_ids, str):
+            if isinstance(new_eos_token_ids, (str, int)):
                 new_eos_token_ids = [new_eos_token_ids]
-            new_eos_token_ids = [
-                self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
-                for token in new_eos_token_ids
-            ]
-            self.eos_token_ids.extend(new_eos_token_ids)
+            resolved = []
+            for token in new_eos_token_ids:
+                if isinstance(token, int):
+                    resolved.append(token)
+                elif isinstance(token, str):
+                    resolved.append(
+                        self.tokenizer.encode(" " + token, add_special_tokens=False)[-1]
+                    )
+            self.eos_token_ids.extend(resolved)
 
     def reset(self, eos_token_ids: List[int] = None):
         eos_token_ids = (
