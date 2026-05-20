@@ -5,7 +5,11 @@ import logging
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer.datasets import PreferenceVisionDataset, VisionDataset
+from .trainer.datasets import (
+    PreferenceVisionDataset,
+    VisionDataset,
+    resolve_completion_token_ids,
+)
 from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo
 from .trainer.sft_trainer import TrainingArgs, train
 from .trainer.utils import (
@@ -163,55 +167,13 @@ def main(args):
 
     # Auto-detect assistant/end-turn/user token IDs for train_on_completions
     if args.train_on_completions:
-        tokenizer = getattr(processor, "tokenizer", processor)
-        if args.assistant_id is None or args.end_turn_id is None or args.user_id is None:
-            # Probe the chat template with a minimal conversation
-            probe = [
-                {"role": "user", "content": "U"},
-                {"role": "assistant", "content": "A"},
-            ]
-            try:
-                probe_text = tokenizer.apply_chat_template(
-                    probe, tokenize=False, add_generation_prompt=False
-                )
-                probe_ids = tokenizer.encode(probe_text)
-
-                # Only match role tokens after a special token (contains
-                # < and >) to avoid matching "model"/"user" in content.
-                role_keywords = {"model", "assistant", "bot"}
-                user_keywords = {"user", "human"}
-                end_turn_markers = {"<turn|>", "<|im_end|>", "<end_of_utterance>"}
-
-                prev_is_special = False
-                for idx, tid in enumerate(probe_ids):
-                    decoded = tokenizer.decode([tid])
-                    stripped = decoded.strip()
-                    cleaned = stripped.lower().strip("<>|")
-                    is_special = "<" in stripped and ">" in stripped
-
-                    if prev_is_special and not is_special:
-                        if cleaned in role_keywords and args.assistant_id is None:
-                            args.assistant_id = tid
-                            logger.info(
-                                f"Auto-detected assistant_id: {tid} ({repr(stripped)})"
-                            )
-                        if cleaned in user_keywords and args.user_id is None:
-                            args.user_id = tid
-                            logger.info(
-                                f"Auto-detected user_id: {tid} ({repr(stripped)})"
-                            )
-
-                    prev_is_special = is_special
-
-                    if stripped in end_turn_markers:
-                        if args.end_turn_id is None:
-                            args.end_turn_id = tid
-                            logger.info(
-                                f"Auto-detected end_turn_id: {tid} ({repr(stripped)})"
-                            )
-
-            except Exception as e:
-                logger.warning(f"Auto-detection failed: {e}")
+        args.assistant_id, args.end_turn_id, args.user_id = resolve_completion_token_ids(
+            processor,
+            assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
+            logger=logger,
+        )
 
         if args.assistant_id is None:
             args.assistant_id = 77091
@@ -250,6 +212,10 @@ def main(args):
             config,
             processor,
             image_resize_shape=args.image_resize_shape,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
         )
     else:
         train_dataset = VisionDataset(
@@ -257,6 +223,10 @@ def main(args):
             config,
             processor,
             image_resize_shape=args.image_resize_shape,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
         )
 
     # Setup model for training
@@ -295,8 +265,6 @@ def main(args):
             args=training_args,
             train_on_completions=args.train_on_completions,
             assistant_id=args.assistant_id,
-            end_turn_id=args.end_turn_id,
-            user_id=args.user_id,
         )
     else:
         training_args = TrainingArgs(
@@ -322,8 +290,6 @@ def main(args):
             args=training_args,
             train_on_completions=args.train_on_completions,
             assistant_id=args.assistant_id,
-            end_turn_id=args.end_turn_id,
-            user_id=args.user_id,
         )
 
     logger.info(

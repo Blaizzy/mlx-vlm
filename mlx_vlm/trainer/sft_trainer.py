@@ -105,72 +105,20 @@ class TrainingArgs:
     )
 
 
-def build_completion_mask(input_ids, assistant_id, end_turn_id=None, user_id=None):
-    """Build a per-token mask that is 1 for assistant completion tokens and 0 elsewhere.
-
-    Supports multi-turn conversations by toggling on at each assistant_id
-    and off at each end_turn_id (or user_id if end_turn_id is not available).
-
-    Accepts mx.array or numpy input. Converts to numpy internally for the
-    sequential state machine, so must NOT be called inside mx.compile.
-    Pre-compute the mask before the compiled step and pass via batch dict.
-
-    Args:
-        input_ids: array of shape (batch_size, seq_length), mx.array or numpy
-        assistant_id: token ID that marks the start of assistant turns
-        end_turn_id: optional token ID that marks the end of a turn
-        user_id: optional token ID that marks start of user turns
-
-    Returns:
-        mx.array of shape (batch_size, seq_length) with 1s on completion tokens
-    """
-    if isinstance(input_ids, mx.array):
-        ids_np = np.array(input_ids)
-    else:
-        ids_np = input_ids
-
-    batch_size, seq_length = ids_np.shape
-    mask = np.zeros((batch_size, seq_length), dtype=np.int32)
-
-    for row_idx in range(batch_size):
-        row = ids_np[row_idx]
-        in_assistant = False
-        for col_idx in range(seq_length):
-            tid = row[col_idx]
-            if tid == assistant_id:
-                in_assistant = True
-            elif end_turn_id is not None and tid == end_turn_id:
-                if in_assistant:
-                    mask[row_idx, col_idx] = 1
-                in_assistant = False
-            elif user_id is not None and tid == user_id:
-                in_assistant = False
-            if in_assistant:
-                mask[row_idx, col_idx] = 1
-
-    return mx.array(mask)
-
-
 def vision_language_loss_fn(
     model, batch, train_on_completions=False, assistant_id=77091,
-    end_turn_id=None, user_id=None,
 ):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
 
-    batch_size, seq_length = input_ids.shape
-
     if train_on_completions:
-        # Use pre-computed mask from batch if available (set by training
-        # loop before the compiled step to avoid np.array inside mx.compile).
-        if "completion_mask" in batch:
-            weight_mask = batch["completion_mask"][:, 1:]
-        else:
-            completion_mask = build_completion_mask(
-                input_ids, assistant_id, end_turn_id, user_id
+        if "completion_mask" not in batch:
+            raise ValueError(
+                "train_on_completions=True requires dataset batches to include "
+                "'completion_mask'"
             )
-            weight_mask = completion_mask[:, 1:]
+        weight_mask = batch["completion_mask"][:, 1:]
     else:
         weight_mask = None
 
@@ -184,7 +132,7 @@ def vision_language_loss_fn(
     kwargs = {
         k: v
         for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
+        if k not in ["input_ids", "pixel_values", "attention_mask", "completion_mask"]
     }
 
     outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
@@ -252,6 +200,11 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
             attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+            completion_mask_batch = (
+                np.zeros((len(items), padded_len), dtype=np.int32)
+                if "completion_mask" in items[0]
+                else None
+            )
 
             for i, item in enumerate(items):
                 arr = np.array(_squeeze_leading_batch_dim(item["input_ids"])).reshape(
@@ -268,6 +221,12 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 else:
                     attention_mask_batch[i, :L] = 1
 
+                if completion_mask_batch is not None:
+                    completion_mask = np.array(
+                        _squeeze_leading_batch_dim(item["completion_mask"])
+                    ).reshape(-1)
+                    completion_mask_batch[i, :L] = completion_mask[:L]
+
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
                 pixel_values_batch = _collate_arrays(
@@ -279,11 +238,19 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 "attention_mask": mx.array(attention_mask_batch),
                 "pixel_values": pixel_values_batch,
             }
+            if completion_mask_batch is not None:
+                batch["completion_mask"] = mx.array(completion_mask_batch)
 
             extra_keys = [
                 k
                 for k in items[0]
-                if k not in ("input_ids", "attention_mask", "pixel_values")
+                if k
+                not in (
+                    "input_ids",
+                    "attention_mask",
+                    "pixel_values",
+                    "completion_mask",
+                )
             ]
             for k in extra_keys:
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
@@ -309,7 +276,6 @@ def evaluate(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None, user_id=None,
 ):
     """
     Evaluate the model on validation dataset.
@@ -319,8 +285,7 @@ def evaluate(
     ntokens = mx.array(0)
 
     loss_fn_partial = partial(
-        loss_fn, train_on_completions=train_on_completions,
-        assistant_id=assistant_id, end_turn_id=end_turn_id, user_id=user_id,
+        loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
     )
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
@@ -371,7 +336,6 @@ def train(
     loss_fn=vision_language_loss_fn,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None, user_id=None,
 ):
     """
     Main training function for vision-language models.
@@ -408,8 +372,7 @@ def train(
 
     # Create loss function with partial application
     loss_fn_partial = partial(
-        loss_fn, train_on_completions=train_on_completions,
-        assistant_id=assistant_id, end_turn_id=end_turn_id, user_id=user_id,
+        loss_fn, train_on_completions=train_on_completions, assistant_id=assistant_id
     )
 
     state = [model.state, optimizer.state, mx.random.state]
@@ -480,7 +443,6 @@ def train(
                 loss_fn=loss_fn_partial,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
-                end_turn_id=end_turn_id, user_id=user_id,
             )
             model.train()
             val_time = time.perf_counter() - tic_val
@@ -494,12 +456,6 @@ def train(
                 )
 
             tic = time.perf_counter()
-
-        # Pre-compute completion mask outside mx.compile boundary
-        if train_on_completions and "completion_mask" not in batch:
-            batch["completion_mask"] = build_completion_mask(
-                batch["input_ids"], assistant_id, end_turn_id, user_id
-            )
 
         # Training step
         lvalue, toks, grad_accum = step(

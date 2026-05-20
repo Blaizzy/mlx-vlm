@@ -32,22 +32,25 @@ class ORPOTrainingArgs(TrainingArgs):
 
 def get_logps(
     model, batch, train_on_completions=False, assistant_id=77091,
-    end_turn_id=None, user_id=None,
 ):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
 
-    batch_size, seq_length = input_ids.shape
-
     shifted_input_ids = input_ids[:, :-1]
     shifted_attention_mask = attention_mask[:, :-1]
     targets = input_ids[:, 1:]
 
+    if train_on_completions and "completion_mask" not in batch:
+        raise ValueError(
+            "train_on_completions=True requires dataset batches to include "
+            "'completion_mask'"
+        )
+
     kwargs = {
         k: v
         for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
+        if k not in ["input_ids", "pixel_values", "attention_mask", "completion_mask"]
     }
 
     outputs = model(shifted_input_ids, pixel_values, shifted_attention_mask, **kwargs)
@@ -70,14 +73,7 @@ def get_logps(
     base_mask = steps < lengths[:, None]
 
     if train_on_completions:
-        from .sft_trainer import build_completion_mask
-
-        completion_mask = build_completion_mask(
-            input_ids, assistant_id, end_turn_id, user_id
-        )
-        # Shift by 1 to align with targets (input_ids[:, 1:])
-        completion_mask_shifted = completion_mask[:, 1:]
-        mask = base_mask * completion_mask_shifted
+        mask = base_mask * batch["completion_mask"][:, 1:]
     else:
         mask = base_mask
 
@@ -139,6 +135,7 @@ def _pad_and_collate(items, prefix, max_seq_length):
     """Pad and collate input_ids, attention_mask, pixel_values for a given prefix."""
     id_key = f"{prefix}_input_ids"
     mask_key = f"{prefix}_attention_mask"
+    completion_mask_key = f"{prefix}_completion_mask"
     pv_key = f"{prefix}_pixel_values"
 
     lengths = [
@@ -155,6 +152,11 @@ def _pad_and_collate(items, prefix, max_seq_length):
 
     input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
     attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+    completion_mask_batch = (
+        np.zeros((len(items), padded_len), dtype=np.int32)
+        if completion_mask_key in items[0]
+        else None
+    )
 
     for i, item in enumerate(items):
         arr = np.array(_squeeze_leading_batch_dim(item[id_key])).reshape(-1)
@@ -167,6 +169,12 @@ def _pad_and_collate(items, prefix, max_seq_length):
         else:
             attention_mask_batch[i, :L] = 1
 
+        if completion_mask_batch is not None:
+            completion_mask = np.array(
+                _squeeze_leading_batch_dim(item[completion_mask_key])
+            ).reshape(-1)
+            completion_mask_batch[i, :L] = completion_mask[:L]
+
     pixel_values_batch = None
     if pv_key in items[0] and items[0][pv_key] is not None:
         pixel_values_batch = _collate_arrays(
@@ -178,8 +186,10 @@ def _pad_and_collate(items, prefix, max_seq_length):
         "attention_mask": mx.array(attention_mask_batch),
         "pixel_values": pixel_values_batch,
     }
+    if completion_mask_batch is not None:
+        result["completion_mask"] = mx.array(completion_mask_batch)
 
-    skip = {id_key, mask_key, pv_key}
+    skip = {id_key, mask_key, completion_mask_key, pv_key}
     for k in items[0]:
         if k.startswith(f"{prefix}_") and k not in skip:
             vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
@@ -237,7 +247,6 @@ def evaluate_orpo(
     loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None, user_id=None,
 ):
     """
     Evaluate the model on validation dataset.
@@ -272,14 +281,12 @@ def evaluate_orpo(
             chosen_batch,
             train_on_completions=train_on_completions,
             assistant_id=assistant_id,
-            end_turn_id=end_turn_id, user_id=user_id,
         )
         rejected_logps, rejected_logits_mean = get_logps(
             model,
             rejected_batch,
             train_on_completions=train_on_completions,
             assistant_id=assistant_id,
-            end_turn_id=end_turn_id, user_id=user_id,
         )
 
         losses, reward, num_tokens, metrics = loss_fn(
@@ -313,7 +320,6 @@ def train_orpo(
     loss_fn=orpo_loss,
     train_on_completions=False,
     assistant_id=77091,
-    end_turn_id=None, user_id=None,
 ):
     """
     Main training function for vision-language models.
@@ -352,14 +358,12 @@ def train_orpo(
                 chosen_batch,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
-                end_turn_id=end_turn_id, user_id=user_id,
             )
             rejected_logps, rejected_logits_mean = get_logps(
                 model,
                 rejected_batch,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
-                end_turn_id=end_turn_id, user_id=user_id,
             )
             losses, reward, num_tokens, metrics = loss_fn(
                 chosen_logps,
@@ -422,7 +426,6 @@ def train_orpo(
                 loss_fn=loss_fn,
                 train_on_completions=train_on_completions,
                 assistant_id=assistant_id,
-                end_turn_id=end_turn_id, user_id=user_id,
             )
             model.train()
             val_time = time.perf_counter() - tic_val
@@ -438,15 +441,6 @@ def train_orpo(
             tic = time.perf_counter()
 
         # Training step
-        # Pre-compute completion masks outside mx.compile boundary
-        if train_on_completions:
-            from .sft_trainer import build_completion_mask
-            for b in (chosen_batch, rejected_batch):
-                if "completion_mask" not in b:
-                    b["completion_mask"] = build_completion_mask(
-                        b["input_ids"], assistant_id, end_turn_id, user_id
-                    )
-
         lvalue, toks = step(chosen_batch, rejected_batch)
         mx.clear_cache()
         losses += lvalue
