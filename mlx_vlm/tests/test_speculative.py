@@ -311,6 +311,119 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     assert sink[0][11].shape == (1, 3, 2, 4, 4)
 
 
+def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
+    mx.random.seed(7)
+    linear = nn.Linear(16, 32, bias=True)
+    linear.weight = mx.random.normal((32, 16)).astype(mx.bfloat16)
+    linear.bias = mx.random.normal((32,)).astype(mx.bfloat16)
+    x = mx.random.normal((3, 4, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
+    mx.random.seed(9)
+    linear = nn.Linear(256, 512, bias=False)
+    linear.weight = mx.random.normal((512, 256)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
+    mx.random.seed(10)
+    linear = nn.Linear(256, 8, bias=False)
+    linear.weight = mx.random.normal((8, 256)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_mlp_matches_singleton_dense_path():
+    mx.random.seed(11)
+    mlp = qwen_language.Qwen3_5MLP(16, 32)
+    mlp.gate_proj.weight = mx.random.normal((32, 16)).astype(mx.bfloat16)
+    mlp.up_proj.weight = mx.random.normal((32, 16)).astype(mx.bfloat16)
+    mlp.down_proj.weight = mx.random.normal((16, 32)).astype(mx.bfloat16)
+    x = mx.random.normal((2, 3, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([mlp(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = mlp(x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_norms_match_singleton_path():
+    mx.random.seed(12)
+    norm = nn.RMSNorm(16, eps=1e-6)
+    x = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([norm(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_timewise(norm, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_gated_norm_matches_singleton_path():
+    mx.random.seed(13)
+    norm = qwen_language.Qwen3_5RMSNormGated(16, eps=1e-6)
+    x = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
+    gate = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate(
+        [norm(x[:, i : i + 1], gate[:, i : i + 1]) for i in range(x.shape[1])],
+        axis=1,
+    )
+    out = qwen_language._target_verify_timewise(norm, x, True, gate)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_gdn_verify_conv_matches_singleton_windows():
+    mx.random.seed(14)
+    config = SimpleNamespace(
+        hidden_size=16,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = qwen_language.Qwen3_5GatedDeltaNet(config)
+    steps = 4
+    conv_input = mx.random.normal(
+        (2, layer.conv_kernel_size + steps - 1, layer.conv_dim)
+    ).astype(mx.bfloat16)
+
+    ref = mx.concatenate(
+        [
+            layer.conv1d(conv_input[:, offset : offset + layer.conv_kernel_size, :])
+            for offset in range(steps)
+        ],
+        axis=1,
+    )
+    out = layer._causal_conv1d_verify(conv_input, steps)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
 def test_speculative_walk_accepts_until_first_mismatch():
     accepted, new_tokens = _speculative_walk(
         mx.array([[11, 12, 13]], dtype=mx.int32),
