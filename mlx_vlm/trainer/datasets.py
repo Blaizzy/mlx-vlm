@@ -15,11 +15,7 @@ def build_completion_mask(input_ids, assistant_id, end_turn_id=None, user_id=Non
     if assistant_id is None:
         raise ValueError("assistant_id is required when train_on_completions is enabled")
 
-    if isinstance(input_ids, mx.array):
-        ids_np = np.array(input_ids)
-    else:
-        ids_np = np.array(input_ids)
-
+    ids_np = np.array(input_ids)
     original_shape = ids_np.shape
     if ids_np.ndim == 1:
         ids_np = ids_np[None, :]
@@ -109,6 +105,8 @@ def resolve_completion_token_ids(
                 logger.info(f"Auto-detected end_turn_id: {tid} ({repr(stripped)})")
 
         prev_is_special = is_special
+        if assistant_id is not None and end_turn_id is not None and user_id is not None:
+            break
 
     return assistant_id, end_turn_id, user_id
 

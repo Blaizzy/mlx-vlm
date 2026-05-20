@@ -12,7 +12,12 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .sft_trainer import TrainingArgs, _collate_arrays, _squeeze_leading_batch_dim
+from .sft_trainer import (
+    TrainingArgs,
+    _collate_arrays,
+    _flat_seq_len,
+    _squeeze_leading_batch_dim,
+)
 from .utils import Colors, grad_checkpoint, save_adapter
 
 
@@ -132,17 +137,14 @@ def orpo_loss(
 
 
 def _pad_and_collate(items, prefix, max_seq_length):
-    """Pad and collate input_ids, attention_mask, pixel_values for a given prefix."""
+    """Pad and collate prefixed token, mask, pixel, and extra batch fields."""
     id_key = f"{prefix}_input_ids"
     mask_key = f"{prefix}_attention_mask"
     completion_mask_key = f"{prefix}_completion_mask"
     pv_key = f"{prefix}_pixel_values"
 
     lengths = [
-        min(
-            np.array(_squeeze_leading_batch_dim(x[id_key])).reshape(-1).shape[0],
-            max_seq_length,
-        )
+        min(_flat_seq_len(x[id_key]), max_seq_length)
         for x in items
     ]
     max_len = min(max(lengths), max_seq_length)
