@@ -162,9 +162,7 @@ class TestState:
 class TestMakeMask:
     def test_make_mask_matches_batch_kv_cache_with_left_padding(self):
         left_padding = [2, 0]
-        cache = BatchQuantizedKVCache(
-            left_padding, group_size=GROUP_SIZE, bits=BITS
-        )
+        cache = BatchQuantizedKVCache(left_padding, group_size=GROUP_SIZE, bits=BITS)
         reference = BatchKVCache(left_padding)
         k, v = _rand_kv(B, 5)
 
