@@ -278,26 +278,18 @@ def _gated_delta_update_verify_decode(
     mask: Optional[mx.array],
     use_kernel: bool,
 ):
-    outputs = []
-    states = []
-    current_state = state
-    for i in range(q.shape[1]):
-        step_mask = mask[:, i : i + 1] if isinstance(mask, mx.array) else None
-        out, current_state = gated_delta_update(
-            q[:, i : i + 1],
-            k[:, i : i + 1],
-            v[:, i : i + 1],
-            a[:, i : i + 1],
-            b[:, i : i + 1],
-            A_log,
-            dt_bias,
-            current_state,
-            step_mask,
-            use_kernel=use_kernel,
-        )
-        outputs.append(out)
-        states.append(current_state)
-    return mx.concatenate(outputs, axis=1), current_state, mx.stack(states, axis=1)
+    return gated_delta_update_with_states(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=use_kernel,
+    )
 
 
 class Qwen3_5Attention(nn.Module):
@@ -552,32 +544,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         initial_state = state
         if gdn_sink is not None:
-            if target_verify and S > 1:
-                out, state, intermediate_states = _gated_delta_update_verify_decode(
-                    q,
-                    k,
-                    v,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                    state,
-                    mask,
-                    use_kernel=not self.training,
-                )
-            else:
-                out, state, intermediate_states = gated_delta_update_with_states(
-                    q,
-                    k,
-                    v,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                    state,
-                    mask,
-                    use_kernel=not self.training,
-                )
+            out, state, intermediate_states = _gated_delta_update_verify_decode(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
         else:
             out, state = gated_delta_update(
                 q,

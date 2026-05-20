@@ -311,6 +311,46 @@ def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     assert sink[0][11].shape == (1, 3, 2, 4, 4)
 
 
+def test_qwen_gdn_verify_update_matches_stepwise_path():
+    mx.random.seed(16)
+    B, S, Hk, D, Hv, Dv = 1, 3, 16, 128, 32, 128
+    q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
+
+    outputs = []
+    states = []
+    current_state = state
+    for i in range(S):
+        out, current_state = qwen_language.gated_delta_update(
+            q[:, i : i + 1],
+            k[:, i : i + 1],
+            v[:, i : i + 1],
+            a[:, i : i + 1],
+            b[:, i : i + 1],
+            A_log,
+            dt_bias,
+            current_state,
+            None,
+            use_kernel=False,
+        )
+        outputs.append(out)
+        states.append(current_state)
+
+    ref = (mx.concatenate(outputs, axis=1), current_state, mx.stack(states, axis=1))
+    out = qwen_language._gated_delta_update_verify_decode(
+        q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=False
+    )
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
 def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
     mx.random.seed(7)
     linear = nn.Linear(16, 32, bias=True)
