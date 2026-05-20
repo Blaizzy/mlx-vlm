@@ -42,7 +42,10 @@ class MockTorch:
 
 
 class MockProcessor:
-    def __init__(self):
+    def __init__(self, tokenizer_return_value=None):
+        self.image_token = "<image>"
+        _return_value = tokenizer_return_value
+
         class DummyTokenizer:
             def __init__(self):
                 self.pad_token = None
@@ -59,6 +62,8 @@ class MockProcessor:
                 del text, add_special_tokens, padding, padding_side
                 if return_tensors != "mlx":
                     raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+                if _return_value is not None:
+                    return _return_value
                 return SimpleNamespace(
                     input_ids=mx.array([[1, 2, 3]]),
                     attention_mask=mx.array([[7, 8, 9]]),
@@ -247,8 +252,12 @@ def test_quantize_module():
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
+    # Define tokenizer return values
+    tok_result = MagicMock()
+    tok_result.input_ids = [[1, 2, 3]]
+    tok_result.attention_mask = [7, 8, 9]
     # Mock processor
-    processor = MockProcessor()
+    processor = MockProcessor(tokenizer_return_value=tok_result)
 
     # Test text-only input
     inputs = prepare_inputs(
