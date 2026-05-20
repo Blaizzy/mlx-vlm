@@ -387,7 +387,10 @@ class BatchQuantizedKVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         from mlx_lm.models.cache import create_attention_mask
 
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+        offset = self.offset
+        if isinstance(offset, mx.array):
+            offset = int(offset.item()) if offset.ndim == 0 else int(offset[0])
+        return create_attention_mask(*args, offset=offset, **kwargs)
 
 
 def make_prompt_cache(

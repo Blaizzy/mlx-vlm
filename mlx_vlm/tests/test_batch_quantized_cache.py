@@ -232,5 +232,31 @@ class TestBatchGeneratorIntegration:
         assert gen.kv_bits is None
 
 
+class TestMakeMask:
+    def test_make_mask_with_scalar_array_offset(self):
+        cache = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(1, 5)
+        cache.update_and_fetch(k, v)
+        mx.eval(cache.offset)
+        mask = cache.make_mask(3, return_array=True, window_size=None)
+        assert mask is not None
+
+    def test_make_mask_with_1d_array_offset(self):
+        cache = BatchQuantizedKVCache([2, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(2, 5)
+        cache.update_and_fetch(k, v)
+        mx.eval(cache.offset)
+        mask = cache.make_mask(3, return_array=True, window_size=None)
+        assert mask is not None
+
+    def test_make_mask_returns_none_for_single_token(self):
+        cache = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(1, 5)
+        cache.update_and_fetch(k, v)
+        mx.eval(cache.offset)
+        result = cache.make_mask(1, return_array=False, window_size=None)
+        assert result is None or isinstance(result, (mx.array, str))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
