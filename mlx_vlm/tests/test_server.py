@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlx_vlm.server as server
+import mlx_vlm.server.generation as server_generation
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
@@ -269,9 +270,13 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     gen._gpu_embed = fake_gpu_embed
 
-    monkeypatch.setattr(server, "_make_cache", lambda *args, **kwargs: [])
-    monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: None)
-    monkeypatch.setattr(server, "get_speculative_batch_coalesce_s", lambda: 0.0)
+    monkeypatch.setattr(server_generation, "_make_cache", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        server_generation, "_get_draft_block_size_from_env", lambda: None
+    )
+    monkeypatch.setattr(
+        server_generation, "get_speculative_batch_coalesce_s", lambda: 0.0
+    )
 
     class _FakeDetokenizer:
         def __init__(self):
@@ -287,7 +292,9 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
             pass
 
     monkeypatch.setattr(
-        server, "make_streaming_detokenizer", lambda processor: _FakeDetokenizer()
+        server_generation,
+        "make_streaming_detokenizer",
+        lambda processor: _FakeDetokenizer(),
     )
 
     def fake_rounds(*args, **kwargs):
@@ -296,7 +303,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
         gen._stop = True
         yield ([4] * int(kwargs["first_bonus"].shape[0]), None)
 
-    monkeypatch.setattr(server, "run_speculative_server_rounds", fake_rounds)
+    monkeypatch.setattr(server_generation, "run_speculative_server_rounds", fake_rounds)
 
     args = server.GenerationArguments(max_tokens=2, temperature=0)
     for spec in request_specs:
@@ -624,7 +631,7 @@ def test_responses_streaming_emits_native_tool_call_items(client):
         patch.object(server, "stream_generate", return_value=iter(chunks)),
         patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
         patch.object(server, "load_tool_module", return_value=tool_module),
-        patch.object(server, "response_generator", None),
+        patch.object(server.runtime, "response_generator", None),
     ):
         response = client.post(
             "/v1/responses",
@@ -687,8 +694,8 @@ def test_v1_stream_endpoints_reject_over_context_before_sse(
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
 
-    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
-    monkeypatch.setattr(server, "response_generator", response_generator)
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
     monkeypatch.setattr(
         server, "get_cached_model", MagicMock(return_value=(model, processor, config))
     )
@@ -736,8 +743,10 @@ def test_v1_non_stream_endpoints_reject_over_context(
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
 
-    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
-    monkeypatch.setattr(server, "response_generator", OverBudgetResponseGenerator())
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(
+        server.runtime, "response_generator", OverBudgetResponseGenerator()
+    )
     monkeypatch.setattr(
         server, "get_cached_model", MagicMock(return_value=(model, processor, config))
     )
@@ -820,7 +829,7 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
                 ]
             )
 
-    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
     with (
         patch.object(
@@ -900,7 +909,7 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
 
 
 def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
-    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -962,7 +971,7 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
 
 
 def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
-    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -1036,7 +1045,7 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
 
 
 def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkeypatch):
-    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -1129,7 +1138,7 @@ def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkey
 
 
 def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch):
-    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -1205,7 +1214,7 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
                 ]
             )
 
-    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
     with (
         patch.object(
@@ -1260,7 +1269,7 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
                 ]
             )
 
-    monkeypatch.setattr(server, "response_generator", FakeResponseGenerator())
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
     with (
         patch.object(
@@ -1297,7 +1306,7 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
 
 
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
-    monkeypatch.setattr(server, "apc_manager", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
 
     response = client.get("/v1/cache/stats")
     assert response.status_code == 200
@@ -1311,7 +1320,7 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
         stats_snapshot=MagicMock(return_value={"hits": 2, "pool_used": 1}),
         clear=MagicMock(),
     )
-    monkeypatch.setattr(server, "apc_manager", manager)
+    monkeypatch.setattr(server.runtime, "apc_manager", manager)
 
     response = client.get("/v1/cache/stats")
     assert response.status_code == 200
@@ -1324,10 +1333,10 @@ def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
 
 
 def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
-    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
-    monkeypatch.setattr(server, "apc_manager", None)
-    monkeypatch.setattr(server, "response_generator", None)
-    monkeypatch.setattr(server, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
 
     response = client.get("/metrics")
 
@@ -1343,9 +1352,9 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
 
 
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
-    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
-    monkeypatch.setattr(server, "apc_manager", None)
-    monkeypatch.setattr(server, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+    monkeypatch.setattr(server.runtime, "response_generator", None)
 
     config = SimpleNamespace(
         text_config=SimpleNamespace(max_position_embeddings=4096),
@@ -1353,7 +1362,7 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     processor = SimpleNamespace()
     model = SimpleNamespace()
     monkeypatch.setattr(
-        server,
+        server.runtime,
         "model_cache",
         {
             "model_path": "demo-model",
@@ -1456,7 +1465,7 @@ class TestResponseGenerator:
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         monkeypatch.setattr(
-            server,
+            server.runtime,
             "model_cache",
             {
                 "config": SimpleNamespace(
@@ -1464,8 +1473,8 @@ class TestResponseGenerator:
                 )
             },
         )
-        monkeypatch.setattr(server, "response_generator", None)
-        monkeypatch.setattr(server, "apc_manager", None)
+        monkeypatch.setattr(server.runtime, "response_generator", None)
+        monkeypatch.setattr(server.runtime, "apc_manager", None)
 
         runtime = server._server_runtime_snapshot()
 
@@ -1865,9 +1874,11 @@ class TestResponseGenerator:
                     del self._active[uid]
                 return [], responses
 
-        monkeypatch.setattr(server, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
         monkeypatch.setattr(
-            server, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
+            server_generation,
+            "make_streaming_detokenizer",
+            lambda _: FakeDetokenizer(),
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
