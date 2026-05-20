@@ -7,6 +7,7 @@ import mlx.nn as nn
 from ....models.base import create_attention_mask
 from ....models.cache import KVCache
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
+from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from .config import Qwen3_5MTPConfig
 
 
@@ -34,9 +35,13 @@ class Qwen3_5MTPDraftModel(nn.Module):
             hidden_size, eps=text_config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
+        layer_cls = (
+            Qwen3_5MoeDecoderLayer
+            if "moe" in getattr(text_config, "model_type", "")
+            else Qwen3_5DecoderLayer
+        )
         self.layers = [
-            Qwen3_5DecoderLayer(args=layer_config, layer_idx=0)
-            for _ in range(mtp_layers)
+            layer_cls(args=layer_config, layer_idx=0) for _ in range(mtp_layers)
         ]
         self.norm = nn.RMSNorm(hidden_size, eps=text_config.rms_norm_eps)
 
@@ -383,6 +388,21 @@ class Qwen3_5MTPDraftModel(nn.Module):
 
     def sanitize(self, weights: dict) -> dict:
         out = {}
+        weights = dict(weights)
+        expert_prefixes = [
+            key[: -len(".experts.gate_up_proj")]
+            for key in weights
+            if key.endswith(".experts.gate_up_proj")
+        ]
+        for prefix in expert_prefixes:
+            gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
+            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
+            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
+            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                f"{prefix}.experts.down_proj"
+            )
+
         norm_suffixes = (
             ".input_layernorm.weight",
             ".post_attention_layernorm.weight",
