@@ -4,9 +4,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .common import (
-    _SpeculativeSamplerRNG,
     _batch_cache_left_padding,
     _record_speculative_round,
+    _SpeculativeSamplerRNG,
     generation_stream,
 )
 

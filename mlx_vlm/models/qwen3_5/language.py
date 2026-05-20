@@ -229,9 +229,7 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
         if out is not None:
             return out
 
-    return mx.concatenate(
-        [linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1
-    )
+    return mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
 
 
 def _target_verify_linears(linears, x: mx.array, target_verify: bool):
@@ -243,9 +241,7 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
     ):
         return tuple(linear(x) for linear in linears)
 
-    return tuple(
-        _target_verify_linear(linear, x, target_verify) for linear in linears
-    )
+    return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
 
 
 def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bool):
@@ -346,9 +342,9 @@ class Qwen3_5Attention(nn.Module):
         gate = gate.reshape(B, L, -1)
 
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(
-            keys.reshape(B, L, self.num_key_value_heads, -1)
-        ).transpose(0, 2, 1, 3)
+        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
+            0, 2, 1, 3
+        )
         values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
         )
@@ -413,9 +409,7 @@ class Qwen3_5MLP(nn.Module):
         gate, up = _target_verify_linears(
             (self.gate_proj, self.up_proj), x, target_verify
         )
-        return _target_verify_linear(
-            self.down_proj, swiglu(gate, up), target_verify
-        )
+        return _target_verify_linear(self.down_proj, swiglu(gate, up), target_verify)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):

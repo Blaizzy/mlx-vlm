@@ -6,13 +6,13 @@ import mlx.nn as nn
 
 from ..models import cache
 from .common import (
-    _SpeculativeSamplerRNG,
     _batch_cache_left_padding,
     _dflash_block_total,
     _record_speculative_round,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
+    _SpeculativeSamplerRNG,
     generation_stream,
 )
 

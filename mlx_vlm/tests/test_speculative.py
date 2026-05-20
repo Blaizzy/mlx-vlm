@@ -17,6 +17,7 @@ import pytest
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
+from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -36,7 +37,6 @@ from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPCo
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
 from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
-from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.eagle3 import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
