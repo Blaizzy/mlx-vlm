@@ -412,7 +412,7 @@ def test_qwen_target_verify_norms_match_singleton_path():
     x = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
 
     ref = mx.concatenate([norm(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
-    out = qwen_language._target_verify_timewise(norm, x, target_verify=True)
+    out = norm(x)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
@@ -428,7 +428,7 @@ def test_qwen_target_verify_gated_norm_matches_singleton_path():
         [norm(x[:, i : i + 1], gate[:, i : i + 1]) for i in range(x.shape[1])],
         axis=1,
     )
-    out = qwen_language._target_verify_timewise(norm, x, True, gate)
+    out = norm(x, gate)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())

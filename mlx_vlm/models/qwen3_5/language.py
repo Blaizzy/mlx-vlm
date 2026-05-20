@@ -262,10 +262,6 @@ def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bo
     )
 
 
-def _target_verify_timewise(fn, x: mx.array, target_verify: bool, *args) -> mx.array:
-    return fn(x, *args)
-
-
 def _gated_delta_update_verify_decode(
     q: mx.array,
     k: mx.array,
@@ -349,13 +345,9 @@ class Qwen3_5Attention(nn.Module):
         )
         gate = gate.reshape(B, L, -1)
 
-        queries = _target_verify_timewise(
-            self.q_norm, queries, target_verify
-        ).transpose(0, 2, 1, 3)
-        keys = _target_verify_timewise(
-            self.k_norm,
-            keys.reshape(B, L, self.num_key_value_heads, -1),
-            target_verify,
+        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+        keys = self.k_norm(
+            keys.reshape(B, L, self.num_key_value_heads, -1)
         ).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
             0, 2, 1, 3
@@ -531,16 +523,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if state is not None and state.shape[0] != B:
             state = None
         inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * _target_verify_timewise(
-            lambda value: mx.fast.rms_norm(value, None, 1e-6),
-            q,
-            target_verify,
-        )
-        k = inv_scale * _target_verify_timewise(
-            lambda value: mx.fast.rms_norm(value, None, 1e-6),
-            k,
-            target_verify,
-        )
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         initial_state = state
         if gdn_sink is not None:
@@ -594,7 +578,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if hasattr(cache, "advance"):
                 cache.advance(S)
 
-        out = _target_verify_timewise(self.norm, out, target_verify, z)
+        out = self.norm(out, z)
         return _target_verify_linear(
             self.out_proj, out.reshape(B, S, -1), target_verify
         )
