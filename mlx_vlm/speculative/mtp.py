@@ -471,7 +471,7 @@ def _mtp_rounds(
             sampler,
             max_tokens - emitted,
         )
-        sampler_rng.target_sampled()
+        sampler_rng.target_sampled(sync_draft=True)
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:
@@ -750,6 +750,7 @@ def _mtp_rounds_batch(
             accepted_list, new_tokens_list = _speculative_walk_batch(
                 draft_tokens, verify.target_tokens, budgets
             )
+            sampler_rng.sync_draft_to_target()
             if (
                 n_active > 1
                 and getattr(draft_model, "requires_uniform_batch_acceptance", False)
@@ -772,7 +773,7 @@ def _mtp_rounds_batch(
                 sampler,
                 budgets,
             )
-            sampler_rng.target_sampled()
+            sampler_rng.target_sampled(sync_draft=True)
         # Keep the adaptive block-size history on a per-round basis so
         # batched MTP reacts like the singleton loop instead of letting
         # batch size change the controller signal.

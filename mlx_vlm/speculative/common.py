@@ -94,9 +94,15 @@ class _SpeculativeSamplerRNG:
         _restore_rng_state(self._target_rng_state)
         return result
 
-    def target_sampled(self) -> None:
+    def target_sampled(self, *, sync_draft: bool = False) -> None:
         if self.enabled:
             self._target_rng_state = _copy_rng_state()
+            if sync_draft:
+                self._draft_rng_state = _copy_rng_state()
+
+    def sync_draft_to_target(self) -> None:
+        if self.enabled:
+            self._draft_rng_state = _copy_rng_state()
 
     def target_eval(self, *values: Any) -> None:
         if not self.enabled:

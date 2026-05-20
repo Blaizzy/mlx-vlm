@@ -99,6 +99,48 @@ def test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream():
     assert draft_model._seed_token is not None
 
 
+def test_speculative_sampler_rng_can_resync_draft_after_rejected_draws():
+    logits = mx.zeros((1, 8), dtype=mx.float32)
+
+    def sampler(values):
+        token = mx.random.categorical(values)
+        mx.eval(token)
+        return token
+
+    mx.random.seed(123)
+    expected_first = sampler(logits)
+    expected_second = sampler(logits)
+    expected_third = sampler(logits)
+
+    draft_model = SimpleNamespace(_seed_token=None)
+
+    def draft_block():
+        return mx.stack([mx.random.categorical(logits) for _ in range(3)])
+
+    def draft_seed():
+        draft_model._seed_token = mx.random.categorical(logits)
+
+    mx.random.seed(123)
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=True)
+    first = sampler(logits)
+    sampler_rng.target_sampled(sync_draft=True)
+
+    # The draft stream may spend random draws on tokens later rejected by the
+    # target verifier.
+    sampler_rng.draft_tokens(draft_block)
+
+    # Only one target token is actually emitted, so the next draft seed should
+    # restart from the target stream after that emitted token.
+    second = sampler(logits)
+    sampler_rng.target_sampled(sync_draft=True)
+    sampler_rng.draft_call(draft_seed)
+    mx.eval(draft_model._seed_token)
+
+    assert first.tolist() == expected_first.tolist()
+    assert second.tolist() == expected_second.tolist()
+    assert draft_model._seed_token.tolist() == expected_third.tolist()
+
+
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
     rows = []
     for row in range(batch_size):
