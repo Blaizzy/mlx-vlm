@@ -54,6 +54,20 @@ class VisionConfig(BaseModelConfig):
             self.layer_types = ["full_attention"] * self.num_hidden_layers
         if self.rope_parameters is None:
             self.rope_parameters = {"rope_theta": 100.0, "rope_type": "default"}
+        # Image-token budget capacity check: the vision tower derives
+        # ``max_patches = default_output_length * pooling_kernel_size ** 2`` at
+        # construction, and the patch-position embedding table is sized to
+        # ``position_embedding_size``. Reject overrides that would request more
+        # patches than the position table can index.
+        requested_patches = self.default_output_length * self.pooling_kernel_size**2
+        if requested_patches > self.position_embedding_size:
+            max_supported = self.position_embedding_size // self.pooling_kernel_size**2
+            raise ValueError(
+                f"default_output_length={self.default_output_length} requires "
+                f"{requested_patches} patches but position_embedding_size only "
+                f"supports {self.position_embedding_size}. Reduce "
+                f"default_output_length to <= {max_supported}."
+            )
 
 
 @dataclass
