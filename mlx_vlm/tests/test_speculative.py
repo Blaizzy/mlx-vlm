@@ -17,6 +17,7 @@ import pytest
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
+from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -62,6 +63,82 @@ from mlx_vlm.speculative.utils import (
 from mlx_vlm.utils import get_model_and_args
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
+
+
+def test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream():
+    logits = mx.zeros((1, 8), dtype=mx.float32)
+
+    def sampler(values):
+        return mx.random.categorical(values)
+
+    mx.random.seed(123)
+    expected_first = sampler(logits)
+    mx.eval(expected_first)
+    expected_second = sampler(logits)
+    mx.eval(expected_second)
+
+    draft_model = SimpleNamespace(_seed_token=None)
+
+    def draft_prefill():
+        draft_model._seed_token = sampler(logits)
+
+    mx.random.seed(123)
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=True)
+    first = sampler(logits)
+    mx.eval(first)
+    sampler_rng.target_sampled()
+
+    sampler_rng.draft_call(draft_prefill)
+
+    second = sampler(logits)
+    mx.eval(second)
+    sampler_rng.target_sampled()
+
+    assert first.tolist() == expected_first.tolist()
+    assert second.tolist() == expected_second.tolist()
+    assert draft_model._seed_token is not None
+
+
+def test_speculative_sampler_rng_can_resync_draft_after_rejected_draws():
+    logits = mx.zeros((1, 8), dtype=mx.float32)
+
+    def sampler(values):
+        token = mx.random.categorical(values)
+        mx.eval(token)
+        return token
+
+    mx.random.seed(123)
+    expected_first = sampler(logits)
+    expected_second = sampler(logits)
+    expected_third = sampler(logits)
+
+    draft_model = SimpleNamespace(_seed_token=None)
+
+    def draft_block():
+        return mx.stack([mx.random.categorical(logits) for _ in range(3)])
+
+    def draft_seed():
+        draft_model._seed_token = mx.random.categorical(logits)
+
+    mx.random.seed(123)
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=True)
+    first = sampler(logits)
+    sampler_rng.target_sampled(sync_draft=True)
+
+    # The draft stream may spend random draws on tokens later rejected by the
+    # target verifier.
+    sampler_rng.draft_tokens(draft_block)
+
+    # Only one target token is actually emitted, so the next draft seed should
+    # restart from the target stream after that emitted token.
+    second = sampler(logits)
+    sampler_rng.target_sampled(sync_draft=True)
+    sampler_rng.draft_call(draft_seed)
+    mx.eval(draft_model._seed_token)
+
+    assert first.tolist() == expected_first.tolist()
+    assert second.tolist() == expected_second.tolist()
+    assert draft_model._seed_token.tolist() == expected_third.tolist()
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -206,7 +283,7 @@ def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     assert float(mx.sum(mx.abs(captured["state"])).item()) == 0.0
 
 
-def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
+def test_qwen_gdn_sink_captures_intermediate_states_for_batched_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -224,9 +301,12 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
         B, S = q.shape[:2]
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        return out, next_state
+        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        return out, next_state, states
 
-    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
+    with patch.object(
+        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+    ):
         out = layer(
             mx.zeros((2, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -235,10 +315,10 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
 
     mx.eval(out)
     assert out.shape == (2, 3, 16)
-    assert sink[0][11] is None
+    assert sink[0][11].shape == (2, 3, 2, 4, 4)
 
 
-def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
+def test_qwen_gdn_sink_captures_intermediate_states_for_singleton_verify():
     config = SimpleNamespace(
         hidden_size=16,
         linear_num_value_heads=2,
@@ -256,9 +336,12 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
         B, S = q.shape[:2]
         out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
         next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
-        return out, next_state
+        states = mx.ones((B, S, 2, 4, 4), dtype=mx.float32)
+        return out, next_state, states
 
-    with patch.object(qwen_language, "gated_delta_update", side_effect=fake_update):
+    with patch.object(
+        qwen_language, "gated_delta_update_with_states", side_effect=fake_update
+    ):
         out = layer(
             mx.zeros((1, 3, 16), dtype=mx.float32),
             cache=ArraysCache(size=2),
@@ -267,7 +350,160 @@ def test_qwen_gdn_sink_skips_intermediate_states_for_singleton_verify():
 
     mx.eval(out)
     assert out.shape == (1, 3, 16)
-    assert sink[0][11] is None
+    assert sink[0][11].shape == (1, 3, 2, 4, 4)
+
+
+def test_qwen_gdn_verify_update_matches_stepwise_path():
+    mx.random.seed(16)
+    B, S, Hk, D, Hv, Dv = 1, 3, 16, 128, 32, 128
+    q = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    k = mx.random.normal((B, S, Hk, D)).astype(mx.bfloat16)
+    v = mx.random.normal((B, S, Hv, Dv)).astype(mx.bfloat16)
+    a = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    b = mx.random.normal((B, S, Hv)).astype(mx.bfloat16)
+    A_log = mx.random.normal((Hv,)).astype(mx.bfloat16)
+    dt_bias = mx.ones((Hv,), dtype=mx.bfloat16)
+    state = mx.zeros((B, Hv, Dv, D), dtype=mx.float32)
+
+    outputs = []
+    states = []
+    current_state = state
+    for i in range(S):
+        out, current_state = qwen_language.gated_delta_update(
+            q[:, i : i + 1],
+            k[:, i : i + 1],
+            v[:, i : i + 1],
+            a[:, i : i + 1],
+            b[:, i : i + 1],
+            A_log,
+            dt_bias,
+            current_state,
+            None,
+            use_kernel=False,
+        )
+        outputs.append(out)
+        states.append(current_state)
+
+    ref = (mx.concatenate(outputs, axis=1), current_state, mx.stack(states, axis=1))
+    out = qwen_language._gated_delta_update_verify_decode(
+        q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=False
+    )
+    mx.eval(*ref, *out)
+
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
+    mx.random.seed(7)
+    linear = nn.Linear(16, 32, bias=True)
+    linear.weight = mx.random.normal((32, 16)).astype(mx.bfloat16)
+    linear.bias = mx.random.normal((32,)).astype(mx.bfloat16)
+    x = mx.random.normal((3, 4, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
+    mx.random.seed(9)
+    linear = nn.Linear(256, 512, bias=False)
+    linear.weight = mx.random.normal((512, 256)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 4, 256)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
+    mx.random.seed(10)
+    linear = nn.Linear(256, 8, bias=False)
+    linear.weight = mx.random.normal((8, 256)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_mlp_matches_singleton_dense_path():
+    mx.random.seed(11)
+    mlp = qwen_language.Qwen3_5MLP(16, 32)
+    mlp.gate_proj.weight = mx.random.normal((32, 16)).astype(mx.bfloat16)
+    mlp.up_proj.weight = mx.random.normal((32, 16)).astype(mx.bfloat16)
+    mlp.down_proj.weight = mx.random.normal((16, 32)).astype(mx.bfloat16)
+    x = mx.random.normal((2, 3, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([mlp(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = mlp(x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_norms_match_singleton_path():
+    mx.random.seed(12)
+    norm = nn.RMSNorm(16, eps=1e-6)
+    x = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate([norm(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    out = norm(x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_gated_norm_matches_singleton_path():
+    mx.random.seed(13)
+    norm = qwen_language.Qwen3_5RMSNormGated(16, eps=1e-6)
+    x = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
+    gate = mx.random.normal((2, 4, 3, 16)).astype(mx.bfloat16)
+
+    ref = mx.concatenate(
+        [norm(x[:, i : i + 1], gate[:, i : i + 1]) for i in range(x.shape[1])],
+        axis=1,
+    )
+    out = norm(x, gate)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_gdn_verify_conv_matches_singleton_windows():
+    mx.random.seed(14)
+    config = SimpleNamespace(
+        hidden_size=16,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = qwen_language.Qwen3_5GatedDeltaNet(config)
+    steps = 4
+    conv_input = mx.random.normal(
+        (2, layer.conv_kernel_size + steps - 1, layer.conv_dim)
+    ).astype(mx.bfloat16)
+
+    ref = mx.concatenate(
+        [
+            layer.conv1d(conv_input[:, offset : offset + layer.conv_kernel_size, :])
+            for offset in range(steps)
+        ],
+        axis=1,
+    )
+    out = layer._causal_conv1d_verify(conv_input, steps)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
 
 
 def test_speculative_walk_accepts_until_first_mismatch():
@@ -643,6 +879,65 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
 
     assert rollback_calls
     assert rollback_calls[0][1] is None
+
+
+def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
+    class Draft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=3)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def set_shared_kv(self, *args, **kwargs):
+            pass
+
+        def reset(self, model):
+            pass
+
+        def draft_block(self, *args, **kwargs):
+            return mx.array([[7, 8]], dtype=mx.int32)
+
+    rollback_calls = []
+
+    class LM:
+        def rollback_speculative_cache(self, *args):
+            rollback_calls.append(args)
+
+        def speculative_draft_hidden(self, hidden):
+            return hidden
+
+    gdn_states = [tuple([None] * 11 + [mx.zeros((1, 3, 1, 1, 1))])]
+    verify = speculative_utils._MTPVerifyResult(
+        hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
+        shared_kv_states={},
+        gdn_states=gdn_states,
+    )
+
+    with (
+        patch.object(mtp_utils, "_mtp_verify_target", return_value=verify),
+        patch.object(
+            mtp_utils,
+            "_mtp_acceptance_walk",
+            return_value=(2, [7, 8]),
+        ),
+    ):
+        list(
+            _mtp_rounds(
+                SimpleNamespace(language_model=LM()),
+                Draft(),
+                [SimpleNamespace(offset=0)],
+                mx.zeros((1, 1, 2), dtype=mx.float32),
+                {},
+                first_bonus=1,
+                max_tokens=5,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                draft_block_size=3,
+                token_dtype=mx.int32,
+                greedy_sampling=True,
+            )
+        )
+
+    assert rollback_calls == []
 
 
 def test_mtp_next_block_size_can_prefer_requested_size():
