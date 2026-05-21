@@ -180,12 +180,76 @@ class OpenAIRequest(FlexibleBaseModel):
     )
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
 class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
 
     input_tokens: int
+    input_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
     output_tokens: int
     total_tokens: int
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: Any, input_tokens: int, output_tokens: int
+    ) -> "OpenAIUsage":
+        return cls(
+            input_tokens=input_tokens,
+            input_tokens_details=PromptTokensDetails(
+                cached_tokens=metrics.cached_tokens
+            ),
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+
+
+def _derive_gen_tps(token_times: List[float], output_tokens: int) -> Optional[float]:
+    if output_tokens <= 0 or len(token_times) < 2:
+        return None
+    elapsed = token_times[-1] - token_times[0]
+    return output_tokens / elapsed if elapsed > 0 else None
+
+
+class GenerationTimings(BaseModel):
+    """Per-request timing breakdown. Durations are in milliseconds."""
+
+    prompt_n: int
+    cache_n: int
+    predicted_n: int
+    prompt_ms: float
+    predicted_ms: float
+    prompt_per_second: float
+    predicted_per_second: float
+
+    @classmethod
+    def from_metrics(
+        cls,
+        metrics: Any,
+        prompt_tokens: int,
+        output_tokens: int,
+    ) -> "GenerationTimings":
+        generation_tps = metrics.generation_tps or _derive_gen_tps(
+            metrics.token_times, output_tokens
+        )
+        cached_tokens = metrics.cached_tokens
+        prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
+        prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
+        return cls(
+            prompt_n=prompt_n,
+            cache_n=int(cached_tokens),
+            predicted_n=int(output_tokens),
+            prompt_ms=prompt_s * 1000.0,
+            predicted_ms=(
+                output_tokens / generation_tps * 1000.0 if generation_tps else 0.0
+            ),
+            prompt_per_second=(prompt_n / prompt_s) if prompt_s else 0.0,
+            predicted_per_second=float(generation_tps or 0.0),
+        )
 
 
 class OpenAIErrorObject(BaseModel):
@@ -240,6 +304,9 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(
         ..., description="Token usage details"
     )  # we need the model to return stats
+    timings: Optional[GenerationTimings] = Field(
+        None, description="Per-request timing breakdown"
+    )
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
@@ -412,20 +479,34 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class PromptTokensDetails(BaseModel):
-    cached_tokens: int = 0
-
-
 class UsageStats(BaseModel):
     """OpenAI-compatible usage statistics for chat completions."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: Any, prompt_tokens: int, completion_tokens: int
+    ) -> "UsageStats":
+        return cls(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=metrics.cached_tokens
+            ),
+            prompt_tps=float(metrics.prompt_tps or 0.0),
+            generation_tps=float(metrics.generation_tps or 0.0),
+            peak_memory=metrics.peak_memory,
+        )
 
 
 class ChatRequest(GenerationRequest):
@@ -463,6 +544,7 @@ class ChatResponse(BaseModel):
     model: str = ""
     choices: List[ChatChoice] = []
     usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
 
 
 class ChatStreamChoice(BaseModel):
@@ -479,6 +561,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
 
 
 # Models for Anthropic-compatible /v1/messages endpoint
@@ -520,7 +603,21 @@ class AnthropicRequest(FlexibleBaseModel):
 
 class AnthropicUsage(BaseModel):
     input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     output_tokens: int = 0
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: Any, prompt_tokens: int, output_tokens: int
+    ) -> "AnthropicUsage":
+        cached_tokens = max(0, int(metrics.cached_tokens))
+        return cls(
+            input_tokens=max(0, int(prompt_tokens) - cached_tokens),
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=cached_tokens,
+            output_tokens=int(output_tokens),
+        )
 
 
 class AnthropicMessageResponse(BaseModel):

@@ -16,13 +16,14 @@ from ..prompt_utils import apply_chat_template
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
 from .generation import (
+    GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
 from .responses_state import process_tool_calls, suppress_tool_call_content
 from .runtime import runtime
-from .schemas import AnthropicMessageResponse, AnthropicRequest
+from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -487,10 +488,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 token_iterator = None
                 token_iter = None
                 metrics_finalized = False
-                token_times: List[float] = []
-                prompt_tps = None
-                generation_tps = None
-                peak_memory = 0.0
+                metrics = GenerationMetrics()
                 prompt_tokens = 0
                 output_tokens = 0
                 finish_reason = None
@@ -584,6 +582,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                         stop_reason=None,
                         usage={
                             "input_tokens": prompt_tokens,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0,
                             "output_tokens": 0,
                         },
                     )
@@ -612,15 +612,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         delta = token.text
                         full_output += delta
                         accumulated += delta
-                        token_times.append(time.perf_counter())
-                        prompt_tps = getattr(token, "prompt_tps", prompt_tps)
-                        generation_tps = getattr(
-                            token, "generation_tps", generation_tps
-                        )
-                        peak_memory = max(
-                            peak_memory,
-                            float(getattr(token, "peak_memory", 0.0) or 0.0),
-                        )
+                        metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
 
@@ -762,7 +754,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                                 "stop_reason": anth_stop_reason,
                                 "stop_sequence": stop_sequence,
                             },
-                            "usage": {"output_tokens": output_tokens},
+                            "usage": AnthropicUsage.from_metrics(
+                                metrics, prompt_tokens, output_tokens
+                            ).model_dump(),
                         },
                     )
                     yield _sse_event("message_stop", {"type": "message_stop"})
@@ -780,10 +774,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                         generated_tokens=output_tokens,
                         request_elapsed_s=time.perf_counter() - request_start,
                         request_started_s=request_start,
-                        token_times=token_times,
-                        prompt_tps=prompt_tps,
-                        generation_tps=generation_tps,
-                        peak_memory_gb=peak_memory or None,
+                        token_times=metrics.token_times,
+                        prompt_tps=metrics.prompt_tps,
+                        generation_tps=metrics.generation_tps,
+                        peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=anth_stop_reason,
                         image_count=len(images),
                         structured_output=bool(gen_args.logits_processors),
@@ -849,20 +843,15 @@ async def anthropic_messages_endpoint(http_request: Request):
             full_text = ""
             prompt_tokens = 0
             output_tokens = 0
-            peak_memory = 0.0
-            token_times: List[float] = []
-            prompt_tps = None
-            generation_tps = None
+            metrics = GenerationMetrics()
             finish_reason = None
 
             if runtime.response_generator is not None:
 
                 def _blocking_generate():
+                    metrics = GenerationMetrics()
                     text = ""
                     ot = 0
-                    tt: List[float] = []
-                    ptps = None
-                    pm = 0.0
                     fr = None
                     ctx, token_iter = runtime.response_generator.generate(
                         prompt=formatted_prompt,
@@ -873,9 +862,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     for tok in token_iter:
                         text += tok.text
                         ot += 1
-                        tt.append(time.perf_counter())
-                        ptps = getattr(tok, "prompt_tps", ptps)
-                        pm = max(pm, float(getattr(tok, "peak_memory", 0.0) or 0.0))
+                        metrics.record_chunk(tok)
                         if tok.finish_reason:
                             fr = tok.finish_reason
                             break
@@ -883,15 +870,13 @@ async def anthropic_messages_endpoint(http_request: Request):
                         token_iter.close()
                     except Exception:
                         pass
-                    return ctx.prompt_tokens, text, ot, tt, ptps, pm, fr
+                    return ctx.prompt_tokens, text, ot, metrics, fr
 
                 (
                     prompt_tokens,
                     full_text,
                     output_tokens,
-                    token_times,
-                    prompt_tps,
-                    peak_memory,
+                    metrics,
                     finish_reason,
                 ) = await asyncio.to_thread(_blocking_generate)
             else:
@@ -908,9 +893,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 full_text = result.text
                 prompt_tokens = result.prompt_tokens
                 output_tokens = result.generation_tokens
-                prompt_tps = getattr(result, "prompt_tps", None)
-                generation_tps = getattr(result, "generation_tps", None)
-                peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
+                metrics.record_result(result)
                 finish_reason = getattr(result, "finish_reason", None) or "stop"
 
             parsed_tool_calls = None
@@ -940,10 +923,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                 model=request.model,
                 stop_reason=stop_reason,
                 stop_sequence=stop_sequence,
-                usage={
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": output_tokens,
-                },
+                usage=AnthropicUsage.from_metrics(
+                    metrics, prompt_tokens, output_tokens
+                ),
             )
 
             completion_tokens = max(
@@ -963,10 +945,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                 generated_tokens=output_tokens,
                 request_elapsed_s=time.perf_counter() - request_start,
                 request_started_s=request_start,
-                token_times=token_times,
-                prompt_tps=prompt_tps,
-                generation_tps=generation_tps,
-                peak_memory_gb=peak_memory or None,
+                token_times=metrics.token_times,
+                prompt_tps=metrics.prompt_tps,
+                generation_tps=metrics.generation_tps,
+                peak_memory_gb=metrics.peak_memory or None,
                 finish_reason=stop_reason,
                 image_count=len(images),
                 structured_output=bool(gen_args.logits_processors),

@@ -975,6 +975,264 @@ def test_chat_completions_preserves_input_audio_references(client):
     assert captured["audio"] == [audio_path]
 
 
+def test_generation_timings_from_metrics():
+    metrics = SimpleNamespace(
+        cached_tokens=2,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
+
+    assert (timings.prompt_n, timings.cache_n, timings.predicted_n) == (8, 2, 4)
+    assert timings.prompt_ms == pytest.approx(500.0)
+    assert timings.prompt_per_second == pytest.approx(16.0)
+    assert timings.predicted_ms == pytest.approx(500.0)
+    assert timings.predicted_per_second == pytest.approx(8.0)
+
+    metrics = SimpleNamespace(
+        cached_tokens=9,
+        prompt_tps=None,
+        generation_tps=None,
+        token_times=[],
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 4, 1)
+    assert timings.prompt_n == 0
+    assert timings.prompt_ms == 0.0
+    assert timings.predicted_ms == 0.0
+
+
+def test_chat_completions_returns_timings(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=10,
+        generation_tokens=4,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        peak_memory=0.1,
+        cached_tokens=2,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    assert (body["timings"]["cache_n"], body["timings"]["prompt_n"]) == (2, 8)
+    assert body["timings"]["predicted_per_second"] == 8.0
+
+
+def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=10), iter(
+                [
+                    server.StreamingToken(
+                        text="hi",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason=None,
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    ),
+                    server.StreamingToken(
+                        text="!",
+                        token=2,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    timed_chunks = [chunk for chunk in chunks if chunk.get("timings") is not None]
+    assert len(timed_chunks) == 1
+    timed_chunk = timed_chunks[0]
+    assert timed_chunk["choices"][0]["finish_reason"] == "stop"
+    assert timed_chunk["timings"]["cache_n"] == 2
+    assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+
+
+def test_generation_timings_from_metrics():
+    metrics = SimpleNamespace(
+        cached_tokens=2,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
+
+    assert (timings.prompt_n, timings.cache_n, timings.predicted_n) == (8, 2, 4)
+    assert timings.prompt_ms == pytest.approx(500.0)
+    assert timings.prompt_per_second == pytest.approx(16.0)
+    assert timings.predicted_ms == pytest.approx(500.0)
+    assert timings.predicted_per_second == pytest.approx(8.0)
+
+    metrics = SimpleNamespace(
+        cached_tokens=9,
+        prompt_tps=None,
+        generation_tps=None,
+        token_times=[],
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 4, 1)
+    assert timings.prompt_n == 0
+    assert timings.prompt_ms == 0.0
+    assert timings.predicted_ms == 0.0
+
+
+def test_chat_completions_returns_timings(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=10,
+        generation_tokens=4,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        peak_memory=0.1,
+        cached_tokens=2,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    assert (body["timings"]["cache_n"], body["timings"]["prompt_n"]) == (2, 8)
+    assert body["timings"]["predicted_per_second"] == 8.0
+
+
+def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=10), iter(
+                [
+                    server.StreamingToken(
+                        text="hi",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason=None,
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    ),
+                    server.StreamingToken(
+                        text="!",
+                        token=2,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    timed_chunks = [chunk for chunk in chunks if chunk.get("timings") is not None]
+    assert len(timed_chunks) == 1
+    timed_chunk = timed_chunks[0]
+    assert timed_chunk["choices"][0]["finish_reason"] == "stop"
+    assert timed_chunk["timings"]["cache_n"] == 2
+    assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+
+
 def test_chat_completions_endpoint_flattens_text_content_parts(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -1076,7 +1334,12 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     assert payload["role"] == "assistant"
     assert payload["content"] == [{"type": "text", "text": "done"}]
     assert payload["stop_reason"] == "end_turn"
-    assert payload["usage"] == {"input_tokens": 8, "output_tokens": 4}
+    assert payload["usage"] == {
+        "input_tokens": 8,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "output_tokens": 4,
+    }
     assert mock_template.call_args.args[2] == [
         {"role": "system", "content": "You are concise."},
         {"role": "user", "content": "Describe it."},
@@ -1157,6 +1420,46 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
         },
         {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
     ]
+
+
+def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = SimpleNamespace(
+        text="done",
+        prompt_tokens=10,
+        generation_tokens=4,
+        cached_tokens=6,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["usage"] == {
+        "input_tokens": 4,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 6,
+        "output_tokens": 4,
+    }
 
 
 def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkeypatch):
@@ -1321,10 +1624,18 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
-                        text="Hel", token=1, logprobs=0.0, finish_reason=None
+                        text="Hel",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason=None,
+                        cached_tokens=2,
                     ),
                     server.StreamingToken(
-                        text="lo", token=2, logprobs=0.0, finish_reason="stop"
+                        text="lo",
+                        token=2,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                        cached_tokens=2,
                     ),
                 ]
             )
@@ -1355,6 +1666,8 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
     assert '"text": "Hel"' in body
     assert "event: message_delta" in body
     assert '"stop_reason": "end_turn"' in body
+    assert '"cache_read_input_tokens": 2' in body
+    assert '"input_tokens": 1' in body
     assert "event: message_stop" in body
 
 
