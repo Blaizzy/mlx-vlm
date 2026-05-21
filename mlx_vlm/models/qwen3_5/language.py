@@ -258,6 +258,28 @@ def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bo
     )
 
 
+def _extract_row_cache(cache_entry, row: int):
+    if isinstance(cache_entry, ArraysCache):
+        row_cache = ArraysCache(size=len(cache_entry.cache))
+        row_cache.cache = [
+            None if cached is None else cached[row : row + 1]
+            for cached in cache_entry.cache
+        ]
+        lengths = getattr(cache_entry, "lengths", None)
+        if lengths is not None:
+            row_cache.lengths = lengths[row : row + 1]
+        return row_cache
+
+    if hasattr(cache_entry, "extract") and not cache_entry.empty():
+        return cache_entry.extract(row)
+
+    if hasattr(cache_entry, "left_padding"):
+        row_cache = KVCache()
+        return row_cache
+
+    return cache_entry
+
+
 def _gated_delta_update_verify_decode(
     q: mx.array,
     k: mx.array,
@@ -653,6 +675,75 @@ class Qwen3_5Model(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        fa_cache = cache[self.fa_idx]
+        if (
+            h.shape[0] > 1
+            and hidden_sink is None
+            and gdn_sink is None
+            and fa_cache is not None
+            and hasattr(fa_cache, "extract")
+            and hasattr(fa_cache.__class__, "merge")
+            and isinstance(getattr(fa_cache, "offset", None), mx.array)
+            and fa_cache.offset.ndim > 0
+        ):
+            query_left_padding = mx.minimum(mx.maximum(-fa_cache.offset, 0), h.shape[1])
+            cache_left_padding = getattr(fa_cache, "left_padding", None)
+            has_left_padding = (
+                isinstance(cache_left_padding, mx.array)
+                and cache_left_padding.ndim > 0
+                and int(cache_left_padding.max().item()) > 0
+            )
+            if has_left_padding or int(query_left_padding.max().item()) > 0:
+                row_outputs = []
+                row_caches = [[] for _ in cache]
+                for row, pad in enumerate(query_left_padding.tolist()):
+                    pad = min(max(int(pad), 0), h.shape[1])
+                    row_inputs = inputs[row : row + 1, pad:]
+                    row_embeds = h[row : row + 1, pad:]
+                    row_position_ids = (
+                        None
+                        if position_ids is None
+                        else position_ids[:, row : row + 1, pad:]
+                    )
+                    if pad > 0 and row_position_ids is not None:
+                        row_position_ids = mx.broadcast_to(
+                            mx.arange(row_inputs.shape[1])[None, None, :],
+                            (3, 1, row_inputs.shape[1]),
+                        )
+                    current_cache = []
+                    for cache_entry in cache:
+                        if cache_entry is None:
+                            current_cache.append(None)
+                        else:
+                            current_cache.append(_extract_row_cache(cache_entry, row))
+
+                    row_out = self(
+                        row_inputs,
+                        inputs_embeds=row_embeds,
+                        cache=current_cache,
+                        position_ids=row_position_ids,
+                    )
+                    if pad > 0:
+                        row_out = mx.concatenate(
+                            [
+                                mx.zeros(
+                                    (1, pad, row_out.shape[-1]), dtype=row_out.dtype
+                                ),
+                                row_out,
+                            ],
+                            axis=1,
+                        )
+                    row_outputs.append(row_out)
+                    for i, cache_entry in enumerate(current_cache):
+                        row_caches[i].append(cache_entry)
+
+                for i, entries in enumerate(row_caches):
+                    if cache[i] is None:
+                        continue
+                    if hasattr(cache[i].__class__, "merge"):
+                        cache[i] = cache[i].__class__.merge(entries)
+                return mx.concatenate(row_outputs, axis=0)
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
@@ -1063,17 +1154,25 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        attention_mask = kwargs.pop("attention_mask", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        if (
+            mask is None
+            and attention_mask is not None
+            and attention_mask.shape[-1] == inputs.shape[-1]
+        ):
+            mask = attention_mask
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
 
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
+        c0 = None
         if cache and cache[self.model.fa_idx] is not None:
             c0 = cache[self.model.fa_idx]
             cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
@@ -1083,6 +1182,16 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
+
+        if mask is None and c0 is not None and cache_offset == 0:
+            left_padding = getattr(c0, "left_padding", None)
+            if (
+                isinstance(left_padding, mx.array)
+                and left_padding.ndim > 0
+                and left_padding.size >= inputs.shape[0]
+            ):
+                positions = mx.arange(inputs.shape[-1])[None, :]
+                mask = positions >= left_padding[: inputs.shape[0], None]
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -1113,6 +1222,10 @@ class LanguageModel(nn.Module):
                     position_ids, rope_deltas = self.get_rope_index(
                         inputs, image_grid_thw, video_grid_thw, rope_mask
                     )
+                    if image_grid_thw is None and video_grid_thw is None:
+                        rope_deltas = mx.zeros(
+                            (batch_size, 1), dtype=rope_deltas.dtype
+                        )
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
