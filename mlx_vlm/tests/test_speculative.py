@@ -867,6 +867,47 @@ def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
     assert fake_head.calls == 3
 
 
+def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    fake_head = FakeEmbed()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [
+            [
+                [0, 0, 9, 0],
+                [0, 0, 0, 9],
+                [0, 9, 0, 0],
+            ],
+            [
+                [0, 9, 0, 0],
+                [9, 0, 0, 0],
+                [0, 0, 9, 0],
+            ],
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 3], [0, 2]], dtype=mx.int32)
+
+    accepted, new_tokens = mtp_utils._speculative_walk_batch_deferred_uniform(
+        lm,
+        target_hidden,
+        draft_tokens,
+        lambda logits: mx.argmax(logits, axis=-1),
+        budgets=[3, 3],
+    )
+
+    assert accepted == [0, 0]
+    assert new_tokens == [[2], [1]]
+    assert fake_head.calls == 1
+
+
 def test_mtp_draft_hidden_uses_model_hook():
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
     lm = SimpleNamespace(speculative_draft_hidden=lambda h: h * 2)

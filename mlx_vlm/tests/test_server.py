@@ -54,6 +54,32 @@ def test_speculative_server_dispatches_mtp_batch_loop():
     )
 
 
+def test_speculative_server_samples_first_bonus_like_decode_step():
+    seen = {}
+    logits = mx.array(
+        [
+            [[1.0, 2.0, 3.0]],
+            [[4.0, 1.0, 0.0]],
+        ],
+        dtype=mx.float32,
+    )
+
+    def sampler(logprobs):
+        seen["shape"] = logprobs.shape
+        seen["values"] = logprobs
+        return mx.argmax(logprobs, axis=-1)
+
+    tokens = server_generation._sample_last_token(logits, sampler)
+    expected_logprobs = logits[:, -1, :] - mx.logsumexp(
+        logits[:, -1, :], axis=-1, keepdims=True
+    )
+    mx.eval(tokens, seen["values"], expected_logprobs)
+
+    assert seen["shape"] == (2, 3)
+    assert tokens.tolist() == [2, 0]
+    assert bool(mx.allclose(seen["values"], expected_logprobs).item())
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")

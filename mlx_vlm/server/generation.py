@@ -91,6 +91,12 @@ def get_speculative_batch_coalesce_s():
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
+def _sample_last_token(logits: mx.array, sampler: Callable[[mx.array], mx.array]):
+    logits = logits[:, -1, :]
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    return sampler(logprobs)
+
+
 def get_server_enable_thinking():
     raw = os.environ.get("MLX_VLM_ENABLE_THINKING")
     if raw is None:
@@ -993,7 +999,7 @@ class ResponseGenerator:
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
-                first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+                first_bonus = _sample_last_token(out.logits, sampler)
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
                 for uid in uids:

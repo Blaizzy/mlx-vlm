@@ -298,6 +298,20 @@ def _is_single_row_batch_cache(cache_entry) -> bool:
     )
 
 
+def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
+    if pad <= 0:
+        return x
+    if x.shape[1] >= target_length:
+        return x
+    return mx.concatenate(
+        [
+            mx.zeros((x.shape[0], pad, *x.shape[2:]), dtype=x.dtype),
+            x,
+        ],
+        axis=1,
+    )
+
+
 def _gated_delta_update_verify_decode(
     q: mx.array,
     k: mx.array,
@@ -322,6 +336,67 @@ def _gated_delta_update_verify_decode(
         mask,
         use_kernel=use_kernel,
     )
+
+
+def _target_verify_left_padded_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    cache,
+    scale: float,
+    mask: Optional[mx.array],
+) -> Optional[mx.array]:
+    if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
+        return None
+
+    left_padding = getattr(cache, "left_padding", None)
+    if not (
+        isinstance(left_padding, mx.array)
+        and left_padding.ndim > 0
+        and int(left_padding.max().item()) > 0
+    ):
+        return None
+
+    row_outputs = {}
+    pads = [int(p) for p in left_padding.tolist()]
+    for pad in sorted(set(pads)):
+        rows = [i for i, row_pad in enumerate(pads) if row_pad == pad]
+        row_idx = mx.array(rows, dtype=mx.int32)
+        group_queries = mx.take(queries, row_idx, axis=0)
+        group_keys = mx.take(keys, row_idx, axis=0)[:, :, pad:, :]
+        group_values = mx.take(values, row_idx, axis=0)[:, :, pad:, :]
+
+        if group_queries.shape[2] > 1:
+            prefix_len = group_keys.shape[-2] - group_queries.shape[2]
+            group_output = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        group_queries[:, :, i : i + 1, :],
+                        group_keys[:, :, : prefix_len + i + 1, :],
+                        group_values[:, :, : prefix_len + i + 1, :],
+                        cache=None,
+                        scale=scale,
+                        mask=None,
+                    )
+                    for i in range(group_queries.shape[2])
+                ],
+                axis=2,
+            )
+        else:
+            group_output = scaled_dot_product_attention(
+                group_queries,
+                group_keys,
+                group_values,
+                cache=None,
+                scale=scale,
+                mask=None,
+            )
+
+        for j, row in enumerate(rows):
+            row_outputs[row] = group_output[j : j + 1]
+
+    return mx.concatenate([row_outputs[i] for i in range(queries.shape[0])], axis=0)
 
 
 class Qwen3_5Attention(nn.Module):
@@ -372,7 +447,6 @@ class Qwen3_5Attention(nn.Module):
         target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
-
         q_proj_output, keys, values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj), x, target_verify
         )
@@ -412,6 +486,13 @@ class Qwen3_5Attention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if target_verify and L > 1:
+            output = _target_verify_left_padded_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
+        else:
+            output = None
+
+        if output is None and target_verify and L > 1:
             prefix_len = keys.shape[-2] - L
             output = mx.concatenate(
                 [
@@ -431,7 +512,7 @@ class Qwen3_5Attention(nn.Module):
                 ],
                 axis=2,
             )
-        else:
+        elif output is None:
             output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
@@ -771,15 +852,7 @@ class Qwen3_5Model(nn.Module):
                         position_ids=row_position_ids,
                     )
                     if pad > 0:
-                        row_out = mx.concatenate(
-                            [
-                                mx.zeros(
-                                    (1, pad, row_out.shape[-1]), dtype=row_out.dtype
-                                ),
-                                row_out,
-                            ],
-                            axis=1,
-                        )
+                        row_out = _pad_row_time(row_out, pad, h.shape[1])
                     row_outputs.append(row_out)
                     for i, cache_entry in enumerate(current_cache):
                         row_caches[i].append(cache_entry)

@@ -254,6 +254,53 @@ def _speculative_walk_batch_deferred_greedy(
     return accepted, new_tokens
 
 
+def _speculative_walk_batch_deferred_uniform(
+    lm: nn.Module,
+    target_hidden: mx.array,
+    draft_tokens: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    budgets: List[int],
+) -> Tuple[List[int], List[List[int]]]:
+    """Deferred walk for models whose batched drafter cache needs lockstep rows.
+
+    Stop at the first rejection in any row. This avoids consuming target sampler
+    RNG for verifier positions that will be thrown away by the uniform clamp.
+    """
+    B = draft_tokens.shape[0]
+    n_draft = draft_tokens.shape[1]
+    draft_lists = [[int(token) for token in row] for row in draft_tokens.tolist()]
+    budgets = [int(budget) for budget in budgets]
+
+    accepted = 0
+    for pos in range(n_draft + 1):
+        with mx.stream(generation_stream):
+            logits = lm.speculative_logits_from_hidden(
+                target_hidden[:, pos : pos + 1, :]
+            )
+            if logits.ndim == 3 and logits.shape[1] == 1:
+                logits = logits[:, 0, :]
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            target_tokens = sampler(logprobs)
+        mx.eval(target_tokens)
+        target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
+
+        if pos < n_draft and all(
+            target_list[row] == draft_lists[row][pos] for row in range(B)
+        ):
+            accepted += 1
+            continue
+
+        new_tokens: List[List[int]] = []
+        for row, budget in enumerate(budgets):
+            row_tokens = draft_lists[row][:accepted]
+            if len(row_tokens) < budget:
+                row_tokens.append(target_list[row])
+            new_tokens.append(row_tokens[:budget])
+        return [accepted] * B, new_tokens
+
+    return [accepted] * B, [draft_lists[row][: budgets[row]] for row in range(B)]
+
+
 def _mtp_acceptance_walk(
     lm: nn.Module,
     verify: _MTPVerifyResult,
@@ -740,6 +787,7 @@ def _mtp_rounds_batch(
                 verify_input,
                 prompt_cache,
                 sampler,
+                sample_target_tokens=greedy_sampling,
             )
             hidden_full = verify.hidden  # [B_active, bs, H]
 
@@ -766,13 +814,27 @@ def _mtp_rounds_batch(
                 )
         else:
             sampler_rng.target_eval(hidden_full)
-            accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
-                lm,
-                hidden_full,
-                draft_tokens,
-                sampler,
-                budgets,
-            )
+            if (
+                n_active > 1
+                and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+            ):
+                accepted_list, new_tokens_list = (
+                    _speculative_walk_batch_deferred_uniform(
+                        lm,
+                        hidden_full,
+                        draft_tokens,
+                        sampler,
+                        budgets,
+                    )
+                )
+            else:
+                accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
+                    lm,
+                    hidden_full,
+                    draft_tokens,
+                    sampler,
+                    budgets,
+                )
             sampler_rng.target_sampled(sync_draft=True)
         # Keep the adaptive block-size history on a per-round basis so
         # batched MTP reacts like the singleton loop instead of letting
