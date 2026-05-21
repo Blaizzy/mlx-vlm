@@ -719,7 +719,10 @@ def _mtp_rounds_batch(
     B = first_bonus.shape[0]
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
-    draft_model.reset(model)
+    if getattr(draft_model, "supports_ragged_batch_acceptance", False):
+        draft_model.reset(model, left_padding=[0] * B)
+    else:
+        draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=not greedy_sampling)
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce
@@ -900,7 +903,7 @@ def _mtp_rounds_batch(
 
         # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
         # per-row tail-zero on rows that accepted less).
-        if max_a < bs - 1:
+        if any(a < bs - 1 for a in accepted_list):
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
                     prompt_cache, verify.gdn_states, accepted_arr, bs

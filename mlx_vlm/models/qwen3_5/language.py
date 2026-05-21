@@ -8,7 +8,6 @@ from mlx_lm.models.activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
-    create_ssm_mask,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -197,7 +196,7 @@ def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
         target_verify
         and x.ndim == 3
         and x.shape[1] > 1
-        and isinstance(linear, nn.Linear)
+        and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
     )
 
 
@@ -220,6 +219,10 @@ def _target_verify_weight(weight: mx.array, x: mx.array) -> Optional[mx.array]:
     return out.reshape(B, L, O)
 
 
+def _target_verify_timewise(fn, x: mx.array) -> mx.array:
+    return mx.concatenate([fn(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+
+
 def _target_verify_singletons(fn, x: mx.array) -> mx.array:
     rows = []
     for row in range(x.shape[0]):
@@ -236,7 +239,10 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
     if not _use_target_verify_dense(linear, x, target_verify):
         return linear(x)
 
-    if "bias" not in linear:
+    if isinstance(linear, nn.QuantizedLinear):
+        return _target_verify_timewise(linear, x)
+
+    if isinstance(linear, nn.Linear) and "bias" not in linear:
         out = _target_verify_weight(linear.weight, x)
         if out is not None:
             return out
@@ -249,7 +255,9 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
         target_verify
         and x.ndim == 3
         and x.shape[1] > 1
-        and all(isinstance(linear, nn.Linear) for linear in linears)
+        and all(
+            isinstance(linear, (nn.Linear, nn.QuantizedLinear)) for linear in linears
+        )
     ):
         return tuple(linear(x) for linear in linears)
 
@@ -264,7 +272,7 @@ def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bo
     if out is not None:
         return out
 
-    return _target_verify_singletons(embedding.as_linear, x)
+    return _target_verify_timewise(embedding.as_linear, x)
 
 
 def _extract_row_cache(cache_entry, row: int):
@@ -310,6 +318,21 @@ def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
         ],
         axis=1,
     )
+
+
+def _create_qwen3_5_ssm_mask(h: mx.array, cache):
+    if not (cache and hasattr(cache, "make_mask")):
+        return None
+
+    left_padding = getattr(cache, "left_padding", None)
+    if isinstance(left_padding, mx.array) and int(left_padding.max().item()) <= 0:
+        return None
+
+    lengths = getattr(cache, "lengths", None)
+    if isinstance(lengths, mx.array) and int(lengths.min().item()) >= h.shape[1]:
+        return None
+
+    return cache.make_mask(h.shape[1])
 
 
 def _gated_delta_update_verify_decode(
@@ -476,7 +499,13 @@ class Qwen3_5Attention(nn.Module):
         cos, sin = self.rotary_emb(values, position_ids)
 
         if mask is not None and isinstance(mask, mx.array):
-            if isinstance(kv_seq_len, mx.array):
+            if (
+                cache is not None
+                and hasattr(cache, "_idx")
+                and hasattr(cache, "left_padding")
+            ):
+                kv_seq_len = int(cache._idx) + L
+            elif isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
 
@@ -865,7 +894,7 @@ class Qwen3_5Model(nn.Module):
                 return mx.concatenate(row_outputs, axis=0)
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        ssm_mask = _create_qwen3_5_ssm_mask(h, cache[self.ssm_idx])
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
@@ -921,7 +950,31 @@ class LanguageModel(nn.Module):
             if c.is_trimmable():
                 if trim > 0:
                     c.trim(trim)
-                if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                right_trimmed = False
+                if is_batch and max_a > 0:
+                    extra_trim = max_a - accepted
+                    if int(extra_trim.max().item()) > 0:
+                        prepare = getattr(c, "prepare", None)
+                        finalize = getattr(c, "finalize", None)
+                        if (
+                            c.keys is not None
+                            and callable(prepare)
+                            and callable(finalize)
+                        ):
+                            prepare(
+                                right_padding=[
+                                    int(extra) for extra in extra_trim.tolist()
+                                ]
+                            )
+                            finalize()
+                            right_trimmed = True
+                if (
+                    is_batch
+                    and not right_trimmed
+                    and hasattr(c, "_idx")
+                    and c.keys is not None
+                    and max_a > 0
+                ):
                     kv_len = c._idx
                     ve = valid_ends.tolist()
                     verify_start = kv_len - n

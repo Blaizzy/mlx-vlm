@@ -2017,6 +2017,70 @@ def test_qwen3_5_mtp_batch_accept_updates_uniform_cache():
     assert drafter._next_position == 5
 
 
+def test_qwen3_5_mtp_batch_accept_updates_ragged_cache():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target, left_padding=[0, 0])
+    drafter.set_shared_kv(
+        {},
+        kv_offset=4,
+        position=mx.array([4, 4], dtype=mx.int32),
+        kv_valid_len=mx.array([4, 4], dtype=mx.int32),
+    )
+    hidden = mx.zeros((2, 1, 16), dtype=mx.float32)
+    draft_tokens = drafter.draft_block(
+        mx.array([7, 8], dtype=mx.int32),
+        hidden,
+        None,
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    verify_hidden = mx.zeros((2, 3, 16), dtype=mx.float32)
+    drafter.accept_verified_tokens_batch(
+        verify_hidden,
+        draft_tokens,
+        accepted=[1, 0],
+        new_tokens=[[int(draft_tokens[0, 0].item()), 5], [6]],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+
+    mx.eval(drafter._seed_token, drafter._cache[0].offset)
+    assert drafter._seed_token.shape == (2, 1)
+    assert drafter._round_appended == 0
+    assert drafter._cache[0]._idx == 3
+    assert drafter._cache[0].offset.tolist() == [2, 1]
+    assert drafter._cache[0].left_padding.tolist() == [1, 2]
+    assert drafter._next_position.tolist() == [6, 5]
+
+
+def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
+    text_config = _tiny_qwen3_5_text_config()
+    language = qwen_language.LanguageModel(args=text_config)
+    cache = qwen_language.KVCache.merge([qwen_language.KVCache(), qwen_language.KVCache()])
+    keys = mx.arange(2 * 1 * 5 * 4, dtype=mx.float32).reshape(2, 1, 5, 4)
+    values = keys + 100
+    cache.update_and_fetch(keys, values)
+
+    language.rollback_speculative_cache([cache], [], mx.array([2, 0]), block_size=3)
+
+    mx.eval(cache.keys, cache.values, cache.offset, cache.left_padding)
+    assert cache._idx == 5
+    assert cache.offset.tolist() == [5, 3]
+    assert cache.left_padding.tolist() == [0, 2]
+
+
 def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
     text_config = _tiny_qwen3_5_text_config()
     text_config.mtp_num_hidden_layers = 1
@@ -2061,6 +2125,33 @@ def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
     assert drafter._cache[0].keys.shape[0] == 1
     assert drafter._seed_token.shape == (1, 1)
     assert drafter._next_position.tolist() == [6]
+
+
+def test_qwen3_5_mtp_filter_batch_keeps_batch_cache_padding_aligned():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target, left_padding=[0, 1, 2])
+    drafter._cache[0].update_and_fetch(
+        mx.zeros((3, 1, 2, 8), dtype=mx.float32),
+        mx.zeros((3, 1, 2, 8), dtype=mx.float32),
+    )
+    drafter._next_position = mx.array([4, 5, 6], dtype=mx.int32)
+
+    drafter.filter_batch(mx.array([0, 2], dtype=mx.int32))
+
+    mx.eval(drafter._cache[0].left_padding, drafter._cache[0].offset)
+    assert drafter._cache[0].keys.shape[0] == 2
+    assert drafter._cache[0].left_padding.tolist() == [0, 2]
+    assert drafter._cache[0].offset.tolist() == [2, 0]
+    assert drafter._next_position.tolist() == [4, 6]
 
 
 def test_qwen3_5_mtp_sanitize_strips_prefix_and_offsets_norms():
