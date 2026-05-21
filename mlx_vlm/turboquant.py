@@ -6,7 +6,7 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import _BaseCache, create_attention_mask
+from mlx_lm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
@@ -6259,8 +6259,10 @@ class BatchTurboQuantKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
-    def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
 
     @property
     def group_size(self):

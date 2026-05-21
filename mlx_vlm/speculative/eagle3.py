@@ -6,6 +6,7 @@ import mlx.nn as nn
 from .common import (
     _batch_cache_left_padding,
     _record_speculative_round,
+    _SpeculativeSamplerRNG,
     generation_stream,
 )
 
@@ -369,10 +370,12 @@ def _eagle3_rounds(
         configured_block_total = min(configured_block_total, block_total)
         adaptive_block_size = False
     draft_cache = draft_model.reset(model)
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=not greedy_sampling)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
-        prefill_draft(
+        sampler_rng.draft_call(
+            prefill_draft,
             prompt_tokens,
             hidden,
             first_bonus,
@@ -398,7 +401,8 @@ def _eagle3_rounds(
         if bs <= 1:
             break
 
-        draft_tokens = draft_model.draft_block(
+        draft_tokens = sampler_rng.draft_tokens(
+            draft_model.draft_block,
             b,
             hidden,
             draft_cache,
@@ -407,7 +411,6 @@ def _eagle3_rounds(
             token_dtype,
             **_eagle3_draft_kwargs(draft_model, greedy_sampling),
         )
-        mx.async_eval(draft_tokens)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate(
@@ -433,7 +436,7 @@ def _eagle3_rounds(
                 )
             else:
                 verify_hidden, target_tokens, gdn_states = hot_verify
-        mx.async_eval(target_tokens, verify_hidden)
+        sampler_rng.target_eval(target_tokens, verify_hidden)
 
         accepted, new_tokens = _eagle3_walk(
             draft_tokens,
@@ -450,7 +453,8 @@ def _eagle3_rounds(
 
         accept_verified = getattr(draft_model, "accept_verified_tokens", None)
         if callable(accept_verified):
-            accept_verified(
+            sampler_rng.draft_call(
+                accept_verified,
                 verify_hidden,
                 draft_tokens,
                 accepted,
@@ -513,10 +517,12 @@ def _eagle3_rounds_batch(
         configured_block_total = min(configured_block_total, block_total)
         adaptive_block_size = False
     draft_cache = draft_model.reset(model, left_padding=left_padding)
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=not greedy_sampling)
 
     prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
     if callable(prefill_draft) and prompt_tokens is not None:
-        prefill_draft(
+        sampler_rng.draft_call(
+            prefill_draft,
             prompt_tokens,
             hidden,
             first_bonus,
@@ -560,7 +566,8 @@ def _eagle3_rounds_batch(
         b_active = [b[active_idx[j]] for j in range(n_active)]
         b_arr = mx.array(b_active, dtype=token_dtype)
 
-        draft_tokens = draft_model.draft_block(
+        draft_tokens = sampler_rng.draft_tokens(
+            draft_model.draft_block,
             b_arr,
             hidden,
             draft_cache,
@@ -569,7 +576,6 @@ def _eagle3_rounds_batch(
             token_dtype,
             **_eagle3_draft_kwargs(draft_model, greedy_sampling),
         )
-        mx.async_eval(draft_tokens)
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
@@ -592,7 +598,7 @@ def _eagle3_rounds_batch(
                 )
             else:
                 verify_hidden, target_tokens, gdn_states = hot_verify
-        mx.async_eval(target_tokens, verify_hidden)
+        sampler_rng.target_eval(target_tokens, verify_hidden)
 
         budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
         accepted_list, new_tokens_list = _eagle3_walk_batch(
@@ -617,7 +623,8 @@ def _eagle3_rounds_batch(
 
         accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
         if callable(accept_verified):
-            accept_verified(
+            sampler_rng.draft_call(
+                accept_verified,
                 verify_hidden,
                 draft_tokens,
                 accepted_list,
