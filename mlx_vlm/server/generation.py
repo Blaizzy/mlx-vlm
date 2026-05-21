@@ -20,6 +20,7 @@ from ..generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
@@ -91,9 +92,83 @@ def get_speculative_batch_coalesce_s():
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
-def _sample_last_token(logits: mx.array, sampler: Callable[[mx.array], mx.array]):
+def _position_seed(seed: int, row_id: int, position: int) -> int:
+    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
+    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
+    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    return int(x & 0xFFFFFFFF)
+
+
+def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
+    return mx.stack(
+        [
+            mx.random.key(_position_seed(seed, row, pos))
+            for row, pos in zip(row_ids, positions)
+        ]
+    )
+
+
+class _PositionedTargetSampler:
+    """Server sampler with stateless target draws for ragged verification."""
+
+    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = DEFAULT_SEED if seed is None else int(seed)
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        if self.top_p > 0 and self.top_p < 1.0:
+            return top_p_sampling(logprobs, self.top_p, self.temperature)
+        return mx.random.categorical(logprobs * (1 / self.temperature))
+
+    def sample_target(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
+            raise ValueError("row_ids and positions must match logprobs batch size.")
+        keys = _position_keys(self.seed, row_ids, positions)
+        if self.top_p > 0 and self.top_p < 1.0:
+            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
+
+    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        if logprobs.dtype == mx.bfloat16:
+            logprobs = logprobs.astype(mx.float32)
+        probs = mx.softmax(logprobs / self.temperature, axis=-1)
+        sorted_indices = mx.argsort(probs, axis=-1)
+        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        top_probs = mx.where(
+            cumulative_probs > 1 - self.top_p,
+            sorted_probs,
+            mx.zeros_like(sorted_probs),
+        )
+        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
+        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+
+
+def _sample_last_token(
+    logits: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    *,
+    row_ids: Optional[List[int]] = None,
+    positions: Optional[List[int]] = None,
+):
     logits = logits[:, -1, :]
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    sample_target = getattr(sampler, "sample_target", None)
+    if callable(sample_target) and row_ids is not None and positions is not None:
+        return sample_target(logprobs, row_ids=row_ids, positions=positions)
     return sampler(logprobs)
 
 
@@ -698,14 +773,11 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
-
-        def sampler(logprobs: mx.array) -> mx.array:
-            if args.top_p > 0 and args.top_p < 1.0:
-                return top_p_sampling(logprobs, args.top_p, args.temperature)
-            else:
-                return mx.random.categorical(logprobs * (1 / args.temperature))
-
-        return sampler
+        return _PositionedTargetSampler(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            seed=args.seed,
+        )
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
@@ -999,7 +1071,13 @@ class ResponseGenerator:
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
-                first_bonus = _sample_last_token(out.logits, sampler)
+                sample_row_ids = [0] * B
+                first_bonus = _sample_last_token(
+                    out.logits,
+                    sampler,
+                    row_ids=sample_row_ids,
+                    positions=[0] * B,
+                )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
                 for uid in uids:
@@ -1070,6 +1148,7 @@ class ResponseGenerator:
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
+                    row_ids=sample_row_ids,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):

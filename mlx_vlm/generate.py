@@ -1563,6 +1563,19 @@ class PromptProgress:
     prompt_time: float = 0.0
 
 
+def _sample_with_positions(
+    sampler: Callable[[mx.array], mx.array],
+    logprobs: mx.array,
+    *,
+    row_ids: Optional[List[int]] = None,
+    positions: Optional[List[int]] = None,
+) -> mx.array:
+    sample_target = getattr(sampler, "sample_target", None)
+    if callable(sample_target) and row_ids is not None and positions is not None:
+        return sample_target(logprobs, row_ids=row_ids, positions=positions)
+    return sampler(logprobs)
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -1661,7 +1674,12 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = self.sampler(logprobs)
+        sampled = _sample_with_positions(
+            self.sampler,
+            logprobs,
+            row_ids=[0] * len(self.uids),
+            positions=[n + 1 for n in self._num_tokens],
+        )
 
         self._next_tokens = sampled
         prev_top_idx = self._next_top_idx
@@ -2174,7 +2192,12 @@ class PromptProcessingBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        first_tokens = sampler(logprobs)
+        first_tokens = _sample_with_positions(
+            sampler,
+            logprobs,
+            row_ids=[0] * len(self.uids),
+            positions=[0] * len(self.uids),
+        )
 
         mx.async_eval(first_tokens)
 

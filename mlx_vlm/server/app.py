@@ -105,6 +105,7 @@ def _build_gen_args(
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
+        seed=getattr(request, "seed", None),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,

@@ -80,6 +80,75 @@ def test_speculative_server_samples_first_bonus_like_decode_step():
     assert bool(mx.allclose(seen["values"], expected_logprobs).item())
 
 
+def test_speculative_server_samples_first_bonus_with_positioned_sampler():
+    seen = {}
+    logits = mx.array(
+        [
+            [[1.0, 2.0, 3.0]],
+            [[4.0, 1.0, 0.0]],
+        ],
+        dtype=mx.float32,
+    )
+
+    class Sampler:
+        def __call__(self, logprobs):
+            raise AssertionError("positioned sampler was not used")
+
+        def sample_target(self, logprobs, *, row_ids, positions):
+            seen["shape"] = logprobs.shape
+            seen["row_ids"] = list(row_ids)
+            seen["positions"] = list(positions)
+            return mx.argmax(logprobs, axis=-1)
+
+    tokens = server_generation._sample_last_token(
+        logits,
+        Sampler(),
+        row_ids=[0, 0],
+        positions=[0, 0],
+    )
+    mx.eval(tokens)
+
+    assert seen == {
+        "shape": (2, 3),
+        "row_ids": [0, 0],
+        "positions": [0, 0],
+    }
+    assert tokens.tolist() == [2, 0]
+
+
+def test_positioned_target_sampler_is_batch_grouping_invariant():
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=42
+    )
+    logits = mx.array(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [3.0, 2.0, 1.0, 0.0],
+        ],
+        dtype=mx.float32,
+    )
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    batched = sampler.sample_target(
+        logprobs,
+        row_ids=[0, 0],
+        positions=[5, 5],
+    )
+    single_0 = sampler.sample_target(
+        logprobs[0:1],
+        row_ids=[0],
+        positions=[5],
+    )
+    single_1 = sampler.sample_target(
+        logprobs[1:2],
+        row_ids=[0],
+        positions=[5],
+    )
+    mx.eval(batched, single_0, single_1)
+
+    assert batched.tolist() == [single_0.item(), single_1.item()]
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")

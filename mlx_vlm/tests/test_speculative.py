@@ -867,6 +867,66 @@ def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
     assert fake_head.calls == 3
 
 
+def test_speculative_walk_batch_deferred_greedy_uses_positioned_sampler():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    class PositionedSampler:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, logprobs):
+            raise AssertionError("positioned target sampler was not used")
+
+        def sample_target(self, logprobs, *, row_ids, positions):
+            self.calls.append((list(row_ids), list(positions)))
+            return mx.argmax(logprobs, axis=-1)
+
+    fake_head = FakeEmbed()
+    sampler = PositionedSampler()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [
+            [
+                [0, 0, 9, 0],
+                [0, 9, 0, 0],
+                [0, 0, 0, 9],
+            ],
+            [
+                [9, 0, 0, 0],
+                [0, 0, 9, 0],
+                [0, 9, 0, 0],
+            ],
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 3], [0, 2]], dtype=mx.int32)
+
+    accepted, new_tokens = _speculative_walk_batch_deferred_greedy(
+        lm,
+        target_hidden,
+        draft_tokens,
+        sampler,
+        budgets=[3, 2],
+        row_ids=[10, 11],
+        base_positions=[7, 12],
+    )
+
+    assert accepted == [1, 2]
+    assert new_tokens == [[2, 1], [0, 2]]
+    assert fake_head.calls == 3
+    assert sampler.calls == [
+        ([10, 11], [7, 12]),
+        ([10, 11], [8, 13]),
+        ([10, 11], [9, 14]),
+    ]
+
+
 def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     class FakeEmbed:
         def __init__(self):
@@ -911,18 +971,38 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
     ragged_drafter = SimpleNamespace(requires_uniform_batch_acceptance=False)
     uniform_drafter = SimpleNamespace(requires_uniform_batch_acceptance=True)
+    normal_sampler = lambda logits: mx.argmax(logits, axis=-1)
+    positioned_sampler = SimpleNamespace(sample_target=lambda *args, **kwargs: None)
 
     assert not mtp_utils._mtp_use_uniform_deferred_walk(
-        ragged_drafter, n_active=1, greedy_sampling=False
+        ragged_drafter,
+        n_active=1,
+        greedy_sampling=False,
+        sampler=normal_sampler,
     )
     assert not mtp_utils._mtp_use_uniform_deferred_walk(
-        ragged_drafter, n_active=2, greedy_sampling=True
+        ragged_drafter,
+        n_active=2,
+        greedy_sampling=True,
+        sampler=normal_sampler,
     )
     assert mtp_utils._mtp_use_uniform_deferred_walk(
-        ragged_drafter, n_active=2, greedy_sampling=False
+        ragged_drafter,
+        n_active=2,
+        greedy_sampling=False,
+        sampler=normal_sampler,
+    )
+    assert not mtp_utils._mtp_use_uniform_deferred_walk(
+        ragged_drafter,
+        n_active=2,
+        greedy_sampling=False,
+        sampler=positioned_sampler,
     )
     assert mtp_utils._mtp_use_uniform_deferred_walk(
-        uniform_drafter, n_active=2, greedy_sampling=True
+        uniform_drafter,
+        n_active=2,
+        greedy_sampling=True,
+        sampler=positioned_sampler,
     )
 
 

@@ -132,6 +132,7 @@ def run_speculative_server_rounds(
     shared_kv_states: Optional[dict] = None,
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
+    row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
 
@@ -206,6 +207,7 @@ def run_speculative_server_rounds(
             stop_check=stop_check,
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
+            row_ids=row_ids,
         )
         return
 

@@ -214,6 +214,8 @@ def _speculative_walk_batch_deferred_greedy(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budgets: List[int],
+    row_ids: Optional[List[int]] = None,
+    base_positions: Optional[List[int]] = None,
 ) -> Tuple[List[int], List[List[int]]]:
     """Batched greedy walk that projects target logits only until all rows stop."""
     B = draft_tokens.shape[0]
@@ -234,7 +236,19 @@ def _speculative_walk_batch_deferred_greedy(
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            target_tokens = sampler(logprobs)
+            if _sampler_supports_positioned_target(sampler):
+                if row_ids is None or base_positions is None:
+                    raise ValueError(
+                        "positioned target sampling requires row_ids and "
+                        "base_positions."
+                    )
+                target_tokens = sampler.sample_target(
+                    logprobs,
+                    row_ids=row_ids,
+                    positions=[int(position) + pos for position in base_positions],
+                )
+            else:
+                target_tokens = sampler(logprobs)
         mx.eval(target_tokens)
         target_list = [int(token) for token in target_tokens.reshape(-1).tolist()]
 
@@ -301,17 +315,25 @@ def _speculative_walk_batch_deferred_uniform(
     return [accepted] * B, [draft_lists[row][: budgets[row]] for row in range(B)]
 
 
+def _sampler_supports_positioned_target(sampler: Callable[[mx.array], mx.array]) -> bool:
+    return callable(getattr(sampler, "sample_target", None))
+
+
 def _mtp_use_uniform_deferred_walk(
     draft_model: nn.Module,
     *,
     n_active: int,
     greedy_sampling: bool,
+    sampler: Callable[[mx.array], mx.array],
 ) -> bool:
     if n_active <= 1:
         return False
 
     if getattr(draft_model, "requires_uniform_batch_acceptance", False):
         return True
+
+    if _sampler_supports_positioned_target(sampler):
+        return False
 
     # Non-greedy sampling uses a single target RNG stream. If rows accept a
     # ragged number of tokens, the verifier would draw future samples for some
@@ -718,6 +740,7 @@ def _mtp_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
+    row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B > 1).
 
@@ -735,6 +758,7 @@ def _mtp_rounds_batch(
         )
 
     B = first_bonus.shape[0]
+    row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
     if getattr(draft_model, "supports_ragged_batch_acceptance", False):
@@ -839,6 +863,7 @@ def _mtp_rounds_batch(
                 draft_model,
                 n_active=n_active,
                 greedy_sampling=greedy_sampling,
+                sampler=sampler,
             ):
                 accepted_list, new_tokens_list = (
                     _speculative_walk_batch_deferred_uniform(
@@ -856,8 +881,12 @@ def _mtp_rounds_batch(
                     draft_tokens,
                     sampler,
                     budgets,
+                    row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                    base_positions=[emitted[active_idx[j]] for j in range(n_active)],
                 )
-            sampler_rng.target_sampled(sync_draft=True)
+            sampler_rng.target_sampled(
+                sync_draft=not _sampler_supports_positioned_target(sampler)
+            )
         # Keep the adaptive block-size history on a per-round basis so
         # batched MTP reacts like the singleton loop instead of letting
         # batch size change the controller signal.
