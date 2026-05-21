@@ -301,6 +301,24 @@ def _speculative_walk_batch_deferred_uniform(
     return [accepted] * B, [draft_lists[row][: budgets[row]] for row in range(B)]
 
 
+def _mtp_use_uniform_deferred_walk(
+    draft_model: nn.Module,
+    *,
+    n_active: int,
+    greedy_sampling: bool,
+) -> bool:
+    if n_active <= 1:
+        return False
+
+    if getattr(draft_model, "requires_uniform_batch_acceptance", False):
+        return True
+
+    # Non-greedy sampling uses a single target RNG stream. If rows accept a
+    # ragged number of tokens, the verifier would draw future samples for some
+    # rows before no-drafter has drawn the next lockstep batch sample.
+    return not greedy_sampling
+
+
 def _mtp_acceptance_walk(
     lm: nn.Module,
     verify: _MTPVerifyResult,
@@ -817,9 +835,10 @@ def _mtp_rounds_batch(
                 )
         else:
             sampler_rng.target_eval(hidden_full)
-            if (
-                n_active > 1
-                and getattr(draft_model, "requires_uniform_batch_acceptance", False)
+            if _mtp_use_uniform_deferred_walk(
+                draft_model,
+                n_active=n_active,
+                greedy_sampling=greedy_sampling,
             ):
                 accepted_list, new_tokens_list = (
                     _speculative_walk_batch_deferred_uniform(

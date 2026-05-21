@@ -908,6 +908,24 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     assert fake_head.calls == 1
 
 
+def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
+    ragged_drafter = SimpleNamespace(requires_uniform_batch_acceptance=False)
+    uniform_drafter = SimpleNamespace(requires_uniform_batch_acceptance=True)
+
+    assert not mtp_utils._mtp_use_uniform_deferred_walk(
+        ragged_drafter, n_active=1, greedy_sampling=False
+    )
+    assert not mtp_utils._mtp_use_uniform_deferred_walk(
+        ragged_drafter, n_active=2, greedy_sampling=True
+    )
+    assert mtp_utils._mtp_use_uniform_deferred_walk(
+        ragged_drafter, n_active=2, greedy_sampling=False
+    )
+    assert mtp_utils._mtp_use_uniform_deferred_walk(
+        uniform_drafter, n_active=2, greedy_sampling=True
+    )
+
+
 def test_mtp_draft_hidden_uses_model_hook():
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
     lm = SimpleNamespace(speculative_draft_hidden=lambda h: h * 2)
