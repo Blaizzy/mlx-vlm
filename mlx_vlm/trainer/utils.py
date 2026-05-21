@@ -9,6 +9,8 @@ from mlx.utils import tree_flatten
 
 from .lora import LoRaLayer
 
+DEFAULT_LORA_NUM_LAYERS = -1
+
 
 class Colors:
     HEADER = "\033[95m"
@@ -81,22 +83,136 @@ def set_module_by_name(model, name, new_module):
         setattr(module, parts[-1], new_module)
 
 
+def _lora_scale(alpha: float, rank: int) -> float:
+    return alpha / rank
+
+
+def _linear_layer_key(model_key: str, language_key: str) -> str:
+    return f"{model_key}.{language_key}" if language_key else model_key
+
+
+def _to_lora(layer, lora_parameters, use_dora=False):
+    if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
+        if use_dora:
+            from mlx_lm.tuner.dora import DoRALinear
+
+            return DoRALinear.from_base(
+                layer,
+                r=lora_parameters["rank"],
+                scale=lora_parameters["scale"],
+                dropout=lora_parameters["dropout"],
+            )
+
+        from mlx_lm.tuner.lora import LoRALinear
+
+        return LoRALinear.from_base(
+            layer,
+            r=lora_parameters["rank"],
+            scale=lora_parameters["scale"],
+            dropout=lora_parameters["dropout"],
+        )
+
+    raise ValueError(f"Can't convert layer of type {type(layer).__name__} to LoRA")
+
+
+def _apply_language_lora_layers(model, linear_layers, lora_parameters):
+    targets = set(linear_layers)
+    keys = []
+    for name, module in model.language_model.named_modules():
+        if isinstance(module, (nn.Linear, nn.QuantizedLinear)):
+            if name.split(".")[-1] in targets:
+                set_module_by_name(
+                    model.language_model,
+                    name,
+                    _to_lora(module, lora_parameters),
+                )
+                keys.append(_linear_layer_key("language_model", name))
+    return keys
+
+
+def _apply_lora_layers(model, config):
+    lora_parameters = dict(config["lora_parameters"])
+    fine_tune_type = config.get("fine_tune_type", "lora")
+    use_dora = fine_tune_type == "dora"
+
+    if fine_tune_type == "full":
+        return model
+
+    if "keys" not in lora_parameters:
+        from mlx_lm.tuner.utils import linear_to_lora_layers
+
+        linear_to_lora_layers(
+            model,
+            config.get("num_layers", DEFAULT_LORA_NUM_LAYERS),
+            lora_parameters,
+            use_dora=use_dora,
+        )
+        return model
+
+    for name in lora_parameters["keys"]:
+        module = get_module_by_name(model, name)
+        set_module_by_name(
+            model,
+            name,
+            _to_lora(module, lora_parameters, use_dora=use_dora),
+        )
+    return model
+
+
+def _lora_config(rank, alpha, dropout):
+    return {
+        "fine_tune_type": "lora",
+        "num_layers": DEFAULT_LORA_NUM_LAYERS,
+        "lora_parameters": {
+            "rank": rank,
+            "dropout": dropout,
+            "scale": _lora_scale(alpha, rank),
+        },
+    }
+
+
+def _apply_legacy_lora_layers(model, config):
+    list_of_modules = find_all_linear_names(model.language_model)
+    return get_peft_model(
+        model,
+        list_of_modules,
+        rank=config["rank"],
+        alpha=config.get("alpha", 0.1),
+        dropout=config.get("dropout", 0.1),
+        legacy=True,
+    )
+
+
 def get_peft_model(
-    model, linear_layers, rank=10, alpha=0.1, dropout=0.1, freeze=True, verbose=True
+    model,
+    linear_layers,
+    rank=10,
+    alpha=0.1,
+    dropout=0.1,
+    freeze=True,
+    verbose=True,
+    legacy=False,
 ):
     if freeze:
         freeze_model(model)
 
-    for name, module in model.language_model.named_modules():
-        if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
-            if name.split(".")[-1] in linear_layers:
-                lora_layer = LoRaLayer(module, rank, alpha, dropout)
-                set_module_by_name(model.language_model, name, lora_layer)
+    if legacy:
+        for name, module in model.language_model.named_modules():
+            if isinstance(module, nn.Linear) or isinstance(module, nn.QuantizedLinear):
+                if name.split(".")[-1] in linear_layers:
+                    lora_layer = LoRaLayer(module, rank, alpha, dropout)
+                    set_module_by_name(model.language_model, name, lora_layer)
 
-    model.config.lora = {}
-    model.config.lora["rank"] = rank
-    model.config.lora["alpha"] = alpha
-    model.config.lora["dropout"] = dropout
+        model.config.lora = {}
+        model.config.lora["rank"] = rank
+        model.config.lora["alpha"] = alpha
+        model.config.lora["dropout"] = dropout
+    else:
+        config = _lora_config(rank, alpha, dropout)
+        config["lora_parameters"]["keys"] = _apply_language_lora_layers(
+            model, linear_layers, config["lora_parameters"]
+        )
+        model.config.lora = config
 
     if verbose:
         print_trainable_parameters(model.language_model)
@@ -204,25 +320,29 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     Returns:
         nn.Module: The updated model with LoRA layers applied.
     """
+    if getattr(model, "_is_text_model", False):
+        from mlx_lm.utils import load_adapters
+
+        model.language_model._model = load_adapters(
+            model.language_model._model, adapter_path
+        )
+        return model
+
     adapter_path = Path(adapter_path)
 
     if not adapter_path.exists():
         raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
 
-    # Check if the adapter has lora params in the config (adapter_config.json)
     with open(adapter_path / "adapter_config.json", "r") as f:
         config = json.load(f)
-        if "rank" not in config:
+        if "rank" not in config and "lora_parameters" not in config:
             raise ValueError("The adapter does not have lora params in the config")
 
-    # TODO: add lora params to the config and load them here
-    list_of_modules = find_all_linear_names(model.language_model)
-    if config is not None:
-        model = get_peft_model(model, list_of_modules, **config)
+    if "lora_parameters" in config:
+        model = _apply_lora_layers(model, config)
     else:
-        model = get_peft_model(model, list_of_modules)
+        model = _apply_legacy_lora_layers(model, config)
 
-    # TODO: Use custom adapter name
     model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
 
     return model

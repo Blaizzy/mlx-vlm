@@ -451,11 +451,18 @@ class Gemma4TextModel(nn.Module):
         masks = []
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
+                return_array = (
+                    h.shape[1] > 1
+                    and c is not None
+                    and int(mx.max(mx.array(c.offset)).item()) > 0
+                )
                 if l.layer_type == "full_attention":
-                    mask["full_attention"] = create_attention_mask(h, c)
+                    mask["full_attention"] = create_attention_mask(
+                        h, c, return_array=return_array
+                    )
                 elif l.layer_type == "sliding_attention":
                     mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                        h, c, window_size=self.window_size, return_array=return_array
                     )
             masks.append(mask[l.layer_type])
         return masks
@@ -545,10 +552,14 @@ class Gemma4TextModel(nn.Module):
 
         # Match HF's `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
         # — the recorded value is the LAST decoder layer's output, captured
-        # BEFORE the final RMSNorm. The drafter's `pre_projection` was trained
-        # against this pre-norm hidden.
+        # BEFORE the final RMSNorm. Speculative verification can reuse this
+        # hidden for deferred logits; MTP drafters normalize it via
+        # LanguageModel.speculative_draft_hidden before consuming it.
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
+
+        if kwargs.pop("skip_final_norm", False):
+            return h
 
         h = self.norm(h)
 
@@ -562,6 +573,18 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         self.model = Gemma4TextModel(config)
         self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None)
+
+    def logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        logits = self.model.embed_tokens.as_linear(hidden)
+        if self.final_logit_softcapping is not None:
+            logits = logit_softcap(self.final_logit_softcapping, logits)
+        return logits
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return self.logits_from_hidden(self.model.norm(hidden))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self.model.norm(hidden)
 
     def __call__(
         self,
@@ -596,9 +619,7 @@ class LanguageModel(nn.Module):
             shared_kv_sink=shared_kv_sink,
             **kwargs,
         )
-        out = self.model.embed_tokens.as_linear(out)
-        if self.final_logit_softcapping is not None:
-            out = logit_softcap(self.final_logit_softcapping, out)
+        out = self.logits_from_hidden(out)
         return LanguageModelOutput(
             logits=out,
             hidden_states=hidden_sink,
