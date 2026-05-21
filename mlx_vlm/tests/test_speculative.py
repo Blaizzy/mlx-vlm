@@ -400,7 +400,16 @@ def test_qwen_target_verify_linear_matches_singleton_dense_gemv():
     linear.bias = mx.random.normal((32,)).astype(mx.bfloat16)
     x = mx.random.normal((3, 4, 16)).astype(mx.bfloat16)
 
-    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    ref = mx.concatenate(
+        [
+            mx.concatenate(
+                [linear(x[row : row + 1, i : i + 1]) for i in range(x.shape[1])],
+                axis=1,
+            )
+            for row in range(x.shape[0])
+        ],
+        axis=0,
+    )
     out = qwen_language._target_verify_linear(linear, x, target_verify=True)
     mx.eval(ref, out)
 
@@ -424,9 +433,18 @@ def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
     mx.random.seed(10)
     linear = nn.Linear(256, 8, bias=False)
     linear.weight = mx.random.normal((8, 256)).astype(mx.bfloat16)
-    x = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
+    x = mx.random.normal((3, 3, 256)).astype(mx.bfloat16)
 
-    ref = mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    ref = mx.concatenate(
+        [
+            mx.concatenate(
+                [linear(x[row : row + 1, i : i + 1]) for i in range(x.shape[1])],
+                axis=1,
+            )
+            for row in range(x.shape[0])
+        ],
+        axis=0,
+    )
     out = qwen_language._target_verify_linear(linear, x, target_verify=True)
     mx.eval(ref, out)
 

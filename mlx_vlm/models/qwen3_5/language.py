@@ -220,6 +220,18 @@ def _target_verify_weight(weight: mx.array, x: mx.array) -> Optional[mx.array]:
     return out.reshape(B, L, O)
 
 
+def _target_verify_singletons(fn, x: mx.array) -> mx.array:
+    rows = []
+    for row in range(x.shape[0]):
+        rows.append(
+            mx.concatenate(
+                [fn(x[row : row + 1, i : i + 1]) for i in range(x.shape[1])],
+                axis=1,
+            )
+        )
+    return mx.concatenate(rows, axis=0)
+
+
 def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
     if not _use_target_verify_dense(linear, x, target_verify):
         return linear(x)
@@ -229,7 +241,7 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
         if out is not None:
             return out
 
-    return mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    return _target_verify_singletons(linear, x)
 
 
 def _target_verify_linears(linears, x: mx.array, target_verify: bool):
@@ -252,10 +264,7 @@ def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bo
     if out is not None:
         return out
 
-    return mx.concatenate(
-        [embedding.as_linear(x[:, i : i + 1]) for i in range(x.shape[1])],
-        axis=1,
-    )
+    return _target_verify_singletons(embedding.as_linear, x)
 
 
 def _extract_row_cache(cache_entry, row: int):
@@ -403,7 +412,11 @@ class Qwen3_5Attention(nn.Module):
                         values[:, :, : prefix_len + i + 1, :],
                         cache=cache,
                         scale=self.scale,
-                        mask=None,
+                        mask=(
+                            mask[..., i : i + 1, : prefix_len + i + 1]
+                            if isinstance(mask, mx.array) and mask.ndim >= 4
+                            else None
+                        ),
                     )
                     for i in range(L)
                 ],
