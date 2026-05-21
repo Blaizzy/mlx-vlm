@@ -289,6 +289,15 @@ def _extract_row_cache(cache_entry, row: int):
     return cache_entry
 
 
+def _is_single_row_batch_cache(cache_entry) -> bool:
+    left_padding = getattr(cache_entry, "left_padding", None)
+    return (
+        isinstance(left_padding, mx.array)
+        and left_padding.ndim > 0
+        and left_padding.size == 1
+    )
+
+
 def _gated_delta_update_verify_decode(
     q: mx.array,
     k: mx.array,
@@ -691,6 +700,35 @@ class Qwen3_5Model(nn.Module):
 
         fa_cache = cache[self.fa_idx]
         if (
+            h.shape[0] == 1
+            and hidden_sink is None
+            and gdn_sink is None
+            and fa_cache is not None
+            and _is_single_row_batch_cache(fa_cache)
+        ):
+            row_cache = []
+            for cache_entry in cache:
+                if cache_entry is None:
+                    row_cache.append(None)
+                elif _is_single_row_batch_cache(cache_entry):
+                    row_cache.append(_extract_row_cache(cache_entry, 0))
+                else:
+                    row_cache.append(cache_entry)
+
+            row_out = self(
+                inputs,
+                inputs_embeds=h,
+                cache=row_cache,
+                position_ids=position_ids,
+            )
+            for i, cache_entry in enumerate(row_cache):
+                if cache[i] is None or cache_entry is None:
+                    continue
+                if hasattr(cache[i].__class__, "merge"):
+                    cache[i] = cache[i].__class__.merge([cache_entry])
+            return row_out
+
+        if (
             h.shape[0] > 1
             and hidden_sink is None
             and gdn_sink is None
@@ -719,11 +757,6 @@ class Qwen3_5Model(nn.Module):
                         if position_ids is None
                         else position_ids[:, row : row + 1, pad:]
                     )
-                    if pad > 0 and row_position_ids is not None:
-                        row_position_ids = mx.broadcast_to(
-                            mx.arange(row_inputs.shape[1])[None, None, :],
-                            (3, 1, row_inputs.shape[1]),
-                        )
                     current_cache = []
                     for cache_entry in cache:
                         if cache_entry is None:
@@ -1016,21 +1049,20 @@ class LanguageModel(nn.Module):
             )
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
-                input_ids = mx.where(
-                    attention_mask[i] == 1, input_ids, mx.zeros_like(input_ids)
-                )
+                row_mask = attention_mask[i].tolist()
+                input_tokens = [
+                    token
+                    for token, keep in zip(input_ids.tolist(), row_mask)
+                    if keep == 1
+                ]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = mx.sum(
-                    mx.where(
-                        input_ids == vision_start_token_id,
-                        mx.arange(input_ids.shape[0]),
-                        mx.zeros_like(input_ids),
-                    )
-                )
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum().item()
-                video_nums = (vision_tokens == video_token_id).sum().item()
-                input_tokens = input_ids.tolist()
+                vision_tokens = [
+                    input_tokens[idx + 1]
+                    for idx, token in enumerate(input_tokens[:-1])
+                    if token == vision_start_token_id
+                ]
+                image_nums = sum(token == image_token_id for token in vision_tokens)
+                video_nums = sum(token == video_token_id for token in vision_tokens)
                 llm_pos_ids_list: list = []
                 st = 0
                 remain_images, remain_videos = image_nums, video_nums
@@ -1112,7 +1144,19 @@ class LanguageModel(nn.Module):
                     llm_pos_ids_list.append(t_index + st_idx)
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                mask = mx.array(attention_mask[i] == 1)
+                compact_max_position = llm_positions.max()
+                padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
+                compact_positions = llm_positions.tolist()
+                compact_idx = 0
+                for col, keep in enumerate(row_mask):
+                    if keep == 1:
+                        for dim in range(3):
+                            padded_positions[dim][col] = compact_positions[dim][
+                                compact_idx
+                            ]
+                        compact_idx += 1
+                llm_positions = mx.array(padded_positions, dtype=position_ids.dtype)
+                mask = mx.array(row_mask, dtype=mx.bool_)
                 expanded_mask = mx.expand_dims(mask, axis=0)
                 expanded_mask = mx.broadcast_to(expanded_mask, (3, 1, mask.shape[0]))
                 expanded_positions = mx.expand_dims(llm_positions, axis=1)
@@ -1129,7 +1173,7 @@ class LanguageModel(nn.Module):
                 )
                 position_ids = updated_position_ids
                 mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
+                    compact_max_position + 1 - len(input_tokens)
                 )
             mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas

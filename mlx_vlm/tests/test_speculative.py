@@ -16,7 +16,13 @@ import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
-from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -522,6 +528,71 @@ def test_qwen_gdn_verify_conv_matches_singleton_windows():
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen3_5_rope_index_ignores_left_padding_for_vision_rows():
+    model_config = qwen_language.ModelConfig(
+        text_config=_tiny_qwen3_5_text_config(),
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        model_type="qwen3_5",
+        image_token_id=101,
+        video_token_id=102,
+        image_token_index=101,
+        video_token_index=102,
+        vision_start_token_id=100,
+        vision_end_token_id=103,
+        vocab_size=128,
+    )
+    lm = qwen_language.LanguageModel.__new__(qwen_language.LanguageModel)
+    lm.config = model_config
+
+    singleton_ids = mx.array([[10, 100, 101, 11, 12]], dtype=mx.int32)
+    padded_ids = mx.array(
+        [[0, 10, 100, 101, 11, 12], [20, 21, 22, 23, 24, 25]],
+        dtype=mx.int32,
+    )
+    attention_mask = mx.array(
+        [[0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.int32
+    )
+    image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+
+    singleton_pos, singleton_delta = lm.get_rope_index(singleton_ids, image_grid_thw)
+    padded_pos, padded_delta = lm.get_rope_index(
+        padded_ids, image_grid_thw, attention_mask=attention_mask
+    )
+    mx.eval(singleton_pos, padded_pos, singleton_delta, padded_delta)
+
+    assert padded_pos[:, 0, 1:].tolist() == singleton_pos[:, 0, :].tolist()
+    assert padded_delta[0, 0].item() == singleton_delta[0, 0].item()
+    assert padded_delta[1, 0].item() == 0
+
+
+def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.num_hidden_layers = 2
+    text_config.full_attention_interval = 2
+    model = qwen_language.Qwen3_5Model(text_config)
+
+    singleton_cache = [ArraysCache(size=2), KVCache()]
+    batch_arrays = ArraysCache(size=2)
+    batch_arrays.left_padding = mx.array([0], dtype=mx.int32)
+    batch_cache = [batch_arrays, BatchKVCache([0])]
+
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    singleton_prompt = model(prompt, cache=singleton_cache)
+    batch_prompt = model(prompt, cache=batch_cache)
+    mx.eval(singleton_prompt, batch_prompt)
+
+    assert bool(mx.array_equal(singleton_prompt, batch_prompt).item())
+    assert isinstance(batch_cache[1], BatchKVCache)
+
+    decode = mx.array([[4]], dtype=mx.int32)
+    singleton_decode = model(decode, cache=singleton_cache)
+    batch_decode = model(decode, cache=batch_cache)
+    mx.eval(singleton_decode, batch_decode)
+
+    assert bool(mx.array_equal(singleton_decode, batch_decode).item())
+    assert isinstance(batch_cache[1], BatchKVCache)
 
 
 def test_speculative_walk_accepts_until_first_mismatch():
