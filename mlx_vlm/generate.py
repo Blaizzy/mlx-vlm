@@ -133,7 +133,12 @@ def parse_arguments():
         help="Temperature for sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
-    parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detailed output (use --no-verbose to print only the final result).",
+    )
     parser.add_argument(
         "--eos-tokens",
         type=str,
