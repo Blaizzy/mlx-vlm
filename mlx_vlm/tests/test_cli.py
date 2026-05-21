@@ -2,7 +2,6 @@ import argparse
 import ast
 from pathlib import Path
 
-
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 
 
