@@ -489,6 +489,7 @@ class StreamingToken:
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+    cached_tokens: int = 0
 
 
 class ResponseGenerator:
@@ -875,6 +876,7 @@ class ResponseGenerator:
                         ),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
+                        "cached_tokens": 0,
                     }
 
                 if not active or batch_gen is None:
@@ -1140,6 +1142,9 @@ class ResponseGenerator:
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
                 active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
+                active[prompt_response.uid]["cached_tokens"] = getattr(
+                    prompt_response, "cached_tokens", 0
+                )
         if not responses:
             return
 
@@ -1167,6 +1172,7 @@ class ResponseGenerator:
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     prompt_tps=info.get("prompt_tps"),
                     top_logprobs=getattr(r, "top_logprobs", None),
+                    cached_tokens=info.get("cached_tokens", 0),
                 )
             )
 

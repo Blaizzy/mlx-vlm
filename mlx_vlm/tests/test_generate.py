@@ -17,6 +17,7 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    PromptProcessingBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
     normalize_resize_shape,
@@ -530,6 +531,29 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_tokens == len(prompt)
         assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
+        assert prompt_responses[0].cached_tokens == 0
+
+    def test_prompt_progress_reports_apc_cached_tokens(self):
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1, 2],
+            input_ids=[[4, 5], [6, 7, 8]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+            warm_cache=[],
+            apc_meta=[
+                {"full_input_ids": [1, 2, 3, 4, 5], "prefix_len": 3},
+                None,
+            ],
+        )
+        batch.record_prompt_time(0.5)
+
+        progress = batch.prompt_progress()
+
+        assert [p.prompt_tokens for p in progress] == [5, 3]
+        assert [p.cached_tokens for p in progress] == [3, 0]
 
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
