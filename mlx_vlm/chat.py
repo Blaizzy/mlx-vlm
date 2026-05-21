@@ -191,7 +191,12 @@ def main():
         default="mlx-community/idefics2-8b-chatty-4bit",
         help="Path to the model or model identifier",
     )
-    parser.add_argument("--verbose", action="store_false", help="Enable verbose output")
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream tokens as they are generated (use --no-verbose to disable).",
+    )
     parser.add_argument(
         "--temperature",
         type=float,
