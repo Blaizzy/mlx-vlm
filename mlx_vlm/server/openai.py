@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import binascii
 import gc
 import json
 import logging
@@ -7,6 +9,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime
+from io import BytesIO
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
@@ -47,6 +50,7 @@ from .schemas import (
     ChatStreamChoice,
     ChatStreamChunk,
     ContentPartOutputText,
+    InputAudio,
     MessageItem,
     OpenAIRequest,
     OpenAIResponse,
@@ -72,6 +76,45 @@ _preflight_stream_context_budget = None
 _split_thinking = None
 _count_thinking_tag_tokens = None
 _make_logprob_content = None
+_AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
+_AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
+
+
+def _looks_like_audio_reference(value: str) -> bool:
+    return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
+        _AUDIO_REFERENCE_SUFFIXES
+    )
+
+
+def _decode_input_audio_data(input_audio: InputAudio):
+    data = input_audio["data"]
+    if not isinstance(data, str):
+        return data
+
+    stripped = data.strip()
+    if stripped.startswith("data:"):
+        prefix, separator, encoded = stripped.partition(",")
+        if (
+            separator == ","
+            and ";base64" in prefix
+            and prefix.startswith("data:audio/")
+        ):
+            try:
+                return BytesIO(base64.b64decode(encoded, validate=True))
+            except (binascii.Error, ValueError) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="input_audio data URI is not valid base64 audio",
+                ) from exc
+        return data
+
+    if _looks_like_audio_reference(stripped):
+        return data
+
+    try:
+        return BytesIO(base64.b64decode(stripped, validate=True))
+    except (binascii.Error, ValueError):
+        return data
 
 
 def register_routes(app, deps):
@@ -905,7 +948,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         elif item_type == "image_url":
                             images.append(item["image_url"]["url"])
                         elif item_type == "input_audio":
-                            audio.append(item["input_audio"]["data"])
+                            audio.append(_decode_input_audio_data(item["input_audio"]))
                 msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
