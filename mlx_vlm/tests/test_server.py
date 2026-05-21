@@ -2081,7 +2081,7 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
-    def test_step_attaches_prompt_tps_from_prompt_progress(self):
+    def test_step_attaches_prompt_metrics_from_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
 
@@ -2091,7 +2091,7 @@ class TestResponseGenerator:
         class PromptProgressBatch:
             def next(self, **kwargs):
                 return (
-                    [SimpleNamespace(uid=1, prompt_tps=184.431)],
+                    [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)],
                     [
                         SimpleNamespace(
                             uid=1,
@@ -2116,6 +2116,7 @@ class TestResponseGenerator:
                     server.make_streaming_detokenizer(processor),
                 ),
                 "prompt_tps": None,
+                "cached_tokens": 0,
             }
         }
 
@@ -2123,6 +2124,7 @@ class TestResponseGenerator:
 
         item = rqueue.get()
         assert item.prompt_tps == pytest.approx(184.431)
+        assert item.cached_tokens == 7
         assert rqueue.get() is None
 
     def test_generate_arguments_to_generate_kwargs(self):
