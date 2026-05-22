@@ -618,7 +618,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                         metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
-                        yield from start_message_event()
+                        for event in start_message_event():
+                            yield event
 
                         delta_reasoning = None
                         delta_content = None
@@ -691,7 +692,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
-                    yield from start_message_event()
+                    for event in start_message_event():
+                        yield event
                     yield close_open_block()
 
                     parsed_tool_calls = None
