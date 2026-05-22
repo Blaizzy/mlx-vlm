@@ -210,13 +210,6 @@ class OpenAIUsage(BaseModel):
         )
 
 
-def _derive_gen_tps(token_times: List[float], output_tokens: int) -> Optional[float]:
-    if output_tokens <= 0 or len(token_times) < 2:
-        return None
-    elapsed = token_times[-1] - token_times[0]
-    return output_tokens / elapsed if elapsed > 0 else None
-
-
 class GenerationTimings(BaseModel):
     """Per-request timing breakdown. Durations are in milliseconds."""
 
@@ -228,6 +221,15 @@ class GenerationTimings(BaseModel):
     prompt_per_second: float
     predicted_per_second: float
 
+    @staticmethod
+    def _derive_gen_tps(
+        token_times: List[float], output_tokens: int
+    ) -> Optional[float]:
+        if output_tokens <= 0 or len(token_times) < 2:
+            return None
+        elapsed = token_times[-1] - token_times[0]
+        return output_tokens / elapsed if elapsed > 0 else None
+
     @classmethod
     def from_metrics(
         cls,
@@ -235,7 +237,7 @@ class GenerationTimings(BaseModel):
         prompt_tokens: int,
         output_tokens: int,
     ) -> "GenerationTimings":
-        generation_tps = metrics.generation_tps or _derive_gen_tps(
+        generation_tps = metrics.generation_tps or cls._derive_gen_tps(
             metrics.token_times, output_tokens
         )
         cached_tokens = metrics.cached_tokens
