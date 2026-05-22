@@ -217,9 +217,12 @@ class GenerationTimings(BaseModel):
     cache_n: int
     predicted_n: int
     prompt_ms: float
-    predicted_ms: float
+    prompt_per_token_ms: float
     prompt_per_second: float
+    predicted_ms: float
+    predicted_per_token_ms: float
     predicted_per_second: float
+    peak_memory: float = 0.0
 
     @staticmethod
     def _derive_gen_tps(
@@ -243,16 +246,23 @@ class GenerationTimings(BaseModel):
         cached_tokens = metrics.cached_tokens
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
         prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
+        prompt_ms = prompt_s * 1000.0
+        predicted_ms = (
+            output_tokens / generation_tps * 1000.0 if generation_tps else 0.0
+        )
         return cls(
             prompt_n=prompt_n,
             cache_n=int(cached_tokens),
             predicted_n=int(output_tokens),
-            prompt_ms=prompt_s * 1000.0,
-            predicted_ms=(
-                output_tokens / generation_tps * 1000.0 if generation_tps else 0.0
-            ),
+            prompt_ms=prompt_ms,
+            prompt_per_token_ms=(prompt_ms / prompt_n) if prompt_n else 0.0,
             prompt_per_second=(prompt_n / prompt_s) if prompt_s else 0.0,
+            predicted_ms=predicted_ms,
+            predicted_per_token_ms=(
+                predicted_ms / output_tokens if output_tokens else 0.0
+            ),
             predicted_per_second=float(generation_tps or 0.0),
+            peak_memory=float(metrics.peak_memory or 0.0),
         )
 
 
@@ -308,9 +318,6 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(
         ..., description="Token usage details"
     )  # we need the model to return stats
-    timings: Optional[GenerationTimings] = Field(
-        None, description="Per-request timing breakdown"
-    )
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
@@ -484,7 +491,9 @@ class GenerationRequest(VLMRequest):
 
 
 class UsageStats(BaseModel):
-    """OpenAI-compatible usage statistics for chat completions."""
+    """OpenAI-compatible usage statistics for chat completions. Throughput and
+    memory metrics live in `GenerationTimings` (sibling `timings` field on the
+    response) to keep this object spec-clean."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -492,9 +501,6 @@ class UsageStats(BaseModel):
     prompt_tokens_details: PromptTokensDetails = Field(
         default_factory=PromptTokensDetails
     )
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    peak_memory: float = 0.0
 
     @classmethod
     def from_metrics(
@@ -507,9 +513,6 @@ class UsageStats(BaseModel):
             prompt_tokens_details=PromptTokensDetails(
                 cached_tokens=metrics.cached_tokens
             ),
-            prompt_tps=float(metrics.prompt_tps or 0.0),
-            generation_tps=float(metrics.generation_tps or 0.0),
-            peak_memory=metrics.peak_memory,
         )
 
 

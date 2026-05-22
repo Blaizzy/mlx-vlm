@@ -981,25 +981,32 @@ def test_generation_timings_from_metrics():
         prompt_tps=20.0,
         generation_tps=8.0,
         token_times=[],
+        peak_memory=0.5,
     )
     timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
 
     assert (timings.prompt_n, timings.cache_n, timings.predicted_n) == (8, 2, 4)
     assert timings.prompt_ms == pytest.approx(500.0)
+    assert timings.prompt_per_token_ms == pytest.approx(62.5)
     assert timings.prompt_per_second == pytest.approx(16.0)
     assert timings.predicted_ms == pytest.approx(500.0)
+    assert timings.predicted_per_token_ms == pytest.approx(125.0)
     assert timings.predicted_per_second == pytest.approx(8.0)
+    assert timings.peak_memory == pytest.approx(0.5)
 
     metrics = SimpleNamespace(
         cached_tokens=9,
         prompt_tps=None,
         generation_tps=None,
         token_times=[],
+        peak_memory=0.0,
     )
     timings = server.GenerationTimings.from_metrics(metrics, 4, 1)
     assert timings.prompt_n == 0
     assert timings.prompt_ms == 0.0
+    assert timings.prompt_per_token_ms == 0.0
     assert timings.predicted_ms == 0.0
+    assert timings.predicted_per_token_ms == 0.0
 
 
 def test_chat_completions_returns_timings(client, monkeypatch):
