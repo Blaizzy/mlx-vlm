@@ -897,6 +897,11 @@ class ResponseGenerator:
                             except Exception:
                                 pass
 
+                if new_items and batch_gen is not None and not active:
+                    if not batch_gen.has_work:
+                        batch_gen.close()
+                        batch_gen = None
+
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(

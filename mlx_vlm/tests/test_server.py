@@ -2061,6 +2061,148 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
+    def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
+        created = []
+        next_uid = [1]
+
+        class FakeDetokenizer:
+            def __init__(self):
+                self.last_segment = ""
+
+            def reset(self):
+                self.last_segment = ""
+
+            def add_token(self, token):
+                self.last_segment = str(token)
+
+            def finalize(self):
+                pass
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, **kwargs):
+                del args
+                self.sampler = kwargs.get("sampler")
+                self.closed = False
+                self._active = {}
+                created.append(self)
+
+            def insert(self, *args, **kwargs):
+                del args, kwargs
+                uid = next_uid[0]
+                next_uid[0] += 1
+                self._active[uid] = True
+                return (uid,)
+
+            @property
+            def has_work(self):
+                return bool(self._active)
+
+            @property
+            def unprocessed_prompts(self):
+                return []
+
+            @property
+            def has_pending_prompts(self):
+                return False
+
+            def next(self, **kwargs):
+                del kwargs
+                responses = [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=uid,
+                        token_logprob=0.0,
+                        finish_reason="length",
+                    )
+                    for uid in list(self._active)
+                ]
+                self._active.clear()
+                return [], responses
+
+            def remove(self, uid):
+                return self._active.pop(uid, None) is not None
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(
+            server_generation,
+            "make_streaming_detokenizer",
+            lambda _: FakeDetokenizer(),
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.model_path = "demo"
+        gen.adapter_path = None
+        gen.model = None
+        gen.processor = None
+        gen.config = None
+        gen.stop_tokens = set()
+        gen.vision_cache = None
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.kv_bits = None
+        gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+        gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+        gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+        gen.top_logprobs_k = 0
+        gen.apc_manager = None
+        gen.tokenizer = SimpleNamespace()
+        gen.requests = Queue()
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+        gen._cancelled = set()
+        gen._cancel_lock = Lock()
+        gen._make_sampler = lambda args: f"sampler-{args.temperature}"
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = None
+            gen.draft_kind = None
+            gen.tokenizer = SimpleNamespace()
+
+        gen._initialize_model = fake_initialize_model
+        gen._gpu_embed = lambda raw_inputs, images=None: (
+            mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
+            {},
+        )
+
+        worker = Thread(target=gen._run, daemon=True)
+        worker.start()
+
+        def run_request(request_id, temperature):
+            rqueue = Queue()
+            gen.requests.put(
+                (
+                    rqueue,
+                    {"request_id": request_id},
+                    1,
+                    server.GenerationArguments(max_tokens=1, temperature=temperature),
+                    None,
+                )
+            )
+            ctx = rqueue.get(timeout=1)
+            assert isinstance(ctx, server.GenerationContext)
+            item = rqueue.get(timeout=1)
+            assert item.finish_reason == "length"
+            assert rqueue.get(timeout=1) is None
+
+        try:
+            run_request(1, 0.0)
+            run_request(2, 0.6)
+        finally:
+            gen._stop = True
+            gen.requests.put(None)
+            worker.join(timeout=2)
+
+        assert [bg.sampler for bg in created] == ["sampler-0.0", "sampler-0.6"]
+        assert created[0].closed is True
+
     def test_step_attaches_prompt_tps_from_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
