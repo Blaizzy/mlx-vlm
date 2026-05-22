@@ -742,7 +742,7 @@ def _mtp_rounds_batch(
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
-    """Batched Gemma 4 MTP round loop (B > 1).
+    """Batched Gemma 4 MTP round loop (B >= 1).
 
     Mirrors ``_dflash_rounds_batch``: per-row state tracked by original
     index, continuous-batching filter on row finish. Differences vs DFlash
