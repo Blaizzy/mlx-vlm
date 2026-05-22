@@ -496,13 +496,15 @@ class GenerationMetrics:
         self.peak_memory = max(
             self.peak_memory, float(getattr(result, "peak_memory", 0.0) or 0.0)
         )
-        self.prompt_tps = getattr(result, "prompt_tps", None) or self.prompt_tps
-        self.generation_tps = (
-            getattr(result, "generation_tps", None) or self.generation_tps
-        )
-        self.cached_tokens = max(
-            self.cached_tokens, int(getattr(result, "cached_tokens", 0) or 0)
-        )
+        prompt_tps = getattr(result, "prompt_tps", None)
+        if prompt_tps is not None:
+            self.prompt_tps = prompt_tps
+        generation_tps = getattr(result, "generation_tps", None)
+        if generation_tps is not None:
+            self.generation_tps = generation_tps
+        cached_tokens = getattr(result, "cached_tokens", None)
+        if cached_tokens is not None:
+            self.cached_tokens = max(self.cached_tokens, int(cached_tokens))
 
 
 @dataclass
