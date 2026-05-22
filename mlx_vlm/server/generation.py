@@ -12,6 +12,7 @@ from typing import Callable, Iterator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
+from mlx_lm.sample_utils import make_logits_processors
 
 from .. import apc as _apc
 from ..generate import (
@@ -20,6 +21,7 @@ from ..generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
@@ -702,6 +704,18 @@ class ResponseGenerator:
 
         return sampler
 
+    def _make_logits_processors(
+        self, args: GenerationArguments
+    ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        processors = make_logits_processors(
+            args.logit_bias,
+            args.repetition_penalty,
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        )
+        if args.logits_processors is not None:
+            processors.extend(args.logits_processors)
+        return processors
+
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
@@ -861,7 +875,7 @@ class ResponseGenerator:
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
-                            logits_processors=[args.logits_processors],
+                            logits_processors=[self._make_logits_processors(args)],
                         )
                     except Exception as e:
                         rqueue.put(e)

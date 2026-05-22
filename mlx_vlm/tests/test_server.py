@@ -2165,6 +2165,34 @@ class TestResponseGenerator:
         assert "logit_bias" not in kw
         assert "thinking_budget" not in kw
 
+    def test_server_generation_builds_repetition_logits_processors(self, monkeypatch):
+        custom_processor = lambda tokens, logits: logits
+        calls = []
+
+        def fake_make_logits_processors(
+            logit_bias, repetition_penalty, repetition_context_size
+        ):
+            calls.append((logit_bias, repetition_penalty, repetition_context_size))
+            return ["repetition-processor"]
+
+        monkeypatch.setattr(
+            server_generation, "make_logits_processors", fake_make_logits_processors
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        args = server.GenerationArguments(
+            repetition_penalty=1.2,
+            logit_bias={5: -0.5},
+            logits_processors=[custom_processor],
+        )
+
+        processors = gen._make_logits_processors(args)
+
+        assert calls == [
+            ({5: -0.5}, 1.2, server_generation.DEFAULT_REPETITION_CONTEXT_SIZE)
+        ]
+        assert processors == ["repetition-processor", custom_processor]
+
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
             max_output_tokens=128,
