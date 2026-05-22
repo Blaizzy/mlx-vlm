@@ -602,6 +602,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                         if not hasattr(token, "text"):
                             continue
 
+                        # GenerationResult.generation_tokens is cumulative;
+                        # StreamingToken lacks the field and is counted one-at-a-time.
                         token_count = getattr(token, "generation_tokens", None)
                         if token_count is not None:
                             output_tokens = int(token_count)

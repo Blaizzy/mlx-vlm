@@ -117,6 +117,41 @@ def _decode_input_audio_data(input_audio: InputAudio):
         return data
 
 
+def _default_finish_reason(output_tokens: int, max_tokens: int) -> str:
+    """Defensive fallback when the backend yields no terminal finish_reason."""
+    return "length" if output_tokens >= max_tokens else "stop"
+
+
+def _final_chat_chunk(
+    request_id: str,
+    model: str,
+    finish_reason: Optional[str],
+    prompt_tokens: int,
+    output_tokens: int,
+    max_tokens: int,
+) -> Tuple[ChatStreamChunk, str]:
+    finish_reason = finish_reason or _default_finish_reason(output_tokens, max_tokens)
+    return (
+        ChatStreamChunk(
+            id=request_id,
+            created=int(time.time()),
+            model=model,
+            usage={
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": prompt_tokens + output_tokens,
+            },
+            choices=[
+                ChatStreamChoice(
+                    finish_reason=finish_reason,
+                    delta=ChatMessage(role="assistant"),
+                )
+            ],
+        ),
+        finish_reason,
+    )
+
+
 def register_routes(app, deps):
     global _INHERIT_ADAPTER
     global get_cached_model, _build_gen_args, _read_tenant_id
@@ -615,10 +650,8 @@ async def responses_endpoint(request: Request):
                         "tool_calls"
                         if output_finish_reason == "tool_calls"
                         else finish_reason
-                    ) or (
-                        "length"
-                        if usage_stats["output_tokens"] >= gen_args.max_tokens
-                        else "stop"
+                    ) or _default_finish_reason(
+                        usage_stats["output_tokens"], gen_args.max_tokens
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
@@ -1138,13 +1171,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             has_payload = (
                                 delta_content is not None
                                 or delta_reasoning is not None
-                                or token.finish_reason is not None
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
                                 choices = [
                                     ChatStreamChoice(
-                                        finish_reason=token.finish_reason,
                                         delta=ChatMessage(
                                             role="assistant",
                                             content=delta_content,
@@ -1173,11 +1204,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 break
 
                         # Parse tool calls from full output and emit final chunk
+                        terminal_emitted = False
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
                             if tc["calls"]:
                                 tool_calls_made = True
                                 finish_reason = "tool_calls"
+                                terminal_emitted = True
                                 choices = [
                                     ChatStreamChoice(
                                         finish_reason="tool_calls",
@@ -1194,27 +1227,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     choices=choices,
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
-                        if not tool_calls_made and finish_reason is None:
-                            finish_reason = (
-                                "length"
-                                if output_tokens >= gen_args.max_tokens
-                                else "stop"
-                            )
-                            chunk_data = ChatStreamChunk(
-                                id=request_id,
-                                created=int(time.time()),
-                                model=request.model,
-                                usage={
-                                    "prompt_tokens": ctx.prompt_tokens,
-                                    "completion_tokens": output_tokens,
-                                    "total_tokens": ctx.prompt_tokens + output_tokens,
-                                },
-                                choices=[
-                                    ChatStreamChoice(
-                                        finish_reason=finish_reason,
-                                        delta=ChatMessage(role="assistant"),
-                                    )
-                                ],
+                        if not terminal_emitted:
+                            chunk_data, finish_reason = _final_chat_chunk(
+                                request_id,
+                                request.model,
+                                finish_reason,
+                                ctx.prompt_tokens,
+                                output_tokens,
+                                gen_args.max_tokens,
                             )
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
@@ -1277,27 +1297,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        if finish_reason is None:
-                            finish_reason = (
-                                "length"
-                                if output_tokens >= gen_args.max_tokens
-                                else "stop"
-                            )
-                        chunk_data = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=request.model,
-                            usage={
-                                "prompt_tokens": stream_prompt_tokens,
-                                "completion_tokens": output_tokens,
-                                "total_tokens": stream_prompt_tokens + output_tokens,
-                            },
-                            choices=[
-                                ChatStreamChoice(
-                                    finish_reason=finish_reason,
-                                    delta=ChatMessage(role="assistant"),
-                                )
-                            ],
+                        chunk_data, finish_reason = _final_chat_chunk(
+                            request_id,
+                            request.model,
+                            finish_reason,
+                            stream_prompt_tokens,
+                            output_tokens,
+                            gen_args.max_tokens,
                         )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
 
@@ -1327,12 +1333,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         prompt_tps=prompt_tps,
                         generation_tps=generation_tps,
                         peak_memory_gb=peak_memory or None,
-                        finish_reason=finish_reason
-                        or (
-                            "length"
-                            if output_tokens >= gen_args.max_tokens
-                            else "stop"
-                        ),
+                        finish_reason=finish_reason,
                         image_count=len(images),
                         audio_count=len(audio),
                         structured_output=bool(gen_args.logits_processors),
@@ -1479,9 +1480,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     peak_memory = float(getattr(gen_result, "peak_memory", 0.0) or 0.0)
                     prompt_tps = getattr(gen_result, "prompt_tps", None)
                     generation_tps = getattr(gen_result, "generation_tps", None)
-                    finish_reason = (
-                        getattr(gen_result, "finish_reason", None) or "stop"
-                    )
+                    finish_reason = getattr(gen_result, "finish_reason", None) or "stop"
 
                 mx.clear_cache()
                 gc.collect()
@@ -1545,7 +1544,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 choices = [
                     ChatChoice(
                         finish_reason=(
-                            "tool_calls" if parsed_tool_calls else finish_reason or "stop"
+                            "tool_calls"
+                            if parsed_tool_calls
+                            else finish_reason or "stop"
                         ),
                         message=ChatMessage(
                             role="assistant",
