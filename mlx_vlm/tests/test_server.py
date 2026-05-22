@@ -1108,9 +1108,81 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     timed_chunks = [chunk for chunk in chunks if chunk.get("timings") is not None]
     assert len(timed_chunks) == 1
     timed_chunk = timed_chunks[0]
-    assert timed_chunk["choices"][0]["finish_reason"] == "stop"
+    assert timed_chunk["choices"] == []
     assert timed_chunk["timings"]["cache_n"] == 2
     assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+
+
+def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=10), iter(
+                [
+                    server.StreamingToken(
+                        text=(
+                            '<tool_call>{"name":"get_weather",'
+                            '"arguments":{"location":"SF"}}</tool_call>'
+                        ),
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                    )
+                ]
+            )
+
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    tool_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "tool_calls"
+    )
+    usage_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
+
+    assert tool_chunk.get("usage") is None
+    assert usage_chunk["choices"] == []
+    assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
 
 
 def test_chat_completions_endpoint_flattens_text_content_parts(client):
