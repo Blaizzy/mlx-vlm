@@ -542,7 +542,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 def start_message_event():
                     nonlocal message_started
                     if message_started:
-                        return ""
+                        return
                     message_started = True
                     start_message = AnthropicMessageResponse(
                         id=message_id,
@@ -553,7 +553,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             metrics, prompt_tokens, output_tokens
                         ),
                     )
-                    return _sse_event(
+                    yield _sse_event(
                         "message_start",
                         {
                             "type": "message_start",
@@ -618,7 +618,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
-                        yield start_message_event()
+                        yield from start_message_event()
 
                         delta_reasoning = None
                         delta_content = None
@@ -691,7 +691,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
-                    yield start_message_event()
+                    yield from start_message_event()
                     yield close_open_block()
 
                     parsed_tool_calls = None
