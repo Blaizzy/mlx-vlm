@@ -130,8 +130,6 @@ def _final_chat_chunk(
     prompt_tokens: int,
     output_tokens: int,
     max_tokens: int,
-    metrics: Optional[GenerationMetrics] = None,
-    include_usage: bool = False,
 ) -> Tuple[ChatStreamChunk, str]:
     finish_reason = finish_reason or _default_finish_reason(output_tokens, max_tokens)
     return (
@@ -139,24 +137,31 @@ def _final_chat_chunk(
             id=request_id,
             created=int(time.time()),
             model=model,
-            usage=(
-                UsageStats.from_metrics(metrics, prompt_tokens, output_tokens)
-                if include_usage and metrics is not None
-                else None
-            ),
             choices=[
                 ChatStreamChoice(
                     finish_reason=finish_reason,
                     delta=ChatMessage(role="assistant"),
                 )
             ],
-            timings=(
-                GenerationTimings.from_metrics(metrics, prompt_tokens, output_tokens)
-                if include_usage and metrics is not None
-                else None
-            ),
         ),
         finish_reason,
+    )
+
+
+def _chat_usage_chunk(
+    request_id: str,
+    model: str,
+    metrics: GenerationMetrics,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> ChatStreamChunk:
+    return ChatStreamChunk(
+        id=request_id,
+        created=int(time.time()),
+        model=model,
+        usage=UsageStats.from_metrics(metrics, prompt_tokens, output_tokens),
+        choices=[],
+        timings=GenerationTimings.from_metrics(metrics, prompt_tokens, output_tokens),
     )
 
 
@@ -1191,21 +1196,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     id=request_id,
                                     created=int(time.time()),
                                     model=request.model,
-                                    usage=(
-                                        UsageStats.from_metrics(
-                                            metrics, ctx.prompt_tokens, output_tokens
-                                        )
-                                        if emit_usage
-                                        else None
-                                    ),
                                     choices=choices,
-                                    timings=(
-                                        GenerationTimings.from_metrics(
-                                            metrics, ctx.prompt_tokens, output_tokens
-                                        )
-                                        if emit_usage
-                                        else None
-                                    ),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if not terminal_emitted:
@@ -1216,8 +1207,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 ctx.prompt_tokens,
                                 output_tokens,
                                 gen_args.max_tokens,
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        if emit_usage:
+                            chunk_data = _chat_usage_chunk(
+                                request_id,
+                                request.model,
                                 metrics,
-                                emit_usage,
+                                ctx.prompt_tokens,
+                                output_tokens,
                             )
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
@@ -1273,10 +1271,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             stream_prompt_tokens,
                             output_tokens,
                             gen_args.max_tokens,
-                            metrics,
-                            emit_usage,
                         )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        if emit_usage:
+                            chunk_data = _chat_usage_chunk(
+                                request_id,
+                                request.model,
+                                metrics,
+                                stream_prompt_tokens,
+                                output_tokens,
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
