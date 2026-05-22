@@ -473,6 +473,7 @@ async def responses_endpoint(request: Request):
                             None,  # audio
                             gen_args,
                         )
+                        usage_stats["input_tokens"] = ctx.prompt_tokens
 
                         output_tokens = 0
 
@@ -503,7 +504,7 @@ async def responses_endpoint(request: Request):
                                 "output_tokens": output_tokens,
                             }
 
-                            if delta is not None:
+                            if delta:
                                 yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
@@ -517,13 +518,9 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
-                            temperature=openai_request.temperature,
-                            max_tokens=gen_args.max_tokens,
-                            top_p=openai_request.top_p,
                             vision_cache=runtime.model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
                             apc_manager=runtime.apc_manager,
-                            apc_tenant=gen_args.tenant_id,
+                            **gen_args.to_generate_kwargs(),
                             **kwargs,
                         )
 
@@ -545,12 +542,15 @@ async def responses_endpoint(request: Request):
                                 peak_memory,
                                 float(getattr(chunk, "peak_memory", 0.0) or 0.0),
                             )
+                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            if chunk_finish is not None:
+                                finish_reason = chunk_finish
                             usage_stats = {
                                 "input_tokens": chunk.prompt_tokens,
                                 "output_tokens": chunk.generation_tokens,
                             }
 
-                            if delta is not None:
+                            if delta:
                                 yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
@@ -615,7 +615,11 @@ async def responses_endpoint(request: Request):
                         "tool_calls"
                         if output_finish_reason == "tool_calls"
                         else finish_reason
-                    ) or ("stop" if usage_stats["output_tokens"] > 0 else None)
+                    ) or (
+                        "length"
+                        if usage_stats["output_tokens"] >= gen_args.max_tokens
+                        else "stop"
+                    )
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
                         model=openai_request.model,
@@ -767,7 +771,6 @@ async def responses_endpoint(request: Request):
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,
-                        apc_tenant=gen_args.tenant_id,
                         **gen_args.to_generate_kwargs(),
                         **kwargs,
                     )
@@ -777,7 +780,7 @@ async def responses_endpoint(request: Request):
                     prompt_tps = getattr(result, "prompt_tps", None)
                     generation_tps = getattr(result, "generation_tps", None)
                     peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
-                    finish_reason = "stop"
+                    finish_reason = getattr(result, "finish_reason", None) or "stop"
 
                 mx.clear_cache()
                 gc.collect()
@@ -1191,6 +1194,29 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     choices=choices,
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        if not tool_calls_made and finish_reason is None:
+                            finish_reason = (
+                                "length"
+                                if output_tokens >= gen_args.max_tokens
+                                else "stop"
+                            )
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                usage={
+                                    "prompt_tokens": ctx.prompt_tokens,
+                                    "completion_tokens": output_tokens,
+                                    "total_tokens": ctx.prompt_tokens + output_tokens,
+                                },
+                                choices=[
+                                    ChatStreamChoice(
+                                        finish_reason=finish_reason,
+                                        delta=ChatMessage(role="assistant"),
+                                    )
+                                ],
+                            )
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
                         # Fallback to stream_generate
                         token_iterator = stream_generate(
@@ -1199,13 +1225,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             prompt=formatted_prompt,
                             image=images,
                             audio=audio,
-                            temperature=request.temperature,
-                            max_tokens=gen_args.max_tokens,
-                            top_p=request.top_p,
                             vision_cache=runtime.model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
                             apc_manager=runtime.apc_manager,
-                            apc_tenant=gen_args.tenant_id,
+                            **gen_args.to_generate_kwargs(),
                             **kwargs,
                         )
 
@@ -1227,29 +1249,57 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 peak_memory,
                                 float(getattr(chunk, "peak_memory", 0.0) or 0.0),
                             )
+                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            if chunk_finish is not None:
+                                finish_reason = chunk_finish
 
-                            choices = [
-                                ChatStreamChoice(
-                                    delta=ChatMessage(
-                                        role="assistant", content=chunk.text
+                            if chunk.text:
+                                choices = [
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant", content=chunk.text
+                                        )
                                     )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage={
+                                        "prompt_tokens": chunk.prompt_tokens,
+                                        "completion_tokens": chunk.generation_tokens,
+                                        "total_tokens": chunk.prompt_tokens
+                                        + chunk.generation_tokens,
+                                    },
+                                    choices=choices,
                                 )
-                            ]
-                            chunk_data = ChatStreamChunk(
-                                id=request_id,
-                                created=int(time.time()),
-                                model=request.model,
-                                usage={
-                                    "prompt_tokens": chunk.prompt_tokens,
-                                    "completion_tokens": chunk.generation_tokens,
-                                    "total_tokens": chunk.prompt_tokens
-                                    + chunk.generation_tokens,
-                                },
-                                choices=choices,
-                            )
 
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
-                            await asyncio.sleep(0.01)
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                await asyncio.sleep(0.01)
+
+                        if finish_reason is None:
+                            finish_reason = (
+                                "length"
+                                if output_tokens >= gen_args.max_tokens
+                                else "stop"
+                            )
+                        chunk_data = ChatStreamChunk(
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage={
+                                "prompt_tokens": stream_prompt_tokens,
+                                "completion_tokens": output_tokens,
+                                "total_tokens": stream_prompt_tokens + output_tokens,
+                            },
+                            choices=[
+                                ChatStreamChoice(
+                                    finish_reason=finish_reason,
+                                    delta=ChatMessage(role="assistant"),
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
@@ -1278,7 +1328,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         generation_tps=generation_tps,
                         peak_memory_gb=peak_memory or None,
                         finish_reason=finish_reason
-                        or ("stop" if output_tokens > 0 else None),
+                        or (
+                            "length"
+                            if output_tokens >= gen_args.max_tokens
+                            else "stop"
+                        ),
                         image_count=len(images),
                         audio_count=len(audio),
                         structured_output=bool(gen_args.logits_processors),
@@ -1425,7 +1479,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     peak_memory = float(getattr(gen_result, "peak_memory", 0.0) or 0.0)
                     prompt_tps = getattr(gen_result, "prompt_tps", None)
                     generation_tps = getattr(gen_result, "generation_tps", None)
-                    finish_reason = "stop"
+                    finish_reason = (
+                        getattr(gen_result, "finish_reason", None) or "stop"
+                    )
 
                 mx.clear_cache()
                 gc.collect()
@@ -1488,7 +1544,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                 choices = [
                     ChatChoice(
-                        finish_reason="tool_calls" if parsed_tool_calls else "stop",
+                        finish_reason=(
+                            "tool_calls" if parsed_tool_calls else finish_reason or "stop"
+                        ),
                         message=ChatMessage(
                             role="assistant",
                             content=content if content else None,

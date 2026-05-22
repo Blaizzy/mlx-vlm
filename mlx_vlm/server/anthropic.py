@@ -564,13 +564,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
-                            temperature=request.temperature,
-                            max_tokens=gen_args.max_tokens,
-                            top_p=request.top_p,
                             vision_cache=runtime.model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
                             apc_manager=runtime.apc_manager,
-                            apc_tenant=gen_args.tenant_id,
+                            **gen_args.to_generate_kwargs(),
                         )
 
                         def _next_token():
@@ -606,7 +602,11 @@ async def anthropic_messages_endpoint(http_request: Request):
                         if not hasattr(token, "text"):
                             continue
 
-                        output_tokens += 1
+                        token_count = getattr(token, "generation_tokens", None)
+                        if token_count is not None:
+                            output_tokens = int(token_count)
+                        else:
+                            output_tokens += 1
                         delta = token.text
                         full_output += delta
                         accumulated += delta
@@ -909,7 +909,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 prompt_tps = getattr(result, "prompt_tps", None)
                 generation_tps = getattr(result, "generation_tps", None)
                 peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
-                finish_reason = "stop"
+                finish_reason = getattr(result, "finish_reason", None) or "stop"
 
             parsed_tool_calls = None
             response_text = full_text

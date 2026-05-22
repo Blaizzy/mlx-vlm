@@ -391,6 +391,9 @@ class GenerationResult:
     generation_tps: float = 0.0
     peak_memory: float = 0.0
     cached_tokens: int = 0
+    # Populated only on the terminal chunk yielded by ``stream_generate``:
+    # ``"stop"`` for eos/stop-sequence, ``"length"`` for max_tokens.
+    finish_reason: Optional[str] = None
 
 
 class PromptCacheState:
@@ -1055,6 +1058,7 @@ def stream_generate(
         tic = time.perf_counter()
 
         generated_tokens = []
+        finish_reason: Optional[str] = None
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -1082,6 +1086,7 @@ def stream_generate(
 
             # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
+                finish_reason = "stop"
                 break
 
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
@@ -1099,6 +1104,27 @@ def stream_generate(
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
             )
+        else:
+            # generate_step exhausted its budget without stopping_criteria firing.
+            finish_reason = "length"
+
+        if not generated_tokens:
+            prompt_time = time.perf_counter() - tic
+            prompt_tps = total_prompt_tokens / prompt_time if prompt_time > 0 else 0.0
+            yield GenerationResult(
+                text="",
+                token=None,
+                logprobs=None,
+                prompt_tokens=total_prompt_tokens,
+                generation_tokens=0,
+                total_tokens=total_prompt_tokens,
+                prompt_tps=prompt_tps,
+                generation_tps=0.0,
+                peak_memory=mx.get_peak_memory() / 1e9,
+                cached_tokens=reused_prefix_len,
+                finish_reason="length",
+            )
+            return
 
         detokenizer.finalize()
         yield GenerationResult(
@@ -1112,6 +1138,7 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
             cached_tokens=reused_prefix_len,
+            finish_reason=finish_reason,
         )
 
         # Save cache state for potential reuse on next turn
@@ -1236,21 +1263,13 @@ def generate(
         text += response.text
         last_response = response
 
+    if last_response is None:
+        return GenerationResult(text=text, peak_memory=mx.get_peak_memory() / 1e9)
+
     if verbose:
         print("\n" + "=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return GenerationResult(
-                text=text,
-                token=None,
-                logprobs=None,
-                prompt_tokens=0,
-                generation_tokens=0,
-                total_tokens=0,
-                prompt_tps=0.0,
-                generation_tps=0.0,
-                peak_memory=mx.get_peak_memory() / 1e9,
-            )
         print(
             f"Prompt: {last_response.prompt_tokens} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
@@ -1272,6 +1291,7 @@ def generate(
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
         cached_tokens=last_response.cached_tokens,
+        finish_reason=last_response.finish_reason,
     )
 
 
