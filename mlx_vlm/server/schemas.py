@@ -198,6 +198,8 @@ class OpenAIUsage(BaseModel):
     def from_metrics(
         cls, metrics: Any, input_tokens: int, output_tokens: int
     ) -> "OpenAIUsage":
+        # Per spec, `input_tokens` is the total prompt count; cached portion is
+        # reported separately in `input_tokens_details.cached_tokens`.
         return cls(
             input_tokens=input_tokens,
             input_tokens_details=PromptTokensDetails(
@@ -611,6 +613,9 @@ class AnthropicUsage(BaseModel):
     def from_metrics(
         cls, metrics: Any, prompt_tokens: int, output_tokens: int
     ) -> "AnthropicUsage":
+        # Per spec, `input_tokens` excludes the cached portion, which is
+        # reported via `cache_read_input_tokens`. We don't currently distinguish
+        # cache creation from reads, so `cache_creation_input_tokens` stays 0.
         cached_tokens = max(0, int(metrics.cached_tokens))
         return cls(
             input_tokens=max(0, int(prompt_tokens) - cached_tokens),
