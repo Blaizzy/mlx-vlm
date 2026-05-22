@@ -1094,6 +1094,7 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
                 "model": "demo",
                 "messages": [{"role": "user", "content": "Hello"}],
                 "stream": True,
+                "stream_options": {"include_usage": True},
             },
         )
 

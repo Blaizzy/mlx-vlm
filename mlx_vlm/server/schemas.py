@@ -214,7 +214,7 @@ class OpenAIUsage(BaseModel):
 
 
 class GenerationTimings(BaseModel):
-    """Per-request timing breakdown. Durations are in milliseconds."""
+    """Per-request timing breakdown."""
 
     prompt_n: int
     cache_n: int
@@ -228,13 +228,11 @@ class GenerationTimings(BaseModel):
     peak_memory: float = 0.0
 
     @staticmethod
-    def _derive_gen_tps(
-        token_times: List[float], output_tokens: int
-    ) -> Optional[float]:
-        if output_tokens <= 0 or len(token_times) < 2:
+    def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
+        if len(token_times) < 2:
             return None
         elapsed = token_times[-1] - token_times[0]
-        return output_tokens / elapsed if elapsed > 0 else None
+        return (len(token_times) - 1) / elapsed if elapsed > 0 else None
 
     @classmethod
     def from_metrics(
@@ -244,7 +242,7 @@ class GenerationTimings(BaseModel):
         output_tokens: int,
     ) -> "GenerationTimings":
         generation_tps = metrics.generation_tps or cls._derive_gen_tps(
-            metrics.token_times, output_tokens
+            metrics.token_times
         )
         cached_tokens = metrics.cached_tokens
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
@@ -519,8 +517,13 @@ class UsageStats(BaseModel):
         )
 
 
+class StreamOptions(BaseModel):
+    include_usage: bool = False
+
+
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    stream_options: Optional[StreamOptions] = None
 
 
 class TopLogprob(BaseModel):
