@@ -126,25 +126,21 @@ def _default_finish_reason(output_tokens: int, max_tokens: int) -> str:
 def _final_chat_chunk(
     request_id: str,
     model: str,
-    finish_reason: Optional[str],
+    finish_reason: str,
     prompt_tokens: int,
     output_tokens: int,
     max_tokens: int,
-) -> Tuple[ChatStreamChunk, str]:
-    finish_reason = finish_reason or _default_finish_reason(output_tokens, max_tokens)
-    return (
-        ChatStreamChunk(
-            id=request_id,
-            created=int(time.time()),
-            model=model,
-            choices=[
-                ChatStreamChoice(
-                    finish_reason=finish_reason,
-                    delta=ChatMessage(role="assistant"),
-                )
-            ],
-        ),
-        finish_reason,
+) -> ChatStreamChunk:
+    return ChatStreamChunk(
+        id=request_id,
+        created=int(time.time()),
+        model=model,
+        choices=[
+            ChatStreamChoice(
+                finish_reason=finish_reason,
+                delta=ChatMessage(role="assistant"),
+            )
+        ],
     )
 
 
@@ -1200,7 +1196,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if not terminal_emitted:
-                            chunk_data, finish_reason = _final_chat_chunk(
+                            finish_reason = finish_reason or _default_finish_reason(
+                                output_tokens, gen_args.max_tokens
+                            )
+                            chunk_data = _final_chat_chunk(
                                 request_id,
                                 request.model,
                                 finish_reason,
@@ -1264,7 +1263,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        chunk_data, finish_reason = _final_chat_chunk(
+                        finish_reason = finish_reason or _default_finish_reason(
+                            output_tokens, gen_args.max_tokens
+                        )
+                        chunk_data = _final_chat_chunk(
                             request_id,
                             request.model,
                             finish_reason,
@@ -1422,11 +1424,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token_iter.close()
                         except Exception:
                             pass
-                        return text, pt, gt, fr, metrics, logprobs
+                        return pt, text, gt, fr, metrics, logprobs
 
                     (
-                        full_text,
                         prompt_tokens,
+                        full_text,
                         output_tokens,
                         finish_reason,
                         metrics,

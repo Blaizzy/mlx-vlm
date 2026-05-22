@@ -875,14 +875,14 @@ async def anthropic_messages_endpoint(http_request: Request):
                         token_iter.close()
                     except Exception:
                         pass
-                    return ctx.prompt_tokens, text, ot, metrics, fr
+                    return ctx.prompt_tokens, text, ot, fr, metrics
 
                 (
                     prompt_tokens,
                     full_text,
                     output_tokens,
-                    metrics,
                     finish_reason,
+                    metrics,
                 ) = await asyncio.to_thread(_blocking_generate)
             else:
                 result = generate(
