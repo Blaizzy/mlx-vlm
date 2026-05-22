@@ -118,18 +118,10 @@ def _decode_input_audio_data(input_audio: InputAudio):
         return data
 
 
-def _default_finish_reason(output_tokens: int, max_tokens: int) -> str:
-    """Defensive fallback when the backend yields no terminal finish_reason."""
-    return "length" if output_tokens >= max_tokens else "stop"
-
-
 def _final_chat_chunk(
     request_id: str,
     model: str,
     finish_reason: str,
-    prompt_tokens: int,
-    output_tokens: int,
-    max_tokens: int,
 ) -> ChatStreamChunk:
     return ChatStreamChunk(
         id=request_id,
@@ -642,9 +634,7 @@ async def responses_endpoint(request: Request):
                     finish_reason = (
                         "tool_calls"
                         if output_finish_reason == "tool_calls"
-                        else finish_reason
-                    ) or _default_finish_reason(
-                        usage_stats["output_tokens"], gen_args.max_tokens
+                        else finish_reason or "stop"
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
@@ -1196,16 +1186,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if not terminal_emitted:
-                            finish_reason = finish_reason or _default_finish_reason(
-                                output_tokens, gen_args.max_tokens
-                            )
+                            finish_reason = finish_reason or "stop"
                             chunk_data = _final_chat_chunk(
                                 request_id,
                                 request.model,
                                 finish_reason,
-                                ctx.prompt_tokens,
-                                output_tokens,
-                                gen_args.max_tokens,
                             )
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
@@ -1263,16 +1248,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
-                        finish_reason = finish_reason or _default_finish_reason(
-                            output_tokens, gen_args.max_tokens
-                        )
+                        finish_reason = finish_reason or "stop"
                         chunk_data = _final_chat_chunk(
                             request_id,
                             request.model,
                             finish_reason,
-                            stream_prompt_tokens,
-                            output_tokens,
-                            gen_args.max_tokens,
                         )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
