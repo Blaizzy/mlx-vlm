@@ -1,8 +1,11 @@
 import os
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
+
+if TYPE_CHECKING:
+    from .generation import GenerationMetrics
 
 from ..generate import (
     DEFAULT_MAX_TOKENS,
@@ -196,7 +199,7 @@ class OpenAIUsage(BaseModel):
 
     @classmethod
     def from_metrics(
-        cls, metrics: Any, input_tokens: int, output_tokens: int
+        cls, metrics: "GenerationMetrics", input_tokens: int, output_tokens: int
     ) -> "OpenAIUsage":
         # Per spec, `input_tokens` is the total prompt count; cached portion is
         # reported separately in `input_tokens_details.cached_tokens`.
@@ -236,7 +239,7 @@ class GenerationTimings(BaseModel):
     @classmethod
     def from_metrics(
         cls,
-        metrics: Any,
+        metrics: "GenerationMetrics",
         prompt_tokens: int,
         output_tokens: int,
     ) -> "GenerationTimings":
@@ -504,7 +507,7 @@ class UsageStats(BaseModel):
 
     @classmethod
     def from_metrics(
-        cls, metrics: Any, prompt_tokens: int, completion_tokens: int
+        cls, metrics: "GenerationMetrics", prompt_tokens: int, completion_tokens: int
     ) -> "UsageStats":
         return cls(
             prompt_tokens=prompt_tokens,
@@ -616,7 +619,7 @@ class AnthropicUsage(BaseModel):
 
     @classmethod
     def from_metrics(
-        cls, metrics: Any, prompt_tokens: int, output_tokens: int
+        cls, metrics: "GenerationMetrics", prompt_tokens: int, output_tokens: int
     ) -> "AnthropicUsage":
         # Per spec, `input_tokens` excludes the cached portion, which is
         # reported via `cache_read_input_tokens`. We don't currently distinguish
