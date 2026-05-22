@@ -32,15 +32,13 @@ from .responses_state import (
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
-)
-from .responses_state import _sse_event as _response_sse_event
-from .responses_state import (
     _store_response,
     process_tool_calls,
     response_store,
     response_store_lock,
     suppress_tool_call_content,
 )
+from .responses_state import _sse_event as _response_sse_event
 from .runtime import runtime
 from .schemas import (
     ChatChoice,
@@ -1157,19 +1155,26 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         logprobs=chunk_logprobs,
                                     )
                                 ]
+                                # Per spec, `usage`/`timings` only appear on the
+                                # final chunk.
+                                is_final = bool(token.finish_reason)
                                 chunk_data = ChatStreamChunk(
                                     id=request_id,
                                     created=int(time.time()),
                                     model=request.model,
-                                    usage=UsageStats.from_metrics(
-                                        metrics, ctx.prompt_tokens, output_tokens
+                                    usage=(
+                                        UsageStats.from_metrics(
+                                            metrics, ctx.prompt_tokens, output_tokens
+                                        )
+                                        if is_final
+                                        else None
                                     ),
                                     choices=choices,
                                     timings=(
                                         GenerationTimings.from_metrics(
                                             metrics, ctx.prompt_tokens, output_tokens
                                         )
-                                        if token.finish_reason
+                                        if is_final
                                         else None
                                     ),
                                 )
@@ -1254,15 +1259,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     id=request_id,
                                     created=int(time.time()),
                                     model=request.model,
-                                    usage={
-                                        "prompt_tokens": chunk.prompt_tokens,
-                                        "completion_tokens": chunk.generation_tokens,
-                                        "total_tokens": chunk.prompt_tokens
-                                        + chunk.generation_tokens,
-                                    },
                                     choices=choices,
                                 )
- 
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
@@ -1276,28 +1274,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             gen_args.max_tokens,
                         )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
-
-                        finish_reason = (
-                            "length" if output_tokens >= gen_args.max_tokens else "stop"
-                        )
-                        final_chunk = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=request.model,
-                            usage=UsageStats.from_metrics(
-                                metrics, stream_prompt_tokens, output_tokens
-                            ),
-                            choices=[
-                                ChatStreamChoice(
-                                    finish_reason=finish_reason,
-                                    delta=ChatMessage(role="assistant"),
-                                )
-                            ],
-                            timings=GenerationTimings.from_metrics(
-                                metrics, stream_prompt_tokens, output_tokens
-                            ),
-                        )
-                        yield f"data: {final_chunk.model_dump_json()}\n\n"
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
