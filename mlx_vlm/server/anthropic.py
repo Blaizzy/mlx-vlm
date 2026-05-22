@@ -501,6 +501,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 accumulated = ""
                 in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
+                message_started = False
 
                 def close_open_block():
                     nonlocal open_block_type, block_index
@@ -535,6 +536,28 @@ async def anthropic_messages_endpoint(http_request: Request):
                             "type": "content_block_start",
                             "index": block_index,
                             "content_block": content_block,
+                        },
+                    )
+
+                def start_message_event():
+                    nonlocal message_started
+                    if message_started:
+                        return ""
+                    message_started = True
+                    start_message = AnthropicMessageResponse(
+                        id=message_id,
+                        content=[],
+                        model=request.model,
+                        stop_reason=None,
+                        usage=AnthropicUsage.from_metrics(
+                            metrics, prompt_tokens, output_tokens
+                        ),
+                    )
+                    return _sse_event(
+                        "message_start",
+                        {
+                            "type": "message_start",
+                            "message": start_message.model_dump(),
                         },
                     )
 
@@ -575,26 +598,6 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                         token_source = "generate"
 
-                    start_message = AnthropicMessageResponse(
-                        id=message_id,
-                        content=[],
-                        model=request.model,
-                        stop_reason=None,
-                        usage={
-                            "input_tokens": prompt_tokens,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0,
-                            "output_tokens": 0,
-                        },
-                    )
-                    yield _sse_event(
-                        "message_start",
-                        {
-                            "type": "message_start",
-                            "message": start_message.model_dump(),
-                        },
-                    )
-
                     while True:
                         token = await asyncio.to_thread(_next_token)
                         if token is None:
@@ -615,6 +618,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
+                        yield start_message_event()
 
                         delta_reasoning = None
                         delta_content = None
@@ -687,6 +691,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
+                    yield start_message_event()
                     yield close_open_block()
 
                     parsed_tool_calls = None
@@ -754,9 +759,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                                 "stop_reason": anth_stop_reason,
                                 "stop_sequence": stop_sequence,
                             },
-                            "usage": AnthropicUsage.from_metrics(
-                                metrics, prompt_tokens, output_tokens
-                            ).model_dump(),
+                            "usage": {"output_tokens": output_tokens},
                         },
                     )
                     yield _sse_event("message_stop", {"type": "message_stop"})
