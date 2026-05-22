@@ -5687,6 +5687,53 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
         )
 
 
+class TestMiniCPMV4_6(unittest.TestCase):
+    @staticmethod
+    def _tiny_text_config():
+        from mlx_vlm.models import minicpmv4_6
+
+        return minicpmv4_6.TextConfig(
+            model_type="qwen3_5_text",
+            hidden_size=16,
+            intermediate_size=32,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=256,
+        )
+
+    def test_minicpmv4_6_language_uses_text_only_rope(self):
+        from mlx_vlm.models import minicpmv4_6
+
+        model_config = SimpleNamespace(vision_config=SimpleNamespace())
+        lm = minicpmv4_6.LanguageModel(self._tiny_text_config(), model_config)
+
+        input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        position_ids, rope_deltas = lm.get_rope_index(input_ids)
+
+        self.assertEqual(position_ids.shape, (3, 1, input_ids.shape[1]))
+        self.assertEqual(rope_deltas.tolist(), [[0]])
+
+    def test_minicpmv4_6_language_rejects_qwen_vl_grid_rope(self):
+        from mlx_vlm.models import minicpmv4_6
+
+        model_config = SimpleNamespace(vision_config=SimpleNamespace())
+        lm = minicpmv4_6.LanguageModel(self._tiny_text_config(), model_config)
+
+        input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        with self.assertRaisesRegex(ValueError, "does not support Qwen3.5-VL"):
+            lm.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
+
+
 class TestMiniCPMO(unittest.TestCase):
     @staticmethod
     def _tiny_config():
