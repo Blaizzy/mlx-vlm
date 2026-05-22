@@ -14,6 +14,7 @@ import mlx_vlm.server as server
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
+from mlx_vlm.generate import GenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -412,7 +413,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=8,
         generation_tokens=4,
@@ -464,8 +465,8 @@ def test_responses_previous_response_id_replays_stored_items(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    first = SimpleNamespace(text="First answer", prompt_tokens=3, generation_tokens=2)
-    second = SimpleNamespace(text="Second answer", prompt_tokens=7, generation_tokens=2)
+    first = GenerationResult(text="First answer", prompt_tokens=3, generation_tokens=2)
+    second = GenerationResult(text="Second answer", prompt_tokens=7, generation_tokens=2)
 
     with (
         patch.object(
@@ -511,7 +512,7 @@ def test_responses_endpoint_returns_function_call_items(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
         prompt_tokens=8,
         generation_tokens=4,
@@ -567,7 +568,7 @@ def test_responses_endpoint_returns_native_shell_call_items(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text='<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
         prompt_tokens=8,
         generation_tokens=4,
@@ -609,12 +610,12 @@ def test_responses_streaming_emits_native_tool_call_items(client):
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
     chunks = [
-        SimpleNamespace(
+        GenerationResult(
             text='<tool_call>{"name":"shell","arguments":{"command":"pwd"}}</tool_call>',
             prompt_tokens=8,
             generation_tokens=4,
-            prompt_tps=None,
-            generation_tps=None,
+            prompt_tps=0.0,
+            generation_tps=0.0,
             peak_memory=0.0,
         )
     ]
@@ -763,7 +764,7 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=8,
         generation_tokens=4,
@@ -874,7 +875,7 @@ def test_chat_completions_decodes_input_audio_base64(client, audio_data_factory)
 
     def fake_generate(prompt, images=None, audio=None, **kwargs):
         captured["audio"] = audio
-        return SimpleNamespace(
+        return GenerationResult(
             text="audio ok",
             prompt_tokens=8,
             generation_tokens=4,
@@ -929,7 +930,7 @@ def test_chat_completions_preserves_input_audio_references(client):
 
     def fake_generate(prompt, images=None, audio=None, **kwargs):
         captured["audio"] = audio
-        return SimpleNamespace(
+        return GenerationResult(
             text="audio ok",
             prompt_tokens=8,
             generation_tokens=4,
@@ -1014,7 +1015,7 @@ def test_chat_completions_returns_timings(client, monkeypatch):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=10,
         generation_tokens=4,
@@ -1116,7 +1117,7 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=8,
         generation_tokens=4,
@@ -1165,7 +1166,7 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=8,
         generation_tokens=4,
@@ -1232,7 +1233,7 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=5,
         generation_tokens=2,
@@ -1306,7 +1307,7 @@ def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=10,
         generation_tokens=4,
@@ -1346,7 +1347,7 @@ def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkey
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text="done",
         prompt_tokens=5,
         generation_tokens=2,
@@ -1439,7 +1440,7 @@ def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    result = SimpleNamespace(
+    result = GenerationResult(
         text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
         prompt_tokens=7,
         generation_tokens=6,
@@ -1688,7 +1689,7 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
         server,
         "generate",
         MagicMock(
-            return_value=SimpleNamespace(
+            return_value=GenerationResult(
                 text="Hello there",
                 prompt_tokens=12,
                 generation_tokens=5,
