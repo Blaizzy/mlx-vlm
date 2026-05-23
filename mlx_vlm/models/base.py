@@ -462,7 +462,9 @@ def install_auto_processor_patch(target_model_types, processor_cls):
         model_type = str(cfg.get("model_type", "")).lower()
         if model_type in target_model_types:
             kwargs.setdefault("trust_remote_code", True)
-            return processor_cls.from_pretrained(pretrained_model_name_or_path, **kwargs)
+            return processor_cls.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
 
         # Chain to the prior from_pretrained
         return previous_from_pretrained.__func__(

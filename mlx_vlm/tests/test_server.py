@@ -2172,11 +2172,20 @@ class TestResponseGenerator:
         args = server.GenerationArguments()
         kw = args.to_generate_kwargs()
         assert "repetition_penalty" not in kw
-        assert kw["repetition_context_size"] == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        assert (
+            kw["repetition_context_size"]
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
         assert "presence_penalty" not in kw
-        assert kw["presence_context_size"] == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        assert (
+            kw["presence_context_size"]
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
         assert "frequency_penalty" not in kw
-        assert kw["frequency_context_size"] == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        assert (
+            kw["frequency_context_size"]
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
         assert "logit_bias" not in kw
         assert "thinking_budget" not in kw
 
@@ -2224,9 +2233,7 @@ class TestResponseGenerator:
 
         processors = gen._make_logits_processors(args)
 
-        assert calls == [
-            ({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)
-        ]
+        assert calls == [({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)]
         assert processors == ["repetition-processor", custom_processor]
 
     def test_build_gen_args_from_openai_request(self):
