@@ -14,6 +14,11 @@ from mlx_lm.models.cache import (
     _BaseCache,
 )
 
+try:
+    from ..triattention import TriAttentionKVCache
+except ImportError:
+    TriAttentionKVCache = None
+
 
 class BufferedRotatingKVCache(RotatingKVCache):
     """Temporal sliding-window cache with rollback slack for speculative blocks."""
