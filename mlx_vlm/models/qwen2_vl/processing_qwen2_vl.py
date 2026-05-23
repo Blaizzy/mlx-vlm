@@ -13,6 +13,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import load_chat_template, to_mlx
+from ..qwen3_vl.processing_qwen3_vl import _pop_image_processor_kwargs
 
 
 class Qwen2VLProcessor(ProcessorMixin):
@@ -74,9 +75,10 @@ class Qwen2VLProcessor(ProcessorMixin):
     ) -> BatchFeature:
         image_inputs = {}
         videos_inputs = {}
+        image_kwargs = _pop_image_processor_kwargs(kwargs)
 
         if images is not None:
-            image_inputs = self.image_processor(images=images)
+            image_inputs = self.image_processor(images=images, **image_kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
 
         if videos is not None:
