@@ -132,6 +132,42 @@ def parse_arguments():
         default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
     )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Penalty factor for previously generated tokens.",
+    )
+    parser.add_argument(
+        "--repetition-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent generated tokens used for repetition penalty.",
+    )
+    parser.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=None,
+        help="Additive penalty for tokens that already appeared.",
+    )
+    parser.add_argument(
+        "--presence-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent generated tokens used for presence penalty.",
+    )
+    parser.add_argument(
+        "--frequency-penalty",
+        type=float,
+        default=None,
+        help="Additive penalty scaled by token frequency.",
+    )
+    parser.add_argument(
+        "--frequency-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent generated tokens used for frequency penalty.",
+    )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument(
         "--verbose",
@@ -471,6 +507,10 @@ def generate_step(
     temperature: float = DEFAULT_TEMPERATURE,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    presence_penalty: Optional[float] = None,
+    presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    frequency_penalty: Optional[float] = None,
+    frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
@@ -505,6 +545,14 @@ def generate_step(
           tokens.
         repetition_context_size (int, optional): The number of tokens to
           consider for repetition penalty.
+        presence_penalty (float, optional): Additive penalty for tokens that
+          already appeared in recent generated context.
+        presence_context_size (int, optional): The number of tokens to
+          consider for presence penalty.
+        frequency_penalty (float, optional): Additive penalty scaled by token
+          frequency in recent generated context.
+        frequency_context_size (int, optional): The number of tokens to
+          consider for frequency penalty.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): Minimum probability threshold relative to the
@@ -558,7 +606,13 @@ def generate_step(
         )
 
     processors = make_logits_processors(
-        logit_bias, repetition_penalty, repetition_context_size
+        logit_bias,
+        repetition_penalty,
+        repetition_context_size,
+        presence_penalty,
+        presence_context_size,
+        frequency_penalty,
+        frequency_context_size,
     )
     if logits_processors is not None:
         processors.extend(logits_processors)
@@ -3422,6 +3476,12 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "repetition_penalty": args.repetition_penalty,
+                "repetition_context_size": args.repetition_context_size,
+                "presence_penalty": args.presence_penalty,
+                "presence_context_size": args.presence_context_size,
+                "frequency_penalty": args.frequency_penalty,
+                "frequency_context_size": args.frequency_context_size,
                 "vision_cache": vision_cache,
                 **kwargs,
             }
@@ -3453,6 +3513,12 @@ def main():
             "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
+            "repetition_penalty": args.repetition_penalty,
+            "repetition_context_size": args.repetition_context_size,
+            "presence_penalty": args.presence_penalty,
+            "presence_context_size": args.presence_context_size,
+            "frequency_penalty": args.frequency_penalty,
+            "frequency_context_size": args.frequency_context_size,
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,

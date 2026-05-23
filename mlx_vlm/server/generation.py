@@ -428,6 +428,11 @@ class GenerationArguments:
     min_p: float = 0.0
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    presence_penalty: Optional[float] = None
+    presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    frequency_penalty: Optional[float] = None
+    frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
@@ -450,6 +455,16 @@ class GenerationArguments:
         }
         if self.repetition_penalty is not None:
             kw["repetition_penalty"] = self.repetition_penalty
+        if self.repetition_context_size is not None:
+            kw["repetition_context_size"] = self.repetition_context_size
+        if self.presence_penalty is not None:
+            kw["presence_penalty"] = self.presence_penalty
+        if self.presence_context_size is not None:
+            kw["presence_context_size"] = self.presence_context_size
+        if self.frequency_penalty is not None:
+            kw["frequency_penalty"] = self.frequency_penalty
+        if self.frequency_context_size is not None:
+            kw["frequency_context_size"] = self.frequency_context_size
         if self.logit_bias is not None:
             kw["logit_bias"] = self.logit_bias
         if self.thinking_budget is not None:
@@ -710,7 +725,11 @@ class ResponseGenerator:
         processors = make_logits_processors(
             args.logit_bias,
             args.repetition_penalty,
-            DEFAULT_REPETITION_CONTEXT_SIZE,
+            args.repetition_context_size,
+            args.presence_penalty,
+            args.presence_context_size,
+            args.frequency_penalty,
+            args.frequency_context_size,
         )
         if args.logits_processors is not None:
             processors.extend(args.logits_processors)

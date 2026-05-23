@@ -1471,6 +1471,32 @@ def _assert_patch_intercepts(test_case, model_type, module_path, cls_name):
             )
 
 
+class TestAutoProcessorPatchErrors(unittest.TestCase):
+    def test_target_processor_errors_do_not_fall_back_to_tokenizer(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.base import install_auto_processor_patch
+
+        class BrokenProcessor:
+            @classmethod
+            def from_pretrained(cls, *args, **kwargs):
+                raise RuntimeError("custom processor failed")
+
+        install_auto_processor_patch("unit_test_broken_processor", BrokenProcessor)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "unit_test_broken_processor"})
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "custom processor failed"):
+                AutoProcessor.from_pretrained(tmpdir)
+
+
 class TestInternVLChatPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(

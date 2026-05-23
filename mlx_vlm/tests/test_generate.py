@@ -1227,6 +1227,11 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
             repetition_penalty=1.15,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={3: -0.75},
         )
 
@@ -1238,7 +1243,9 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
         )
-        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+        mock_make_logits_processors.assert_called_once_with(
+            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
+        )
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -1272,6 +1279,12 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
         chat=False,
         verbose=False,
         eos_tokens=None,

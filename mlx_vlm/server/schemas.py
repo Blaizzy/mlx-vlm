@@ -143,6 +143,17 @@ class OpenAIRequest(FlexibleBaseModel):
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = Field(
         None,
@@ -364,6 +375,17 @@ class VLMRequest(FlexibleBaseModel):
     min_p: float = Field(0.0, description="Min-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = Field(
         None,
@@ -511,6 +533,17 @@ class AnthropicRequest(FlexibleBaseModel):
     output_config: Optional[Any] = None
     adapter_path: Optional[str] = None
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
