@@ -435,6 +435,34 @@ def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
     assert bool(mx.array_equal(ref, out).item())
 
 
+def test_qwen_target_verify_quantized_linear_matches_singleton_path():
+    mx.random.seed(15)
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+
+    ref = qwen_language._target_verify_timewise(linear, x)
+    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
+    mx.random.seed(16)
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+
+    x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
+    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
 def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
     mx.random.seed(10)
     linear = nn.Linear(256, 8, bias=False)
@@ -1069,6 +1097,39 @@ def test_mtp_verify_target_uses_model_logits_hook():
         speculative_verify_logits=verify_logits,
         speculative_logits_from_hidden=lambda _: (_ for _ in ()).throw(
             AssertionError("deferred logits should not be used")
+        ),
+    )
+
+    result = _mtp_verify_target(
+        lm,
+        verify_input,
+        prompt_cache=["cache"],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert calls[0][0] is verify_input
+    assert calls[0][1] == ["cache"]
+    assert result.hidden is hidden
+    assert result.shared_kv_states == {"full": ("k", "v")}
+    assert result.gdn_states == ["gdn"]
+    assert result.target_tokens is target_tokens
+
+
+def test_mtp_verify_target_prefers_argmax_hidden_hook_for_greedy_tokens():
+    verify_input = mx.array([[7, 8]], dtype=mx.int32)
+    hidden = mx.array([[[1.0, 0.0], [0.0, 1.0]]], dtype=mx.float32)
+    target_tokens = mx.array([[3, 4]], dtype=mx.int32)
+    calls = []
+
+    def verify_hidden(inputs, cache):
+        calls.append((inputs, cache))
+        return hidden, {"full": ("k", "v")}, ["gdn"]
+
+    lm = SimpleNamespace(
+        speculative_verify_hidden=verify_hidden,
+        speculative_argmax_from_hidden=lambda h: target_tokens,
+        speculative_verify_logits=lambda *args: (_ for _ in ()).throw(
+            AssertionError("full logits should not be used for greedy argmax")
         ),
     )
 

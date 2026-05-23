@@ -142,6 +142,15 @@ def _mtp_verify_target(
     sample_target_tokens: bool = True,
 ) -> _MTPVerifyResult:
     if sample_target_tokens:
+        argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
+        if callable(argmax_from_hidden):
+            result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
+            if result is not None:
+                target_tokens = argmax_from_hidden(result.hidden)
+                if target_tokens is not None:
+                    result.target_tokens = target_tokens
+                    return result
+
         result = _mtp_verify_with_model_method(lm, verify_input, prompt_cache, sampler)
         if result is not None:
             return result
@@ -176,6 +185,8 @@ def _speculative_walk_deferred_greedy(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budget: int,
+    row_id: int = 0,
+    base_position: Optional[int] = None,
 ) -> Tuple[int, List[int]]:
     """Greedy MTP walk that projects target logits only until rejection."""
     n_draft = draft_tokens.shape[1]
@@ -191,7 +202,15 @@ def _speculative_walk_deferred_greedy(
             if logits.ndim == 3 and logits.shape[1] == 1:
                 logits = logits[:, 0, :]
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            target_token = sampler(logprobs)
+            sample_target = getattr(sampler, "sample_target", None)
+            if callable(sample_target) and base_position is not None:
+                target_token = sample_target(
+                    logprobs,
+                    row_ids=[row_id],
+                    positions=[int(base_position) + pos],
+                )
+            else:
+                target_token = sampler(logprobs)
         mx.eval(target_token)
         token = int(target_token.reshape(-1).item())
 
@@ -347,6 +366,8 @@ def _mtp_acceptance_walk(
     draft_tokens: mx.array,
     sampler: Callable[[mx.array], mx.array],
     budget: int,
+    row_id: int = 0,
+    base_position: Optional[int] = None,
 ) -> Tuple[int, List[int]]:
     if verify.target_tokens is not None:
         mx.async_eval(verify.target_tokens, verify.hidden)
@@ -359,6 +380,8 @@ def _mtp_acceptance_walk(
         draft_tokens,
         sampler,
         budget,
+        row_id=row_id,
+        base_position=base_position,
     )
 
 
@@ -557,8 +580,12 @@ def _mtp_rounds(
             draft_tokens,
             sampler,
             max_tokens - emitted,
+            row_id=0,
+            base_position=emitted,
         )
-        sampler_rng.target_sampled(sync_draft=True)
+        sampler_rng.target_sampled(
+            sync_draft=not _sampler_supports_positioned_target(sampler)
+        )
         _record_speculative_round(draft_model, accepted, bs - 1)
 
         for tok in new_tokens:

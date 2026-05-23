@@ -22,6 +22,7 @@ from transformers import PreTrainedTokenizer
 from . import apc as _apc
 from .models import cache
 from .prompt_utils import apply_chat_template
+from .sample_utils import top_p_sampling
 from .speculative.utils import format_speculative_stats, run_speculative_rounds
 from .tokenizer_utils import make_streaming_detokenizer
 from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
@@ -55,6 +56,71 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+
+
+def _position_seed(seed: int, row_id: int, position: int) -> int:
+    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
+    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
+    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    return int(x & 0xFFFFFFFF)
+
+
+def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
+    return mx.stack(
+        [
+            mx.random.key(_position_seed(seed, row, pos))
+            for row, pos in zip(row_ids, positions)
+        ]
+    )
+
+
+class _PositionedTargetSampler:
+    """Sampler with stateless target draws keyed by generated-token position."""
+
+    def __init__(self, *, temperature: float, top_p: float, seed: int):
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = int(seed)
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        if self.top_p > 0 and self.top_p < 1.0:
+            return top_p_sampling(logprobs, self.top_p, self.temperature)
+        return mx.random.categorical(logprobs * (1 / self.temperature))
+
+    def sample_target(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
+            raise ValueError("row_ids and positions must match logprobs batch size.")
+        keys = _position_keys(self.seed, row_ids, positions)
+        if self.top_p > 0 and self.top_p < 1.0:
+            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
+
+    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        if logprobs.dtype == mx.bfloat16:
+            logprobs = logprobs.astype(mx.float32)
+        probs = mx.softmax(logprobs / self.temperature, axis=-1)
+        sorted_indices = mx.argsort(probs, axis=-1)
+        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        top_probs = mx.where(
+            cumulative_probs > 1 - self.top_p,
+            sorted_probs,
+            mx.zeros_like(sorted_probs),
+        )
+        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
+        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
 
 
 def parse_arguments():
@@ -131,6 +197,12 @@ def parse_arguments():
         type=float,
         default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="Seed for random sampling.",
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument("--verbose", action="store_false", help="Detailed output.")
@@ -463,6 +535,7 @@ def generate_step(
     *,
     max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = DEFAULT_TEMPERATURE,
+    seed: Optional[int] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     top_p: float = DEFAULT_TOP_P,
@@ -495,6 +568,7 @@ def generate_step(
         mask: The attention mask (optional).
         max_tokens (int): Maximum number of tokens to generate.
         temperature (float): The temperature for sampling, if 0 the argmax is used.
+        seed (int, optional): Seed for deterministic target sampling.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
@@ -544,12 +618,24 @@ def generate_step(
 
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
-        sampler = make_sampler(
-            temp=temperature,
-            top_p=top_p,
-            min_p=min_p,
-            top_k=top_k,
-        )
+        if (
+            seed is not None
+            and temperature > 0
+            and min_p == DEFAULT_MIN_P
+            and top_k == DEFAULT_TOP_K
+        ):
+            sampler = _PositionedTargetSampler(
+                temperature=temperature,
+                top_p=top_p,
+                seed=seed,
+            )
+        else:
+            sampler = make_sampler(
+                temp=temperature,
+                top_p=top_p,
+                min_p=min_p,
+                top_k=top_k,
+            )
 
     processors = make_logits_processors(
         logit_bias, repetition_penalty, repetition_context_size
@@ -559,6 +645,7 @@ def generate_step(
 
     y = input_ids
     tokens = mx.array([], dtype=input_ids.dtype)
+    target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
 
@@ -596,7 +683,7 @@ def generate_step(
             lm._rope_deltas = None
 
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs, last_outputs
+        nonlocal tokens, kwargs, last_outputs, target_sample_position
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in kwargs:
@@ -624,7 +711,13 @@ def generate_step(
             quantize_cache_fn(prompt_cache)
 
             logprobs = logits - mx.logsumexp(logits)
-            y = sampler(logprobs)
+            y = _sample_with_positions(
+                sampler,
+                logprobs,
+                row_ids=[0] * int(logprobs.shape[0]),
+                positions=[target_sample_position] * int(logprobs.shape[0]),
+            )
+            target_sample_position += 1
 
             if outputs.cross_attention_states is not None:
                 kwargs = {"cross_attention_states": outputs.cross_attention_states}
@@ -3325,6 +3418,8 @@ def _generate_batch(
 
 def main():
     args = parse_arguments()
+    mx.random.seed(args.seed)
+
     if isinstance(args.image, str):
         args.image = [args.image]
     if isinstance(args.audio, str):
@@ -3426,6 +3521,7 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "seed": args.seed,
                 "vision_cache": vision_cache,
                 **kwargs,
             }
@@ -3456,6 +3552,7 @@ def main():
             "video": args.video,
             "fps": args.fps,
             "temperature": args.temperature,
+            "seed": args.seed,
             "max_tokens": args.max_tokens,
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
