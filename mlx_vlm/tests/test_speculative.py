@@ -847,6 +847,72 @@ def test_speculative_walk_mtp_deferred_greedy_stops_after_first_mismatch():
     assert fake_head.calls == 2
 
 
+def test_mtp_acceptance_walk_samples_positioned_block_once():
+    class FakeEmbed:
+        def __init__(self):
+            self.calls = 0
+
+        def as_linear(self, hidden):
+            self.calls += 1
+            return hidden
+
+    class PositionedSampler:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, logprobs):
+            raise AssertionError("positioned target sampler was not used")
+
+        def sample_target(self, logprobs, *, row_ids, positions):
+            self.calls.append((list(row_ids), list(positions)))
+            return mx.argmax(logprobs, axis=-1)
+
+    fake_head = FakeEmbed()
+    sampler = PositionedSampler()
+    lm = SimpleNamespace(speculative_logits_from_hidden=fake_head.as_linear)
+    target_hidden = mx.array(
+        [
+            [
+                [0, 0, 9, 0],
+                [0, 0, 0, 9],
+                [0, 9, 0, 0],
+                [9, 0, 0, 0],
+            ]
+        ],
+        dtype=mx.float32,
+    )
+    draft_tokens = mx.array([[2, 1, 3]], dtype=mx.int32)
+    verify = mtp_utils._MTPVerifyResult(hidden=target_hidden, shared_kv_states={})
+
+    accepted, new_tokens = mtp_utils._mtp_acceptance_walk(
+        lm,
+        verify,
+        draft_tokens,
+        sampler,
+        budget=4,
+        row_id=5,
+        base_position=7,
+    )
+
+    assert accepted == 1
+    assert new_tokens == [2, 3]
+    assert fake_head.calls == 1
+    assert sampler.calls == [([5, 5, 5, 5], [7, 8, 9, 10])]
+
+
+def test_mtp_draft_kwargs_uses_greedy_for_positioned_sampler():
+    class PositionedSampler:
+        def sample_target(self, logprobs, *, row_ids, positions):
+            return mx.argmax(logprobs, axis=-1)
+
+    draft_model = SimpleNamespace(supports_greedy_draft_argmax=True)
+
+    assert mtp_utils._mtp_draft_kwargs(draft_model, False) == {}
+    assert mtp_utils._mtp_draft_kwargs(draft_model, False, PositionedSampler()) == {
+        "greedy": True
+    }
+
+
 def test_speculative_walk_batch_deferred_greedy_matches_batch_walk():
     class FakeEmbed:
         def __init__(self):
