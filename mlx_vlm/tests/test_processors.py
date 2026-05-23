@@ -711,6 +711,43 @@ class TestQwen2_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
 
+    def test_forwards_image_pixel_kwargs_to_image_processor(self):
+        p = self._make_processor()
+        seen = {}
+
+        class ImageProcessor:
+            model_input_names = ["pixel_values"]
+            merge_size = 2
+
+            def __call__(self, images=None, **kwargs):
+                seen.update(kwargs)
+                return {
+                    "pixel_values": np.zeros((1, 3, 224, 224), dtype=np.float32),
+                    "image_grid_thw": np.array([[1, 16, 16]], dtype=np.int64),
+                }
+
+        class Tokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(self, text, **kwargs):
+                if "max_pixels" in kwargs:
+                    raise AssertionError("max_pixels leaked into tokenizer kwargs")
+                return {
+                    "input_ids": [list(range(10)) for _ in text],
+                    "attention_mask": [[1] * 10 for _ in text],
+                }
+
+        p.image_processor = ImageProcessor()
+        p.tokenizer = Tokenizer()
+
+        p(
+            text=["<|image_pad|> Describe"],
+            images=[_make_image()],
+            max_pixels=1280 * 28 * 28,
+        )
+
+        self.assertEqual(seen["max_pixels"], 1280 * 28 * 28)
+
 
 class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -735,6 +772,33 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
 
     def _image_call_args(self):
         return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
+
+    def test_image_processor_honors_per_call_max_pixels(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        image = np.zeros((3, 1200, 1200), dtype=np.uint8)
+        processor = Qwen3VLImageProcessor(
+            patch_size=14,
+            merge_size=2,
+            max_pixels=12845056,
+        )
+
+        default_grid = processor(images=[image])["image_grid_thw"][0]
+        capped_grid = processor(
+            images=[image],
+            max_pixels=1280 * 28 * 28,
+        )[
+            "image_grid_thw"
+        ][0]
+
+        self.assertGreater(
+            default_grid[1] * default_grid[2],
+            capped_grid[1] * capped_grid[2],
+        )
+        self.assertLessEqual(
+            capped_grid[1] * 14 * capped_grid[2] * 14,
+            1280 * 28 * 28,
+        )
 
 
 class TestQwen3OmniMoeProcessor(_ProcessorTestBase, unittest.TestCase):
