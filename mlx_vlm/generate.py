@@ -1522,8 +1522,33 @@ def _extend_cache(cache_a, cache_b):
         return cache_b
     if not cache_b:
         return cache_a
-    for ca, cb in zip(cache_a, cache_b):
-        ca.extend(cb)
+
+    def kv_rows(c):
+        if isinstance(c, cache.KVCache):
+            return [c]
+        offset = getattr(c, "offset", None)
+        if (
+            hasattr(c, "extract")
+            and isinstance(offset, mx.array)
+            and offset.ndim > 0
+        ):
+            return [c.extract(i) for i in range(int(offset.shape[0]))]
+        return None
+
+    for i, (ca, cb) in enumerate(zip(cache_a, cache_b)):
+        if (
+            hasattr(ca, "extend")
+            and not isinstance(ca, cache.KVCache)
+            and not isinstance(cb, cache.KVCache)
+        ):
+            ca.extend(cb)
+            continue
+        ca_rows = kv_rows(ca)
+        cb_rows = kv_rows(cb)
+        if ca_rows is not None and cb_rows is not None:
+            cache_a[i] = cache.BatchKVCache.merge(ca_rows + cb_rows)
+            continue
+        raise ValueError(f"{type(ca)} does not yet support batch extension")
     return cache_a
 
 
@@ -2076,6 +2101,13 @@ class PromptProcessingBatch:
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
+        elif (
+            len(input_ids) == 1
+            and right_pad_per_row is None
+            and kv_bits is None
+            and hasattr(model, "make_cache")
+        ):
+            self.prompt_cache = cache.make_prompt_cache(model)
         else:
             self.prompt_cache = _make_cache(
                 model,

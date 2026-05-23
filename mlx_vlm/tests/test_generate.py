@@ -21,6 +21,7 @@ from mlx_vlm.generate import (
     _prime_cached_prefix_rope_state,
     normalize_resize_shape,
 )
+from mlx_vlm.models import cache as cache_module
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -1415,6 +1416,51 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     assert "_apc_tenant" not in prompt_kwargs
     assert prompt_kwargs["per_layer_inputs"][0, :, 0, 0].tolist() == [0, 0, 1, 1]
     assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
+
+
+def test_singleton_prompt_batch_uses_singleton_kv_cache():
+    model = SimpleNamespace(make_cache=lambda: [cache_module.KVCache()])
+
+    batch = generate_module.PromptProcessingBatch(
+        model=model,
+        uids=[1],
+        input_ids=[[1, 2, 3]],
+        max_tokens=[4],
+        inputs_embeds=mx.ones((1, 3, 2)),
+        prompt_kwargs={},
+    )
+
+    assert isinstance(batch.prompt_cache[0], cache_module.KVCache)
+    assert not isinstance(batch.prompt_cache[0], cache_module.BatchKVCache)
+
+
+def test_extend_cache_promotes_singleton_kv_cache_to_batch():
+    left = cache_module.KVCache()
+    right = cache_module.KVCache()
+    left.update_and_fetch(mx.ones((1, 1, 3, 2)), mx.ones((1, 1, 3, 2)))
+    right.update_and_fetch(mx.ones((1, 1, 2, 2)), mx.ones((1, 1, 2, 2)))
+
+    merged = generate_module._extend_cache([left], [right])
+
+    assert isinstance(merged[0], cache_module.BatchKVCache)
+    assert merged[0].left_padding.tolist() == [0, 1]
+    assert merged[0].offset.tolist() == [3, 2]
+
+
+def test_extend_cache_promotes_batch_and_singleton_kv_cache_to_batch():
+    left_a = cache_module.KVCache()
+    left_b = cache_module.KVCache()
+    right = cache_module.KVCache()
+    left_a.update_and_fetch(mx.ones((1, 1, 3, 2)), mx.ones((1, 1, 3, 2)))
+    left_b.update_and_fetch(mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2)))
+    right.update_and_fetch(mx.ones((1, 1, 2, 2)), mx.ones((1, 1, 2, 2)))
+    left = cache_module.BatchKVCache.merge([left_a, left_b])
+
+    merged = generate_module._extend_cache([left], [right])
+
+    assert isinstance(merged[0], cache_module.BatchKVCache)
+    assert merged[0].left_padding.tolist() == [0, 2, 1]
+    assert merged[0].offset.tolist() == [3, 1, 2]
 
 
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
