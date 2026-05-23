@@ -449,6 +449,20 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
+def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
+    mx.random.seed(17)
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+
+    ref = linear(x)
+    out = qwen_language._target_verify_quantized_linear(linear, x)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     mx.random.seed(16)
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)

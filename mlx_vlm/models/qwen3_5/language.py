@@ -1851,6 +1851,9 @@ class LanguageModel(nn.Module):
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
+        out = _target_verify_quantized_linear(self.lm_head, hidden)
+        if out is not None:
+            return out
         return self.lm_head(hidden)
 
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
