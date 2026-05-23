@@ -32,13 +32,15 @@ from .responses_state import (
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
+)
+from .responses_state import _sse_event as _response_sse_event
+from .responses_state import (
     _store_response,
     process_tool_calls,
     response_store,
     response_store_lock,
     suppress_tool_call_content,
 )
-from .responses_state import _sse_event as _response_sse_event
 from .runtime import runtime
 from .schemas import (
     ChatChoice,

@@ -466,7 +466,9 @@ def test_responses_previous_response_id_replays_stored_items(client):
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
     first = GenerationResult(text="First answer", prompt_tokens=3, generation_tokens=2)
-    second = GenerationResult(text="Second answer", prompt_tokens=7, generation_tokens=2)
+    second = GenerationResult(
+        text="Second answer", prompt_tokens=7, generation_tokens=2
+    )
 
     with (
         patch.object(
