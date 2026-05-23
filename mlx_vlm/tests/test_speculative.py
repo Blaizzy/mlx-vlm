@@ -263,6 +263,39 @@ def test_qwen_rollback_speculative_cache_uses_intermediate_states():
     ]
 
 
+def test_qwen_gated_delta_accept_states_matches_python_gather():
+    accepted = mx.array([0, 2, 1, 3], dtype=mx.int32)
+    intermediate_states = mx.arange(4 * 4 * 2 * 3 * 5, dtype=mx.float32).reshape(
+        4, 4, 2, 3, 5
+    )
+    conv_input = mx.arange(4 * 7 * 6, dtype=mx.float32).reshape(4, 7, 6)
+    live_state = mx.full((4, 2, 3, 5), -1.0, dtype=mx.float32)
+    live_conv = mx.full((4, 3, 6), -2.0, dtype=mx.float32)
+
+    ref_state, ref_conv = qwen_language.gated_delta_accept_states(
+        intermediate_states,
+        conv_input,
+        live_state,
+        live_conv,
+        accepted,
+        kernel_size=4,
+        use_kernel=False,
+    )
+    out_state, out_conv = qwen_language.gated_delta_accept_states(
+        intermediate_states,
+        conv_input,
+        live_state,
+        live_conv,
+        accepted,
+        kernel_size=4,
+        use_kernel=True,
+    )
+    mx.eval(ref_state, ref_conv, out_state, out_conv)
+
+    assert bool(mx.array_equal(ref_state, out_state).item())
+    assert bool(mx.array_equal(ref_conv, out_conv).item())
+
+
 def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     accepted = mx.array([1, 0], dtype=mx.int32)
     caches = [ArraysCache(size=2)]

@@ -13,6 +13,7 @@ from ..base import (
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
 from .gated_delta import (
+    gated_delta_accept_states,
     gated_delta_state_update,
     gated_delta_update,
     gated_delta_update_with_states,
@@ -1365,47 +1366,95 @@ class LanguageModel(nn.Module):
 
         if all(len(s) > 11 and s[11] is not None for s in gdn_states):
             a0 = int(accepted[0].item()) if not is_batch else None
-            for j, c in enumerate(ssm_caches):
-                (
-                    _q,
-                    _k,
-                    _v,
-                    _a,
-                    _b,
-                    _A_log,
-                    _dt_bias,
-                    _init_state,
-                    _mask,
-                    conv_input,
-                    K,
-                    intermediate_states,
-                    *_,
-                ) = gdn_states[j]
-                if is_batch:
-                    acc_list = accepted.tolist()
-                    state_steps = intermediate_states.shape[1]
-                    states = [
-                        (
-                            intermediate_states[bi, int(acc_list[bi])]
-                            if int(acc_list[bi]) < state_steps
-                            else c[1][bi]
+            if is_batch:
+                intermediate_parts = []
+                conv_input_parts = []
+                live_state_parts = []
+                live_conv_parts = []
+                layer_batch_sizes = []
+                kernel_sizes = []
+
+                for j, c in enumerate(ssm_caches):
+                    (
+                        _q,
+                        _k,
+                        _v,
+                        _a,
+                        _b,
+                        _A_log,
+                        _dt_bias,
+                        _init_state,
+                        _mask,
+                        conv_input,
+                        K,
+                        intermediate_states,
+                        *_,
+                    ) = gdn_states[j]
+                    rows = intermediate_states.shape[0]
+                    layer_batch_sizes.append(rows)
+                    kernel_sizes.append(int(K))
+                    intermediate_parts.append(intermediate_states)
+                    conv_input_parts.append(conv_input)
+
+                    live_state = c[1]
+                    if live_state is None:
+                        live_state = mx.zeros(
+                            (
+                                rows,
+                                intermediate_states.shape[2],
+                                intermediate_states.shape[3],
+                                intermediate_states.shape[4],
+                            ),
+                            dtype=intermediate_states.dtype,
                         )
-                        for bi in range(len(acc_list))
-                    ]
-                    c[1] = mx.stack(states, axis=0)
-                    slices = [
-                        (
-                            conv_input[
-                                bi : bi + 1,
-                                int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
-                            ]
-                            if int(acc_list[bi]) < state_steps
-                            else c[0][bi : bi + 1]
+                    live_state_parts.append(live_state)
+
+                    live_conv = c[0]
+                    if live_conv is None:
+                        live_conv = mx.zeros(
+                            (rows, int(K) - 1, conv_input.shape[-1]),
+                            dtype=conv_input.dtype,
                         )
-                        for bi in range(len(acc_list))
-                    ]
-                    c[0] = mx.concatenate(slices, axis=0)
-                else:
+                    live_conv_parts.append(live_conv)
+
+                if len(set(kernel_sizes)) != 1:
+                    raise ValueError("Qwen GDN layers must share conv kernel size.")
+
+                accepted_bat = mx.concatenate(
+                    [accepted.astype(mx.int32) for _ in ssm_caches], axis=0
+                )
+                state_bat, conv_bat = gated_delta_accept_states(
+                    mx.concatenate(intermediate_parts, axis=0),
+                    mx.concatenate(conv_input_parts, axis=0),
+                    mx.concatenate(live_state_parts, axis=0),
+                    mx.concatenate(live_conv_parts, axis=0),
+                    accepted_bat,
+                    kernel_sizes[0],
+                    use_kernel=True,
+                )
+
+                offset = 0
+                for c, rows in zip(ssm_caches, layer_batch_sizes):
+                    c[1] = state_bat[offset : offset + rows]
+                    c[0] = conv_bat[offset : offset + rows]
+                    offset += rows
+            else:
+                for j, c in enumerate(ssm_caches):
+                    (
+                        _q,
+                        _k,
+                        _v,
+                        _a,
+                        _b,
+                        _A_log,
+                        _dt_bias,
+                        _init_state,
+                        _mask,
+                        conv_input,
+                        K,
+                        intermediate_states,
+                        *_,
+                    ) = gdn_states[j]
                     if a0 < intermediate_states.shape[1]:
                         c[1] = intermediate_states[:, a0]
                         c[0] = conv_input[:, a0 + 1 : a0 + K]
