@@ -48,4 +48,3 @@ dependencies = {file = ["requirements.txt"]}
 ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
-glm-ocr = ["torch", "torchvision"]
