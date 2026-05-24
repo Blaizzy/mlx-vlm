@@ -1123,9 +1123,7 @@ def _qwen3_5_ragged_decode_attention(
 
     plans = [_qwen3_5_sdpa_vector_plan(k_size - pad, q_heads, kv_heads) for pad in pads]
     if len(set(plans)) != 1:
-        return _qwen3_5_ragged_decode_attention_grouped(
-            queries, keys, values, pads, scale, plans
-        )
+        return None
     mode, blocks = plans[0]
 
     queries = mx.contiguous(queries)
@@ -1182,37 +1180,6 @@ def _qwen3_5_ragged_decode_attention(
         output_shapes=[(batch, q_heads, 1, v_size)],
         output_dtypes=[queries.dtype],
     )[0]
-
-
-def _qwen3_5_ragged_decode_attention_grouped(
-    queries: mx.array,
-    keys: mx.array,
-    values: mx.array,
-    pads: List[int],
-    scale: float,
-    plans: List[tuple],
-) -> Optional[mx.array]:
-    grouped_rows = {}
-    for row, plan in enumerate(plans):
-        grouped_rows.setdefault(plan, []).append(row)
-
-    row_outputs = {}
-    for rows in grouped_rows.values():
-        row_idx = mx.array(rows, dtype=mx.int32)
-        group_output = _qwen3_5_ragged_decode_attention(
-            mx.take(queries, row_idx, axis=0),
-            mx.take(keys, row_idx, axis=0),
-            mx.take(values, row_idx, axis=0),
-            [pads[row] for row in rows],
-            scale,
-        )
-        if group_output is None:
-            return None
-        for local_row, row in enumerate(rows):
-            row_outputs[row] = group_output[local_row : local_row + 1]
-
-    return mx.concatenate([row_outputs[row] for row in range(queries.shape[0])], axis=0)
-
 
 def _target_verify_left_padded_attention(
     queries: mx.array,

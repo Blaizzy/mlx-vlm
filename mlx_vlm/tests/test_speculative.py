@@ -588,7 +588,7 @@ def test_qwen3_5_ragged_decode_attention_matches_two_pass_singleton():
     assert bool(mx.array_equal(out, ref).item())
 
 
-def test_qwen3_5_ragged_decode_attention_matches_mixed_plan_singleton():
+def test_qwen3_5_ragged_decode_attention_rejects_mixed_plan():
     mx.random.seed(21)
     scale = 64**-0.5
     if qwen_language._qwen3_5_device_arch_suffix() in {"d", "s"}:
@@ -610,12 +610,9 @@ def test_qwen3_5_ragged_decode_attention_matches_mixed_plan_singleton():
     out = qwen_language._qwen3_5_ragged_decode_attention(
         queries, keys, values, pads, scale
     )
-    ref = _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale)
-    mx.eval(out, ref)
 
     assert len(set(plans)) == 2
-    assert out is not None
-    assert bool(mx.array_equal(out, ref).item())
+    assert out is None
 
 
 def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
