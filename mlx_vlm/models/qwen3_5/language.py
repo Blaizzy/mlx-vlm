@@ -1913,6 +1913,13 @@ class LanguageModel(nn.Module):
         logits = self.speculative_logits_from_hidden(hidden)
         return mx.argmax(logits, axis=-1)
 
+    @property
+    def prefer_rowwise_batch_decode(self) -> bool:
+        return (
+            not self.args.tie_word_embeddings
+            and isinstance(getattr(self, "lm_head", None), nn.QuantizedLinear)
+        )
+
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(
             inputs,

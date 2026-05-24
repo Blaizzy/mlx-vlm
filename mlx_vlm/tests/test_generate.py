@@ -610,6 +610,53 @@ class TestBatchGenerator:
         assert batch._next_tokens.tolist() == [7, 7]
         assert model.calls == [{"return_hidden": True, "skip_logits": True}]
 
+    def test_generation_batch_rowwise_decode_survives_filter_to_singleton(self):
+        class RowCache:
+            def __init__(self, token):
+                self.token = token
+
+        class BatchCache:
+            def extract(self, idx):
+                return RowCache(10 + idx)
+
+        class RowwiseModel:
+            prefer_rowwise_batch_decode = True
+
+            def __init__(self):
+                self.seen = []
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                self.seen.append((input_ids.tolist(), cache[0].token, kwargs))
+                hidden = mx.array([[[cache[0].token]]], dtype=mx.float32)
+                return SimpleNamespace(hidden_states=[hidden])
+
+            def speculative_argmax_from_hidden(self, hidden):
+                return hidden.astype(mx.int32)[:, :, 0]
+
+        model = RowwiseModel()
+        batch = GenerationBatch(
+            model=model,
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[BatchCache()],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[3, 3],
+            greedy_sampling=True,
+        )
+        batch.compute_logprobs = False
+
+        first = batch.next()
+        assert [r.token for r in first] == [5, 6]
+        assert batch._next_tokens.tolist() == [10, 11]
+        assert [call[1] for call in model.seen] == [10, 11]
+
+        batch.filter([1])
+        second = batch.next()
+        assert [r.token for r in second] == [11]
+        assert batch._next_tokens.tolist() == [11]
+        assert model.seen[-1][1] == 11
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
