@@ -506,6 +506,7 @@ class GenerationArguments:
     top_k: int = 0
     min_p: float = 0.0
     seed: Optional[int] = None
+    logprobs: bool = False
     repetition_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
@@ -865,7 +866,7 @@ class ResponseGenerator:
 
         self._ready.set()
 
-        if self.draft_model is not None:
+        if self.draft_model is not None and self.draft_kind != "mtp":
             self._run_speculative()
             return
 
@@ -913,9 +914,14 @@ class ResponseGenerator:
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
-                            top_logprobs_k=self.top_logprobs_k,
+                            compute_logprobs=bool(args.logprobs),
+                            top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
+                            draft_model=self.draft_model,
+                            draft_kind=self.draft_kind,
+                            draft_block_size=_get_draft_block_size_from_env(),
+                            greedy_sampling=args.temperature == 0,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -977,6 +983,9 @@ class ResponseGenerator:
                 batch_gen = None
                 mx.clear_cache()
                 gc.collect()
+
+        if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
+            batch_gen.close()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
@@ -1241,10 +1250,14 @@ class ResponseGenerator:
             rqueue = info["rqueue"]
 
             tok = r.token
-            if hasattr(tok, "item"):
+            if tok is None:
+                text = info["streamer"].finalize()
+                tok = 0
+            elif hasattr(tok, "item"):
                 tok = tok.item()
-
-            text = self._stream_text(info, tok, r.finish_reason)
+                text = self._stream_text(info, tok, r.finish_reason)
+            else:
+                text = self._stream_text(info, tok, r.finish_reason)
 
             lp = r.token_logprob
 

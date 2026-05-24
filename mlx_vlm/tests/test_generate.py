@@ -576,6 +576,40 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_generation_batch_uses_greedy_hidden_argmax_without_logprobs(self):
+        class FastArgmaxModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                del cache
+                self.calls.append(kwargs)
+                assert kwargs["return_hidden"] is True
+                assert kwargs["skip_logits"] is True
+                hidden = mx.ones((input_ids.shape[0], input_ids.shape[1], 3))
+                return SimpleNamespace(hidden_states=[hidden])
+
+            def speculative_argmax_from_hidden(self, hidden):
+                return mx.full((hidden.shape[0], hidden.shape[1]), 7, dtype=mx.int32)
+
+        model = FastArgmaxModel()
+        batch = GenerationBatch(
+            model=model,
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2, 2],
+            greedy_sampling=True,
+        )
+        batch.compute_logprobs = False
+
+        first = batch.next()
+        assert [r.token for r in first] == [5, 6]
+        assert batch._next_tokens.tolist() == [7, 7]
+        assert model.calls == [{"return_hidden": True, "skip_logits": True}]
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,

@@ -511,7 +511,7 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     if (
         not isinstance(linear, nn.QuantizedLinear)
         or x.ndim != 3
-        or x.shape[1] <= 1
+        or x.shape[1] < 1
         or linear.bits not in (4, 5)
         or linear.mode != "affine"
         or linear.biases is None

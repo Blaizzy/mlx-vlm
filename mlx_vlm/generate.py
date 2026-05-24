@@ -23,7 +23,14 @@ from . import apc as _apc
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
-from .speculative.utils import format_speculative_stats, run_speculative_rounds
+from .speculative.utils import (
+    format_speculative_stats,
+    make_speculative_prompt_cache,
+    run_speculative_rounds,
+    run_speculative_server_rounds,
+    speculative_hidden_state,
+    speculative_prefill_kwargs,
+)
 from .tokenizer_utils import make_streaming_detokenizer
 from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
 from .utils import (
@@ -1721,6 +1728,7 @@ class GenerationBatch:
         stop_criteria,
         max_tokens: List[int],
         top_logprobs_k: int = 0,
+        greedy_sampling: bool = False,
         token_context: Optional[List[List[int]]] = None,
         logits_processors: Optional[
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
@@ -1736,6 +1744,7 @@ class GenerationBatch:
         self._num_tokens = [0] * len(uids)
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
+        self.greedy_sampling = greedy_sampling
         self.logits_processors = logits_processors or []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
 
@@ -1752,6 +1761,36 @@ class GenerationBatch:
     def __len__(self):
         return len(self.uids)
 
+    def _greedy_argmax_step(self, inputs: mx.array, fwd_kwargs: dict):
+        if (
+            not self.greedy_sampling
+            or self.compute_logprobs
+            or self.top_logprobs_k > 0
+            or (self.logits_processors and any(self.logits_processors))
+        ):
+            return None
+
+        argmax_from_hidden = getattr(
+            self._language_model, "speculative_argmax_from_hidden", None
+        )
+        if not callable(argmax_from_hidden):
+            return None
+
+        output = self._language_model(
+            inputs[:, None],
+            cache=self.prompt_cache,
+            return_hidden=True,
+            skip_logits=True,
+            **fwd_kwargs,
+        )
+        hidden = output.hidden_states[-1]
+        sampled = argmax_from_hidden(hidden)
+        if sampled is None:
+            return None
+        if sampled.ndim == 2 and sampled.shape[1] == 1:
+            sampled = sampled[:, 0]
+        return sampled
+
     def _step(self):
         """Perform one generation step with double buffering."""
         self._current_tokens = self._next_tokens
@@ -1761,6 +1800,16 @@ class GenerationBatch:
         fwd_kwargs = {}
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
+
+        sampled = self._greedy_argmax_step(inputs, fwd_kwargs)
+        if sampled is not None:
+            self._next_tokens = sampled
+            self._next_lps = None
+            self._next_top_idx = None
+            self._next_top_lp = None
+            mx.async_eval(self._next_tokens)
+            mx.eval(inputs)
+            return inputs.tolist(), None, None, None
 
         output = self._language_model(
             inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
@@ -1977,7 +2026,13 @@ class GenerationBatch:
 
     @classmethod
     def empty(
-        cls, model, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+        cls,
+        model,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        greedy_sampling: bool = False,
     ):
         """Create an empty generation batch."""
         batch = cls.__new__(cls)
@@ -1991,6 +2046,7 @@ class GenerationBatch:
         batch._num_tokens = []
         batch.compute_logprobs = compute_logprobs
         batch.top_logprobs_k = top_logprobs_k
+        batch.greedy_sampling = greedy_sampling
         batch.token_context = []
         batch.logits_processors = []
         batch._current_tokens = None
@@ -2001,6 +2057,176 @@ class GenerationBatch:
         batch._next_top_lp = None
         batch._rope_deltas = None
         return batch
+
+
+class SpeculativeGenerationBatch:
+    """GenerationBatch-compatible wrapper for server-side MTP decode."""
+
+    is_speculative = True
+    Response = GenerationBatch.Response
+
+    def __init__(
+        self,
+        model: nn.Module,
+        draft_model: nn.Module,
+        draft_kind: str,
+        uids: List[int],
+        first_tokens: mx.array,
+        prompt_cache: List[Any],
+        sampler: Callable[[mx.array], mx.array],
+        stop_criteria,
+        max_tokens: List[int],
+        hidden: mx.array,
+        shared_kv_states: Optional[dict],
+        prompt_tokens: mx.array,
+        *,
+        draft_block_size: Optional[int] = None,
+        token_dtype: mx.Dtype = mx.int32,
+        greedy_sampling: bool = False,
+    ):
+        self.model = model
+        self.draft_model = draft_model
+        self.draft_kind = draft_kind
+        self.uids = list(uids)
+        self._all_uids = list(uids)
+        self.first_tokens = first_tokens
+        self.prompt_cache = prompt_cache
+        self.sampler = sampler
+        self.stop_criteria = stop_criteria
+        self.max_tokens = list(max_tokens)
+        self.hidden = hidden
+        self.shared_kv_states = shared_kv_states
+        self.prompt_tokens = prompt_tokens
+        self.draft_block_size = draft_block_size
+        self.token_dtype = token_dtype
+        self.greedy_sampling = greedy_sampling
+        self._num_tokens = [0] * len(uids)
+        self._finished = [False] * len(uids)
+        self._sent_first = False
+        self._rounds_iter = None
+
+    def __len__(self):
+        return sum(not done for done in self._finished)
+
+    def _refresh_uids(self):
+        self.uids = [
+            uid for uid, done in zip(self._all_uids, self._finished) if not done
+        ]
+
+    def extend(self, other: "SpeculativeGenerationBatch"):
+        if len(self) == 0:
+            self.__dict__.update(other.__dict__)
+            return
+        raise RuntimeError("Cannot extend an active speculative generation batch.")
+
+    def filter(self, keep: List[int]):
+        keep_uids = {self.uids[idx] for idx in keep}
+        for i, uid in enumerate(self._all_uids):
+            if uid not in keep_uids:
+                self._finished[i] = True
+        self._refresh_uids()
+
+    def _finish_reason(self, row: int, token: int) -> Optional[str]:
+        if self.stop_criteria(token):
+            return "stop"
+        if self._num_tokens[row] >= self.max_tokens[row]:
+            return "length"
+        return None
+
+    def _start_rounds(self):
+        if self._rounds_iter is not None:
+            return
+
+        def stop_check(seq_idx, token_id):
+            return (
+                self._finished[seq_idx]
+                or self.stop_criteria(token_id)
+                or self._num_tokens[seq_idx] >= self.max_tokens[seq_idx]
+            )
+
+        self._rounds_iter = run_speculative_server_rounds(
+            self.model,
+            self.draft_model,
+            self.prompt_cache,
+            self.hidden,
+            draft_kind=self.draft_kind,
+            first_bonus=self.first_tokens,
+            max_tokens=max(self.max_tokens) if self.max_tokens else 0,
+            sampler=self.sampler,
+            draft_block_size=self.draft_block_size,
+            token_dtype=self.token_dtype,
+            stop_check=stop_check,
+            greedy_sampling=self.greedy_sampling,
+            shared_kv_states=self.shared_kv_states,
+            eos_token_ids=None,
+            prompt_tokens=self.prompt_tokens,
+            row_ids=[0] * len(self._all_uids),
+        )
+
+    def next(self) -> List[Response]:
+        if len(self) == 0:
+            return []
+
+        responses: List[GenerationBatch.Response] = []
+        if not self._sent_first:
+            self._sent_first = True
+            mx.eval(self.first_tokens)
+            for row, token in enumerate(self.first_tokens.tolist()):
+                if self._finished[row]:
+                    continue
+                token = int(token)
+                self._num_tokens[row] += 1
+                finish_reason = self._finish_reason(row, token)
+                if finish_reason is not None:
+                    self._finished[row] = True
+                responses.append(
+                    self.Response(
+                        uid=self._all_uids[row],
+                        token=token,
+                        token_logprob=0.0,
+                        finish_reason=finish_reason,
+                    )
+                )
+            self._refresh_uids()
+            return responses
+
+        self._start_rounds()
+        try:
+            tok_list, _ = next(self._rounds_iter)
+        except StopIteration:
+            for row, done in enumerate(self._finished):
+                if not done:
+                    self._finished[row] = True
+                    responses.append(
+                        self.Response(
+                            uid=self._all_uids[row],
+                            token=None,
+                            token_logprob=0.0,
+                            finish_reason="length",
+                        )
+                    )
+            self._refresh_uids()
+            return responses
+
+        for row, token in enumerate(tok_list):
+            if token is None or self._finished[row]:
+                continue
+            token = int(token)
+            self._num_tokens[row] += 1
+            finish_reason = self._finish_reason(row, token)
+            if finish_reason is not None:
+                self._finished[row] = True
+            responses.append(
+                self.Response(
+                    uid=self._all_uids[row],
+                    token=token,
+                    token_logprob=0.0,
+                    finish_reason=finish_reason,
+                )
+            )
+
+        self._refresh_uids()
+        return responses
 
 
 class PromptProcessingBatch:
@@ -2033,12 +2259,20 @@ class PromptProcessingBatch:
         right_pad_per_row: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
+        draft_model: Optional[nn.Module] = None,
+        draft_kind: Optional[str] = None,
+        draft_block_size: Optional[int] = None,
+        greedy_sampling: bool = False,
     ):
         self.model = model
         self.uids = uids
         self._prompt_uids = list(uids)
         self.max_tokens = max_tokens
         self.prefill_step_size = prefill_step_size
+        self.draft_model = draft_model
+        self.draft_kind = draft_kind
+        self.draft_block_size = draft_block_size
+        self.greedy_sampling = greedy_sampling
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -2101,6 +2335,20 @@ class PromptProcessingBatch:
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
+        elif draft_model is not None and draft_kind is not None:
+            self.prompt_cache = make_speculative_prompt_cache(
+                model,
+                draft_kind=draft_kind,
+                batch_size=len(input_ids),
+                left_padding=left_padding,
+                make_cache=lambda lm, lp: _make_cache(
+                    lm,
+                    lp,
+                    kv_bits=kv_bits,
+                    kv_group_size=kv_group_size,
+                    kv_quant_scheme=kv_quant_scheme,
+                ),
+            )
         elif (
             len(input_ids) == 1
             and right_pad_per_row is None
@@ -2287,11 +2535,17 @@ class PromptProcessingBatch:
         self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        call_kwargs = dict(self._prompt_kwargs)
+        if self.draft_model is not None and self.draft_kind is not None:
+            call_kwargs.update(
+                speculative_prefill_kwargs(self.draft_kind, self.draft_model)
+            )
+
         output = self.model(
             self._input_ids,
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds,
-            **self._prompt_kwargs,
+            **call_kwargs,
         )
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
@@ -2352,27 +2606,50 @@ class PromptProcessingBatch:
                     self._suffix_lens,
                 )
 
-        gen_batch = GenerationBatch(
-            model=self.model,
-            uids=list(self.uids),
-            inputs=first_tokens,
-            prompt_cache=self.prompt_cache,
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=list(self.max_tokens),
-            top_logprobs_k=top_logprobs_k,
-            token_context=[list(ctx) for ctx in self._token_context],
-            logits_processors=list(self.logits_processors),
-        )
+        if self.draft_model is not None and self.draft_kind is not None:
+            gen_batch = SpeculativeGenerationBatch(
+                model=self.model,
+                draft_model=self.draft_model,
+                draft_kind=self.draft_kind,
+                uids=list(self.uids),
+                first_tokens=first_tokens,
+                prompt_cache=self.prompt_cache,
+                sampler=sampler,
+                stop_criteria=stop_criteria,
+                max_tokens=list(self.max_tokens),
+                hidden=speculative_hidden_state(self.draft_kind, output),
+                shared_kv_states=(
+                    output.shared_kv_states if self.draft_kind == "mtp" else None
+                ),
+                prompt_tokens=self._input_ids,
+                draft_block_size=self.draft_block_size,
+                token_dtype=self._input_ids.dtype,
+                greedy_sampling=self.greedy_sampling,
+            )
+            compute_logprobs = False
+        else:
+            gen_batch = GenerationBatch(
+                model=self.model,
+                uids=list(self.uids),
+                inputs=first_tokens,
+                prompt_cache=self.prompt_cache,
+                sampler=sampler,
+                stop_criteria=stop_criteria,
+                max_tokens=list(self.max_tokens),
+                top_logprobs_k=top_logprobs_k,
+                greedy_sampling=self.greedy_sampling,
+                token_context=[list(ctx) for ctx in self._token_context],
+                logits_processors=list(self.logits_processors),
+            )
         gen_batch.compute_logprobs = compute_logprobs
 
-        if compute_logprobs:
+        if compute_logprobs and isinstance(gen_batch, GenerationBatch):
             gen_batch._next_lps = logprobs[
                 mx.arange(first_tokens.shape[0]), first_tokens
             ]
 
         # Prime top-K buffers so the first token can emit top_logprobs too.
-        if top_logprobs_k > 0:
+        if top_logprobs_k > 0 and isinstance(gen_batch, GenerationBatch):
             k = top_logprobs_k
             sort_idx = mx.argsort(logprobs, axis=-1)
             top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
@@ -2522,6 +2799,10 @@ class BatchGenerator:
         ] = None,
         stream=None,
         apc_manager: Optional["_apc.APCManager"] = None,
+        draft_model: Optional[nn.Module] = None,
+        draft_kind: Optional[str] = None,
+        draft_block_size: Optional[int] = None,
+        greedy_sampling: bool = False,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2533,6 +2814,17 @@ class BatchGenerator:
         self.compute_logprobs = compute_logprobs
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
+        self.draft_model = draft_model
+        self.draft_kind = draft_kind
+        self.draft_block_size = draft_block_size
+        self.greedy_sampling = greedy_sampling or sampler is None
+        if self.draft_model is not None:
+            prefill_step_size = None
+            apc_manager = None
+            compute_logprobs = False
+            top_logprobs_k = 0
+            self.compute_logprobs = False
+            self.top_logprobs_k = 0
         # APC: opt-out for KV-quantized caches. Plain KV models use block APC;
         # mixed/custom cache models use exact prompt-cache snapshots.
         self.apc_mode = None
@@ -2562,6 +2854,7 @@ class BatchGenerator:
             self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
             top_logprobs_k=self.top_logprobs_k,
+            greedy_sampling=self.greedy_sampling,
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
@@ -2844,6 +3137,10 @@ class BatchGenerator:
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
+            draft_model=self.draft_model,
+            draft_kind=self.draft_kind,
+            draft_block_size=self.draft_block_size,
+            greedy_sampling=self.greedy_sampling,
         )
 
     def _build_apc_meta_for_cold(
@@ -2993,6 +3290,12 @@ class BatchGenerator:
             return progress()
         return []
 
+    def _extend_generation_batch(self, gen_batch) -> None:
+        if len(self._generation_batch) == 0:
+            self._generation_batch = gen_batch
+        else:
+            self._generation_batch.extend(gen_batch)
+
     def _next(self, **kwargs):
         generation_responses = []
         prompt_responses = []
@@ -3005,6 +3308,11 @@ class BatchGenerator:
             if self._steps_counter % 50 == 0:
                 mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
+
+        if getattr(self._generation_batch, "is_speculative", False) and len(
+            self._generation_batch
+        ) > 0:
+            return prompt_responses, generation_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
             return prompt_responses, generation_responses
@@ -3030,7 +3338,7 @@ class BatchGenerator:
             self._prompt_time_counter += elapsed
             self._record_prompt_batch_time(self._prompt_batch, elapsed)
             prompt_responses = self._prompt_batch_progress(self._prompt_batch)
-            self._generation_batch.extend(gen_batch)
+            self._extend_generation_batch(gen_batch)
             self._prompt_batch = None
             mx.clear_cache()
             return prompt_responses, generation_responses
@@ -3073,7 +3381,7 @@ class BatchGenerator:
                     self._prompt_time_counter += elapsed
                     self._record_prompt_batch_time(self._prompt_batch, elapsed)
                     prompt_responses = self._prompt_batch_progress(self._prompt_batch)
-                    self._generation_batch.extend(gen_batch)
+                    self._extend_generation_batch(gen_batch)
                     self._prompt_batch = None
                     mx.clear_cache()
                 return prompt_responses, generation_responses
@@ -3108,6 +3416,10 @@ class BatchGenerator:
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
                 apc_mode=self.apc_mode,
+                draft_model=self.draft_model,
+                draft_kind=self.draft_kind,
+                draft_block_size=self.draft_block_size,
+                greedy_sampling=self.greedy_sampling,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
@@ -3129,7 +3441,7 @@ class BatchGenerator:
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 prompt_responses = self._prompt_batch_progress(self._prompt_batch)
-                self._generation_batch.extend(gen_batch)
+                self._extend_generation_batch(gen_batch)
                 self._prompt_batch = None
                 mx.clear_cache()
 
