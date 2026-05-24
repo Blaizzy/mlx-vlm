@@ -68,6 +68,7 @@ class Glm46VImageProcessor(ImageProcessingMixin):
         image_mean: Optional[List[float]] = None,
         image_std: Optional[List[float]] = None,
         do_convert_rgb: bool = True,
+        use_transformers_backend: bool = True,
         **kwargs,
     ):
         self.patch_size = patch_size
@@ -81,6 +82,58 @@ class Glm46VImageProcessor(ImageProcessingMixin):
         self.image_mean = image_mean or [0.48145466, 0.4578275, 0.40821073]
         self.image_std = image_std or [0.26862954, 0.26130258, 0.27577711]
         self.do_convert_rgb = do_convert_rgb
+        self.use_transformers_backend = use_transformers_backend
+        self._transformers_image_processor = None
+
+    def _get_transformers_image_processor(self):
+        if not self.use_transformers_backend:
+            return None
+        if self._transformers_image_processor is not None:
+            return self._transformers_image_processor
+
+        try:
+            from transformers.models.glm46v.image_processing_glm46v import (
+                Glm46VImageProcessor as HFGlm46VImageProcessor,
+            )
+
+            self._transformers_image_processor = HFGlm46VImageProcessor(
+                patch_size=self.patch_size,
+                temporal_patch_size=self.temporal_patch_size,
+                merge_size=self.merge_size,
+                size={
+                    "shortest_edge": self.min_pixels,
+                    "longest_edge": self.max_pixels,
+                },
+                do_rescale=self.do_rescale,
+                rescale_factor=self.rescale_factor,
+                do_normalize=self.do_normalize,
+                image_mean=self.image_mean,
+                image_std=self.image_std,
+                do_convert_rgb=self.do_convert_rgb,
+            )
+        except Exception:
+            self._transformers_image_processor = None
+        return self._transformers_image_processor
+
+    def _process_with_transformers_backend(self, images):
+        image_processor = self._get_transformers_image_processor()
+        if image_processor is None:
+            return None
+
+        try:
+            import torch
+
+            outputs = image_processor(images=images)
+            return {
+                name: (
+                    value.detach().cpu().numpy()
+                    if isinstance(value, torch.Tensor)
+                    else np.asarray(value)
+                )
+                for name, value in outputs.items()
+            }
+        except Exception:
+            return None
 
     def _process_one(self, image: np.ndarray) -> Tuple[np.ndarray, List[int]]:
         C, H, W = image.shape
@@ -130,6 +183,10 @@ class Glm46VImageProcessor(ImageProcessingMixin):
         return flatten[0], [grid_t, grid_h, grid_w]
 
     def __call__(self, images, **kwargs):
+        transformers_outputs = self._process_with_transformers_backend(images)
+        if transformers_outputs is not None:
+            return transformers_outputs
+
         if not isinstance(images, list):
             images = [images]
         all_patches = []

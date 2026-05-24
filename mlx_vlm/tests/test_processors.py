@@ -592,6 +592,50 @@ class TestGlmOcrProcessor(unittest.TestCase):
         self.assertEqual(result["image_grid_thw"].tolist(), [[1, 2, 4]])
         self.assertEqual(result["pixel_values"].shape, (8, 1176))
 
+    def test_image_processor_matches_transformers_backend_bit_exactly(self):
+        try:
+            import torch
+            from transformers.models.glm46v.image_processing_glm46v import (
+                Glm46VImageProcessor as HFGlm46VImageProcessor,
+            )
+        except Exception as exc:
+            self.skipTest(f"Transformers torch image backend unavailable: {exc}")
+
+        from mlx_vlm.models.glm_ocr.processing import Glm46VImageProcessor
+
+        image = Image.fromarray(np.zeros((28, 56, 3), dtype=np.uint8))
+        hf_processor = HFGlm46VImageProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            size={
+                "shortest_edge": 14 * 14 * 2 * 2,
+                "longest_edge": 14 * 14 * 2 * 2 * 64,
+            },
+        )
+        processor = Glm46VImageProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=14 * 14 * 2 * 2,
+            max_pixels=14 * 14 * 2 * 2 * 64,
+        )
+
+        expected = hf_processor(images=image)
+        actual = processor(images=image)
+
+        expected_pixels = expected["pixel_values"]
+        if isinstance(expected_pixels, torch.Tensor):
+            expected_pixels = expected_pixels.detach().cpu().numpy()
+
+        self.assertTrue(np.array_equal(expected_pixels, actual["pixel_values"]))
+        self.assertTrue(
+            np.array_equal(
+                expected["image_grid_thw"].detach().cpu().numpy(),
+                actual["image_grid_thw"],
+            )
+        )
+
 
 class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
