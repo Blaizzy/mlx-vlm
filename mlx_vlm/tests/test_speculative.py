@@ -510,6 +510,114 @@ def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
+def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():
+    mx.random.seed(18)
+    linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
+
+    out = qwen_language._target_verify_quantized_argmax(linear, x)
+    ref = mx.concatenate(
+        [
+            qwen_language._target_verify_quantized_argmax(linear, x[row : row + 1])
+            for row in range(x.shape[0])
+        ],
+        axis=0,
+    )
+    mx.eval(out, ref)
+
+    assert bool(mx.array_equal(out, ref).item())
+
+
+def _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale):
+    return mx.concatenate(
+        [
+            qwen_language.scaled_dot_product_attention(
+                queries[row : row + 1],
+                keys[row : row + 1, :, pad:, :],
+                values[row : row + 1, :, pad:, :],
+                cache=None,
+                scale=scale,
+                mask=None,
+            )
+            for row, pad in enumerate(pads)
+        ],
+        axis=0,
+    )
+
+
+def test_qwen3_5_ragged_decode_attention_matches_one_pass_singleton():
+    mx.random.seed(19)
+    pads = [17, 0]
+    scale = 64**-0.5
+    queries = mx.random.normal((2, 4, 1, 64), dtype=mx.bfloat16)
+    keys = mx.random.normal((2, 2, 256, 64), dtype=mx.bfloat16)
+    values = mx.random.normal((2, 2, 256, 64), dtype=mx.bfloat16)
+
+    out = qwen_language._qwen3_5_ragged_decode_attention(
+        queries, keys, values, pads, scale
+    )
+    ref = _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale)
+    mx.eval(out, ref)
+
+    assert out is not None
+    assert bool(mx.array_equal(out, ref).item())
+
+
+def test_qwen3_5_ragged_decode_attention_matches_two_pass_singleton():
+    mx.random.seed(20)
+    pads = [7, 0]
+    scale = 64**-0.5
+    key_length = (
+        1100
+        if qwen_language._qwen3_5_device_arch_suffix() in {"d", "s"}
+        else 4112
+    )
+    queries = mx.random.normal((2, 4, 1, 64), dtype=mx.bfloat16)
+    keys = mx.random.normal((2, 2, key_length, 64), dtype=mx.bfloat16)
+    values = mx.random.normal((2, 2, key_length, 64), dtype=mx.bfloat16)
+
+    out = qwen_language._qwen3_5_ragged_decode_attention(
+        queries, keys, values, pads, scale
+    )
+    ref = _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale)
+    mx.eval(out, ref)
+
+    assert out is not None
+    assert bool(mx.array_equal(out, ref).item())
+
+
+def test_qwen3_5_ragged_decode_attention_matches_mixed_plan_singleton():
+    mx.random.seed(21)
+    scale = 64**-0.5
+    if qwen_language._qwen3_5_device_arch_suffix() in {"d", "s"}:
+        key_length = 1100
+        pads = [101, 0]
+    else:
+        key_length = 4112
+        pads = [33, 0]
+    queries = mx.random.normal((2, 4, 1, 64), dtype=mx.bfloat16)
+    keys = mx.random.normal((2, 2, key_length, 64), dtype=mx.bfloat16)
+    values = mx.random.normal((2, 2, key_length, 64), dtype=mx.bfloat16)
+
+    plans = [
+        qwen_language._qwen3_5_sdpa_vector_plan(
+            key_length - pad, queries.shape[1], keys.shape[1]
+        )
+        for pad in pads
+    ]
+    out = qwen_language._qwen3_5_ragged_decode_attention(
+        queries, keys, values, pads, scale
+    )
+    ref = _qwen3_5_ragged_attention_reference(queries, keys, values, pads, scale)
+    mx.eval(out, ref)
+
+    assert len(set(plans)) == 2
+    assert out is not None
+    assert bool(mx.array_equal(out, ref).item())
+
+
 def test_qwen_target_verify_small_projection_matches_singleton_dense_gemv():
     mx.random.seed(10)
     linear = nn.Linear(256, 8, bias=False)

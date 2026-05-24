@@ -562,6 +562,11 @@ def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
         return None
 
     B, T, K = x.shape
+    if T == 1 and 1 < B <= 4:
+        out = _target_verify_quantized_argmax(linear, x.transpose(1, 0, 2))
+        if out is not None:
+            return out.transpose(1, 0)
+
     N = linear.weight.shape[0]
     num_tiles = N // 8
 
@@ -762,6 +767,453 @@ def _gated_delta_update_verify_decode(
     )
 
 
+_QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE = r"""
+    uint q_batch_head_idx = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D_SIZE / BD;
+    constexpr int v_per_thread = V_SIZE / BD;
+
+    typedef float U;
+    thread U q[qk_per_thread];
+    thread U k[qk_per_thread];
+    thread U o[v_per_thread];
+    threadgroup U outputs[BN * BD];
+    threadgroup U max_scores[BN];
+    threadgroup U sum_exp_scores[BN];
+
+    int batch_idx = int(q_batch_head_idx) / NUM_Q_HEADS;
+    int q_head_idx = int(q_batch_head_idx) - batch_idx * NUM_Q_HEADS;
+    int kv_head_idx = q_head_idx / GQA_FACTOR;
+    int pad = int(pads[batch_idx]);
+    int N = K_SIZE - pad;
+
+    const device T* qptr =
+        queries + int(q_batch_head_idx) * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* kptr =
+        keys + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * D_SIZE +
+        (pad + int(simd_gid)) * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* vptr =
+        values + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * V_SIZE +
+        (pad + int(simd_gid)) * V_SIZE + int(simd_lid) * v_per_thread;
+    device T* optr =
+        out + int(q_batch_head_idx) * V_SIZE + int(simd_gid) * v_per_thread;
+
+    U s = U(scale[0]);
+    for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = s * qptr[i];
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+        o[i] = 0;
+    }
+
+    U max_score = -3.4028234663852886e38f;
+    U sum_exp_score = 0;
+
+    for (int i = int(simd_gid); i < N; i += BN) {
+        for (int j = 0; j < qk_per_thread; j++) {
+            k[j] = kptr[j];
+        }
+
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * k[j];
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * vptr[j];
+        }
+
+        kptr += BN * D_SIZE;
+        vptr += BN * V_SIZE;
+    }
+
+    if (simd_lid == 0) {
+        max_scores[simd_gid] = max_score;
+        sum_exp_scores[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    max_score = max_scores[simd_lid];
+    U new_max = simd_max(max_score);
+    U factor = fast::exp(max_score - new_max);
+    sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    for (int i = 0; i < v_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < v_per_thread; i++) {
+            optr[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+_QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE = r"""
+    uint simd_lid = thread_index_in_simdgroup;
+    uint kv_head_idx = threadgroup_position_in_grid.x;
+    uint batch_idx = threadgroup_position_in_grid.y;
+    uint block_idx = threadgroup_position_in_grid.z;
+    uint gqa_idx = thread_position_in_threadgroup.y;
+
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D_SIZE / BD;
+    constexpr int v_per_thread = V_SIZE / BD;
+
+    typedef float U;
+    thread U q[qk_per_thread];
+    thread U o[v_per_thread] = {0};
+
+    int q_head_idx = int(GQA_FACTOR * kv_head_idx + gqa_idx);
+    int q_batch_head_idx = int(batch_idx) * NUM_Q_HEADS + q_head_idx;
+    int pad = int(pads[batch_idx]);
+    int N = K_SIZE - pad;
+
+    const device T* qptr =
+        queries + q_batch_head_idx * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* kptr =
+        keys + (int(batch_idx) * NUM_KV_HEADS + int(kv_head_idx)) *
+                   K_SIZE * D_SIZE +
+        (pad + int(block_idx)) * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* vptr =
+        values + (int(batch_idx) * NUM_KV_HEADS + int(kv_head_idx)) *
+                     K_SIZE * V_SIZE +
+        (pad + int(block_idx)) * V_SIZE + int(simd_lid) * v_per_thread;
+    device T* optr =
+        partials + q_batch_head_idx * BLOCKS * V_SIZE +
+        int(block_idx) * V_SIZE + int(simd_lid) * v_per_thread;
+    device float* sump =
+        sums + q_batch_head_idx * BLOCKS + int(block_idx);
+    device float* maxp =
+        maxs + q_batch_head_idx * BLOCKS + int(block_idx);
+
+    U s = U(scale[0]);
+    for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = s * qptr[i];
+    }
+
+    U max_score = -3.4028234663852886e38f;
+    U sum_exp_score = 0;
+
+    for (int i = int(block_idx); i < N; i += BLOCKS) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * kptr[j];
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * vptr[j];
+        }
+
+        kptr += BLOCKS * D_SIZE;
+        vptr += BLOCKS * V_SIZE;
+    }
+
+    if (simd_lid == 0) {
+        sump[0] = sum_exp_score;
+        maxp[0] = max_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+        optr[i] = static_cast<T>(o[i]);
+    }
+"""
+
+
+_QWEN3_5_RAGGED_SDPA_TWO_PASS_2_SOURCE = r"""
+    uint q_batch_head_idx = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = D_SIZE / BD;
+
+    typedef float U;
+    thread U o[elem_per_thread] = {0};
+    threadgroup U outputs[BN * BD];
+
+    const device T* part =
+        partials + int(q_batch_head_idx) * BLOCKS * D_SIZE +
+        int(simd_gid) * D_SIZE + int(simd_lid) * elem_per_thread;
+    const device float* sump = sums + int(q_batch_head_idx) * BLOCKS;
+    const device float* maxp = maxs + int(q_batch_head_idx) * BLOCKS;
+    device T* optr =
+        out + int(q_batch_head_idx) * D_SIZE + int(simd_gid) * elem_per_thread;
+
+    U sum_exp_score = 0.0;
+    U max_score = -3.4028234663852886e38f;
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, maxp[int(simd_lid) + BN * b]);
+    }
+    max_score = simd_max(max_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(maxp[int(simd_lid) + BN * b] - max_score);
+        sum_exp_score += factor * sump[int(simd_lid) + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(maxp[int(simd_gid)] - max_score);
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] += factor * static_cast<U>(part[i]);
+        }
+        maxp += BN;
+        sump += BN;
+        part += BN * D_SIZE;
+    }
+
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++) {
+            optr[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _qwen3_5_device_arch_suffix() -> str:
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    return str(info.get("architecture", ""))[-1:]
+
+
+def _qwen3_5_sdpa_vector_blocks(seq_len: int, gqa_factor: int) -> int:
+    devc = _qwen3_5_device_arch_suffix()
+    n_simds = gqa_factor
+    if devc == "s":
+        blocks = 64
+        if seq_len > 1024 and n_simds > 4:
+            if seq_len <= 8192:
+                blocks = 128
+            elif seq_len <= 32768:
+                blocks = 256
+            elif seq_len <= 65536:
+                blocks = 512
+            else:
+                blocks = 1024
+        return blocks
+    if devc == "d":
+        blocks = 128
+        if n_simds <= 2 and seq_len > 8192:
+            blocks = 256
+        elif n_simds >= 6:
+            if 16384 <= seq_len < 65536:
+                blocks = 512
+            elif seq_len >= 65536:
+                blocks = 1024
+        return blocks
+    if n_simds >= 4:
+        return 64
+    return 32
+
+
+def _qwen3_5_sdpa_vector_plan(seq_len: int, q_heads: int, kv_heads: int):
+    devc = _qwen3_5_device_arch_suffix()
+    if (devc in {"d", "s"} and seq_len >= 1024) or (
+        kv_heads < q_heads and seq_len >= 4096
+    ):
+        return ("two_pass", _qwen3_5_sdpa_vector_blocks(seq_len, q_heads // kv_heads))
+    return ("one_pass", 0)
+
+
+@lru_cache(maxsize=None)
+def _qwen3_5_ragged_sdpa_one_pass_kernel(dtype, d_size, v_size, k_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=f"qwen3_5_ragged_sdpa_1p_{dtype_name}_d{d_size}_v{v_size}_k{k_size}",
+        input_names=["queries", "keys", "values", "pads", "scale"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, k_size, blocks):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_"
+            f"d{d_size}_v{v_size}_k{k_size}_b{blocks}"
+        ),
+        input_names=["queries", "keys", "values", "pads", "scale"],
+        output_names=["partials", "sums", "maxs"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _qwen3_5_ragged_sdpa_two_pass_2_kernel(dtype, v_size, blocks):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=f"qwen3_5_ragged_sdpa_2p2_{dtype_name}_v{v_size}_b{blocks}",
+        input_names=["partials", "sums", "maxs"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_QWEN3_5_RAGGED_SDPA_TWO_PASS_2_SOURCE,
+    )
+
+
+def _qwen3_5_ragged_decode_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    pads: List[int],
+    scale: float,
+) -> Optional[mx.array]:
+    if (
+        queries.ndim != 4
+        or keys.ndim != 4
+        or values.ndim != 4
+        or queries.shape[2] != 1
+        or queries.dtype not in (mx.bfloat16, mx.float16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+    ):
+        return None
+
+    batch, q_heads, _, d_size = queries.shape
+    if len(pads) != batch or any(p < 0 for p in pads):
+        return None
+    kv_heads = keys.shape[1]
+    k_size = keys.shape[2]
+    v_size = values.shape[-1]
+    if (
+        q_heads % kv_heads != 0
+        or d_size != v_size
+        or d_size not in (64, 96, 128, 256)
+        or any(p >= k_size for p in pads)
+    ):
+        return None
+
+    plans = [_qwen3_5_sdpa_vector_plan(k_size - pad, q_heads, kv_heads) for pad in pads]
+    if len(set(plans)) != 1:
+        return _qwen3_5_ragged_decode_attention_grouped(
+            queries, keys, values, pads, scale, plans
+        )
+    mode, blocks = plans[0]
+
+    queries = mx.contiguous(queries)
+    keys = mx.contiguous(keys)
+    values = mx.contiguous(values)
+    pads_array = mx.array(pads, dtype=mx.int32)
+    scale_array = mx.array([scale], dtype=mx.float32)
+    template = [
+        ("T", queries.dtype),
+        ("D_SIZE", int(d_size)),
+        ("V_SIZE", int(v_size)),
+        ("K_SIZE", int(k_size)),
+        ("NUM_Q_HEADS", int(q_heads)),
+        ("NUM_KV_HEADS", int(kv_heads)),
+        ("GQA_FACTOR", int(q_heads // kv_heads)),
+    ]
+
+    if mode == "one_pass":
+        kernel = _qwen3_5_ragged_sdpa_one_pass_kernel(
+            queries.dtype, d_size, v_size, k_size
+        )
+        return kernel(
+            inputs=[queries, keys, values, pads_array, scale_array],
+            template=template,
+            grid=(1024, batch * q_heads, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(batch, q_heads, 1, v_size)],
+            output_dtypes=[queries.dtype],
+        )[0]
+
+    kernel_1 = _qwen3_5_ragged_sdpa_two_pass_1_kernel(
+        queries.dtype, d_size, v_size, k_size, blocks
+    )
+    partials, sums, maxs = kernel_1(
+        inputs=[queries, keys, values, pads_array, scale_array],
+        template=[*template, ("BLOCKS", int(blocks))],
+        grid=(32 * kv_heads, (q_heads // kv_heads) * batch, blocks),
+        threadgroup=(32, q_heads // kv_heads, 1),
+        output_shapes=[
+            (batch, q_heads, 1, blocks, v_size),
+            (batch, q_heads, 1, blocks),
+            (batch, q_heads, 1, blocks),
+        ],
+        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+    )
+    kernel_2 = _qwen3_5_ragged_sdpa_two_pass_2_kernel(
+        queries.dtype, v_size, blocks
+    )
+    return kernel_2(
+        inputs=[partials, sums, maxs],
+        template=[("T", queries.dtype), ("D_SIZE", int(v_size)), ("BLOCKS", int(blocks))],
+        grid=(1024, batch * q_heads, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(batch, q_heads, 1, v_size)],
+        output_dtypes=[queries.dtype],
+    )[0]
+
+
+def _qwen3_5_ragged_decode_attention_grouped(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    pads: List[int],
+    scale: float,
+    plans: List[tuple],
+) -> Optional[mx.array]:
+    grouped_rows = {}
+    for row, plan in enumerate(plans):
+        grouped_rows.setdefault(plan, []).append(row)
+
+    row_outputs = {}
+    for rows in grouped_rows.values():
+        row_idx = mx.array(rows, dtype=mx.int32)
+        group_output = _qwen3_5_ragged_decode_attention(
+            mx.take(queries, row_idx, axis=0),
+            mx.take(keys, row_idx, axis=0),
+            mx.take(values, row_idx, axis=0),
+            [pads[row] for row in rows],
+            scale,
+        )
+        if group_output is None:
+            return None
+        for local_row, row in enumerate(rows):
+            row_outputs[row] = group_output[local_row : local_row + 1]
+
+    return mx.concatenate([row_outputs[row] for row in range(queries.shape[0])], axis=0)
+
+
 def _target_verify_left_padded_attention(
     queries: mx.array,
     keys: mx.array,
@@ -786,6 +1238,10 @@ def _target_verify_left_padded_attention(
         pads = [int(p) for p in left_padding.tolist()]
     if max(pads) <= 0:
         return None
+
+    output = _qwen3_5_ragged_decode_attention(queries, keys, values, pads, scale)
+    if output is not None:
+        return output
 
     row_outputs = {}
     for pad in sorted(set(pads)):
