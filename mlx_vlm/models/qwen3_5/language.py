@@ -710,6 +710,32 @@ def _create_qwen3_5_ssm_mask(h: mx.array, cache):
     return cache.make_mask(h.shape[1])
 
 
+def _create_qwen3_5_attention_mask(h: mx.array, cache):
+    if cache is None:
+        return create_attention_mask(h, cache)
+
+    if hasattr(cache, "_qwen3_5_decode_left_padding"):
+        delattr(cache, "_qwen3_5_decode_left_padding")
+
+    left_padding = getattr(cache, "left_padding", None)
+    if (
+        h.shape[1] == 1
+        and isinstance(left_padding, mx.array)
+        and left_padding.ndim > 0
+    ):
+        padding_cache = getattr(cache, "_qwen3_5_left_padding_cache", None)
+        if padding_cache is None or padding_cache[0] is not left_padding:
+            pads = [int(p) for p in left_padding.tolist()]
+            padding_cache = (left_padding, pads, max(pads))
+            cache._qwen3_5_left_padding_cache = padding_cache
+        pads = padding_cache[1]
+        if padding_cache[2] <= 0:
+            return None
+        cache._qwen3_5_decode_left_padding = pads
+        return "left_padded_decode"
+    return create_attention_mask(h, cache)
+
+
 def _gated_delta_update_verify_decode(
     q: mx.array,
     k: mx.array,
@@ -748,16 +774,20 @@ def _target_verify_left_padded_attention(
     if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
         return None
 
-    left_padding = getattr(cache, "left_padding", None)
-    if not (
-        isinstance(left_padding, mx.array)
-        and left_padding.ndim > 0
-        and int(left_padding.max().item()) > 0
-    ):
+    pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+    if pads is None:
+        left_padding = getattr(cache, "left_padding", None)
+        if not (
+            isinstance(left_padding, mx.array)
+            and left_padding.ndim > 0
+            and int(left_padding.max().item()) > 0
+        ):
+            return None
+        pads = [int(p) for p in left_padding.tolist()]
+    if max(pads) <= 0:
         return None
 
     row_outputs = {}
-    pads = [int(p) for p in left_padding.tolist()]
     for pad in sorted(set(pads)):
         rows = [i for i, row_pad in enumerate(pads) if row_pad == pad]
         row_idx = mx.array(rows, dtype=mx.int32)
@@ -889,7 +919,13 @@ class Qwen3_5Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if target_verify and L > 1:
+        left_padded_decode = (
+            mask == "left_padded_decode" if isinstance(mask, str) else False
+        )
+        if left_padded_decode:
+            mask = None
+
+        if (target_verify and L > 1) or left_padded_decode:
             output = _target_verify_left_padded_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
@@ -1215,6 +1251,7 @@ class Qwen3_5Model(nn.Module):
 
         if (
             h.shape[0] > 1
+            and h.shape[1] > 1
             and hidden_sink is None
             and gdn_sink is None
             and fa_cache is not None
@@ -1268,7 +1305,7 @@ class Qwen3_5Model(nn.Module):
                         cache[i] = cache[i].__class__.merge(entries)
                 return mx.concatenate(row_outputs, axis=0)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        fa_mask = _create_qwen3_5_attention_mask(h, cache[self.fa_idx])
         ssm_mask = _create_qwen3_5_ssm_mask(h, cache[self.ssm_idx])
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
@@ -1912,13 +1949,6 @@ class LanguageModel(nn.Module):
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
         return mx.argmax(logits, axis=-1)
-
-    @property
-    def prefer_rowwise_batch_decode(self) -> bool:
-        return (
-            not self.args.tie_word_embeddings
-            and isinstance(getattr(self, "lm_head", None), nn.QuantizedLinear)
-        )
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(

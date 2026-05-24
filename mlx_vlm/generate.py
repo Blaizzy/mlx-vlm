@@ -1573,22 +1573,6 @@ def _extend_cache(cache_a, cache_b):
     return cache_a
 
 
-def _split_cache_rows(prompt_cache: List[Any], batch_size: int):
-    if batch_size == 0:
-        return []
-    if batch_size == 1 and prompt_cache:
-        return [prompt_cache]
-
-    rows = [[] for _ in range(batch_size)]
-    for cache_entry in prompt_cache:
-        extract = getattr(cache_entry, "extract", None)
-        if not callable(extract):
-            return None
-        for row in range(batch_size):
-            rows[row].append(extract(row))
-    return rows
-
-
 def _make_cache(
     model,
     left_padding,
@@ -1785,53 +1769,12 @@ class GenerationBatch:
         self._next_top_idx = None
         self._next_top_lp = None
 
-        # Per-sequence MRoPE delta
         self._rope_deltas = None
-        self._row_prompt_caches = None
 
     def __len__(self):
         return len(self.uids)
 
-    def _prefer_rowwise_batch_decode(self) -> bool:
-        prefer = getattr(self._language_model, "prefer_rowwise_batch_decode", False)
-        return bool(prefer() if callable(prefer) else prefer)
-
-    def _can_use_rowwise_greedy_decode(self) -> bool:
-        return (
-            (len(self.uids) > 1 or self._row_prompt_caches is not None)
-            and self.greedy_sampling
-            and not self.compute_logprobs
-            and self.top_logprobs_k == 0
-            and not (self.logits_processors and any(self.logits_processors))
-            and callable(
-                getattr(self._language_model, "speculative_argmax_from_hidden", None)
-            )
-            and self._prefer_rowwise_batch_decode()
-        )
-
-    def _cache_rows(self):
-        if self._row_prompt_caches is not None:
-            return self._row_prompt_caches
-        return _split_cache_rows(self.prompt_cache, len(self.uids))
-
-    def _ensure_rowwise_caches(self) -> bool:
-        if self._row_prompt_caches is not None:
-            return True
-        rows = _split_cache_rows(self.prompt_cache, len(self.uids))
-        if rows is None:
-            return False
-        self._row_prompt_caches = rows
-        self.prompt_cache = []
-        return True
-
     def cache_states(self):
-        if self._row_prompt_caches is not None:
-            return [
-                c.state
-                for row_cache in self._row_prompt_caches
-                for c in row_cache
-                if hasattr(c, "state")
-            ]
         return [c.state for c in self.prompt_cache if hasattr(c, "state")]
 
     def _greedy_argmax_step(self, inputs: mx.array, fwd_kwargs: dict):
@@ -1864,38 +1807,6 @@ class GenerationBatch:
             sampled = sampled[:, 0]
         return sampled
 
-    def _step_rowwise_greedy(self, inputs: mx.array, fwd_kwargs: dict):
-        if not self._ensure_rowwise_caches():
-            return None
-
-        argmax_from_hidden = self._language_model.speculative_argmax_from_hidden
-        next_tokens = []
-        for row, row_cache in enumerate(self._row_prompt_caches):
-            row_kwargs = dict(fwd_kwargs)
-            if "rope_deltas" in row_kwargs:
-                row_kwargs["rope_deltas"] = row_kwargs["rope_deltas"][row : row + 1]
-            output = self._language_model(
-                inputs[row : row + 1, None],
-                cache=row_cache,
-                return_hidden=True,
-                skip_logits=True,
-                **row_kwargs,
-            )
-            sampled = argmax_from_hidden(output.hidden_states[-1])
-            if sampled is None:
-                return None
-            if sampled.ndim == 2 and sampled.shape[1] == 1:
-                sampled = sampled[:, 0]
-            next_tokens.append(sampled)
-
-        self._next_tokens = mx.concatenate(next_tokens, axis=0)
-        self._next_lps = None
-        self._next_top_idx = None
-        self._next_top_lp = None
-        mx.async_eval(self._next_tokens)
-        mx.eval(inputs)
-        return inputs.tolist(), None, None, None
-
     def _step(self):
         """Perform one generation step with double buffering."""
         self._current_tokens = self._next_tokens
@@ -1905,11 +1816,6 @@ class GenerationBatch:
         fwd_kwargs = {}
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
-
-        if self._can_use_rowwise_greedy_decode():
-            rowwise = self._step_rowwise_greedy(inputs, fwd_kwargs)
-            if rowwise is not None:
-                return rowwise
 
         sampled = self._greedy_argmax_step(inputs, fwd_kwargs)
         if sampled is not None:
@@ -2005,17 +1911,7 @@ class GenerationBatch:
         """Extend this batch with another generation batch."""
         self_was_empty = len(self.uids) == 0
         self.uids.extend(other.uids)
-        if self._row_prompt_caches is not None or other._row_prompt_caches is not None:
-            self_rows = self._cache_rows()
-            other_rows = other._cache_rows()
-            if self_rows is not None and other_rows is not None:
-                self._row_prompt_caches = self_rows + other_rows
-                self.prompt_cache = []
-            else:
-                self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
-                self._row_prompt_caches = None
-        else:
-            self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
+        self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
         self._num_tokens.extend(other._num_tokens)
         self.token_context.extend(other.token_context)
@@ -2080,7 +1976,6 @@ class GenerationBatch:
 
         if not keep:
             self.prompt_cache.clear()
-            self._row_prompt_caches = None
             self._current_tokens = None
             self._current_lps = None
             self._next_tokens = None
@@ -2092,13 +1987,8 @@ class GenerationBatch:
             self.logits_processors = []
         else:
             keep_arr = mx.array(keep, mx.int32)
-            if self._row_prompt_caches is not None:
-                self._row_prompt_caches = [
-                    self._row_prompt_caches[idx] for idx in keep
-                ]
-            else:
-                for c in self.prompt_cache:
-                    c.filter(keep_arr)
+            for c in self.prompt_cache:
+                c.filter(keep_arr)
             if self._next_tokens is not None:
                 self._next_tokens = self._next_tokens[keep_arr]
             if self._next_lps is not None:
@@ -2182,7 +2072,6 @@ class GenerationBatch:
         batch._next_top_idx = None
         batch._next_top_lp = None
         batch._rope_deltas = None
-        batch._row_prompt_caches = None
         return batch
 
 
