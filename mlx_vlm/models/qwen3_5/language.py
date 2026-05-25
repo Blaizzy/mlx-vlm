@@ -37,6 +37,7 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
             mrope_section=mrope_section,
             style="interleaved",
         )
+        mx.eval(self.inv_freq)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
