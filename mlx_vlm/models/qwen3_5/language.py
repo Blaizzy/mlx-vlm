@@ -377,70 +377,6 @@ _TARGET_VERIFY_QMV_SOURCE = r"""
 """
 
 
-_DECODE_BATCH_QMV_SOURCE = r"""
-    uint n_tile = threadgroup_position_in_grid.y;
-    uint simd_gid = simdgroup_index_in_threadgroup;
-    uint simd_lid = thread_index_in_simdgroup;
-
-    int batch_idx = int(simd_gid) / NUM_SIMDGROUPS;
-    int out_simd = int(simd_gid) - batch_idx * NUM_SIMDGROUPS;
-    if (batch_idx >= BATCH_N) {
-      return;
-    }
-
-    int out_row = int(n_tile) * BN + out_simd * RESULTS_PER_SIMDGROUP;
-    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-    int in_vec_size_g = K_SIZE / GS;
-
-    const device uint8_t* ws_base =
-        (const device uint8_t*)w + out_row * in_vec_size_w +
-        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-    const device T* scales_base =
-        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* biases_base =
-        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* x_base =
-        x + batch_idx * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
-
-    float result[RESULTS_PER_SIMDGROUP];
-    float x_thread[VALUES_PER_THREAD];
-    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-      result[row] = 0.0f;
-    }
-
-    const device uint8_t* ws = ws_base;
-    const device T* sc = scales_base;
-    const device T* bs = biases_base;
-    const device T* xk = x_base;
-
-    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
-      float sum = load_vector_exact<T>(xk, x_thread);
-
-      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        const device T* sl = sc + row * in_vec_size_g;
-        const device T* bl = bs + row * in_vec_size_g;
-        result[row] += qdot_exact(wl, x_thread, float(sl[0]), float(bl[0]), sum);
-      }
-
-      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-      sc += BLOCK_SIZE / GS;
-      bs += BLOCK_SIZE / GS;
-      xk += BLOCK_SIZE;
-    }
-
-    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
-      int n = out_row + row;
-      if (n < N_SIZE) {
-        float r = simd_sum(result[row]);
-        if (simd_lid == 0) {
-          y[(batch_idx * N_SIZE) + n] = T(r);
-        }
-      }
-    }
-"""
-
-
 _TARGET_VERIFY_QARGMAX_SOURCE = r"""
     uint n_tile = threadgroup_position_in_grid.y;
     uint b_idx = threadgroup_position_in_grid.z;
@@ -571,21 +507,6 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
     )
 
 
-@lru_cache(maxsize=None)
-def _decode_batch_qmv_kernel(bits, group_size, dtype, batch_n, k_size, n_size):
-    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
-    return mx.fast.metal_kernel(
-        name=(
-            "qwen3_5_decode_batch_qmv_"
-            f"b{bits}_gs{group_size}_bn{batch_n}_k{k_size}_n{n_size}_{dtype_name}"
-        ),
-        input_names=["x", "w", "scales", "biases"],
-        output_names=["y"],
-        header=_target_verify_qlinear_header(bits, group_size),
-        source=_DECODE_BATCH_QMV_SOURCE,
-    )
-
-
 def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     if (
         not isinstance(linear, nn.QuantizedLinear)
@@ -607,39 +528,6 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
         and K % 512 == 0
         and N % 8 == 0
     )
-
-
-def _decode_quantized_linear_batch(linear, x: mx.array) -> Optional[mx.array]:
-    if (
-        not _can_target_verify_quantized(linear, x)
-        or x.shape[1] != 1
-        or x.shape[0] != 4
-    ):
-        return None
-
-    B, _T, K = x.shape
-    N = linear.weight.shape[0]
-
-    x = mx.contiguous(x)
-    kernel = _decode_batch_qmv_kernel(
-        linear.bits, linear.group_size, x.dtype, B, K, N
-    )
-    out = kernel(
-        inputs=[x, linear.weight, linear.scales, linear.biases],
-        template=[
-            ("T", x.dtype),
-            ("BATCH_N", int(B)),
-            ("K_SIZE", int(K)),
-            ("N_SIZE", int(N)),
-        ],
-        grid=(32, 2 * B * (N // 8), 1),
-        threadgroup=(32, 2 * B, 1),
-        output_shapes=[(B, 1, N)],
-        output_dtypes=[x.dtype],
-    )[0]
-    if "bias" in linear:
-        out = out + linear["bias"]
-    return out
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -778,10 +666,6 @@ def _target_verify_singletons(fn, x: mx.array) -> mx.array:
 
 def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
     if not _use_target_verify_dense(linear, x, target_verify):
-        if isinstance(linear, nn.QuantizedLinear):
-            out = _decode_quantized_linear_batch(linear, x)
-            if out is not None:
-                return out
         return linear(x)
 
     if isinstance(linear, nn.QuantizedLinear):
@@ -812,15 +696,7 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
         out = _decode_quantized_linears_fused(linears, x)
         if out is not None:
             return out
-        outputs = []
-        for linear in linears:
-            if isinstance(linear, nn.QuantizedLinear):
-                out = _decode_quantized_linear_batch(linear, x)
-                if out is not None:
-                    outputs.append(out)
-                    continue
-            outputs.append(linear(x))
-        return tuple(outputs)
+        return tuple(linear(x) for linear in linears)
 
     return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
 

@@ -516,22 +516,6 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
-def test_qwen3_5_decode_quantized_linear_batch_matches_singleton_rows():
-    for bits in (4, 5):
-        mx.random.seed(180 + bits)
-        linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=bits)
-        linear.scales = linear.scales.astype(mx.bfloat16)
-        linear.biases = linear.biases.astype(mx.bfloat16)
-        x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
-
-        ref = mx.concatenate([linear(x[row : row + 1]) for row in range(4)], axis=0)
-        out = qwen_language._decode_quantized_linear_batch(linear, x)
-        mx.eval(ref, out)
-
-        assert out is not None
-        assert bool(mx.array_equal(ref, out).item())
-
-
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     mx.random.seed(16)
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)

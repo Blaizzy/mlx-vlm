@@ -1130,7 +1130,7 @@ class ResponseGenerator:
                             token=tok,
                             logprobs=0.0,
                             finish_reason=finish,
-                            peak_memory=mx.get_peak_memory() / 1e9,
+                            peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
                         )
                     )
@@ -1197,7 +1197,7 @@ class ResponseGenerator:
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
-                                peak_memory=mx.get_peak_memory() / 1e9,
+                                peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
