@@ -129,6 +129,7 @@ class ModelConfig(BaseModelConfig):
     ignore_index: int = -100
     image_token_id: int = 258880
     audio_token_id: int = 258881
+    video_token_id: Optional[int] = None
     boi_token_id: int = 255999
     eoi_token_id: int = 258882
     boa_token_id: int = 256000
@@ -136,6 +137,7 @@ class ModelConfig(BaseModelConfig):
     hidden_size: int = 1536
     pad_token_id: int = 0
     vision_soft_tokens_per_image: int = 280
+    vision_soft_tokens_per_video_frame: int = 70
     audio_soft_tokens_per_image: int = 750
     audio_ms_per_token: int = 40
     eos_token_id: Optional[List[int]] = None

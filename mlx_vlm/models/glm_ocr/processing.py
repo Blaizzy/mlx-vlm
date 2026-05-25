@@ -1,10 +1,257 @@
-from typing import List, Union
+import math
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_processing_utils import ImageProcessingMixin
 from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch
+from ..qwen3_vl.processing_qwen3_vl import _resize_video_frames, _to_numpy_image
+
+
+def smart_resize(
+    num_frames: int,
+    height: int,
+    width: int,
+    temporal_factor: int = 2,
+    factor: int = 28,
+    min_pixels: int = 112 * 112,
+    max_pixels: int = 14 * 14 * 2 * 2 * 2 * 6144,
+) -> Tuple[int, int]:
+    """Torch-free port of Transformers' GLM-4V smart resize helper."""
+    if num_frames < temporal_factor:
+        raise ValueError(
+            f"t:{num_frames} must be larger than temporal_factor:{temporal_factor}"
+        )
+    if height < factor or width < factor:
+        scale = max(factor / height, factor / width)
+        height = int(height * scale)
+        width = int(width * scale)
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            f"absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+    t_bar = round(num_frames / temporal_factor) * temporal_factor
+
+    if t_bar * h_bar * w_bar > max_pixels:
+        beta = math.sqrt((num_frames * height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif t_bar * h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (num_frames * height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+
+    return h_bar, w_bar
+
+
+class Glm46VImageProcessor(ImageProcessingMixin):
+    """Numpy/PIL GLM-4.6V image processor matching Transformers' patch layout."""
+
+    model_input_names = ["pixel_values", "image_grid_thw"]
+
+    def __init__(
+        self,
+        patch_size: int = 14,
+        temporal_patch_size: int = 2,
+        merge_size: int = 2,
+        min_pixels: int = 112 * 112,
+        max_pixels: int = 14 * 14 * 2 * 2 * 2 * 6144,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255.0,
+        do_normalize: bool = True,
+        image_mean: Optional[List[float]] = None,
+        image_std: Optional[List[float]] = None,
+        do_convert_rgb: bool = True,
+        use_transformers_backend: bool = True,
+        **kwargs,
+    ):
+        self.patch_size = patch_size
+        self.temporal_patch_size = temporal_patch_size
+        self.merge_size = merge_size
+        self.min_pixels = min_pixels
+        self.max_pixels = max_pixels
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
+        self.do_normalize = do_normalize
+        self.image_mean = image_mean or [0.48145466, 0.4578275, 0.40821073]
+        self.image_std = image_std or [0.26862954, 0.26130258, 0.27577711]
+        self.do_convert_rgb = do_convert_rgb
+        self.use_transformers_backend = use_transformers_backend
+        self._transformers_image_processor = None
+
+    def _get_transformers_image_processor(self):
+        if not self.use_transformers_backend:
+            return None
+        if self._transformers_image_processor is not None:
+            return self._transformers_image_processor
+
+        try:
+            from transformers.models.glm46v.image_processing_glm46v import (
+                Glm46VImageProcessor as HFGlm46VImageProcessor,
+            )
+
+            self._transformers_image_processor = HFGlm46VImageProcessor(
+                patch_size=self.patch_size,
+                temporal_patch_size=self.temporal_patch_size,
+                merge_size=self.merge_size,
+                size={
+                    "shortest_edge": self.min_pixels,
+                    "longest_edge": self.max_pixels,
+                },
+                do_rescale=self.do_rescale,
+                rescale_factor=self.rescale_factor,
+                do_normalize=self.do_normalize,
+                image_mean=self.image_mean,
+                image_std=self.image_std,
+                do_convert_rgb=self.do_convert_rgb,
+            )
+        except Exception:
+            self._transformers_image_processor = None
+        return self._transformers_image_processor
+
+    def _process_with_transformers_backend(self, images):
+        image_processor = self._get_transformers_image_processor()
+        if image_processor is None:
+            return None
+
+        try:
+            import torch
+
+            outputs = image_processor(images=images)
+            return {
+                name: (
+                    value.detach().cpu().numpy()
+                    if isinstance(value, torch.Tensor)
+                    else np.asarray(value)
+                )
+                for name, value in outputs.items()
+            }
+        except Exception:
+            return None
+
+    def _process_one(self, image: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+        C, H, W = image.shape
+        factor = self.patch_size * self.merge_size
+        resized_h, resized_w = smart_resize(
+            num_frames=self.temporal_patch_size,
+            height=H,
+            width=W,
+            temporal_factor=self.temporal_patch_size,
+            factor=factor,
+            min_pixels=self.min_pixels,
+            max_pixels=self.max_pixels,
+        )
+
+        frame = _resize_video_frames(image[None, ...], resized_h, resized_w)[0]
+        patches = frame.astype(np.float32)
+        if self.do_rescale and frame.dtype == np.uint8:
+            patches = patches * self.rescale_factor
+        if self.do_normalize:
+            mean = np.array(self.image_mean, dtype=np.float32)[:, None, None]
+            std = np.array(self.image_std, dtype=np.float32)[:, None, None]
+            patches = (patches - mean) / std
+
+        patches = np.repeat(patches[None, None, ...], self.temporal_patch_size, axis=1)
+
+        grid_t = 1
+        grid_h = resized_h // self.patch_size
+        grid_w = resized_w // self.patch_size
+        ps = self.patch_size
+        tps = self.temporal_patch_size
+        ms = self.merge_size
+
+        patches = patches.reshape(
+            1,
+            grid_t,
+            tps,
+            C,
+            grid_h // ms,
+            ms,
+            ps,
+            grid_w // ms,
+            ms,
+            ps,
+        )
+        patches = patches.transpose(0, 1, 4, 7, 5, 8, 3, 2, 6, 9)
+        flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
+        return flatten[0], [grid_t, grid_h, grid_w]
+
+    def __call__(self, images, **kwargs):
+        transformers_outputs = self._process_with_transformers_backend(images)
+        if transformers_outputs is not None:
+            return transformers_outputs
+
+        if not isinstance(images, list):
+            images = [images]
+        all_patches = []
+        all_thw = []
+        for image in images:
+            if not (isinstance(image, np.ndarray) and image.ndim == 3):
+                image = _to_numpy_image(image)
+            patches, thw = self._process_one(image)
+            all_patches.append(patches)
+            all_thw.append(thw)
+        return {
+            "pixel_values": np.concatenate(all_patches, axis=0),
+            "image_grid_thw": np.array(all_thw, dtype=np.int64),
+        }
+
+    def preprocess(self, images, **kwargs):
+        return self(images, **kwargs)
+
+
+def _load_glm_ocr_json(pretrained_model_name_or_path, relative_name: str):
+    import json
+    from pathlib import Path
+
+    local = Path(pretrained_model_name_or_path) / relative_name
+    if local.exists():
+        return json.loads(local.read_text())
+    try:
+        from huggingface_hub import hf_hub_download
+
+        fetched = Path(hf_hub_download(pretrained_model_name_or_path, relative_name))
+        return json.loads(fetched.read_text())
+    except Exception:
+        return None
+
+
+def _glm_ocr_image_kwargs(pretrained_model_name_or_path):
+    proc_cfg = _load_glm_ocr_json(
+        pretrained_model_name_or_path, "processor_config.json"
+    )
+    raw = _load_glm_ocr_json(pretrained_model_name_or_path, "preprocessor_config.json")
+    raw = raw or {}
+    if proc_cfg:
+        raw.update(proc_cfg.get("image_processor", {}) or {})
+
+    out = {}
+    for key in (
+        "patch_size",
+        "temporal_patch_size",
+        "merge_size",
+        "image_mean",
+        "image_std",
+        "rescale_factor",
+        "do_rescale",
+        "do_normalize",
+        "do_convert_rgb",
+    ):
+        if key in raw:
+            out[key] = raw[key]
+
+    size = raw.get("size") or {}
+    if size.get("shortest_edge") is not None:
+        out["min_pixels"] = size["shortest_edge"]
+    if size.get("longest_edge") is not None:
+        out["max_pixels"] = size["longest_edge"]
+    return out
 
 
 class GlmOcrProcessor(ProcessorMixin):
@@ -20,6 +267,9 @@ class GlmOcrProcessor(ProcessorMixin):
     valid_kwargs = ["chat_template"]
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
+
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
 
     def __init__(
         self,
@@ -183,10 +433,7 @@ class GlmOcrProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load processor from pretrained model path."""
-        import json
-        from pathlib import Path
-
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from transformers import AutoTokenizer
 
         trust_remote_code = kwargs.pop("trust_remote_code", True)
 
@@ -199,24 +446,14 @@ class GlmOcrProcessor(ProcessorMixin):
 
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        # Read processor_config.json for correct init kwargs
-        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
-        proc_kwargs = {}
-        ip_overrides = {}
-        if proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
-            ip_cfg = proc_cfg.get("image_processor", {})
-            if "patch_size" in ip_cfg:
-                ip_overrides["patch_size"] = ip_cfg["patch_size"]
-            if "size" in ip_cfg:
-                ip_overrides["size"] = ip_cfg["size"]
-
-        image_processor = AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
-            **ip_overrides,
-            **kwargs,
+        proc_cfg = _load_glm_ocr_json(
+            pretrained_model_name_or_path, "processor_config.json"
+        )
+        proc_kwargs = proc_cfg or {}
+        proc_kwargs.pop("image_processor", None)
+        proc_kwargs.pop("processor_class", None)
+        image_processor = Glm46VImageProcessor(
+            **_glm_ocr_image_kwargs(pretrained_model_name_or_path)
         )
 
         return cls(
@@ -227,7 +464,7 @@ class GlmOcrProcessor(ProcessorMixin):
         )
 
 
-__all__ = ["GlmOcrProcessor"]
+__all__ = ["GlmOcrProcessor", "Glm46VImageProcessor", "smart_resize"]
 
 # Register the processor with AutoProcessor for the glm_ocr model type
 install_auto_processor_patch("glm_ocr", GlmOcrProcessor)

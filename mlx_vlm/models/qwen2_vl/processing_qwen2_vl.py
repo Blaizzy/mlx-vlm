@@ -13,6 +13,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..base import load_chat_template, to_mlx
+from ..qwen3_vl.processing_qwen3_vl import _pop_image_processor_kwargs
 
 
 class Qwen2VLProcessor(ProcessorMixin):
@@ -21,6 +22,10 @@ class Qwen2VLProcessor(ProcessorMixin):
     image_processor_class = "AutoImageProcessor"
     tokenizer_class = "AutoTokenizer"
     video_processor_class = "AutoVideoProcessor"
+
+    # Override the check_argument_for_proper_class method to allow for numpy processors
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
 
     def __init__(
         self,
@@ -70,9 +75,10 @@ class Qwen2VLProcessor(ProcessorMixin):
     ) -> BatchFeature:
         image_inputs = {}
         videos_inputs = {}
+        image_kwargs = _pop_image_processor_kwargs(kwargs)
 
         if images is not None:
-            image_inputs = self.image_processor(images=images)
+            image_inputs = self.image_processor(images=images, **image_kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
 
         if videos is not None:
@@ -134,10 +140,15 @@ class Qwen2VLProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import json
-        from pathlib import Path
+        from transformers import AutoTokenizer
 
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from ..qwen3_vl.processing_qwen3_vl import (
+            Qwen3VLImageProcessor,
+            Qwen3VLVideoProcessor,
+            _load_qwen_vl_json,
+            _qwen_vl_image_kwargs,
+            _qwen_vl_video_kwargs,
+        )
 
         kwargs.pop("use_fast", None)
         tokenizer = AutoTokenizer.from_pretrained(
@@ -145,46 +156,31 @@ class Qwen2VLProcessor(ProcessorMixin):
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
 
-        proc_cfg_path = Path(pretrained_model_name_or_path) / "processor_config.json"
-        ip_overrides = {}
-        if proc_cfg_path.exists():
-            with open(proc_cfg_path) as f:
-                proc_cfg = json.load(f)
-            ip_cfg = proc_cfg.get("image_processor", {})
-            if "patch_size" in ip_cfg:
-                ip_overrides["patch_size"] = ip_cfg["patch_size"]
-            if "size" in ip_cfg:
-                ip_overrides["size"] = ip_cfg["size"]
+        ip_cfg = _qwen_vl_image_kwargs(
+            pretrained_model_name_or_path,
+            default_patch_size=14,
+        )
+        vp_cfg = _qwen_vl_video_kwargs(
+            pretrained_model_name_or_path,
+            default_patch_size=14,
+        )
 
-        try:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                use_fast=False,
-                **ip_overrides,
-                **kwargs,
-            )
-        except ValueError:
-            image_processor = AutoImageProcessor.from_pretrained(
-                pretrained_model_name_or_path,
-                **ip_overrides,
-                **kwargs,
-            )
+        image_processor = Qwen3VLImageProcessor(**ip_cfg)
+        video_processor = Qwen3VLVideoProcessor(**vp_cfg)
 
-        video_processor = None
-        try:
-            from transformers import AutoVideoProcessor
-
-            video_processor = AutoVideoProcessor.from_pretrained(
-                pretrained_model_name_or_path, **kwargs
-            )
-        except (ImportError, ValueError, OSError):
-            pass
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or {}
+        )
+        chat_template = proc_cfg.get(
+            "chat_template", getattr(tokenizer, "chat_template", None)
+        )
 
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
             video_processor=video_processor,
-            chat_template=getattr(tokenizer, "chat_template", None),
+            chat_template=chat_template,
         )
 
 

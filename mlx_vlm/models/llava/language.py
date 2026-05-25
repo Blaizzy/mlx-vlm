@@ -172,6 +172,7 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        **kwargs,
     ):
         out = self.model(inputs, mask=mask, cache=cache, inputs_embeds=inputs_embeds)
         if self.config.tie_word_embeddings:
