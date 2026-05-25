@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from ..base import (
     LanguageModelOutput,

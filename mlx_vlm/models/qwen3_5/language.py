@@ -30,36 +30,12 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
         base=10000,
         mrope_section=[11, 11, 0],
     ):
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
-        )
-        mx.eval(inv_freq)
-        self.inv_freq = inv_freq
-
-        self.mrope_section = mrope_section
-
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        freqs_t = freqs[0]
-        for dim, offset in enumerate((1, 2), start=1):
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-    def __call__(self, x, position_ids):
-        if position_ids.ndim == 2:
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
-            )
-
-        inv_freq_expanded = mx.broadcast_to(
-            self.inv_freq[None, None, :, None].astype(mx.float32),
-            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
+        super().__init__(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            mrope_section=mrope_section,
+            style="interleaved",
         )
 
 
