@@ -1,6 +1,6 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import extract_text_from_content
+from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
 
 
 class TestExtractTextFromContent:
@@ -172,6 +172,81 @@ class TestApplyChatTemplateIntegration:
                     ],
                 }
             ]
+
+    def test_text_only_formats_regular_chat_message(self):
+        """Text-only models should use regular role/content messages with no image tokens."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            "Make a program to find pi",
+            return_messages=True,
+        )
+
+        assert result == [{"role": "user", "content": "Make a program to find pi"}]
+
+    def test_tool_call_arguments_json_string_is_normalized(self):
+        """OpenAI-style JSON-string tool call arguments should become dicts."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        messages = [
+            {"role": "user", "content": "Estimate pi."},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "calculate_pi",
+                            "arguments": '{"method":"monte_carlo","samples":1000}',
+                        },
+                    }
+                ],
+            },
+        ]
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            messages,
+            return_messages=True,
+        )
+
+        arguments = result[1]["tool_calls"][0]["function"]["arguments"]
+        assert arguments == {"method": "monte_carlo", "samples": 1000}
+
+    def test_single_tool_call_dict_is_preserved(self):
+        """A single assistant message with tool_calls should keep tool metadata."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        prompt = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "calculate_pi",
+                        "arguments": '{"method":"nilakantha"}',
+                    },
+                }
+            ],
+        }
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "laguna"},
+            prompt,
+            return_messages=True,
+        )
+
+        assert result[0]["tool_calls"][0]["function"]["arguments"] == {
+            "method": "nilakantha"
+        }
 
     def test_multimodal_message_does_not_include_base64_in_prompt(self):
         """Critical regression test: base64 should NOT appear in formatted messages.
@@ -389,3 +464,23 @@ class TestExtractTextFromContentEdgeCases:
         ]
         result = extract_text_from_content(content)
         assert result == "Actual content"
+
+
+def test_apply_chat_template_uses_generic_text_model_fallback():
+    class TextProcessor:
+        chat_template = "{{ messages }}"
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True
+        ):
+            assert add_generation_prompt is True
+            assert messages == [{"role": "user", "content": "Hello"}]
+            return "templated"
+
+    result = apply_chat_template(
+        TextProcessor(),
+        {"model_type": "llama"},
+        "Hello",
+    )
+
+    assert result == "templated"

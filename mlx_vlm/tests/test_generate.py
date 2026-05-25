@@ -17,6 +17,7 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    PromptProcessingBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
     normalize_resize_shape,
@@ -579,6 +580,29 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_tokens == len(prompt)
         assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
+        assert prompt_responses[0].cached_tokens == 0
+
+    def test_prompt_progress_reports_apc_cached_tokens(self):
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1, 2],
+            input_ids=[[4, 5], [6, 7, 8]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+            warm_cache=[],
+            apc_meta=[
+                {"full_input_ids": [1, 2, 3, 4, 5], "prefix_len": 3},
+                None,
+            ],
+        )
+        batch.record_prompt_time(0.5)
+
+        progress = batch.prompt_progress()
+
+        assert [p.prompt_tokens for p in progress] == [5, 3]
+        assert [p.cached_tokens for p in progress] == [3, 0]
 
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
@@ -1299,6 +1323,11 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
             repetition_penalty=1.15,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={3: -0.75},
         )
 
@@ -1310,7 +1339,9 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
         )
-        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+        mock_make_logits_processors.assert_called_once_with(
+            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
+        )
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -1344,6 +1375,12 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
         chat=False,
         verbose=False,
         eos_tokens=None,

@@ -9,10 +9,14 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.utils import quantize_model
 
+from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    get_model_and_args,
     load,
     load_image,
+    load_model,
+    load_processor,
     prepare_inputs,
     process_inputs_with_fallback,
     sanitize_weights,
@@ -382,6 +386,134 @@ def test_load_passes_revision():
         mock_get_model_path.assert_called_with(
             "repo", revision="abc", force_download=False
         )
+
+
+def test_get_model_and_args_routes_text_only_configs():
+    model_class, model_type = get_model_and_args({"model_type": "llama"})
+
+    assert model_class.__name__ == "mlx_vlm.models.text_only"
+    assert model_type == "text_only"
+
+
+def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
+    with pytest.raises(ValueError):
+        get_model_and_args(
+            {"model_type": "unknown-vlm", "vision_config": {"hidden_size": 16}},
+        )
+
+
+def test_load_model_routes_text_models_through_existing_loader():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeArgs:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeLM(nn.Module):
+        def __init__(self, args):
+            super().__init__()
+            self.model = nn.Linear(2, 2, bias=False)
+
+        def __call__(self, inputs, cache=None):
+            return self.model(inputs)
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True, strict=False)
+
+    assert getattr(model, "_is_text_model", False) is True
+
+
+def test_load_delegates_adapter_loading_to_trainer_entrypoint():
+    model = MagicMock()
+    adapted_model = MagicMock()
+    processor = MagicMock()
+
+    with (
+        patch("mlx_vlm.utils.get_model_path", return_value=Path("/tmp/model")),
+        patch("mlx_vlm.utils.load_model", return_value=model),
+        patch("mlx_vlm.utils.apply_lora_layers", return_value=adapted_model) as apply,
+        patch("mlx_vlm.utils.load_image_processor", return_value=None),
+        patch("mlx_vlm.utils.load_processor", return_value=processor),
+    ):
+        result_model, result_processor = load("model-id", adapter_path="adapter-dir")
+
+    apply.assert_called_once_with(model, "adapter-dir")
+    adapted_model.eval.assert_called_once()
+    assert result_model is adapted_model
+    assert result_processor is processor
+
+
+def test_load_processor_propagates_auto_processor_errors():
+    with patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError):
+        with pytest.raises(ValueError):
+            load_processor(Path("/tmp/model"), eos_token_ids=2)
+
+
+def test_text_only_model_provides_input_embeddings_and_wraps_logits():
+    class TinyInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(8, 3)
+            self.layers = []
+
+        def __call__(self, inputs, cache=None, input_embeddings=None):
+            if input_embeddings is not None:
+                return input_embeddings
+            return self.embed_tokens(inputs)
+
+    class TinyLM(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = TinyInner()
+            self.lm_head = nn.Linear(3, 4, bias=False)
+
+        def __call__(self, inputs, cache=None, input_embeddings=None):
+            return self.lm_head(self.model(inputs, cache, input_embeddings))
+
+    model = TextOnlyModel(TinyLM(), {"model_type": "llama", "eos_token_id": 2})
+    embeds = model.get_input_embeddings(mx.array([[1, 2]]))
+    output = model(mx.array([[1, 2]]), inputs_embeds=embeds.inputs_embeds)
+
+    assert embeds.inputs_embeds.shape == (1, 2, 3)
+    assert output.logits.shape == (1, 2, 4)
+    assert model.config.model_type == "llama"
+
+
+def test_text_only_language_model_uses_inner_embedding_path_when_outer_cannot():
+    class TinyInner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(8, 3)
+            self.layers = []
+
+        def __call__(self, inputs, cache=None, input_embeddings=None):
+            assert input_embeddings is not None
+            return input_embeddings
+
+    class OuterNoEmbeddingForward(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = TinyInner()
+            self.lm_head = nn.Linear(3, 4, bias=False)
+
+        def __call__(self, inputs, cache=None):
+            raise AssertionError("outer call should be bypassed for input embeddings")
+
+    model = TextOnlyModel(
+        OuterNoEmbeddingForward(), {"model_type": "gpt_oss", "eos_token_id": 2}
+    )
+    embeds = model.get_input_embeddings(mx.array([[1, 2]])).inputs_embeds
+    output = model.language_model(mx.array([[1, 2]]), inputs_embeds=embeds)
+
+    assert output.logits.shape == (1, 2, 4)
 
 
 def _make_test_image_bytes():

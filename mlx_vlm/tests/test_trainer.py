@@ -6,7 +6,7 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
-from mlx_vlm.trainer.sft_trainer import TrainingArgs, train
+from mlx_vlm.trainer.sft_trainer import TrainingArgs, iterate_batches, train
 
 
 class TestDataset(unittest.TestCase):
@@ -128,6 +128,32 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(len(dataset), len(self.mock_hf_dataset))
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
+
+
+class TestBatchCollation(unittest.TestCase):
+    def test_iterate_batches_concatenates_variable_length_pixel_values(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((2, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2]]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": mx.ones((3, 4)),
+                "image_grid_thw": mx.array([[1, 1, 3]]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertEqual(batch["input_ids"].shape, (2, 32))
+        self.assertEqual(batch["pixel_values"].shape, (5, 4))
+        self.assertTrue(
+            mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
+        )
 
 
 class TestTrainer(unittest.TestCase):

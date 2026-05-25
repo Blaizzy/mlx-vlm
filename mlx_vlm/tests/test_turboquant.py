@@ -3,7 +3,7 @@ import pytest
 
 from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.models.base import scaled_dot_product_attention
-from mlx_vlm.models.cache import ArraysCache, KVCache
+from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -182,6 +182,23 @@ def test_batch_turboquant_extend_pads_shorter_uniform_batch():
     assert longer.offset.tolist() == [5, 3]
     assert longer.left_padding.tolist() == [0, 2]
     assert longer._idx == 5
+
+
+def test_batch_turboquant_make_mask_matches_batch_kv_cache_with_left_padding():
+    left_padding = [2, 0]
+    cache = BatchTurboQuantKVCache(left_padding, bits=3.5)
+    reference = BatchKVCache(left_padding)
+    keys = mx.random.normal((2, 2, 5, 64))
+    values = mx.random.normal((2, 2, 5, 64))
+
+    cache.update_and_fetch(keys, values)
+    reference.update_and_fetch(keys, values)
+
+    mask = cache.make_mask(2, return_array=True, window_size=None)
+    reference_mask = reference.make_mask(2, return_array=True, window_size=None)
+
+    assert mask.shape == reference_mask.shape
+    assert mx.all(mask == reference_mask).item()
 
 
 def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():
