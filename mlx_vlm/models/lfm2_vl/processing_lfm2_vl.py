@@ -186,6 +186,7 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         "device",
         "disable_grouping",
         "return_tensors",
+        "input_data_format",
     ):
         image_processor_config.pop(key, None)
 
