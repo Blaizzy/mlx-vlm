@@ -334,9 +334,7 @@ class LanguageModel(nn.Module):
         llm_grid_w = int(grid_thw[2]) // spatial_merge_size
 
         image_seq_length = llm_grid_t * llm_grid_h * llm_grid_w
-        position_temporal = np.full(
-            (image_seq_length,), start_position, dtype=np.int64
-        )
+        position_temporal = np.full((image_seq_length,), start_position, dtype=np.int64)
         position_height = np.repeat(
             np.arange(
                 start_position,
@@ -378,12 +376,8 @@ class LanguageModel(nn.Module):
                 and attention_mask.shape[-1] == input_ids.shape[-1]
                 else None
             )
-            image_grids = (
-                image_grid_thw.tolist() if image_grid_thw is not None else []
-            )
-            video_grids = (
-                video_grid_thw.tolist() if video_grid_thw is not None else []
-            )
+            image_grids = image_grid_thw.tolist() if image_grid_thw is not None else []
+            video_grids = video_grid_thw.tolist() if video_grid_thw is not None else []
             image_index = 0
             video_index = 0
             for batch_idx, current_input_ids in enumerate(input_ids_list):
@@ -425,8 +419,7 @@ class LanguageModel(nn.Module):
                         text_len = end_idx - start_idx
                         text_positions = np.arange(text_len, dtype=np.int64)[None, :]
                         llm_pos_ids_list.append(
-                            np.broadcast_to(text_positions, (3, text_len))
-                            + current_pos
+                            np.broadcast_to(text_positions, (3, text_len)) + current_pos
                         )
                         current_pos += text_len
                         continue
