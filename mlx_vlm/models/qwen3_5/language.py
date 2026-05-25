@@ -116,6 +116,12 @@ def _precise_swiglu(h, gate, x):
     return (gate * x).astype(h.dtype)
 
 
+@partial(mx.compile, shapeless=True)
+def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
+    out = mx.sum(conv_input.astype(mx.float32) * weight[None, :, :], axis=1)
+    return out.astype(conv_input.dtype)[:, None, :]
+
+
 _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
     name="qwen3_5_target_verify_gemv",
     input_names=["x", "weight"],
@@ -757,6 +763,68 @@ def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
     )
 
 
+def _qwen3_5_left_padding_info(cache):
+    left_padding = getattr(cache, "left_padding", None)
+    if not (
+        isinstance(left_padding, mx.array)
+        and left_padding.ndim > 0
+        and left_padding.size > 0
+    ):
+        return None
+
+    cached = getattr(cache, "_qwen3_5_left_padding_info", None)
+    if cached is None or cached[0] is not left_padding:
+        pads = tuple(int(p) for p in left_padding.tolist())
+        cached = (left_padding, pads, max(pads) if pads else 0)
+        cache._qwen3_5_left_padding_info = cached
+    return cached[1], cached[2]
+
+
+def _qwen3_5_set_left_padding_info(cache, pads):
+    left_padding = getattr(cache, "left_padding", None)
+    if not isinstance(left_padding, mx.array):
+        return
+    pads = tuple(int(p) for p in pads)
+    cache._qwen3_5_left_padding_info = (
+        left_padding,
+        pads,
+        max(pads) if pads else 0,
+    )
+
+
+def _qwen3_5_advance_left_padding_info(cache, steps: int):
+    cached = getattr(cache, "_qwen3_5_left_padding_info", None)
+    if cached is None:
+        return
+    _left_padding, pads, _max_pad = cached
+    _qwen3_5_set_left_padding_info(cache, (p - steps for p in pads))
+
+
+def _qwen3_5_lengths_info(cache):
+    lengths = getattr(cache, "lengths", None)
+    if not (
+        isinstance(lengths, mx.array)
+        and lengths.ndim > 0
+        and lengths.size > 0
+    ):
+        return None
+    cached = getattr(cache, "_qwen3_5_lengths_info", None)
+    if cached is None or cached[0] is not lengths:
+        values = tuple(int(v) for v in lengths.tolist())
+        cached = (lengths, min(values) if values else 0)
+        cache._qwen3_5_lengths_info = cached
+    return cached[1]
+
+
+def _qwen3_5_advance_lengths_info(cache, steps: int):
+    lengths = getattr(cache, "lengths", None)
+    cached = getattr(cache, "_qwen3_5_lengths_info", None)
+    if cached is None or not isinstance(lengths, mx.array):
+        return
+    _lengths, min_value = cached
+    cache._qwen3_5_lengths_info = (lengths, min_value - steps)
+
+
 def _create_qwen3_5_ssm_mask(h: mx.array, cache):
     if not (cache and hasattr(cache, "make_mask")):
         return None
@@ -771,14 +839,17 @@ def _create_qwen3_5_ssm_mask(h: mx.array, cache):
             == batch_size
         ):
             return None
-        if int(left_padding.max().item()) <= 0:
+        left_padding_info = _qwen3_5_left_padding_info(cache)
+        max_left_padding = left_padding_info[1] if left_padding_info else 0
+        if max_left_padding <= 0:
             if lengths is None:
                 cache._qwen3_5_ssm_no_mask_batch_size = batch_size
             return None
         if hasattr(cache, "_qwen3_5_ssm_no_mask_batch_size"):
             delattr(cache, "_qwen3_5_ssm_no_mask_batch_size")
 
-    if isinstance(lengths, mx.array) and int(lengths.min().item()) >= h.shape[1]:
+    lengths_min = _qwen3_5_lengths_info(cache)
+    if lengths_min is not None and lengths_min >= h.shape[1]:
         return None
 
     return cache.make_mask(h.shape[1])
@@ -799,8 +870,9 @@ def _create_qwen3_5_attention_mask(h: mx.array, cache):
     ):
         padding_cache = getattr(cache, "_qwen3_5_left_padding_cache", None)
         if padding_cache is None or padding_cache[0] is not left_padding:
-            pads = [int(p) for p in left_padding.tolist()]
-            padding_cache = (left_padding, pads, max(pads))
+            left_padding_info = _qwen3_5_left_padding_info(cache)
+            pads = list(left_padding_info[0]) if left_padding_info else []
+            padding_cache = (left_padding, pads, max(pads) if pads else 0)
             cache._qwen3_5_left_padding_cache = padding_cache
         pads = padding_cache[1]
         if padding_cache[2] <= 0:
@@ -1173,6 +1245,19 @@ def _qwen3_5_ragged_sdpa_two_pass_2_kernel(dtype, v_size, blocks):
     )
 
 
+@lru_cache(maxsize=128)
+def _qwen3_5_cached_i32_array(values):
+    return mx.array(values, dtype=mx.int32)
+
+
+@lru_cache(maxsize=128)
+def _qwen3_5_cached_sdpa_scalars(scale: float, k_size: int):
+    return (
+        mx.array([scale], dtype=mx.float32),
+        mx.array([k_size], dtype=mx.int32),
+    )
+
+
 def _qwen3_5_ragged_decode_attention(
     queries: mx.array,
     keys: mx.array,
@@ -1192,6 +1277,7 @@ def _qwen3_5_ragged_decode_attention(
         return None
 
     batch, q_heads, _, d_size = queries.shape
+    pads = tuple(int(p) for p in pads)
     if len(pads) != batch or any(p < 0 for p in pads):
         return None
     kv_heads = keys.shape[1]
@@ -1213,9 +1299,8 @@ def _qwen3_5_ragged_decode_attention(
     queries = mx.contiguous(queries)
     keys = mx.contiguous(keys)
     values = mx.contiguous(values)
-    pads_array = mx.array(pads, dtype=mx.int32)
-    scale_array = mx.array([scale], dtype=mx.float32)
-    k_size_array = mx.array([k_size], dtype=mx.int32)
+    pads_array = _qwen3_5_cached_i32_array(pads)
+    scale_array, k_size_array = _qwen3_5_cached_sdpa_scalars(float(scale), int(k_size))
     template = [
         ("T", queries.dtype),
         ("D_SIZE", int(d_size)),
@@ -1277,14 +1362,10 @@ def _target_verify_left_padded_attention(
 
     pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
     if pads is None:
-        left_padding = getattr(cache, "left_padding", None)
-        if not (
-            isinstance(left_padding, mx.array)
-            and left_padding.ndim > 0
-            and int(left_padding.max().item()) > 0
-        ):
+        left_padding_info = _qwen3_5_left_padding_info(cache)
+        if left_padding_info is None or left_padding_info[1] <= 0:
             return None
-        pads = [int(p) for p in left_padding.tolist()]
+        pads = list(left_padding_info[0])
     if max(pads) <= 0:
         return None
 
@@ -1539,8 +1620,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._qwen3_5_decode_conv_weight = cached
 
         weight = cached[1]
-        out = mx.sum(conv_input.astype(mx.float32) * weight[None, :, :], axis=1)
-        return out.astype(self.conv1d.weight.dtype)[:, None, :]
+        return _qwen3_5_decode_depthwise_conv(conv_input, weight)
 
     def __call__(
         self,
@@ -1660,6 +1740,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             cache[1] = state
             if hasattr(cache, "advance"):
                 cache.advance(S)
+                _qwen3_5_advance_left_padding_info(cache, S)
+                _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
         return _target_verify_linear(
