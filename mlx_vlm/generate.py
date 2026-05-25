@@ -2005,7 +2005,6 @@ class GenerationBatch:
             return []
 
         tokens, lp_list, top_idx_list, top_lp_list = self._step()
-
         keep = []
         responses = []
         for i in range(len(self.uids)):
@@ -2149,6 +2148,28 @@ class SpeculativeGenerationBatch:
             return "length"
         return None
 
+    def _append_token_responses(
+        self,
+        responses: List[Response],
+        tok_list: List[Optional[int]],
+    ) -> None:
+        for row, token in enumerate(tok_list):
+            if token is None or self._finished[row]:
+                continue
+            token = int(token)
+            self._num_tokens[row] += 1
+            finish_reason = self._finish_reason(row, token)
+            if finish_reason is not None:
+                self._finished[row] = True
+            responses.append(
+                self.Response(
+                    uid=self._all_uids[row],
+                    token=token,
+                    token_logprob=0.0,
+                    finish_reason=finish_reason,
+                )
+            )
+
     def _start_rounds(self):
         if self._rounds_iter is not None:
             return
@@ -2208,7 +2229,7 @@ class SpeculativeGenerationBatch:
 
         self._start_rounds()
         try:
-            tok_list, _ = next(self._rounds_iter)
+            tok_list, round_meta = next(self._rounds_iter)
         except StopIteration:
             for row, done in enumerate(self._finished):
                 if not done:
@@ -2224,22 +2245,17 @@ class SpeculativeGenerationBatch:
             self._refresh_uids()
             return responses
 
-        for row, token in enumerate(tok_list):
-            if token is None or self._finished[row]:
-                continue
-            token = int(token)
-            self._num_tokens[row] += 1
-            finish_reason = self._finish_reason(row, token)
-            if finish_reason is not None:
-                self._finished[row] = True
-            responses.append(
-                self.Response(
-                    uid=self._all_uids[row],
-                    token=token,
-                    token_logprob=0.0,
-                    finish_reason=finish_reason,
-                )
-            )
+        self._append_token_responses(responses, tok_list)
+        while (
+            isinstance(round_meta, dict)
+            and int(round_meta.get("round_pos", 0)) + 1
+            < int(round_meta.get("round_len", 1))
+        ):
+            try:
+                tok_list, round_meta = next(self._rounds_iter)
+            except StopIteration:
+                break
+            self._append_token_responses(responses, tok_list)
 
         self._refresh_uids()
         return responses
@@ -3154,10 +3170,10 @@ class BatchGenerator:
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
-            draft_model=self.draft_model,
-            draft_kind=self.draft_kind,
-            draft_block_size=self.draft_block_size,
-            greedy_sampling=self.greedy_sampling,
+            draft_model=getattr(self, "draft_model", None),
+            draft_kind=getattr(self, "draft_kind", None),
+            draft_block_size=getattr(self, "draft_block_size", None),
+            greedy_sampling=getattr(self, "greedy_sampling", False),
         )
 
     def _build_apc_meta_for_cold(
@@ -3440,10 +3456,10 @@ class BatchGenerator:
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
                 apc_mode=self.apc_mode,
-                draft_model=self.draft_model,
-                draft_kind=self.draft_kind,
-                draft_block_size=self.draft_block_size,
-                greedy_sampling=self.greedy_sampling,
+                draft_model=getattr(self, "draft_model", None),
+                draft_kind=getattr(self, "draft_kind", None),
+                draft_block_size=getattr(self, "draft_block_size", None),
+                greedy_sampling=getattr(self, "greedy_sampling", False),
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
@@ -3786,7 +3802,8 @@ def _generate_batch(
 
 def main():
     args = parse_arguments()
-    mx.random.seed(args.seed)
+    seed = getattr(args, "seed", DEFAULT_SEED)
+    mx.random.seed(seed)
 
     if isinstance(args.image, str):
         args.image = [args.image]
@@ -3889,7 +3906,7 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
-                "seed": args.seed,
+                "seed": seed,
                 "vision_cache": vision_cache,
                 **kwargs,
             }
@@ -3920,7 +3937,7 @@ def main():
             "video": args.video,
             "fps": args.fps,
             "temperature": args.temperature,
-            "seed": args.seed,
+            "seed": seed,
             "max_tokens": args.max_tokens,
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,

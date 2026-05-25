@@ -496,6 +496,42 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
+def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
+    for bits in (4, 5):
+        mx.random.seed(170 + bits)
+        linears = [
+            nn.QuantizedLinear(512, out_dim, bias=False, group_size=64, bits=bits)
+            for out_dim in (64, 64, 16, 16)
+        ]
+        for linear in linears:
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+        x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
+
+        ref = tuple(linear(x) for linear in linears)
+        out = qwen_language._decode_quantized_linears_fused(tuple(linears), x)
+        mx.eval(*ref, *out)
+
+        assert out is not None
+        assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen3_5_decode_quantized_linear_batch_matches_singleton_rows():
+    for bits in (4, 5):
+        mx.random.seed(180 + bits)
+        linear = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=bits)
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+        x = mx.random.normal((4, 1, 512), dtype=mx.bfloat16)
+
+        ref = mx.concatenate([linear(x[row : row + 1]) for row in range(4)], axis=0)
+        out = qwen_language._decode_quantized_linear_batch(linear, x)
+        mx.eval(ref, out)
+
+        assert out is not None
+        assert bool(mx.array_equal(ref, out).item())
+
+
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
     mx.random.seed(16)
     linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
@@ -705,6 +741,30 @@ def test_qwen_gdn_verify_conv_matches_singleton_windows():
         axis=1,
     )
     out = layer._causal_conv1d_verify(conv_input, steps)
+    mx.eval(ref, out)
+
+    assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_gdn_decode_conv_matches_conv1d():
+    mx.random.seed(141)
+    config = SimpleNamespace(
+        hidden_size=16,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = qwen_language.Qwen3_5GatedDeltaNet(config)
+    layer.conv1d.weight = layer.conv1d.weight.astype(mx.bfloat16)
+    conv_input = mx.random.normal(
+        (3, layer.conv_kernel_size, layer.conv_dim), dtype=mx.bfloat16
+    )
+
+    ref = layer.conv1d(conv_input)
+    out = layer._causal_conv1d_decode(conv_input)
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())

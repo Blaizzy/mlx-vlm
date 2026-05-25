@@ -880,8 +880,19 @@ class ResponseGenerator:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
+                active_batch = bool(active)
+                coalesce_s = (
+                    get_speculative_batch_coalesce_s()
+                    if (
+                        not active_batch
+                        and self.draft_model is not None
+                        and self.draft_kind == "mtp"
+                    )
+                    else 0.0
+                )
                 new_items, should_stop = self._collect_pending_requests(
-                    active=bool(active)
+                    active=active_batch,
+                    coalesce_s=coalesce_s,
                 )
                 if should_stop:
                     break

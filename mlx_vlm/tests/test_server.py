@@ -2209,6 +2209,40 @@ class TestResponseGenerator:
         assert kwargs["compute_logprobs"] is False
         assert batch_state["instance"].next_active_sizes == [2]
 
+    def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
+        calls = []
+        draft_model = object()
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = draft_model
+            gen.draft_kind = "mtp"
+            gen.tokenizer = SimpleNamespace()
+
+        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
+            del idle_timeout
+            calls.append((active, coalesce_s))
+            return [], True
+
+        gen._initialize_model = fake_initialize_model
+        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
+        gen._collect_pending_requests = fake_collect_pending_requests
+
+        gen._run()
+
+        assert calls == [(False, 0.037)]
+
     def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
         created = []
         next_uid = [1]

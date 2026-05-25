@@ -17,6 +17,7 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    SpeculativeGenerationBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
     normalize_resize_shape,
@@ -609,6 +610,41 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6]
         assert batch._next_tokens.tolist() == [7, 7]
         assert model.calls == [{"return_hidden": True, "skip_logits": True}]
+
+    def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
+        def fake_rounds(*args, **kwargs):
+            del args, kwargs
+            yield [1, 10], {"round_pos": 0, "round_len": 2}
+            yield [2, 11], {"round_pos": 1, "round_len": 2}
+            yield [3, 12], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(generate_module, "run_speculative_server_rounds", fake_rounds)
+
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100, 200],
+            first_tokens=mx.array([0, 9], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[10, 10],
+            hidden=mx.zeros((2, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0], [9]], dtype=mx.int32),
+        )
+
+        first = batch.next()
+        assert [(r.uid, r.token) for r in first] == [(100, 0), (200, 9)]
+
+        second = batch.next()
+        assert [(r.uid, r.token) for r in second] == [
+            (100, 1),
+            (200, 10),
+            (100, 2),
+            (200, 11),
+        ]
 
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(

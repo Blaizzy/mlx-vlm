@@ -1018,7 +1018,7 @@ def _mtp_rounds_batch(
                         finished[orig] = True
                     if stop_check is not None and stop_check(orig, tok):
                         finished[orig] = True
-            yield tokens_out, None
+            yield tokens_out, {"round_pos": pos, "round_len": max_new}
 
         # Update bonus tokens and per-row positions
         for j in range(n_active):
