@@ -351,6 +351,30 @@ def test_turboquant_decode_attention_4bit_uses_paper_prod_key_codec():
     assert output.shape == queries.shape
 
 
+def _assert_mse_states_equal(left, right):
+    assert bool(mx.all(left.norms == right.norms).item())
+    assert bool(mx.all(left.indices == right.indices).item())
+
+
+@pytest.mark.parametrize("dim", [64, 128, 256])
+def test_turboquant_mse_prefill_decode_matches_batch_quantized_state(dim):
+    mx.random.seed(99)
+    keys = mx.random.normal((1, 8, 17, dim)).astype(mx.float16)
+    values = mx.random.normal((1, 8, 17, dim)).astype(mx.float16)
+
+    batch_cache = TurboQuantKVCache(bits=4.0)
+    batch_cache.update_and_fetch(keys, values)
+
+    split_cache = TurboQuantKVCache(bits=4.0)
+    split_cache.update_and_fetch(keys[:, :, :16, :], values[:, :, :16, :])
+    split_cache.update_and_fetch(keys[:, :, 16:17, :], values[:, :, 16:17, :])
+
+    batch_keys, batch_values = batch_cache.state
+    split_keys, split_values = split_cache.state
+    _assert_mse_states_equal(batch_keys, split_keys)
+    _assert_mse_states_equal(batch_values, split_values)
+
+
 def test_turboquant_decode_attention_integer_separate_path_bypasses_fused(monkeypatch):
     if not mx.metal.is_available():
         pytest.skip("Metal kernels are unavailable on this host")
