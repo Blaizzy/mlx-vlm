@@ -2000,13 +2000,31 @@ class LanguageModel(nn.Module):
         block_size: int,
     ) -> int:
         if isinstance(accepted, int):
-            accepted = mx.array([accepted])
+            accepted_list = [int(accepted)]
+        elif isinstance(accepted, mx.array):
+            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
+        else:
+            accepted_list = [int(x) for x in accepted]
 
-        max_a = int(accepted.max().item())
+        max_a = max(accepted_list)
         n = max_a + 1
         trim = block_size - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
+        is_batch = len(accepted_list) > 1
+        valid_ends_list = [a + 1 for a in accepted_list]
+        accepted_mx = None
+        valid_ends_mx = None
+
+        def accepted_array():
+            nonlocal accepted_mx
+            if accepted_mx is None:
+                accepted_mx = mx.array(accepted_list, dtype=mx.int32)
+            return accepted_mx
+
+        def valid_ends_array():
+            nonlocal valid_ends_mx
+            if valid_ends_mx is None:
+                valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
+            return valid_ends_mx
 
         # Separate trimmable (KV) caches from SSM caches.
         ssm_caches = []
@@ -2018,8 +2036,8 @@ class LanguageModel(nn.Module):
                     c.trim(trim)
                 right_trimmed = False
                 if is_batch and max_a > 0:
-                    extra_trim = max_a - accepted
-                    if int(extra_trim.max().item()) > 0:
+                    extra_trim_list = [max_a - a for a in accepted_list]
+                    if any(extra_trim_list):
                         prepare = getattr(c, "prepare", None)
                         finalize = getattr(c, "finalize", None)
                         if (
@@ -2027,11 +2045,7 @@ class LanguageModel(nn.Module):
                             and callable(prepare)
                             and callable(finalize)
                         ):
-                            prepare(
-                                right_padding=[
-                                    int(extra) for extra in extra_trim.tolist()
-                                ]
-                            )
+                            prepare(right_padding=extra_trim_list)
                             finalize()
                             right_trimmed = True
                 if (
@@ -2042,10 +2056,9 @@ class LanguageModel(nn.Module):
                     and max_a > 0
                 ):
                     kv_len = c._idx
-                    ve = valid_ends.tolist()
                     verify_start = kv_len - n
-                    for bi in range(accepted.shape[0]):
-                        start = verify_start + int(ve[bi])
+                    for bi, ve in enumerate(valid_ends_list):
+                        start = verify_start + ve
                         if start < kv_len:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
@@ -2056,7 +2069,7 @@ class LanguageModel(nn.Module):
             return max_a
 
         if all(len(s) > 11 and s[11] is not None for s in gdn_states):
-            a0 = int(accepted[0].item()) if not is_batch else None
+            a0 = accepted_list[0] if not is_batch else None
             if is_batch:
                 intermediate_parts = []
                 conv_input_parts = []
@@ -2111,8 +2124,9 @@ class LanguageModel(nn.Module):
                 if len(set(kernel_sizes)) != 1:
                     raise ValueError("Qwen GDN layers must share conv kernel size.")
 
+                accepted_mx = accepted_array()
                 accepted_bat = mx.concatenate(
-                    [accepted.astype(mx.int32) for _ in ssm_caches], axis=0
+                    [accepted_mx for _ in ssm_caches], axis=0
                 )
                 state_bat, conv_bat = gated_delta_accept_states(
                     mx.concatenate(intermediate_parts, axis=0),
@@ -2187,7 +2201,7 @@ class LanguageModel(nn.Module):
             a_list.append(a)
             b_list.append(b)
             if is_batch:
-                steps_list.append(valid_ends.astype(mx.int32))
+                steps_list.append(valid_ends_array())
             else:
                 steps_list.append(mx.full((batch_rows,), n, dtype=mx.int32))
             A_log_list.append(
@@ -2242,7 +2256,7 @@ class LanguageModel(nn.Module):
         )
 
         # Scatter results back to individual caches.
-        a0 = int(accepted[0].item()) if not is_batch else None
+        a0 = accepted_list[0] if not is_batch else None
         state_offset = 0
         for j, c in enumerate(ssm_caches):
             batch_rows = layer_batch_sizes[j]
@@ -2250,13 +2264,12 @@ class LanguageModel(nn.Module):
             state_offset += batch_rows
             conv_input, K = conv_data[j]
             if is_batch:
-                acc_list = accepted.tolist()
                 slices = [
                     conv_input[
                         bi : bi + 1,
-                        int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
+                        accepted_list[bi] + 1 : accepted_list[bi] + K,
                     ]
-                    for bi in range(accepted.shape[0])
+                    for bi in range(len(accepted_list))
                 ]
                 c[0] = mx.concatenate(slices, axis=0)
             else:

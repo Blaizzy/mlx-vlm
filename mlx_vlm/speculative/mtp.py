@@ -662,7 +662,7 @@ def _mtp_rounds(
         next_shared_kv = _slice_shared_kv_after_reject(
             verify.shared_kv_states, bs - (accepted + 1)
         )
-        kv_offset = _mtp_cache_offset_max(prompt_cache)
+        kv_offset += accepted + 1
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset,
@@ -975,7 +975,6 @@ def _mtp_rounds_batch(
         )
 
         max_a = max(accepted_list)
-        accepted_arr = mx.array(accepted_list)
 
         accept_verified = getattr(draft_model, "accept_verified_tokens_batch", None)
         if callable(accept_verified):
@@ -1032,7 +1031,7 @@ def _mtp_rounds_batch(
         if any(a < bs - 1 for a in accepted_list):
             with mx.stream(generation_stream):
                 lm.rollback_speculative_cache(
-                    prompt_cache, verify.gdn_states, accepted_arr, bs
+                    prompt_cache, verify.gdn_states, accepted_list, bs
                 )
 
         # Slice + tail-zero ``verify.shared_kv_states`` to match the
@@ -1098,7 +1097,7 @@ def _mtp_rounds_batch(
 
         # Re-bind drafter with new shared_kv and per-row positions.
         positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
-        new_kv_offset = _mtp_cache_offset_max(prompt_cache)
+        new_kv_offset = max(positions_active) if positions_active else 0
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset=new_kv_offset,
