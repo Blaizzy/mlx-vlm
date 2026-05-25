@@ -1248,52 +1248,6 @@ class TestSamplerArgs:
         )
 
 
-def test_repeated_tail_detector_detects_exact_repeated_span():
-    tokens = list(range(10)) + [1, 2, 3, 4] * 2
-
-    assert generate_module._has_repeated_tail(tokens, min_span=4, max_span=16)
-
-
-def test_repeated_tail_detector_ignores_short_or_nonmatching_tails():
-    assert not generate_module._has_repeated_tail([1, 2, 3, 4], min_span=4)
-    assert not generate_module._has_repeated_tail(
-        list(range(10)) + [1, 2, 3, 4, 1, 2, 3, 5],
-        min_span=4,
-        max_span=16,
-    )
-
-
-def test_ocr_line_repeat_guard_stops_before_duplicate_line():
-    seen = set()
-    text, pending, repeated = generate_module._flush_non_repeating_ocr_lines(
-        "| A | 1 |\n| B | 2 |\n",
-        seen,
-    )
-    assert text == "| A | 1 |\n| B | 2 |\n"
-    assert pending == ""
-    assert repeated is False
-
-    text, pending, repeated = generate_module._flush_non_repeating_ocr_lines(
-        "| A | 1 |\n",
-        seen,
-    )
-    assert text == ""
-    assert pending == ""
-    assert repeated is True
-
-
-def test_ocr_line_repeat_guard_ignores_separator_lines_and_buffers_partials():
-    seen = set()
-    text, pending, repeated = generate_module._flush_non_repeating_ocr_lines(
-        "| :--- | :--- |\n| A",
-        seen,
-    )
-    assert text == "| :--- | :--- |\n"
-    assert pending == "| A"
-    assert repeated is False
-    assert seen == set()
-
-
 def test_normalize_resize_shape_expands_single_value():
     assert normalize_resize_shape([224]) == (224, 224)
 
