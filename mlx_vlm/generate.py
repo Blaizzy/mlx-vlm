@@ -55,6 +55,57 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+GLM_OCR_REPEAT_STOP_MIN_SPAN = 8
+GLM_OCR_REPEAT_STOP_MAX_SPAN = 256
+
+
+def _has_repeated_tail(
+    tokens: List[int],
+    min_span: int = GLM_OCR_REPEAT_STOP_MIN_SPAN,
+    max_span: int = GLM_OCR_REPEAT_STOP_MAX_SPAN,
+) -> bool:
+    """Return True when the generated token tail is an exact repeated span."""
+    token_count = len(tokens)
+    if token_count < min_span * 2:
+        return False
+
+    max_span = min(max_span, token_count // 2)
+    for span in range(max_span, min_span - 1, -1):
+        if tokens[-span:] == tokens[-2 * span : -span]:
+            return True
+    return False
+
+
+def _normalize_ocr_line_for_repeat_check(line: str) -> str:
+    line = line.strip()
+    if not line:
+        return ""
+    if set(line) <= {"|", ":", "-", " "}:
+        return ""
+    return " ".join(line.split())
+
+
+def _flush_non_repeating_ocr_lines(
+    pending_text: str,
+    seen_lines: set,
+) -> Tuple[str, str, bool]:
+    """Return completed non-repeating lines, remaining text, and repeat flag."""
+    parts = pending_text.splitlines(keepends=True)
+    if parts and not parts[-1].endswith(("\n", "\r")):
+        remainder = parts.pop()
+    else:
+        remainder = ""
+
+    accepted = []
+    for line in parts:
+        key = _normalize_ocr_line_for_repeat_check(line)
+        if key:
+            if key in seen_lines:
+                return "".join(accepted), "", True
+            seen_lines.add(key)
+        accepted.append(line)
+
+    return "".join(accepted), remainder, False
 
 
 def parse_arguments():
@@ -1109,6 +1160,14 @@ def stream_generate(
         tic = time.perf_counter()
 
         generated_tokens = []
+        model_type = str(getattr(model.config, "model_type", "")).lower()
+        stop_repeated_tail = (
+            model_type == "glm_ocr"
+            and float(kwargs.get("temperature", DEFAULT_TEMPERATURE) or 0) == 0
+        )
+        pending_ocr_text = ""
+        seen_ocr_lines = set()
+        suppressed_repeated_tail = False
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -1129,6 +1188,8 @@ def stream_generate(
                         logger.warning("APC exact-cache store failed: %s", e)
 
             generated_tokens.append(token)
+            if stop_repeated_tail and _has_repeated_tail(generated_tokens):
+                break
 
             # Check thinking budget and force token if needed
             if thinking_criteria is not None:
@@ -1139,10 +1200,25 @@ def stream_generate(
                 break
 
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
+            segment = detokenizer.last_segment
+            stop_after_yield = False
+
+            if stop_repeated_tail:
+                pending_ocr_text += segment
+                segment, pending_ocr_text, repeated_line = (
+                    _flush_non_repeating_ocr_lines(pending_ocr_text, seen_ocr_lines)
+                )
+                if repeated_line:
+                    suppressed_repeated_tail = True
+                    stop_after_yield = True
+                    if not segment:
+                        break
+                elif not segment:
+                    continue
 
             # Yield the last segment if streaming
             yield GenerationResult(
-                text=detokenizer.last_segment,
+                text=segment,
                 token=token,
                 logprobs=logprobs,
                 prompt_tokens=total_prompt_tokens,
@@ -1153,10 +1229,17 @@ def stream_generate(
                 peak_memory=mx.get_peak_memory() / 1e9,
                 cached_tokens=reused_prefix_len,
             )
+            if stop_after_yield:
+                break
 
         detokenizer.finalize()
+        final_segment = detokenizer.last_segment
+        if stop_repeated_tail:
+            final_segment = (
+                "" if suppressed_repeated_tail else pending_ocr_text + final_segment
+            )
         yield GenerationResult(
-            text=detokenizer.last_segment,
+            text=final_segment,
             token=token,
             logprobs=logprobs,
             prompt_tokens=total_prompt_tokens,
