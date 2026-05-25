@@ -4975,15 +4975,7 @@ class TurboQuantKVCache(_BaseCache):
         ):
             return None, None
 
-        # _fused_kv_quantize_kernel rotates with the dense matrix
-        # (self.key_codec.rotation), but _TurboQuantMSECodec.quantize uses the
-        # Hadamard transform whenever use_rht is True (power-of-2 dims). The
-        # two are different orthogonal projections, so mixing this fast path
-        # with prefill via codec.quantize stores indices in two incompatible
-        # bases and corrupts the decode-attention output. Skip the fast path
-        # for use_rht codecs until the kernel is taught to apply Hadamard
-        # externally (the way _TurboQuantMSECodec.quantize does for L=1 via
-        # _fused_norot_quantize_kernel).
+        # RHT codecs use Hadamard rotation; this fused kernel applies dense rotation.
         if self.key_codec.use_rht or self.value_codec.use_rht:
             return None, None
 
