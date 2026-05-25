@@ -322,6 +322,37 @@ class LanguageModel(nn.Module):
         self._rope_deltas = None
         self._position_ids = None
 
+    def get_vision_position_ids(
+        self,
+        start_position: int,
+        grid_thw: list[int],
+        temp_merge_size: int = 1,
+    ):
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        llm_grid_t = int(grid_thw[0]) // temp_merge_size
+        llm_grid_h = int(grid_thw[1]) // spatial_merge_size
+        llm_grid_w = int(grid_thw[2]) // spatial_merge_size
+
+        image_seq_length = llm_grid_t * llm_grid_h * llm_grid_w
+        position_temporal = np.full((image_seq_length,), start_position, dtype=np.int64)
+        position_height = np.repeat(
+            np.arange(
+                start_position,
+                start_position + llm_grid_h,
+                dtype=np.int64,
+            ),
+            llm_grid_w * llm_grid_t,
+        )
+        position_width = np.tile(
+            np.arange(
+                start_position,
+                start_position + llm_grid_w,
+                dtype=np.int64,
+            ),
+            llm_grid_h * llm_grid_t,
+        )
+        return np.stack([position_temporal, position_height, position_width], axis=0)
+
     def get_rope_index(
         self,
         input_ids: mx.array,
@@ -330,149 +361,105 @@ class LanguageModel(nn.Module):
         attention_mask: Optional[mx.array] = None,
     ):
         batch_size, seq_length = input_ids.shape
-        position_ids = mx.arange(seq_length, dtype=mx.int32)
-        position_ids = mx.broadcast_to(position_ids[None, :], (batch_size, seq_length))
+        position_ids_np = np.zeros((3, batch_size, seq_length), dtype=np.int64)
         spatial_merge_size = self.config.vision_config.spatial_merge_size
         image_token_id = self.config.image_token_id
         video_token_id = self.config.video_token_id
-        image_start_token_id = self.config.image_start_token_id
         mrope_position_deltas = []
         if input_ids is not None and (
             image_grid_thw is not None or video_grid_thw is not None
         ):
-            total_input_ids = input_ids
-            if (
-                attention_mask is None
-                or attention_mask.shape[-1] != input_ids.shape[-1]
-            ):
-                attention_mask = mx.ones_like(input_ids)
-            position_ids = mx.ones(
-                (3, input_ids.shape[0], input_ids.shape[1]), dtype=input_ids.dtype
+            input_ids_list = input_ids.tolist()
+            attention_mask_list = (
+                attention_mask.tolist()
+                if attention_mask is not None
+                and attention_mask.shape[-1] == input_ids.shape[-1]
+                else None
             )
-            image_index, video_index = 0, 0
-            for i, input_ids in enumerate(total_input_ids):
-                input_ids = mx.where(
-                    attention_mask[i] == 1, input_ids, mx.zeros_like(input_ids)
-                )
-                image_nums, video_nums = 0, 0
-                vision_start_indices = mx.sum(
-                    mx.where(
-                        input_ids == image_start_token_id,
-                        mx.arange(input_ids.shape[0]),
-                        mx.zeros_like(input_ids),
-                    )
-                )
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum().item()
-                video_nums = (vision_tokens == video_token_id).sum().item()
-                input_tokens = input_ids.tolist()
+            image_grids = image_grid_thw.tolist() if image_grid_thw is not None else []
+            video_grids = video_grid_thw.tolist() if video_grid_thw is not None else []
+            image_index = 0
+            video_index = 0
+            for batch_idx, current_input_ids in enumerate(input_ids_list):
+                if attention_mask_list is not None:
+                    valid_indices = [
+                        i
+                        for i, m in enumerate(attention_mask_list[batch_idx])
+                        if m == 1
+                    ]
+                    current_input_ids = [current_input_ids[i] for i in valid_indices]
+                else:
+                    valid_indices = list(range(len(current_input_ids)))
+
+                token_types = []
+                for token_id in current_input_ids:
+                    if token_id == image_token_id:
+                        token_types.append(1)
+                    elif token_id == video_token_id:
+                        token_types.append(2)
+                    else:
+                        token_types.append(0)
+
+                groups = []
+                if token_types:
+                    start = 0
+                    current_type = token_types[0]
+                    for idx, token_type in enumerate(token_types[1:], start=1):
+                        if token_type != current_type:
+                            groups.append((current_type, start, idx))
+                            start = idx
+                            current_type = token_type
+                    groups.append((current_type, start, len(token_types)))
+
+                current_pos = 0
+                video_group_index = 0
                 llm_pos_ids_list: list = []
-                st = 0
-                remain_images, remain_videos = image_nums, video_nums
-                for _ in range(image_nums + video_nums):
-                    if image_token_id in input_tokens and remain_images > 0:
-                        ed_image = input_tokens.index(image_token_id, st)
-                    else:
-                        ed_image = len(input_tokens) + 1
-                    if video_token_id in input_tokens and remain_videos > 0:
-                        ed_video = input_tokens.index(video_token_id, st)
-                    else:
-                        ed_video = len(input_tokens) + 1
-                    if ed_image < ed_video:
-                        t, h, w = (
-                            image_grid_thw[image_index][0],
-                            image_grid_thw[image_index][1],
-                            image_grid_thw[image_index][2],
+                for modality_type, start_idx, end_idx in groups:
+                    if modality_type == 0:
+                        text_len = end_idx - start_idx
+                        text_positions = np.arange(text_len, dtype=np.int64)[None, :]
+                        llm_pos_ids_list.append(
+                            np.broadcast_to(text_positions, (3, text_len)) + current_pos
                         )
+                        current_pos += text_len
+                        continue
+
+                    if modality_type == 2:
+                        grid_thw = video_grids[video_index]
+                        video_group_index += 1
+                        if video_group_index >= int(grid_thw[0]):
+                            video_index += 1
+                            video_group_index = 0
+                    else:
+                        grid_thw = image_grids[image_index]
                         image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t, h, w = (
-                            video_grid_thw[video_index][0],
-                            video_grid_thw[video_index][1],
-                            video_grid_thw[video_index][2],
-                        )
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-                    llm_grid_t, llm_grid_h, llm_grid_w = (
-                        t.item(),
-                        h.item() // spatial_merge_size,
-                        w.item() // spatial_merge_size,
-                    )
-                    text_len = ed - st
-                    st_idx = (
-                        llm_pos_ids_list[-1].max() + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
-                    )
-                    index = mx.arange(text_len).reshape(1, text_len)
-                    index = mx.broadcast_to(index, (3, text_len))
-                    index = index + st_idx
-                    llm_pos_ids_list.append(index)
-                    t_index = mx.arange(llm_grid_t).reshape(llm_grid_t, 1)
-                    t_index = mx.broadcast_to(
-                        t_index, (llm_grid_t, llm_grid_h * llm_grid_w)
-                    )
-                    t_index = t_index.flatten()
 
-                    h_index = mx.arange(llm_grid_h).reshape(1, llm_grid_h, 1)
-                    h_index = mx.broadcast_to(
-                        h_index, (llm_grid_t, llm_grid_h, llm_grid_w)
-                    )
-                    h_index = h_index.flatten()
-
-                    w_index = mx.arange(llm_grid_w).reshape(1, 1, llm_grid_w)
-                    w_index = mx.broadcast_to(
-                        w_index, (llm_grid_t, llm_grid_h, llm_grid_w)
-                    )
-                    w_index = w_index.flatten()
-
+                    temp_merge_size = int(grid_thw[0])
                     llm_pos_ids_list.append(
-                        mx.stack([t_index, h_index, w_index]) + text_len + st_idx
+                        self.get_vision_position_ids(
+                            current_pos,
+                            grid_thw,
+                            temp_merge_size=temp_merge_size,
+                        )
                     )
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-                if st < len(input_tokens):
-                    st_idx = (
-                        llm_pos_ids_list[-1].max() + 1
-                        if len(llm_pos_ids_list) > 0
-                        else 0
+                    current_pos += max(int(grid_thw[1]), int(grid_thw[2])) // (
+                        spatial_merge_size
                     )
-                    text_len = len(input_tokens) - st
 
-                    t_index = mx.arange(text_len).reshape(1, text_len)
-                    t_index = mx.broadcast_to(t_index, (3, text_len))
-
-                    llm_pos_ids_list.append(t_index + st_idx)
-
-                llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                mask = mx.array(attention_mask[i] == 1)
-                expanded_mask = mx.expand_dims(mask, axis=0)
-                expanded_mask = mx.broadcast_to(expanded_mask, (3, 1, mask.shape[0]))
-                expanded_positions = mx.expand_dims(llm_positions, axis=1)
-                new_positions = mx.where(
-                    expanded_mask, expanded_positions, position_ids[:, i : i + 1, :]
-                )
-                updated_position_ids = mx.concatenate(
-                    [
-                        position_ids[:, :i, :],
-                        new_positions,
-                        position_ids[:, i + 1 :, :],
-                    ],
-                    axis=1,
-                )
-                position_ids = updated_position_ids
+                llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
+                position_ids_np[:, batch_idx, valid_indices] = llm_positions
                 mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
+                    int(llm_positions.max()) + 1 - len(current_input_ids)
                 )
-            mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
-            return position_ids, mrope_position_deltas
+            return (
+                mx.array(position_ids_np, dtype=input_ids.dtype),
+                mx.array(mrope_position_deltas, dtype=input_ids.dtype).reshape(-1, 1),
+            )
         else:
             if attention_mask is not None:
                 position_ids = mx.cumsum(attention_mask.astype(mx.int64), axis=-1) - 1
                 position_ids = mx.where(
-                    attention_mask == 0, mx.ones_like(position_ids), position_ids
+                    attention_mask == 0, mx.zeros_like(position_ids), position_ids
                 )
                 max_position_ids = position_ids.max(axis=-1, keepdims=True)
                 position_ids = mx.broadcast_to(
@@ -533,19 +520,24 @@ class LanguageModel(nn.Module):
                 or cache[0] is None
                 or (cache_offsets is None and cache_offset == 0)
             )
-            if is_prefill or self._rope_deltas is None:
-                # Use cached position_ids if available (pre-computed in get_input_embeddings)
-                if self._position_ids is not None:
-                    seq_length = inputs.shape[1]
-                    position_ids = self._position_ids[
-                        :, :, cache_offset : cache_offset + seq_length
-                    ]
-                else:
+            seq_length = inputs.shape[1]
+            if (
+                self._position_ids is not None
+                and cache_offsets is None
+                and cache_offset + seq_length <= self._position_ids.shape[-1]
+            ):
+                position_ids = self._position_ids[
+                    :, :, cache_offset : cache_offset + seq_length
+                ]
+            elif is_prefill or self._rope_deltas is None:
+                if self._position_ids is None:
                     position_ids, rope_deltas = self.get_rope_index(
                         inputs, image_grid_thw, video_grid_thw, rope_mask
                     )
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
+                else:
+                    position_ids = self._position_ids[:, :, :seq_length]
             else:
                 # Use the prev pre-calculated rope-deltas to get the correct position ids
                 batch_size, seq_length = inputs.shape
