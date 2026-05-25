@@ -793,6 +793,9 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
+    image = image or None
+    audio = audio or None
+    video = video or None
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
