@@ -1,9 +1,125 @@
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
+
+
+def _copy_rng_state() -> List[mx.array]:
+    return [mx.array(state) for state in mx.random.state]
+
+
+def _restore_rng_state(state: List[mx.array]) -> None:
+    for i, value in enumerate(state):
+        mx.random.state[i] = value
+
+
+def _append_arrays(value: Any, arrays: List[mx.array]) -> None:
+    if isinstance(value, mx.array):
+        arrays.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _append_arrays(item, arrays)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _append_arrays(item, arrays)
+
+
+def _draft_sampler_state_arrays(draft_model: nn.Module) -> List[mx.array]:
+    attrs = getattr(draft_model, "sampler_state_attrs", ("_seed_token",))
+    if isinstance(attrs, str):
+        attrs = (attrs,)
+
+    arrays = []
+    for attr in attrs:
+        value = getattr(draft_model, attr, None)
+        if isinstance(value, mx.array):
+            arrays.append(value)
+    return arrays
+
+
+class _SpeculativeSamplerRNG:
+    """Keep target and drafter sampler RNG streams independent."""
+
+    def __init__(self, draft_model: nn.Module, *, enabled: bool):
+        self.draft_model = draft_model
+        self.enabled = bool(enabled)
+        self._target_rng_state = _copy_rng_state() if self.enabled else None
+        self._draft_rng_state = _copy_rng_state() if self.enabled else None
+
+    def draft_call(
+        self,
+        fn: Callable,
+        *args,
+        **kwargs,
+    ):
+        if not self.enabled:
+            return fn(*args, **kwargs)
+
+        self._target_rng_state = _copy_rng_state()
+        _restore_rng_state(self._draft_rng_state)
+        result = fn(*args, **kwargs)
+
+        arrays = _draft_sampler_state_arrays(self.draft_model)
+        arrays.extend(mx.random.state)
+        if arrays:
+            mx.async_eval(*arrays)
+
+        self._draft_rng_state = _copy_rng_state()
+        _restore_rng_state(self._target_rng_state)
+        return result
+
+    def draft_tokens(self, fn: Callable, *args, **kwargs):
+        if not self.enabled:
+            result = fn(*args, **kwargs)
+            arrays: List[mx.array] = []
+            _append_arrays(result, arrays)
+            if arrays:
+                mx.async_eval(*arrays)
+            return result
+
+        self._target_rng_state = _copy_rng_state()
+        _restore_rng_state(self._draft_rng_state)
+        result = fn(*args, **kwargs)
+
+        arrays = []
+        _append_arrays(result, arrays)
+        arrays.extend(_draft_sampler_state_arrays(self.draft_model))
+        arrays.extend(mx.random.state)
+        if arrays:
+            mx.async_eval(*arrays)
+
+        self._draft_rng_state = _copy_rng_state()
+        _restore_rng_state(self._target_rng_state)
+        return result
+
+    def target_sampled(self, *, sync_draft: bool = False) -> None:
+        if self.enabled:
+            self._target_rng_state = _copy_rng_state()
+            if sync_draft:
+                self._draft_rng_state = _copy_rng_state()
+
+    def sync_draft_to_target(self) -> None:
+        if self.enabled:
+            self._draft_rng_state = _copy_rng_state()
+
+    def target_eval(self, *values: Any) -> None:
+        if not self.enabled:
+            arrays: List[mx.array] = []
+            for value in values:
+                _append_arrays(value, arrays)
+            if arrays:
+                mx.async_eval(*arrays)
+            return
+
+        arrays = []
+        for value in values:
+            _append_arrays(value, arrays)
+        arrays.extend(mx.random.state)
+        if arrays:
+            mx.async_eval(*arrays)
+        self._target_rng_state = _copy_rng_state()
 
 
 def _speculative_walk(

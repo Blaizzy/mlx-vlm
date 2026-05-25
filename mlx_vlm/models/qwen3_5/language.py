@@ -13,7 +13,11 @@ from ..base import (
 )
 from ..cache import ArraysCache, KVCache
 from .config import ModelConfig, TextConfig
-from .gated_delta import gated_delta_state_update, gated_delta_update
+from .gated_delta import (
+    gated_delta_state_update,
+    gated_delta_update,
+    gated_delta_update_with_states,
+)
 
 
 class Qwen3_5RotaryEmbedding:
@@ -112,6 +116,174 @@ def _precise_swiglu(h, gate, x):
     return (gate * x).astype(h.dtype)
 
 
+_TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
+    name="qwen3_5_target_verify_gemv",
+    input_names=["x", "weight"],
+    output_names=["out"],
+    header="#include <metal_simdgroup>\nusing namespace metal;\n",
+    source=r"""
+        uint lane = thread_position_in_grid.x;
+        uint out_block = thread_position_in_grid.y;
+        uint row = thread_position_in_grid.z;
+
+        constexpr int TM = 4;
+        constexpr int TN = 4;
+        constexpr int SN = 32;
+        constexpr int blockN = SN * TN;
+
+        if (row >= R) {
+            return;
+        }
+
+        int out_row = int(out_block * TM);
+        if (out_row >= O) {
+            return;
+        }
+
+        const device T* in_vec = x + row * K;
+        const device T* mat = weight + out_row * K;
+
+        float result[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+        int col = int(lane * TN);
+        int n_iter = K / blockN;
+        int leftover = K - blockN * n_iter;
+
+        for (int iter = 0; iter < n_iter; ++iter) {
+            float v[TN];
+            for (int tn = 0; tn < TN; ++tn) {
+                v[tn] = static_cast<float>(in_vec[col + tn]);
+            }
+
+            for (int tm = 0; tm < TM; ++tm) {
+                for (int tn = 0; tn < TN; ++tn) {
+                    result[tm] += static_cast<float>(mat[tm * K + col + tn]) * v[tn];
+                }
+            }
+
+            col += blockN;
+        }
+
+        if (leftover > 0) {
+            float v[TN];
+            for (int tn = 0; tn < TN; ++tn) {
+                v[tn] = (col + tn < K) ? static_cast<float>(in_vec[col + tn]) : 0.0f;
+            }
+
+            for (int tm = 0; tm < TM; ++tm) {
+                for (int tn = 0; tn < TN; ++tn) {
+                    T m = (col + tn < K) ? mat[tm * K + col + tn] : T(0);
+                    result[tm] += static_cast<float>(m) * v[tn];
+                }
+            }
+        }
+
+        for (int tm = 0; tm < TM; ++tm) {
+            for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                result[tm] += simd_shuffle_down(result[tm], sn);
+            }
+        }
+
+        if (lane == 0) {
+            for (int tm = 0; tm < TM; ++tm) {
+                out[row * O + out_row + tm] = static_cast<T>(result[tm]);
+            }
+        }
+    """,
+)
+
+
+def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
+    return (
+        target_verify
+        and x.ndim == 3
+        and x.shape[1] > 1
+        and isinstance(linear, nn.Linear)
+    )
+
+
+def _target_verify_weight(weight: mx.array, x: mx.array) -> Optional[mx.array]:
+    B, L, D = x.shape
+    O = weight.shape[0]
+    if O < 4 or O % 4 != 0 or D >= 16 * O or weight.dtype != x.dtype:
+        return None
+
+    rows = B * L
+    rows8 = ((rows + 7) // 8) * 8
+    out = _TARGET_VERIFY_GEMV(
+        inputs=[x.reshape(rows, D), weight],
+        template=[("T", x.dtype), ("K", D), ("O", O), ("R", rows)],
+        grid=(32, O // 4, rows8),
+        threadgroup=(32, 1, 8),
+        output_shapes=[(rows, O)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return out.reshape(B, L, O)
+
+
+def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
+    if not _use_target_verify_dense(linear, x, target_verify):
+        return linear(x)
+
+    if "bias" not in linear:
+        out = _target_verify_weight(linear.weight, x)
+        if out is not None:
+            return out
+
+    return mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+
+
+def _target_verify_linears(linears, x: mx.array, target_verify: bool):
+    if not (
+        target_verify
+        and x.ndim == 3
+        and x.shape[1] > 1
+        and all(isinstance(linear, nn.Linear) for linear in linears)
+    ):
+        return tuple(linear(x) for linear in linears)
+
+    return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
+
+
+def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bool):
+    if not (target_verify and x.ndim == 3 and x.shape[1] > 1):
+        return embedding.as_linear(x)
+
+    out = _target_verify_weight(embedding.weight, x)
+    if out is not None:
+        return out
+
+    return mx.concatenate(
+        [embedding.as_linear(x[:, i : i + 1]) for i in range(x.shape[1])],
+        axis=1,
+    )
+
+
+def _gated_delta_update_verify_decode(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array],
+    mask: Optional[mx.array],
+    use_kernel: bool,
+):
+    return gated_delta_update_with_states(
+        q,
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        state,
+        mask,
+        use_kernel=use_kernel,
+    )
+
+
 class Qwen3_5Attention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -157,16 +329,17 @@ class Qwen3_5Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
 
-        q_proj_output = self.q_proj(x)
+        q_proj_output, keys, values = _target_verify_linears(
+            (self.q_proj, self.k_proj, self.v_proj), x, target_verify
+        )
         queries, gate = mx.split(
             q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
         )
         gate = gate.reshape(B, L, -1)
-
-        keys, values = self.k_proj(x), self.v_proj(x)
 
         queries = self.q_norm(queries).transpose(0, 2, 1, 3)
         keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
@@ -198,12 +371,31 @@ class Qwen3_5Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if target_verify and L > 1:
+            prefix_len = keys.shape[-2] - L
+            output = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        queries[:, :, i : i + 1, :],
+                        keys[:, :, : prefix_len + i + 1, :],
+                        values[:, :, : prefix_len + i + 1, :],
+                        cache=cache,
+                        scale=self.scale,
+                        mask=None,
+                    )
+                    for i in range(L)
+                ],
+                axis=2,
+            )
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        return _target_verify_linear(
+            self.o_proj, output * mx.sigmoid(gate), target_verify
+        )
 
 
 class Qwen3_5MLP(nn.Module):
@@ -213,8 +405,11 @@ class Qwen3_5MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
 
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+    def __call__(self, x, target_verify: bool = False) -> mx.array:
+        gate, up = _target_verify_linears(
+            (self.gate_proj, self.up_proj), x, target_verify
+        )
+        return _target_verify_linear(self.down_proj, swiglu(gate, up), target_verify)
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
@@ -261,22 +456,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+    def _causal_conv1d_verify(self, conv_input: mx.array, steps: int) -> mx.array:
+        return self.conv1d(conv_input)
+
     def __call__(
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         gdn_sink: Optional[list] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         B, S, _ = inputs.shape
+        target_verify = target_verify or gdn_sink is not None
 
-        mixed_qkv = self.in_proj_qkv(inputs)
+        mixed_qkv, z, b, a = _target_verify_linears(
+            (self.in_proj_qkv, self.in_proj_z, self.in_proj_b, self.in_proj_a),
+            inputs,
+            target_verify,
+        )
 
-        z = self.in_proj_z(inputs)
         z = z.reshape(B, S, -1, self.head_v_dim)
-
-        b = self.in_proj_b(inputs)
-        a = self.in_proj_a(inputs)
 
         if cache is not None and cache[0] is not None:
             conv_state = cache[0]
@@ -299,7 +499,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
             cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
-        conv_out = nn.silu(self.conv1d(conv_input))
+        if gdn_sink is not None:
+            conv_out = nn.silu(self._causal_conv1d_verify(conv_input, S))
+        else:
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
             t.reshape(B, S, h, d)
@@ -318,24 +521,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         initial_state = state
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        if gdn_sink is not None:
+            out, state, intermediate_states = _gated_delta_update_verify_decode(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
+            intermediate_states = None
 
         if gdn_sink is not None:
-            # Tuple layout consumed by ``rollback_speculative_cache`` below.
-            # Speculative rollback reconstructs the accepted state with the
-            # state-only GDN kernel; materializing every per-token state here
-            # slows down the target verify pass.
             gdn_sink.append(
                 (
                     q,
@@ -349,7 +563,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     mask,
                     conv_input,
                     self.conv_kernel_size,
-                    None,
+                    intermediate_states,
                 )
             )
 
@@ -359,7 +573,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 cache.advance(S)
 
         out = self.norm(out, z)
-        return self.out_proj(out.reshape(B, S, -1))
+        return _target_verify_linear(
+            self.out_proj, out.reshape(B, S, -1), target_verify
+        )
 
 
 class Qwen3_5DecoderLayer(nn.Module):
@@ -384,15 +600,26 @@ class Qwen3_5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
         gdn_sink: Optional[list] = None,
+        target_verify: bool = False,
     ) -> mx.array:
         if self.is_linear:
             r = self.linear_attn(
-                self.input_layernorm(x), mask, cache, gdn_sink=gdn_sink
+                self.input_layernorm(x),
+                mask,
+                cache,
+                gdn_sink=gdn_sink,
+                target_verify=target_verify,
             )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+            r = self.self_attn(
+                self.input_layernorm(x),
+                mask,
+                cache,
+                position_ids,
+                target_verify=target_verify,
+            )
         h = x + r
-        return h + self.mlp(self.post_attention_layernorm(h))
+        return h + self.mlp(self.post_attention_layernorm(h), target_verify)
 
 
 class Qwen3_5Model(nn.Module):
@@ -433,7 +660,14 @@ class Qwen3_5Model(nn.Module):
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask, c, position_ids, gdn_sink=gdn_sink)
+            h = layer(
+                h,
+                mask,
+                c,
+                position_ids,
+                gdn_sink=gdn_sink,
+                target_verify=gdn_sink is not None,
+            )
             if hidden_sink is not None and i in capture_set:
                 hidden_sink.append(h)
 
@@ -913,6 +1147,7 @@ class LanguageModel(nn.Module):
             [] if capture_layer_ids is not None else None
         )
         gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
+        target_verify = gdn_sink is not None
 
         out = self.model(
             inputs,
@@ -931,9 +1166,11 @@ class LanguageModel(nn.Module):
         if skip_logits:
             logits = None
         elif self.args.tie_word_embeddings:
-            logits = self.model.embed_tokens.as_linear(out)
+            logits = _target_verify_embedding_as_linear(
+                self.model.embed_tokens, out, target_verify
+            )
         else:
-            logits = self.lm_head(out)
+            logits = _target_verify_linear(self.lm_head, out, target_verify)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,

@@ -529,6 +529,114 @@ class TestMiniCPMVProcessor(unittest.TestCase):
         self.assertEqual(messages[0]["content"][1]["type"], "text")
 
 
+class TestGlmOcrProcessor(unittest.TestCase):
+    def test_from_pretrained_uses_local_numpy_image_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.glm_ocr.processing import (
+            Glm46VImageProcessor,
+            GlmOcrProcessor,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "image_processor": {
+                            "patch_size": 14,
+                            "temporal_patch_size": 2,
+                            "merge_size": 2,
+                            "size": {
+                                "shortest_edge": 12544,
+                                "longest_edge": 9633792,
+                            },
+                            "image_mean": [0.48145466, 0.4578275, 0.40821073],
+                            "image_std": [0.26862954, 0.26130258, 0.27577711],
+                        },
+                        "processor_class": "GlmOcrProcessor",
+                    }
+                )
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(image_token="<|image|>"),
+                ),
+                patch("mlx_vlm.models.base.load_chat_template"),
+            ):
+                processor = GlmOcrProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor.image_processor, Glm46VImageProcessor)
+        self.assertEqual(processor.image_processor.patch_size, 14)
+        self.assertEqual(processor.image_processor.max_pixels, 9633792)
+
+    def test_image_processor_matches_glm_patch_shape(self):
+        from mlx_vlm.models.glm_ocr.processing import Glm46VImageProcessor
+
+        processor = Glm46VImageProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=14 * 14 * 2 * 2,
+            max_pixels=14 * 14 * 2 * 2 * 64,
+        )
+
+        image = Image.fromarray(np.zeros((28, 56, 3), dtype=np.uint8))
+        result = processor(images=image)
+
+        self.assertEqual(result["image_grid_thw"].tolist(), [[1, 2, 4]])
+        self.assertEqual(result["pixel_values"].shape, (8, 1176))
+
+    def test_image_processor_matches_transformers_backend_bit_exactly(self):
+        try:
+            import torch
+            from transformers.models.glm46v.image_processing_glm46v import (
+                Glm46VImageProcessor as HFGlm46VImageProcessor,
+            )
+        except Exception as exc:
+            self.skipTest(f"Transformers torch image backend unavailable: {exc}")
+
+        from mlx_vlm.models.glm_ocr.processing import Glm46VImageProcessor
+
+        image = Image.fromarray(np.zeros((28, 56, 3), dtype=np.uint8))
+        hf_processor = HFGlm46VImageProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            size={
+                "shortest_edge": 14 * 14 * 2 * 2,
+                "longest_edge": 14 * 14 * 2 * 2 * 64,
+            },
+        )
+        processor = Glm46VImageProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=14 * 14 * 2 * 2,
+            max_pixels=14 * 14 * 2 * 2 * 64,
+        )
+
+        expected = hf_processor(images=image)
+        actual = processor(images=image)
+
+        expected_pixels = expected["pixel_values"]
+        if isinstance(expected_pixels, torch.Tensor):
+            expected_pixels = expected_pixels.detach().cpu().numpy()
+
+        self.assertTrue(np.array_equal(expected_pixels, actual["pixel_values"]))
+        self.assertTrue(
+            np.array_equal(
+                expected["image_grid_thw"].detach().cpu().numpy(),
+                actual["image_grid_thw"],
+            )
+        )
+
+
 class TestSmolVLMProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.smolvlm.processing_smolvlm import SmolVLMProcessor
@@ -711,6 +819,43 @@ class TestQwen2_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
     def _image_call_args(self):
         return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
 
+    def test_forwards_image_pixel_kwargs_to_image_processor(self):
+        p = self._make_processor()
+        seen = {}
+
+        class ImageProcessor:
+            model_input_names = ["pixel_values"]
+            merge_size = 2
+
+            def __call__(self, images=None, **kwargs):
+                seen.update(kwargs)
+                return {
+                    "pixel_values": np.zeros((1, 3, 224, 224), dtype=np.float32),
+                    "image_grid_thw": np.array([[1, 16, 16]], dtype=np.int64),
+                }
+
+        class Tokenizer:
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __call__(self, text, **kwargs):
+                if "max_pixels" in kwargs:
+                    raise AssertionError("max_pixels leaked into tokenizer kwargs")
+                return {
+                    "input_ids": [list(range(10)) for _ in text],
+                    "attention_mask": [[1] * 10 for _ in text],
+                }
+
+        p.image_processor = ImageProcessor()
+        p.tokenizer = Tokenizer()
+
+        p(
+            text=["<|image_pad|> Describe"],
+            images=[_make_image()],
+            max_pixels=1280 * 28 * 28,
+        )
+
+        self.assertEqual(seen["max_pixels"], 1280 * 28 * 28)
+
 
 class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
@@ -735,6 +880,33 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
 
     def _image_call_args(self):
         return {"text": ["<|image_pad|> Describe"], "images": [_make_image()]}
+
+    def test_image_processor_honors_per_call_max_pixels(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        image = np.zeros((3, 1200, 1200), dtype=np.uint8)
+        processor = Qwen3VLImageProcessor(
+            patch_size=14,
+            merge_size=2,
+            max_pixels=12845056,
+        )
+
+        default_grid = processor(images=[image])["image_grid_thw"][0]
+        capped_grid = processor(
+            images=[image],
+            max_pixels=1280 * 28 * 28,
+        )[
+            "image_grid_thw"
+        ][0]
+
+        self.assertGreater(
+            default_grid[1] * default_grid[2],
+            capped_grid[1] * capped_grid[2],
+        )
+        self.assertLessEqual(
+            capped_grid[1] * 14 * capped_grid[2] * 14,
+            1280 * 28 * 28,
+        )
 
 
 class TestQwen3OmniMoeProcessor(_ProcessorTestBase, unittest.TestCase):

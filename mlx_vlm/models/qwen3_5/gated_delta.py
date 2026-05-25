@@ -1,7 +1,7 @@
 from typing import Optional
 
 import mlx.core as mx
-from mlx_lm.models.gated_delta import compute_g, gated_delta_update
+from mlx_lm.models.gated_delta import compute_g, gated_delta_update  # noqa: F401
 
 
 def _make_gated_delta_with_states_kernel(has_mask: bool = False):
@@ -136,13 +136,8 @@ def _gated_delta_with_states_ops(
             y = mx.where(valid[:, None, None], y, 0)
 
         ys.append(y.astype(q.dtype))
-        if t < T - 1:
-            states.append(state)
-    state_steps = max(T - 1, 0)
-    if state_steps == 0:
-        stacked_states = mx.zeros((B, 0, Hv, Dv, state.shape[-1]), dtype=state.dtype)
-    else:
-        stacked_states = mx.stack(states, axis=1)
+        states.append(state)
+    stacked_states = mx.stack(states, axis=1)
     return mx.stack(ys, axis=1), state, stacked_states
 
 
@@ -175,13 +170,7 @@ def gated_delta_update_with_states(
 
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
-    state_steps = max(T - 1, 0)
-    if state_steps == 0:
-        y, state = gated_delta_update(
-            q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=use_kernel
-        )
-        states = mx.zeros((B, 0, Hv, Dv, Dk), dtype=state.dtype)
-        return y, state, states
+    state_steps = T
 
     input_type = q.dtype
     state_type = state.dtype
