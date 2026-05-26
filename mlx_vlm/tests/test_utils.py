@@ -11,6 +11,7 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.utils import quantize_model
 
+from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
@@ -244,6 +245,45 @@ def test_quantize_module():
         "group_size": 64,
         "bits": 4,
         "mode": "affine",
+    }
+
+
+def test_convert_preserves_existing_deepseek_v4_quantization():
+    config = {
+        "model_type": "deepseek_v4",
+        "quantization_config": {"quant_method": "fp8"},
+    }
+    existing_quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.model.layers.0.attn.wkv": {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        },
+    }
+
+    with patch(
+        "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+        return_value=existing_quantization,
+    ):
+        _preserve_existing_deepseek_v4_quantization(
+            config,
+            model=MagicMock(),
+            q_group_size=64,
+            q_bits=4,
+            q_mode="affine",
+        )
+
+    assert config["quantization"] is config["quantization_config"]
+    assert config["quantization"]["group_size"] == 64
+    assert config["quantization"]["bits"] == 4
+    assert config["quantization"]["mode"] == "affine"
+    assert config["quantization"]["language_model.model.layers.0.attn.wkv"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
     }
 
 

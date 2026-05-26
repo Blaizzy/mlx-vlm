@@ -882,8 +882,13 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head = HyperHead(config)
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        h = self.embed_tokens(inputs)
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[Any] = None,
+        inputs_embeds: Optional[mx.array] = None,
+    ) -> mx.array:
+        h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
             h[:, :, None, :],
             (h.shape[0], h.shape[1], self.args.hc_mult, h.shape[2]),
@@ -940,17 +945,12 @@ class LanguageModel(nn.Module):
         self,
         inputs: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        input_embeddings: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ) -> LanguageModelOutput:
-        if inputs is None:
-            inputs = kwargs.get("input_ids")
-        if inputs_embeds is not None or input_embeddings is not None:
-            raise NotImplementedError(
-                "DeepSeek V4 does not support input embeddings yet."
-            )
-        logits = self.lm_head(self.model(inputs, cache))
+        logits = self.lm_head(
+            self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        )
         return LanguageModelOutput(logits=logits)
 
     @property

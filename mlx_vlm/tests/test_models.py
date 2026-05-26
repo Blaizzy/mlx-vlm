@@ -215,6 +215,11 @@ class TestModels(unittest.TestCase):
             hc_mult=2,
             hc_sinkhorn_iters=2,
         )
+        loaded_config = deepseek_v4.ModelConfig.from_dict(
+            {"model_type": "deepseek_v4", "eos_token_id": 1}
+        )
+        self.assertEqual(loaded_config.eos_token_id, 1)
+
         model = deepseek_v4.Model(config)
 
         self.language_test_runner(
@@ -223,6 +228,10 @@ class TestModels(unittest.TestCase):
             config.vocab_size,
             config.num_hidden_layers,
         )
+        inputs = mx.array([[1, 2, 3]])
+        inputs_embeds = model.language_model.model.embed_tokens(inputs)
+        out = model.language_model(inputs, inputs_embeds=inputs_embeds)
+        self.assertEqual(out.logits.shape, (1, 3, config.vocab_size))
 
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 
@@ -45,6 +45,9 @@ class ModelConfig(BaseModelConfig):
     index_topk: int = 512
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
+    bos_token_id: Optional[int] = None
+    eos_token_id: Optional[Union[int, List[int]]] = None
+    pad_token_id: Optional[int] = None
     topk_method: str = "noaux_tc"
 
     def __post_init__(self):
