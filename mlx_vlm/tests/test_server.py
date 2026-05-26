@@ -1644,6 +1644,46 @@ class TestResponseGenerator:
 
         assert cancelled == ["req-1"]
 
+    def test_token_iterator_close_cancels_while_next_blocks(self):
+        cancelled = []
+        result = []
+
+        class BlockingQueue(Queue):
+            def __init__(self):
+                super().__init__()
+                self.waiting = Event()
+
+            def get(self, *args, **kwargs):
+                self.waiting.set()
+                return super().get(*args, **kwargs)
+
+        rqueue = BlockingQueue()
+        token_iter = server_generation._TokenIterator(
+            rqueue,
+            "req-1",
+            cancelled.append,
+            None,
+        )
+
+        def consume():
+            try:
+                result.append(next(token_iter))
+            except Exception as exc:
+                result.append(exc)
+
+        thread = Thread(target=consume)
+        thread.start()
+        assert rqueue.waiting.wait(timeout=1.0)
+
+        token_iter.close()
+
+        assert cancelled == ["req-1"]
+
+        rqueue.put(None)
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+        assert isinstance(result[0], StopIteration)
+
     def test_token_iterator_waits_past_timeout_for_delayed_token(self, monkeypatch):
         import threading
 
