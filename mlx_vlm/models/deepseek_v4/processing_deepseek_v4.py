@@ -91,12 +91,17 @@ class DeepseekV4Processor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
         chat_template = kwargs.pop("chat_template", None)
-        tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path, **kwargs
-        )
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
+        except (AttributeError, ValueError):
+            tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
         if chat_template is None:
             chat_template = load_deepseek_v4_chat_template(
                 pretrained_model_name_or_path,
