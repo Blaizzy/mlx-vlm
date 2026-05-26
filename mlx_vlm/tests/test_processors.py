@@ -1774,6 +1774,32 @@ class TestDeepseekV4Processor(unittest.TestCase):
 
         self.assertEqual(processor.chat_template, "{{ explicit }}")
 
+    def test_from_pretrained_uses_default_chat_template_when_missing(self):
+        import tempfile
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DEFAULT_CHAT_TEMPLATE,
+            DeepseekV4Processor,
+        )
+
+        tokenizer = self.MockTokenizer()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+                ),
+                patch.object(
+                    DeepseekV4Processor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = DeepseekV4Processor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.chat_template, DEFAULT_CHAT_TEMPLATE)
+        self.assertIn("<｜Assistant｜></think>", processor.chat_template)
+
     def test_patch_intercepts(self):
         import json
         import tempfile

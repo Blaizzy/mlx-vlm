@@ -5,6 +5,26 @@ from transformers.processing_utils import ProcessorMixin
 
 from ..base import install_auto_processor_patch
 
+DEFAULT_CHAT_TEMPLATE = (
+    "{{- '<｜begin▁of▁sentence｜>' -}}"
+    "{%- if messages[0]['role'] == 'system' -%}"
+    "{{- messages[0]['content'] -}}"
+    "{%- set start = 1 -%}"
+    "{%- else -%}"
+    "{%- set start = 0 -%}"
+    "{%- endif -%}"
+    "{%- for m in messages[start:] -%}"
+    "{%- if m['role'] == 'user' -%}"
+    "{{- '<｜User｜>' + m['content'] -}}"
+    "{%- elif m['role'] == 'assistant' -%}"
+    "{{- '<｜Assistant｜>' + m['content'] + '<｜end▁of▁sentence｜>' -}}"
+    "{%- endif -%}"
+    "{%- endfor -%}"
+    "{%- if add_generation_prompt -%}"
+    "{{- '<｜Assistant｜></think>' -}}"
+    "{%- endif -%}"
+)
+
 
 def load_deepseek_v4_chat_template(model_path, **kwargs) -> Optional[str]:
     local_path = Path(model_path)
@@ -38,11 +58,13 @@ class DeepseekV4Processor(ProcessorMixin):
 
     def __init__(self, tokenizer, chat_template: Optional[str] = None, **kwargs):
         self.tokenizer = tokenizer
-        if chat_template is not None:
-            self.tokenizer.chat_template = chat_template
-        super().__init__(
-            tokenizer, chat_template=getattr(tokenizer, "chat_template", None), **kwargs
+        chat_template = (
+            chat_template
+            or getattr(tokenizer, "chat_template", None)
+            or DEFAULT_CHAT_TEMPLATE
         )
+        self.tokenizer.chat_template = chat_template
+        super().__init__(tokenizer, chat_template=chat_template, **kwargs)
 
     @property
     def chat_template(self):
@@ -85,4 +107,8 @@ class DeepseekV4Processor(ProcessorMixin):
 
 install_auto_processor_patch("deepseek_v4", DeepseekV4Processor)
 
-__all__ = ["DeepseekV4Processor", "load_deepseek_v4_chat_template"]
+__all__ = [
+    "DEFAULT_CHAT_TEMPLATE",
+    "DeepseekV4Processor",
+    "load_deepseek_v4_chat_template",
+]
