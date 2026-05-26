@@ -9,6 +9,11 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..rope_utils import (
+    apply_rotary_pos_emb_even_odd,
+    compute_mrope_frequencies,
+    mrope_position_selector,
+)
 from .config import ModelConfig, TextConfig
 
 
@@ -55,57 +60,25 @@ class GlmOcrRotaryEmbedding(nn.Module):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config)
         self._inv_freq = mx.array(inv_freq, dtype=mx.float32)
         self._original_inv_freq = mx.array(inv_freq, dtype=mx.float32)
-
-    def apply_mrope(self, freqs, mrope_section):
-        """Apply M-RoPE by selecting different dimensions for T, H, W."""
-        split_indices = np.cumsum(mrope_section)[:-1].tolist()
-        chunks = mx.split(freqs, split_indices, axis=-1)
-        result = mx.concatenate(
-            [chunk[i % 3] for i, chunk in enumerate(chunks)], axis=-1
+        self._position_selector = mrope_position_selector(
+            "split_select",
+            self.mrope_section,
+            self._inv_freq.shape[0],
         )
-        return result
 
     def __call__(self, x, position_ids):
-        inv_freq_expanded = self._inv_freq[None, None, :, None].astype(mx.float32)
-        inv_freq_expanded = mx.broadcast_to(
-            inv_freq_expanded, (3, position_ids.shape[1], self._inv_freq.shape[0], 1)
+        freqs = compute_mrope_frequencies(
+            position_ids,
+            self._inv_freq,
+            self.mrope_section,
+            style="split_select",
+            position_selector=self._position_selector,
         )
-        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
-
-        freqs = (
-            inv_freq_expanded.astype(mx.float32)
-            @ position_ids_expanded.astype(mx.float32)
-        ).transpose(0, 1, 3, 2)
-
-        freqs = self.apply_mrope(freqs, self.mrope_section)
-
         emb = mx.concatenate((freqs, freqs), axis=-1)
         cos = mx.cos(emb) * self.attention_scaling
         sin = mx.sin(emb) * self.attention_scaling
 
         return cos.astype(x.dtype), sin.astype(x.dtype)
-
-
-def rotate_half_llm(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
-
-
-def repeat_interleave(x, repeats, axis=-1):
-    """
-    Repeat elements of an array along an axis, interleaving the repeated values.
-    Like torch.repeat_interleave: [a,b,c] with repeats=2 -> [a,a,b,b,c,c]
-    """
-    shape = list(x.shape)
-    x = mx.expand_dims(x, axis=axis + 1 if axis >= 0 else axis)
-    tile_shape = [1] * len(x.shape)
-    tile_shape[axis + 1 if axis >= 0 else axis] = repeats
-    x = mx.tile(x, tile_shape)
-    new_shape = shape.copy()
-    new_shape[axis] = shape[axis] * repeats
-    return x.reshape(new_shape)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -119,26 +92,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
         cos: Cosine tensor of shape (batch, seq_len, head_dim)
         sin: Sine tensor of shape (batch, seq_len, head_dim)
     """
-    cos = cos[:, None, :, :]
-    sin = sin[:, None, :, :]
-
-    cos = repeat_interleave(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
-    sin = repeat_interleave(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
-
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (rotate_half_llm(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half_llm(k_rot) * sin)
-
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-
-    return q_embed, k_embed
+    return apply_rotary_pos_emb_even_odd(q, k, cos, sin)
 
 
 class GlmOcrAttention(nn.Module):
