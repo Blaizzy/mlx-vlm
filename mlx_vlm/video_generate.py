@@ -459,7 +459,12 @@ def main():
         default="mlx-community/Qwen2.5-VL-7B-Instruct-4bit",
         help="Select the model to use",
     )
-    parser.add_argument("--verbose", action="store_false", help="Print verbose output")
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print verbose output (use --no-verbose to print only the final result).",
+    )
 
     args = parser.parse_args()
 

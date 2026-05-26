@@ -132,8 +132,49 @@ def parse_arguments():
         default=DEFAULT_TEMPERATURE,
         help="Temperature for sampling.",
     )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Penalty factor for previously generated tokens.",
+    )
+    parser.add_argument(
+        "--repetition-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent generated tokens used for repetition penalty.",
+    )
+    parser.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=None,
+        help="Additive penalty for tokens that already appeared.",
+    )
+    parser.add_argument(
+        "--presence-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent generated tokens used for presence penalty.",
+    )
+    parser.add_argument(
+        "--frequency-penalty",
+        type=float,
+        default=None,
+        help="Additive penalty scaled by token frequency.",
+    )
+    parser.add_argument(
+        "--frequency-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent generated tokens used for frequency penalty.",
+    )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
-    parser.add_argument("--verbose", action="store_false", help="Detailed output.")
+    parser.add_argument(
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detailed output (use --no-verbose to print only the final result).",
+    )
     parser.add_argument(
         "--eos-tokens",
         type=str,
@@ -385,6 +426,7 @@ class GenerationResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
+    cached_tokens: int = 0
 
 
 class PromptCacheState:
@@ -465,6 +507,10 @@ def generate_step(
     temperature: float = DEFAULT_TEMPERATURE,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    presence_penalty: Optional[float] = None,
+    presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    frequency_penalty: Optional[float] = None,
+    frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
@@ -499,6 +545,14 @@ def generate_step(
           tokens.
         repetition_context_size (int, optional): The number of tokens to
           consider for repetition penalty.
+        presence_penalty (float, optional): Additive penalty for tokens that
+          already appeared in recent generated context.
+        presence_context_size (int, optional): The number of tokens to
+          consider for presence penalty.
+        frequency_penalty (float, optional): Additive penalty scaled by token
+          frequency in recent generated context.
+        frequency_context_size (int, optional): The number of tokens to
+          consider for frequency penalty.
         top_p (float, optional): Nucleus sampling, higher means model considers
           more less likely words.
         min_p (float, optional): Minimum probability threshold relative to the
@@ -552,7 +606,13 @@ def generate_step(
         )
 
     processors = make_logits_processors(
-        logit_bias, repetition_penalty, repetition_context_size
+        logit_bias,
+        repetition_penalty,
+        repetition_context_size,
+        presence_penalty,
+        presence_context_size,
+        frequency_penalty,
+        frequency_context_size,
     )
     if logits_processors is not None:
         processors.extend(logits_processors)
@@ -802,6 +862,8 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
+    image = image or None
+    audio = audio or None
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -1089,6 +1151,7 @@ def stream_generate(
                 prompt_tps=prompt_tps,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
+                cached_tokens=reused_prefix_len,
             )
 
         detokenizer.finalize()
@@ -1102,6 +1165,7 @@ def stream_generate(
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
+            cached_tokens=reused_prefix_len,
         )
 
         # Save cache state for potential reuse on next turn
@@ -1261,6 +1325,7 @@ def generate(
         prompt_tps=last_response.prompt_tps,
         generation_tps=last_response.generation_tps,
         peak_memory=last_response.peak_memory,
+        cached_tokens=last_response.cached_tokens,
     )
 
 
@@ -1561,6 +1626,7 @@ class PromptProgress:
     prompt_tokens: int
     prompt_tps: float = 0.0
     prompt_time: float = 0.0
+    cached_tokens: int = 0
 
 
 class GenerationBatch:
@@ -1955,13 +2021,17 @@ class PromptProcessingBatch:
         self._apc_harvest_enabled = True
         self._prompt_time_s = 0.0
         self._prompt_tokens_per_row: List[int] = []
+        self._cached_tokens_per_row: List[int] = []
         for idx, suffix_len in enumerate(lengths):
             full_input_ids = None
+            prefix_len = 0
             if idx < len(self._apc_meta) and self._apc_meta[idx] is not None:
                 full_input_ids = self._apc_meta[idx].get("full_input_ids")
+                prefix_len = int(self._apc_meta[idx].get("prefix_len") or 0)
             self._prompt_tokens_per_row.append(
                 len(full_input_ids) if full_input_ids is not None else suffix_len
             )
+            self._cached_tokens_per_row.append(prefix_len)
 
         if warm_cache is not None:
             self.prompt_cache = warm_cache
@@ -2134,9 +2204,12 @@ class PromptProcessingBatch:
                 prompt_tokens=prompt_tokens,
                 prompt_tps=prompt_tokens / self._prompt_time_s,
                 prompt_time=self._prompt_time_s,
+                cached_tokens=cached_tokens,
             )
-            for uid, prompt_tokens in zip(
-                self._prompt_uids, self._prompt_tokens_per_row
+            for uid, prompt_tokens, cached_tokens in zip(
+                self._prompt_uids,
+                self._prompt_tokens_per_row,
+                self._cached_tokens_per_row,
             )
         ]
 
@@ -3403,6 +3476,12 @@ def main():
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
+                "repetition_penalty": args.repetition_penalty,
+                "repetition_context_size": args.repetition_context_size,
+                "presence_penalty": args.presence_penalty,
+                "presence_context_size": args.presence_context_size,
+                "frequency_penalty": args.frequency_penalty,
+                "frequency_context_size": args.frequency_context_size,
                 "vision_cache": vision_cache,
                 **kwargs,
             }
@@ -3434,6 +3513,12 @@ def main():
             "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
+            "repetition_penalty": args.repetition_penalty,
+            "repetition_context_size": args.repetition_context_size,
+            "presence_penalty": args.presence_penalty,
+            "presence_context_size": args.presence_context_size,
+            "frequency_penalty": args.frequency_penalty,
+            "frequency_context_size": args.frequency_context_size,
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,

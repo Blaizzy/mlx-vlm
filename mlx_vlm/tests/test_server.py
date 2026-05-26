@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 from queue import Queue
@@ -858,6 +859,120 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].min_p == 0.08
     assert captured["args"].repetition_penalty == 1.15
     assert captured["args"].logit_bias == {12: -1.5}
+
+
+@pytest.mark.parametrize(
+    "audio_data_factory",
+    [
+        lambda raw: base64.b64encode(raw).decode("ascii"),
+        lambda raw: f"data:audio/wav;base64,{base64.b64encode(raw).decode('ascii')}",
+    ],
+)
+def test_chat_completions_decodes_input_audio_base64(client, audio_data_factory):
+    raw_audio = b"RIFF$\x00\x00\x00WAVEfmt "
+    captured = {}
+
+    def fake_generate(prompt, images=None, audio=None, **kwargs):
+        captured["audio"] = audio
+        return SimpleNamespace(
+            text="audio ok",
+            prompt_tokens=8,
+            generation_tokens=4,
+            total_tokens=12,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        )
+
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen2_vl"),
+            ),
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", side_effect=fake_generate),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the audio."},
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": audio_data_factory(raw_audio),
+                                    "format": "wav",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["audio"][0].getvalue() == raw_audio
+
+
+def test_chat_completions_preserves_input_audio_references(client):
+    audio_path = "/tmp/audio.wav"
+    captured = {}
+
+    def fake_generate(prompt, images=None, audio=None, **kwargs):
+        captured["audio"] = audio
+        return SimpleNamespace(
+            text="audio ok",
+            prompt_tokens=8,
+            generation_tokens=4,
+            total_tokens=12,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+        )
+
+    with (
+        patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen2_vl"),
+            ),
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", side_effect=fake_generate),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the audio."},
+                            {
+                                "type": "input_audio",
+                                "input_audio": {"data": audio_path, "format": "wav"},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured["audio"] == [audio_path]
 
 
 def test_chat_completions_endpoint_flattens_text_content_parts(client):
@@ -1966,7 +2081,7 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
-    def test_step_attaches_prompt_tps_from_prompt_progress(self):
+    def test_step_attaches_prompt_metrics_from_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
 
@@ -1976,7 +2091,7 @@ class TestResponseGenerator:
         class PromptProgressBatch:
             def next(self, **kwargs):
                 return (
-                    [SimpleNamespace(uid=1, prompt_tps=184.431)],
+                    [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)],
                     [
                         SimpleNamespace(
                             uid=1,
@@ -2001,6 +2116,7 @@ class TestResponseGenerator:
                     server.make_streaming_detokenizer(processor),
                 ),
                 "prompt_tps": None,
+                "cached_tokens": 0,
             }
         }
 
@@ -2008,6 +2124,7 @@ class TestResponseGenerator:
 
         item = rqueue.get()
         assert item.prompt_tps == pytest.approx(184.431)
+        assert item.cached_tokens == 7
         assert rqueue.get() is None
 
     def test_generate_arguments_to_generate_kwargs(self):
@@ -2018,6 +2135,11 @@ class TestResponseGenerator:
             top_k=40,
             min_p=0.05,
             repetition_penalty=1.15,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={3: -0.5},
             enable_thinking=False,
             thinking_budget=100,
@@ -2029,6 +2151,11 @@ class TestResponseGenerator:
         assert kw["top_k"] == 40
         assert kw["min_p"] == 0.05
         assert kw["repetition_penalty"] == 1.15
+        assert kw["repetition_context_size"] == 512
+        assert kw["presence_penalty"] == 0.2
+        assert kw["presence_context_size"] == 256
+        assert kw["frequency_penalty"] == 0.3
+        assert kw["frequency_context_size"] == 128
         assert kw["logit_bias"] == {3: -0.5}
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 100
@@ -2045,8 +2172,69 @@ class TestResponseGenerator:
         args = server.GenerationArguments()
         kw = args.to_generate_kwargs()
         assert "repetition_penalty" not in kw
+        assert (
+            kw["repetition_context_size"]
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        assert "presence_penalty" not in kw
+        assert (
+            kw["presence_context_size"]
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        assert "frequency_penalty" not in kw
+        assert (
+            kw["frequency_context_size"]
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
         assert "logit_bias" not in kw
         assert "thinking_budget" not in kw
+
+    def test_server_generation_builds_repetition_logits_processors(self, monkeypatch):
+        custom_processor = lambda tokens, logits: logits
+        calls = []
+
+        def fake_make_logits_processors(
+            logit_bias,
+            repetition_penalty,
+            repetition_context_size,
+            presence_penalty,
+            presence_context_size,
+            frequency_penalty,
+            frequency_context_size,
+        ):
+            calls.append(
+                (
+                    logit_bias,
+                    repetition_penalty,
+                    repetition_context_size,
+                    presence_penalty,
+                    presence_context_size,
+                    frequency_penalty,
+                    frequency_context_size,
+                )
+            )
+            return ["repetition-processor"]
+
+        monkeypatch.setattr(
+            server_generation, "make_logits_processors", fake_make_logits_processors
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        args = server.GenerationArguments(
+            repetition_penalty=1.2,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
+            logit_bias={5: -0.5},
+            logits_processors=[custom_processor],
+        )
+
+        processors = gen._make_logits_processors(args)
+
+        assert calls == [({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)]
+        assert processors == ["repetition-processor", custom_processor]
 
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
@@ -2056,6 +2244,11 @@ class TestResponseGenerator:
             top_k=32,
             min_p=0.1,
             repetition_penalty=1.2,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={"5": -1.0},
             enable_thinking=False,
             thinking_budget=None,
@@ -2064,6 +2257,11 @@ class TestResponseGenerator:
         args = server._build_gen_args(req, tenant_id="tenant-a")
         assert args.max_tokens == 128
         assert args.top_k == 32
+        assert args.repetition_context_size == 512
+        assert args.presence_penalty == 0.2
+        assert args.presence_context_size == 256
+        assert args.frequency_penalty == 0.3
+        assert args.frequency_context_size == 128
         assert args.logit_bias == {5: -1.0}  # string keys converted to int
         assert args.to_generate_kwargs()["apc_tenant"] == "tenant-a"
 
@@ -2076,6 +2274,11 @@ class TestResponseGenerator:
             top_k=0,
             min_p=0.0,
             repetition_penalty=None,
+            repetition_context_size=None,
+            presence_penalty=None,
+            presence_context_size=None,
+            frequency_penalty=None,
+            frequency_context_size=None,
             logit_bias=None,
             enable_thinking=True,
             thinking_budget=None,
