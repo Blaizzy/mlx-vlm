@@ -2288,6 +2288,72 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
+    def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            repetition_penalty=1.1,
+            presence_penalty=0.2,
+            frequency_penalty=0.3,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert (
+            args.repetition_context_size
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        assert (
+            args.presence_context_size
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        assert (
+            args.frequency_context_size
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+
+    def test_build_gen_args_defaults_penalty_context_sizes_when_null(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            repetition_penalty=1.1,
+            repetition_context_size=None,
+            presence_penalty=0.2,
+            presence_context_size=None,
+            frequency_penalty=0.3,
+            frequency_context_size=None,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert (
+            args.repetition_context_size
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        assert (
+            args.presence_context_size
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+        assert (
+            args.frequency_context_size
+            == server_generation.DEFAULT_REPETITION_CONTEXT_SIZE
+        )
+
+    def test_build_gen_args_preserves_explicit_penalty_context_sizes(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            repetition_context_size=64,
+            presence_context_size=32,
+            frequency_context_size=16,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.repetition_context_size == 64
+        assert args.presence_context_size == 32
+        assert args.frequency_context_size == 16
+
     def test_build_gen_args_uses_server_thinking_default_when_omitted(
         self, monkeypatch
     ):
