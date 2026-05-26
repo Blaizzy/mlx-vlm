@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -557,9 +557,12 @@ class LocalAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
+        offset = position_offset if position_offset is not None else (
+            cache.offset if cache is not None else 0
+        )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q = self.wq_b(self.q_norm(self.wq_a(x)))
@@ -646,11 +649,14 @@ class CompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = position_offset if position_offset is not None else (
+            local_cache.offset if local_cache is not None else 0
+        )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q = self.wq_b(self.q_norm(self.wq_a(x)))
@@ -748,12 +754,15 @@ class SparseCompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
         idx_cache = cache[2] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = position_offset if position_offset is not None else (
+            local_cache.offset if local_cache is not None else 0
+        )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q_residual = self.q_norm(self.wq_a(x))
@@ -858,10 +867,16 @@ class DeepseekV4Block(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any],
         input_ids: mx.array,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         residual = h
         x, post, comb = self.attn_hc(h)
-        x = self.attn(self.attn_norm(x), mask=mask, cache=cache)
+        x = self.attn(
+            self.attn_norm(x),
+            mask=mask,
+            cache=cache,
+            position_offset=position_offset,
+        )
         h = hc_expand(x, residual, post, comb)
 
         residual = h
@@ -887,6 +902,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        hidden_sink: Optional[list] = None,
+        skip_final_norm: bool = False,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
@@ -929,7 +946,59 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
+        if hidden_sink is not None:
+            hidden_sink.append(h)
+
+        if skip_final_norm:
+            return h
+
         return self.norm(self.hc_head(h))
+
+
+def _clone_cache_tree(value):
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, tuple):
+        return tuple(_clone_cache_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_cache_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clone_cache_tree(v) for k, v in value.items()}
+    return value
+
+
+def _snapshot_cache_state(caches: List[Any]) -> List[Optional[Tuple[Any, Any]]]:
+    snapshot = []
+    for cache in caches:
+        if cache is None:
+            snapshot.append(None)
+            continue
+        state = getattr(cache, "state", None)
+        meta_state = getattr(cache, "meta_state", None)
+        snapshot.append((_clone_cache_tree(state), _clone_cache_tree(meta_state)))
+    return snapshot
+
+
+def _restore_cache_state(
+    caches: List[Any], snapshot: List[Optional[Tuple[Any, Any]]]
+) -> None:
+    for cache, entry in zip(caches, snapshot):
+        if cache is None or entry is None:
+            continue
+        state, meta_state = entry
+        if meta_state is not None and hasattr(type(cache), "meta_state"):
+            cache.meta_state = _clone_cache_tree(meta_state)
+        cache.state = _clone_cache_tree(state)
+
+
+def _iter_leaf_caches(caches):
+    for cache in caches:
+        if cache is None:
+            continue
+        if isinstance(cache, CacheList):
+            yield from _iter_leaf_caches(cache.caches)
+        else:
+            yield cache
 
 
 class LanguageModel(nn.Module):
@@ -948,10 +1017,122 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ) -> LanguageModelOutput:
-        logits = self.lm_head(
-            self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        skip_final_norm = kwargs.pop("skip_final_norm", False)
+        hidden_sink = kwargs.pop("hidden_sink", None)
+        if return_hidden and hidden_sink is None:
+            hidden_sink = []
+
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            hidden_sink=hidden_sink,
+            skip_final_norm=skip_final_norm,
         )
-        return LanguageModelOutput(logits=logits)
+        logits = None if skip_logits else self.lm_head(out)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def _target_hidden(self, hidden: mx.array) -> mx.array:
+        if (
+            hidden.ndim == 3
+            and hidden.shape[-1] == self.args.hc_mult * self.args.hidden_size
+        ):
+            hidden = hidden.reshape(*hidden.shape[:-1], self.args.hc_mult, -1)
+        if hidden.ndim != 4:
+            raise ValueError(
+                "DeepSeek-V4 speculative hidden must have shape "
+                "[batch, tokens, hc_mult, hidden_size]."
+            )
+        return hidden
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        hidden = self._target_hidden(hidden)
+        return self.lm_head(self.model.norm(self.model.hc_head(hidden)))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self._target_hidden(hidden)
+
+    def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
+        hidden_steps = []
+        logits_steps = []
+        cache_snapshots = []
+        sample_logits = sampler is not None
+
+        for idx in range(inputs.shape[1]):
+            out = self(
+                inputs[:, idx : idx + 1],
+                cache=cache,
+                return_hidden=True,
+                return_shared_kv=True,
+                skip_logits=not sample_logits,
+            )
+            hidden_steps.append(out.hidden_states[-1])
+            if sample_logits:
+                logits_steps.append(out.logits)
+            cache_snapshots.append(_snapshot_cache_state(cache))
+
+        hidden = mx.concatenate(hidden_steps, axis=1)
+        if not sample_logits:
+            return hidden, {}, cache_snapshots
+
+        logits = mx.concatenate(logits_steps, axis=1)
+        return hidden, {}, cache_snapshots, sampler(logits)
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        return self._speculative_verify(inputs, cache, sampler)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        return self._speculative_verify(inputs, cache)
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Any,
+        accepted,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+
+        max_a = int(accepted.max().item())
+        if gdn_states:
+            accepted_list = [int(a) for a in accepted.tolist()]
+            if len(set(accepted_list)) != 1:
+                raise ValueError(
+                    "DeepSeek-V4 speculative rollback requires uniform acceptance."
+                )
+            _restore_cache_state(caches, gdn_states[max_a])
+            return max_a
+
+        n = max_a + 1
+        trim = block_size - n
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        for cache in _iter_leaf_caches(caches):
+            if trim > 0 and hasattr(cache, "trim"):
+                cache.trim(trim)
+            if is_batch and hasattr(cache, "_idx") and max_a > 0:
+                keys = getattr(cache, "keys", None)
+                values = getattr(cache, "values", None)
+                if keys is None or values is None:
+                    continue
+                kv_len = cache._idx
+                verify_start = kv_len - n
+                for bi, valid_end in enumerate(valid_ends.tolist()):
+                    start = verify_start + int(valid_end)
+                    if start < kv_len:
+                        cache.keys[bi, :, start:kv_len, :] = 0
+                        cache.values[bi, :, start:kv_len, :] = 0
+
+        return max_a
 
     @property
     def layers(self):

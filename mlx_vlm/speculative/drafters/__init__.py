@@ -9,6 +9,7 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
+    "deepseek_v4_mtp": "mtp",
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
     "qwen3_5_mtp": "mtp",
