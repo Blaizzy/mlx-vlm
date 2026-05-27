@@ -17,18 +17,38 @@ from .common import (
     wired_limit,
 )
 from .dispatch import generate, stream_generate
+from .image import (
+    ImageGenerationModel,
+    ImageGenerationRequest,
+    ImageGenerationResult,
+    generate_image,
+    image_generation_model_class,
+    image_to_b64_json,
+    image_to_png_bytes,
+    is_image_generation_model,
+    load_image_generation_model,
+)
 
 __all__ = [
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
     "GenerationResult",
+    "ImageGenerationModel",
+    "ImageGenerationRequest",
+    "ImageGenerationResult",
     "PromptCacheState",
     "PromptProcessingBatch",
     "batch_generate",
     "generate",
+    "generate_image",
     "generate_step",
     "generation_stream",
+    "image_generation_model_class",
+    "image_to_b64_json",
+    "image_to_png_bytes",
+    "is_image_generation_model",
+    "load_image_generation_model",
     "main",
     "maybe_quantize_kv_cache",
     "parse_arguments",
@@ -38,14 +58,16 @@ __all__ = [
 
 
 def __getattr__(name):
-    from . import ar, dispatch
+    from . import ar, dispatch, image
 
     if hasattr(dispatch, name):
         return getattr(dispatch, name)
+    if hasattr(image, name):
+        return getattr(image, name)
     return getattr(ar, name)
 
 
 def __dir__():
-    from . import ar, dispatch
+    from . import ar, dispatch, image
 
-    return sorted(set(__all__) | set(dir(ar)) | set(dir(dispatch)))
+    return sorted(set(__all__) | set(dir(ar)) | set(dir(dispatch)) | set(dir(image)))

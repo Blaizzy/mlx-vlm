@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from threading import Lock
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 
@@ -18,6 +19,7 @@ from ..generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
 )
+from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -68,6 +70,7 @@ def _server_runtime_snapshot() -> dict:
     return {
         "loaded_model": runtime.model_cache.get("model_path", None),
         "loaded_adapter": runtime.model_cache.get("adapter_path", None),
+        "model_kind": runtime.model_cache.get("model_kind", "text_generation"),
         "loaded_context_size": native_context_size,
         "configured_context_limit": configured_context_limit,
         "effective_context_limit": effective_context_limit,
@@ -399,6 +402,37 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     if runtime.model_cache:
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
+
+    if is_image_generation_model(model_path):
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for image generation models.",
+            )
+        print(f"Loading image generation model from: {model_path}")
+        try:
+            model = load_image_generation_model(model_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load image generation model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "family", "image_generation"),
+            text_config=None,
+        )
+        runtime.response_generator = None
+        runtime.apc_manager = None
+        runtime.model_cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": "image_generation",
+            "generation_lock": Lock(),
+        }
+        return model, None, config
 
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)

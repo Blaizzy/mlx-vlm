@@ -1403,6 +1403,12 @@ def test_normalize_resize_shape_rejects_invalid_values(value):
 def test_generate_cli_smoke(capsys):
     args = Namespace(
         model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
         adapter_path=None,
         image=["image.png"],
         audio=None,
@@ -1466,6 +1472,28 @@ def test_generate_cli_smoke(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
+def test_generate_image_cli_routes_before_vlm_load():
+    args = Namespace(
+        model="bonsai-ternary",
+        output_modality="image",
+        output="out.png",
+        size="512x512",
+        steps=4,
+        seed=7,
+        guidance=1.0,
+    )
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "run_image_generation_cli") as mock_run_image,
+        patch.object(dispatch_module, "load") as mock_load,
+    ):
+        dispatch_module.main()
+
+    mock_run_image.assert_called_once_with(args)
+    mock_load.assert_not_called()
+
+
 def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
 
@@ -1473,6 +1501,8 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
 
     assert args.thinking_start_token == "<think>"
     assert args.thinking_end_token == "</think>"
+    assert args.output_modality == "text"
+    assert args.size == "512x512"
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
