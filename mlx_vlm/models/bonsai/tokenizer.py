@@ -49,7 +49,9 @@ class BonsaiTokenizer:
         )
         return max(len(ids) for ids in tokens["input_ids"])
 
-    def tokenize(self, prompt: str | list[str], max_length: int | None = None) -> TokenizerOutput:
+    def tokenize(
+        self, prompt: str | list[str], max_length: int | None = None
+    ) -> TokenizerOutput:
         prompts = self._format_prompts(prompt)
         if all(p == "" for p in prompts):
             batch = len(prompts)

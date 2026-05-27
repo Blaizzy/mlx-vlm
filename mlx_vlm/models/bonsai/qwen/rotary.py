@@ -17,7 +17,9 @@ class Qwen3TextRotaryEmbedding(nn.Module):
         self.scaling_factor = scaling_factor
         self.inv_freq = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
 
-    def __call__(self, x: mx.array, position_ids: mx.array) -> tuple[mx.array, mx.array]:
+    def __call__(
+        self, x: mx.array, position_ids: mx.array
+    ) -> tuple[mx.array, mx.array]:
         if position_ids.ndim == 1:
             position_ids = mx.expand_dims(position_ids, axis=0)
         inv_freq = mx.expand_dims(mx.expand_dims(self.inv_freq, axis=0), axis=0)

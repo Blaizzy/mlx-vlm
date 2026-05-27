@@ -29,10 +29,18 @@ class Qwen3VLAttention(nn.Module):
         self.head_dim = head_dim
         self.num_key_value_groups = num_attention_heads // num_key_value_heads
         self.scaling = 1.0 / math.sqrt(self.head_dim)
-        self.q_proj = nn.Linear(hidden_size, num_attention_heads * head_dim, bias=attention_bias)
-        self.k_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.v_proj = nn.Linear(hidden_size, num_key_value_heads * head_dim, bias=attention_bias)
-        self.o_proj = nn.Linear(num_attention_heads * head_dim, hidden_size, bias=attention_bias)
+        self.q_proj = nn.Linear(
+            hidden_size, num_attention_heads * head_dim, bias=attention_bias
+        )
+        self.k_proj = nn.Linear(
+            hidden_size, num_key_value_heads * head_dim, bias=attention_bias
+        )
+        self.v_proj = nn.Linear(
+            hidden_size, num_key_value_heads * head_dim, bias=attention_bias
+        )
+        self.o_proj = nn.Linear(
+            num_attention_heads * head_dim, hidden_size, bias=attention_bias
+        )
         self.q_norm = Qwen3VLRMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = Qwen3VLRMSNorm(head_dim, eps=rms_norm_eps)
         self.mrope_section = mrope_section or [24, 20, 20]
@@ -51,9 +59,13 @@ class Qwen3VLAttention(nn.Module):
         k_proj = self.k_proj(hidden_states)
         v_proj = self.v_proj(hidden_states)
 
-        query_states = q_proj.reshape(bsz, q_len, self.num_attention_heads, self.head_dim)
+        query_states = q_proj.reshape(
+            bsz, q_len, self.num_attention_heads, self.head_dim
+        )
         key_states = k_proj.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim)
-        value_states = v_proj.reshape(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = v_proj.reshape(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        )
 
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
@@ -77,7 +89,12 @@ class Qwen3VLAttention(nn.Module):
                 cache_value_states = value_states
                 cache_length = q_len
             else:
-                cache_shape = (bsz, self.num_key_value_heads, max_cache_length, self.head_dim)
+                cache_shape = (
+                    bsz,
+                    self.num_key_value_heads,
+                    max_cache_length,
+                    self.head_dim,
+                )
                 cache_key_states = mx.zeros(cache_shape, dtype=key_states.dtype)
                 cache_value_states = mx.zeros(cache_shape, dtype=value_states.dtype)
                 start_indices = mx.array([0, 0, 0, 0], dtype=mx.int32)
@@ -115,8 +132,12 @@ class Qwen3VLAttention(nn.Module):
         valid_value_states = cache_value_states[:, :, :cache_length, :]
 
         if self.num_key_value_heads != self.num_attention_heads:
-            key_states = Qwen3VLAttention._repeat_kv(valid_key_states, self.num_key_value_groups)
-            value_states = Qwen3VLAttention._repeat_kv(valid_value_states, self.num_key_value_groups)
+            key_states = Qwen3VLAttention._repeat_kv(
+                valid_key_states, self.num_key_value_groups
+            )
+            value_states = Qwen3VLAttention._repeat_kv(
+                valid_value_states, self.num_key_value_groups
+            )
         else:
             key_states = valid_key_states
             value_states = valid_value_states
@@ -140,7 +161,9 @@ class Qwen3VLAttention(nn.Module):
         )
 
         attn_output = attn_output.astype(query_states.dtype)
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(bsz, q_len, self.num_attention_heads * self.head_dim)
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
+            bsz, q_len, self.num_attention_heads * self.head_dim
+        )
         attn_output = self.o_proj(attn_output)
         return attn_output, (cache_key_states, cache_value_states, cache_length)
 
@@ -150,11 +173,15 @@ class Qwen3VLAttention(nn.Module):
 
         if len(shape) == 5:
             batch, num_key_value_heads, rep, slen, head_dim = shape
-            return hidden_states.reshape(batch, num_key_value_heads * rep, slen, head_dim)
+            return hidden_states.reshape(
+                batch, num_key_value_heads * rep, slen, head_dim
+            )
 
         batch, num_key_value_heads, slen, head_dim = shape
         hidden_states = mx.expand_dims(hidden_states, axis=2)
-        hidden_states = mx.broadcast_to(hidden_states, (batch, num_key_value_heads, n_rep, slen, head_dim))
+        hidden_states = mx.broadcast_to(
+            hidden_states, (batch, num_key_value_heads, n_rep, slen, head_dim)
+        )
         return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
     @staticmethod

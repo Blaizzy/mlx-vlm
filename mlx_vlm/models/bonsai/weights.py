@@ -37,13 +37,19 @@ def load_text_encoder_4bit(model_path: str | Path) -> Qwen3TextEncoder:
     return text_encoder
 
 
-def load_transformer(model_path: str | Path, precision: str) -> Flux2KleinFastTransformer:
+def load_transformer(
+    model_path: str | Path, precision: str
+) -> Flux2KleinFastTransformer:
     root = Path(model_path).expanduser()
     spec = Flux2KleinMegakernelSpec()
     packed_dir = find_packed_artifact_dir(root)
     if packed_dir is None:
-        raise FileNotFoundError(f"Missing transformer-packed-mflux artifact under {root}")
-    weights = load_klein_fast_packed_weights_from_disk(packed_dir, spec, dtype=mx.bfloat16)
+        raise FileNotFoundError(
+            f"Missing transformer-packed-mflux artifact under {root}"
+        )
+    weights = load_klein_fast_packed_weights_from_disk(
+        packed_dir, spec, dtype=mx.bfloat16
+    )
     transformer = Flux2KleinFastTransformer(
         weights=weights,
         precision=precision,
@@ -73,7 +79,10 @@ def load_transformer(model_path: str | Path, precision: str) -> Flux2KleinFastTr
     transformer.time_guidance_embed.linear_2.weight = raw[
         "time_guidance_embed.timestep_embedder.linear_2.weight"
     ].astype(mx.bfloat16)
-    mx.eval(transformer.time_guidance_embed.linear_1.weight, transformer.time_guidance_embed.linear_2.weight)
+    mx.eval(
+        transformer.time_guidance_embed.linear_1.weight,
+        transformer.time_guidance_embed.linear_2.weight,
+    )
     return transformer
 
 
@@ -83,7 +92,11 @@ def load_vae() -> BonsaiVAE:
     raw = mx.load(path)
     mapped: dict = {}
     for key, value in raw.items():
-        if not (key.startswith("decoder.") or key.startswith("post_quant_conv.") or key.startswith("bn.")):
+        if not (
+            key.startswith("decoder.")
+            or key.startswith("post_quant_conv.")
+            or key.startswith("bn.")
+        ):
             continue
         if key.endswith(".num_batches_tracked"):
             continue

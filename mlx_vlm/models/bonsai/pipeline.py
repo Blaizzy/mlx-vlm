@@ -9,15 +9,27 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
-from mlx_vlm.models.bonsai.config import BonsaiVariant, default_model_path, get_variant, validate_dimensions
+from mlx_vlm.models.bonsai.config import (
+    BonsaiVariant,
+    default_model_path,
+    get_variant,
+    validate_dimensions,
+)
 from mlx_vlm.models.bonsai.download import download_model, validate_model_layout
-from mlx_vlm.models.bonsai.klein_fast.blocks import DEFAULT_QUANT_GROUP_SIZE, _require_native_quantized_matmul
+from mlx_vlm.models.bonsai.klein_fast.blocks import (
+    DEFAULT_QUANT_GROUP_SIZE,
+    _require_native_quantized_matmul,
+)
 from mlx_vlm.models.bonsai.latent import prepare_packed_latents
 from mlx_vlm.models.bonsai.prompt import encode_prompt
 from mlx_vlm.models.bonsai.scheduler import FlowMatchEulerDiscreteScheduler
 from mlx_vlm.models.bonsai.tiling import TilingConfig
 from mlx_vlm.models.bonsai.tokenizer import BonsaiTokenizer
-from mlx_vlm.models.bonsai.weights import load_text_encoder_4bit, load_transformer, load_vae
+from mlx_vlm.models.bonsai.weights import (
+    load_text_encoder_4bit,
+    load_transformer,
+    load_vae,
+)
 
 TiledVAE = Literal["auto", "on", "off"]
 
@@ -123,11 +135,15 @@ class BonsaiImage:
             raise ValueError("prompt must not be empty")
 
         max_seq = max_sequence_length or self.runtime_config.max_sequence_length
-        prompt_embeds, text_ids = self._encode_prompt(prompt, max_sequence_length=max_seq)
+        prompt_embeds, text_ids = self._encode_prompt(
+            prompt, max_sequence_length=max_seq
+        )
         negative_prompt_embeds = None
         negative_text_ids = None
         if guidance is not None and guidance > 1.0:
-            negative_prompt_embeds, negative_text_ids = self._encode_prompt(" ", max_sequence_length=max_seq)
+            negative_prompt_embeds, negative_text_ids = self._encode_prompt(
+                " ", max_sequence_length=max_seq
+            )
         self._ensure_transformer_and_vae()
 
         latents, latent_ids, latent_height, latent_width = prepare_packed_latents(
@@ -162,11 +178,15 @@ class BonsaiImage:
             latents = scheduler.step(noise=noise, step_index=i, latents=latents)
             mx.eval(latents)
 
-        packed = latents.reshape(latents.shape[0], latent_height, latent_width, latents.shape[-1])
+        packed = latents.reshape(
+            latents.shape[0], latent_height, latent_width, latents.shape[-1]
+        )
         packed = packed.transpose(0, 3, 1, 2)
         decoded = self.vae.decode_packed_latents(  # type: ignore[union-attr]
             packed,
-            tiling_config=self._resolve_tiling(height=height, width=width, override=tiled_vae),
+            tiling_config=self._resolve_tiling(
+                height=height, width=width, override=tiled_vae
+            ),
         )
         if self.runtime_config.evict_transformer:
             self.transformer = None
@@ -175,7 +195,9 @@ class BonsaiImage:
             mx.clear_cache()
         return _to_image_array(decoded)
 
-    def _encode_prompt(self, prompt: str, *, max_sequence_length: int) -> tuple[mx.array, mx.array]:
+    def _encode_prompt(
+        self, prompt: str, *, max_sequence_length: int
+    ) -> tuple[mx.array, mx.array]:
         key = (prompt, max_sequence_length, self.runtime_config.bucketed_seq_len)
         cached = self.prompt_cache.get(key)
         if cached is not None:
@@ -222,7 +244,9 @@ class BonsaiImage:
             guidance=None,
         )
 
-    def _resolve_tiling(self, *, height: int, width: int, override: bool | None) -> TilingConfig | None:
+    def _resolve_tiling(
+        self, *, height: int, width: int, override: bool | None
+    ) -> TilingConfig | None:
         if override is True:
             return TilingConfig()
         if override is False:
@@ -232,7 +256,11 @@ class BonsaiImage:
             return TilingConfig()
         if mode == "off":
             return None
-        return TilingConfig() if max(height, width) >= 2 * TilingConfig().vae_decode_tile_size else None
+        return (
+            TilingConfig()
+            if max(height, width) >= 2 * TilingConfig().vae_decode_tile_size
+            else None
+        )
 
 
 def _to_image_array(decoded_latents: mx.array) -> mx.array:

@@ -23,7 +23,9 @@ def prepare_packed_latents(
         key=mx.random.key(seed),
     ).astype(ModelConfig.precision)
     latent_ids = prepare_grid_ids(latents, t_coord=0)
-    packed = latents.reshape(batch_size, num_latent_channels * 4, latent_height * latent_width)
+    packed = latents.reshape(
+        batch_size, num_latent_channels * 4, latent_height * latent_width
+    )
     return packed.transpose(0, 2, 1), latent_ids, latent_height, latent_width
 
 

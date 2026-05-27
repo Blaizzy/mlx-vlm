@@ -53,8 +53,12 @@ def validate_model_layout(model_path: str | Path) -> Path:
     root = Path(model_path).expanduser()
     if not root.exists():
         raise FileNotFoundError(f"Model path does not exist: {root}")
-    missing = [relative for relative in REQUIRED_FILES if not (root / relative).exists()]
+    missing = [
+        relative for relative in REQUIRED_FILES if not (root / relative).exists()
+    ]
     if missing:
         formatted = "\n".join(f"  - {item}" for item in missing)
-        raise FileNotFoundError(f"Model snapshot is missing required Bonsai files:\n{formatted}")
+        raise FileNotFoundError(
+            f"Model snapshot is missing required Bonsai files:\n{formatted}"
+        )
     return root

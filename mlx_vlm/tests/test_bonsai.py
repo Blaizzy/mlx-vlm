@@ -72,7 +72,9 @@ def test_bonsai_declares_image_generation_model_type(tmp_path: Path) -> None:
     assert BonsaiImageGenerationModel.is_image_generation_model
     assert BonsaiImageGenerationModel.model_type == "bonsai"
     assert image_generation_model_class("bonsai-ternary") is BonsaiImageGenerationModel
-    assert image_generation_model_class(tmp_path.as_posix()) is BonsaiImageGenerationModel
+    assert (
+        image_generation_model_class(tmp_path.as_posix()) is BonsaiImageGenerationModel
+    )
     assert is_image_generation_model("bonsai-ternary")
     assert not is_image_generation_model("mlx-community/nanoLLaVA-1.5-8bit")
 
@@ -83,9 +85,7 @@ def test_bonsai_parse_size() -> None:
 
 
 @pytest.mark.parametrize("width,height", [(255, 512), (512, 2050), (513, 512)])
-def test_bonsai_validate_dimensions_rejects_bad_sizes(
-    width: int, height: int
-) -> None:
+def test_bonsai_validate_dimensions_rejects_bad_sizes(width: int, height: int) -> None:
     with pytest.raises(ValueError):
         validate_dimensions(width=width, height=height)
 

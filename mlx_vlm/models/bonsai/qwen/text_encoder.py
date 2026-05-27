@@ -81,8 +81,12 @@ class Qwen3TextEncoder(nn.Module):
             zeros_2d = mx.zeros((seq_len, seq_len), dtype=mask_dtype)
             neginf_2d = mx.full((seq_len, seq_len), -float("inf"), dtype=mask_dtype)
             causal_tri_mask = mx.where(tri_bool, neginf_2d, zeros_2d)
-            causal_tri_mask = mx.expand_dims(mx.expand_dims(causal_tri_mask, axis=0), axis=0)
-            causal_tri_mask = mx.broadcast_to(causal_tri_mask, (batch_size, 1, seq_len, seq_len))
+            causal_tri_mask = mx.expand_dims(
+                mx.expand_dims(causal_tri_mask, axis=0), axis=0
+            )
+            causal_tri_mask = mx.broadcast_to(
+                causal_tri_mask, (batch_size, 1, seq_len, seq_len)
+            )
         attention_mask_4d = causal_tri_mask + padding_mask
 
         position_ids = mx.arange(seq_len, dtype=mx.int32)
@@ -120,5 +124,7 @@ class Qwen3TextEncoder(nn.Module):
             raise RuntimeError("Hidden states not available for prompt embedding.")
         stacked = mx.stack([hidden_states_list[i] for i in hidden_state_layers], axis=1)
         batch_size, num_layers, seq_len, hidden_dim = stacked.shape
-        prompt_embeds = mx.transpose(stacked, (0, 2, 1, 3)).reshape(batch_size, seq_len, num_layers * hidden_dim)
+        prompt_embeds = mx.transpose(stacked, (0, 2, 1, 3)).reshape(
+            batch_size, seq_len, num_layers * hidden_dim
+        )
         return prompt_embeds

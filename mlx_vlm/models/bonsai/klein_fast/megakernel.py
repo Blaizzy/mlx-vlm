@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Literal
 
 import mlx.core as mx
-import mlx.nn
 
 from mlx_vlm.models.bonsai.klein_fast.blocks import (
     DenseLinearKernel,

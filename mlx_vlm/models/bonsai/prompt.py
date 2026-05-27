@@ -26,7 +26,9 @@ def encode_prompt(
     bucketed: bool = True,
 ) -> tuple[mx.array, mx.array]:
     true_len = tokenizer.count_tokens(prompt) if bucketed else max_sequence_length
-    effective_max = _pick_bucket(true_len, DEFAULT_SEQ_LEN_BUCKETS, cap=max_sequence_length)
+    effective_max = _pick_bucket(
+        true_len, DEFAULT_SEQ_LEN_BUCKETS, cap=max_sequence_length
+    )
     tokens = tokenizer.tokenize(prompt=prompt, max_length=effective_max)
     embeds = text_encoder.get_prompt_embeds(
         input_ids=tokens.input_ids,

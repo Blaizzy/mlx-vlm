@@ -31,7 +31,9 @@ VARIANTS: dict[str, BonsaiVariant] = {
     ),
 }
 
-_ALIASES = {alias: variant for variant in VARIANTS.values() for alias in variant.aliases}
+_ALIASES = {
+    alias: variant for variant in VARIANTS.values() for alias in variant.aliases
+}
 
 
 def get_variant(name: str | BonsaiVariant = "ternary") -> BonsaiVariant:
@@ -42,7 +44,9 @@ def get_variant(name: str | BonsaiVariant = "ternary") -> BonsaiVariant:
         return _ALIASES[key]
     except KeyError as exc:
         supported = ", ".join(sorted(_ALIASES))
-        raise ValueError(f"Unknown Bonsai variant {name!r}. Supported: {supported}") from exc
+        raise ValueError(
+            f"Unknown Bonsai variant {name!r}. Supported: {supported}"
+        ) from exc
 
 
 def list_variants() -> tuple[str, ...]:
@@ -53,8 +57,14 @@ def default_models_dir() -> Path:
     return Path.cwd() / "models"
 
 
-def default_model_path(variant: BonsaiVariant, models_dir: str | Path | None = None) -> Path:
-    root = Path(models_dir).expanduser() if models_dir is not None else default_models_dir()
+def default_model_path(
+    variant: BonsaiVariant, models_dir: str | Path | None = None
+) -> Path:
+    root = (
+        Path(models_dir).expanduser()
+        if models_dir is not None
+        else default_models_dir()
+    )
     return root / variant.local_dir_name
 
 

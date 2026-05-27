@@ -16,12 +16,8 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..generate import generate, stream_generate
-from ..generate_image import (
-    ImageGenerationRequest as CoreImageGenerationRequest,
-    generate_image,
-    is_image_generation_model,
-    parse_size,
-)
+from ..generate_image import ImageGenerationRequest as CoreImageGenerationRequest
+from ..generate_image import generate_image, is_image_generation_model, parse_size
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
@@ -176,7 +172,9 @@ def _image_output_path(
     seed: int,
 ) -> Path | None:
     if image_request.output_path:
-        return _indexed_output_path(Path(image_request.output_path).expanduser(), index, count)
+        return _indexed_output_path(
+            Path(image_request.output_path).expanduser(), index, count
+        )
     if image_request.output_dir:
         directory = Path(image_request.output_dir).expanduser()
         return directory / f"image-{seed}.png"
@@ -221,6 +219,7 @@ async def images_generations_endpoint(request: Request):
             results = []
             lock = generation_lock
             if lock is None:
+
                 class _NullLock:
                     def __enter__(self):
                         return None

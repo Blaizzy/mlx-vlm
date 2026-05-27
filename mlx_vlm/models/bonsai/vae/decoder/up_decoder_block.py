@@ -25,7 +25,9 @@ class Flux2UpDecoderBlock2D(nn.Module):
             )
             for i in range(num_layers)
         ]
-        self.upsamplers = [Flux2Upsample2D(out_channels, out_channels)] if add_upsample else []
+        self.upsamplers = (
+            [Flux2Upsample2D(out_channels, out_channels)] if add_upsample else []
+        )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         for resnet in self.resnets:

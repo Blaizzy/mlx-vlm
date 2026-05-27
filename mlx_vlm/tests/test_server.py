@@ -13,8 +13,8 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import mlx_vlm.server as server
-import mlx_vlm.server.openai as server_openai
 import mlx_vlm.server.generation as server_generation
+import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate_image import ImageGenerationResult
@@ -287,9 +287,7 @@ def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
     )
 
     def fake_generate_image(model, request, **kwargs):
-        return _fake_image_result(
-            seed=request.seed, output_path=kwargs["output_path"]
-        )
+        return _fake_image_result(seed=request.seed, output_path=kwargs["output_path"])
 
     monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
 

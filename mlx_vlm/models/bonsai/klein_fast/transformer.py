@@ -99,7 +99,11 @@ class Flux2KleinFastTransformer(nn.Module):
         ) -> mx.array:
             precomputed = self.megakernel.prepare_all_modulations(temb)
             return self.megakernel.forward_from_modulations(
-                hidden_states, encoder_hidden_states, precomputed, rotary_cos, rotary_sin
+                hidden_states,
+                encoder_hidden_states,
+                precomputed,
+                rotary_cos,
+                rotary_sin,
             )
 
         self._compiled_forward = mx.compile(_forward_with_modulations)
@@ -116,17 +120,25 @@ class Flux2KleinFastTransformer(nn.Module):
         if not isinstance(timestep, mx.array):
             timestep = mx.array(timestep, dtype=hidden_states.dtype)
         if timestep.ndim == 0:
-            timestep = mx.full((hidden_states.shape[0],), timestep, dtype=hidden_states.dtype)
+            timestep = mx.full(
+                (hidden_states.shape[0],), timestep, dtype=hidden_states.dtype
+            )
         timestep = timestep.astype(hidden_states.dtype)
-        timestep_scale = mx.where(mx.max(timestep) <= 1.0, 1000.0, 1.0).astype(hidden_states.dtype)
+        timestep_scale = mx.where(mx.max(timestep) <= 1.0, 1000.0, 1.0).astype(
+            hidden_states.dtype
+        )
         timestep = timestep * timestep_scale
         if guidance is not None:
             if not isinstance(guidance, mx.array):
                 guidance = mx.array(guidance, dtype=hidden_states.dtype)
             if guidance.ndim == 0:
-                guidance = mx.full((hidden_states.shape[0],), guidance, dtype=hidden_states.dtype)
+                guidance = mx.full(
+                    (hidden_states.shape[0],), guidance, dtype=hidden_states.dtype
+                )
             guidance = guidance.astype(hidden_states.dtype)
-            guidance_scale = mx.where(mx.max(guidance) <= 1.0, 1000.0, 1.0).astype(hidden_states.dtype)
+            guidance_scale = mx.where(mx.max(guidance) <= 1.0, 1000.0, 1.0).astype(
+                hidden_states.dtype
+            )
             guidance = guidance * guidance_scale
         temb = self.time_guidance_embed(timestep, guidance)
         temb = temb.astype(ModelConfig.precision)

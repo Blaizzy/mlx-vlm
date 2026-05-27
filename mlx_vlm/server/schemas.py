@@ -4,11 +4,6 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
-from ..generate_image import (
-    DEFAULT_IMAGE_GUIDANCE,
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-)
 from ..generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_PATH,
@@ -16,6 +11,11 @@ from ..generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     normalize_resize_shape,
+)
+from ..generate_image import (
+    DEFAULT_IMAGE_GUIDANCE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_IMAGE_STEPS,
 )
 
 
@@ -93,6 +93,7 @@ class ImageGenerationResponse(BaseModel):
     data: List[ImageGenerationResponseData]
     output_format: Literal["png"] = "png"
     size: str
+
 
 # Models for /responses endpoint
 

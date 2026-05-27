@@ -72,7 +72,9 @@ def decode_image_tiled(
             tile_np = tile_np[:eff_h, :eff_w, :]
 
             if out_np is None:
-                out_np = np.zeros((height_out, width_out, tile_np.shape[2]), dtype=np.float32)
+                out_np = np.zeros(
+                    (height_out, width_out, tile_np.shape[2]), dtype=np.float32
+                )
                 count_np = np.zeros((height_out, width_out, 1), dtype=np.float32)
 
             ov_h_out = max(0, min(overlap_h, eff_h - 1))
@@ -91,8 +93,12 @@ def decode_image_tiled(
                     ww[-ov_w_out:] = 1.0 - ramp_w[:ov_w_out]
 
             weights = wh[:, None] * ww[None, :]
-            out_np[y_out : y_out + eff_h, x_out : x_out + eff_w, :] += tile_np * weights[:, :, None]
-            count_np[y_out : y_out + eff_h, x_out : x_out + eff_w, :] += weights[:, :, None]
+            out_np[y_out : y_out + eff_h, x_out : x_out + eff_w, :] += (
+                tile_np * weights[:, :, None]
+            )
+            count_np[y_out : y_out + eff_h, x_out : x_out + eff_w, :] += weights[
+                :, :, None
+            ]
 
     assert out_np is not None and count_np is not None
     out_np = out_np / np.clip(count_np, 1e-6, None)

@@ -58,7 +58,9 @@ def _get_and_cast(raw: dict[str, mx.array], key: str, dtype: mx.Dtype) -> mx.arr
 
 
 def _load_raw_safetensors(transformer_dir: Path) -> dict[str, mx.array]:
-    shards = sorted(p for p in transformer_dir.glob("*.safetensors") if not p.name.startswith("._"))
+    shards = sorted(
+        p for p in transformer_dir.glob("*.safetensors") if not p.name.startswith("._")
+    )
     if not shards:
         raise FileNotFoundError(f"No safetensors files found in {transformer_dir}")
     merged: dict[str, mx.array] = {}
@@ -83,8 +85,12 @@ def _build_megakernel_weights_from_raw(
     dtype: mx.Dtype,
 ) -> MegakernelWeights:
     """Pure mapping logic; unit-testable without touching the filesystem."""
-    shared_double_mod_img = _get_and_cast(raw, _SHARED_MODULATION_KEYS["double_mod_img"], dtype)
-    shared_double_mod_txt = _get_and_cast(raw, _SHARED_MODULATION_KEYS["double_mod_txt"], dtype)
+    shared_double_mod_img = _get_and_cast(
+        raw, _SHARED_MODULATION_KEYS["double_mod_img"], dtype
+    )
+    shared_double_mod_txt = _get_and_cast(
+        raw, _SHARED_MODULATION_KEYS["double_mod_txt"], dtype
+    )
     shared_single_mod = _get_and_cast(raw, _SHARED_MODULATION_KEYS["single_mod"], dtype)
 
     double_block_weights: list[DoubleBlockWeights] = []
@@ -138,7 +144,9 @@ def _load_packed_or_dense_linear(
         return _get_and_cast(raw, hf_weight_key, dtype)
     biases_key = f"{layer_prefix}.biases"
     if biases_key not in raw:
-        raise KeyError(f"Found '{scales_key}' but missing '{biases_key}' in packed artifact")
+        raise KeyError(
+            f"Found '{scales_key}' but missing '{biases_key}' in packed artifact"
+        )
     if hf_weight_key not in raw:
         raise KeyError(f"Missing packed weight '{hf_weight_key}' in packed artifact")
     packed = raw[hf_weight_key]
@@ -200,8 +208,12 @@ def _build_megakernel_weights_from_packed(
     bits: int,
     group_size: int,
 ) -> MegakernelWeights:
-    shared_double_mod_img = _get_and_cast(raw, _SHARED_MODULATION_KEYS["double_mod_img"], dtype)
-    shared_double_mod_txt = _get_and_cast(raw, _SHARED_MODULATION_KEYS["double_mod_txt"], dtype)
+    shared_double_mod_img = _get_and_cast(
+        raw, _SHARED_MODULATION_KEYS["double_mod_img"], dtype
+    )
+    shared_double_mod_txt = _get_and_cast(
+        raw, _SHARED_MODULATION_KEYS["double_mod_txt"], dtype
+    )
     shared_single_mod = _get_and_cast(raw, _SHARED_MODULATION_KEYS["single_mod"], dtype)
 
     def load_block_linear(hf_key: str) -> WeightOrPacked:

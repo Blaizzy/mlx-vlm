@@ -21,7 +21,9 @@ class Flux2Decoder(nn.Module):
         mid_block_add_attention: bool = True,
     ):
         super().__init__()
-        self.conv_in = Flux2ConvIn(in_channels=in_channels, out_channels=block_out_channels[-1])
+        self.conv_in = Flux2ConvIn(
+            in_channels=in_channels, out_channels=block_out_channels[-1]
+        )
         self.mid_block = Flux2UNetMidBlock2D(
             channels=block_out_channels[-1],
             eps=eps,
@@ -44,8 +46,12 @@ class Flux2Decoder(nn.Module):
                 )
             )
 
-        self.conv_norm_out = Flux2ConvNormOut(channels=block_out_channels[0], num_groups=norm_num_groups, eps=eps)
-        self.conv_out = Flux2ConvOut(in_channels=block_out_channels[0], out_channels=out_channels)
+        self.conv_norm_out = Flux2ConvNormOut(
+            channels=block_out_channels[0], num_groups=norm_num_groups, eps=eps
+        )
+        self.conv_out = Flux2ConvOut(
+            in_channels=block_out_channels[0], out_channels=out_channels
+        )
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         hidden_states = self.conv_in(hidden_states)

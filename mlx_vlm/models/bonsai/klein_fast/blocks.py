@@ -181,7 +181,9 @@ def _silu(x: mx.array) -> mx.array:
     return mlx.nn.silu(x)
 
 
-def _layer_norm_affine(x: mx.array, weight: mx.array, bias: mx.array, eps: float) -> mx.array:
+def _layer_norm_affine(
+    x: mx.array, weight: mx.array, bias: mx.array, eps: float
+) -> mx.array:
     return mx.fast.layer_norm(x, weight, bias, eps)
 
 
@@ -410,9 +412,14 @@ def _get_fused_double_norm_rope_kernel(
         _fused_double_kernel_cache[key] = mx.fast.metal_kernel(
             name=f"flux2_fused_double_norm_rope_{safe_key}",
             input_names=[
-                "img_qkv", "txt_qkv",
-                "norm_q", "norm_k", "norm_added_q", "norm_added_k",
-                "cos_vals", "sin_vals",
+                "img_qkv",
+                "txt_qkv",
+                "norm_q",
+                "norm_k",
+                "norm_added_q",
+                "norm_added_k",
+                "cos_vals",
+                "sin_vals",
             ],
             output_names=["q_out", "k_out", "v_out"],
             source=source,
@@ -420,7 +427,9 @@ def _get_fused_double_norm_rope_kernel(
     return _fused_double_kernel_cache[key]
 
 
-def _get_fused_single_norm_rope_kernel(spec: "Flux2KleinBlockSpec", seq_len: int) -> Any:
+def _get_fused_single_norm_rope_kernel(
+    spec: "Flux2KleinBlockSpec", seq_len: int
+) -> Any:
     fused_dim = spec.qkv_mlp_out_dim
     key = f"{seq_len}_{spec.dim}_{spec.num_heads}_{spec.head_dim}_{fused_dim}_{spec.rms_norm_eps}"
     if key not in _fused_single_kernel_cache:
@@ -488,7 +497,9 @@ def quantize_affine_nbit(
     q = np.clip(q, 0, max_q).astype(np.uint32)
     q_flat = q.reshape(rows, -1)
     q_grouped = q_flat.reshape(rows, -1, vals_per_u32)
-    shifts = (np.arange(vals_per_u32, dtype=np.uint32) * bits).reshape(1, 1, vals_per_u32)
+    shifts = (np.arange(vals_per_u32, dtype=np.uint32) * bits).reshape(
+        1, 1, vals_per_u32
+    )
     packed = np.sum(np.left_shift(q_grouped, shifts), axis=2, dtype=np.uint32)
 
     return (
@@ -506,7 +517,9 @@ def _require_native_quantized_matmul(bits: int, group_size: int) -> None:
     """
     _require_supported_bits(bits)
     _require_supported_group_size(group_size)
-    probe_weight = mx.arange(group_size, dtype=mx.float32).reshape(1, group_size) - (group_size // 2)
+    probe_weight = mx.arange(group_size, dtype=mx.float32).reshape(1, group_size) - (
+        group_size // 2
+    )
     packed_weight, scales, biases = quantize_affine_nbit(
         probe_weight,
         bits=bits,
@@ -565,7 +578,13 @@ class QuantizedLinearKernel:
             group_size=group_size,
             scale_dtype=scale_dtype,
         )
-        return cls(packed_weight=packed_weight, scales=scales, biases=biases, bits=bits, group_size=group_size)
+        return cls(
+            packed_weight=packed_weight,
+            scales=scales,
+            biases=biases,
+            bits=bits,
+            group_size=group_size,
+        )
 
     @property
     def out_features(self) -> int:
@@ -590,7 +609,9 @@ class QuantizedLinearKernel:
 LinearKernel = DenseLinearKernel | QuantizedLinearKernel
 
 
-def _fuse_quantized_linears(linears: list[QuantizedLinearKernel]) -> QuantizedLinearKernel:
+def _fuse_quantized_linears(
+    linears: list[QuantizedLinearKernel],
+) -> QuantizedLinearKernel:
     return QuantizedLinearKernel(
         packed_weight=mx.concatenate([l.packed_weight for l in linears], axis=0),
         scales=mx.concatenate([l.scales for l in linears], axis=0),
@@ -612,7 +633,9 @@ def _fuse_linears(linears: list[LinearKernel]) -> LinearKernel:
     raise TypeError("Cannot fuse mixed linear kernel types")
 
 
-def _make_linear(weight: WeightOrPacked, precision: PrecisionName, group_size: int) -> LinearKernel:
+def _make_linear(
+    weight: WeightOrPacked, precision: PrecisionName, group_size: int
+) -> LinearKernel:
     if isinstance(weight, PackedWeight):
         _require_native_quantized_matmul(weight.bits, weight.group_size)
         return QuantizedLinearKernel(
@@ -669,7 +692,9 @@ class SingleFlux2Block:
         rotary_sin: mx.array,
     ) -> mx.array:
         norm_w, norm_b, gate = modulation
-        norm_hidden_states = _layer_norm_affine(hidden_states, norm_w, norm_b, self.spec.layer_norm_eps)
+        norm_hidden_states = _layer_norm_affine(
+            hidden_states, norm_w, norm_b, self.spec.layer_norm_eps
+        )
 
         fused = self.qkv_mlp_proj(norm_hidden_states)
         mlp_hidden = fused[:, :, 3 * self.spec.dim :]
@@ -699,7 +724,9 @@ class SingleFlux2Block:
             value,
             scale=1.0 / math.sqrt(D),
         )
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape((batch_size, seq_len, self.spec.dim))
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(
+            (batch_size, seq_len, self.spec.dim)
+        )
         mlp_output = _swiglu_projected(mlp_hidden)
         fused_out = mx.concatenate([attn_output, mlp_output], axis=-1)
         block_output = self.out_proj(fused_out)
@@ -751,8 +778,12 @@ class DoubleFlux2Block:
         self.to_add_out = _make_linear(weights.to_add_out, precision, group_size)
         self.ff_linear_in = _make_linear(weights.ff_linear_in, precision, group_size)
         self.ff_linear_out = _make_linear(weights.ff_linear_out, precision, group_size)
-        self.ff_context_linear_in = _make_linear(weights.ff_context_linear_in, precision, group_size)
-        self.ff_context_linear_out = _make_linear(weights.ff_context_linear_out, precision, group_size)
+        self.ff_context_linear_in = _make_linear(
+            weights.ff_context_linear_in, precision, group_size
+        )
+        self.ff_context_linear_out = _make_linear(
+            weights.ff_context_linear_out, precision, group_size
+        )
         self.norm_q = weights.norm_q.astype(mx.bfloat16)
         self.norm_k = weights.norm_k.astype(mx.bfloat16)
         self.norm_added_q = weights.norm_added_q.astype(mx.bfloat16)
@@ -773,11 +804,21 @@ class DoubleFlux2Block:
         scale_mlp = mod[:, :, 1, 1, :]
         gate_mlp = mod[:, :, 1, 2, :]
         return (
-            ((1.0 + scale_msa).reshape(-1), shift_msa.reshape(-1), gate_msa.reshape(-1)),
-            ((1.0 + scale_mlp).reshape(-1), shift_mlp.reshape(-1), gate_mlp.reshape(-1)),
+            (
+                (1.0 + scale_msa).reshape(-1),
+                shift_msa.reshape(-1),
+                gate_msa.reshape(-1),
+            ),
+            (
+                (1.0 + scale_mlp).reshape(-1),
+                shift_mlp.reshape(-1),
+                gate_mlp.reshape(-1),
+            ),
         )
 
-    def _feedforward(self, x: mx.array, linear_in: LinearKernel, linear_out: LinearKernel) -> mx.array:
+    def _feedforward(
+        self, x: mx.array, linear_in: LinearKernel, linear_out: LinearKernel
+    ) -> mx.array:
         return linear_out(_swiglu_projected(linear_in(x)))
 
     def forward_from_modulation(
@@ -792,7 +833,9 @@ class DoubleFlux2Block:
         (w_msa, b_msa, gate_msa), (w_mlp, b_mlp, gate_mlp) = img_modulation
         (c_w_msa, c_b_msa, c_gate_msa), (c_w_mlp, c_b_mlp, c_gate_mlp) = txt_modulation
 
-        norm_hidden_states = _layer_norm_affine(hidden_states, w_msa, b_msa, self.spec.layer_norm_eps)
+        norm_hidden_states = _layer_norm_affine(
+            hidden_states, w_msa, b_msa, self.spec.layer_norm_eps
+        )
         norm_encoder_hidden_states = _layer_norm_affine(
             encoder_hidden_states, c_w_msa, c_b_msa, self.spec.layer_norm_eps
         )
@@ -809,10 +852,14 @@ class DoubleFlux2Block:
         kernel = _get_fused_double_norm_rope_kernel(self.spec, img_seq, txt_seq)
         full_query, full_key, full_value = kernel(
             inputs=[
-                img_qkv, txt_qkv,
-                self.norm_q, self.norm_k,
-                self.norm_added_q, self.norm_added_k,
-                rotary_cos, rotary_sin,
+                img_qkv,
+                txt_qkv,
+                self.norm_q,
+                self.norm_k,
+                self.norm_added_q,
+                self.norm_added_k,
+                rotary_cos,
+                rotary_sin,
             ],
             template=[("T", mx.bfloat16)],
             grid=(batch_size * (img_seq + txt_seq) * H * 32, 1, 1),
@@ -831,12 +878,16 @@ class DoubleFlux2Block:
             full_value,
             scale=1.0 / math.sqrt(D),
         )
-        attn = attn.transpose(0, 2, 1, 3).reshape((batch_size, txt_seq + img_seq, self.spec.dim))
+        attn = attn.transpose(0, 2, 1, 3).reshape(
+            (batch_size, txt_seq + img_seq, self.spec.dim)
+        )
         context_attn_output = self.to_add_out(attn[:, :txt_seq])
         attn_output = self.to_out(attn[:, txt_seq:])
 
         hidden_states = hidden_states + gate_msa * attn_output
-        norm_hidden_states = _layer_norm_affine(hidden_states, w_mlp, b_mlp, self.spec.layer_norm_eps)
+        norm_hidden_states = _layer_norm_affine(
+            hidden_states, w_mlp, b_mlp, self.spec.layer_norm_eps
+        )
         hidden_states = hidden_states + gate_mlp * self._feedforward(
             norm_hidden_states,
             self.ff_linear_in,
@@ -864,9 +915,13 @@ class DoubleFlux2Block:
         rotary_sin: mx.array,
     ) -> tuple[mx.array, mx.array]:
         hidden_states, squeezed_hidden = _ensure_batched_hidden_states(hidden_states)
-        encoder_hidden_states, squeezed_encoder = _ensure_batched_hidden_states(encoder_hidden_states)
+        encoder_hidden_states, squeezed_encoder = _ensure_batched_hidden_states(
+            encoder_hidden_states
+        )
         if squeezed_hidden != squeezed_encoder:
-            raise ValueError("hidden_states and encoder_hidden_states must have matching batch structure")
+            raise ValueError(
+                "hidden_states and encoder_hidden_states must have matching batch structure"
+            )
         enc_out, hid_out = self.forward_from_modulation(
             hidden_states,
             encoder_hidden_states,

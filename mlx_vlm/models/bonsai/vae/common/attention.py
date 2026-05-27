@@ -8,7 +8,9 @@ from mlx_vlm.models.bonsai.constants import ModelConfig
 class Flux2AttentionBlock(nn.Module):
     def __init__(self, channels: int, groups: int = 32, eps: float = 1e-6):
         super().__init__()
-        self.group_norm = nn.GroupNorm(num_groups=groups, dims=channels, eps=eps, pytorch_compatible=True)
+        self.group_norm = nn.GroupNorm(
+            num_groups=groups, dims=channels, eps=eps, pytorch_compatible=True
+        )
         self.to_q = nn.Linear(channels, channels)
         self.to_k = nn.Linear(channels, channels)
         self.to_v = nn.Linear(channels, channels)
@@ -18,7 +20,9 @@ class Flux2AttentionBlock(nn.Module):
         hidden_states = mx.transpose(hidden_states, (0, 2, 3, 1))
         batch, height, width, channels = hidden_states.shape
 
-        normed = self.group_norm(hidden_states.astype(mx.float32)).astype(ModelConfig.precision)
+        normed = self.group_norm(hidden_states.astype(mx.float32)).astype(
+            ModelConfig.precision
+        )
         q = self.to_q(normed).reshape(batch, height * width, 1, channels)
         k = self.to_k(normed).reshape(batch, height * width, 1, channels)
         v = self.to_v(normed).reshape(batch, height * width, 1, channels)
@@ -29,7 +33,9 @@ class Flux2AttentionBlock(nn.Module):
 
         scale = 1 / mx.sqrt(q.shape[-1])
         attended = scaled_dot_product_attention(q, k, v, scale=scale)
-        attended = mx.transpose(attended, (0, 2, 1, 3)).reshape(batch, height, width, channels)
+        attended = mx.transpose(attended, (0, 2, 1, 3)).reshape(
+            batch, height, width, channels
+        )
         attended = self.to_out(attended)
 
         hidden_states = hidden_states + attended

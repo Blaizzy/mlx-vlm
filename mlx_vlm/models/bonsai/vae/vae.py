@@ -14,11 +14,17 @@ class BonsaiVAE(nn.Module):
     latent_channels: int = 32
     spatial_scale: int = 8
 
-    def __init__(self, decoder_block_out_channels: tuple[int, ...] = (96, 192, 384, 384)):
+    def __init__(
+        self, decoder_block_out_channels: tuple[int, ...] = (96, 192, 384, 384)
+    ):
         super().__init__()
         self.decoder = Flux2Decoder(block_out_channels=decoder_block_out_channels)
-        self.post_quant_conv = nn.Conv2d(self.latent_channels, self.latent_channels, kernel_size=1, padding=0)
-        self.bn = Flux2BatchNormStats(num_features=4 * self.latent_channels, eps=1e-4, momentum=0.1)
+        self.post_quant_conv = nn.Conv2d(
+            self.latent_channels, self.latent_channels, kernel_size=1, padding=0
+        )
+        self.bn = Flux2BatchNormStats(
+            num_features=4 * self.latent_channels, eps=1e-4, momentum=0.1
+        )
 
     def decode(self, latents: mx.array) -> mx.array:
         if latents.ndim == 5:
@@ -50,7 +56,10 @@ class BonsaiVAE(nn.Module):
             return decode_image_tiled(
                 latent=latent_5d,
                 decode_fn=self.decode,
-                tile_size=(tiling_config.vae_decode_tile_size, tiling_config.vae_decode_tile_size),
+                tile_size=(
+                    tiling_config.vae_decode_tile_size,
+                    tiling_config.vae_decode_tile_size,
+                ),
                 tile_overlap=(overlap_px, overlap_px),
                 spatial_scale=self.spatial_scale,
             )
@@ -59,6 +68,10 @@ class BonsaiVAE(nn.Module):
     @staticmethod
     def _unpatchify_latents(latents: mx.array) -> mx.array:
         batch_size, num_channels, height, width = latents.shape
-        latents = mx.reshape(latents, (batch_size, num_channels // 4, 2, 2, height, width))
+        latents = mx.reshape(
+            latents, (batch_size, num_channels // 4, 2, 2, height, width)
+        )
         latents = mx.transpose(latents, (0, 1, 4, 2, 5, 3))
-        return mx.reshape(latents, (batch_size, num_channels // 4, height * 2, width * 2))
+        return mx.reshape(
+            latents, (batch_size, num_channels // 4, height * 2, width * 2)
+        )
