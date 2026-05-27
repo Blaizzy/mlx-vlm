@@ -2,13 +2,13 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
 
 
@@ -86,55 +86,15 @@ class GLM4VRotaryEmbedding(nn.Module):
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-def rotate_half_llm(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    return mx.flatten(mx.stack([-x2, x1], axis=-1), start_axis=-2, end_axis=-1)
-
-
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
-    """
-    Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
-    Args:
-        q (mx.array): The query tensor.
-        k (mx.array): The key tensor.
-        cos (mx.array): The cosine part of the rotary embedding.
-        sin (mx.array): The sine part of the rotary embedding.
-        mrope_section (List[int]): Multimodal rope section for channel dimension of temporal, height and width.
-        unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
-    Returns:
-        tuple(mx.array): The rotated query and key tensors.
-    """
-
-    mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
-
-    cos = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
-    )[
-        :, None, :, :
-    ]  # unsqueeze dim 1
-    sin = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
-    )[:, None, :, :]
-
-    cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
-    sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
-
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (rotate_half_llm(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half_llm(k_rot) * sin)
-
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-
-    return q_embed, k_embed
+    return _apply_mrope(
+        q,
+        k,
+        cos,
+        sin,
+        mrope_section=mrope_section,
+        style="sectioned_even_odd",
+    )
 
 
 class Glm4vAttention(nn.Module):

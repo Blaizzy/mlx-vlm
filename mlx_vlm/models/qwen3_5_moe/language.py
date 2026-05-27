@@ -94,6 +94,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         gdn_sink: Optional[list] = None,
         target_verify: bool = False,
     ) -> mx.array:
@@ -108,9 +109,10 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         else:
             r = self.self_attn(
                 self.input_layernorm(x),
-                mask,
-                cache,
-                position_ids,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
                 target_verify=target_verify,
             )
         h = x + r

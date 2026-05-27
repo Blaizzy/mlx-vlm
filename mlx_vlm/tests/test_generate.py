@@ -350,6 +350,55 @@ class TestGenerationBatch:
         empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
         assert empty._rope_deltas.tolist() == [[5], [7]]
 
+    def test_extend_materializes_pending_decode_before_cache_merge(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def extend(self, other):
+                calls.append(("extend-cache",))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        a = self._mrope_batch([0], [[0]])
+        b = self._mrope_batch([1], [[5]])
+        a.prompt_cache = [RecordingCache()]
+        b.prompt_cache = [RecordingCache()]
+
+        a.extend(b)
+
+        assert calls == [("eval", (0,)), ("eval", (1,)), ("extend-cache",)]
+
+    def test_filter_materializes_pending_decode_before_cache_filter(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def filter(self, keep):
+                calls.append(("filter-cache", keep.tolist()))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        batch = self._mrope_batch([0, 1], [[0], [5]])
+        batch.prompt_cache = [RecordingCache()]
+        batch._next_tokens = mx.array([10, 20], dtype=mx.int32)
+
+        batch.filter([0])
+
+        assert calls == [("eval", (0, 1)), ("filter-cache", [0])]
+
     @staticmethod
     def _capture(value, B):
         from mlx_vlm.generate import PromptProcessingBatch
@@ -598,6 +647,53 @@ class TestBatchGenerator:
 
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
+
+    def test_generation_batch_extend_keeps_processor_context_aligned(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        seen_contexts = []
+
+        def force_token_2(tokens, logits):
+            seen_contexts.append(tokens.tolist())
+            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
+            return mx.broadcast_to(token_scores, logits.shape)
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        plain = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2, 2],
+            logits_processors=[None, None],
+        )
+        structured = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[2],
+            inputs=mx.array([7], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[[force_token_2]],
+        )
+
+        plain.extend(structured)
+        assert plain.token_context == [[], [], [30]]
+
+        first = plain.next()
+        assert [r.token for r in first] == [5, 6, 7]
+        assert seen_contexts == [[30, 7]]
 
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
@@ -1227,6 +1323,11 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
             repetition_penalty=1.15,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={3: -0.75},
         )
 
@@ -1238,7 +1339,9 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
         )
-        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+        mock_make_logits_processors.assert_called_once_with(
+            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
+        )
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -1272,6 +1375,12 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
         chat=False,
         verbose=False,
         eos_tokens=None,

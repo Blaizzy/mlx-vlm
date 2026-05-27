@@ -8,10 +8,11 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Iterator, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
+from mlx_lm.sample_utils import make_logits_processors
 
 from .. import apc as _apc
 from ..generate import (
@@ -20,6 +21,7 @@ from ..generate import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
+    DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
@@ -426,6 +428,11 @@ class GenerationArguments:
     min_p: float = 0.0
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    presence_penalty: Optional[float] = None
+    presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    frequency_penalty: Optional[float] = None
+    frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
@@ -448,6 +455,16 @@ class GenerationArguments:
         }
         if self.repetition_penalty is not None:
             kw["repetition_penalty"] = self.repetition_penalty
+        if self.repetition_context_size is not None:
+            kw["repetition_context_size"] = self.repetition_context_size
+        if self.presence_penalty is not None:
+            kw["presence_penalty"] = self.presence_penalty
+        if self.presence_context_size is not None:
+            kw["presence_context_size"] = self.presence_context_size
+        if self.frequency_penalty is not None:
+            kw["frequency_penalty"] = self.frequency_penalty
+        if self.frequency_context_size is not None:
+            kw["frequency_context_size"] = self.frequency_context_size
         if self.logit_bias is not None:
             kw["logit_bias"] = self.logit_bias
         if self.thinking_budget is not None:
@@ -519,6 +536,70 @@ class StreamingToken:
     prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
+
+
+class _TokenIterator:
+    """Closeable iterator over queued tokens for one generation request.
+
+    close() cancels unfinished requests and is safe while another thread is
+    blocked in __next__ waiting for the next token.
+    """
+
+    def __init__(self, rqueue, uid, cancel_fn, queue_timeout):
+        self._rqueue = rqueue
+        self._uid = uid
+        self._cancel_fn = cancel_fn
+        self._queue_timeout = queue_timeout
+        self._ended = False
+        self._closed = False
+        self._lock = Lock()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._ended:
+            raise StopIteration
+        try:
+            item = self._rqueue.get(timeout=self._queue_timeout)
+        except QueueEmpty as exc:
+            # Consumer is stalled or upstream is wedged — treat as cancel.
+            self.close()
+            label = (
+                "without a timeout"
+                if self._queue_timeout is None
+                else f"for {self._queue_timeout:g}s"
+            )
+            raise RuntimeError(
+                "Timed out waiting "
+                f"{label} for the next generated token. "
+                "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
+                "prefills, or reduce the prompt size."
+            ) from exc
+        if item is None:
+            self._ended = True
+            raise StopIteration
+        if isinstance(item, Exception):
+            self._ended = True
+            raise item
+        if getattr(item, "finish_reason", None):
+            self._ended = True
+        return item
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        if not self._ended:
+            self._cancel_fn(self._uid)
+
+    def __del__(self):
+        # Mirror generator semantics: implicit close on GC.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class ResponseGenerator:
@@ -637,7 +718,7 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
-    ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+    ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         if self.draft_model is not None and args.logits_processors is not None:
@@ -659,46 +740,9 @@ class ResponseGenerator:
         if isinstance(ctx, Exception):
             raise ctx
 
-        uid = ctx.uid
-
-        def token_iterator():
-            # Mark ended before yielding the final token so a consumer that
-            # closes immediately after seeing finish_reason isn't treated
-            # as a client abort.
-            ended = False
-            queue_timeout = get_token_queue_timeout()
-            try:
-                while True:
-                    try:
-                        item = rqueue.get(timeout=queue_timeout)
-                    except QueueEmpty as exc:
-                        timeout_label = (
-                            "without a timeout"
-                            if queue_timeout is None
-                            else f"for {queue_timeout:g}s"
-                        )
-                        raise RuntimeError(
-                            "Timed out waiting "
-                            f"{timeout_label} for the next generated token. "
-                            "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
-                            "prefills, or reduce the prompt size."
-                        ) from exc
-                    if item is None:
-                        ended = True
-                        break
-                    if isinstance(item, Exception):
-                        ended = True
-                        raise item
-                    if getattr(item, "finish_reason", None):
-                        ended = True
-                    yield item
-                    if ended:
-                        break
-            finally:
-                if not ended:
-                    self._cancel(uid)
-
-        return ctx, token_iterator()
+        return ctx, _TokenIterator(
+            rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
+        )
 
     def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
@@ -730,6 +774,22 @@ class ResponseGenerator:
                 return mx.random.categorical(logprobs * (1 / args.temperature))
 
         return sampler
+
+    def _make_logits_processors(
+        self, args: GenerationArguments
+    ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        processors = make_logits_processors(
+            args.logit_bias,
+            args.repetition_penalty,
+            args.repetition_context_size,
+            args.presence_penalty,
+            args.presence_context_size,
+            args.frequency_penalty,
+            args.frequency_context_size,
+        )
+        if args.logits_processors is not None:
+            processors.extend(args.logits_processors)
+        return processors
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
@@ -890,7 +950,7 @@ class ResponseGenerator:
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
-                            logits_processors=[args.logits_processors],
+                            logits_processors=[self._make_logits_processors(args)],
                         )
                     except Exception as e:
                         rqueue.put(e)

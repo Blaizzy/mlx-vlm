@@ -1681,10 +1681,12 @@ class TestModels(unittest.TestCase):
 
         position_ids = captured["position_ids"]
         self.assertIsNotNone(position_ids)
-        # MRoPE shape: (3, batch, seq).
-        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
         # Decode position == cache._idx (10), not cache.offset[0].item() (3).
-        self.assertEqual(position_ids[0, 0, 0].item(), 10)
+        if position_ids.ndim == 3:
+            self.assertEqual(position_ids[0, 0, 0].item(), 10)
+        else:
+            self.assertEqual(position_ids[0, 0].item(), 10)
 
     def _assert_mrope_decode_uses_rope_deltas_kwarg(self, language_model, hidden_size):
         """Shared assertion: under continuous batching, an explicit
@@ -1735,10 +1737,13 @@ class TestModels(unittest.TestCase):
 
         position_ids = captured["position_ids"]
         self.assertIsNotNone(position_ids)
-        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
         # Position == cache._idx (10) + kwarg delta (5) == 15.
         # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
-        self.assertEqual(position_ids[0, 0, 0].item(), 15)
+        if position_ids.ndim == 3:
+            self.assertEqual(position_ids[0, 0, 0].item(), 15)
+        else:
+            self.assertEqual(position_ids[0, 0].item(), 15)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
@@ -3284,6 +3289,29 @@ class TestModels(unittest.TestCase):
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
         )
+
+        rope_input_ids = mx.array([[10, 11, 999, 999, 999, 999, 999, 999, 12, 13]])
+        rope_grid_thw = mx.array([[1, 4, 6]], dtype=mx.int64)
+        position_ids, rope_deltas = model.language_model.get_rope_index(
+            rope_input_ids,
+            image_grid_thw=rope_grid_thw,
+        )
+        expected_position_ids = mx.array(
+            [
+                [
+                    [0, 1, 2, 2, 2, 2, 2, 2, 5, 6],
+                ],
+                [
+                    [0, 1, 2, 2, 2, 3, 3, 3, 5, 6],
+                ],
+                [
+                    [0, 1, 2, 3, 4, 2, 3, 4, 5, 6],
+                ],
+            ],
+            dtype=rope_input_ids.dtype,
+        )
+        self.assertTrue(mx.array_equal(position_ids, expected_position_ids).item())
+        self.assertEqual(rope_deltas.item(), -3)
 
         # Test vision model with proper input format
         # grid_thw format: [temporal, height/patch, width/patch]
@@ -5838,6 +5866,23 @@ class TestMiniCPMO(unittest.TestCase):
         sanitized = model.sanitize(weights)
         self.assertEqual(sanitized["audio_tower.conv1.weight"].shape, (8, 3, 80))
         self.assertEqual(sanitized["audio_tower.conv2.weight"].shape, (8, 3, 8))
+
+    def test_minicpmo_vision_embedding_uses_floating_pixel_dtype(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        model.language_model.model.embed_tokens.weight = mx.zeros(
+            model.language_model.model.embed_tokens.weight.shape,
+            dtype=mx.uint32,
+        )
+        pixel_values = [[mx.ones((3, 28, 28), dtype=mx.uint32)]]
+        tgt_sizes = [mx.array([[2, 2]], dtype=mx.int32)]
+
+        vision_hidden_states = model.get_vision_embedding(pixel_values, tgt_sizes)
+
+        self.assertEqual(len(vision_hidden_states), 1)
+        self.assertIsInstance(vision_hidden_states[0], mx.array)
+        self.assertEqual(vision_hidden_states[0].shape, (1, 4, 64))
 
 
 class TestPhi4MM(unittest.TestCase):

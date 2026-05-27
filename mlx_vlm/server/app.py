@@ -13,7 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 
 from .. import apc as _apc
-from ..generate import DEFAULT_TEMPERATURE, DEFAULT_TOP_P
+from ..generate import (
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_P,
+)
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -106,6 +110,23 @@ def _build_gen_args(
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
         repetition_penalty=getattr(request, "repetition_penalty", None),
+        repetition_context_size=_request_field_or_default(
+            request,
+            "repetition_context_size",
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        ),
+        presence_penalty=getattr(request, "presence_penalty", None),
+        presence_context_size=_request_field_or_default(
+            request,
+            "presence_context_size",
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        ),
+        frequency_penalty=getattr(request, "frequency_penalty", None),
+        frequency_context_size=_request_field_or_default(
+            request,
+            "frequency_context_size",
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        ),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
