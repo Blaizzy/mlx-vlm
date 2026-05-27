@@ -3,7 +3,7 @@ import pytest
 
 from mlx_vlm.generate import maybe_quantize_kv_cache
 from mlx_vlm.models.base import scaled_dot_product_attention
-from mlx_vlm.models.cache import ArraysCache, KVCache
+from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 from mlx_vlm.turboquant import (
     BatchTurboQuantKVCache,
     TurboQuantKVCache,
@@ -184,6 +184,23 @@ def test_batch_turboquant_extend_pads_shorter_uniform_batch():
     assert longer._idx == 5
 
 
+def test_batch_turboquant_make_mask_matches_batch_kv_cache_with_left_padding():
+    left_padding = [2, 0]
+    cache = BatchTurboQuantKVCache(left_padding, bits=3.5)
+    reference = BatchKVCache(left_padding)
+    keys = mx.random.normal((2, 2, 5, 64))
+    values = mx.random.normal((2, 2, 5, 64))
+
+    cache.update_and_fetch(keys, values)
+    reference.update_and_fetch(keys, values)
+
+    mask = cache.make_mask(2, return_array=True, window_size=None)
+    reference_mask = reference.make_mask(2, return_array=True, window_size=None)
+
+    assert mask.shape == reference_mask.shape
+    assert mx.all(mask == reference_mask).item()
+
+
 def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():
     keys = mx.random.normal((1, 2, 16, 32))
     values = mx.random.normal((1, 2, 16, 32))
@@ -332,6 +349,30 @@ def test_turboquant_decode_attention_4bit_uses_paper_prod_key_codec():
     )
 
     assert output.shape == queries.shape
+
+
+def _assert_mse_states_equal(left, right):
+    assert bool(mx.all(left.norms == right.norms).item())
+    assert bool(mx.all(left.indices == right.indices).item())
+
+
+@pytest.mark.parametrize("dim", [64, 128, 256])
+def test_turboquant_mse_prefill_decode_matches_batch_quantized_state(dim):
+    mx.random.seed(99)
+    keys = mx.random.normal((1, 8, 17, dim)).astype(mx.float16)
+    values = mx.random.normal((1, 8, 17, dim)).astype(mx.float16)
+
+    batch_cache = TurboQuantKVCache(bits=4.0)
+    batch_cache.update_and_fetch(keys, values)
+
+    split_cache = TurboQuantKVCache(bits=4.0)
+    split_cache.update_and_fetch(keys[:, :, :16, :], values[:, :, :16, :])
+    split_cache.update_and_fetch(keys[:, :, 16:17, :], values[:, :, 16:17, :])
+
+    batch_keys, batch_values = batch_cache.state
+    split_keys, split_values = split_cache.state
+    _assert_mse_states_equal(batch_keys, split_keys)
+    _assert_mse_states_equal(batch_values, split_values)
 
 
 def test_turboquant_decode_attention_integer_separate_path_bypasses_fused(monkeypatch):

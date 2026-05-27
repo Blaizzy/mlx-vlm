@@ -56,9 +56,13 @@ def _is_mlx_safetensors(file: Path) -> bool:
 
 def _load_selected_tensors(file: Path, keys: list[str]) -> Dict[str, mx.array]:
     tensors = {}
-    with safe_open(file, framework="mlx") as f:
-        for key in keys:
-            tensors[key] = mx.array(f.get_tensor(key))
+    try:
+        with safe_open(file, framework="mlx") as f:
+            for key in keys:
+                tensors[key] = mx.array(f.get_tensor(key))
+    except TypeError:
+        shard = mx.load(str(file))
+        tensors = {key: shard[key] for key in keys}
     return tensors
 
 

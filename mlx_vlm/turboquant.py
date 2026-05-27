@@ -6,7 +6,7 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import _BaseCache, create_attention_mask
+from mlx_lm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
@@ -4975,6 +4975,10 @@ class TurboQuantKVCache(_BaseCache):
         ):
             return None, None
 
+        # RHT codecs use Hadamard rotation; this fused kernel applies dense rotation.
+        if self.key_codec.use_rht or self.value_codec.use_rht:
+            return None, None
+
         key_bits = int(self.key_codec.bits)
         val_bits = int(self.value_codec.bits)
         kernel = _fused_kv_quantize_kernel(key_bits, val_bits)
@@ -6259,8 +6263,10 @@ class BatchTurboQuantKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
-    def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
 
     @property
     def group_size(self):
