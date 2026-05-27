@@ -168,17 +168,9 @@ def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
         kwargs["diffusion_full_canvas"] = True
     if args.diffusion_min_canvas_length is not None:
         kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
-    if args.diffusion_static_cache:
-        kwargs["diffusion_static_cache"] = True
     if args.diffusion_sampler != "auto-regressive-euler":
         kwargs["diffusion_sampler"] = args.diffusion_sampler
         kwargs["diffusion_threshold"] = args.diffusion_threshold
-    if args.diffusion_compile:
-        kwargs["diffusion_compile"] = True
-    if args.diffusion_show_unmasking:
-        kwargs["diffusion_show_unmasking"] = True
-        kwargs["diffusion_unmasking_interval"] = args.diffusion_unmasking_interval
-        kwargs["diffusion_unmasking_width"] = args.diffusion_unmasking_width
     return kwargs
 
 

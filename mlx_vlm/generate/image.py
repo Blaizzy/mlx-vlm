@@ -256,12 +256,6 @@ def _validate_image_generation_args(args: Any) -> None:
         incompatible.append("--max-denoising-steps")
     if getattr(args, "diffusion_full_canvas", False):
         incompatible.append("--diffusion-full-canvas")
-    if getattr(args, "diffusion_static_cache", False):
-        incompatible.append("--diffusion-static-cache")
-    if getattr(args, "diffusion_compile", False):
-        incompatible.append("--diffusion-compile")
-    if getattr(args, "diffusion_show_unmasking", False):
-        incompatible.append("--diffusion-show-unmasking")
     if incompatible:
         joined = ", ".join(incompatible)
         raise ValueError(f"Image generation does not support: {joined}")

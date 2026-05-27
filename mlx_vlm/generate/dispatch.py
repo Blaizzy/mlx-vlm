@@ -51,7 +51,6 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
-DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 
 
 def parse_arguments():
@@ -184,14 +183,6 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
-        "--diffusion-static-cache",
-        action="store_true",
-        help=(
-            "Use a fixed-capacity encoder KV cache for multi-canvas "
-            "diffusion generation."
-        ),
-    )
-    parser.add_argument(
         "--diffusion-sampler",
         choices=["auto-regressive-euler", "confidence-threshold"],
         default="auto-regressive-euler",
@@ -204,34 +195,6 @@ def parse_arguments():
         help=(
             "Token probability threshold for "
             "--diffusion-sampler confidence-threshold."
-        ),
-    )
-    parser.add_argument(
-        "--diffusion-compile",
-        action="store_true",
-        help=(
-            "Experimentally compile the diffusion decoder logits graph "
-            "for each canvas shape/cache state."
-        ),
-    )
-    parser.add_argument(
-        "--diffusion-show-unmasking",
-        action="store_true",
-        help="Redraw diffusion intermediate canvas drafts during denoising.",
-    )
-    parser.add_argument(
-        "--diffusion-unmasking-interval",
-        type=int,
-        default=1,
-        help="Show every Nth diffusion denoising step when unmasking is enabled.",
-    )
-    parser.add_argument(
-        "--diffusion-unmasking-width",
-        type=int,
-        default=DEFAULT_DIFFUSION_UNMASKING_WIDTH,
-        help=(
-            "Maximum terminal columns used for diffusion draft redraws. "
-            "Use 0 for the full untrimmed redraw."
         ),
     )
     parser.add_argument(
@@ -571,7 +534,6 @@ class PromptCacheState:
 from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
-    DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
@@ -1264,13 +1226,8 @@ def main():
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
-        "diffusion_static_cache": False,
         "diffusion_sampler": "auto-regressive-euler",
         "diffusion_threshold": 0.9,
-        "diffusion_compile": False,
-        "diffusion_show_unmasking": False,
-        "diffusion_unmasking_interval": 1,
-        "diffusion_unmasking_width": DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
