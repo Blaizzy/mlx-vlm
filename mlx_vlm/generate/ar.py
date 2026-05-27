@@ -2319,6 +2319,41 @@ def batch_generate(
         total_stats.generation_tokens += chunk_stats.generation_tokens
         total_stats.generation_time += chunk_stats.generation_time
 
+    text_only_indices = list(range(len(processed_images), len(prompts)))
+    if text_only_indices:
+        group_prompts = [prompts[i] for i in text_only_indices]
+        if isinstance(max_tokens, list):
+            group_max_tokens = [max_tokens[i] for i in text_only_indices]
+        else:
+            group_max_tokens = max_tokens
+
+        group_kwargs = dict(kwargs)
+        logits_processors = group_kwargs.get("logits_processors")
+        if logits_processors is not None and isinstance(logits_processors, list):
+            if not logits_processors or all(callable(p) for p in logits_processors):
+                group_kwargs["logits_processors"] = logits_processors
+            else:
+                group_kwargs["logits_processors"] = [
+                    logits_processors[i] for i in text_only_indices
+                ]
+
+        chunk_texts, chunk_stats = _generate_batch(
+            model,
+            processor,
+            group_prompts,
+            None,
+            group_max_tokens,
+            **group_kwargs,
+        )
+
+        for j, orig_idx in enumerate(text_only_indices):
+            all_texts[orig_idx] = chunk_texts[j]
+
+        total_stats.prompt_tokens += chunk_stats.prompt_tokens
+        total_stats.prompt_time += chunk_stats.prompt_time
+        total_stats.generation_tokens += chunk_stats.generation_tokens
+        total_stats.generation_time += chunk_stats.generation_time
+
     mx.clear_cache()
 
     # Compute final stats
