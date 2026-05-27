@@ -375,16 +375,51 @@ class LanguageModel(nn.Module):
             set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
         )
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
-        visualizer_state = {"active": visualize and sys.stdout.isatty(), "rows": 0}
+        visualizer_state = {
+            "active": visualize and sys.stdout.isatty(),
+            "alternate_screen": False,
+            "rows": 0,
+            "last_draw": 0.0,
+            "min_interval": 0.1,
+            "token_ids": None,
+            "pieces": None,
+            "canvas": "",
+        }
+
+        def begin_visualizer(use_alternate_screen: bool) -> None:
+            if (
+                not visualizer_state["active"]
+                or visualizer_state["alternate_screen"]
+                or not use_alternate_screen
+            ):
+                return
+            print("\033[?1049h\033[?25l\033[H\033[2J", end="", flush=True)
+            visualizer_state["alternate_screen"] = True
 
         def clear_visualizer() -> None:
-            if not visualizer_state["active"] or visualizer_state["rows"] == 0:
+            if not visualizer_state["active"]:
+                return
+            if visualizer_state["alternate_screen"]:
+                print("\033[H\033[2J", end="", flush=True)
+                visualizer_state["rows"] = 0
+                return
+            if visualizer_state["rows"] == 0:
                 return
             controls = ["\r\033[2K"]
             for _ in range(visualizer_state["rows"] - 1):
                 controls.append("\033[1A\r\033[2K")
             print("".join(controls), end="", flush=True)
             visualizer_state["rows"] = 0
+
+        def finish_visualizer() -> None:
+            if not visualizer_state["active"]:
+                return
+            if visualizer_state["alternate_screen"]:
+                print("\033[H\033[2J\033[?25h\033[?1049l", end="", flush=True)
+                visualizer_state["alternate_screen"] = False
+                visualizer_state["rows"] = 0
+            else:
+                clear_visualizer()
 
         def wrap_pieces(pieces, width: int) -> str:
             lines = []
@@ -408,29 +443,60 @@ class LanguageModel(nn.Module):
             )
             return piece.replace("\n", "\\n") or " "
 
-        def visualize_tokens(tokens: mx.array) -> None:
+        def visualize_tokens(tokens: mx.array, force: bool = False) -> None:
             if not visualizer_state["active"]:
                 return
-            pieces = []
-            token_ids = tokens[0].tolist()
-            for i, token_id in enumerate(token_ids):
-                if token_id == mask_id:
-                    pieces.append("[MASK]")
-                elif token_id in eos_token_ids:
-                    pieces.append(decode_token(token_id) or "<eos>")
-                    tail = len(token_ids) - i - 1
-                    if tail:
-                        pieces.extend(["[MASK]"] * tail)
-                    break
-                else:
-                    pieces.append(decode_token(token_id))
+            now = time.perf_counter()
+            if (
+                not force
+                and now - visualizer_state["last_draw"]
+                < visualizer_state["min_interval"]
+            ):
+                return
 
-            terminal_width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
+            token_ids = tokens[0].tolist()
+            pieces = visualizer_state["pieces"]
+            previous_token_ids = visualizer_state["token_ids"]
+            if pieces is None or previous_token_ids is None:
+                pieces = ["[MASK]"] * len(token_ids)
+                previous_token_ids = [mask_id] * len(token_ids)
+
+            found_eos = False
+            for i, token_id in enumerate(token_ids):
+                previous_token_id = previous_token_ids[i]
+                if found_eos:
+                    if previous_token_id != mask_id:
+                        pieces[i] = "[MASK]"
+                    continue
+
+                if token_id == mask_id:
+                    if previous_token_id != mask_id:
+                        pieces[i] = "[MASK]"
+                elif token_id in eos_token_ids:
+                    if previous_token_id != token_id:
+                        pieces[i] = decode_token(token_id) or "<eos>"
+                    found_eos = True
+                else:
+                    if previous_token_id != token_id:
+                        pieces[i] = decode_token(token_id)
+
+            visualizer_state["pieces"] = pieces
+            visualizer_state["token_ids"] = token_ids
+
+            terminal_size = shutil.get_terminal_size((120, 20))
+            terminal_width = max(20, terminal_size.columns - 1)
             canvas = wrap_pieces(pieces, terminal_width)
+            if not force and canvas == visualizer_state["canvas"]:
+                return
+            rows = max(1, canvas.count("\n") + 1)
+            use_alternate_screen = rows >= max(1, terminal_size.lines - 2)
+            begin_visualizer(use_alternate_screen)
 
             clear_visualizer()
             print(canvas, end="", flush=True)
-            visualizer_state["rows"] = max(1, canvas.count("\n") + 1)
+            visualizer_state["rows"] = rows
+            visualizer_state["last_draw"] = now
+            visualizer_state["canvas"] = canvas
 
         prompt_length = inputs.shape[1]
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
@@ -446,7 +512,7 @@ class LanguageModel(nn.Module):
         position_ids = mx.arange(total_length, dtype=mx.int32)[None, :]
         prefill_blocks = prompt_length // block_length
         display_end = prompt_length + gen_length
-        visualize_tokens(x[:, prompt_length:display_end])
+        visualize_tokens(x[:, prompt_length:display_end], force=True)
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
 
@@ -536,7 +602,7 @@ class LanguageModel(nn.Module):
             gen_length,
         )
         if visualizer_state["active"]:
-            clear_visualizer()
+            finish_visualizer()
             if tokenizer is not None:
                 final_text = tokenizer.decode(
                     generated_ids[:end], skip_special_tokens=skip_special_tokens
