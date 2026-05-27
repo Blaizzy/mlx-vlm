@@ -31,9 +31,7 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
 )
-from mlx_vlm.speculative.drafters.deepseek_v4_mtp import (
-    DeepseekV4MTPDraftModel,
-)
+from mlx_vlm.speculative.drafters.deepseek_v4_mtp import DeepseekV4MTPDraftModel
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp.config import DeepseekV4MTPConfig
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp.split import split_deepseek_v4_mtp
 from mlx_vlm.speculative.drafters.eagle3 import Eagle3DraftModel
@@ -2065,7 +2063,7 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
 
 
-def test_deepseek_v4_returns_mtp_hidden_and_rolls_back_snapshot():
+def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     cfg = _tiny_deepseek_v4_config()
     lm = deepseek_language.LanguageModel(cfg)
     cache = lm.make_cache()
@@ -2076,7 +2074,7 @@ def test_deepseek_v4_returns_mtp_hidden_and_rolls_back_snapshot():
 
     assert hidden.shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
     assert shared_kv == {}
-    assert rollback_state[1].tolist() == inputs.tolist()
+    assert rollback_state is None
     assert cache[0].offset == 3
 
     lm.rollback_speculative_cache(cache, rollback_state, accepted=0, block_size=3)
@@ -2085,6 +2083,17 @@ def test_deepseek_v4_returns_mtp_hidden_and_rolls_back_snapshot():
     logits = lm.speculative_logits_from_hidden(hidden[:, :1])
     mx.eval(logits)
     assert logits.shape == (1, 1, cfg.vocab_size)
+
+
+def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window():
+    pool = PoolingCache(4)
+    pool.accumulate_windows(mx.array([[[10.0]]]), mx.ones((1, 1, 1)), offset=0)
+
+    assert not deepseek_language._needs_replay_snapshot_for_cache([pool], 2)
+    assert deepseek_language._needs_replay_snapshot_for_cache([pool], 3)
+    assert not deepseek_language._needs_replay_snapshot_for_cache(
+        [RotatingKVCache(max_size=8)], 3
+    )
 
 
 def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite_remainder():

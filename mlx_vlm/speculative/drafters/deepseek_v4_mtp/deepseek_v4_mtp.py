@@ -262,9 +262,7 @@ class DeepseekV4MTPDraftModel(nn.Module):
         else:
             bonus = bonus_token[:, None].astype(token_dtype)
 
-        shifted = mx.concatenate(
-            [input_ids[:, 1:].astype(token_dtype), bonus], axis=1
-        )
+        shifted = mx.concatenate([input_ids[:, 1:].astype(token_dtype), bonus], axis=1)
         self._next_position = 0
         logits_hidden, pre_hc_hidden = self._forward_tokens(
             shifted,
@@ -497,9 +495,7 @@ class DeepseekV4MTPDraftModel(nn.Module):
             for sub in ("attn", "ffn"):
                 for param in ("fn", "base", "scale"):
                     nk = nk.replace(f".hc_{sub}_{param}", f".{sub}_hc.{param}")
-                    nk = nk.replace(
-                        f"hc_{sub}_{param}", f"decoder.{sub}_hc.{param}"
-                    )
+                    nk = nk.replace(f"hc_{sub}_{param}", f"decoder.{sub}_hc.{param}")
             for old, new in w_remap.items():
                 nk = nk.replace(f".shared_experts.{old}.", f".shared_experts.{new}.")
             nk = nk.replace("hc_head_fn", "hc_head.fn")

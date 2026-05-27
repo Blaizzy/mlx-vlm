@@ -578,8 +578,10 @@ class LocalAttention(nn.Module):
         position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        offset = position_offset if position_offset is not None else (
-            cache.offset if cache is not None else 0
+        offset = (
+            position_offset
+            if position_offset is not None
+            else (cache.offset if cache is not None else 0)
         )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
@@ -673,8 +675,10 @@ class CompressedAttention(nn.Module):
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
-        offset = position_offset if position_offset is not None else (
-            local_cache.offset if local_cache is not None else 0
+        offset = (
+            position_offset
+            if position_offset is not None
+            else (local_cache.offset if local_cache is not None else 0)
         )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
@@ -780,8 +784,10 @@ class SparseCompressedAttention(nn.Module):
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
         idx_cache = cache[2] if cache is not None else None
-        offset = position_offset if position_offset is not None else (
-            local_cache.offset if local_cache is not None else 0
+        offset = (
+            position_offset
+            if position_offset is not None
+            else (local_cache.offset if local_cache is not None else 0)
         )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
@@ -994,6 +1000,28 @@ def _snapshot_cache_state(
     return [_snapshot_single_cache(cache, incoming_tokens) for cache in caches]
 
 
+def _needs_replay_snapshot(cache, incoming_tokens: int) -> bool:
+    if cache is None:
+        return False
+    if isinstance(cache, CacheList):
+        return any(
+            _needs_replay_snapshot(child, incoming_tokens) for child in cache.caches
+        )
+    if isinstance(cache, PoolingCache):
+        return int(cache.remainder) + int(incoming_tokens) >= int(cache.ratio)
+    if isinstance(cache, RotatingKVCache):
+        return False
+    return not (hasattr(cache, "trim") and callable(cache.trim))
+
+
+def _needs_replay_snapshot_for_cache(
+    caches: Optional[List[Any]], incoming_tokens: int = 0
+) -> bool:
+    if caches is None:
+        return False
+    return any(_needs_replay_snapshot(cache, incoming_tokens) for cache in caches)
+
+
 def _snapshot_single_cache(cache, incoming_tokens: int = 0):
     if cache is None:
         return None
@@ -1009,9 +1037,7 @@ def _snapshot_single_cache(cache, incoming_tokens: int = 0):
         if incoming_tokens > 0:
             overwrite_len = total % cache.ratio if total >= cache.ratio else 0
         will_overwrite_remainder = (
-            remainder > 0
-            and cache.buf_kv is not None
-            and overwrite_len > 0
+            remainder > 0 and cache.buf_kv is not None and overwrite_len > 0
         )
         buf_kv = cache.buf_kv[:, :overwrite_len] if will_overwrite_remainder else None
         buf_gate = (
@@ -1188,7 +1214,12 @@ class LanguageModel(nn.Module):
         return self._target_hidden(hidden)
 
     def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        cache_snapshot = _snapshot_cache_state(cache, int(inputs.shape[1]))
+        incoming_tokens = int(inputs.shape[1])
+        cache_snapshot = (
+            _snapshot_cache_state(cache, incoming_tokens)
+            if _needs_replay_snapshot_for_cache(cache, incoming_tokens)
+            else None
+        )
         sample_logits = sampler is not None
 
         out = self(
@@ -1200,7 +1231,9 @@ class LanguageModel(nn.Module):
             skip_final_norm=not sample_logits,
         )
         hidden = out.hidden_states[-1]
-        rollback_state = (cache_snapshot, inputs)
+        rollback_state = (
+            (cache_snapshot, inputs) if cache_snapshot is not None else None
+        )
         if not sample_logits:
             return hidden, {}, rollback_state
 
