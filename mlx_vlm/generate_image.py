@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from io import BytesIO
 from pathlib import Path
@@ -222,6 +223,84 @@ def image_to_b64_json(image: Image.Image | mx.array | ImageGenerationResult) -> 
     return base64.b64encode(image_to_png_bytes(image)).decode("ascii")
 
 
+def _prompt_to_image_text(prompt: str | Sequence[str]) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    return " ".join(str(part) for part in prompt)
+
+
+def _validate_image_generation_args(args: Any) -> None:
+    incompatible = []
+    for name in ("image", "audio", "video", "adapter_path", "draft_model"):
+        if getattr(args, name, None) is not None:
+            incompatible.append(f"--{name.replace('_', '-')}")
+    if args.chat:
+        incompatible.append("--chat")
+    if args.resize_shape is not None:
+        incompatible.append("--resize-shape")
+    if args.eos_tokens is not None:
+        incompatible.append("--eos-tokens")
+    if args.kv_bits is not None:
+        incompatible.append("--kv-bits")
+    if args.max_kv_size is not None:
+        incompatible.append("--max-kv-size")
+    if args.processor_kwargs:
+        incompatible.append("--processor-kwargs")
+    if args.quantize_activations:
+        incompatible.append("--quantize-activations")
+    if args.skip_special_tokens:
+        incompatible.append("--skip-special-tokens")
+    if args.thinking_budget is not None:
+        incompatible.append("--thinking-budget")
+    if getattr(args, "max_denoising_steps", None) is not None:
+        incompatible.append("--max-denoising-steps")
+    if getattr(args, "diffusion_full_canvas", False):
+        incompatible.append("--diffusion-full-canvas")
+    if getattr(args, "diffusion_static_cache", False):
+        incompatible.append("--diffusion-static-cache")
+    if getattr(args, "diffusion_compile", False):
+        incompatible.append("--diffusion-compile")
+    if getattr(args, "diffusion_show_unmasking", False):
+        incompatible.append("--diffusion-show-unmasking")
+    if incompatible:
+        joined = ", ".join(incompatible)
+        raise ValueError(f"Image generation does not support: {joined}")
+
+
+def run_image_generation_cli(args: Any) -> None:
+    _validate_image_generation_args(args)
+    width, height = parse_size(args.size)
+    seed = args.seed if args.seed is not None else random.randrange(2**32)
+    prompt = _prompt_to_image_text(args.prompt)
+    if not prompt:
+        raise ValueError("--prompt must not be empty for image generation")
+
+    output_path = (
+        Path(args.output).expanduser()
+        if args.output is not None
+        else Path("outputs") / f"image-{seed}.png"
+    )
+    model = load_image_generation_model(args.model)
+    request = ImageGenerationRequest(
+        prompt=prompt,
+        seed=seed,
+        steps=args.steps,
+        width=width,
+        height=height,
+        guidance=args.guidance,
+    )
+    result = generate_image(
+        model,
+        request,
+        output_path=output_path,
+    )
+    print(
+        f"Saved {result.path} seed={result.seed} "
+        f"size={result.width}x{result.height} steps={result.steps} "
+        f"variant={result.variant}"
+    )
+
+
 __all__ = [
     "DEFAULT_IMAGE_FORMAT",
     "DEFAULT_IMAGE_GUIDANCE",
@@ -241,4 +320,5 @@ __all__ = [
     "is_image_generation_model",
     "load_image_generation_model",
     "parse_size",
+    "run_image_generation_cli",
 ]
