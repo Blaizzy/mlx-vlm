@@ -92,6 +92,7 @@ MODEL_CONFIG = {
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
     "laguna": MessageFormat.TEXT_ONLY,
+    "deepseek_v4": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image

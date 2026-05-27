@@ -12,6 +12,8 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
+from ..rope_utils import MRoPERotaryEmbedding
+from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
 from .gated_delta import (
     gated_delta_state_update,
@@ -20,78 +22,26 @@ from .gated_delta import (
 )
 
 
-class Qwen3_5RotaryEmbedding:
+class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
     def __init__(
-        self, dim, max_position_embeddings=2048, base=10000, mrope_section=[11, 11, 0]
+        self,
+        dim,
+        max_position_embeddings=2048,
+        base=10000,
+        mrope_section=[11, 11, 0],
     ):
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-
-        inv_freq = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2).astype(mx.float32) / self.dim)
+        super().__init__(
+            dim,
+            max_position_embeddings=max_position_embeddings,
+            base=base,
+            mrope_section=mrope_section,
+            style="interleaved",
         )
-        mx.eval(inv_freq)
-        self.inv_freq = inv_freq
-
-        self.mrope_section = mrope_section
-
-    def apply_interleaved_mrope(self, freqs, mrope_section):
-        freqs_t = freqs[0]
-        for dim, offset in enumerate((1, 2), start=1):
-            length = mrope_section[dim] * 3
-            idx = slice(offset, length, 3)
-            freqs_t[..., idx] = freqs[dim, ..., idx]
-        return freqs_t
-
-    def __call__(self, x, position_ids):
-        if position_ids.ndim == 2:
-            position_ids = mx.broadcast_to(
-                position_ids[None, ...],
-                (3, position_ids.shape[0], position_ids.shape[1]),
-            )
-
-        inv_freq_expanded = mx.broadcast_to(
-            self.inv_freq[None, None, :, None].astype(mx.float32),
-            (3, position_ids.shape[1], self.inv_freq.shape[0], 1),
-        )
-        position_ids_expanded = position_ids[:, :, None, :].astype(mx.float32)
-
-        freqs = inv_freq_expanded @ position_ids_expanded
-        freqs = mx.swapaxes(freqs, 2, 3)
-        freqs = self.apply_interleaved_mrope(freqs, self.mrope_section)
-        emb = mx.concatenate([freqs, freqs], axis=-1)
-        cos = mx.cos(emb)
-        sin = mx.sin(emb)
-
-        return cos, sin
-
-
-def rotate_half(x):
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
+        mx.eval(self.inv_freq)
 
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
-    cos = mx.expand_dims(cos, axis=unqueeze_dim)
-    sin = mx.expand_dims(sin, axis=unqueeze_dim)
-
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    dtype = q.dtype
-    q_embed = ((q_rot * cos) + (rotate_half(q_rot) * sin)).astype(dtype)
-    k_embed = ((k_rot * cos) + (rotate_half(k_rot) * sin)).astype(dtype)
-
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-
-    return q_embed, k_embed
+    return _apply_mrope(q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim)
 
 
 class Qwen3_5RMSNormGated(nn.Module):
@@ -329,6 +279,7 @@ class Qwen3_5Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
@@ -359,14 +310,21 @@ class Qwen3_5Attention(nn.Module):
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            queries, keys = self.rotary_emb.apply_rotary(
+                queries,
+                keys,
+                position_ids,
+                unsqueeze_dim=1,
+            )
+        else:
+            cos, sin = position_embeddings
+            queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if mask is not None and isinstance(mask, mx.array):
             if isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
-
-        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -498,7 +456,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            n_keep = self.conv_kernel_size - 1
+            if getattr(cache, "lengths", None) is not None:
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         if gdn_sink is not None:
             conv_out = nn.silu(self._causal_conv1d_verify(conv_input, S))
         else:
@@ -599,6 +563,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         gdn_sink: Optional[list] = None,
         target_verify: bool = False,
     ) -> mx.array:
@@ -613,9 +578,10 @@ class Qwen3_5DecoderLayer(nn.Module):
         else:
             r = self.self_attn(
                 self.input_layernorm(x),
-                mask,
-                cache,
-                position_ids,
+                mask=mask,
+                cache=cache,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
                 target_verify=target_verify,
             )
         h = x + r
@@ -656,15 +622,25 @@ class Qwen3_5Model(nn.Module):
 
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        position_embeddings = None
+        if position_ids is not None:
+            for layer in self.layers:
+                if not layer.is_linear:
+                    if not layer.self_attn.rotary_emb.fused_apply:
+                        position_embeddings = layer.self_attn.rotary_emb(
+                            h, position_ids
+                        )
+                    break
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
             h = layer(
                 h,
-                mask,
-                c,
-                position_ids,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
                 gdn_sink=gdn_sink,
                 target_verify=gdn_sink is not None,
             )
@@ -1036,14 +1012,11 @@ class LanguageModel(nn.Module):
                     attention_mask == 0, mx.ones_like(position_ids), position_ids
                 )
                 max_position_ids = position_ids.max(axis=-1, keepdims=True)
-                position_ids = mx.broadcast_to(
-                    position_ids[None, :, :], (3, *position_ids.shape)
-                )
                 mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
-                    position_ids, (3, input_ids.shape[0], input_ids.shape[1])
+                    position_ids, (input_ids.shape[0], input_ids.shape[1])
                 )
                 mrope_position_deltas = mx.zeros(
                     [input_ids.shape[0], 1],
@@ -1101,14 +1074,29 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                if (
-                    self._position_ids is not None
-                    and self._position_ids.shape[1] == batch_size
-                    and self._position_ids.shape[-1] >= cache_offset + seq_length
-                ):
-                    position_ids = self._position_ids[
-                        :, :, cache_offset : cache_offset + seq_length
-                    ]
+                if self._position_ids is not None:
+                    if (
+                        self._position_ids.ndim == 3
+                        and self._position_ids.shape[1] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, :, cache_offset : cache_offset + seq_length
+                        ]
+                    elif (
+                        self._position_ids.ndim == 2
+                        and self._position_ids.shape[0] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, cache_offset : cache_offset + seq_length
+                        ]
+                    else:
+                        position_ids, rope_deltas = self.get_rope_index(
+                            inputs, image_grid_thw, video_grid_thw, rope_mask
+                        )
+                        self._rope_deltas = rope_deltas
+                        self._position_ids = position_ids
                 else:
                     position_ids, rope_deltas = self.get_rope_index(
                         inputs, image_grid_thw, video_grid_thw, rope_mask
@@ -1138,10 +1126,7 @@ class LanguageModel(nn.Module):
 
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-                position_ids = mx.add(position_ids, delta)[None, ...]
-                position_ids = mx.broadcast_to(
-                    position_ids, (3, batch_size, seq_length)
-                )
+                position_ids = mx.add(position_ids, delta)
 
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None

@@ -1,4 +1,6 @@
 import base64
+import json
+import struct
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,9 +11,11 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.utils import quantize_model
 
+from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _load_safetensors,
     get_model_and_args,
     load,
     load_image,
@@ -244,6 +248,45 @@ def test_quantize_module():
     }
 
 
+def test_convert_preserves_existing_deepseek_v4_quantization():
+    config = {
+        "model_type": "deepseek_v4",
+        "quantization_config": {"quant_method": "fp8"},
+    }
+    existing_quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.model.layers.0.attn.wkv": {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        },
+    }
+
+    with patch(
+        "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+        return_value=existing_quantization,
+    ):
+        _preserve_existing_deepseek_v4_quantization(
+            config,
+            model=MagicMock(),
+            q_group_size=64,
+            q_bits=4,
+            q_mode="affine",
+        )
+
+    assert config["quantization"] is config["quantization_config"]
+    assert config["quantization"]["group_size"] == 64
+    assert config["quantization"]["bits"] == 4
+    assert config["quantization"]["mode"] == "affine"
+    assert config["quantization"]["language_model.model.layers.0.attn.wkv"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }
+
+
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
@@ -429,6 +472,92 @@ def test_load_model_routes_text_models_through_existing_loader():
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
 
     assert getattr(model, "_is_text_model", False) is True
+
+
+def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
+    path = tmp_path / "model.safetensors"
+    header = {
+        "weight": {
+            "dtype": "F8_E8M0",
+            "shape": [1],
+            "data_offsets": [0, 1],
+        }
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00")
+
+    loaded = {"weight": mx.array([1], dtype=mx.uint8)}
+
+    def fake_mx_load(file_path):
+        current = json.loads(path.read_bytes()[8 : 8 + len(header_bytes)])
+        if current["weight"]["dtype"] == "F8_E8M0":
+            raise RuntimeError("unsupported dtype F8_E8M0")
+        assert current["weight"]["dtype"] == "U8"
+        return loaded
+
+    with patch("mlx_vlm.utils.mx.load", side_effect=fake_mx_load):
+        assert _load_safetensors(str(path)) is loaded
+
+    restored = json.loads(path.read_bytes()[8 : 8 + len(header_bytes)])
+    assert restored["weight"]["dtype"] == "F8_E8M0"
+
+
+def test_load_model_uses_deepseek_v4_fp8_quantization_config():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(2, 2, bias=False)
+
+        def load_weights(self, weights):
+            self.loaded_weights = weights
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.weight": {"group_size": 64, "bits": 8, "mode": "affine"},
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value={}),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch(
+            "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+            return_value=quantization,
+        ) as make_quantization_config,
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+
+    make_quantization_config.assert_called_once_with(model)
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 64
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "affine"
 
 
 def test_load_delegates_adapter_loading_to_trainer_entrypoint():

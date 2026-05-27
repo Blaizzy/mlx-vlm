@@ -4975,6 +4975,10 @@ class TurboQuantKVCache(_BaseCache):
         ):
             return None, None
 
+        # RHT codecs use Hadamard rotation; this fused kernel applies dense rotation.
+        if self.key_codec.use_rht or self.value_codec.use_rht:
+            return None, None
+
         key_bits = int(self.key_codec.bits)
         val_bits = int(self.value_codec.bits)
         kernel = _fused_kv_quantize_kernel(key_bits, val_bits)

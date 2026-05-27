@@ -350,15 +350,22 @@ def _buffer_mtp_target_cache(
     requested = int(draft_block_size or configured)
     buffer_size = max(32, min(128, max(configured, requested) * 8))
 
-    for idx, entry in enumerate(prompt_cache):
+    def buffer_entry(entry):
+        if isinstance(entry, cache.CacheList):
+            entry.caches = tuple(buffer_entry(child) for child in entry.caches)
+            return entry
         if isinstance(entry, cache.BufferedRotatingKVCache):
             entry.buffer_size = max(entry.buffer_size, buffer_size)
         elif (
             isinstance(entry, cache.RotatingKVCache) and getattr(entry, "keep", 0) == 0
         ):
-            prompt_cache[idx] = cache.BufferedRotatingKVCache.from_cache(
+            return cache.BufferedRotatingKVCache.from_cache(
                 entry, buffer_size=buffer_size
             )
+        return entry
+
+    for idx, entry in enumerate(prompt_cache):
+        prompt_cache[idx] = buffer_entry(entry)
 
 
 def _mtp_rounds(
