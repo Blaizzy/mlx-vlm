@@ -32,6 +32,7 @@ from mlx_vlm.speculative.drafters import (
     DRAFTER_KIND_BY_MODEL_TYPE,
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
+    validate_drafter_compatibility,
 )
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp import DeepseekV4MTPDraftModel
 from mlx_vlm.speculative.drafters.deepseek_v4_mtp.config import DeepseekV4MTPConfig
@@ -214,6 +215,51 @@ def _make_drafter_dir(tmp_path: Path, model_type: str | None) -> Path:
     cfg = {} if model_type is None else {"model_type": model_type}
     (d / "config.json").write_text(json.dumps(cfg))
     return d
+
+
+def _make_target_config(hidden_size: int):
+    return SimpleNamespace(
+        model_type="target_text",
+        hidden_size=hidden_size,
+    )
+
+
+def _make_target_model(hidden_size: int):
+    return SimpleNamespace(
+        language_model=SimpleNamespace(config=_make_target_config(hidden_size))
+    )
+
+
+def _make_drafter_config(model_type: str, hidden_size: int, *, field: str):
+    kwargs = {"model_type": model_type}
+    if field == "backbone_hidden_size":
+        kwargs["backbone_hidden_size"] = hidden_size
+    elif field == "target_hidden_size":
+        kwargs["target_hidden_size"] = hidden_size
+    elif field == "text_config.hidden_size":
+        kwargs["text_config"] = SimpleNamespace(hidden_size=hidden_size)
+    else:
+        raise ValueError(f"Unknown hidden-size field: {field}")
+    return SimpleNamespace(**kwargs)
+
+
+MTP_DRAFTER_COMPAT_CASES = [
+    pytest.param(
+        "gemma4_assistant",
+        "backbone_hidden_size",
+        id="backbone-hidden-size",
+    ),
+    pytest.param(
+        "qwen3_5_mtp",
+        "text_config.hidden_size",
+        id="text-config-hidden-size",
+    ),
+    pytest.param(
+        "custom_mtp",
+        "target_hidden_size",
+        id="target-hidden-size",
+    ),
+]
 
 
 def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():
@@ -1559,6 +1605,63 @@ def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     (path / "config.json").write_text(json.dumps({"speculators_model_type": "eagle3"}))
     assert resolve_drafter_kind(path, None) == "eagle3"
     assert resolve_drafter_kind(path, "dflash") == "eagle3"
+
+
+@pytest.mark.parametrize("model_type,hidden_size_field", MTP_DRAFTER_COMPAT_CASES)
+def test_mtp_drafter_compatibility_accepts_matching_target(
+    model_type, hidden_size_field
+):
+    target = _make_target_model(hidden_size=4096)
+    drafter = SimpleNamespace(
+        config=_make_drafter_config(model_type, 4096, field=hidden_size_field)
+    )
+
+    validate_drafter_compatibility(target, drafter, "mtp")
+
+
+@pytest.mark.parametrize("model_type,hidden_size_field", MTP_DRAFTER_COMPAT_CASES)
+def test_mtp_drafter_compatibility_rejects_mismatched_target(
+    model_type, hidden_size_field
+):
+    target = _make_target_model(hidden_size=5376)
+    drafter = SimpleNamespace(
+        config=_make_drafter_config(model_type, 1536, field=hidden_size_field)
+    )
+
+    with pytest.raises(ValueError, match="incompatible with the target model") as exc:
+        validate_drafter_compatibility(target, drafter, "mtp")
+
+    message = str(exc.value)
+    assert "Drafter target hidden_size=1536" in message
+    assert "target hidden_size=5376" in message
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    [
+        "gemma4_assistant",
+        "qwen3_5_mtp",
+        "deepseek_v4_mtp",
+        "custom_mtp",
+    ],
+)
+def test_mtp_drafter_compatibility_requires_mtp_kind(model_type):
+    target = _make_target_model(hidden_size=4096)
+    drafter = SimpleNamespace(
+        config=_make_drafter_config(model_type, 4096, field="text_config.hidden_size")
+    )
+
+    with pytest.raises(ValueError, match="requires draft_kind='mtp'"):
+        validate_drafter_compatibility(target, drafter, "dflash")
+
+
+def test_drafter_compatibility_ignores_unknown_backbone_free_drafters():
+    target = _make_target_model(hidden_size=5376)
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(model_type="custom_drafter", hidden_size=1536)
+    )
+
+    validate_drafter_compatibility(target, drafter, "dflash")
 
 
 def test_model_loader_uses_speculators_model_type_for_eagle3_config():
