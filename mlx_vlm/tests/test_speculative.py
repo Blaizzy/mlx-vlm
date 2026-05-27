@@ -153,6 +153,28 @@ def test_speculative_sampler_rng_can_resync_draft_after_rejected_draws():
     assert draft_model._seed_token.tolist() == expected_third.tolist()
 
 
+def test_speculative_sampler_rng_async_evals_greedy_draft_call_state(monkeypatch):
+    result_array = mx.array([1], dtype=mx.int32)
+    state_array = mx.array([2], dtype=mx.int32)
+    calls = []
+
+    def fake_async_eval(*arrays):
+        calls.append(arrays)
+
+    draft_model = SimpleNamespace(
+        draft_eval_state=lambda: {"cache": [state_array]},
+    )
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=False)
+
+    monkeypatch.setattr(mx, "async_eval", fake_async_eval)
+    result = sampler_rng.draft_call(lambda: result_array)
+
+    assert result is result_array
+    assert len(calls) == 1
+    assert calls[0][0] is result_array
+    assert calls[0][1] is state_array
+
+
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
     rows = []
     for row in range(batch_size):
