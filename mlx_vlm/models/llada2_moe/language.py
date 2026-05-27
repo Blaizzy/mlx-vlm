@@ -1,4 +1,4 @@
-import shutil
+import sys
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -374,15 +374,12 @@ class LanguageModel(nn.Module):
             set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
         )
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
-        visualizer_state = {"rows": 0}
+        visualizer_state = {"active": visualize and sys.stdout.isatty()}
 
         def clear_visualizer() -> None:
-            if not visualize or visualizer_state["rows"] == 0:
+            if not visualizer_state["active"]:
                 return
-            print("\r\033[2K", end="")
-            for _ in range(visualizer_state["rows"] - 1):
-                print("\033[1A\r\033[2K", end="")
-            visualizer_state["rows"] = 0
+            print("\r\033[2K\033[?7h", end="", flush=True)
 
         def decode_token(token_id: int) -> str:
             if tokenizer is None:
@@ -393,7 +390,7 @@ class LanguageModel(nn.Module):
             return piece.replace("\n", "\\n") or " "
 
         def visualize_tokens(tokens: mx.array) -> None:
-            if not visualize:
+            if not visualizer_state["active"]:
                 return
             pieces = []
             token_ids = tokens[0].tolist()
@@ -410,11 +407,8 @@ class LanguageModel(nn.Module):
                     pieces.append(decode_token(token_id))
 
             line = " ".join(pieces)
-            terminal_width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
-            rows = max(1, (len(line) // terminal_width) + 1)
             clear_visualizer()
-            print(line, end="", flush=True)
-            visualizer_state["rows"] = rows
+            print("\033[?7l" + line + "\033[?7h", end="", flush=True)
 
         prompt_length = inputs.shape[1]
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
