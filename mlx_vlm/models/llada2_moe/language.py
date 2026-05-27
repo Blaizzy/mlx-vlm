@@ -1,3 +1,4 @@
+import shutil
 import sys
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -394,19 +395,37 @@ class LanguageModel(nn.Module):
                 return
             pieces = []
             token_ids = tokens[0].tolist()
+            focus = 0
             for i, token_id in enumerate(token_ids):
                 if token_id == mask_id:
                     pieces.append("[MASK]")
                 elif token_id in eos_token_ids:
                     pieces.append(decode_token(token_id) or "<eos>")
+                    focus = i
                     tail = len(token_ids) - i - 1
                     if tail:
                         pieces.extend(["[MASK]"] * tail)
                     break
                 else:
                     pieces.append(decode_token(token_id))
+                    focus = i
 
+            terminal_width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
+            start = 0
             line = " ".join(pieces)
+            if len(line) > terminal_width:
+                start = max(0, focus - 8)
+                visible_pieces = []
+                visible_length = 0
+                for piece in pieces[start:]:
+                    separator = 1 if visible_pieces else 0
+                    next_length = visible_length + separator + len(piece)
+                    if next_length > terminal_width:
+                        break
+                    visible_pieces.append(piece)
+                    visible_length = next_length
+                line = " ".join(visible_pieces) or pieces[start][:terminal_width]
+
             clear_visualizer()
             print("\033[?7l" + line + "\033[?7h", end="", flush=True)
 
