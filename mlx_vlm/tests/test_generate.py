@@ -650,6 +650,46 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_generation_batch_thinking_budget_criteria_can_force_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def apply_forced_token(self, next_y):
+                if self.forced_token_id is None:
+                    return next_y
+                forced = mx.array([self.forced_token_id], dtype=mx.int32)
+                self.forced_token_id = None
+                return forced
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        first = batch.next()
+        assert [r.token for r in first] == [5]
+
+        second = batch.next()
+        assert [r.token for r in second] == [3]
+
     def test_generation_batch_extend_keeps_processor_context_aligned(self):
         class FixedLogitModel:
             def __call__(self, input_ids, cache=None, **kwargs):
@@ -1549,6 +1589,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "_apc_tenant": "tenant",
             },
             [],
+            None,
         )
         for i, length in enumerate(lengths)
     ]
@@ -1606,6 +1647,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 123,
             },
             [],
+            None,
         ),
         (
             2,
@@ -1618,6 +1660,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 456,
             },
             [],
+            None,
         ),
     ]
     picks = [
@@ -1666,7 +1709,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, []))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)

@@ -23,6 +23,8 @@ from ..generate import (
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
+    DEFAULT_THINKING_END_TOKEN,
+    DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
     _make_cache,
@@ -36,7 +38,7 @@ from ..speculative.utils import (
     speculative_prefill_kwargs,
 )
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import load, prepare_inputs
+from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -446,6 +448,7 @@ class GenerationArguments:
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    thinking_end_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
@@ -480,6 +483,8 @@ class GenerationArguments:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
             kw["thinking_start_token"] = self.thinking_start_token
+        if self.thinking_end_token is not None:
+            kw["thinking_end_token"] = self.thinking_end_token
         if self.logits_processors is not None:
             kw["logits_processors"] = self.logits_processors
         if self.tenant_id is not None:
@@ -493,6 +498,8 @@ class GenerationArguments:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
             kw["thinking_start_token"] = self.thinking_start_token
+        if self.thinking_end_token is not None:
+            kw["thinking_end_token"] = self.thinking_end_token
         return kw
 
 
@@ -747,6 +754,10 @@ class ResponseGenerator:
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
             )
+        if self.draft_model is not None and args.thinking_budget is not None:
+            raise ValueError(
+                "thinking_budget is not supported with speculative decoding in the server."
+            )
         rqueue: Queue = Queue()
 
         # CPU preprocessing (tokenize, load images) on caller thread.
@@ -812,6 +823,28 @@ class ResponseGenerator:
         if args.logits_processors is not None:
             processors.extend(args.logits_processors)
         return processors
+
+    def _make_thinking_budget_criteria(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> Optional[ThinkingBudgetCriteria]:
+        if args.thinking_budget is None:
+            return None
+        tokenizer = self.tokenizer
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        enable_thinking = bool(args.enable_thinking) and (
+            thinking_start_token_id in input_ids.flatten().tolist()
+        )
+        return ThinkingBudgetCriteria(
+            tokenizer=tokenizer,
+            thinking_budget=args.thinking_budget,
+            thinking_end_token=thinking_end_token,
+            thinking_start_token=thinking_start_token,
+            enable_thinking=enable_thinking,
+        )
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
@@ -968,11 +1001,15 @@ class ResponseGenerator:
                         self._flush(batch_gen, active)
 
                     try:
+                        thinking_budget_criteria = self._make_thinking_budget_criteria(
+                            args, input_ids
+                        )
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
                             logits_processors=[self._make_logits_processors(args)],
+                            thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:
                         rqueue.put(e)

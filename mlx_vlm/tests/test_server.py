@@ -834,6 +834,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
                 "enable_thinking": False,
                 "thinking_budget": 24,
                 "thinking_start_token": "<think>",
+                "thinking_end_token": "</think>",
             },
         )
 
@@ -841,6 +842,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_template.call_args.kwargs["enable_thinking"] is False
     assert mock_template.call_args.kwargs["thinking_budget"] == 24
     assert mock_template.call_args.kwargs["thinking_start_token"] == "<think>"
+    assert mock_template.call_args.kwargs["thinking_end_token"] == "</think>"
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["top_k"] == 40
     assert mock_generate.call_args.kwargs["min_p"] == 0.08
@@ -849,6 +851,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
+    assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
 
 
 def test_responses_previous_response_id_replays_stored_items(client):
@@ -2842,6 +2845,8 @@ class TestResponseGenerator:
             logit_bias={3: -0.5},
             enable_thinking=False,
             thinking_budget=100,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
             logits_processors=[processor],
             tenant_id="tenant-a",
         )
@@ -2858,14 +2863,21 @@ class TestResponseGenerator:
         assert kw["logit_bias"] == {3: -0.5}
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 100
+        assert kw["thinking_start_token"] == "<think>"
+        assert kw["thinking_end_token"] == "</think>"
         assert kw["logits_processors"] == [processor]
         assert kw["apc_tenant"] == "tenant-a"
 
     def test_generate_arguments_to_template_kwargs(self):
-        args = server.GenerationArguments(enable_thinking=False, thinking_budget=50)
+        args = server.GenerationArguments(
+            enable_thinking=False,
+            thinking_budget=50,
+            thinking_end_token="</think>",
+        )
         kw = args.to_template_kwargs()
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 50
+        assert kw["thinking_end_token"] == "</think>"
 
     def test_generate_arguments_omits_none_optionals(self):
         args = server.GenerationArguments()
@@ -2952,6 +2964,7 @@ class TestResponseGenerator:
             enable_thinking=False,
             thinking_budget=None,
             thinking_start_token=None,
+            thinking_end_token=None,
         )
         args = server._build_gen_args(req, tenant_id="tenant-a")
         assert args.max_tokens == 128
@@ -2982,6 +2995,7 @@ class TestResponseGenerator:
             enable_thinking=True,
             thinking_budget=None,
             thinking_start_token=None,
+            thinking_end_token=None,
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 256

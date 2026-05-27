@@ -238,6 +238,7 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -546,6 +547,7 @@ class VLMRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
     logprobs: Optional[bool] = Field(
         None,
         description="Return log-probabilities for each output token.",
@@ -713,6 +715,7 @@ class AnthropicRequest(FlexibleBaseModel):
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    thinking_end_token: Optional[str] = None
     response_format: Optional[Any] = None
 
 
