@@ -1194,6 +1194,11 @@ def generate(
 
 def main():
     args = parse_arguments()
+
+    if getattr(args, "output_modality", "text") == "image":
+        run_image_generation_cli(args)
+        return
+
     diffusion_arg_defaults = {
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
@@ -1209,10 +1214,6 @@ def main():
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
             setattr(args, name, default)
-
-    if getattr(args, "output_modality", "text") == "image":
-        run_image_generation_cli(args)
-        return
 
     if isinstance(args.image, str):
         args.image = [args.image]
