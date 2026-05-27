@@ -1,3 +1,4 @@
+import shutil
 from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
@@ -356,6 +357,9 @@ class LanguageModel(nn.Module):
         eos_id: Optional[int] = None,
         mask_id: Optional[int] = None,
         num_to_transfer: int = 1,
+        visualize: bool = False,
+        tokenizer: Optional[Any] = None,
+        skip_special_tokens: bool = False,
     ) -> mx.array:
         if inputs.shape[0] != 1:
             raise ValueError(
@@ -364,7 +368,51 @@ class LanguageModel(nn.Module):
 
         eos_id = self.config.eos_token_id if eos_id is None else eos_id
         mask_id = self.config.mask_token_id if mask_id is None else mask_id
+        eos_token_ids = (
+            set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
+        )
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
+        visualizer_state = {"rows": 0}
+
+        def clear_visualizer() -> None:
+            if not visualize or visualizer_state["rows"] == 0:
+                return
+            print("\r\033[2K", end="")
+            for _ in range(visualizer_state["rows"] - 1):
+                print("\033[1A\r\033[2K", end="")
+            visualizer_state["rows"] = 0
+
+        def decode_token(token_id: int) -> str:
+            if tokenizer is None:
+                return str(token_id)
+            piece = tokenizer.decode(
+                [token_id], skip_special_tokens=skip_special_tokens
+            )
+            return piece.replace("\n", "\\n") or " "
+
+        def visualize_tokens(tokens: mx.array) -> None:
+            if not visualize:
+                return
+            pieces = []
+            token_ids = tokens[0].tolist()
+            for i, token_id in enumerate(token_ids):
+                if token_id == mask_id:
+                    pieces.append("[MASK]")
+                elif token_id in eos_token_ids:
+                    pieces.append(decode_token(token_id) or "<eos>")
+                    tail = len(token_ids) - i - 1
+                    if tail:
+                        pieces.extend(["[MASK]"] * tail)
+                    break
+                else:
+                    pieces.append(decode_token(token_id))
+
+            line = " ".join(pieces)
+            terminal_width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
+            rows = max(1, (len(line) // terminal_width) + 1)
+            clear_visualizer()
+            print(line, end="", flush=True)
+            visualizer_state["rows"] = rows
 
         prompt_length = inputs.shape[1]
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
@@ -379,6 +427,8 @@ class LanguageModel(nn.Module):
         x = mx.concatenate([inputs, x[:, prompt_length:]], axis=1)
         position_ids = mx.arange(total_length, dtype=mx.int32)[None, :]
         prefill_blocks = prompt_length // block_length
+        display_end = prompt_length + gen_length
+        visualize_tokens(x[:, prompt_length:display_end])
 
         for num_block in range(prefill_blocks, num_blocks):
             current_window_end = (num_block + 1) * block_length
@@ -434,6 +484,9 @@ class LanguageModel(nn.Module):
 
                 new_block = mx.where(final_mask, x0, old_block)
                 cur_x = mx.concatenate([cur_x[:, :-block_length], new_block], axis=1)
+                x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
+                if bool(final_mask.any().item()):
+                    visualize_tokens(x[:, prompt_length:display_end])
 
                 if not bool(active_block_mask.any().item()) and not bool(
                     edit_mask.any().item()
@@ -450,6 +503,7 @@ class LanguageModel(nn.Module):
         generated = x[:, prompt_length : prompt_length + gen_length]
         generated_ids = generated[0].tolist()
         end = generated_ids.index(eos_id) + 1 if eos_id in generated_ids else gen_length
+        clear_visualizer()
         return generated[:, :end]
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

@@ -652,6 +652,7 @@ def stream_generate(
           containing the generated text, tokens, and statistics.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    verbose = kwargs.pop("verbose", False)
 
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
@@ -710,6 +711,57 @@ def stream_generate(
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         kwargs.update(data_kwargs)
+
+    if getattr(model.config, "model_type", None) == "llada2_moe":
+        if image is not None or audio is not None or video is not None:
+            raise ValueError("LLaDA2 MoE is a text-only model.")
+
+        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+        temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
+        top_p = kwargs.get("top_p", DEFAULT_TOP_P)
+        top_k = kwargs.get("top_k", DEFAULT_TOP_K)
+
+        tic = time.perf_counter()
+        generated = model.language_model.generate(
+            input_ids,
+            temperature=temperature,
+            gen_length=max_tokens,
+            top_p=None if top_p is None or top_p >= 1.0 else top_p,
+            top_k=None if top_k is None or top_k <= 0 else top_k,
+            eos_early_stop=True,
+            threshold=kwargs.get("threshold", 0.5),
+            editing_threshold=kwargs.get("editing_threshold", 0.0),
+            visualize=verbose,
+            tokenizer=tokenizer,
+            skip_special_tokens=skip_special_tokens,
+        )
+        mx.eval(generated)
+        total_time = time.perf_counter() - tic
+        generated_tokens = generated[0].tolist()
+        text = tokenizer.decode(
+            generated_tokens, skip_special_tokens=skip_special_tokens
+        )
+
+        yield GenerationResult(
+            text=text,
+            token=generated_tokens[-1] if generated_tokens else None,
+            logprobs=None,
+            prompt_tokens=input_ids.size,
+            generation_tokens=len(generated_tokens),
+            total_tokens=input_ids.size + len(generated_tokens),
+            prompt_tps=0.0,
+            generation_tps=(
+                len(generated_tokens) / total_time if total_time > 0 else 0.0
+            ),
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=(
+                "stop"
+                if generated_tokens
+                and tokenizer.stopping_criteria(generated_tokens[-1])
+                else "length"
+            ),
+        )
+        return
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
@@ -1141,7 +1193,7 @@ def generate(
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(
-        model, processor, prompt, image, audio, video, **kwargs
+        model, processor, prompt, image, audio, video, verbose=verbose, **kwargs
     ):
         if response.is_draft:
             diffusion_output.handle_draft(response)
