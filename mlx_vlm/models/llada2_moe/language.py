@@ -375,12 +375,30 @@ class LanguageModel(nn.Module):
             set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
         )
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
-        visualizer_state = {"active": visualize and sys.stdout.isatty()}
+        visualizer_state = {"active": visualize and sys.stdout.isatty(), "rows": 0}
 
         def clear_visualizer() -> None:
-            if not visualizer_state["active"]:
+            if not visualizer_state["active"] or visualizer_state["rows"] == 0:
                 return
-            print("\r\033[2K\033[?7h", end="", flush=True)
+            controls = ["\r\033[2K"]
+            for _ in range(visualizer_state["rows"] - 1):
+                controls.append("\033[1A\r\033[2K")
+            print("".join(controls), end="", flush=True)
+            visualizer_state["rows"] = 0
+
+        def wrap_pieces(pieces, width: int) -> str:
+            lines = []
+            line = ""
+            for piece in pieces:
+                separator = " " if line else ""
+                if line and len(line) + len(separator) + len(piece) > width:
+                    lines.append(line)
+                    line = piece
+                else:
+                    line += separator + piece
+            if line:
+                lines.append(line)
+            return "\n".join(lines)
 
         def decode_token(token_id: int) -> str:
             if tokenizer is None:
@@ -395,39 +413,24 @@ class LanguageModel(nn.Module):
                 return
             pieces = []
             token_ids = tokens[0].tolist()
-            focus = 0
             for i, token_id in enumerate(token_ids):
                 if token_id == mask_id:
                     pieces.append("[MASK]")
                 elif token_id in eos_token_ids:
                     pieces.append(decode_token(token_id) or "<eos>")
-                    focus = i
                     tail = len(token_ids) - i - 1
                     if tail:
                         pieces.extend(["[MASK]"] * tail)
                     break
                 else:
                     pieces.append(decode_token(token_id))
-                    focus = i
 
             terminal_width = max(20, shutil.get_terminal_size((120, 20)).columns - 1)
-            start = 0
-            line = " ".join(pieces)
-            if len(line) > terminal_width:
-                start = max(0, focus - 8)
-                visible_pieces = []
-                visible_length = 0
-                for piece in pieces[start:]:
-                    separator = 1 if visible_pieces else 0
-                    next_length = visible_length + separator + len(piece)
-                    if next_length > terminal_width:
-                        break
-                    visible_pieces.append(piece)
-                    visible_length = next_length
-                line = " ".join(visible_pieces) or pieces[start][:terminal_width]
+            canvas = wrap_pieces(pieces, terminal_width)
 
             clear_visualizer()
-            print("\033[?7l" + line + "\033[?7h", end="", flush=True)
+            print(canvas, end="", flush=True)
+            visualizer_state["rows"] = max(1, canvas.count("\n") + 1)
 
         prompt_length = inputs.shape[1]
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
@@ -524,8 +527,25 @@ class LanguageModel(nn.Module):
 
         generated = x[:, prompt_length : prompt_length + gen_length]
         generated_ids = generated[0].tolist()
-        end = generated_ids.index(eos_id) + 1 if eos_id in generated_ids else gen_length
-        clear_visualizer()
+        end = next(
+            (
+                i + 1
+                for i, token_id in enumerate(generated_ids)
+                if token_id in eos_token_ids
+            ),
+            gen_length,
+        )
+        if visualizer_state["active"]:
+            clear_visualizer()
+            if tokenizer is not None:
+                final_text = tokenizer.decode(
+                    generated_ids[:end], skip_special_tokens=skip_special_tokens
+                )
+            else:
+                final_text = " ".join(str(token_id) for token_id in generated_ids[:end])
+            print(final_text, end="", flush=True)
+            if stats is not None:
+                stats["text_already_printed"] = True
         return generated[:, :end]
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

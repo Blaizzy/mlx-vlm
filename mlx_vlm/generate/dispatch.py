@@ -763,6 +763,7 @@ def stream_generate(
                 and tokenizer.stopping_criteria(generated_tokens[-1])
                 else "length"
             ),
+            text_already_printed=bool(generation_stats.get("text_already_printed")),
         )
         return
 
@@ -1203,7 +1204,11 @@ def generate(
             last_response = response
             continue
 
-        if verbose and not diffusion_output.handle_text(response.text):
+        if (
+            verbose
+            and not response.text_already_printed
+            and not diffusion_output.handle_text(response.text)
+        ):
             print(response.text, end="", flush=True)
         text += response.text
         last_response = response
