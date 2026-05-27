@@ -2229,7 +2229,10 @@ def batch_generate(
 
     # Handle no images case
     if images is None:
-        texts, stats = _generate_batch(
+        generate_batch_fn = _generate_module_override(
+            "_generate_batch", _generate_batch
+        )
+        texts, stats = generate_batch_fn(
             model, processor, prompts, None, max_tokens, verbose, **kwargs
         )
         return BatchResponse(texts, stats)
@@ -2299,7 +2302,10 @@ def batch_generate(
                 ]
 
         # Process the entire group at once (same shape = no padding needed)
-        chunk_texts, chunk_stats = _generate_batch(
+        generate_batch_fn = _generate_module_override(
+            "_generate_batch", _generate_batch
+        )
+        chunk_texts, chunk_stats = generate_batch_fn(
             model,
             processor,
             group_prompts,
@@ -2337,7 +2343,10 @@ def batch_generate(
                     logits_processors[i] for i in text_only_indices
                 ]
 
-        chunk_texts, chunk_stats = _generate_batch(
+        generate_batch_fn = _generate_module_override(
+            "_generate_batch", _generate_batch
+        )
+        chunk_texts, chunk_stats = generate_batch_fn(
             model,
             processor,
             group_prompts,
@@ -2414,7 +2423,7 @@ def _generate_batch(
         for i in range(len(prompts))
     ]
     formatted_prompts = [
-        apply_chat_template(
+        _generate_module_override("apply_chat_template", apply_chat_template)(
             processor,
             model.config,
             p,
@@ -2432,7 +2441,7 @@ def _generate_batch(
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
 
-    inputs = prepare_inputs(
+    inputs = _generate_module_override("prepare_inputs", prepare_inputs)(
         processor,
         images=images,
         audio=None,
@@ -2457,7 +2466,8 @@ def _generate_batch(
         kwargs["prefill_step_size"] = None
 
     # Use batch_size for prefill and completion to ensure consistent processing
-    gen = BatchGenerator(
+    batch_generator_cls = _generate_module_override("BatchGenerator", BatchGenerator)
+    gen = batch_generator_cls(
         model.language_model,
         processor,
         prefill_batch_size=batch_size,
