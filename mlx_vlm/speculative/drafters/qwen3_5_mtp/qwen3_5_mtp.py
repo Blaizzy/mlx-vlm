@@ -105,6 +105,12 @@ class Qwen3_5MTPDraftModel(nn.Module):
         self._round_appended = 0
         return self._cache
 
+    def draft_eval_state(self):
+        state = [self._seed_token, self._seed_hidden]
+        for cache in self._cache:
+            state.append(cache.state)
+        return state
+
     def set_shared_kv(
         self,
         shared_kv_states: dict,

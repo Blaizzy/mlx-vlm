@@ -96,7 +96,7 @@ def get_device_info():
         return None
 
 
-def test_model_loading(model_path, trust_remote_code=False):
+def run_model_loading(model_path, trust_remote_code=False):
     try:
         console.print("[bold green]Loading model...")
         start_time = time.time()
@@ -113,7 +113,7 @@ def test_model_loading(model_path, trust_remote_code=False):
         return None, None, None, True
 
 
-def test_generation(
+def run_generation(
     model, processor, config, model_path, test_inputs, vision_language=True
 ):
     try:
@@ -194,14 +194,14 @@ def main():
         console.print(Panel(f"Testing {model_path}", style="bold blue"))
 
         # Run tests
-        model, processor, config, error = test_model_loading(
+        model, processor, config, error = run_model_loading(
             model_path, args.trust_remote_code
         )
 
         if not error and model:
             print("\n")
             # Test vision-language generation
-            error |= test_generation(
+            error |= run_generation(
                 model, processor, config, model_path, test_inputs, vision_language=True
             )
 
@@ -212,7 +212,7 @@ def main():
             mx.reset_peak_memory()
 
             # Test language-only generation
-            error |= test_generation(
+            error |= run_generation(
                 model, processor, config, model_path, test_inputs, vision_language=False
             )
             print("\n")
