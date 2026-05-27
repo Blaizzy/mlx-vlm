@@ -1703,6 +1703,8 @@ def _make_cache(
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
+        elif isinstance(c, cache.PoolingCache):
+            return cache.BatchPoolingCache(c.ratio, left_padding)
         elif isinstance(c, cache.RotatingKVCache):
             if c.keep > 0:
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
