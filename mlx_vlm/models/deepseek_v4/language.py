@@ -1,6 +1,6 @@
 import math
 from functools import partial
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -223,6 +223,24 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
     full_mask = mx.concatenate([mask, pool_mask], axis=-1)
 
     return full_mask
+
+
+def _align_local_mask(mask: Optional[mx.array], local_len: int):
+    if mask is None:
+        return None
+
+    current_len = mask.shape[-1]
+    if current_len == local_len:
+        return mask
+    if current_len > local_len:
+        return mask[..., -local_len:]
+
+    pad_shape = (*mask.shape[:-1], local_len - current_len)
+    if mask.dtype == mx.bool_:
+        pad = mx.ones(pad_shape, dtype=mask.dtype)
+    else:
+        pad = mx.zeros(pad_shape, dtype=mask.dtype)
+    return mx.concatenate([pad, mask], axis=-1)
 
 
 @partial(mx.compile, shapeless=True)
@@ -557,9 +575,14 @@ class LocalAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        offset = cache.offset if cache is not None else 0
+        offset = (
+            position_offset
+            if position_offset is not None
+            else (cache.offset if cache is not None else 0)
+        )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q = self.wq_b(self.q_norm(self.wq_a(x)))
@@ -572,6 +595,7 @@ class LocalAttention(nn.Module):
         kv = self.rope(kv, offset)
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
         out = scaled_dot_product_attention(
             q,
@@ -646,11 +670,16 @@ class CompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         pool_cache = cache[1] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = (
+            position_offset
+            if position_offset is not None
+            else (local_cache.offset if local_cache is not None else 0)
+        )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q = self.wq_b(self.q_norm(self.wq_a(x)))
@@ -663,6 +692,7 @@ class CompressedAttention(nn.Module):
         kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
         # Pool tokens into compressed KV and concatenate with local KV
         pooled = self.compressor(x, pool_cache, offset)
@@ -748,12 +778,17 @@ class SparseCompressedAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         B, L, _ = x.shape
         local_cache = cache[0] if cache is not None else None
         comp_cache = cache[1] if cache is not None else None
         idx_cache = cache[2] if cache is not None else None
-        offset = local_cache.offset if local_cache is not None else 0
+        offset = (
+            position_offset
+            if position_offset is not None
+            else (local_cache.offset if local_cache is not None else 0)
+        )
         offset = mx.array(offset) if isinstance(offset, mx.array) else offset
 
         q_residual = self.q_norm(self.wq_a(x))
@@ -766,6 +801,7 @@ class SparseCompressedAttention(nn.Module):
         kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
         pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
@@ -858,10 +894,16 @@ class DeepseekV4Block(nn.Module):
         mask: Optional[mx.array],
         cache: Optional[Any],
         input_ids: mx.array,
+        position_offset: Optional[Union[int, mx.array]] = None,
     ) -> mx.array:
         residual = h
         x, post, comb = self.attn_hc(h)
-        x = self.attn(self.attn_norm(x), mask=mask, cache=cache)
+        x = self.attn(
+            self.attn_norm(x),
+            mask=mask,
+            cache=cache,
+            position_offset=position_offset,
+        )
         h = hc_expand(x, residual, post, comb)
 
         residual = h
@@ -887,6 +929,8 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        hidden_sink: Optional[list] = None,
+        skip_final_norm: bool = False,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         h = mx.broadcast_to(
@@ -929,7 +973,186 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
+        if hidden_sink is not None:
+            hidden_sink.append(h)
+
+        if skip_final_norm:
+            return h
+
         return self.norm(self.hc_head(h))
+
+
+def _clone_cache_tree(value):
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, tuple):
+        return tuple(_clone_cache_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_cache_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clone_cache_tree(v) for k, v in value.items()}
+    return value
+
+
+def _snapshot_cache_state(
+    caches: List[Any], incoming_tokens: int = 0
+) -> List[Optional[Tuple[Any, Any]]]:
+    return [_snapshot_single_cache(cache, incoming_tokens) for cache in caches]
+
+
+def _needs_replay_snapshot(cache, incoming_tokens: int) -> bool:
+    if cache is None:
+        return False
+    if isinstance(cache, CacheList):
+        return any(
+            _needs_replay_snapshot(child, incoming_tokens) for child in cache.caches
+        )
+    if isinstance(cache, PoolingCache):
+        return int(cache.remainder) + int(incoming_tokens) >= int(cache.ratio)
+    if isinstance(cache, RotatingKVCache):
+        return False
+    return not (hasattr(cache, "trim") and callable(cache.trim))
+
+
+def _needs_replay_snapshot_for_cache(
+    caches: Optional[List[Any]], incoming_tokens: int = 0
+) -> bool:
+    if caches is None:
+        return False
+    return any(_needs_replay_snapshot(cache, incoming_tokens) for cache in caches)
+
+
+def _snapshot_single_cache(cache, incoming_tokens: int = 0):
+    if cache is None:
+        return None
+    if isinstance(cache, CacheList):
+        return (
+            "cache_list",
+            [_snapshot_single_cache(child, incoming_tokens) for child in cache.caches],
+        )
+    if isinstance(cache, PoolingCache):
+        remainder = int(cache.remainder)
+        total = remainder + int(incoming_tokens)
+        overwrite_len = remainder
+        if incoming_tokens > 0:
+            overwrite_len = total % cache.ratio if total >= cache.ratio else 0
+        will_overwrite_remainder = (
+            remainder > 0 and cache.buf_kv is not None and overwrite_len > 0
+        )
+        buf_kv = cache.buf_kv[:, :overwrite_len] if will_overwrite_remainder else None
+        buf_gate = (
+            cache.buf_gate[:, :overwrite_len] if will_overwrite_remainder else None
+        )
+        pooled_len = None if cache.pooled is None else cache.pooled.shape[1]
+        return (
+            "pooling",
+            remainder,
+            _clone_cache_tree(buf_kv),
+            _clone_cache_tree(buf_gate),
+            pooled_len,
+        )
+    if isinstance(cache, RotatingKVCache):
+        return (
+            "rotating",
+            _clone_cache_tree(cache.offset),
+            int(cache._idx),
+            getattr(cache, "start_position", None),
+        )
+    return (
+        "full",
+        _clone_cache_tree(getattr(cache, "state", None)),
+        _clone_cache_tree(getattr(cache, "meta_state", None)),
+    )
+
+
+def _clear_cache_state(cache) -> None:
+    if isinstance(cache, CacheList):
+        for child in cache.caches:
+            _clear_cache_state(child)
+        return
+    if hasattr(cache, "keys"):
+        cache.keys = None
+    if hasattr(cache, "values"):
+        cache.values = None
+    if hasattr(cache, "offset"):
+        cache.offset = 0
+    if hasattr(cache, "_idx"):
+        cache._idx = 0
+    if hasattr(cache, "start_position"):
+        cache.start_position = 0
+    if hasattr(cache, "buf_kv"):
+        cache.buf_kv = None
+    if hasattr(cache, "buf_gate"):
+        cache.buf_gate = None
+    if hasattr(cache, "remainder"):
+        cache.remainder = 0
+    if hasattr(cache, "pooled"):
+        cache.pooled = None
+
+
+def _restore_single_cache(cache, snapshot) -> None:
+    if cache is None or snapshot is None:
+        return
+    kind = snapshot[0]
+    if isinstance(cache, CacheList):
+        for child, child_snapshot in zip(cache.caches, snapshot[1]):
+            _restore_single_cache(child, child_snapshot)
+        return
+    if kind == "pooling":
+        _, remainder, buf_kv, buf_gate, pooled_len = snapshot
+        cache.remainder = int(remainder)
+        if buf_kv is not None:
+            restore_len = int(buf_kv.shape[1])
+            if cache.buf_kv is None or cache.buf_kv.shape[1] < cache.ratio:
+                cache.buf_kv = mx.zeros(
+                    (buf_kv.shape[0], cache.ratio, buf_kv.shape[2]),
+                    dtype=buf_kv.dtype,
+                )
+            if cache.buf_gate is None or cache.buf_gate.shape[1] < cache.ratio:
+                cache.buf_gate = mx.zeros(
+                    (buf_gate.shape[0], cache.ratio, buf_gate.shape[2]),
+                    dtype=buf_gate.dtype,
+                )
+            cache.buf_kv[:, :restore_len] = buf_kv
+            cache.buf_gate[:, :restore_len] = buf_gate
+        if pooled_len is None:
+            cache.pooled = None
+        elif cache.pooled is not None:
+            cache.pooled = cache.pooled[:, :pooled_len]
+        return
+    if kind == "rotating":
+        _, offset, idx, start_position = snapshot
+        cache.offset = _clone_cache_tree(offset)
+        cache._idx = int(idx)
+        if start_position is not None and hasattr(cache, "start_position"):
+            cache.start_position = int(start_position)
+        return
+    _, state, meta_state = snapshot
+    if state is None:
+        _clear_cache_state(cache)
+        return
+    if meta_state is not None and hasattr(type(cache), "meta_state"):
+        cache.meta_state = _clone_cache_tree(meta_state)
+    cache.state = _clone_cache_tree(state)
+
+
+def _restore_cache_state(
+    caches: List[Any], snapshot: List[Optional[Tuple[Any, Any]]]
+) -> None:
+    for cache, entry in zip(caches, snapshot):
+        if cache is None or entry is None:
+            continue
+        _restore_single_cache(cache, entry)
+
+
+def _iter_leaf_caches(caches):
+    for cache in caches:
+        if cache is None:
+            continue
+        if isinstance(cache, CacheList):
+            yield from _iter_leaf_caches(cache.caches)
+        else:
+            yield cache
 
 
 class LanguageModel(nn.Module):
@@ -948,10 +1171,128 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ) -> LanguageModelOutput:
-        logits = self.lm_head(
-            self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        skip_final_norm = kwargs.pop("skip_final_norm", False)
+        hidden_sink = kwargs.pop("hidden_sink", None)
+        if return_hidden and hidden_sink is None:
+            hidden_sink = []
+
+        out = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            hidden_sink=hidden_sink,
+            skip_final_norm=skip_final_norm,
         )
-        return LanguageModelOutput(logits=logits)
+        logits = None if skip_logits else self.lm_head(out)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def _target_hidden(self, hidden: mx.array) -> mx.array:
+        if (
+            hidden.ndim == 3
+            and hidden.shape[-1] == self.args.hc_mult * self.args.hidden_size
+        ):
+            hidden = hidden.reshape(*hidden.shape[:-1], self.args.hc_mult, -1)
+        if hidden.ndim != 4:
+            raise ValueError(
+                "DeepSeek-V4 speculative hidden must have shape "
+                "[batch, tokens, hc_mult, hidden_size]."
+            )
+        return hidden
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        hidden = self._target_hidden(hidden)
+        return self.lm_head(self.model.norm(self.model.hc_head(hidden)))
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return self._target_hidden(hidden)
+
+    def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
+        incoming_tokens = int(inputs.shape[1])
+        cache_snapshot = (
+            _snapshot_cache_state(cache, incoming_tokens)
+            if _needs_replay_snapshot_for_cache(cache, incoming_tokens)
+            else None
+        )
+        sample_logits = sampler is not None
+
+        out = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=not sample_logits,
+            skip_final_norm=not sample_logits,
+        )
+        hidden = out.hidden_states[-1]
+        rollback_state = (
+            (cache_snapshot, inputs) if cache_snapshot is not None else None
+        )
+        if not sample_logits:
+            return hidden, {}, rollback_state
+
+        return hidden, {}, rollback_state, sampler(out.logits)
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        # Greedy MTP verification is faster with one batched LM-head projection
+        # than with per-position deferred projections on Metal.
+        return self._speculative_verify(inputs, cache, sampler)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        return self._speculative_verify(inputs, cache)
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: Any,
+        accepted,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+
+        max_a = int(accepted.max().item())
+        if gdn_states:
+            cache_snapshot, verify_inputs = gdn_states
+            accepted_list = [int(a) for a in accepted.tolist()]
+            if len(set(accepted_list)) != 1:
+                raise ValueError(
+                    "DeepSeek-V4 speculative rollback requires uniform acceptance."
+                )
+            _restore_cache_state(caches, cache_snapshot)
+            keep = max_a + 1
+            if keep > 0:
+                self(verify_inputs[:, :keep], cache=caches, skip_logits=True)
+            return max_a
+
+        n = max_a + 1
+        trim = block_size - n
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        for cache in _iter_leaf_caches(caches):
+            if trim > 0 and hasattr(cache, "trim"):
+                cache.trim(trim)
+            if is_batch and hasattr(cache, "_idx") and max_a > 0:
+                keys = getattr(cache, "keys", None)
+                values = getattr(cache, "values", None)
+                if keys is None or values is None:
+                    continue
+                kv_len = cache._idx
+                verify_start = kv_len - n
+                for bi, valid_end in enumerate(valid_ends.tolist()):
+                    start = verify_start + int(valid_end)
+                    if start < kv_len:
+                        cache.keys[bi, :, start:kv_len, :] = 0
+                        cache.values[bi, :, start:kv_len, :] = 0
+
+        return max_a
 
     @property
     def layers(self):

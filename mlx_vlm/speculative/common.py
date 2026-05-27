@@ -27,15 +27,19 @@ def _append_arrays(value: Any, arrays: List[mx.array]) -> None:
 
 
 def _draft_sampler_state_arrays(draft_model: nn.Module) -> List[mx.array]:
+    state_fn = getattr(draft_model, "draft_eval_state", None)
+    if callable(state_fn):
+        arrays: List[mx.array] = []
+        _append_arrays(state_fn(), arrays)
+        return arrays
+
     attrs = getattr(draft_model, "sampler_state_attrs", ("_seed_token",))
     if isinstance(attrs, str):
         attrs = (attrs,)
 
     arrays = []
     for attr in attrs:
-        value = getattr(draft_model, attr, None)
-        if isinstance(value, mx.array):
-            arrays.append(value)
+        _append_arrays(getattr(draft_model, attr, None), arrays)
     return arrays
 
 
@@ -55,7 +59,13 @@ class _SpeculativeSamplerRNG:
         **kwargs,
     ):
         if not self.enabled:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            arrays = []
+            _append_arrays(result, arrays)
+            arrays.extend(_draft_sampler_state_arrays(self.draft_model))
+            if arrays:
+                mx.async_eval(*arrays)
+            return result
 
         self._target_rng_state = _copy_rng_state()
         _restore_rng_state(self._draft_rng_state)
