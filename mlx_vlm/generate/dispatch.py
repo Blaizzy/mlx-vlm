@@ -3,7 +3,6 @@ import codecs
 import contextlib
 import json
 import logging
-import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -47,11 +46,6 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
-
-
-def _generate_module_override(name: str, fallback):
-    generate_module = sys.modules.get("mlx_vlm.generate")
-    return getattr(generate_module, name, fallback) if generate_module else fallback
 
 
 def parse_arguments():
@@ -1156,7 +1150,7 @@ def generate(
 
 
 def main():
-    args = _generate_module_override("parse_arguments", parse_arguments)()
+    args = parse_arguments()
     diffusion_arg_defaults = {
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
@@ -1180,7 +1174,7 @@ def main():
     if isinstance(args.video, str):
         args.video = [args.video]
 
-    model, processor = _generate_module_override("load", load)(
+    model, processor = load(
         args.model,
         args.adapter_path,
         revision=args.revision,
@@ -1225,7 +1219,7 @@ def main():
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
-    prompt = _generate_module_override("apply_chat_template", apply_chat_template)(
+    prompt = apply_chat_template(
         processor,
         config,
         prompt,
@@ -1270,9 +1264,7 @@ def main():
             chat.append({"role": "system", "content": args.system})
         while user := input("User:"):
             chat.append({"role": "user", "content": user})
-            prompt = _generate_module_override(
-                "apply_chat_template", apply_chat_template
-            )(
+            prompt = apply_chat_template(
                 processor,
                 config,
                 chat,
@@ -1356,7 +1348,7 @@ def main():
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
-        result = _generate_module_override("generate", generate)(
+        result = generate(
             model,
             processor,
             prompt,
