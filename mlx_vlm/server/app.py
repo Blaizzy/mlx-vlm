@@ -14,12 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 
 from .. import apc as _apc
-from ..generate_image import is_image_generation_model, load_image_generation_model
 from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
 )
+from ..generate_image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__

@@ -10,8 +10,8 @@ import time
 import traceback
 import uuid
 from datetime import datetime
-from pathlib import Path
 from io import BytesIO
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
@@ -55,10 +55,10 @@ from .schemas import (
     ChatStreamChoice,
     ChatStreamChunk,
     ContentPartOutputText,
+    GenerationTimings,
     ImageGenerationRequest,
     ImageGenerationResponse,
     ImageGenerationResponseData,
-    GenerationTimings,
     InputAudio,
     MessageItem,
     OpenAIRequest,
