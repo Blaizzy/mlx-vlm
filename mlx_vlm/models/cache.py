@@ -1162,3 +1162,98 @@ class StaticKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+
+class StaticPrefixKVCache(_BaseCache):
+    """Fixed-capacity KV cache with prefix fetch semantics.
+
+    ``update_and_fetch`` returns only the populated prefix so normal encoder
+    prefill attention sees the same shapes as a dynamic cache. Decoder code can
+    use ``decoder_state`` to attend over the full fixed allocation together with
+    an attention mask that hides unpopulated entries.
+    """
+
+    def __init__(self, max_size: int, step: int = 256):
+        self.max_size = int(max_size)
+        self.step = int(step)
+        self.keys = None
+        self.values = None
+        self.offset = 0
+
+    def _capacity_for(self, needed: int) -> int:
+        if needed <= self.max_size:
+            return self.max_size
+        return ((needed + self.step - 1) // self.step) * self.step
+
+    def _ensure_capacity(self, keys: mx.array, values: mx.array, needed: int) -> None:
+        if self.keys is not None and needed <= self.keys.shape[2]:
+            return
+
+        B, n_kv_heads, _, k_head_dim = keys.shape
+        v_head_dim = values.shape[-1]
+        capacity = self._capacity_for(needed)
+        new_keys = mx.zeros((B, n_kv_heads, capacity, k_head_dim), dtype=keys.dtype)
+        new_values = mx.zeros((B, n_kv_heads, capacity, v_head_dim), dtype=values.dtype)
+        if self.keys is not None and self.offset > 0:
+            new_keys[..., : self.offset, :] = self.keys[..., : self.offset, :]
+            new_values[..., : self.offset, :] = self.values[..., : self.offset, :]
+        self.keys = new_keys
+        self.values = new_values
+        self.max_size = capacity
+
+    def update_and_fetch(
+        self, keys: mx.array, values: mx.array
+    ) -> Tuple[mx.array, mx.array]:
+        seq_len = keys.shape[2]
+        prev = self.offset
+        end = prev + seq_len
+        self._ensure_capacity(keys, values, end)
+        self.keys[..., prev:end, :] = keys
+        self.values[..., prev:end, :] = values
+        self.offset = end
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    @property
+    def state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+
+    @state.setter
+    def state(self, v):
+        if v is not None and len(v) == 2:
+            self.keys, self.values = v
+            if self.keys is not None:
+                self.offset = self.keys.shape[2]
+                self.max_size = self.keys.shape[2]
+
+    @property
+    def decoder_state(self):
+        if self.keys is None:
+            return None, None
+        return self.keys, self.values
+
+    @property
+    def meta_state(self):
+        return tuple(map(str, (self.max_size, self.step, self.offset)))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.max_size, self.step, self.offset = map(int, v)
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(int(n), self.offset)
+        self.offset -= n
+        return n
+
+    def empty(self):
+        return self.keys is None
+
+    @property
+    def nbytes(self):
+        if self.keys is None:
+            return 0
+        return self.keys.nbytes + self.values.nbytes
