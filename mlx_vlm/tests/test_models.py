@@ -159,6 +159,98 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_deepseek_v4_language_model(self):
+        from mlx_vlm.models import deepseek_v4
+        from mlx_vlm.models.deepseek_v4.hyper_connection import (
+            _hc_split_sinkhorn_ops,
+            hc_expand,
+        )
+        from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+        rope = DeepseekV4RoPE(4, 10000)
+        x = mx.random.uniform(shape=(1, 2, 3, 4))
+        y = rope(x, offset=1)
+        y_inv = rope(y, offset=1, inverse=True)
+        self.assertTrue(mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5))
+
+        mixes = mx.random.normal((2, 3, 8), dtype=mx.float32)
+        scale = mx.array([1.2, 0.7, 1.1], dtype=mx.float32)
+        base = mx.random.normal((8,), dtype=mx.float32)
+        _, _, comb = _hc_split_sinkhorn_ops(mixes, scale, base, 2, 20, 1e-6)
+        self.assertTrue(mx.allclose(comb.sum(-1), mx.ones_like(comb.sum(-1)), atol=0.1))
+
+        post = mx.random.normal((2, 3, 2), dtype=mx.float32)
+        block_out = mx.random.normal((2, 3, 8), dtype=mx.bfloat16)
+        comb = mx.random.normal((2, 3, 2, 2), dtype=mx.float32)
+        residual = mx.random.normal((2, 3, 2, 8), dtype=mx.bfloat16)
+        expected = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+        expected = expected + mx.matmul(
+            comb.swapaxes(-1, -2), residual.astype(mx.float32)
+        )
+        actual = hc_expand(block_out, residual, post, comb)
+        self.assertTrue(mx.allclose(actual, expected.astype(block_out.dtype)))
+
+        config = deepseek_v4.ModelConfig(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        loaded_config = deepseek_v4.ModelConfig.from_dict(
+            {"model_type": "deepseek_v4", "eos_token_id": 1}
+        )
+        self.assertEqual(loaded_config.eos_token_id, 1)
+
+        model = deepseek_v4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        inputs = mx.array([[1, 2, 3]])
+        inputs_embeds = model.language_model.model.embed_tokens(inputs)
+        out = model.language_model(inputs, inputs_embeds=inputs_embeds)
+        self.assertEqual(out.logits.shape, (1, 3, config.vocab_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
+        self.assertEqual(type(cache[2]).__name__, "CacheList")
+
+        weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
+        converted = model.sanitize(
+            {
+                "layers.0.attn.wkv.weight": weight,
+                "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
+            }
+        )
+        wkey = "language_model.model.layers.0.attn.wkv.weight"
+        skey = "language_model.model.layers.0.attn.wkv.scales"
+        self.assertIn(wkey, converted)
+        self.assertIn(skey, converted)
+        self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
+        self.assertEqual(converted[skey].shape, (128, 4))
+
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
 
