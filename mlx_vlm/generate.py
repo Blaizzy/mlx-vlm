@@ -5,10 +5,12 @@ import functools
 import json
 import logging
 import os
+import random
 import time
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
@@ -20,6 +22,15 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from . import apc as _apc
+from .generate_image import (
+    DEFAULT_IMAGE_GUIDANCE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_IMAGE_STEPS,
+    ImageGenerationRequest,
+    generate_image,
+    load_image_generation_model,
+    parse_size,
+)
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .speculative.utils import format_speculative_stats, run_speculative_rounds
@@ -66,6 +77,43 @@ def parse_arguments():
         type=str,
         default=DEFAULT_MODEL_PATH,
         help="The path to the local model directory or Hugging Face repo.",
+    )
+    parser.add_argument(
+        "--output-modality",
+        type=str,
+        choices=("text", "image"),
+        default="text",
+        help="Generate text with a VLM or generate an image with a supported image model.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output path for image generation.",
+    )
+    parser.add_argument(
+        "--size",
+        type=str,
+        default=DEFAULT_IMAGE_SIZE,
+        help="Generated image size as WIDTHxHEIGHT.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_IMAGE_STEPS,
+        help="Number of image generation inference steps.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed for image generation. Defaults to a random 32-bit seed.",
+    )
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=DEFAULT_IMAGE_GUIDANCE,
+        help="Classifier-free guidance for image generation.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -278,6 +326,74 @@ def normalize_resize_shape(
     ):
         raise ValueError("resize_shape must contain 1 or 2 integers")
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
+
+
+def _prompt_to_image_text(prompt: Union[str, Sequence[str]]) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    return " ".join(str(part) for part in prompt)
+
+
+def _validate_image_generation_args(args) -> None:
+    incompatible = []
+    for name in ("image", "audio", "video", "adapter_path", "draft_model"):
+        if getattr(args, name, None) is not None:
+            incompatible.append(f"--{name.replace('_', '-')}")
+    if args.chat:
+        incompatible.append("--chat")
+    if args.resize_shape is not None:
+        incompatible.append("--resize-shape")
+    if args.eos_tokens is not None:
+        incompatible.append("--eos-tokens")
+    if args.kv_bits is not None:
+        incompatible.append("--kv-bits")
+    if args.max_kv_size is not None:
+        incompatible.append("--max-kv-size")
+    if args.processor_kwargs:
+        incompatible.append("--processor-kwargs")
+    if args.quantize_activations:
+        incompatible.append("--quantize-activations")
+    if args.skip_special_tokens:
+        incompatible.append("--skip-special-tokens")
+    if args.thinking_budget is not None:
+        incompatible.append("--thinking-budget")
+    if incompatible:
+        joined = ", ".join(incompatible)
+        raise ValueError(f"Image generation does not support: {joined}")
+
+
+def _run_image_generation_cli(args) -> None:
+    _validate_image_generation_args(args)
+    width, height = parse_size(args.size)
+    seed = args.seed if args.seed is not None else random.randrange(2**32)
+    prompt = _prompt_to_image_text(args.prompt)
+    if not prompt:
+        raise ValueError("--prompt must not be empty for image generation")
+
+    output_path = (
+        Path(args.output).expanduser()
+        if args.output is not None
+        else Path("outputs") / f"image-{seed}.png"
+    )
+    model = load_image_generation_model(args.model)
+    request = ImageGenerationRequest(
+        prompt=prompt,
+        seed=seed,
+        steps=args.steps,
+        width=width,
+        height=height,
+        guidance=args.guidance,
+    )
+    result = generate_image(
+        model,
+        request,
+        output_path=output_path,
+    )
+    print(
+        f"Saved {result.path} seed={result.seed} "
+        f"size={result.width}x{result.height} steps={result.steps} "
+        f"variant={result.variant}"
+    )
 
 
 # A stream on the default device just for generation
@@ -3320,6 +3436,10 @@ def main():
         args.audio = [args.audio]
     if isinstance(args.video, str):
         args.video = [args.video]
+
+    if getattr(args, "output_modality", "text") == "image":
+        _run_image_generation_cli(args)
+        return
 
     model, processor = load(
         args.model,

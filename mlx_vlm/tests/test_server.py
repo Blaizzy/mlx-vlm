@@ -1,18 +1,23 @@
 import json
 import time
+from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import mlx_vlm.server as server
+import mlx_vlm.server.openai as server_openai
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
+from mlx_vlm.generate_image import ImageGenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -214,6 +219,100 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
     assert "local/single-file-model" in ids
     assert "local/sharded-model" in ids
     assert "missing/weights" not in ids
+
+
+def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
+    image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
+    data = ImageGenerationResult(
+        array=mx.array(np.array(image)),
+        seed=seed,
+        width=16,
+        height=16,
+        steps=1,
+        model="bonsai",
+        family="bonsai",
+        variant="ternary",
+        guidance=1.0,
+        peak_memory=0.0,
+        prompt_tokens=5,
+    )
+    if output_path is not None:
+        data.save(output_path)
+    return data
+
+
+def test_images_generations_returns_b64_json(client, monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(server_openai, "is_image_generation_model", lambda model: True)
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model: (SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")),
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        calls.append(request)
+        return _fake_image_result(seed=request.seed)
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "bonsai-ternary",
+            "prompt": "bonsai",
+            "n": 2,
+            "seed": 10,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["size"] == "256x256"
+    assert [item["seed"] for item in payload["data"]] == [10, 11]
+    assert all(item["b64_json"] for item in payload["data"])
+    assert [call.seed for call in calls] == [10, 11]
+
+
+def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(server_openai, "is_image_generation_model", lambda model: True)
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model: (SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")),
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        return _fake_image_result(
+            seed=request.seed, output_path=kwargs["output_path"]
+        )
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "bonsai-ternary",
+            "prompt": "bonsai",
+            "n": 2,
+            "seed": 20,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "path",
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    paths = [Path(item["path"]) for item in payload["data"]]
+    assert [path.name for path in paths] == ["image-20.png", "image-21.png"]
+    assert all(path.exists() for path in paths)
+    assert all(item["b64_json"] is None for item in payload["data"])
 
 
 class _RecordingSpeculativeLM:
