@@ -1,9 +1,3 @@
-"""Low-bit quantized FLUX.2 Klein 4B transformer backend.
-
-Provides Flux2KleinFastTransformer as a drop-in replacement for
-Flux2Transformer with a fused 25-block megakernel.
-"""
-
 from mlx_vlm.models.bonsai.klein_fast.blocks import (
     DEFAULT_QUANT_GROUP_SIZE,
     DenseLinearKernel,

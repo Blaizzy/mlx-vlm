@@ -1,11 +1,3 @@
-"""FLUX.2 Klein 25-block megakernel for MLX.
-
-forward() accepts rotary_cos / rotary_sin as arguments so the enclosing
-transformer can supply per-call RoPE for variable image sizes. Callers pass
-a pre-computed `temb` (shape (B, dim), bf16) produced by mflux's
-Flux2TimestepGuidanceEmbeddings.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

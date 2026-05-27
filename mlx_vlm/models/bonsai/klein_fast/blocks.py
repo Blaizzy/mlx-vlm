@@ -1,17 +1,3 @@
-"""Flux2 Klein transformer block building blocks for MLX.
-
-RoPE uses mflux's compact (S, D/2) cos/sin representation and matches
-AttentionUtils.apply_rope_bshd so outputs are bit-identical to the reference
-blocks at matched dtypes/eps.
-
-Spec exposes layer_norm_eps and rms_norm_eps separately. Defaults (1e-6 for
-both) match the canonical FLUX.2 Klein reference: diffusers' Flux2Attention
-and Flux2TransformerBlock both consume the single `eps` field from
-transformer/config.json (1e-06 in black-forest-labs/FLUX.2-klein-4B). mflux's
-Flux2Attention hardcodes RMSNorm(eps=1e-5), which disagrees with that config;
-callers using real Klein weights should stick to 1e-6 for both.
-"""
-
 from __future__ import annotations
 
 import json
@@ -211,10 +197,6 @@ def _restore_hidden_states(x: mx.array, squeezed: bool) -> mx.array:
 
 
 def _apply_rope_bshd(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Apply Flux-style RoPE to an [B, H, S, D] tensor using compact (S, D/2) cos/sin.
-
-    Matches mflux.models.flux.model.flux_transformer.common.attention_utils.AttentionUtils.apply_rope_bshd.
-    """
     out_dtype = x.dtype
     x_f = x.astype(mx.float32)
     cos_b = cos.reshape(1, 1, cos.shape[0], cos.shape[1])

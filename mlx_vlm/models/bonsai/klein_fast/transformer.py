@@ -1,17 +1,3 @@
-"""Drop-in replacement for Flux2Transformer backed by the fused 25-block megakernel.
-
-Wraps the 25-block Flux2KleinMegakernel with mflux's standard embedding /
-positional-encoding modules so it slots into the existing pipeline without
-changes to the caller. The `__call__` signature matches
-Flux2Transformer.__call__ exactly:
-    (hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids, guidance)
-
-`temb` is used only to build prepare_all_modulations outside the compiled
-graph, then a single mx.compile'd forward_from_modulations runs the full
-25-block stack. The compiled function is cached on the transformer instance
-and reused across diffusion steps; shape-identical calls hit the compile cache.
-"""
-
 from __future__ import annotations
 
 import mlx.core as mx

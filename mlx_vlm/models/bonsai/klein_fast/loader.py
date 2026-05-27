@@ -1,18 +1,3 @@
-"""Load FLUX.2 Klein 4B weights into MegakernelWeights.
-
-Two entry points:
-
-- `load_klein_fast_weights_from_hf` — consumes the HF diffusers `transformer/`
-  layout (bf16 weights) and leaves quantization to the megakernel constructor.
-  Runtime `quantize_affine_nbit` runs on every cold start.
-
-- `load_klein_fast_packed_weights_from_disk` — consumes the pre-packed MLX
-  artifact `transformer-packed-mflux/` (packed uint32 weights + bf16
-  scales/biases + bf16 for the skip-list layers). Returns a MegakernelWeights
-  where each block linear is already a PackedWeight triple, bypassing runtime
-  quantization.
-"""
-
 from __future__ import annotations
 
 import json
