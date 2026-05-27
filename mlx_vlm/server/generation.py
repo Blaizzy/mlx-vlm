@@ -57,6 +57,15 @@ def _get_draft_block_size_from_env():
     return int(draft_block_size_str) if draft_block_size_str else None
 
 
+def _notify_queues(queues, *items):
+    for queue in queues:
+        for item in items:
+            try:
+                queue.put(item)
+            except Exception:
+                break
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -1233,9 +1242,9 @@ class ResponseGenerator:
                 traceback.print_exc()
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
                 error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
-                for rqueue in error_queues.values():
-                    rqueue.put(e)
-                    rqueue.put(None)
+                _notify_queues(error_queues.values(), e, None)
+                mx.clear_cache()
+                gc.collect()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""

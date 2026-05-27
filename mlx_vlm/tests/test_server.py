@@ -371,6 +371,101 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
     assert rqueue.get(timeout=1) is None
 
 
+def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+
+    class BrokenQueue:
+        def put(self, item):
+            raise RuntimeError("client went away")
+
+    good_queue = Queue()
+    pending = [
+        (
+            BrokenQueue(),
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        ),
+        (
+            good_queue,
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        ),
+    ]
+    calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pending, False
+        return [], True
+
+    error = RuntimeError("speculative prefill failed")
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=error)
+
+    gen._run_speculative()
+
+    assert good_queue.get(timeout=1) is error
+    assert good_queue.get(timeout=1) is None
+
+
+def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+    rqueue = Queue()
+
+    calls = {"clear_cache": 0, "collect": 0}
+    collect_calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        collect_calls["count"] += 1
+        if collect_calls["count"] > 1:
+            return [], True
+        return [
+            (
+                rqueue,
+                {"input_ids": mx.array([[1]], dtype=mx.int32)},
+                1,
+                server.GenerationArguments(max_tokens=2),
+                None,
+            )
+        ], False
+
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(
+        server_generation.mx,
+        "clear_cache",
+        lambda: calls.__setitem__("clear_cache", calls["clear_cache"] + 1),
+    )
+    monkeypatch.setattr(
+        server_generation.gc,
+        "collect",
+        lambda: calls.__setitem__("collect", calls["collect"] + 1),
+    )
+
+    gen._run_speculative()
+
+    assert calls == {"clear_cache": 1, "collect": 1}
+
+
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
     def repo(repo_id, file_names):
         return SimpleNamespace(
