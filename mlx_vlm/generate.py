@@ -3487,7 +3487,15 @@ def main():
                 f"using {resolved_kind!r} instead of {args.draft_kind!r}."
             )
         args.draft_kind = resolved_kind
-        validate_drafter_compatibility(model, draft_model, args.draft_kind)
+        try:
+            validate_drafter_compatibility(model, draft_model, args.draft_kind)
+        except ValueError as e:
+            print(
+                "Speculative drafter is incompatible with the target model; "
+                f"falling back to autoregressive generation. {e}"
+            )
+            draft_model = None
+            args.draft_kind = None
 
     prompt = args.prompt
 

@@ -703,8 +703,17 @@ class ResponseGenerator:
                     f"using {resolved_kind!r} instead of {draft_kind!r}."
                 )
             draft_kind = resolved_kind
-            validate_drafter_compatibility(model, draft_model, draft_kind)
-            print("Drafter ready — speculative decoding enabled.")
+            try:
+                validate_drafter_compatibility(model, draft_model, draft_kind)
+            except ValueError as e:
+                print(
+                    "Speculative drafter is incompatible with the target model; "
+                    f"falling back to autoregressive generation. {e}"
+                )
+                draft_model = None
+                draft_kind = None
+            else:
+                print("Drafter ready — speculative decoding enabled.")
 
         self.model = model
         self.processor = processor
