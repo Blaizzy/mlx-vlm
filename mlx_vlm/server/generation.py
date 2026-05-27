@@ -592,7 +592,10 @@ class ResponseGenerator:
         draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
-            from ..speculative.drafters import load_drafter
+            from ..speculative.drafters import (
+                load_drafter,
+                validate_drafter_compatibility,
+            )
 
             print(
                 f"Loading speculative drafter ({draft_kind or 'auto'}): "
@@ -607,6 +610,7 @@ class ResponseGenerator:
                     f"using {resolved_kind!r} instead of {draft_kind!r}."
                 )
             draft_kind = resolved_kind
+            validate_drafter_compatibility(model, draft_model, draft_kind)
             print("Drafter ready — speculative decoding enabled.")
 
         self.model = model

@@ -632,6 +632,9 @@ def generate_step(
     # Speculative decoding setup
     last_outputs = None
     if draft_model is not None:
+        from .speculative.drafters import validate_drafter_compatibility
+
+        validate_drafter_compatibility(model, draft_model, draft_kind)
         if draft_kind == "mtp":
             # MTP drafter consumes target's last-layer hidden + shared K/V
             # (per layer-type) rather than per-layer hidden captures.
@@ -3393,7 +3396,7 @@ def main():
 
     draft_model = None
     if args.draft_model is not None:
-        from .speculative.drafters import load_drafter
+        from .speculative.drafters import load_drafter, validate_drafter_compatibility
 
         print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
         draft_model, resolved_kind = load_drafter(
@@ -3407,6 +3410,7 @@ def main():
                 f"using {resolved_kind!r} instead of {args.draft_kind!r}."
             )
         args.draft_kind = resolved_kind
+        validate_drafter_compatibility(model, draft_model, args.draft_kind)
 
     prompt = args.prompt
 
