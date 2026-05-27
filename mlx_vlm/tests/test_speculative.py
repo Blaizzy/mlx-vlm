@@ -217,35 +217,49 @@ def _make_drafter_dir(tmp_path: Path, model_type: str | None) -> Path:
     return d
 
 
-def _make_gemma4_target_config(
-    *,
-    hidden_size: int = 5376,
-):
+def _make_target_config(hidden_size: int):
     return SimpleNamespace(
-        model_type="gemma4_text",
+        model_type="target_text",
         hidden_size=hidden_size,
     )
 
 
-def _make_gemma4_assistant_config(
-    *,
-    backbone_hidden_size: int = 5376,
-):
+def _make_target_model(hidden_size: int):
     return SimpleNamespace(
-        model_type="gemma4_assistant",
-        backbone_hidden_size=backbone_hidden_size,
+        language_model=SimpleNamespace(config=_make_target_config(hidden_size))
     )
 
 
-def _make_qwen_mtp_config(
-    *,
-    hidden_size: int = 2560,
-    model_type: str = "qwen3_5_mtp",
-):
-    return SimpleNamespace(
-        model_type=model_type,
-        text_config=SimpleNamespace(hidden_size=hidden_size),
-    )
+def _make_drafter_config(model_type: str, hidden_size: int, *, field: str):
+    kwargs = {"model_type": model_type}
+    if field == "backbone_hidden_size":
+        kwargs["backbone_hidden_size"] = hidden_size
+    elif field == "target_hidden_size":
+        kwargs["target_hidden_size"] = hidden_size
+    elif field == "text_config.hidden_size":
+        kwargs["text_config"] = SimpleNamespace(hidden_size=hidden_size)
+    else:
+        raise ValueError(f"Unknown hidden-size field: {field}")
+    return SimpleNamespace(**kwargs)
+
+
+MTP_DRAFTER_COMPAT_CASES = [
+    pytest.param(
+        "gemma4_assistant",
+        "backbone_hidden_size",
+        id="backbone-hidden-size",
+    ),
+    pytest.param(
+        "qwen3_5_mtp",
+        "text_config.hidden_size",
+        id="text-config-hidden-size",
+    ),
+    pytest.param(
+        "custom_mtp",
+        "target_hidden_size",
+        id="target-hidden-size",
+    ),
+]
 
 
 def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():
@@ -1593,72 +1607,48 @@ def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "eagle3"
 
 
-def test_gemma4_assistant_compatibility_accepts_matching_target():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(config=_make_gemma4_target_config())
+@pytest.mark.parametrize("model_type,hidden_size_field", MTP_DRAFTER_COMPAT_CASES)
+def test_mtp_drafter_compatibility_accepts_matching_target(
+    model_type, hidden_size_field
+):
+    target = _make_target_model(hidden_size=4096)
+    drafter = SimpleNamespace(
+        config=_make_drafter_config(model_type, 4096, field=hidden_size_field)
     )
-    drafter = SimpleNamespace(config=_make_gemma4_assistant_config())
 
     validate_drafter_compatibility(target, drafter, "mtp")
 
 
-def test_gemma4_assistant_compatibility_rejects_wrong_target_size():
-    target_31b = SimpleNamespace(
-        language_model=SimpleNamespace(config=_make_gemma4_target_config())
-    )
-    e2b_drafter = SimpleNamespace(
-        config=_make_gemma4_assistant_config(backbone_hidden_size=1536)
+@pytest.mark.parametrize("model_type,hidden_size_field", MTP_DRAFTER_COMPAT_CASES)
+def test_mtp_drafter_compatibility_rejects_mismatched_target(
+    model_type, hidden_size_field
+):
+    target = _make_target_model(hidden_size=5376)
+    drafter = SimpleNamespace(
+        config=_make_drafter_config(model_type, 1536, field=hidden_size_field)
     )
 
     with pytest.raises(ValueError, match="incompatible with the target model") as exc:
-        validate_drafter_compatibility(target_31b, e2b_drafter, "mtp")
+        validate_drafter_compatibility(target, drafter, "mtp")
 
     message = str(exc.value)
     assert "Drafter target hidden_size=1536" in message
     assert "target hidden_size=5376" in message
 
 
-def test_mtp_drafter_compatibility_rejects_wrong_target_size():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(config=_make_gemma4_target_config())
-    )
-    drafter = SimpleNamespace(config=_make_qwen_mtp_config())
-
-    with pytest.raises(ValueError, match="incompatible with the target model") as exc:
-        validate_drafter_compatibility(target, drafter, "mtp")
-
-    message = str(exc.value)
-    assert "Drafter target hidden_size=2560" in message
-    assert "target hidden_size=5376" in message
-
-
-def test_mtp_drafter_compatibility_accepts_matching_text_hidden_size():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            config=_make_gemma4_target_config(hidden_size=2560)
-        )
-    )
-    drafter = SimpleNamespace(config=_make_qwen_mtp_config())
-
-    validate_drafter_compatibility(target, drafter, "mtp")
-
-
-def test_drafter_compatibility_requires_expected_kind():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(config=_make_gemma4_target_config())
-    )
-    drafter = SimpleNamespace(config=_make_gemma4_assistant_config())
-
-    with pytest.raises(ValueError, match="requires draft_kind='mtp'"):
-        validate_drafter_compatibility(target, drafter, "dflash")
-
-
-def test_mtp_model_type_requires_mtp_kind_without_static_mapping():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(config=_make_gemma4_target_config())
-    )
+@pytest.mark.parametrize(
+    "model_type",
+    [
+        "gemma4_assistant",
+        "qwen3_5_mtp",
+        "deepseek_v4_mtp",
+        "custom_mtp",
+    ],
+)
+def test_mtp_drafter_compatibility_requires_mtp_kind(model_type):
+    target = _make_target_model(hidden_size=4096)
     drafter = SimpleNamespace(
-        config=_make_qwen_mtp_config(model_type="deepseek_v4_mtp")
+        config=_make_drafter_config(model_type, 4096, field="text_config.hidden_size")
     )
 
     with pytest.raises(ValueError, match="requires draft_kind='mtp'"):
@@ -1666,9 +1656,7 @@ def test_mtp_model_type_requires_mtp_kind_without_static_mapping():
 
 
 def test_drafter_compatibility_ignores_unknown_backbone_free_drafters():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(config=_make_gemma4_target_config())
-    )
+    target = _make_target_model(hidden_size=5376)
     drafter = SimpleNamespace(
         config=SimpleNamespace(model_type="custom_drafter", hidden_size=1536)
     )
