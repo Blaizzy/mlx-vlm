@@ -176,6 +176,301 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def _unstarted_response_generator():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model_path = "demo"
+    gen.adapter_path = None
+    gen.model = None
+    gen.processor = None
+    gen.config = None
+    gen.stop_tokens = set()
+    gen.vision_cache = None
+    gen.draft_model = None
+    gen.draft_kind = None
+    gen.kv_bits = None
+    gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+    gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+    gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+    gen.top_logprobs_k = 0
+    gen.apc_manager = None
+    gen.tokenizer = None
+    gen.requests = Queue()
+    gen._stop = False
+    gen._ready = Event()
+    gen._load_error = None
+    gen._cancelled = set()
+    gen._cancel_lock = Lock()
+    return gen
+
+
+def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        hidden_size=5376,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="gemma4_assistant",
+            backbone_hidden_size=1536,
+        )
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+
+    gen._initialize_model()
+
+    assert gen.model is model
+    assert gen.processor is processor
+    assert gen.draft_model is None
+    assert gen.draft_kind is None
+
+
+def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
+    class FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    class FakeBatchGenerator:
+        def __init__(self, *args, **kwargs):
+            self.unprocessed_prompts = []
+            self.has_pending_prompts = False
+
+        def insert(self, *args, **kwargs):
+            return (1,)
+
+        def next(self, **kwargs):
+            return [], [
+                SimpleNamespace(
+                    uid=1,
+                    token=7,
+                    token_logprob=0.0,
+                    finish_reason="length",
+                )
+            ]
+
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        hidden_size=5376,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="gemma4_assistant",
+            backbone_hidden_size=1536,
+        )
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(
+        server_generation,
+        "make_streaming_detokenizer",
+        lambda _processor: FakeDetokenizer(),
+    )
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+    gen._gpu_embed = lambda raw_inputs, images=None: (
+        mx.array([[raw_inputs["token"]]], dtype=mx.int32),
+        {},
+    )
+
+    rqueue = Queue()
+    gen.requests.put(
+        (
+            rqueue,
+            {"token": 1},
+            1,
+            server.GenerationArguments(max_tokens=1),
+            None,
+        )
+    )
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+    try:
+        ctx = rqueue.get(timeout=1)
+        token = rqueue.get(timeout=1)
+        done = rqueue.get(timeout=1)
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
+
+    assert isinstance(ctx, server.GenerationContext)
+    assert token.text == "7"
+    assert token.finish_reason == "length"
+    assert done is None
+    assert gen.draft_model is None
+    assert gen.draft_kind is None
+
+
+def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+
+    rqueue = Queue()
+    pending = [
+        (
+            rqueue,
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        )
+    ]
+    calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pending, False
+        return [], True
+
+    error = RuntimeError("speculative prefill failed")
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=error)
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.utils.speculative_prefill_kwargs",
+        lambda *_args, **_kwargs: {},
+    )
+
+    gen._run_speculative()
+
+    assert rqueue.get(timeout=1) is error
+    assert rqueue.get(timeout=1) is None
+
+
+def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+
+    class BrokenQueue:
+        def put(self, item):
+            raise RuntimeError("client went away")
+
+    good_queue = Queue()
+    pending = [
+        (
+            BrokenQueue(),
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        ),
+        (
+            good_queue,
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        ),
+    ]
+    calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pending, False
+        return [], True
+
+    error = RuntimeError("speculative prefill failed")
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=error)
+
+    gen._run_speculative()
+
+    assert good_queue.get(timeout=1) is error
+    assert good_queue.get(timeout=1) is None
+
+
+def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+    rqueue = Queue()
+
+    calls = {"clear_cache": 0, "collect": 0}
+    collect_calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        collect_calls["count"] += 1
+        if collect_calls["count"] > 1:
+            return [], True
+        return [
+            (
+                rqueue,
+                {"input_ids": mx.array([[1]], dtype=mx.int32)},
+                1,
+                server.GenerationArguments(max_tokens=2),
+                None,
+            )
+        ], False
+
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(
+        server_generation.mx,
+        "clear_cache",
+        lambda: calls.__setitem__("clear_cache", calls["clear_cache"] + 1),
+    )
+    monkeypatch.setattr(
+        server_generation.gc,
+        "collect",
+        lambda: calls.__setitem__("collect", calls["collect"] + 1),
+    )
+
+    gen._run_speculative()
+
+    assert calls == {"clear_cache": 1, "collect": 1}
+
+
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
     def repo(repo_id, file_names):
         return SimpleNamespace(
