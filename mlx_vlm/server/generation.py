@@ -4,7 +4,7 @@ import os
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -493,6 +493,35 @@ class GenerationContext:
 
     uid: int
     prompt_tokens: int
+
+
+@dataclass
+class GenerationMetrics:
+    """Runtime metrics collected while consuming generation output."""
+
+    token_times: List[float] = field(default_factory=list)
+    peak_memory: float = 0.0
+    cached_tokens: int = 0
+    prompt_tps: Optional[float] = None
+    generation_tps: Optional[float] = None
+
+    def record_chunk(self, chunk) -> None:
+        self.token_times.append(time.perf_counter())
+        self.record_result(chunk)
+
+    def record_result(self, result) -> None:
+        self.peak_memory = max(
+            self.peak_memory, float(getattr(result, "peak_memory", 0.0) or 0.0)
+        )
+        prompt_tps = getattr(result, "prompt_tps", None)
+        if prompt_tps is not None:
+            self.prompt_tps = prompt_tps
+        generation_tps = getattr(result, "generation_tps", None)
+        if generation_tps is not None:
+            self.generation_tps = generation_tps
+        cached_tokens = getattr(result, "cached_tokens", None)
+        if cached_tokens is not None:
+            self.cached_tokens = max(self.cached_tokens, int(cached_tokens))
 
 
 @dataclass
