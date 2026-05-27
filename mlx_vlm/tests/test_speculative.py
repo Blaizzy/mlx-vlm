@@ -1023,10 +1023,9 @@ def test_masked_embedder_token_ordering_is_buffer_not_parameter():
     promotion converted int32 -> float32, and the next gather in
     `_selected_logits` raised `indices must be integral`.
 
-    The fix is `self.freeze(keys="token_ordering", recurse=False)` in
-    `__init__`. This test confirms (a) token_ordering is absent from
-    trainable_parameters and (b) an AdamW step does not change its dtype or
-    contents.
+    This test confirms (a) token_ordering is absent from trainable_parameters,
+    (b) it remains absent after a broad unfreeze, and (c) an AdamW step does
+    not change its dtype or contents.
     """
     cfg = SimpleNamespace(
         text_config=SimpleNamespace(hidden_size=2, vocab_size=8),
@@ -1037,6 +1036,10 @@ def test_masked_embedder_token_ordering_is_buffer_not_parameter():
     embedder.token_ordering = mx.array([0, 2, 4, 6, 1, 3, 5, 7], dtype=mx.int32)
     original = mx.array(embedder.token_ordering.tolist(), dtype=mx.int32)
 
+    trainable_paths = {p for p, _ in tree_flatten(embedder.trainable_parameters())}
+    assert "token_ordering" not in trainable_paths
+
+    embedder.unfreeze()
     trainable_paths = {p for p, _ in tree_flatten(embedder.trainable_parameters())}
     assert "token_ordering" not in trainable_paths
 
