@@ -19,8 +19,8 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..generate import generate, stream_generate
-from ..generate_image import ImageGenerationRequest as CoreImageGenerationRequest
-from ..generate_image import generate_image, is_image_generation_model, parse_size
+from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
+from ..generate.image import generate_image, is_image_generation_model, parse_size
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs

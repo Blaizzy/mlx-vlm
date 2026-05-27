@@ -21,7 +21,7 @@ from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
 from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
-from ..generate_image import (
+from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_IMAGE_STEPS,

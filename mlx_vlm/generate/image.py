@@ -127,7 +127,7 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
 
     model_type = _model_type_from_id(model)
     if model_type == "bonsai":
-        from .models.bonsai.model import BonsaiImageGenerationModel
+        from ..models.bonsai.model import BonsaiImageGenerationModel
 
         if (
             BonsaiImageGenerationModel.is_image_generation_model
@@ -138,7 +138,7 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
 
     model_path = Path(model).expanduser()
     if model_path.exists():
-        from .models.bonsai.model import BonsaiImageGenerationModel
+        from ..models.bonsai.model import BonsaiImageGenerationModel
 
         if (
             BonsaiImageGenerationModel.is_image_generation_model

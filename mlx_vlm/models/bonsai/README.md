@@ -63,7 +63,7 @@ the image is written to `outputs/image-{seed}.png`.
 ### Basic generation
 
 ```python
-from mlx_vlm.generate_image import (
+from mlx_vlm.generate.image import (
     ImageGenerationRequest,
     generate_image,
     load_image_generation_model,
@@ -94,7 +94,7 @@ result.save("outputs/bonsai.png")
 ### Prompt shorthand
 
 ```python
-from mlx_vlm.generate_image import generate_image, load_image_generation_model
+from mlx_vlm.generate.image import generate_image, load_image_generation_model
 
 model = load_image_generation_model("bonsai-ternary")
 
@@ -114,7 +114,7 @@ print(result.path)
 ### Base64 PNG output
 
 ```python
-from mlx_vlm.generate_image import generate_image, load_image_generation_model
+from mlx_vlm.generate.image import generate_image, load_image_generation_model
 
 model = load_image_generation_model("bonsai-ternary")
 result = generate_image(

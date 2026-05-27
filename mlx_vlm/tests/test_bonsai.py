@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import mlx_vlm.models.bonsai.download as download_module
-from mlx_vlm.generate_image import (
+from mlx_vlm.generate.image import (
     ImageGenerationResult,
     image_generation_model_class,
     is_image_generation_model,
