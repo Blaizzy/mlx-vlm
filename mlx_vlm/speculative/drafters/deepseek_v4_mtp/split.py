@@ -131,7 +131,7 @@ def split_deepseek_v4_mtp(
     draft_config = {
         "model_type": "deepseek_v4_mtp",
         "text_config": text_config,
-        "block_size": int(block_size or depth + 2),
+        "block_size": int(block_size or depth + 1),
         "tie_word_embeddings": bool(text_config.get("tie_word_embeddings", False)),
     }
     quantization = _quantization_from_weights(selected)

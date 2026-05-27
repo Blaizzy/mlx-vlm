@@ -2152,6 +2152,20 @@ def test_deepseek_v4_mtp_draft_block_smoke():
     assert tokens.shape == (1, 2)
 
 
+def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():
+    text_config = _tiny_deepseek_v4_config()
+    cfg = DeepseekV4MTPConfig.from_dict(
+        {
+            "model_type": "deepseek_v4_mtp",
+            "text_config": text_config.to_dict(),
+            "block_size": 3,
+        }
+    )
+
+    assert cfg.block_size == 3
+    assert cfg.runtime_block_size == 2
+
+
 def test_deepseek_v4_mtp_batch_accept_updates_uniform_cache():
     text_config = _tiny_deepseek_v4_config()
     drafter = DeepseekV4MTPDraftModel(
@@ -2257,7 +2271,7 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
         cfg = json.load(f)
     weights = mx.load(str(output / "model.safetensors"))
     assert cfg["model_type"] == "deepseek_v4_mtp"
-    assert cfg["block_size"] == 3
+    assert cfg["block_size"] == 2
     assert cfg["quantization"]["e_proj"]["mode"] == "mxfp8"
     assert cfg["quantization"]["decoder.attn.wq_a"]["mode"] == "mxfp8"
     assert "e_proj.weight" in weights
