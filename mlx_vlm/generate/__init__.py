@@ -7,15 +7,17 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
-from .cli import main, parse_arguments
-from .dispatch import (
+from .ar import (
     BatchGenerator,
     BatchResponse,
     BatchStats,
     PromptProcessingBatch,
     batch_generate,
-    generate,
     generate_step,
+)
+from .cli import main, parse_arguments
+from .dispatch import (
+    generate,
     stream_generate,
 )
 
@@ -39,12 +41,16 @@ __all__ = [
 
 
 def __getattr__(name):
+    from . import ar
     from . import dispatch
 
-    return getattr(dispatch, name)
+    if hasattr(dispatch, name):
+        return getattr(dispatch, name)
+    return getattr(ar, name)
 
 
 def __dir__():
+    from . import ar
     from . import dispatch
 
-    return sorted(set(__all__) | set(dir(dispatch)))
+    return sorted(set(__all__) | set(dir(ar)) | set(dir(dispatch)))
