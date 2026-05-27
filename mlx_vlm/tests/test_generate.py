@@ -648,6 +648,46 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_generation_batch_thinking_budget_criteria_can_force_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def apply_forced_token(self, next_y):
+                if self.forced_token_id is None:
+                    return next_y
+                forced = mx.array([self.forced_token_id], dtype=mx.int32)
+                self.forced_token_id = None
+                return forced
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        first = batch.next()
+        assert [r.token for r in first] == [5]
+
+        second = batch.next()
+        assert [r.token for r in second] == [3]
+
     def test_generation_batch_extend_keeps_processor_context_aligned(self):
         class FixedLogitModel:
             def __call__(self, input_ids, cache=None, **kwargs):

@@ -1684,6 +1684,7 @@ class GenerationBatch:
         logits_processors: Optional[
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1696,6 +1697,7 @@ class GenerationBatch:
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
+        self.thinking_budget_criteria = thinking_budget_criteria or []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
         self._ensure_token_context()
 
@@ -1857,6 +1859,7 @@ class GenerationBatch:
         self._num_tokens.extend(other._num_tokens)
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
+        self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
         self._ensure_token_context()
 
         if self._current_tokens is None:
@@ -1918,6 +1921,10 @@ class GenerationBatch:
             self.token_context = [self.token_context[idx] for idx in keep]
         if self.logits_processors:
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        if self.thinking_budget_criteria:
+            self.thinking_budget_criteria = [
+                self.thinking_budget_criteria[idx] for idx in keep
+            ]
 
         if not keep:
             self.prompt_cache.clear()
@@ -1930,6 +1937,7 @@ class GenerationBatch:
             self._rope_deltas = None
             self.token_context = []
             self.logits_processors = []
+            self.thinking_budget_criteria = []
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1953,10 +1961,26 @@ class GenerationBatch:
 
         keep = []
         responses = []
+        forced_next_tokens = None
         for i in range(len(self.uids)):
             finish_reason = None
             self._num_tokens[i] += 1
             tok = tokens[i]
+            if (
+                i < len(self.thinking_budget_criteria)
+                and self.thinking_budget_criteria[i] is not None
+            ):
+                criteria = self.thinking_budget_criteria[i]
+                criteria(tok)
+                if forced_next_tokens is None:
+                    mx.eval(self._next_tokens)
+                    forced_next_tokens = self._next_tokens.tolist()
+                next_y = criteria.apply_forced_token(
+                    mx.array([forced_next_tokens[i]], dtype=mx.int32)
+                )
+                next_token = int(next_y.item())
+                if next_token != forced_next_tokens[i]:
+                    forced_next_tokens[i] = next_token
 
             if self.stop_criteria(tok):
                 finish_reason = "stop"
@@ -1979,6 +2003,10 @@ class GenerationBatch:
                     top_logprobs=top_lp,
                 )
             )
+
+        if forced_next_tokens is not None:
+            self._next_tokens = mx.array(forced_next_tokens, dtype=mx.int32)
+            mx.async_eval(self._next_tokens)
 
         if len(keep) < len(self.uids):
             self.filter(keep)
@@ -2003,6 +2031,7 @@ class GenerationBatch:
         batch.top_logprobs_k = top_logprobs_k
         batch.token_context = []
         batch.logits_processors = []
+        batch.thinking_budget_criteria = []
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -2033,6 +2062,7 @@ class PromptProcessingBatch:
         logits_processors: Optional[
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
+        thinking_budget_criteria: Optional[List[Any]] = None,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
@@ -2074,6 +2104,7 @@ class PromptProcessingBatch:
         self._processed_prompt_columns = 0
 
         self.logits_processors = logits_processors or []
+        self.thinking_budget_criteria = thinking_budget_criteria or []
         self._token_context = (
             [list(ids) for ids in input_ids]
             if self.logits_processors and any(self.logits_processors)
@@ -2368,6 +2399,7 @@ class PromptProcessingBatch:
             top_logprobs_k=top_logprobs_k,
             token_context=[list(ctx) for ctx in self._token_context],
             logits_processors=list(self.logits_processors),
+            thinking_budget_criteria=list(self.thinking_budget_criteria),
         )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -2603,7 +2635,7 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
-        uid, ids_list, max_toks, prompt_kwargs, lps = sequence
+        uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
         # v1/v2: don't trim a prefix that contains image tokens — re-running
@@ -2728,6 +2760,7 @@ class BatchGenerator:
         max_tokens_list = [s[2] for s in sequences]
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
+        thinking_budget_criteria = [s[5] for s in sequences]
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -2839,6 +2872,7 @@ class BatchGenerator:
             inputs_embeds=inputs_embeds,
             prompt_kwargs=merged_kwargs,
             logits_processors=logits_processors,
+            thinking_budget_criteria=thinking_budget_criteria,
             prefill_step_size=self.prefill_step_size,
             kv_bits=self.kv_bits,
             kv_group_size=self.kv_group_size,
@@ -2902,6 +2936,7 @@ class BatchGenerator:
         logits_processors: Optional[
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         uids = []
 
@@ -2914,9 +2949,19 @@ class BatchGenerator:
             logits_processors = [self.logits_processors] * len(prompts)
         elif len(logits_processors) != len(prompts):
             raise ValueError("Insufficient number of logits_processors provided")
+        if thinking_budget_criteria is None:
+            thinking_budget_criteria = [None] * len(prompts)
+        elif len(thinking_budget_criteria) != len(prompts):
+            raise ValueError("Insufficient number of thinking_budget_criteria provided")
 
-        for p, m, kw, lp in zip(prompts, max_tokens, prompt_kwargs, logits_processors):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp))
+        for p, m, kw, lp, tc in zip(
+            prompts,
+            max_tokens,
+            prompt_kwargs,
+            logits_processors,
+            thinking_budget_criteria,
+        ):
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2929,7 +2974,7 @@ class BatchGenerator:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -3090,6 +3135,7 @@ class BatchGenerator:
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
+            thinking_budget_criteria = [s[5] for s in sequences]
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
@@ -3106,6 +3152,7 @@ class BatchGenerator:
                 inputs_embeds=inputs_embeds,
                 prompt_kwargs=merged_kwargs,
                 logits_processors=logits_processors,
+                thinking_budget_criteria=thinking_budget_criteria,
                 prefill_step_size=self.prefill_step_size,
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,

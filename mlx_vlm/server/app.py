@@ -131,6 +131,7 @@ def _build_gen_args(
         enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
+        thinking_end_token=getattr(request, "thinking_end_token", None),
         tenant_id=tenant_id,
     )
     if processor is not None:
