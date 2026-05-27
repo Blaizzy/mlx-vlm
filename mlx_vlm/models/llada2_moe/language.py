@@ -9,7 +9,7 @@ from mlx_lm.models.activations import swiglu
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import LanguageModelOutput, scaled_dot_product_attention
-from ..cache import KVCache
+from ..cache import KVCache, StaticPrefixKVCache
 from .config import ModelConfig
 
 
@@ -502,28 +502,32 @@ class LanguageModel(nn.Module):
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
         total_length = num_blocks * block_length
 
-        block_mask = mx.tril(mx.ones((num_blocks, num_blocks), dtype=mx.bool_))
-        block_attention_mask = mx.repeat(
-            mx.repeat(block_mask, block_length, axis=0), block_length, axis=1
-        )[None, None]
-
         x = mx.full((1, total_length), mask_id, dtype=inputs.dtype)
         x = mx.concatenate([inputs, x[:, prompt_length:]], axis=1)
-        position_ids = mx.arange(total_length, dtype=mx.int32)[None, :]
         prefill_blocks = prompt_length // block_length
         display_end = prompt_length + gen_length
         visualize_tokens(x[:, prompt_length:display_end], force=True)
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
+        prefix_cache = [StaticPrefixKVCache(total_length) for _ in self.layers]
+
+        def project_hidden(hidden_states: mx.array) -> mx.array:
+            if self.config.tie_word_embeddings:
+                return self.model.word_embeddings.as_linear(hidden_states)
+            return self.lm_head(hidden_states)
+
+        def forward_cached(tokens: mx.array, cache) -> mx.array:
+            return project_hidden(self.model(tokens, cache=cache))
+
+        for prefix_block in range(prefill_blocks):
+            prefix_start = prefix_block * block_length
+            prefix_end = prefix_start + block_length
+            mx.eval(self.model(x[:, prefix_start:prefix_end], cache=prefix_cache))
 
         for num_block in range(prefill_blocks, num_blocks):
             current_window_end = (num_block + 1) * block_length
             block_start = num_block * block_length
             cur_x = x[:, :current_window_end]
-            cur_position_ids = position_ids[:, :current_window_end]
-            cur_attn_mask = block_attention_mask[
-                :, :, :current_window_end, :current_window_end
-            ]
             block_positions = mx.arange(block_length)
             prompt_mask = block_start + block_positions < prompt_length
 
@@ -536,11 +540,8 @@ class LanguageModel(nn.Module):
                 if post_steps > max_post_steps:
                     break
 
-                logits = self(
-                    cur_x,
-                    mask=cur_attn_mask,
-                    position_ids=cur_position_ids,
-                ).logits[:, -block_length:, :]
+                block_cache = [StaticPrefixKVCache.from_prefix(c) for c in prefix_cache]
+                logits = forward_cached(old_block, cache=block_cache)
                 x0, x0_p = self._sample_with_temperature_topk_topp(
                     logits,
                     temperature=temperature,
@@ -585,6 +586,9 @@ class LanguageModel(nn.Module):
                     break
 
             x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
+            mx.eval(
+                self.model(x[:, block_start:current_window_end], cache=prefix_cache)
+            )
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
                 if not bool((generated == mask_id).any().item()):
