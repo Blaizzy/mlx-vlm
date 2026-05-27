@@ -17,7 +17,13 @@ import pytest
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
-from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BufferedRotatingKVCache,
+    CacheList,
+    PoolingCache,
+    RotatingKVCache,
+)
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -626,6 +632,25 @@ def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     assert buffered.trim(2) == 2
     assert buffered.offset == 5
     assert buffered.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_mtp_target_cache_buffers_cache_list_local_rotating_cache():
+    base = RotatingKVCache(max_size=4, keep=0)
+    keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+    base.update_and_fetch(keys, keys)
+    prompt_cache = [CacheList(base, PoolingCache(4))]
+    draft_model = SimpleNamespace(config=SimpleNamespace(block_size=3))
+
+    mtp_utils._buffer_mtp_target_cache(prompt_cache, draft_model, None)
+
+    assert isinstance(prompt_cache[0][0], BufferedRotatingKVCache)
+    assert isinstance(prompt_cache[0][1], PoolingCache)
+    assert prompt_cache[0][0].state[0].reshape(-1).tolist() == [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+    ]
 
 
 def test_normalize_batched_shared_kv_states_repacks_left_padded_rows():
@@ -2024,20 +2049,62 @@ def test_deepseek_v4_returns_mtp_hidden_and_rolls_back_snapshot():
     cache = lm.make_cache()
     inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
 
-    hidden, shared_kv, snapshots = lm.speculative_verify_hidden(inputs, cache)
+    hidden, shared_kv, rollback_state = lm.speculative_verify_hidden(inputs, cache)
     mx.eval(hidden)
 
     assert hidden.shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
     assert shared_kv == {}
-    assert len(snapshots) == 3
+    assert rollback_state[1].tolist() == inputs.tolist()
     assert cache[0].offset == 3
 
-    lm.rollback_speculative_cache(cache, snapshots, accepted=0, block_size=3)
+    lm.rollback_speculative_cache(cache, rollback_state, accepted=0, block_size=3)
     assert cache[0].offset == 1
 
     logits = lm.speculative_logits_from_hidden(hidden[:, :1])
     mx.eval(logits)
     assert logits.shape == (1, 1, cfg.vocab_size)
+
+
+def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite_remainder():
+    pool = PoolingCache(4)
+    old_kv = mx.array([[[10.0]]])
+    old_gate = mx.array([[[1.0]]])
+    pool.accumulate_windows(old_kv, old_gate, offset=0)
+
+    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    assert snapshot[0][2] is None
+
+    new_kv = mx.array([[[20.0], [21.0], [22.0]]])
+    new_gate = mx.ones_like(new_kv)
+    pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=1)
+    pool.update_and_fetch(pooled)
+
+    deepseek_language._restore_cache_state([pool], snapshot)
+
+    assert pool.remainder == 1
+    assert pool.pooled is None
+    assert pool.buf_kv[:, :1].reshape(-1).tolist() == [10.0]
+
+
+def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
+    pool = PoolingCache(4)
+    old_kv = mx.array([[[10.0], [11.0], [12.0]]])
+    old_gate = mx.ones_like(old_kv)
+    pool.accumulate_windows(old_kv, old_gate, offset=0)
+
+    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    assert snapshot[0][2].shape == (1, 2, 1)
+
+    new_kv = mx.array([[[20.0], [21.0], [22.0]]])
+    new_gate = mx.ones_like(new_kv)
+    pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=3)
+    pool.update_and_fetch(pooled)
+
+    deepseek_language._restore_cache_state([pool], snapshot)
+
+    assert pool.remainder == 3
+    assert pool.pooled is None
+    assert pool.buf_kv[:, :3].reshape(-1).tolist() == [10.0, 11.0, 12.0]
 
 
 def test_deepseek_v4_language_ignores_generation_metadata_kwargs():

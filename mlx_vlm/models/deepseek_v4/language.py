@@ -988,16 +988,126 @@ def _clone_cache_tree(value):
     return value
 
 
-def _snapshot_cache_state(caches: List[Any]) -> List[Optional[Tuple[Any, Any]]]:
-    snapshot = []
-    for cache in caches:
-        if cache is None:
-            snapshot.append(None)
-            continue
-        state = getattr(cache, "state", None)
-        meta_state = getattr(cache, "meta_state", None)
-        snapshot.append((_clone_cache_tree(state), _clone_cache_tree(meta_state)))
-    return snapshot
+def _snapshot_cache_state(
+    caches: List[Any], incoming_tokens: int = 0
+) -> List[Optional[Tuple[Any, Any]]]:
+    return [_snapshot_single_cache(cache, incoming_tokens) for cache in caches]
+
+
+def _snapshot_single_cache(cache, incoming_tokens: int = 0):
+    if cache is None:
+        return None
+    if isinstance(cache, CacheList):
+        return (
+            "cache_list",
+            [_snapshot_single_cache(child, incoming_tokens) for child in cache.caches],
+        )
+    if isinstance(cache, PoolingCache):
+        remainder = int(cache.remainder)
+        total = remainder + int(incoming_tokens)
+        overwrite_len = remainder
+        if incoming_tokens > 0:
+            overwrite_len = total % cache.ratio if total >= cache.ratio else 0
+        will_overwrite_remainder = (
+            remainder > 0
+            and cache.buf_kv is not None
+            and overwrite_len > 0
+        )
+        buf_kv = cache.buf_kv[:, :overwrite_len] if will_overwrite_remainder else None
+        buf_gate = (
+            cache.buf_gate[:, :overwrite_len] if will_overwrite_remainder else None
+        )
+        pooled_len = None if cache.pooled is None else cache.pooled.shape[1]
+        return (
+            "pooling",
+            remainder,
+            _clone_cache_tree(buf_kv),
+            _clone_cache_tree(buf_gate),
+            pooled_len,
+        )
+    if isinstance(cache, RotatingKVCache):
+        return (
+            "rotating",
+            _clone_cache_tree(cache.offset),
+            int(cache._idx),
+            getattr(cache, "start_position", None),
+        )
+    return (
+        "full",
+        _clone_cache_tree(getattr(cache, "state", None)),
+        _clone_cache_tree(getattr(cache, "meta_state", None)),
+    )
+
+
+def _clear_cache_state(cache) -> None:
+    if isinstance(cache, CacheList):
+        for child in cache.caches:
+            _clear_cache_state(child)
+        return
+    if hasattr(cache, "keys"):
+        cache.keys = None
+    if hasattr(cache, "values"):
+        cache.values = None
+    if hasattr(cache, "offset"):
+        cache.offset = 0
+    if hasattr(cache, "_idx"):
+        cache._idx = 0
+    if hasattr(cache, "start_position"):
+        cache.start_position = 0
+    if hasattr(cache, "buf_kv"):
+        cache.buf_kv = None
+    if hasattr(cache, "buf_gate"):
+        cache.buf_gate = None
+    if hasattr(cache, "remainder"):
+        cache.remainder = 0
+    if hasattr(cache, "pooled"):
+        cache.pooled = None
+
+
+def _restore_single_cache(cache, snapshot) -> None:
+    if cache is None or snapshot is None:
+        return
+    kind = snapshot[0]
+    if isinstance(cache, CacheList):
+        for child, child_snapshot in zip(cache.caches, snapshot[1]):
+            _restore_single_cache(child, child_snapshot)
+        return
+    if kind == "pooling":
+        _, remainder, buf_kv, buf_gate, pooled_len = snapshot
+        cache.remainder = int(remainder)
+        if buf_kv is not None:
+            restore_len = int(buf_kv.shape[1])
+            if cache.buf_kv is None or cache.buf_kv.shape[1] < cache.ratio:
+                cache.buf_kv = mx.zeros(
+                    (buf_kv.shape[0], cache.ratio, buf_kv.shape[2]),
+                    dtype=buf_kv.dtype,
+                )
+            if cache.buf_gate is None or cache.buf_gate.shape[1] < cache.ratio:
+                cache.buf_gate = mx.zeros(
+                    (buf_gate.shape[0], cache.ratio, buf_gate.shape[2]),
+                    dtype=buf_gate.dtype,
+                )
+            cache.buf_kv[:, :restore_len] = buf_kv
+            cache.buf_gate[:, :restore_len] = buf_gate
+        if pooled_len is None:
+            cache.pooled = None
+        elif cache.pooled is not None:
+            cache.pooled = cache.pooled[:, :pooled_len]
+        return
+    if kind == "rotating":
+        _, offset, idx, start_position = snapshot
+        cache.offset = _clone_cache_tree(offset)
+        cache._idx = int(idx)
+        if start_position is not None and hasattr(cache, "start_position"):
+            cache.start_position = int(start_position)
+        return
+    _, state, meta_state = snapshot
+    if state is None:
+        _clear_cache_state(cache)
+        return
+    if meta_state is not None and hasattr(type(cache), "meta_state"):
+        cache.meta_state = _clone_cache_tree(meta_state)
+    cache.state = _clone_cache_tree(state)
 
 
 def _restore_cache_state(
@@ -1006,10 +1116,7 @@ def _restore_cache_state(
     for cache, entry in zip(caches, snapshot):
         if cache is None or entry is None:
             continue
-        state, meta_state = entry
-        if meta_state is not None and hasattr(type(cache), "meta_state"):
-            cache.meta_state = _clone_cache_tree(meta_state)
-        cache.state = _clone_cache_tree(state)
+        _restore_single_cache(cache, entry)
 
 
 def _iter_leaf_caches(caches):
@@ -1081,32 +1188,27 @@ class LanguageModel(nn.Module):
         return self._target_hidden(hidden)
 
     def _speculative_verify(self, inputs: mx.array, cache, sampler=None):
-        hidden_steps = []
-        logits_steps = []
-        cache_snapshots = []
+        cache_snapshot = _snapshot_cache_state(cache, int(inputs.shape[1]))
         sample_logits = sampler is not None
 
-        for idx in range(inputs.shape[1]):
-            out = self(
-                inputs[:, idx : idx + 1],
-                cache=cache,
-                return_hidden=True,
-                return_shared_kv=True,
-                skip_logits=not sample_logits,
-            )
-            hidden_steps.append(out.hidden_states[-1])
-            if sample_logits:
-                logits_steps.append(out.logits)
-            cache_snapshots.append(_snapshot_cache_state(cache))
-
-        hidden = mx.concatenate(hidden_steps, axis=1)
+        out = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=not sample_logits,
+            skip_final_norm=not sample_logits,
+        )
+        hidden = out.hidden_states[-1]
+        rollback_state = (cache_snapshot, inputs)
         if not sample_logits:
-            return hidden, {}, cache_snapshots
+            return hidden, {}, rollback_state
 
-        logits = mx.concatenate(logits_steps, axis=1)
-        return hidden, {}, cache_snapshots, sampler(logits)
+        return hidden, {}, rollback_state, sampler(out.logits)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        # Greedy MTP verification is faster with one batched LM-head projection
+        # than with per-position deferred projections on Metal.
         return self._speculative_verify(inputs, cache, sampler)
 
     def speculative_verify_hidden(self, inputs: mx.array, cache):
@@ -1124,12 +1226,16 @@ class LanguageModel(nn.Module):
 
         max_a = int(accepted.max().item())
         if gdn_states:
+            cache_snapshot, verify_inputs = gdn_states
             accepted_list = [int(a) for a in accepted.tolist()]
             if len(set(accepted_list)) != 1:
                 raise ValueError(
                     "DeepSeek-V4 speculative rollback requires uniform acceptance."
                 )
-            _restore_cache_state(caches, gdn_states[max_a])
+            _restore_cache_state(caches, cache_snapshot)
+            keep = max_a + 1
+            if keep > 0:
+                self(verify_inputs[:, :keep], cache=caches, skip_logits=True)
             return max_a
 
         n = max_a + 1
