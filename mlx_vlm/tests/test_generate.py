@@ -1561,6 +1561,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "_apc_tenant": "tenant",
             },
             [],
+            None,
         )
         for i, length in enumerate(lengths)
     ]
@@ -1618,6 +1619,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 123,
             },
             [],
+            None,
         ),
         (
             2,
@@ -1630,6 +1632,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 456,
             },
             [],
+            None,
         ),
     ]
     picks = [
@@ -1678,7 +1681,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, []))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)

@@ -1653,10 +1653,6 @@ class PromptProgress:
     cached_tokens: int = 0
 
 
-def _sequence_thinking_budget_criteria(sequence):
-    return sequence[5] if len(sequence) > 5 else None
-
-
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -2639,7 +2635,7 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
-        uid, ids_list, max_toks, prompt_kwargs, lps = sequence[:5]
+        uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
         # v1/v2: don't trim a prefix that contains image tokens — re-running
@@ -2764,9 +2760,7 @@ class BatchGenerator:
         max_tokens_list = [s[2] for s in sequences]
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
-        thinking_budget_criteria = [
-            _sequence_thinking_budget_criteria(s) for s in sequences
-        ]
+        thinking_budget_criteria = [s[5] for s in sequences]
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3141,9 +3135,7 @@ class BatchGenerator:
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
-            thinking_budget_criteria = [
-                _sequence_thinking_budget_criteria(s) for s in sequences
-            ]
+            thinking_budget_criteria = [s[5] for s in sequences]
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
