@@ -19,13 +19,13 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
-from . import apc as _apc
-from .models import cache
-from .prompt_utils import apply_chat_template
-from .speculative.utils import format_speculative_stats, run_speculative_rounds
-from .tokenizer_utils import make_streaming_detokenizer
-from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
-from .utils import (
+from .. import apc as _apc
+from ..models import cache
+from ..prompt_utils import apply_chat_template
+from ..speculative.utils import format_speculative_stats, run_speculative_rounds
+from ..tokenizer_utils import make_streaming_detokenizer
+from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
+from ..utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
     group_images_by_shape,
@@ -536,14 +536,14 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
-from .generation.common import (
+from .common import (
     GenerationResult,
     PromptCacheState,
     generation_stream,
     maybe_quantize_kv_cache,
     wired_limit,
 )
-from .generation.diffusion import (
+from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     DiffusionOutputHandler,
@@ -729,7 +729,7 @@ def generate_step(
     # Speculative decoding setup
     last_outputs = None
     if draft_model is not None:
-        from .speculative.drafters import validate_drafter_compatibility
+        from ..speculative.drafters import validate_drafter_compatibility
 
         validate_drafter_compatibility(model, draft_model, draft_kind)
         if draft_kind == "mtp":
@@ -3312,7 +3312,7 @@ def batch_generate(
     """
     from PIL import Image
 
-    from .utils import process_image
+    from ..utils import process_image
 
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
@@ -3609,7 +3609,7 @@ def main():
 
     draft_model = None
     if args.draft_model is not None:
-        from .speculative.drafters import load_drafter, validate_drafter_compatibility
+        from ..speculative.drafters import load_drafter, validate_drafter_compatibility
 
         print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
         draft_model, resolved_kind = load_drafter(
@@ -3680,7 +3680,7 @@ def main():
             kwargs["thinking_start_token"] = args.thinking_start_token
 
     if args.chat:
-        from .vision_cache import VisionFeatureCache
+        from ..vision_cache import VisionFeatureCache
 
         vision_cache = VisionFeatureCache()
         chat = []
