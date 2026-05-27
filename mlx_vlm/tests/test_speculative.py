@@ -2049,6 +2049,16 @@ def test_deepseek_v4_language_ignores_generation_metadata_kwargs():
     assert out.logits.shape == (1, 1, cfg.vocab_size)
 
 
+def test_deepseek_v4_local_mask_aligns_to_layer_cache_width():
+    mask = mx.array([[[[False, True, True, False, True]]]], dtype=mx.bool_)
+
+    trimmed = deepseek_language._align_local_mask(mask, 3)
+    padded = deepseek_language._align_local_mask(trimmed, 5)
+
+    assert trimmed.tolist() == [[[[True, False, True]]]]
+    assert padded.tolist() == [[[[True, True, True, False, True]]]]
+
+
 def test_deepseek_v4_mtp_draft_block_smoke():
     text_config = _tiny_deepseek_v4_config()
     drafter = DeepseekV4MTPDraftModel(

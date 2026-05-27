@@ -225,6 +225,24 @@ def _extend_mask(mask: Optional[mx.array], pool_mask: Optional[mx.array], N: int
     return full_mask
 
 
+def _align_local_mask(mask: Optional[mx.array], local_len: int):
+    if mask is None:
+        return None
+
+    current_len = mask.shape[-1]
+    if current_len == local_len:
+        return mask
+    if current_len > local_len:
+        return mask[..., -local_len:]
+
+    pad_shape = (*mask.shape[:-1], local_len - current_len)
+    if mask.dtype == mx.bool_:
+        pad = mx.ones(pad_shape, dtype=mask.dtype)
+    else:
+        pad = mx.zeros(pad_shape, dtype=mask.dtype)
+    return mx.concatenate([pad, mask], axis=-1)
+
+
 @partial(mx.compile, shapeless=True)
 def _simple_compress_kv(kv, gate, ape, head_dim):
     weights = mx.softmax(gate.astype(mx.float32) + ape, axis=-2)
@@ -575,6 +593,7 @@ class LocalAttention(nn.Module):
         kv = self.rope(kv, offset)
         if cache is not None:
             kv, _ = cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
         out = scaled_dot_product_attention(
             q,
@@ -669,6 +688,7 @@ class CompressedAttention(nn.Module):
         kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
         # Pool tokens into compressed KV and concatenate with local KV
         pooled = self.compressor(x, pool_cache, offset)
@@ -775,6 +795,7 @@ class SparseCompressedAttention(nn.Module):
         kv = self.rope(kv, offset)
         if local_cache is not None:
             kv, _ = local_cache.update_and_fetch(kv, mx.zeros((B, 1, L, 0)))
+        mask = _align_local_mask(mask, kv.shape[2])
 
         pooled = self.compressor(x, comp_cache, offset)
         pmask = comp_cache.make_mask(L, offset) if comp_cache is not None else None
