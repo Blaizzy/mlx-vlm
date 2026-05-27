@@ -21,6 +21,12 @@ from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
 from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
+from .image import (
+    DEFAULT_IMAGE_GUIDANCE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_IMAGE_STEPS,
+    run_image_generation_cli,
+)
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -57,6 +63,43 @@ def parse_arguments():
         type=str,
         default=DEFAULT_MODEL_PATH,
         help="The path to the local model directory or Hugging Face repo.",
+    )
+    parser.add_argument(
+        "--output-modality",
+        type=str,
+        choices=("text", "image"),
+        default="text",
+        help="Generate text with a VLM or generate an image with a supported image model.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Output path for image generation.",
+    )
+    parser.add_argument(
+        "--size",
+        type=str,
+        default=DEFAULT_IMAGE_SIZE,
+        help="Generated image size as WIDTHxHEIGHT.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_IMAGE_STEPS,
+        help="Number of image generation inference steps.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Seed for image generation. Defaults to a random 32-bit seed.",
+    )
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=DEFAULT_IMAGE_GUIDANCE,
+        help="Classifier-free guidance for image generation.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -1151,6 +1194,11 @@ def generate(
 
 def main():
     args = parse_arguments()
+
+    if getattr(args, "output_modality", "text") == "image":
+        run_image_generation_cli(args)
+        return
+
     diffusion_arg_defaults = {
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,

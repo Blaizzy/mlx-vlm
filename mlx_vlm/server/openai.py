@@ -4,12 +4,14 @@ import binascii
 import gc
 import json
 import logging
+import random
 import re
 import time
 import traceback
 import uuid
 from datetime import datetime
 from io import BytesIO
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import mlx.core as mx
@@ -17,6 +19,8 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..generate import generate, stream_generate
+from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
+from ..generate.image import generate_image, is_image_generation_model, parse_size
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
@@ -52,6 +56,9 @@ from .schemas import (
     ChatStreamChunk,
     ContentPartOutputText,
     GenerationTimings,
+    ImageGenerationRequest,
+    ImageGenerationResponse,
+    ImageGenerationResponseData,
     InputAudio,
     MessageItem,
     OpenAIRequest,
@@ -203,9 +210,187 @@ def register_routes(app, deps):
     app.post("/v1/chat/completions", response_model=None, include_in_schema=False)(
         chat_completions_endpoint
     )
+    app.post("/images/generations", response_model=ImageGenerationResponse)(
+        images_generations_endpoint
+    )
+    app.post(
+        "/v1/images/generations",
+        response_model=ImageGenerationResponse,
+        include_in_schema=False,
+    )(images_generations_endpoint)
 
 
 # OpenAI compatile endpoints
+
+
+def _resolve_image_size(image_request: ImageGenerationRequest) -> Tuple[int, int]:
+    if image_request.width is not None or image_request.height is not None:
+        if image_request.width is None or image_request.height is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Both width and height are required when either is set.",
+            )
+        return image_request.width, image_request.height
+    try:
+        return parse_size(image_request.size or "512x512")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _indexed_output_path(path: Path, index: int, count: int) -> Path:
+    if path.suffix.lower() != ".png":
+        path = path.with_suffix(".png")
+    if count <= 1:
+        return path
+    return path.with_name(f"{path.stem}-{index + 1:02d}{path.suffix}")
+
+
+def _image_output_path(
+    image_request: ImageGenerationRequest,
+    *,
+    index: int,
+    count: int,
+    seed: int,
+) -> Path | None:
+    if image_request.output_path:
+        return _indexed_output_path(
+            Path(image_request.output_path).expanduser(), index, count
+        )
+    if image_request.output_dir:
+        directory = Path(image_request.output_dir).expanduser()
+        return directory / f"image-{seed}.png"
+    if image_request.response_format == "path":
+        return Path("outputs") / f"image-{seed}.png"
+    return None
+
+
+async def images_generations_endpoint(request: Request):
+    request_start = time.perf_counter()
+    body = await request.json()
+    image_request = ImageGenerationRequest(**body)
+    if not is_image_generation_model(image_request.model):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model {image_request.model!r} is not a supported image "
+                "generation model."
+            ),
+        )
+    if not image_request.prompt:
+        raise HTTPException(status_code=400, detail="Missing prompt.")
+
+    width, height = _resolve_image_size(image_request)
+    created = int(time.time())
+    base_seed = (
+        int(image_request.seed)
+        if image_request.seed is not None
+        else random.randrange(2**32)
+    )
+
+    runtime.metrics.begin_request(
+        endpoint="/v1/images/generations",
+        model=image_request.model,
+        stream=False,
+    )
+    try:
+        model, _, _ = get_cached_model(image_request.model)
+        generation_lock = runtime.model_cache.get("generation_lock")
+
+        def _generate_all():
+            results = []
+            lock = generation_lock
+            if lock is None:
+
+                class _NullLock:
+                    def __enter__(self):
+                        return None
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                lock = _NullLock()
+            with lock:
+                for index in range(image_request.n):
+                    seed = base_seed + index
+                    output_path = _image_output_path(
+                        image_request,
+                        index=index,
+                        count=image_request.n,
+                        seed=seed,
+                    )
+                    core_request = CoreImageGenerationRequest(
+                        prompt=image_request.prompt,
+                        seed=seed,
+                        steps=image_request.steps,
+                        width=width,
+                        height=height,
+                        guidance=image_request.guidance,
+                        output_format=image_request.output_format,
+                    )
+                    result = generate_image(
+                        model,
+                        core_request,
+                        output_path=output_path,
+                    )
+                    results.append(result)
+            return results
+
+        results = _generate_all()
+        data = []
+        for result in results:
+            item = ImageGenerationResponseData(
+                width=result.width,
+                height=result.height,
+                seed=result.seed,
+                path=str(result.path) if result.path is not None else None,
+            )
+            if image_request.response_format == "b64_json":
+                item.b64_json = result.to_b64_json()
+            data.append(item)
+
+        elapsed = time.perf_counter() - request_start
+        prompt_tokens = results[0].prompt_tokens if results else 0
+        peak_memory = max((r.peak_memory for r in results), default=0.0)
+        envelope = _build_metrics_envelope(
+            endpoint="/v1/images/generations",
+            model=image_request.model,
+            stream=False,
+            backend="image_generation",
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=0,
+            generated_tokens=0,
+            request_elapsed_s=elapsed,
+            request_started_s=request_start,
+            peak_memory_gb=peak_memory or None,
+            finish_reason="stop",
+            image_count=len(data),
+        )
+        runtime.metrics.record_success(envelope)
+        return ImageGenerationResponse(
+            created=created,
+            data=data,
+            output_format=image_request.output_format,
+            size=f"{width}x{height}",
+        )
+    except HTTPException:
+        runtime.metrics.record_failure(
+            endpoint="/v1/images/generations",
+            model=image_request.model,
+            stream=False,
+            error="http_exception",
+        )
+        raise
+    except Exception as e:
+        runtime.metrics.record_failure(
+            endpoint="/v1/images/generations",
+            model=image_request.model,
+            stream=False,
+            error=str(e),
+        )
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
 
 
 async def responses_input_tokens_endpoint(request: Request):
