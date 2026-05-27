@@ -55,6 +55,8 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
+DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 
 
 def parse_arguments():
@@ -125,6 +127,80 @@ def parse_arguments():
         type=int,
         default=DEFAULT_MAX_TOKENS,
         help="Maximum number of tokens to generate.",
+    )
+    parser.add_argument(
+        "--max-denoising-steps",
+        type=int,
+        default=None,
+        help="Maximum denoising steps for diffusion generation.",
+    )
+    parser.add_argument(
+        "--diffusion-full-canvas",
+        action="store_true",
+        help=(
+            "Use the checkpoint canvas length for diffusion generation even when "
+            "--max-tokens requests a partial block."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-min-canvas-length",
+        type=int,
+        default=None,
+        help=(
+            "Minimum active canvas length for diffusion partial blocks. "
+            f"Default: {DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH}."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-static-cache",
+        action="store_true",
+        help=(
+            "Use a fixed-capacity encoder KV cache for multi-canvas "
+            "diffusion generation."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-sampler",
+        choices=["auto-regressive-euler", "confidence-threshold"],
+        default="auto-regressive-euler",
+        help="Canvas update sampler for diffusion generation.",
+    )
+    parser.add_argument(
+        "--diffusion-threshold",
+        type=float,
+        default=0.9,
+        help=(
+            "Token probability threshold for "
+            "--diffusion-sampler confidence-threshold."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-compile",
+        action="store_true",
+        help=(
+            "Experimentally compile the diffusion decoder logits graph "
+            "for each canvas shape/cache state."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-show-unmasking",
+        action="store_true",
+        help="Redraw diffusion intermediate canvas drafts during denoising.",
+    )
+    parser.add_argument(
+        "--diffusion-unmasking-interval",
+        type=int,
+        default=1,
+        help="Show every Nth diffusion denoising step when unmasking is enabled.",
+    )
+    parser.add_argument(
+        "--diffusion-unmasking-width",
+        type=int,
+        default=DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+        help=(
+            "Maximum terminal columns used for diffusion draft redraws. "
+            "Use 0 for the full untrimmed redraw."
+        ),
     )
     parser.add_argument(
         "--temperature",
@@ -458,6 +534,24 @@ class PromptCacheState:
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+
+
+from .generation.common import (
+    GenerationResult,
+    PromptCacheState,
+    generation_stream,
+    maybe_quantize_kv_cache,
+    wired_limit,
+)
+from .generation.diffusion import (
+    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
+    DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+    DiffusionOutputHandler,
+    diffusion_kwargs_from_args,
+    is_diffusion_model,
+    print_diffusion_stats,
+    stream_diffusion_generate_from_kwargs,
+)
 
 
 def _prime_cached_prefix_rope_state(
@@ -916,6 +1010,19 @@ def stream_generate(
     apc_extra_hash = 0
     apc_mode: Optional[str] = None
 
+    if is_diffusion_model(model):
+        yield from stream_diffusion_generate_from_kwargs(
+            model,
+            processor,
+            tokenizer,
+            input_ids,
+            pixel_values,
+            mask,
+            skip_special_token_ids,
+            kwargs,
+        )
+        return
+
     if apc_manager is not None:
         apc_mode = _apc.model_apc_mode(model.language_model)
         if apc_mode is None:
@@ -1295,6 +1402,7 @@ def generate(
 
     # Get the tokenizer
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    diffusion_output = DiffusionOutputHandler(model, kwargs, verbose)
 
     # Add custom EOS tokens to the stopping criteria
     if eos_tokens is not None:
@@ -1316,7 +1424,12 @@ def generate(
     for response in stream_generate(
         model, processor, prompt, image, audio, video, **kwargs
     ):
-        if verbose:
+        if response.is_draft:
+            diffusion_output.handle_draft(response)
+            last_response = response
+            continue
+
+        if verbose and not diffusion_output.handle_text(response.text):
             print(response.text, end="", flush=True)
         text += response.text
         last_response = response
@@ -1325,6 +1438,7 @@ def generate(
         return GenerationResult(text=text, peak_memory=mx.get_peak_memory() / 1e9)
 
     if verbose:
+        diffusion_output.finish(text)
         print("\n" + "=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
@@ -1336,6 +1450,7 @@ def generate(
             f"Generation: {last_response.generation_tokens} tokens, "
             f"{last_response.generation_tps:.3f} tokens-per-sec"
         )
+        print_diffusion_stats(last_response)
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
     return GenerationResult(
@@ -1350,6 +1465,11 @@ def generate(
         peak_memory=last_response.peak_memory,
         cached_tokens=last_response.cached_tokens,
         finish_reason=last_response.finish_reason,
+        diffusion_canvas_tokens=last_response.diffusion_canvas_tokens,
+        diffusion_denoising_steps=last_response.diffusion_denoising_steps,
+        diffusion_work_tokens=last_response.diffusion_work_tokens,
+        diffusion_canvas_tps=last_response.diffusion_canvas_tps,
+        diffusion_work_tps=last_response.diffusion_work_tps,
     )
 
 
@@ -3455,6 +3575,22 @@ def _generate_batch(
 
 def main():
     args = parse_arguments()
+    diffusion_arg_defaults = {
+        "max_denoising_steps": None,
+        "diffusion_full_canvas": False,
+        "diffusion_min_canvas_length": None,
+        "diffusion_static_cache": False,
+        "diffusion_sampler": "auto-regressive-euler",
+        "diffusion_threshold": 0.9,
+        "diffusion_compile": False,
+        "diffusion_show_unmasking": False,
+        "diffusion_unmasking_interval": 1,
+        "diffusion_unmasking_width": DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+    }
+    for name, default in diffusion_arg_defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, default)
+
     if isinstance(args.image, str):
         args.image = [args.image]
     if isinstance(args.audio, str):
@@ -3578,7 +3714,9 @@ def main():
                 stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
+            stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
+            diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
             for chunk in stream_generate(
                 model,
                 processor,
@@ -3588,10 +3726,15 @@ def main():
                 args.video,
                 **stream_kwargs,
             ):
+                if chunk.is_draft:
+                    diffusion_output.handle_draft(chunk)
+                    continue
                 response += chunk.text
-                print(chunk.text, end="")
+                if not diffusion_output.handle_text(chunk.text):
+                    print(chunk.text, end="")
 
             chat.append({"role": "assistant", "content": response})
+            diffusion_output.finish(response)
             print()
 
     else:
@@ -3622,6 +3765,7 @@ def main():
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
+        gen_kwargs.update(diffusion_kwargs_from_args(args, config))
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
             gen_kwargs["draft_kind"] = args.draft_kind

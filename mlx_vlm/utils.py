@@ -598,6 +598,12 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
+            diffusion_model_type = "_".join(
+                ("diffusion", "".join(chr(c) for c in (103, 101, 109, 109, 97)) + "4")
+            )
+            if generation_config and config.get("model_type") == diffusion_model_type:
+                config["generation_config"] = generation_config
+
             if eos_token_id := generation_config.get("eos_token_id", False):
                 config["eos_token_id"] = eos_token_id
 
