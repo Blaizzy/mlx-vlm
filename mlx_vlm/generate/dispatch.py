@@ -721,6 +721,7 @@ def stream_generate(
         top_p = kwargs.get("top_p", DEFAULT_TOP_P)
         top_k = kwargs.get("top_k", DEFAULT_TOP_K)
 
+        generation_stats = {}
         tic = time.perf_counter()
         generated = model.language_model.generate(
             input_ids,
@@ -734,9 +735,13 @@ def stream_generate(
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
+            stats=generation_stats,
         )
         mx.eval(generated)
         total_time = time.perf_counter() - tic
+        prompt_time = generation_stats.get("prompt_time", 0.0)
+        prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
+        generation_time = max(total_time - prompt_time, 1e-9)
         generated_tokens = generated[0].tolist()
         text = tokenizer.decode(
             generated_tokens, skip_special_tokens=skip_special_tokens
@@ -749,10 +754,8 @@ def stream_generate(
             prompt_tokens=input_ids.size,
             generation_tokens=len(generated_tokens),
             total_tokens=input_ids.size + len(generated_tokens),
-            prompt_tps=0.0,
-            generation_tps=(
-                len(generated_tokens) / total_time if total_time > 0 else 0.0
-            ),
+            prompt_tps=prompt_tps,
+            generation_tps=len(generated_tokens) / generation_time,
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason=(
                 "stop"

@@ -1,4 +1,5 @@
 import shutil
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
@@ -360,6 +361,7 @@ class LanguageModel(nn.Module):
         visualize: bool = False,
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
+        stats: Optional[Dict[str, float]] = None,
     ) -> mx.array:
         if inputs.shape[0] != 1:
             raise ValueError(
@@ -429,6 +431,8 @@ class LanguageModel(nn.Module):
         prefill_blocks = prompt_length // block_length
         display_end = prompt_length + gen_length
         visualize_tokens(x[:, prompt_length:display_end])
+        prompt_tic = time.perf_counter()
+        recorded_prompt_time = False
 
         for num_block in range(prefill_blocks, num_blocks):
             current_window_end = (num_block + 1) * block_length
@@ -461,6 +465,11 @@ class LanguageModel(nn.Module):
                     top_k=top_k,
                     top_p=top_p,
                 )
+                if stats is not None and not recorded_prompt_time:
+                    mx.eval(x0, x0_p)
+                    stats["prompt_time"] = time.perf_counter() - prompt_tic
+                    stats["prompt_tokens"] = float(prompt_length)
+                    recorded_prompt_time = True
 
                 transfer_mask = mx.zeros_like(active_block_mask)
                 if bool(active_block_mask.any().item()):
