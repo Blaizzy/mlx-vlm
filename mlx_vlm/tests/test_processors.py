@@ -1684,6 +1684,155 @@ class TestDotsVLPatch(unittest.TestCase):
         )
 
 
+class TestDeepseekV4Processor(unittest.TestCase):
+    class MockTokenizer:
+        chat_template = None
+        model_input_names = ["input_ids", "attention_mask"]
+
+        def __call__(self, text, **kwargs):
+            return {"input_ids": [0], "attention_mask": [1]}
+
+        def apply_chat_template(self, *args, **kwargs):
+            return "templated"
+
+        def encode(self, text, **kwargs):
+            return [0]
+
+        def decode(self, ids, **kwargs):
+            return "decoded"
+
+        def batch_decode(self, ids, **kwargs):
+            return ["decoded"] * len(ids)
+
+    def test_loads_local_chat_template_jinja(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            load_deepseek_v4_chat_template,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "chat_template.jinja").write_text(
+                "{{ messages[0]['content'] }}",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                load_deepseek_v4_chat_template(tmpdir),
+                "{{ messages[0]['content'] }}",
+            )
+
+    def test_from_pretrained_sets_local_chat_template(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DeepseekV4Processor,
+        )
+
+        tokenizer = self.MockTokenizer()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "chat_template.jinja").write_text(
+                "{{ messages[0]['content'] }}",
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+                ),
+                patch.object(
+                    DeepseekV4Processor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = DeepseekV4Processor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.chat_template, "{{ messages[0]['content'] }}")
+
+    def test_from_pretrained_prefers_explicit_chat_template(self):
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DeepseekV4Processor,
+        )
+
+        tokenizer = self.MockTokenizer()
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer),
+            patch.object(
+                DeepseekV4Processor,
+                "check_argument_for_proper_class",
+                return_value=None,
+            ),
+        ):
+            processor = DeepseekV4Processor.from_pretrained(
+                "repo/name",
+                chat_template="{{ explicit }}",
+            )
+
+        self.assertEqual(processor.chat_template, "{{ explicit }}")
+
+    def test_from_pretrained_uses_default_chat_template_when_missing(self):
+        import tempfile
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DEFAULT_CHAT_TEMPLATE,
+            DeepseekV4Processor,
+        )
+
+        tokenizer = self.MockTokenizer()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+                ),
+                patch.object(
+                    DeepseekV4Processor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = DeepseekV4Processor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.chat_template, DEFAULT_CHAT_TEMPLATE)
+        self.assertIn("<｜Assistant｜></think>", processor.chat_template)
+
+    def test_patch_intercepts(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.deepseek_v4.processing_deepseek_v4 import (
+            DeepseekV4Processor,
+        )
+
+        tokenizer = self.MockTokenizer()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "deepseek_v4"}),
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+                ),
+                patch.object(
+                    DeepseekV4Processor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor, DeepseekV4Processor)
+
+
 class TestPatchChainsForUnknownModelType(unittest.TestCase):
     def test_falls_through(self):
         import importlib
