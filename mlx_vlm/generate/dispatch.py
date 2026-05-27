@@ -3,12 +3,10 @@ import codecs
 import contextlib
 import json
 import logging
-import os
 import time
-import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,14 +19,8 @@ from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
-from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, turboquant_enabled
-from ..utils import (
-    StoppingCriteria,
-    ThinkingBudgetCriteria,
-    group_images_by_shape,
-    load,
-    prepare_inputs,
-)
+from ..turboquant import TurboQuantKVCache, turboquant_enabled
+from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -533,13 +525,7 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
-from .common import (
-    GenerationResult,
-    PromptCacheState,
-    generation_stream,
-    maybe_quantize_kv_cache,
-    wired_limit,
-)
+from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DEFAULT_DIFFUSION_UNMASKING_WIDTH,
@@ -1161,16 +1147,6 @@ def generate(
         diffusion_canvas_tps=last_response.diffusion_canvas_tps,
         diffusion_work_tps=last_response.diffusion_work_tps,
     )
-
-
-from .ar import (
-    BatchGenerator,
-    BatchGenerationResult,
-    BatchResponse,
-    BatchStats,
-    PromptProcessingBatch,
-    batch_generate,
-)
 
 
 def main():

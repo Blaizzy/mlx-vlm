@@ -1,12 +1,5 @@
 """Public generation API."""
 
-from .common import (
-    GenerationResult,
-    PromptCacheState,
-    generation_stream,
-    maybe_quantize_kv_cache,
-    wired_limit,
-)
 from .ar import (
     BatchGenerator,
     BatchResponse,
@@ -16,10 +9,14 @@ from .ar import (
     generate_step,
 )
 from .cli import main, parse_arguments
-from .dispatch import (
-    generate,
-    stream_generate,
+from .common import (
+    GenerationResult,
+    PromptCacheState,
+    generation_stream,
+    maybe_quantize_kv_cache,
+    wired_limit,
 )
+from .dispatch import generate, stream_generate
 
 __all__ = [
     "BatchGenerator",
@@ -41,8 +38,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    from . import ar
-    from . import dispatch
+    from . import ar, dispatch
 
     if hasattr(dispatch, name):
         return getattr(dispatch, name)
@@ -50,7 +46,6 @@ def __getattr__(name):
 
 
 def __dir__():
-    from . import ar
-    from . import dispatch
+    from . import ar, dispatch
 
     return sorted(set(__all__) | set(dir(ar)) | set(dir(dispatch)))
