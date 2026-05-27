@@ -19,9 +19,7 @@ logger = logging.getLogger("mlx_vlm.generate")
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
-_DIFFUSION_MODEL_TYPE = "_".join(
-    ("diffusion", "".join(chr(c) for c in (103, 101, 109, 109, 97)) + "4")
-)
+_DIFFUSION_MODEL_TYPE = "diffusion_gemma4"
 
 
 def _display_width(text: str) -> int:
