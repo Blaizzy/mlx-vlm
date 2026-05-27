@@ -14,13 +14,16 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+import mlx_vlm.models.deepseek_v4.language as deepseek_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
     BufferedRotatingKVCache,
+    CacheList,
     KVCache,
+    PoolingCache,
     RotatingKVCache,
 )
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
@@ -30,6 +33,9 @@ from mlx_vlm.speculative.drafters import (
     KNOWN_DRAFTER_KINDS,
     resolve_drafter_kind,
 )
+from mlx_vlm.speculative.drafters.deepseek_v4_mtp import DeepseekV4MTPDraftModel
+from mlx_vlm.speculative.drafters.deepseek_v4_mtp.config import DeepseekV4MTPConfig
+from mlx_vlm.speculative.drafters.deepseek_v4_mtp.split import split_deepseek_v4_mtp
 from mlx_vlm.speculative.drafters.eagle3 import Eagle3DraftModel
 from mlx_vlm.speculative.drafters.eagle3 import ModelConfig as Eagle3Config
 from mlx_vlm.speculative.drafters.eagle3 import TextConfig as Eagle3TextConfig
@@ -145,6 +151,28 @@ def test_speculative_sampler_rng_can_resync_draft_after_rejected_draws():
     assert first.tolist() == expected_first.tolist()
     assert second.tolist() == expected_second.tolist()
     assert draft_model._seed_token.tolist() == expected_third.tolist()
+
+
+def test_speculative_sampler_rng_async_evals_greedy_draft_call_state(monkeypatch):
+    result_array = mx.array([1], dtype=mx.int32)
+    state_array = mx.array([2], dtype=mx.int32)
+    calls = []
+
+    def fake_async_eval(*arrays):
+        calls.append(arrays)
+
+    draft_model = SimpleNamespace(
+        draft_eval_state=lambda: {"cache": [state_array]},
+    )
+    sampler_rng = _SpeculativeSamplerRNG(draft_model, enabled=False)
+
+    monkeypatch.setattr(mx, "async_eval", fake_async_eval)
+    result = sampler_rng.draft_call(lambda: result_array)
+
+    assert result is result_array
+    assert len(calls) == 1
+    assert calls[0][0] is result_array
+    assert calls[0][1] is state_array
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -933,6 +961,25 @@ def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     assert buffered.trim(2) == 2
     assert buffered.offset == 5
     assert buffered.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
+
+
+def test_mtp_target_cache_buffers_cache_list_local_rotating_cache():
+    base = RotatingKVCache(max_size=4, keep=0)
+    keys = mx.arange(4, dtype=mx.float32).reshape(1, 1, 4, 1)
+    base.update_and_fetch(keys, keys)
+    prompt_cache = [CacheList(base, PoolingCache(4))]
+    draft_model = SimpleNamespace(config=SimpleNamespace(block_size=3))
+
+    mtp_utils._buffer_mtp_target_cache(prompt_cache, draft_model, None)
+
+    assert isinstance(prompt_cache[0][0], BufferedRotatingKVCache)
+    assert isinstance(prompt_cache[0][1], PoolingCache)
+    assert prompt_cache[0][0].state[0].reshape(-1).tolist() == [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+    ]
 
 
 def test_normalize_batched_shared_kv_states_repacks_left_padded_rows():
@@ -2044,6 +2091,12 @@ def test_kind_none_autodetects_mtp_for_qwen3_5_mtp(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "mtp"
 
 
+def test_kind_none_autodetects_mtp_for_deepseek_v4_mtp(tmp_path):
+    path = _make_drafter_dir(tmp_path, "deepseek_v4_mtp")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
 def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     path = tmp_path / "drafter"
     path.mkdir()
@@ -2095,6 +2148,35 @@ def _tiny_qwen3_5_text_config():
             "rope_theta": 10000,
             "partial_rotary_factor": 0.25,
         },
+    )
+
+
+def _tiny_deepseek_v4_config():
+    return deepseek_language.ModelConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        moe_intermediate_size=4,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        n_shared_experts=1,
+        n_routed_experts=2,
+        num_experts_per_tok=1,
+        q_lora_rank=8,
+        qk_rope_head_dim=4,
+        head_dim=8,
+        o_groups=1,
+        o_lora_rank=8,
+        index_n_heads=1,
+        index_head_dim=8,
+        index_topk=1,
+        num_hash_layers=0,
+        hc_mult=2,
+        hc_sinkhorn_iters=2,
+        compress_ratios=[0],
+        sliding_window=16,
+        max_position_embeddings=128,
     )
 
 
@@ -2653,3 +2735,250 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert cfg["block_size"] == 3
     assert "fc.weight" in weights
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
+
+
+def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
+    cfg = _tiny_deepseek_v4_config()
+    lm = deepseek_language.LanguageModel(cfg)
+    cache = lm.make_cache()
+    inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    hidden, shared_kv, rollback_state = lm.speculative_verify_hidden(inputs, cache)
+    mx.eval(hidden)
+
+    assert hidden.shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
+    assert shared_kv == {}
+    assert rollback_state is None
+    assert cache[0].offset == 3
+
+    lm.rollback_speculative_cache(cache, rollback_state, accepted=0, block_size=3)
+    assert cache[0].offset == 1
+
+    logits = lm.speculative_logits_from_hidden(hidden[:, :1])
+    mx.eval(logits)
+    assert logits.shape == (1, 1, cfg.vocab_size)
+
+
+def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window():
+    pool = PoolingCache(4)
+    pool.accumulate_windows(mx.array([[[10.0]]]), mx.ones((1, 1, 1)), offset=0)
+
+    assert not deepseek_language._needs_replay_snapshot_for_cache([pool], 2)
+    assert deepseek_language._needs_replay_snapshot_for_cache([pool], 3)
+    assert not deepseek_language._needs_replay_snapshot_for_cache(
+        [RotatingKVCache(max_size=8)], 3
+    )
+
+
+def test_deepseek_v4_pooling_snapshot_skips_clone_when_verify_does_not_overwrite_remainder():
+    pool = PoolingCache(4)
+    old_kv = mx.array([[[10.0]]])
+    old_gate = mx.array([[[1.0]]])
+    pool.accumulate_windows(old_kv, old_gate, offset=0)
+
+    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    assert snapshot[0][2] is None
+
+    new_kv = mx.array([[[20.0], [21.0], [22.0]]])
+    new_gate = mx.ones_like(new_kv)
+    pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=1)
+    pool.update_and_fetch(pooled)
+
+    deepseek_language._restore_cache_state([pool], snapshot)
+
+    assert pool.remainder == 1
+    assert pool.pooled is None
+    assert pool.buf_kv[:, :1].reshape(-1).tolist() == [10.0]
+
+
+def test_deepseek_v4_pooling_snapshot_restores_only_overwritten_prefix():
+    pool = PoolingCache(4)
+    old_kv = mx.array([[[10.0], [11.0], [12.0]]])
+    old_gate = mx.ones_like(old_kv)
+    pool.accumulate_windows(old_kv, old_gate, offset=0)
+
+    snapshot = deepseek_language._snapshot_cache_state([pool], incoming_tokens=3)
+    assert snapshot[0][2].shape == (1, 2, 1)
+
+    new_kv = mx.array([[[20.0], [21.0], [22.0]]])
+    new_gate = mx.ones_like(new_kv)
+    pooled, _, _ = pool.accumulate_windows(new_kv, new_gate, offset=3)
+    pool.update_and_fetch(pooled)
+
+    deepseek_language._restore_cache_state([pool], snapshot)
+
+    assert pool.remainder == 3
+    assert pool.pooled is None
+    assert pool.buf_kv[:, :3].reshape(-1).tolist() == [10.0, 11.0, 12.0]
+
+
+def test_deepseek_v4_language_ignores_generation_metadata_kwargs():
+    cfg = _tiny_deepseek_v4_config()
+    lm = deepseek_language.LanguageModel(cfg)
+    out = lm(mx.array([[1]], dtype=mx.int32), fps=2.0, image=None, video=None)
+    mx.eval(out.logits)
+
+    assert out.logits.shape == (1, 1, cfg.vocab_size)
+
+
+def test_deepseek_v4_local_mask_aligns_to_layer_cache_width():
+    mask = mx.array([[[[False, True, True, False, True]]]], dtype=mx.bool_)
+
+    trimmed = deepseek_language._align_local_mask(mask, 3)
+    padded = deepseek_language._align_local_mask(trimmed, 5)
+
+    assert trimmed.tolist() == [[[[True, False, True]]]]
+    assert padded.tolist() == [[[[True, True, True, False, True]]]]
+
+
+def test_deepseek_v4_mtp_draft_block_smoke():
+    text_config = _tiny_deepseek_v4_config()
+    drafter = DeepseekV4MTPDraftModel(
+        DeepseekV4MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
+    hidden = mx.zeros((1, 1, text_config.hc_mult, 16), dtype=mx.float32)
+    tokens = drafter.draft_block(
+        7,
+        hidden,
+        None,
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    mx.eval(tokens)
+    assert tokens.shape == (1, 2)
+
+
+def test_deepseek_v4_mtp_runtime_block_size_defaults_to_native_nextn_depth():
+    text_config = _tiny_deepseek_v4_config()
+    cfg = DeepseekV4MTPConfig.from_dict(
+        {
+            "model_type": "deepseek_v4_mtp",
+            "text_config": text_config.to_dict(),
+            "block_size": 3,
+        }
+    )
+
+    assert cfg.block_size == 3
+    assert cfg.runtime_block_size == 2
+
+
+def test_deepseek_v4_mtp_batch_accept_updates_uniform_cache():
+    text_config = _tiny_deepseek_v4_config()
+    drafter = DeepseekV4MTPDraftModel(
+        DeepseekV4MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
+    hidden = mx.zeros((2, 1, text_config.hc_mult, 16), dtype=mx.float32)
+    draft_tokens = drafter.draft_block(
+        mx.array([7, 8], dtype=mx.int32),
+        hidden,
+        None,
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    verify_hidden = mx.zeros((2, 3, text_config.hc_mult, 16), dtype=mx.float32)
+    drafter.accept_verified_tokens_batch(
+        verify_hidden,
+        draft_tokens,
+        accepted=[0, 0],
+        new_tokens=[[3], [4]],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+
+    mx.eval(drafter._seed_token)
+    assert drafter._seed_token.shape == (2, 1)
+    assert drafter._seed_hidden.shape == (2, 1, text_config.hc_mult, 16)
+    assert drafter._round_appended == 0
+    assert drafter._cache[0].offset == 1
+    assert drafter._next_position == 5
+
+
+def test_deepseek_v4_mtp_sanitize_maps_embedded_weights():
+    cfg = _tiny_deepseek_v4_config()
+    context = SimpleNamespace(args=cfg)
+    weights = {
+        "mtp.0.e_proj.weight": mx.zeros((4, 4), dtype=mx.uint8),
+        "mtp.0.e_proj.scale": mx.ones((1, 1), dtype=mx.float32),
+        "mtp.0.ffn.gate.bias": mx.zeros((cfg.n_routed_experts,)),
+        "mtp.0.hc_attn_fn": mx.ones((2, 2)),
+        "mtp.0.hc_head_scale": mx.ones((1,)),
+        "mtp.0.attn.wo_a.weight": mx.ones((cfg.o_lora_rank, 4)),
+    }
+    for expert in range(cfg.n_routed_experts):
+        for name in ("w1", "w2", "w3"):
+            weights[f"mtp.0.ffn.experts.{expert}.{name}.weight"] = mx.zeros(
+                (4, 16), dtype=mx.int8
+            )
+            weights[f"mtp.0.ffn.experts.{expert}.{name}.scale"] = mx.ones(
+                (4, 1), dtype=mx.uint8
+            )
+
+    out = DeepseekV4MTPDraftModel.sanitize(context, weights)
+
+    assert "e_proj.scales" in out
+    assert "decoder.ffn.gate.e_score_correction_bias" in out
+    assert "decoder.attn_hc.fn" in out
+    assert "hc_head.scale" in out
+    assert out["decoder.ffn.switch_mlp.gate_proj.weight"].shape[0] == (
+        cfg.n_routed_experts
+    )
+    assert out["decoder.ffn.switch_mlp.gate_proj.scales"].shape[0] == (
+        cfg.n_routed_experts
+    )
+    assert out["decoder.attn.wo_a.weight"].shape == (1, cfg.o_lora_rank, 4)
+
+
+def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    text_config = _tiny_deepseek_v4_config()
+    (source / "config.json").write_text(
+        json.dumps({"model_type": "deepseek_v4", **text_config.to_dict()})
+    )
+    mx.save_safetensors(
+        str(source / "mtp.safetensors"),
+        {
+            "mtp.0.e_proj.weight": mx.zeros((4, 4), dtype=mx.uint8),
+            "mtp.0.e_proj.scale": mx.ones((1, 1), dtype=mx.float32),
+            "mtp.0.attn.wq_a.weight": mx.zeros((4, 4), dtype=mx.uint8),
+            "mtp.0.attn.wq_a.scale": mx.ones((1, 1), dtype=mx.float32),
+            "mtp.0.enorm.weight": mx.zeros((text_config.hidden_size,)),
+        },
+        metadata={},
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    split_deepseek_v4_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    assert cfg["model_type"] == "deepseek_v4_mtp"
+    assert cfg["block_size"] == 2
+    assert cfg["quantization"]["e_proj"]["mode"] == "mxfp8"
+    assert cfg["quantization"]["decoder.attn.wq_a"]["mode"] == "mxfp8"
+    assert "e_proj.weight" in weights
+    assert "e_proj.scales" in weights
+    assert "enorm.weight" in weights

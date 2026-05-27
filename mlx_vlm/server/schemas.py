@@ -1,8 +1,11 @@
 import os
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
+
+if TYPE_CHECKING:
+    from .generation import GenerationMetrics
 
 from ..generate import (
     DEFAULT_MAX_TOKENS,
@@ -143,6 +146,17 @@ class OpenAIRequest(FlexibleBaseModel):
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = Field(
         None,
@@ -180,12 +194,88 @@ class OpenAIRequest(FlexibleBaseModel):
     )
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
 class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
 
     input_tokens: int
+    input_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
     output_tokens: int
     total_tokens: int
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: "GenerationMetrics", input_tokens: int, output_tokens: int
+    ) -> "OpenAIUsage":
+        # Per spec, `input_tokens` is the total prompt count; cached portion is
+        # reported separately in `input_tokens_details.cached_tokens`.
+        return cls(
+            input_tokens=input_tokens,
+            input_tokens_details=PromptTokensDetails(
+                cached_tokens=metrics.cached_tokens
+            ),
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+
+
+class GenerationTimings(BaseModel):
+    """Per-request timing breakdown."""
+
+    prompt_n: int
+    cache_n: int
+    predicted_n: int
+    prompt_ms: float
+    prompt_per_token_ms: float
+    prompt_per_second: float
+    predicted_ms: float
+    predicted_per_token_ms: float
+    predicted_per_second: float
+    peak_memory: float = 0.0
+
+    @staticmethod
+    def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
+        if len(token_times) < 2:
+            return None
+        elapsed = token_times[-1] - token_times[0]
+        return (len(token_times) - 1) / elapsed if elapsed > 0 else None
+
+    @classmethod
+    def from_metrics(
+        cls,
+        metrics: "GenerationMetrics",
+        prompt_tokens: int,
+        output_tokens: int,
+    ) -> "GenerationTimings":
+        generation_tps = metrics.generation_tps or cls._derive_gen_tps(
+            metrics.token_times
+        )
+        cached_tokens = metrics.cached_tokens
+        prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
+        prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
+        prompt_ms = prompt_s * 1000.0
+        predicted_ms = (
+            output_tokens / generation_tps * 1000.0 if generation_tps else 0.0
+        )
+        return cls(
+            prompt_n=prompt_n,
+            cache_n=int(cached_tokens),
+            predicted_n=int(output_tokens),
+            prompt_ms=prompt_ms,
+            prompt_per_token_ms=(prompt_ms / prompt_n) if prompt_n else 0.0,
+            prompt_per_second=(prompt_n / prompt_s) if prompt_s else 0.0,
+            predicted_ms=predicted_ms,
+            predicted_per_token_ms=(
+                predicted_ms / output_tokens if output_tokens else 0.0
+            ),
+            predicted_per_second=float(generation_tps or 0.0),
+            peak_memory=float(metrics.peak_memory or 0.0),
+        )
 
 
 class OpenAIErrorObject(BaseModel):
@@ -364,6 +454,17 @@ class VLMRequest(FlexibleBaseModel):
     min_p: float = Field(0.0, description="Min-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = Field(
         None,
@@ -412,24 +513,39 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class PromptTokensDetails(BaseModel):
-    cached_tokens: int = 0
-
-
 class UsageStats(BaseModel):
-    """OpenAI-compatible usage statistics for chat completions."""
+    """OpenAI-compatible usage statistics for chat completions. Throughput and
+    memory metrics live in `GenerationTimings` (sibling `timings` field on the
+    response) to keep this object spec-clean."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    peak_memory: float = 0.0
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: "GenerationMetrics", prompt_tokens: int, completion_tokens: int
+    ) -> "UsageStats":
+        return cls(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=metrics.cached_tokens
+            ),
+        )
+
+
+class StreamOptions(BaseModel):
+    include_usage: bool = False
 
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    stream_options: Optional[StreamOptions] = None
 
 
 class TopLogprob(BaseModel):
@@ -463,6 +579,7 @@ class ChatResponse(BaseModel):
     model: str = ""
     choices: List[ChatChoice] = []
     usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
 
 
 class ChatStreamChoice(BaseModel):
@@ -479,6 +596,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
 
 
 # Models for Anthropic-compatible /v1/messages endpoint
@@ -511,6 +629,17 @@ class AnthropicRequest(FlexibleBaseModel):
     output_config: Optional[Any] = None
     adapter_path: Optional[str] = None
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
@@ -520,7 +649,24 @@ class AnthropicRequest(FlexibleBaseModel):
 
 class AnthropicUsage(BaseModel):
     input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     output_tokens: int = 0
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: "GenerationMetrics", prompt_tokens: int, output_tokens: int
+    ) -> "AnthropicUsage":
+        # Per spec, `input_tokens` excludes the cached portion, which is
+        # reported via `cache_read_input_tokens`. We don't currently distinguish
+        # cache creation from reads, so `cache_creation_input_tokens` stays 0.
+        cached_tokens = max(0, int(metrics.cached_tokens))
+        return cls(
+            input_tokens=max(0, int(prompt_tokens) - cached_tokens),
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=cached_tokens,
+            output_tokens=int(output_tokens),
+        )
 
 
 class AnthropicMessageResponse(BaseModel):

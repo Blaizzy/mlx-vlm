@@ -1,5 +1,5 @@
-from ..qwen3_5.language import LanguageModel
 from .config import ModelConfig, SliceConfig, TextConfig, VisionConfig
+from .language import LanguageModel
 from .minicpmv4_6 import Model
 from .processing_minicpmv4_6 import (
     MiniCPMVImageProcessor,

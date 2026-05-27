@@ -120,6 +120,7 @@ from .schemas import (
     ContentPartOutputText,
     FlexibleBaseModel,
     GenerationRequest,
+    GenerationTimings,
     ImageUrl,
     InputAudio,
     MessageItem,
