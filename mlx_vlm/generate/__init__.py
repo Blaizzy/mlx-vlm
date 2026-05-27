@@ -12,7 +12,6 @@ from .dispatch import (
     BatchGenerator,
     BatchResponse,
     BatchStats,
-    GenerationResponse,
     PromptProcessingBatch,
     batch_generate,
     generate,
@@ -24,7 +23,6 @@ __all__ = [
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
-    "GenerationResponse",
     "GenerationResult",
     "PromptCacheState",
     "PromptProcessingBatch",
@@ -38,3 +36,15 @@ __all__ = [
     "stream_generate",
     "wired_limit",
 ]
+
+
+def __getattr__(name):
+    from . import dispatch
+
+    return getattr(dispatch, name)
+
+
+def __dir__():
+    from . import dispatch
+
+    return sorted(set(__all__) | set(dir(dispatch)))
