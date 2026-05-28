@@ -17,10 +17,13 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    PromptProcessingBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
-    normalize_resize_shape,
 )
+from mlx_vlm.generate import ar as ar_module
+from mlx_vlm.generate import dispatch as dispatch_module
+from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -349,6 +352,55 @@ class TestGenerationBatch:
         empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
         assert empty._rope_deltas.tolist() == [[5], [7]]
 
+    def test_extend_materializes_pending_decode_before_cache_merge(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def extend(self, other):
+                calls.append(("extend-cache",))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        a = self._mrope_batch([0], [[0]])
+        b = self._mrope_batch([1], [[5]])
+        a.prompt_cache = [RecordingCache()]
+        b.prompt_cache = [RecordingCache()]
+
+        a.extend(b)
+
+        assert calls == [("eval", (0,)), ("eval", (1,)), ("extend-cache",)]
+
+    def test_filter_materializes_pending_decode_before_cache_filter(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def filter(self, keep):
+                calls.append(("filter-cache", keep.tolist()))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        batch = self._mrope_batch([0, 1], [[0], [5]])
+        batch.prompt_cache = [RecordingCache()]
+        batch._next_tokens = mx.array([10, 20], dtype=mx.int32)
+
+        batch.filter([0])
+
+        assert calls == [("eval", (0, 1)), ("filter-cache", [0])]
+
     @staticmethod
     def _capture(value, B):
         from mlx_vlm.generate import PromptProcessingBatch
@@ -520,7 +572,7 @@ class TestBatchGenerator:
             prompt_kwargs=[{"inputs_embeds": inputs_embeds}],
         )
         ticks = iter([10.0, 10.2])
-        monkeypatch.setattr(generate_module.time, "perf_counter", lambda: next(ticks))
+        monkeypatch.setattr(ar_module.time, "perf_counter", lambda: next(ticks))
 
         prompt_responses, generation_responses = gen.next()
 
@@ -530,6 +582,29 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_tokens == len(prompt)
         assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
+        assert prompt_responses[0].cached_tokens == 0
+
+    def test_prompt_progress_reports_apc_cached_tokens(self):
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1, 2],
+            input_ids=[[4, 5], [6, 7, 8]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+            warm_cache=[],
+            apc_meta=[
+                {"full_input_ids": [1, 2, 3, 4, 5], "prefix_len": 3},
+                None,
+            ],
+        )
+        batch.record_prompt_time(0.5)
+
+        progress = batch.prompt_progress()
+
+        assert [p.prompt_tokens for p in progress] == [5, 3]
+        assert [p.cached_tokens for p in progress] == [3, 0]
 
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
@@ -575,6 +650,93 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_generation_batch_thinking_budget_criteria_can_force_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def apply_forced_token(self, next_y):
+                if self.forced_token_id is None:
+                    return next_y
+                forced = mx.array([self.forced_token_id], dtype=mx.int32)
+                self.forced_token_id = None
+                return forced
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        first = batch.next()
+        assert [r.token for r in first] == [5]
+
+        second = batch.next()
+        assert [r.token for r in second] == [3]
+
+    def test_generation_batch_extend_keeps_processor_context_aligned(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        seen_contexts = []
+
+        def force_token_2(tokens, logits):
+            seen_contexts.append(tokens.tolist())
+            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
+            return mx.broadcast_to(token_scores, logits.shape)
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        plain = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2, 2],
+            logits_processors=[None, None],
+        )
+        structured = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[2],
+            inputs=mx.array([7], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[[force_token_2]],
+        )
+
+        plain.extend(structured)
+        assert plain.token_context == [[], [], [30]]
+
+        first = plain.next()
+        assert [r.token for r in first] == [5, 6, 7]
+        assert seen_contexts == [[30, 7]]
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
@@ -609,7 +771,7 @@ class TestBatchGenerator:
 class TestBatchGenerate:
     """Tests for the batch_generate function."""
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     def test_text_only_batch(self, mock_generate_batch, mock_model, mock_processor):
         """Test batch generation without images."""
         from mlx_vlm.generate import batch_generate
@@ -684,12 +846,12 @@ class TestBatchGenerate:
 
         with (
             patch.object(
-                generate_module,
+                ar_module,
                 "apply_chat_template",
                 side_effect=lambda processor, config, prompt, num_images=0: prompt,
             ),
             patch.object(
-                generate_module,
+                ar_module,
                 "prepare_inputs",
                 return_value={
                     "input_ids": input_ids,
@@ -699,17 +861,17 @@ class TestBatchGenerate:
             patch.object(
                 mock_model, "get_input_embeddings", return_value=embedding_output
             ),
-            patch.object(generate_module.BatchGenerator, "insert", new=fake_insert),
+            patch.object(ar_module.BatchGenerator, "insert", new=fake_insert),
         ):
             with pytest.raises(_StopInsert):
-                generate_module._generate_batch(
+                ar_module._generate_batch(
                     mock_model,
                     mock_processor,
                     prompts=["alpha", "beta", "gamma"],
                     max_tokens=5,
                 )
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_same_shape(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -748,7 +910,7 @@ class TestBatchGenerate:
         # Same shape images should be processed in one batch
         assert mock_generate_batch.call_count == 1
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_different_shapes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -800,7 +962,7 @@ class TestBatchGenerate:
         # All 3 responses should be present
         assert len(response.texts) == 3
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -831,7 +993,7 @@ class TestBatchGenerate:
         assert response.image_sizes is not None
         assert response.image_sizes[0] == (512, 384)
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_disable_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -861,7 +1023,7 @@ class TestBatchGenerate:
 
         assert response.image_sizes is None
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     def test_per_sample_max_tokens(
         self, mock_generate_batch, mock_model, mock_processor
     ):
@@ -887,7 +1049,7 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         assert len(response.texts) == 2
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_single_image_string(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -914,7 +1076,7 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         mock_process_image.assert_called_once()
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_verbose_output(
         self,
@@ -955,7 +1117,7 @@ class TestBatchGenerate:
         captured = capsys.readouterr()
         assert "[batch_generate]" in captured.out
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_disable_grouping(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -1203,6 +1365,11 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
             repetition_penalty=1.15,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={3: -0.75},
         )
 
@@ -1214,7 +1381,9 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
         )
-        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+        mock_make_logits_processors.assert_called_once_with(
+            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
+        )
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -1232,13 +1401,16 @@ def test_normalize_resize_shape_rejects_invalid_values(value):
 
 
 def test_generate_cli_smoke(capsys):
-    import importlib
-
-    generate_module = importlib.import_module("mlx_vlm.generate")
     prompt = ["画像の前面に積み重なっているのはどのようなアイテムですか？"]
 
     args = Namespace(
         model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
         adapter_path=None,
         image=["image.png"],
         audio=None,
@@ -1249,6 +1421,12 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
         chat=False,
         verbose=False,
         eos_tokens=None,
@@ -1275,18 +1453,18 @@ def test_generate_cli_smoke(capsys):
     processor = SimpleNamespace()
 
     with (
-        patch.object(generate_module, "parse_arguments", return_value=args),
-        patch.object(generate_module, "load", return_value=(model, processor)),
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
         patch.object(
-            generate_module, "apply_chat_template", return_value="prompt"
+            dispatch_module, "apply_chat_template", return_value="prompt"
         ) as mock_apply_chat_template,
         patch.object(
-            generate_module,
+            dispatch_module,
             "generate",
             return_value=SimpleNamespace(text="done"),
         ) as mock_generate,
     ):
-        generate_module.main()
+        dispatch_module.main()
 
     assert mock_apply_chat_template.call_args.args[2] == prompt
     assert mock_apply_chat_template.call_args.kwargs["num_images"] == 1
@@ -1298,6 +1476,28 @@ def test_generate_cli_smoke(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
+def test_generate_image_cli_routes_before_vlm_load():
+    args = Namespace(
+        model="bonsai-ternary",
+        output_modality="image",
+        output="out.png",
+        size="512x512",
+        steps=4,
+        seed=7,
+        guidance=1.0,
+    )
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "run_image_generation_cli") as mock_run_image,
+        patch.object(dispatch_module, "load") as mock_load,
+    ):
+        dispatch_module.main()
+
+    mock_run_image.assert_called_once_with(args)
+    mock_load.assert_not_called()
+
+
 def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
 
@@ -1305,6 +1505,8 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
 
     assert args.thinking_start_token == "<think>"
     assert args.thinking_end_token == "</think>"
+    assert args.output_modality == "text"
+    assert args.size == "512x512"
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
@@ -1391,6 +1593,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "_apc_tenant": "tenant",
             },
             [],
+            None,
         )
         for i, length in enumerate(lengths)
     ]
@@ -1448,6 +1651,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 123,
             },
             [],
+            None,
         ),
         (
             2,
@@ -1460,6 +1664,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 456,
             },
             [],
+            None,
         ),
     ]
     picks = [
@@ -1475,7 +1680,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     with (
         patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
         patch.object(
-            generate_module._apc,
+            ar_module._apc,
             "make_warm_batch_kv_cache_multi",
             return_value=([], 4),
         ),
@@ -1508,7 +1713,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, []))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)

@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import math
+import struct
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -49,6 +50,8 @@ MODEL_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+
+SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
 def quantize_activations(model: nn.Module) -> nn.Module:
@@ -246,7 +249,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
 
     weights = {}
     for wf in weight_files:
-        weights.update(mx.load(wf))
+        weights.update(_load_safetensors(wf))
 
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
@@ -307,6 +310,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
+                from .models.deepseek_v4.language import make_quantization_config
+
+                quantization = make_quantization_config(model)
             elif quant_method in ("awq", "gptq", "bitnet"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -373,6 +380,50 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     return model
 
 
+def _load_safetensors(path: str) -> dict:
+    try:
+        return mx.load(path)
+    except RuntimeError as e:
+        if not any(dtype in str(e) for dtype in SAFETENSORS_DTYPE_FALLBACKS):
+            raise
+        load_error = e
+
+    with open(path, "r+b") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        original_header = f.read(header_len)
+        header = json.loads(original_header)
+        changed = False
+
+        for tensor_info in header.values():
+            if not isinstance(tensor_info, dict):
+                continue
+            dtype = tensor_info.get("dtype")
+            if dtype in SAFETENSORS_DTYPE_FALLBACKS:
+                tensor_info["dtype"] = SAFETENSORS_DTYPE_FALLBACKS[dtype]
+                changed = True
+
+        if not changed:
+            raise load_error
+
+        patched_header = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        if len(patched_header) > header_len:
+            raise RuntimeError(
+                f"Cannot reinterpret unsupported safetensors dtype in {path}: "
+                "patched header is larger than the original header."
+            )
+
+        try:
+            f.seek(8)
+            f.write(patched_header)
+            f.write(b" " * (header_len - len(patched_header)))
+            f.flush()
+            return mx.load(path)
+        finally:
+            f.seek(8)
+            f.write(original_header)
+            f.flush()
+
+
 def sanitize_weights(model_obj, weights, config=None):
     """Helper function to sanitize weights if the model has a sanitize method"""
     if hasattr(model_obj, "sanitize"):
@@ -409,6 +460,7 @@ def load(
     adapter_path: Optional[str] = None,
     lazy: bool = False,
     revision: Optional[str] = None,
+    strict: bool = True,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -425,6 +477,8 @@ def load(
             when needed. Default: ``False``
         revision (str, optional): A revision id which can be a branch name,
             a tag, or a commit hash. Default: ``None``.
+        strict (bool): Whether or not to raise an exception if weights don't
+            match. Default: ``True``.
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -440,7 +494,7 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+    model = load_model(model_path, lazy, strict=strict, **kwargs)
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -1637,6 +1691,7 @@ class ThinkingBudgetCriteria:
         self.in_thinking = self.enable_thinking
         self.thinking_token_count = 0
         self.budget_exceeded = False
+        self.forced_token_id = None
 
     def reset_thinking_state(self):
         """Reset thinking state between generations."""

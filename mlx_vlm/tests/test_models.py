@@ -159,6 +159,98 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_deepseek_v4_language_model(self):
+        from mlx_vlm.models import deepseek_v4
+        from mlx_vlm.models.deepseek_v4.hyper_connection import (
+            _hc_split_sinkhorn_ops,
+            hc_expand,
+        )
+        from mlx_vlm.models.deepseek_v4.language import DeepseekV4RoPE
+
+        rope = DeepseekV4RoPE(4, 10000)
+        x = mx.random.uniform(shape=(1, 2, 3, 4))
+        y = rope(x, offset=1)
+        y_inv = rope(y, offset=1, inverse=True)
+        self.assertTrue(mx.allclose(y_inv, x, rtol=1e-5, atol=1e-5))
+
+        mixes = mx.random.normal((2, 3, 8), dtype=mx.float32)
+        scale = mx.array([1.2, 0.7, 1.1], dtype=mx.float32)
+        base = mx.random.normal((8,), dtype=mx.float32)
+        _, _, comb = _hc_split_sinkhorn_ops(mixes, scale, base, 2, 20, 1e-6)
+        self.assertTrue(mx.allclose(comb.sum(-1), mx.ones_like(comb.sum(-1)), atol=0.1))
+
+        post = mx.random.normal((2, 3, 2), dtype=mx.float32)
+        block_out = mx.random.normal((2, 3, 8), dtype=mx.bfloat16)
+        comb = mx.random.normal((2, 3, 2, 2), dtype=mx.float32)
+        residual = mx.random.normal((2, 3, 2, 8), dtype=mx.bfloat16)
+        expected = post[..., None] * block_out[:, :, None, :].astype(mx.float32)
+        expected = expected + mx.matmul(
+            comb.swapaxes(-1, -2), residual.astype(mx.float32)
+        )
+        actual = hc_expand(block_out, residual, post, comb)
+        self.assertTrue(mx.allclose(actual, expected.astype(block_out.dtype)))
+
+        config = deepseek_v4.ModelConfig(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        loaded_config = deepseek_v4.ModelConfig.from_dict(
+            {"model_type": "deepseek_v4", "eos_token_id": 1}
+        )
+        self.assertEqual(loaded_config.eos_token_id, 1)
+
+        model = deepseek_v4.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+        inputs = mx.array([[1, 2, 3]])
+        inputs_embeds = model.language_model.model.embed_tokens(inputs)
+        out = model.language_model(inputs, inputs_embeds=inputs_embeds)
+        self.assertEqual(out.logits.shape, (1, 3, config.vocab_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
+        self.assertEqual(type(cache[2]).__name__, "CacheList")
+
+        weight = mx.to_fp8(mx.ones((128, 128), dtype=mx.float32))
+        converted = model.sanitize(
+            {
+                "layers.0.attn.wkv.weight": weight,
+                "layers.0.attn.wkv.scale": mx.full((1, 1), 127, dtype=mx.uint8),
+            }
+        )
+        wkey = "language_model.model.layers.0.attn.wkv.weight"
+        skey = "language_model.model.layers.0.attn.wkv.scales"
+        self.assertIn(wkey, converted)
+        self.assertIn(skey, converted)
+        self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
+        self.assertEqual(converted[skey].shape, (128, 4))
+
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
 
@@ -1681,10 +1773,12 @@ class TestModels(unittest.TestCase):
 
         position_ids = captured["position_ids"]
         self.assertIsNotNone(position_ids)
-        # MRoPE shape: (3, batch, seq).
-        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
         # Decode position == cache._idx (10), not cache.offset[0].item() (3).
-        self.assertEqual(position_ids[0, 0, 0].item(), 10)
+        if position_ids.ndim == 3:
+            self.assertEqual(position_ids[0, 0, 0].item(), 10)
+        else:
+            self.assertEqual(position_ids[0, 0].item(), 10)
 
     def _assert_mrope_decode_uses_rope_deltas_kwarg(self, language_model, hidden_size):
         """Shared assertion: under continuous batching, an explicit
@@ -1735,10 +1829,13 @@ class TestModels(unittest.TestCase):
 
         position_ids = captured["position_ids"]
         self.assertIsNotNone(position_ids)
-        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
+        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
         # Position == cache._idx (10) + kwarg delta (5) == 15.
         # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
-        self.assertEqual(position_ids[0, 0, 0].item(), 15)
+        if position_ids.ndim == 3:
+            self.assertEqual(position_ids[0, 0, 0].item(), 15)
+        else:
+            self.assertEqual(position_ids[0, 0].item(), 15)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
@@ -3284,6 +3381,29 @@ class TestModels(unittest.TestCase):
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
         )
+
+        rope_input_ids = mx.array([[10, 11, 999, 999, 999, 999, 999, 999, 12, 13]])
+        rope_grid_thw = mx.array([[1, 4, 6]], dtype=mx.int64)
+        position_ids, rope_deltas = model.language_model.get_rope_index(
+            rope_input_ids,
+            image_grid_thw=rope_grid_thw,
+        )
+        expected_position_ids = mx.array(
+            [
+                [
+                    [0, 1, 2, 2, 2, 2, 2, 2, 5, 6],
+                ],
+                [
+                    [0, 1, 2, 2, 2, 3, 3, 3, 5, 6],
+                ],
+                [
+                    [0, 1, 2, 3, 4, 2, 3, 4, 5, 6],
+                ],
+            ],
+            dtype=rope_input_ids.dtype,
+        )
+        self.assertTrue(mx.array_equal(position_ids, expected_position_ids).item())
+        self.assertEqual(rope_deltas.item(), -3)
 
         # Test vision model with proper input format
         # grid_thw format: [temporal, height/patch, width/patch]
@@ -5780,6 +5900,53 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
         )
 
 
+class TestMiniCPMV4_6(unittest.TestCase):
+    @staticmethod
+    def _tiny_text_config():
+        from mlx_vlm.models import minicpmv4_6
+
+        return minicpmv4_6.TextConfig(
+            model_type="qwen3_5_text",
+            hidden_size=16,
+            intermediate_size=32,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=256,
+        )
+
+    def test_minicpmv4_6_language_uses_text_only_rope(self):
+        from mlx_vlm.models import minicpmv4_6
+
+        model_config = SimpleNamespace(vision_config=SimpleNamespace())
+        lm = minicpmv4_6.LanguageModel(self._tiny_text_config(), model_config)
+
+        input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        position_ids, rope_deltas = lm.get_rope_index(input_ids)
+
+        self.assertEqual(position_ids.shape, (3, 1, input_ids.shape[1]))
+        self.assertEqual(rope_deltas.tolist(), [[0]])
+
+    def test_minicpmv4_6_language_rejects_qwen_vl_grid_rope(self):
+        from mlx_vlm.models import minicpmv4_6
+
+        model_config = SimpleNamespace(vision_config=SimpleNamespace())
+        lm = minicpmv4_6.LanguageModel(self._tiny_text_config(), model_config)
+
+        input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+        image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
+        with self.assertRaisesRegex(ValueError, "does not support Qwen3.5-VL"):
+            lm.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
+
+
 class TestMiniCPMO(unittest.TestCase):
     @staticmethod
     def _tiny_config():
@@ -5884,6 +6051,23 @@ class TestMiniCPMO(unittest.TestCase):
         sanitized = model.sanitize(weights)
         self.assertEqual(sanitized["audio_tower.conv1.weight"].shape, (8, 3, 80))
         self.assertEqual(sanitized["audio_tower.conv2.weight"].shape, (8, 3, 8))
+
+    def test_minicpmo_vision_embedding_uses_floating_pixel_dtype(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        model.language_model.model.embed_tokens.weight = mx.zeros(
+            model.language_model.model.embed_tokens.weight.shape,
+            dtype=mx.uint32,
+        )
+        pixel_values = [[mx.ones((3, 28, 28), dtype=mx.uint32)]]
+        tgt_sizes = [mx.array([[2, 2]], dtype=mx.int32)]
+
+        vision_hidden_states = model.get_vision_embedding(pixel_values, tgt_sizes)
+
+        self.assertEqual(len(vision_hidden_states), 1)
+        self.assertIsInstance(vision_hidden_states[0], mx.array)
+        self.assertEqual(vision_hidden_states[0].shape, (1, 4, 64))
 
 
 class TestPhi4MM(unittest.TestCase):
@@ -6394,6 +6578,126 @@ class TestSam3(unittest.TestCase):
         cos, sin = compute_axial_cis(64, 8, 8)
         self.assertEqual(cos.shape, (64, 64))
         self.assertEqual(sin.shape, (64, 64))
+
+
+class TestRTDetrV2(unittest.TestCase):
+    def test_config_from_dict(self):
+        """Flat HF config dict resolves into nested sub-configs."""
+        from mlx_vlm.models.rt_detr_v2 import ModelConfig, RTDetrResNetConfig
+
+        hf_like = {
+            "model_type": "rt_detr_v2",
+            "image_size": 64,
+            "num_labels": 10,
+            "backbone_config": {
+                "model_type": "rt_detr_resnet",
+                "depths": [1, 1, 2, 1],
+                "hidden_sizes": [10, 20, 30, 40],
+            },
+            "encoder_hidden_dim": 32,
+            "encoder_in_channels": [20, 30, 40],
+            "encoder_attention_heads": 2,
+            "encoder_ffn_dim": 64,
+            "d_model": 32,
+            "num_queries": 30,
+            "decoder_layers": 2,
+            "decoder_attention_heads": 2,
+            "decoder_ffn_dim": 64,
+            "decoder_in_channels": [32, 32, 32],
+        }
+        cfg = ModelConfig.from_dict(hf_like)
+        self.assertEqual(cfg.model_type, "rt_detr_v2")
+        self.assertEqual(cfg.num_labels, 10)
+        self.assertIsInstance(cfg.backbone_config, RTDetrResNetConfig)
+        self.assertEqual(cfg.backbone_config.depths, [1, 1, 2, 1])
+        # __post_init__ rebuilds the sub-configs from flat fields
+        self.assertEqual(cfg._hybrid_encoder_config.encoder_hidden_dim, 32)
+        self.assertEqual(cfg._transformer_config.d_model, 32)
+        self.assertEqual(cfg._transformer_config.num_queries, 30)
+        self.assertEqual(cfg._transformer_config.num_labels, 10)
+        # framework-compat hooks
+        self.assertIsNone(cfg.text_config)
+        self.assertIsNone(cfg.vision_config)
+
+    def test_forward_shapes(self):
+        """End-to-end forward on a tiny config returns the documented shapes."""
+        from mlx_vlm.models.rt_detr_v2 import Model, ModelConfig
+
+        cfg = ModelConfig.from_dict(
+            {
+                "model_type": "rt_detr_v2",
+                "image_size": 64,
+                "num_labels": 10,
+                "backbone_config": {
+                    "model_type": "rt_detr_resnet",
+                    "depths": [1, 1, 2, 1],
+                    "hidden_sizes": [10, 20, 30, 40],
+                },
+                "encoder_hidden_dim": 32,
+                "encoder_in_channels": [20, 30, 40],
+                "encoder_attention_heads": 2,
+                "encoder_ffn_dim": 64,
+                "d_model": 32,
+                "num_queries": 30,
+                "decoder_layers": 2,
+                "decoder_attention_heads": 2,
+                "decoder_ffn_dim": 64,
+                "decoder_in_channels": [32, 32, 32],
+            }
+        )
+        model = Model(cfg)
+        model.eval()
+
+        pixel = mx.random.normal((2, 64, 64, 3))
+        out = model(pixel)
+        mx.eval(out["pred_logits"], out["pred_boxes"])
+
+        self.assertEqual(out["pred_logits"].shape, (2, 30, 10))
+        self.assertEqual(out["pred_boxes"].shape, (2, 30, 4))
+        # intermediate trajectories cover all decoder layers
+        self.assertEqual(out["intermediate_logits"].shape, (2, 2, 30, 10))
+        self.assertEqual(out["intermediate_reference_points"].shape, (2, 2, 30, 4))
+
+    def test_sanitize_renames_and_transposes(self):
+        """`Model.sanitize` rewrites HF keys and transposes NCHW conv weights."""
+        from mlx_vlm.models.rt_detr_v2 import Model
+
+        raw = {
+            # NCHW conv weight under the HF backbone prefix -> NHWC under
+            # vision.backbone after sanitize
+            "model.backbone.model.embedder.embedder.0.convolution.weight": mx.zeros(
+                (8, 3, 7, 7)
+            ),
+            # encoder body: `normalization` -> `bn`
+            "model.encoder.0.normalization.weight": mx.ones((16,)),
+            # vd downsampling shortcut: Sequential index 1 -> proj
+            "model.backbone.model.encoder.stages.1.layers.0.shortcut.1.convolution.weight": mx.zeros(
+                (16, 8, 1, 1)
+            ),
+            # num_batches_tracked must be dropped
+            "model.backbone.model.embedder.embedder.0.normalization.num_batches_tracked": mx.array(
+                0
+            ),
+        }
+        sanitized = Model.sanitize(raw)
+
+        self.assertNotIn(
+            "model.backbone.model.embedder.embedder.0.normalization.num_batches_tracked",
+            sanitized,
+        )
+        self.assertIn("vision.backbone.embedder.embedder.0.conv.weight", sanitized)
+        # NCHW (8, 3, 7, 7) -> NHWC (8, 7, 7, 3)
+        self.assertEqual(
+            sanitized["vision.backbone.embedder.embedder.0.conv.weight"].shape,
+            (8, 7, 7, 3),
+        )
+        # `.normalization.` rename under the encoder body
+        self.assertIn("vision.hybrid_encoder.0.bn.weight", sanitized)
+        # vd shortcut Sequential[1] -> proj
+        self.assertIn(
+            "vision.backbone.encoder.stages.1.layers.0.shortcut.proj.conv.weight",
+            sanitized,
+        )
 
 
 if __name__ == "__main__":

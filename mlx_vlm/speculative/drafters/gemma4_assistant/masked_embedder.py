@@ -33,8 +33,18 @@ class MaskedEmbedder(nn.Module):
         self.centroids = nn.Linear(self.hidden_size, self.num_centroids, bias=False)
         # ``token_ordering[c * vocab_size_per_centroid : (c+1) * vocab_size_per_centroid]``
         # holds the canonical token IDs assigned to centroid ``c``.
-        # Loaded from checkpoint as int64; cast to int32 for indexing.
+        # Loaded from checkpoint as int64; cast to int32 for indexing. This is a
+        # static checkpoint buffer, not a learnable parameter.
         self.token_ordering = mx.zeros((self.vocab_size,), dtype=mx.int32)
+        self._freeze_static_buffers()
+
+    def _freeze_static_buffers(self):
+        self.freeze(keys="token_ordering", recurse=False, strict=True)
+
+    def unfreeze(self, *, recurse: bool = True, keys=None, strict: bool = False):
+        super().unfreeze(recurse=recurse, keys=keys, strict=strict)
+        self._freeze_static_buffers()
+        return self
 
     def __call__(self, hidden_states: mx.array, lm_head_weight: mx.array) -> mx.array:
         """Compute sparse logits over the full vocab.

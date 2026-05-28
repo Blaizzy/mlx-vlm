@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from .qwen3_dflash import DFlashDraftModel
 
@@ -9,6 +9,7 @@ KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
+    "deepseek_v4_mtp": "mtp",
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
     "qwen3_5_mtp": "mtp",
@@ -17,6 +18,64 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
 DEFAULT_DRAFTER_KIND = "dflash"
 
 logger = logging.getLogger(__name__)
+
+
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _hidden_size(config: Any) -> Any:
+    return _cfg_get(_cfg_get(config, "text_config", config), "hidden_size")
+
+
+def validate_drafter_compatibility(
+    target_model: Any,
+    draft_model: Any,
+    draft_kind: Optional[str],
+) -> None:
+    """Validate that a loaded drafter can safely pair with a target model.
+
+    This intentionally uses architecture/config fields instead of repository
+    names, so quantized MLX conversions and local checkpoints remain accepted.
+    """
+    draft_cfg = getattr(draft_model, "config", None)
+    if draft_cfg is None:
+        return
+
+    model_type = _cfg_get(draft_cfg, "model_type")
+    expected_kind = DRAFTER_KIND_BY_MODEL_TYPE.get(model_type)
+    if expected_kind is None and "mtp" in str(model_type).lower():
+        expected_kind = "mtp"
+    if expected_kind is not None and draft_kind != expected_kind:
+        raise ValueError(
+            f"Drafter model_type={model_type!r} requires draft_kind={expected_kind!r}. "
+            f"Got draft_kind={draft_kind!r}."
+        )
+
+    if draft_kind != "mtp":
+        return
+
+    draft_hidden_size = (
+        _cfg_get(draft_cfg, "backbone_hidden_size")
+        or _cfg_get(draft_cfg, "target_hidden_size")
+        or _hidden_size(draft_cfg)
+    )
+    target = getattr(target_model, "language_model", target_model)
+    target_hidden_size = _hidden_size(getattr(target, "config", None))
+
+    if (
+        draft_hidden_size is not None
+        and target_hidden_size is not None
+        and draft_hidden_size != target_hidden_size
+    ):
+        raise ValueError(
+            "Drafter is incompatible with the target model. "
+            "Use the drafter checkpoint for the same target family and size. "
+            f"Drafter target hidden_size={draft_hidden_size!r}, "
+            f"target hidden_size={target_hidden_size!r}."
+        )
 
 
 def _peek_drafter_model_type(model_path) -> Optional[str]:
@@ -95,6 +154,7 @@ __all__ = [
     "KNOWN_DRAFTER_KINDS",
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "DEFAULT_DRAFTER_KIND",
+    "validate_drafter_compatibility",
     "resolve_drafter_kind",
     "load_drafter",
 ]

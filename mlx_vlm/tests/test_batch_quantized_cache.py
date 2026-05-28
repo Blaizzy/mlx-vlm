@@ -159,6 +159,23 @@ class TestState:
         assert state[1] is None
 
 
+class TestMakeMask:
+    def test_make_mask_matches_batch_kv_cache_with_left_padding(self):
+        left_padding = [2, 0]
+        cache = BatchQuantizedKVCache(left_padding, group_size=GROUP_SIZE, bits=BITS)
+        reference = BatchKVCache(left_padding)
+        k, v = _rand_kv(B, 5)
+
+        cache.update_and_fetch(k, v)
+        reference.update_and_fetch(k, v)
+
+        mask = cache.make_mask(2, return_array=True, window_size=None)
+        reference_mask = reference.make_mask(2, return_array=True, window_size=None)
+
+        assert mask.shape == reference_mask.shape
+        assert mx.all(mask == reference_mask).item()
+
+
 class TestMakeCache:
     """Test that _make_cache creates BatchQuantizedKVCache when kv_bits is set."""
 

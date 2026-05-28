@@ -30,6 +30,47 @@ QUANT_RECIPES = [
 ]
 
 
+def _quantization_params(
+    q_group_size: Optional[int], q_bits: Optional[int], q_mode: str
+):
+    mode_defaults = {
+        "affine": (64, 4),
+        "mxfp4": (32, 4),
+        "nvfp4": (16, 4),
+        "mxfp8": (32, 8),
+    }
+    group_size, bits = mode_defaults[q_mode]
+    return {
+        "group_size": q_group_size or group_size,
+        "bits": q_bits or bits,
+        "mode": q_mode,
+    }
+
+
+def _preserve_existing_deepseek_v4_quantization(
+    config: dict,
+    model: nn.Module,
+    q_group_size: Optional[int],
+    q_bits: Optional[int],
+    q_mode: str,
+):
+    quantization_config = config.get("quantization_config", {})
+    if (
+        config.get("model_type") != "deepseek_v4"
+        or "quantization" in config
+        or not isinstance(quantization_config, dict)
+        or quantization_config.get("quant_method") != "fp8"
+    ):
+        return
+
+    from .models.deepseek_v4.language import make_quantization_config
+
+    quantization = make_quantization_config(model)
+    quantization.update(_quantization_params(q_group_size, q_bits, q_mode))
+    config["quantization"] = quantization
+    config["quantization_config"] = quantization
+
+
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module], Union[bool, dict]]:
@@ -157,6 +198,10 @@ def convert(
 
     if quantize:
         from mlx_lm.utils import quantize_model
+
+        _preserve_existing_deepseek_v4_quantization(
+            config, model, q_group_size, q_bits, q_mode
+        )
 
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
