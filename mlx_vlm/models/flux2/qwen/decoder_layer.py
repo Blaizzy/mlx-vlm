@@ -1,9 +1,9 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.qwen.attention import Qwen3VLAttention, Qwen3VLKVCache
-from mlx_vlm.models.bonsai.qwen.mlp import Qwen3VLMLP
-from mlx_vlm.models.bonsai.qwen.rms_norm import Qwen3VLRMSNorm
+from mlx_vlm.models.flux2.qwen.attention import Qwen3VLAttention, Qwen3VLKVCache
+from mlx_vlm.models.flux2.qwen.mlp import Qwen3VLMLP
+from mlx_vlm.models.flux2.qwen.rms_norm import Qwen3VLRMSNorm
 
 
 class Qwen3VLDecoderLayer(nn.Module):

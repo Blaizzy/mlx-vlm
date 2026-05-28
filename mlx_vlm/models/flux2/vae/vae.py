@@ -3,12 +3,12 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.tiling import TilingConfig, decode_image_tiled
-from mlx_vlm.models.bonsai.vae.common.batch_norm_stats import Flux2BatchNormStats
-from mlx_vlm.models.bonsai.vae.decoder.decoder import Flux2Decoder
+from mlx_vlm.models.flux2.tiling import TilingConfig, decode_image_tiled
+from mlx_vlm.models.flux2.vae.common.batch_norm_stats import Flux2BatchNormStats
+from mlx_vlm.models.flux2.vae.decoder.decoder import Flux2Decoder
 
 
-class BonsaiVAE(nn.Module):
+class Flux2VAE(nn.Module):
     scaling_factor: float = 1.0
     shift_factor: float = 0.0
     latent_channels: int = 32

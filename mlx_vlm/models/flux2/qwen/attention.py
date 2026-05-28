@@ -4,7 +4,7 @@ import mlx.core as mx
 from mlx import nn
 from mlx.core.fast import scaled_dot_product_attention
 
-from mlx_vlm.models.bonsai.qwen.rms_norm import Qwen3VLRMSNorm
+from mlx_vlm.models.flux2.qwen.rms_norm import Qwen3VLRMSNorm
 
 Qwen3VLKVCache = tuple[mx.array, mx.array, int]
 

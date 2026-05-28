@@ -118,7 +118,13 @@ def _model_type_from_id(model: str) -> str:
         return ""
     name = model_id.rsplit("/", 1)[-1]
     model_type = name.split("-", 1)[0]
-    return {"ternary": "bonsai", "2bit": "bonsai"}.get(model_type, model_type)
+    return {
+        "ternary": "bonsai",
+        "2bit": "bonsai",
+        "flux.2": "flux2",
+        "flux2": "flux2",
+        "klein": "flux2",
+    }.get(model_type, model_type)
 
 
 def image_generation_model_class(model: str | None) -> type[Any] | None:
@@ -135,16 +141,31 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
         ):
             return BonsaiImageGenerationModel
         return None
+    if model_type == "flux2":
+        from ..models.flux2.model import Flux2ImageGenerationModel
+
+        if (
+            Flux2ImageGenerationModel.is_image_generation_model
+            and Flux2ImageGenerationModel.supports_model(model)
+        ):
+            return Flux2ImageGenerationModel
+        return None
 
     model_path = Path(model).expanduser()
     if model_path.exists():
         from ..models.bonsai.model import BonsaiImageGenerationModel
+        from ..models.flux2.model import Flux2ImageGenerationModel
 
         if (
             BonsaiImageGenerationModel.is_image_generation_model
             and BonsaiImageGenerationModel.supports_model(model)
         ):
             return BonsaiImageGenerationModel
+        if (
+            Flux2ImageGenerationModel.is_image_generation_model
+            and Flux2ImageGenerationModel.supports_model(model)
+        ):
+            return Flux2ImageGenerationModel
 
     return None
 
