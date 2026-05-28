@@ -1173,12 +1173,21 @@ class StaticPrefixKVCache(_BaseCache):
     an attention mask that hides unpopulated entries.
     """
 
-    def __init__(self, max_size: int, step: int = 256):
+    def __init__(self, max_size: int, step: int = 256, read_only: bool = False):
         self.max_size = int(max_size)
         self.step = int(step)
         self.keys = None
         self.values = None
         self.offset = 0
+        self.read_only = read_only
+
+    @classmethod
+    def from_prefix(cls, other: "StaticPrefixKVCache") -> "StaticPrefixKVCache":
+        cache = cls(other.max_size, other.step, read_only=True)
+        cache.keys = other.keys
+        cache.values = other.values
+        cache.offset = other.offset
+        return cache
 
     def _capacity_for(self, needed: int) -> int:
         if needed <= self.max_size:
@@ -1204,6 +1213,14 @@ class StaticPrefixKVCache(_BaseCache):
     def update_and_fetch(
         self, keys: mx.array, values: mx.array
     ) -> Tuple[mx.array, mx.array]:
+        if self.read_only:
+            if self.keys is None:
+                return keys, values
+            return (
+                mx.concatenate([self.keys[..., : self.offset, :], keys], axis=2),
+                mx.concatenate([self.values[..., : self.offset, :], values], axis=2),
+            )
+
         seq_len = keys.shape[2]
         prev = self.offset
         end = prev + seq_len

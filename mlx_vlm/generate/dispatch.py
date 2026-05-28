@@ -51,7 +51,6 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
-DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 
 
 def parse_arguments():
@@ -184,14 +183,6 @@ def parse_arguments():
         ),
     )
     parser.add_argument(
-        "--diffusion-static-cache",
-        action="store_true",
-        help=(
-            "Use a fixed-capacity encoder KV cache for multi-canvas "
-            "diffusion generation."
-        ),
-    )
-    parser.add_argument(
         "--diffusion-sampler",
         choices=["auto-regressive-euler", "confidence-threshold"],
         default="auto-regressive-euler",
@@ -204,34 +195,6 @@ def parse_arguments():
         help=(
             "Token probability threshold for "
             "--diffusion-sampler confidence-threshold."
-        ),
-    )
-    parser.add_argument(
-        "--diffusion-compile",
-        action="store_true",
-        help=(
-            "Experimentally compile the diffusion decoder logits graph "
-            "for each canvas shape/cache state."
-        ),
-    )
-    parser.add_argument(
-        "--diffusion-show-unmasking",
-        action="store_true",
-        help="Redraw diffusion intermediate canvas drafts during denoising.",
-    )
-    parser.add_argument(
-        "--diffusion-unmasking-interval",
-        type=int,
-        default=1,
-        help="Show every Nth diffusion denoising step when unmasking is enabled.",
-    )
-    parser.add_argument(
-        "--diffusion-unmasking-width",
-        type=int,
-        default=DEFAULT_DIFFUSION_UNMASKING_WIDTH,
-        help=(
-            "Maximum terminal columns used for diffusion draft redraws. "
-            "Use 0 for the full untrimmed redraw."
         ),
     )
     parser.add_argument(
@@ -571,7 +534,6 @@ class PromptCacheState:
 from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
-    DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
@@ -652,6 +614,7 @@ def stream_generate(
           containing the generated text, tokens, and statistics.
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    verbose = kwargs.pop("verbose", False)
 
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
@@ -710,6 +673,62 @@ def stream_generate(
             if k not in ["input_ids", "pixel_values", "attention_mask"]
         }
         kwargs.update(data_kwargs)
+
+    if getattr(model.config, "model_type", None) == "llada2_moe":
+        if image is not None or audio is not None or video is not None:
+            raise ValueError("LLaDA2 MoE is a text-only model.")
+
+        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+        temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
+        top_p = kwargs.get("top_p", DEFAULT_TOP_P)
+        top_k = kwargs.get("top_k", DEFAULT_TOP_K)
+
+        generation_stats = {}
+        tic = time.perf_counter()
+        generated = model.language_model.generate(
+            input_ids,
+            temperature=temperature,
+            gen_length=max_tokens,
+            top_p=None if top_p is None or top_p >= 1.0 else top_p,
+            top_k=None if top_k is None or top_k <= 0 else top_k,
+            eos_early_stop=True,
+            threshold=kwargs.get("threshold", 0.95),
+            editing_threshold=kwargs.get("editing_threshold", 0.9),
+            max_post_steps=kwargs.get("max_post_steps", 4),
+            visualize=verbose,
+            tokenizer=tokenizer,
+            skip_special_tokens=skip_special_tokens,
+            stats=generation_stats,
+        )
+        mx.eval(generated)
+        total_time = time.perf_counter() - tic
+        prompt_time = generation_stats.get("prompt_time", 0.0)
+        prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
+        generation_time = max(total_time - prompt_time, 1e-9)
+        generated_tokens = generated[0].tolist()
+        text = tokenizer.decode(
+            generated_tokens, skip_special_tokens=skip_special_tokens
+        )
+
+        yield GenerationResult(
+            text=text,
+            token=generated_tokens[-1] if generated_tokens else None,
+            logprobs=None,
+            prompt_tokens=input_ids.size,
+            generation_tokens=len(generated_tokens),
+            total_tokens=input_ids.size + len(generated_tokens),
+            prompt_tps=prompt_tps,
+            generation_tps=len(generated_tokens) / generation_time,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=(
+                "stop"
+                if generated_tokens
+                and tokenizer.stopping_criteria(generated_tokens[-1])
+                else "length"
+            ),
+            text_already_printed=bool(generation_stats.get("text_already_printed")),
+        )
+        return
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
@@ -1141,14 +1160,18 @@ def generate(
         tokenizer.stopping_criteria.reset(model.config.eos_token_id)
 
     for response in stream_generate(
-        model, processor, prompt, image, audio, video, **kwargs
+        model, processor, prompt, image, audio, video, verbose=verbose, **kwargs
     ):
         if response.is_draft:
             diffusion_output.handle_draft(response)
             last_response = response
             continue
 
-        if verbose and not diffusion_output.handle_text(response.text):
+        if (
+            verbose
+            and not response.text_already_printed
+            and not diffusion_output.handle_text(response.text)
+        ):
             print(response.text, end="", flush=True)
         text += response.text
         last_response = response
@@ -1203,13 +1226,8 @@ def main():
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
-        "diffusion_static_cache": False,
         "diffusion_sampler": "auto-regressive-euler",
         "diffusion_threshold": 0.9,
-        "diffusion_compile": False,
-        "diffusion_show_unmasking": False,
-        "diffusion_unmasking_interval": 1,
-        "diffusion_unmasking_width": DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):

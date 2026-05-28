@@ -3,7 +3,11 @@
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.models.cache import BatchKVCache, BatchQuantizedKVCache
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BatchQuantizedKVCache,
+    StaticPrefixKVCache,
+)
 
 B, H, D = 2, 4, 64  # batch, heads, head_dim
 GROUP_SIZE = 32
@@ -209,6 +213,28 @@ class TestMakeCache:
         caches = _make_cache(FakeModel(), [0, 0])
         for c in caches:
             assert isinstance(c, BatchKVCache)
+
+
+class TestStaticPrefixKVCache:
+    def test_read_only_view_does_not_mutate_prefix(self):
+        prefix_cache = StaticPrefixKVCache(max_size=8)
+        prefix_keys = mx.ones((1, 1, 2, 2), dtype=mx.float32)
+        prefix_values = mx.full((1, 1, 2, 2), 2.0, dtype=mx.float32)
+        prefix_cache.update_and_fetch(prefix_keys, prefix_values)
+
+        read_only_cache = StaticPrefixKVCache.from_prefix(prefix_cache)
+        current_keys = mx.full((1, 1, 1, 2), 3.0, dtype=mx.float32)
+        current_values = mx.full((1, 1, 1, 2), 4.0, dtype=mx.float32)
+        keys, values = read_only_cache.update_and_fetch(current_keys, current_values)
+
+        assert prefix_cache.offset == 2
+        assert read_only_cache.offset == 2
+        assert keys.shape == (1, 1, 3, 2)
+        assert values.shape == (1, 1, 3, 2)
+        assert bool(mx.all(keys[..., :2, :] == 1.0).item())
+        assert bool(mx.all(keys[..., 2:, :] == 3.0).item())
+        assert bool(mx.all(values[..., :2, :] == 2.0).item())
+        assert bool(mx.all(values[..., 2:, :] == 4.0).item())
 
 
 class TestBatchGeneratorIntegration:

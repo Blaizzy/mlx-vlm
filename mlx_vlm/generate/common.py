@@ -124,6 +124,7 @@ class GenerationResult:
     diffusion_work_tps: float = 0.0
     is_draft: bool = False
     draft_text: str = ""
+    text_already_printed: bool = False
     diffusion_step: int = 0
     diffusion_total_steps: int = 0
     diffusion_canvas_index: int = 0
