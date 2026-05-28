@@ -378,7 +378,12 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 _INHERIT_ADAPTER = object()
 
 
-def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
+def get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
@@ -387,7 +392,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         cached = runtime.model_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path)
+    cache_key = (model_path, adapter_path, model_kind)
 
     # Return from cache if already loaded and matches the requested paths
     if runtime.model_cache.get("cache_key") == cache_key:
@@ -403,7 +408,10 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
 
-    if is_image_generation_model(model_path):
+    load_as_image = model_kind == "image_generation" or (
+        model_kind == "auto" and is_image_generation_model(model_path)
+    )
+    if load_as_image:
         if adapter_path is not None:
             raise HTTPException(
                 status_code=400,
@@ -412,6 +420,10 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         print(f"Loading image generation model from: {model_path}")
         try:
             model = load_image_generation_model(model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported image generation model: {e}"
+            ) from e
         except Exception as e:
             raise HTTPException(
                 status_code=500, detail=f"Failed to load image generation model: {e}"

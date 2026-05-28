@@ -8,6 +8,7 @@ from huggingface_hub import snapshot_download
 from mlx_vlm.models.flux2.config import Flux2Variant, get_variant
 
 DOWNLOAD_PATTERNS = (
+    "model_index.json",
     "vae/*.safetensors",
     "vae/*.json",
     "transformer/*.safetensors",
