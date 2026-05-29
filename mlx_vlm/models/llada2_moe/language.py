@@ -439,18 +439,16 @@ class LanguageModel(nn.Module):
             else:
                 clear_visualizer()
 
-        def wrap_pieces(pieces, width: int) -> str:
+        def wrap_text(text: str, width: int) -> str:
             lines = []
-            line = ""
-            for piece in pieces:
-                separator = " " if line else ""
-                if line and len(line) + len(separator) + len(piece) > width:
-                    lines.append(line)
-                    line = piece
-                else:
-                    line += separator + piece
-            if line:
-                lines.append(line)
+            while len(text) > width:
+                split_at = text.rfind(" ", 0, width + 1)
+                if split_at <= 0:
+                    split_at = width
+                lines.append(text[:split_at].rstrip())
+                text = text[split_at:].lstrip()
+            if text:
+                lines.append(text)
             return "\n".join(lines)
 
         def decode_token(token_id: int) -> str:
@@ -503,7 +501,7 @@ class LanguageModel(nn.Module):
 
             terminal_size = shutil.get_terminal_size((120, 20))
             terminal_width = max(20, terminal_size.columns - 1)
-            canvas = wrap_pieces(pieces, terminal_width)
+            canvas = wrap_text("".join(pieces), terminal_width)
             if not force and canvas == visualizer_state["canvas"]:
                 return
             rows = max(1, canvas.count("\n") + 1)
