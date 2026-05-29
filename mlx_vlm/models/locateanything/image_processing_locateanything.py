@@ -1,10 +1,10 @@
 """
 MLX-based LocateAnything image processor.
 
-Mirrors the MoonViT preprocessing pipeline (shared with Kimi-VL): rescale to the
-token limit, center-crop to a multiple of ``merge_kernel_size * patch_size``,
-convert to MLX, normalize, and patchify. The output contract matches what the
-MoonViT ``VisionModel`` consumes.
+Mirrors the HF LocateAnything preprocessing: rescale to the token limit, then
+bicubic-resize up to a multiple of ``merge_kernel_size * patch_size``, convert
+to MLX, normalize, and patchify. The output contract matches what the MoonViT
+``VisionModel`` consumes.
 
 LocateAnything differs from Kimi-VL only in the normalization constants
 (``0.5`` mean/std) and ``in_token_limit`` (see ``preprocessor_config.json``).
@@ -55,7 +55,8 @@ class LocateAnythingImageProcessor(_base_image_processor()):
     def rescale(
         self, image: Image.Image, merge_kernel_size: List[int] = None
     ) -> Image.Image:
-        """Rescale to the token limit and crop to patch/merge boundaries."""
+        """Rescale to the token limit, then bicubic-resize up to a multiple of
+        ``merge_kernel_size * patch_size`` (matches the HF reference exactly)."""
         if merge_kernel_size is None:
             merge_kernel_size = self.merge_kernel_size
 
@@ -69,14 +70,15 @@ class LocateAnythingImageProcessor(_base_image_processor()):
             new_w, new_h = int(w * scale), int(h * scale)
             image = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
 
-        # Center crop so grid dimensions are divisible by merge_kernel_size.
-        crop_size_w = merge_kernel_size[1] * patch_size
-        crop_size_h = merge_kernel_size[0] * patch_size
-        new_w = image.size[0] - image.size[0] % crop_size_w
-        new_h = image.size[1] - image.size[1] % crop_size_h
-        left = (image.size[0] - new_w) // 2
-        top = (image.size[1] - new_h) // 2
-        image = image.crop((left, top, left + new_w, top + new_h))
+        # Resize up so grid dimensions are divisible by merge_kernel_size,
+        # preserving all image content (HF uses ceil + bicubic, not cropping).
+        new_w, new_h = image.size
+        pad_w = merge_kernel_size[1] * patch_size
+        pad_h = merge_kernel_size[0] * patch_size
+        target_w = math.ceil(new_w / pad_w) * pad_w
+        target_h = math.ceil(new_h / pad_h) * pad_h
+        if (target_w, target_h) != (new_w, new_h):
+            image = image.resize((target_w, target_h), Image.Resampling.BICUBIC)
 
         w, h = image.size
         if w // patch_size >= 512 or h // patch_size >= 512:
