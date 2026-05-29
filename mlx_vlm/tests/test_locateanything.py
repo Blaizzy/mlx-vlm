@@ -98,6 +98,25 @@ class TestLocateAnythingConfig(unittest.TestCase):
         self.assertEqual(cfg.box_start_token_id, 151668)
         self.assertEqual(cfg.mlp_connector_layers, 2)
 
+    def test_pbd_config_fields(self):
+        tc = TextConfig.from_dict(
+            {
+                "model_type": "qwen2",
+                "block_size": 6,
+                "text_mask_token_id": 151676,
+                "null_token_id": 152678,
+                "switch_token_id": 152679,
+            }
+        )
+        self.assertEqual(tc.block_size, 6)
+        self.assertEqual(tc.text_mask_token_id, 151676)
+        self.assertEqual(tc.null_token_id, 152678)
+        self.assertEqual(tc.switch_token_id, 152679)
+        self.assertFalse(tc.causal_attn)
+
+        cfg = ModelConfig(text_config=tc, vision_config=tiny_vision_config())
+        self.assertEqual(cfg.n_future_tokens, 6)
+
 
 class TestLocateAnythingModel(unittest.TestCase):
     def _build_model(self):
@@ -167,6 +186,159 @@ class TestLocateAnythingModel(unittest.TestCase):
         self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", out)
         # tied lm_head is dropped
         self.assertNotIn("language_model.lm_head.weight", out)
+
+
+class TestLocateAnythingPBD(unittest.TestCase):
+    TOKEN_IDS = {
+        "box_start_token_id": 100,
+        "box_end_token_id": 101,
+        "coord_start_token_id": 200,
+        "coord_end_token_id": 300,
+        "ref_start_token_id": 102,
+        "ref_end_token_id": 103,
+        "none_token_id": 4,
+        "null_token_id": 400,
+        "switch_token_id": 401,
+        "default_mask_token_id": 90,
+        "im_end_token_id": 99,
+    }
+
+    def test_magi_block_mask_prefill(self):
+        from mlx_vlm.models.locateanything.language import build_magi_block_mask
+
+        # Prefill: kv_len == q_len, prefix P=4, block B=3.
+        m = build_magi_block_mask(7, 7, 3)
+        self.assertEqual(m.shape, (1, 1, 7, 7))
+        allowed = (m[0, 0] == 0).tolist()
+        # Prefix rows 0..3 are strictly causal.
+        for i in range(4):
+            for j in range(7):
+                self.assertEqual(allowed[i][j], j <= i, f"prefix ({i},{j})")
+        # Block rows 4..6 attend to prefix [0,2] (cols 0,1,2), NOT bridge col 3,
+        # and bidirectionally within the block (cols 4,5,6).
+        blocked_k = 7 - 3 - 1  # = 3
+        for i in range(4, 7):
+            for j in range(7):
+                expect = (j < blocked_k) or (j >= 7 - 3)
+                self.assertEqual(allowed[i][j], expect, f"block ({i},{j})")
+
+    def test_magi_block_mask_decode(self):
+        from mlx_vlm.models.locateanything.language import build_magi_block_mask
+
+        # Decode: kv_len=10, q_len=6 (r=3 recompute rows + block B=3), prefix cached=4.
+        m = build_magi_block_mask(10, 6, 3)
+        allowed = (m[0, 0] == 0).tolist()
+        qgs = 10 - 6  # global start = 4
+        # Recompute rows 0..2 are causal in global coordinates.
+        for i in range(3):
+            for j in range(10):
+                self.assertEqual(allowed[i][j], j <= qgs + i, f"recompute ({i},{j})")
+        # Block rows attend prefix [0, blocked_k) and the window [window_start, kv).
+        blocked_k = 10 - 3 - 1  # = 6
+        window_start = 10 - 3  # = 7
+        for i in range(3, 6):
+            for j in range(10):
+                expect = (j < blocked_k) or (j >= window_start)
+                self.assertEqual(allowed[i][j], expect, f"block ({i},{j})")
+
+    def _block_probs(self, rows):
+        """Build a [6, vocab] one-hot-ish prob array from per-row {id: p} dicts."""
+        vocab = 512
+        probs = mx.zeros((6, vocab))
+        for i, row in enumerate(rows):
+            for tid, p in row.items():
+                probs[i, tid] = p
+        return probs
+
+    def test_decode_bbox_avg_coord_box(self):
+        from mlx_vlm.models.locateanything.pbd import decode_bbox_avg
+
+        t = self.TOKEN_IDS
+        rows = [
+            {t["box_start_token_id"]: 1.0},
+            {210: 1.0},
+            {220: 1.0},
+            {230: 1.0},
+            {240: 1.0},
+            {t["box_end_token_id"]: 1.0},
+        ]
+        box = decode_bbox_avg(self._block_probs(rows), t, generation_mode="fast")
+        self.assertEqual(
+            box,
+            [t["box_start_token_id"], 210, 220, 230, 240, t["box_end_token_id"]],
+        )
+
+    def test_decode_bbox_avg_rejects_terminal_block(self):
+        from mlx_vlm.models.locateanything.pbd import decode_bbox_avg
+
+        t = self.TOKEN_IDS
+        # Bridge says im_end; positions 1-4 are null, position 5 null (would pass
+        # end_thresh). The position-0 gate must reject this terminal block.
+        rows = [
+            {t["im_end_token_id"]: 0.99, t["box_start_token_id"]: 0.001},
+            {t["null_token_id"]: 1.0},
+            {t["null_token_id"]: 1.0},
+            {t["null_token_id"]: 1.0},
+            {t["null_token_id"]: 1.0},
+            {t["null_token_id"]: 1.0},
+        ]
+        self.assertIsNone(
+            decode_bbox_avg(self._block_probs(rows), t, generation_mode="hybrid")
+        )
+
+    def test_handle_pattern_coord_box(self):
+        from mlx_vlm.models.locateanything.pbd import handle_pattern
+
+        t = self.TOKEN_IDS
+        x0 = [t["box_start_token_id"], 210, 220, 230, 240, t["box_end_token_id"]]
+        out = handle_pattern(x0, t, "hybrid")
+        self.assertEqual(out["type"], "coord_box")
+        self.assertEqual(out["tokens"], x0)
+        self.assertFalse(out["need_switch_to_ar"])
+
+    def test_handle_pattern_terminal(self):
+        from mlx_vlm.models.locateanything.pbd import handle_pattern
+
+        t = self.TOKEN_IDS
+        out = handle_pattern(
+            [t["im_end_token_id"]] + [t["null_token_id"]] * 5, t, "hybrid"
+        )
+        self.assertEqual(out["type"], "im_end")
+        self.assertTrue(out["is_terminal"])
+
+    def test_handle_pattern_error_box_switches_to_ar(self):
+        from mlx_vlm.models.locateanything.pbd import handle_pattern
+
+        t = self.TOKEN_IDS
+        # box_start, one coord, then a non-coord -> malformed box in hybrid mode.
+        x0 = [
+            t["box_start_token_id"],
+            210,
+            t["null_token_id"],
+            0,
+            240,
+            t["box_end_token_id"],
+        ]
+        out = handle_pattern(x0, t, "hybrid")
+        self.assertEqual(out["type"], "error_box")
+        self.assertTrue(out["need_switch_to_ar"])
+        self.assertEqual(out["tokens"], [t["box_start_token_id"], 210])
+
+    def test_handle_pattern_error_box_stays_in_fast(self):
+        from mlx_vlm.models.locateanything.pbd import handle_pattern
+
+        t = self.TOKEN_IDS
+        x0 = [
+            t["box_start_token_id"],
+            210,
+            t["null_token_id"],
+            0,
+            240,
+            t["box_end_token_id"],
+        ]
+        out = handle_pattern(x0, t, "fast")
+        self.assertEqual(out["type"], "coord_box")
+        self.assertFalse(out["need_switch_to_ar"])
 
 
 if __name__ == "__main__":

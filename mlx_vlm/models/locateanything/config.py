@@ -52,6 +52,12 @@ class TextConfig(BaseModelConfig):
     rope_scaling: Optional[dict] = None
     max_position_embeddings: int = 32768
     tie_word_embeddings: bool = True
+    # Parallel Box Decoding (PBD) fields
+    block_size: int = 6
+    causal_attn: bool = False
+    text_mask_token_id: int = 151676
+    null_token_id: int = 152678
+    switch_token_id: int = 152679
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -75,3 +81,5 @@ class ModelConfig(BaseModelConfig):
     mlp_connector_layers: int = 2
     vocab_size: int = 152681
     eos_token_id: Optional[List[int]] = None
+    # MTP block length for Parallel Box Decoding (mirrors text_config.block_size)
+    n_future_tokens: int = 6

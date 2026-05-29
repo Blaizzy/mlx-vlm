@@ -1,9 +1,10 @@
-from typing import Optional
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
+from ..cache import KVCache
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -104,6 +105,34 @@ class Model(nn.Module):
             inputs=input_ids,
             cache=cache,
             inputs_embeds=input_embeddings_features.inputs_embeds,
+        )
+
+    def make_cache(self):
+        return [KVCache() for _ in self.language_model.model.layers]
+
+    def pbd_generate(
+        self,
+        input_ids: mx.array,
+        pixel_values: Optional[mx.array] = None,
+        generation_mode: str = "hybrid",
+        max_tokens: int = 2048,
+        cache=None,
+        **kwargs,
+    ) -> List[int]:
+        """Parallel Box Decoding entry point (fast / hybrid / slow).
+
+        Returns the list of generated token ids (excluding the prompt). ``slow``
+        is pure auto-regressive and matches the default AR path; ``fast`` and
+        ``hybrid`` use the MTP block decoder in :mod:`.pbd`.
+        """
+        from .pbd import PBDDecoder
+
+        embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        if cache is None:
+            cache = self.make_cache()
+        decoder = PBDDecoder(self, generation_mode=generation_mode)
+        return decoder.generate(
+            input_ids, embeds.inputs_embeds, cache, max_tokens=max_tokens
         )
 
     def sanitize(self, weights):
