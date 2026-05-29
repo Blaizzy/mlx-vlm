@@ -170,7 +170,9 @@ def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
         kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
     if args.diffusion_sampler != "auto-regressive-euler":
         kwargs["diffusion_sampler"] = args.diffusion_sampler
-        kwargs["diffusion_threshold"] = args.diffusion_threshold
+        kwargs["diffusion_threshold"] = (
+            0.9 if args.threshold is None else args.threshold
+        )
     return kwargs
 
 
