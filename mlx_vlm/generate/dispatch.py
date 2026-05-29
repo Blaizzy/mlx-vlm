@@ -56,7 +56,6 @@ DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD = 0.5
 DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS = 16
 DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER = 1
 DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS = 2
-DEFAULT_MASKED_DIFFUSION_CACHE_STRATEGY = "prefix"
 
 
 def parse_arguments():
@@ -206,12 +205,6 @@ def parse_arguments():
         type=int,
         default=None,
         help="Stop post-fill refinement after this many stable no-edit steps.",
-    )
-    parser.add_argument(
-        "--cache-strategy",
-        choices=["prefix", "window"],
-        default=None,
-        help="Masked diffusion attention strategy: prefix cache or full block window.",
     )
     parser.add_argument(
         "--diffusion-full-canvas",
@@ -752,9 +745,6 @@ def stream_generate(
         stability_steps = kwargs.get(
             "stability_steps", DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS
         )
-        cache_strategy = kwargs.get(
-            "cache_strategy", DEFAULT_MASKED_DIFFUSION_CACHE_STRATEGY
-        )
 
         generation_stats = {}
         tic = time.perf_counter()
@@ -773,7 +763,6 @@ def stream_generate(
             num_to_transfer=num_to_transfer,
             max_transfer_per_step=max_transfer_per_step,
             stability_steps=stability_steps,
-            cache_strategy=cache_strategy,
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
@@ -1313,7 +1302,6 @@ def main():
         "editing_threshold": None,
         "max_post_steps": None,
         "stability_steps": None,
-        "cache_strategy": None,
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
@@ -1461,8 +1449,6 @@ def main():
                 stream_kwargs["max_post_steps"] = args.max_post_steps
             if args.stability_steps is not None:
                 stream_kwargs["stability_steps"] = args.stability_steps
-            if args.cache_strategy is not None:
-                stream_kwargs["cache_strategy"] = args.cache_strategy
             stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
             diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
@@ -1533,8 +1519,6 @@ def main():
             gen_kwargs["max_post_steps"] = args.max_post_steps
         if args.stability_steps is not None:
             gen_kwargs["stability_steps"] = args.stability_steps
-        if args.cache_strategy is not None:
-            gen_kwargs["cache_strategy"] = args.cache_strategy
         gen_kwargs.update(diffusion_kwargs_from_args(args, config))
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
