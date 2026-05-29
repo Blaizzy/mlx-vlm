@@ -34,6 +34,7 @@ class ModelConfig(BaseModelConfig):
     mask_token_id: int = 100
     default_generation_mode: str = "ar"
     default_diffusion_steps: int = 32
+    default_diffusion_threshold: Optional[float] = 0.9
     dlm_paradigm: str = "bidirectional"
     block_size: int = 32
     dlm_loss_weight: Optional[float] = None

@@ -615,9 +615,12 @@ class LanguageModel(nn.Module):
                 confidence = mx.where(mask_index, token_probs, -mx.inf)
                 remaining_steps = max(1, steps - step_idx)
                 masked_count = int(mask_index.sum().item())
-                transfer_count = max(
-                    1, (masked_count + remaining_steps - 1) // remaining_steps
-                )
+                if threshold is not None:
+                    transfer_count = masked_count
+                else:
+                    transfer_count = max(
+                        1, (masked_count + remaining_steps - 1) // remaining_steps
+                    )
                 if max_transfer_per_step is not None:
                     transfer_count = min(transfer_count, max_transfer_per_step)
                 _, indices = _topk(confidence, min(transfer_count, masked_count))

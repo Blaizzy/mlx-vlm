@@ -779,7 +779,9 @@ def stream_generate(
         )
         config = getattr(model, "config", None)
         if getattr(config, "default_generation_mode", None) == "ar":
-            threshold = kwargs.get("threshold")
+            threshold = kwargs.get(
+                "threshold", getattr(config, "default_diffusion_threshold", None)
+            )
             min_threshold = kwargs.get("min_threshold")
         else:
             threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)

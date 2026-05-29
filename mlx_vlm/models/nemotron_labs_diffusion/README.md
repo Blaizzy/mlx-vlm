@@ -37,7 +37,7 @@ mlx_vlm.generate \
 ### Diffusion generation
 
 Pass `generation_mode="diffusion"` to use the masked diffusion path.
-Nemotron defaults to 32 denoising steps in this mode for a quality-first diffusion schedule.
+Nemotron defaults to 32 denoising steps and a 0.9 transfer threshold in this mode, matching the upstream dLM example.
 
 ```sh
 mlx_vlm.generate \
@@ -167,6 +167,6 @@ print(result.text)
 - The model is text-only. Image, audio, and video inputs are not supported.
 - AR generation should use the normal CLI without diffusion-specific arguments.
 - Diffusion generation uses masked block denoising. `--verbose` shows the block visualization as masks are filled.
-- The default diffusion schedule uses 32 denoising steps and no confidence threshold. Lower `--max-denoising-steps` for speed experiments, but quality can degrade quickly.
+- The default diffusion schedule uses 32 denoising steps and a 0.9 confidence threshold. Lower `--max-denoising-steps` for speed experiments, but quality can degrade quickly.
 - Diffusion and linear self-speculative generation are exposed through `generation_mode`, for example `--gen-kwargs '{"generation_mode": "diffusion"}'`.
 - The optional `linear_spec_lora` adapter included in the Hugging Face repo is used only during the diffusion draft phase of linear self-speculation.
