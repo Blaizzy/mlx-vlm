@@ -20,7 +20,7 @@ from fastapi.responses import StreamingResponse
 
 from ..generate import generate, stream_generate
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
-from ..generate.image import generate_image, is_image_generation_model, parse_size
+from ..generate.image import generate_image, parse_size
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
@@ -268,14 +268,6 @@ async def images_generations_endpoint(request: Request):
     request_start = time.perf_counter()
     body = await request.json()
     image_request = ImageGenerationRequest(**body)
-    if not is_image_generation_model(image_request.model):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Model {image_request.model!r} is not a supported image "
-                "generation model."
-            ),
-        )
     if not image_request.prompt:
         raise HTTPException(status_code=400, detail="Missing prompt.")
 
@@ -293,7 +285,9 @@ async def images_generations_endpoint(request: Request):
         stream=False,
     )
     try:
-        model, _, _ = get_cached_model(image_request.model)
+        model, _, _ = get_cached_model(
+            image_request.model, model_kind="image_generation"
+        )
         generation_lock = runtime.model_cache.get("generation_lock")
 
         def _generate_all():

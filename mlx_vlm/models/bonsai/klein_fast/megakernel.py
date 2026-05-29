@@ -112,7 +112,6 @@ class Flux2KleinMegakernel:
         """
         if temb.ndim == 1:
             temb = temb[None, :]
-        dim = self.spec.dim
 
         double_mods = []
         for block in self.double_blocks:

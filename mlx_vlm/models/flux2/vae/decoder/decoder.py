@@ -1,12 +1,12 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.constants import ModelConfig
-from mlx_vlm.models.bonsai.vae.common.unet_mid_block import Flux2UNetMidBlock2D
-from mlx_vlm.models.bonsai.vae.decoder.conv_in import Flux2ConvIn
-from mlx_vlm.models.bonsai.vae.decoder.conv_norm_out import Flux2ConvNormOut
-from mlx_vlm.models.bonsai.vae.decoder.conv_out import Flux2ConvOut
-from mlx_vlm.models.bonsai.vae.decoder.up_decoder_block import Flux2UpDecoderBlock2D
+from mlx_vlm.models.flux2.constants import ModelConfig
+from mlx_vlm.models.flux2.vae.common.unet_mid_block import Flux2UNetMidBlock2D
+from mlx_vlm.models.flux2.vae.decoder.conv_in import Flux2ConvIn
+from mlx_vlm.models.flux2.vae.decoder.conv_norm_out import Flux2ConvNormOut
+from mlx_vlm.models.flux2.vae.decoder.conv_out import Flux2ConvOut
+from mlx_vlm.models.flux2.vae.decoder.up_decoder_block import Flux2UpDecoderBlock2D
 
 
 class Flux2Decoder(nn.Module):

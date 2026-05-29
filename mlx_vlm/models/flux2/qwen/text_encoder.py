@@ -1,9 +1,9 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.qwen.decoder_layer import Qwen3VLDecoderLayer
-from mlx_vlm.models.bonsai.qwen.rms_norm import Qwen3VLRMSNorm
-from mlx_vlm.models.bonsai.qwen.rotary import Qwen3TextRotaryEmbedding
+from mlx_vlm.models.flux2.qwen.decoder_layer import Qwen3VLDecoderLayer
+from mlx_vlm.models.flux2.qwen.rms_norm import Qwen3VLRMSNorm
+from mlx_vlm.models.flux2.qwen.rotary import Qwen3TextRotaryEmbedding
 
 
 class Qwen3TextEncoder(nn.Module):

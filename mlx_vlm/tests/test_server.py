@@ -540,12 +540,16 @@ def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
 
 def test_images_generations_returns_b64_json(client, monkeypatch):
     calls = []
+    cache_calls = []
 
-    monkeypatch.setattr(server_openai, "is_image_generation_model", lambda model: True)
+    def fake_get_cached_model(model, **kwargs):
+        cache_calls.append((model, kwargs))
+        return SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")
+
     monkeypatch.setattr(
         server,
         "get_cached_model",
-        lambda model: (SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")),
+        fake_get_cached_model,
     )
 
     def fake_generate_image(model, request, **kwargs):
@@ -573,14 +577,18 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert [item["seed"] for item in payload["data"]] == [10, 11]
     assert all(item["b64_json"] for item in payload["data"])
     assert [call.seed for call in calls] == [10, 11]
+    assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
 
 
 def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
-    monkeypatch.setattr(server_openai, "is_image_generation_model", lambda model: True)
     monkeypatch.setattr(
         server,
         "get_cached_model",
-        lambda model: (SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")),
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="bonsai"),
+        ),
     )
 
     def fake_generate_image(model, request, **kwargs):

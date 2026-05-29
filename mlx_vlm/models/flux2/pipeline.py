@@ -9,33 +9,20 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
-from mlx_vlm.models.bonsai.config import (
-    BonsaiVariant,
-    default_model_path,
-    get_variant,
-    validate_dimensions,
-)
-from mlx_vlm.models.bonsai.download import download_model, validate_model_layout
-from mlx_vlm.models.bonsai.klein_fast.blocks import (
-    DEFAULT_QUANT_GROUP_SIZE,
-    _require_native_quantized_matmul,
-)
-from mlx_vlm.models.bonsai.weights import (
-    load_text_encoder_4bit,
-    load_transformer,
-    load_vae,
-)
+from mlx_vlm.models.flux2.config import Flux2Variant, get_variant, validate_dimensions
+from mlx_vlm.models.flux2.download import download_model, validate_model_layout
 from mlx_vlm.models.flux2.latent import prepare_packed_latents
 from mlx_vlm.models.flux2.prompt import encode_prompt
 from mlx_vlm.models.flux2.scheduler import FlowMatchEulerDiscreteScheduler
 from mlx_vlm.models.flux2.tiling import TilingConfig
 from mlx_vlm.models.flux2.tokenizer import Flux2Tokenizer
+from mlx_vlm.models.flux2.weights import load_text_encoder, load_transformer, load_vae
 
 TiledVAE = Literal["auto", "on", "off"]
 
 
 @dataclass(frozen=True, slots=True)
-class BonsaiRuntimeConfig:
+class Flux2RuntimeConfig:
     evict_text_encoder: bool = True
     evict_transformer: bool = False
     bucketed_seq_len: bool = True
@@ -43,31 +30,29 @@ class BonsaiRuntimeConfig:
     max_sequence_length: int = 512
 
 
-class BonsaiImage:
+class Flux2Image:
     def __init__(
         self,
         *,
-        variant: str | BonsaiVariant = "ternary",
+        variant: str | Flux2Variant = "flux2-klein-4b",
         model_path: str | Path,
-        runtime_config: BonsaiRuntimeConfig | None = None,
+        runtime_config: Flux2RuntimeConfig | None = None,
     ) -> None:
         self.variant = get_variant(variant)
         self.model_path = validate_model_layout(model_path)
-        self.runtime_config = runtime_config or BonsaiRuntimeConfig()
+        self.runtime_config = runtime_config or Flux2RuntimeConfig()
         self.tokenizer = Flux2Tokenizer(self.model_path)
-        self.text_encoder = load_text_encoder_4bit(self.model_path)
+        self.text_encoder = load_text_encoder(self.model_path, self.variant)
         self.transformer = None
         self.vae = None
         self.prompt_cache: dict[tuple[str, int, bool], tuple[mx.array, mx.array]] = {}
-        _check_quantized_matmul(self.variant.precision)
 
     @classmethod
     def from_pretrained(
         cls,
-        variant: str | BonsaiVariant = "ternary",
+        variant: str | Flux2Variant = "flux2-klein-4b",
         *,
         model_path: str | Path | None = None,
-        models_dir: str | Path | None = None,
         download: bool = True,
         token: str | None = None,
         evict_text_encoder: bool = True,
@@ -75,14 +60,15 @@ class BonsaiImage:
         bucketed_seq_len: bool = True,
         tiled_vae: TiledVAE = "auto",
         max_sequence_length: int = 512,
-    ) -> "BonsaiImage":
+    ) -> "Flux2Image":
         spec = get_variant(variant)
         if model_path is None:
-            if download:
-                model_path = download_model(spec, models_dir=models_dir, token=token)
-            else:
-                model_path = default_model_path(spec, models_dir)
-        config = BonsaiRuntimeConfig(
+            if not download:
+                raise FileNotFoundError(
+                    f"No local model_path was provided for {spec.repo_id}"
+                )
+            model_path = download_model(spec, token=token)
+        config = Flux2RuntimeConfig(
             evict_text_encoder=evict_text_encoder,
             evict_transformer=evict_transformer,
             bucketed_seq_len=bucketed_seq_len,
@@ -97,8 +83,8 @@ class BonsaiImage:
         *,
         seed: int = 42,
         steps: int = 4,
-        width: int = 512,
-        height: int = 512,
+        width: int = 1024,
+        height: int = 1024,
         guidance: float = 1.0,
         max_sequence_length: int | None = None,
         tiled_vae: bool | None = None,
@@ -122,8 +108,8 @@ class BonsaiImage:
         *,
         seed: int = 42,
         steps: int = 4,
-        width: int = 512,
-        height: int = 512,
+        width: int = 1024,
+        height: int = 1024,
         guidance: float = 1.0,
         max_sequence_length: int | None = None,
         tiled_vae: bool | None = None,
@@ -155,23 +141,20 @@ class BonsaiImage:
             image_seq_len=(height // 16) * (width // 16),
             num_inference_steps=steps,
         )
-        predict = self._predict
         for i in range(steps):
-            noise = predict(
+            noise = self._predict(
                 latents=latents,
                 latent_ids=latent_ids,
                 prompt_embeds=prompt_embeds,
                 text_ids=text_ids,
-                guidance=guidance,
                 timestep=scheduler.timesteps[i],
             )
             if negative_prompt_embeds is not None and negative_text_ids is not None:
-                negative_noise = predict(
+                negative_noise = self._predict(
                     latents=latents,
                     latent_ids=latent_ids,
                     prompt_embeds=negative_prompt_embeds,
                     text_ids=negative_text_ids,
-                    guidance=guidance,
                     timestep=scheduler.timesteps[i],
                 )
                 noise = negative_noise + guidance * (noise - negative_noise)
@@ -203,7 +186,7 @@ class BonsaiImage:
         if cached is not None:
             return cached
         if self.text_encoder is None:
-            self.text_encoder = load_text_encoder_4bit(self.model_path)
+            self.text_encoder = load_text_encoder(self.model_path, self.variant)
         embeds, text_ids = encode_prompt(
             prompt=prompt,
             tokenizer=self.tokenizer,
@@ -221,9 +204,9 @@ class BonsaiImage:
 
     def _ensure_transformer_and_vae(self) -> None:
         if self.transformer is None:
-            self.transformer = load_transformer(self.model_path, self.variant.precision)
+            self.transformer = load_transformer(self.model_path, self.variant)
         if self.vae is None:
-            self.vae = load_vae()
+            self.vae = load_vae(self.model_path)
 
     def _predict(
         self,
@@ -232,7 +215,6 @@ class BonsaiImage:
         latent_ids: mx.array,
         prompt_embeds: mx.array,
         text_ids: mx.array,
-        guidance: float,
         timestep: mx.array,
     ) -> mx.array:
         return self.transformer(  # type: ignore[operator]
@@ -275,17 +257,3 @@ def _to_image_array(decoded_latents: mx.array) -> mx.array:
 def _to_pil(image_array: mx.array) -> Image.Image:
     array = np.array(image_array)
     return Image.fromarray(array)
-
-
-def _check_quantized_matmul(precision: str) -> None:
-    bits = 1 if precision == "1bit" else 2 if precision == "2bit" else None
-    if bits is None:
-        return
-    try:
-        _require_native_quantized_matmul(bits, DEFAULT_QUANT_GROUP_SIZE)
-    except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(
-            "The installed MLX runtime does not support the Bonsai "
-            f"{precision} quantized matmul path. Use the PrismML MLX revision "
-            "pinned by the original demo, or another MLX build with this kernel."
-        ) from exc

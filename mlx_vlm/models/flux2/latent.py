@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from mlx_vlm.models.bonsai.constants import ModelConfig
+from mlx_vlm.models.flux2.constants import ModelConfig
 
 
 def prepare_packed_latents(

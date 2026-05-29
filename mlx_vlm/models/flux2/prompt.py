@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from mlx_vlm.models.bonsai.qwen.text_encoder import Qwen3TextEncoder
-from mlx_vlm.models.bonsai.tokenizer import BonsaiTokenizer
+from mlx_vlm.models.flux2.qwen.text_encoder import Qwen3TextEncoder
+from mlx_vlm.models.flux2.tokenizer import Flux2Tokenizer
 
 DEFAULT_SEQ_LEN_BUCKETS: tuple[int, ...] = (32, 64, 128, 256, 512)
 
@@ -19,7 +19,7 @@ def _pick_bucket(true_len: int, buckets: tuple[int, ...], cap: int) -> int:
 def encode_prompt(
     *,
     prompt: str | list[str],
-    tokenizer: BonsaiTokenizer,
+    tokenizer: Flux2Tokenizer,
     text_encoder: Qwen3TextEncoder,
     max_sequence_length: int = 512,
     hidden_state_layers: tuple[int, ...] = (9, 18, 27),
