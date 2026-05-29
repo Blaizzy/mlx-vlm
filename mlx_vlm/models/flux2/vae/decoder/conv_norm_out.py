@@ -1,7 +1,7 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.constants import ModelConfig
+from mlx_vlm.models.flux2.constants import ModelConfig
 
 
 class Flux2ConvNormOut(nn.GroupNorm):

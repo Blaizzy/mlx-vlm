@@ -1,8 +1,8 @@
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.vae.common.attention import Flux2AttentionBlock
-from mlx_vlm.models.bonsai.vae.common.resnet_block_2d import Flux2ResnetBlock2D
+from mlx_vlm.models.flux2.vae.common.attention import Flux2AttentionBlock
+from mlx_vlm.models.flux2.vae.common.resnet_block_2d import Flux2ResnetBlock2D
 
 
 class Flux2UNetMidBlock2D(nn.Module):

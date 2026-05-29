@@ -160,7 +160,10 @@ def _is_text_only_config(config: dict) -> bool:
 
 
 def get_model_path(
-    path_or_hf_repo: str, revision: Optional[str] = None, force_download: bool = False
+    path_or_hf_repo: str,
+    revision: Optional[str] = None,
+    force_download: bool = False,
+    allow_patterns: Optional[List[str]] = None,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -179,7 +182,8 @@ def get_model_path(
             snapshot_download(
                 repo_id=path_or_hf_repo,
                 revision=revision,
-                allow_patterns=[
+                allow_patterns=allow_patterns
+                or [
                     "*.json",
                     "*.safetensors",
                     "*.py",

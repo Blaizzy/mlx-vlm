@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import mlx.core as mx
@@ -20,6 +21,8 @@ from mlx_vlm.models.bonsai.download import (
 )
 from mlx_vlm.models.bonsai.model import BonsaiImageGenerationModel
 from mlx_vlm.models.bonsai.pipeline import BonsaiImage, BonsaiRuntimeConfig
+
+image_module = importlib.import_module("mlx_vlm.generate.image")
 
 
 class FakeTransformer:
@@ -68,6 +71,17 @@ def test_bonsai_variant_aliases_are_ternary_only() -> None:
 
 def test_bonsai_declares_image_generation_model_type(tmp_path: Path) -> None:
     _write_layout(tmp_path)
+    (tmp_path / "manifest.json").write_text(
+        """
+        {
+          "files": [
+            {"remote_path": "transformer-packed-mflux/diffusion_pytorch_model.safetensors"},
+            {"remote_path": "text_encoder-mlx-4bit/model.safetensors"},
+            {"remote_path": "tokenizer/tokenizer.json"}
+          ]
+        }
+        """
+    )
 
     assert BonsaiImageGenerationModel.is_image_generation_model
     assert BonsaiImageGenerationModel.model_type == "bonsai"
@@ -77,6 +91,34 @@ def test_bonsai_declares_image_generation_model_type(tmp_path: Path) -> None:
     )
     assert is_image_generation_model("bonsai-ternary")
     assert not is_image_generation_model("mlx-community/nanoLLaVA-1.5-8bit")
+
+
+def test_bonsai_image_model_class_uses_remote_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_layout(tmp_path)
+    (tmp_path / "manifest.json").write_text(
+        """
+        {
+          "files": [
+            {"remote_path": "transformer-packed-mflux/diffusion_pytorch_model.safetensors"},
+            {"remote_path": "text_encoder-mlx-4bit/model.safetensors"},
+            {"remote_path": "tokenizer/tokenizer.json"}
+          ]
+        }
+        """
+    )
+
+    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
+        assert repo_id == "example/custom-image-model"
+        return tmp_path
+
+    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
+
+    assert (
+        image_generation_model_class("example/custom-image-model")
+        is BonsaiImageGenerationModel
+    )
 
 
 def test_bonsai_parse_size() -> None:

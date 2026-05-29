@@ -14,7 +14,7 @@ class TokenizerOutput:
     attention_mask: mx.array
 
 
-class BonsaiTokenizer:
+class Flux2Tokenizer:
     def __init__(self, model_path: str | Path, max_length: int = 512) -> None:
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -71,3 +71,6 @@ class BonsaiTokenizer:
             input_ids=mx.array(tokens["input_ids"]),
             attention_mask=mx.array(tokens["attention_mask"]),
         )
+
+
+__all__ = ["Flux2Tokenizer", "TokenizerOutput"]

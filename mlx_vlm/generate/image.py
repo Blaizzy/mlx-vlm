@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import base64
+import importlib
+import json
 import random
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol
@@ -12,10 +16,26 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
+from ..utils import get_model_path
+
 DEFAULT_IMAGE_SIZE = "512x512"
 DEFAULT_IMAGE_STEPS = 4
 DEFAULT_IMAGE_GUIDANCE = 1.0
 DEFAULT_IMAGE_FORMAT = "png"
+IMAGE_DOWNLOAD_PATTERNS = (
+    "*.json",
+    "*.safetensors",
+    "*.txt",
+    "*.jinja",
+    "*.model",
+    "*.tiktoken",
+    "**/*.json",
+    "**/*.safetensors",
+    "**/*.txt",
+    "**/*.jinja",
+    "**/*.model",
+    "**/*.tiktoken",
+)
 
 ImageOutputFormat = Literal["b64_json", "path"]
 ImageArrayLayout = Literal["HWC"]
@@ -118,33 +138,198 @@ def _model_type_from_id(model: str) -> str:
         return ""
     name = model_id.rsplit("/", 1)[-1]
     model_type = name.split("-", 1)[0]
-    return {"ternary": "bonsai", "2bit": "bonsai"}.get(model_type, model_type)
+    return {
+        "ternary": "bonsai",
+        "2bit": "bonsai",
+        "flux.2": "flux2",
+        "flux2": "flux2",
+        "klein": "flux2",
+    }.get(model_type, model_type)
+
+
+def _normalize_model_type(model_type: Any | None) -> str | None:
+    if model_type is None:
+        return None
+    normalized = str(model_type).strip().lower().replace("-", "_")
+    return normalized if normalized and normalized.isidentifier() else None
+
+
+def _add_model_type(candidates: list[str], model_type: Any | None) -> None:
+    normalized = _normalize_model_type(model_type)
+    if normalized is not None and normalized not in candidates:
+        candidates.append(normalized)
+
+
+def _model_types_from_class_name(class_name: str) -> tuple[str, ...]:
+    tokens = re.findall(r"[A-Z][a-z0-9]*|[A-Z]+(?=[A-Z]|$)", class_name)
+    candidates: list[str] = []
+    for end in range(1, len(tokens) + 1):
+        _add_model_type(candidates, "_".join(tokens[:end]))
+    for token in tokens:
+        _add_model_type(candidates, token)
+    return tuple(candidates)
+
+
+def _image_model_types_from_metadata(metadata: dict[str, Any]) -> tuple[str, ...]:
+    candidates: list[str] = []
+    _add_model_type(candidates, metadata.get("model_type"))
+    candidates.extend(
+        candidate
+        for candidate in _model_types_from_class_name(
+            str(metadata.get("_class_name") or "")
+        )
+        if candidate not in candidates
+    )
+    for component in ("transformer", "vae", "scheduler", "text_encoder"):
+        value = metadata.get(component)
+        component_class = ""
+        if isinstance(value, Sequence) and not isinstance(value, str) and value:
+            component_class = str(value[-1])
+        elif isinstance(value, dict):
+            component_class = str(value.get("_class_name") or value.get("class") or "")
+        candidates.extend(
+            candidate
+            for candidate in _model_types_from_class_name(component_class)
+            if candidate not in candidates
+        )
+    return tuple(candidates)
+
+
+def _manifest_paths(metadata: dict[str, Any]) -> set[str]:
+    paths = set()
+    for entry in metadata.get("files", ()):
+        if isinstance(entry, str):
+            paths.add(entry)
+        elif isinstance(entry, dict):
+            path = (
+                entry.get("remote_path")
+                or entry.get("path")
+                or entry.get("filename")
+                or entry.get("name")
+            )
+            if path is not None:
+                paths.add(str(path))
+    return paths
+
+
+def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
+    paths = _manifest_paths(metadata)
+    if (
+        "transformer-packed-mflux/diffusion_pytorch_model.safetensors" in paths
+        and "text_encoder-mlx-4bit/model.safetensors" in paths
+        and "tokenizer/tokenizer.json" in paths
+    ):
+        return "bonsai"
+    return None
+
+
+def _load_json_file(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _local_image_model_types(model: str) -> tuple[str, ...]:
+    root = Path(model).expanduser()
+    if not root.exists():
+        return ()
+
+    candidates: list[str] = []
+    for filename in ("model_index.json", "config.json"):
+        metadata = _load_json_file(root / filename)
+        if metadata is not None:
+            for model_type in _image_model_types_from_metadata(metadata):
+                _add_model_type(candidates, model_type)
+
+    manifest = _load_json_file(root / "manifest.json")
+    if manifest is not None:
+        _add_model_type(candidates, _image_model_type_from_manifest(manifest))
+
+    for config_path in sorted(root.glob("*/config.json")):
+        metadata = _load_json_file(config_path)
+        if metadata is not None:
+            for model_type in _image_model_types_from_metadata(metadata):
+                _add_model_type(candidates, model_type)
+    return tuple(candidates)
+
+
+@lru_cache(maxsize=128)
+def _image_model_class_for_type(model_type: str | None) -> type[Any] | None:
+    normalized = _normalize_model_type(model_type)
+    if normalized is None:
+        return None
+    package_name = f"mlx_vlm.models.{normalized}"
+    module_name = f"{package_name}.model"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name in {package_name, module_name}:
+            return None
+        raise
+    for value in vars(module).values():
+        if (
+            isinstance(value, type)
+            and getattr(value, "is_image_generation_model", False)
+            and getattr(value, "model_type", None) == normalized
+        ):
+            return value
+    return None
+
+
+def _supported_image_model_class(
+    model_type: str | None, model: str
+) -> type[Any] | None:
+    model_class = _image_model_class_for_type(model_type)
+    if (
+        model_class is not None
+        and model_class.is_image_generation_model
+        and model_class.supports_model(model)
+    ):
+        return model_class
+    return None
+
+
+def _resolve_image_model_path(
+    model: str,
+    *,
+    revision: str | None = None,
+    force_download: bool = False,
+) -> Path | None:
+    model_path = Path(model).expanduser()
+    if model_path.exists():
+        return model_path
+    return get_model_path(
+        model,
+        revision=revision,
+        force_download=force_download,
+        allow_patterns=list(IMAGE_DOWNLOAD_PATTERNS),
+    )
 
 
 def image_generation_model_class(model: str | None) -> type[Any] | None:
     if model is None:
         return None
 
-    model_type = _model_type_from_id(model)
-    if model_type == "bonsai":
-        from ..models.bonsai.model import BonsaiImageGenerationModel
-
-        if (
-            BonsaiImageGenerationModel.is_image_generation_model
-            and BonsaiImageGenerationModel.supports_model(model)
-        ):
-            return BonsaiImageGenerationModel
-        return None
-
-    model_path = Path(model).expanduser()
-    if model_path.exists():
-        from ..models.bonsai.model import BonsaiImageGenerationModel
-
-        if (
-            BonsaiImageGenerationModel.is_image_generation_model
-            and BonsaiImageGenerationModel.supports_model(model)
-        ):
-            return BonsaiImageGenerationModel
+    try:
+        resolved_path = _resolve_image_model_path(model)
+    except Exception:
+        resolved_path = None
+    local_model_types = (
+        _local_image_model_types(str(resolved_path))
+        if resolved_path is not None
+        else ()
+    )
+    for model_type in (
+        *local_model_types,
+        _model_type_from_id(model),
+    ):
+        model_class = _image_model_class_for_type(model_type)
+        if model_class is not None and model_class.is_image_generation_model:
+            return model_class
 
     return None
 
@@ -152,7 +337,11 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
 def is_image_generation_model(model: str | None) -> bool:
     if model is None:
         return False
-    return image_generation_model_class(model) is not None
+
+    for model_type in (*_local_image_model_types(model), _model_type_from_id(model)):
+        if _supported_image_model_class(model_type, model) is not None:
+            return True
+    return False
 
 
 def load_image_generation_model(
@@ -161,8 +350,37 @@ def load_image_generation_model(
 ) -> ImageGenerationModel:
     if model is None:
         raise ValueError("Image generation model must be specified")
-    model_class = image_generation_model_class(model)
+    force_download = kwargs.pop("force_download", False)
+    revision = kwargs.pop("revision", None)
+    alias_model_class = _image_model_class_for_type(_model_type_from_id(model))
+    try:
+        resolved_path = _resolve_image_model_path(
+            model,
+            revision=revision,
+            force_download=force_download,
+        )
+    except Exception:
+        if (
+            alias_model_class is not None
+            and alias_model_class.is_image_generation_model
+        ):
+            return alias_model_class.from_model_id(model, **kwargs)
+        raise
+    local_model_types = (
+        _local_image_model_types(str(resolved_path))
+        if resolved_path is not None
+        else ()
+    )
+    model_class = None
+    for model_type in (*local_model_types, _model_type_from_id(model)):
+        model_class = _image_model_class_for_type(model_type)
+        if model_class is not None and model_class.is_image_generation_model:
+            break
+    if model_class is None:
+        model_class = alias_model_class
     if model_class is not None:
+        if resolved_path is not None:
+            kwargs.setdefault("model_path", resolved_path)
         return model_class.from_model_id(model, **kwargs)
     raise ValueError(f"Image generation model {model} is not supported")
 
