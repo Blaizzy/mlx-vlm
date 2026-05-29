@@ -23,7 +23,7 @@ def encode_prompt(
     text_encoder: Qwen3TextEncoder,
     max_sequence_length: int = 512,
     hidden_state_layers: tuple[int, ...] = (9, 18, 27),
-    bucketed: bool = True,
+    bucketed: bool = False,
 ) -> tuple[mx.array, mx.array]:
     true_len = tokenizer.count_tokens(prompt) if bucketed else max_sequence_length
     effective_max = _pick_bucket(
