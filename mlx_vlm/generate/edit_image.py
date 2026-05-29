@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import importlib
 import random
 from collections.abc import Sequence
@@ -17,9 +16,7 @@ from .image import (
     _local_image_model_types,
     _model_type_from_id,
     _normalize_model_type,
-    _prompt_to_image_text,
     _resolve_image_model_path,
-    parse_size,
 )
 
 
@@ -229,101 +226,6 @@ def edit_image(
     return data
 
 
-def parse_image_edit_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Edit an image with a supported image-editing model."
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="The path to the local model directory or Hugging Face repo.",
-    )
-    parser.add_argument(
-        "--image",
-        type=str,
-        nargs="+",
-        required=True,
-        help="Path of one or more reference images.",
-    )
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        nargs="+",
-        required=True,
-        help="Edit prompt.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Output path for the edited image.",
-    )
-    parser.add_argument(
-        "--size",
-        type=str,
-        default=None,
-        help="Edited image size as WIDTHxHEIGHT. Defaults to the first reference image size.",
-    )
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=DEFAULT_IMAGE_STEPS,
-        help="Number of image edit inference steps.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Seed for image editing. Defaults to a random 32-bit seed.",
-    )
-    parser.add_argument(
-        "--guidance",
-        type=float,
-        default=DEFAULT_IMAGE_GUIDANCE,
-        help="Classifier-free guidance for image editing.",
-    )
-    return parser.parse_args(argv)
-
-
-def run_image_edit_cli(args: Any | None = None) -> None:
-    if args is None:
-        args = parse_image_edit_arguments()
-    width = height = None
-    if args.size is not None:
-        width, height = parse_size(args.size)
-    seed = args.seed if args.seed is not None else random.randrange(2**32)
-    prompt = _prompt_to_image_text(args.prompt)
-    if not prompt:
-        raise ValueError("--prompt must not be empty for image editing")
-
-    output_path = (
-        Path(args.output).expanduser()
-        if args.output is not None
-        else Path("outputs") / f"edit-{seed}.png"
-    )
-    model = load_image_edit_model(args.model)
-    request = ImageEditRequest(
-        prompt=prompt,
-        image_paths=tuple(args.image),
-        seed=seed,
-        steps=args.steps,
-        width=width,
-        height=height,
-        guidance=args.guidance,
-    )
-    result = edit_image(
-        model,
-        request,
-        output_path=output_path,
-    )
-    print(
-        f"Saved {result.path} seed={result.seed} "
-        f"size={result.width}x{result.height} steps={result.steps} "
-        f"variant={result.variant}"
-    )
-
-
 __all__ = [
     "ImageEditModel",
     "ImageEditRequest",
@@ -331,6 +233,4 @@ __all__ = [
     "image_edit_model_class",
     "is_image_edit_model",
     "load_image_edit_model",
-    "parse_image_edit_arguments",
-    "run_image_edit_cli",
 ]

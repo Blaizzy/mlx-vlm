@@ -29,12 +29,14 @@ from .image import (
     ImageGenerationModel,
     ImageGenerationRequest,
     ImageGenerationResult,
+    ImageTask,
     generate_image,
     image_generation_model_class,
     image_to_b64_json,
     image_to_png_bytes,
     is_image_generation_model,
     load_image_generation_model,
+    load_image_model,
 )
 
 __all__ = [
@@ -47,6 +49,7 @@ __all__ = [
     "ImageGenerationModel",
     "ImageGenerationRequest",
     "ImageGenerationResult",
+    "ImageTask",
     "PromptCacheState",
     "PromptProcessingBatch",
     "batch_generate",
@@ -63,6 +66,7 @@ __all__ = [
     "is_image_generation_model",
     "load_image_edit_model",
     "load_image_generation_model",
+    "load_image_model",
     "main",
     "maybe_quantize_kv_cache",
     "parse_arguments",

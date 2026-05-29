@@ -22,6 +22,7 @@ DEFAULT_IMAGE_SIZE = "512x512"
 DEFAULT_IMAGE_STEPS = 4
 DEFAULT_IMAGE_GUIDANCE = 1.0
 DEFAULT_IMAGE_FORMAT = "png"
+DEFAULT_IMAGE_TASK = "generate"
 IMAGE_DOWNLOAD_PATTERNS = (
     "*.json",
     "*.safetensors",
@@ -38,6 +39,7 @@ IMAGE_DOWNLOAD_PATTERNS = (
 )
 
 ImageOutputFormat = Literal["b64_json", "path"]
+ImageTask = Literal["generate", "edit"]
 ImageArrayLayout = Literal["HWC"]
 ImageArrayRange = Literal["uint8_0_255"]
 ImageColorSpace = Literal["RGB"]
@@ -385,6 +387,27 @@ def load_image_generation_model(
     raise ValueError(f"Image generation model {model} is not supported")
 
 
+def _normalize_image_task(task: str | None) -> ImageTask:
+    normalized = (task or DEFAULT_IMAGE_TASK).strip().lower()
+    if normalized not in {"generate", "edit"}:
+        raise ValueError(f"Image task must be 'generate' or 'edit', got {task!r}")
+    return normalized  # type: ignore[return-value]
+
+
+def load_image_model(
+    model: str | None,
+    *,
+    task: ImageTask = DEFAULT_IMAGE_TASK,
+    **kwargs: Any,
+) -> ImageGenerationModel | Any:
+    task = _normalize_image_task(task)
+    if task == "edit":
+        from .edit_image import load_image_edit_model
+
+        return load_image_edit_model(model, **kwargs)
+    return load_image_generation_model(model, **kwargs)
+
+
 def _request_from_prompt(prompt: str, **kwargs: Any) -> ImageGenerationRequest:
     supported = {
         "seed",
@@ -405,12 +428,43 @@ def _request_from_prompt(prompt: str, **kwargs: Any) -> ImageGenerationRequest:
 
 
 def generate_image(
-    model: ImageGenerationModel,
-    request: ImageGenerationRequest | str,
+    model: ImageGenerationModel | Any,
+    request: ImageGenerationRequest | str | Any,
     *,
+    task: ImageTask = DEFAULT_IMAGE_TASK,
+    image_paths: Sequence[str | Path] | None = None,
     output_path: str | Path | None = None,
     **kwargs: Any,
 ) -> ImageGenerationResult:
+    task = _normalize_image_task(task)
+    if task == "edit":
+        from .edit_image import ImageEditRequest, edit_image
+
+        if isinstance(request, ImageGenerationRequest):
+            if image_paths is None:
+                raise ValueError(
+                    "image_paths are required when editing from "
+                    "ImageGenerationRequest"
+                )
+            request = ImageEditRequest(
+                prompt=request.prompt,
+                image_paths=tuple(image_paths),
+                seed=request.seed,
+                steps=request.steps,
+                width=request.width,
+                height=request.height,
+                guidance=request.guidance,
+                output_format=request.output_format,
+                extra=dict(request.extra),
+            )
+        return edit_image(
+            model,
+            request,
+            image_paths=image_paths,
+            output_path=output_path,
+            **kwargs,
+        )
+
     if isinstance(request, str):
         request = _request_from_prompt(request, **kwargs)
     elif kwargs:
@@ -447,28 +501,32 @@ def _prompt_to_image_text(prompt: str | Sequence[str]) -> str:
     return " ".join(str(part) for part in prompt)
 
 
-def _validate_image_generation_args(args: Any) -> None:
+def _validate_image_generation_args(args: Any, *, task: ImageTask) -> None:
     incompatible = []
-    for name in ("image", "audio", "video", "adapter_path", "draft_model"):
+    if task == "generate" and getattr(args, "image", None) is not None:
+        incompatible.append("--image")
+    if task == "edit" and not getattr(args, "image", None):
+        raise ValueError("Image editing requires at least one --image path")
+    for name in ("audio", "video", "adapter_path", "draft_model"):
         if getattr(args, name, None) is not None:
             incompatible.append(f"--{name.replace('_', '-')}")
-    if args.chat:
+    if getattr(args, "chat", False):
         incompatible.append("--chat")
-    if args.resize_shape is not None:
+    if getattr(args, "resize_shape", None) is not None:
         incompatible.append("--resize-shape")
-    if args.eos_tokens is not None:
+    if getattr(args, "eos_tokens", None) is not None:
         incompatible.append("--eos-tokens")
-    if args.kv_bits is not None:
+    if getattr(args, "kv_bits", None) is not None:
         incompatible.append("--kv-bits")
-    if args.max_kv_size is not None:
+    if getattr(args, "max_kv_size", None) is not None:
         incompatible.append("--max-kv-size")
-    if args.processor_kwargs:
+    if getattr(args, "processor_kwargs", None):
         incompatible.append("--processor-kwargs")
-    if args.quantize_activations:
+    if getattr(args, "quantize_activations", False):
         incompatible.append("--quantize-activations")
-    if args.skip_special_tokens:
+    if getattr(args, "skip_special_tokens", False):
         incompatible.append("--skip-special-tokens")
-    if args.thinking_budget is not None:
+    if getattr(args, "thinking_budget", None) is not None:
         incompatible.append("--thinking-budget")
     if getattr(args, "max_denoising_steps", None) is not None:
         incompatible.append("--max-denoising-steps")
@@ -476,36 +534,71 @@ def _validate_image_generation_args(args: Any) -> None:
         incompatible.append("--diffusion-full-canvas")
     if incompatible:
         joined = ", ".join(incompatible)
-        raise ValueError(f"Image generation does not support: {joined}")
+        raise ValueError(f"Image {task} does not support: {joined}")
 
 
 def run_image_generation_cli(args: Any) -> None:
-    _validate_image_generation_args(args)
-    width, height = parse_size(args.size)
+    task = _normalize_image_task(getattr(args, "task", DEFAULT_IMAGE_TASK))
+    _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
-        raise ValueError("--prompt must not be empty for image generation")
+        raise ValueError(f"--prompt must not be empty for image {task}")
 
-    output_path = (
-        Path(args.output).expanduser()
-        if args.output is not None
-        else Path("outputs") / f"image-{seed}.png"
-    )
-    model = load_image_generation_model(args.model)
-    request = ImageGenerationRequest(
-        prompt=prompt,
-        seed=seed,
-        steps=args.steps,
-        width=width,
-        height=height,
-        guidance=args.guidance,
-    )
-    result = generate_image(
-        model,
-        request,
-        output_path=output_path,
-    )
+    load_kwargs = {
+        "force_download": getattr(args, "force_download", False),
+        "revision": getattr(args, "revision", None),
+    }
+    if task == "edit":
+        from .edit_image import ImageEditRequest
+
+        width = height = None
+        size = getattr(args, "size", None)
+        if size is not None:
+            width, height = parse_size(size)
+        output_path = (
+            Path(args.output).expanduser()
+            if args.output is not None
+            else Path("outputs") / f"edit-{seed}.png"
+        )
+        model = load_image_model(args.model, task="edit", **load_kwargs)
+        request = ImageEditRequest(
+            prompt=prompt,
+            image_paths=tuple(args.image),
+            seed=seed,
+            steps=args.steps,
+            width=width,
+            height=height,
+            guidance=args.guidance,
+        )
+        result = generate_image(
+            model,
+            request,
+            task="edit",
+            output_path=output_path,
+        )
+    else:
+        width, height = parse_size(getattr(args, "size", None) or DEFAULT_IMAGE_SIZE)
+        output_path = (
+            Path(args.output).expanduser()
+            if args.output is not None
+            else Path("outputs") / f"image-{seed}.png"
+        )
+        model = load_image_model(args.model, task="generate", **load_kwargs)
+        request = ImageGenerationRequest(
+            prompt=prompt,
+            seed=seed,
+            steps=args.steps,
+            width=width,
+            height=height,
+            guidance=args.guidance,
+        )
+        result = generate_image(
+            model,
+            request,
+            task="generate",
+            output_path=output_path,
+        )
     print(
         f"Saved {result.path} seed={result.seed} "
         f"size={result.width}x{result.height} steps={result.steps} "
@@ -518,6 +611,7 @@ __all__ = [
     "DEFAULT_IMAGE_GUIDANCE",
     "DEFAULT_IMAGE_SIZE",
     "DEFAULT_IMAGE_STEPS",
+    "DEFAULT_IMAGE_TASK",
     "ImageArrayLayout",
     "ImageArrayRange",
     "ImageColorSpace",
@@ -525,12 +619,14 @@ __all__ = [
     "ImageGenerationRequest",
     "ImageGenerationResult",
     "ImageOutputFormat",
+    "ImageTask",
     "generate_image",
     "image_generation_model_class",
     "image_to_b64_json",
     "image_to_png_bytes",
     "is_image_generation_model",
     "load_image_generation_model",
+    "load_image_model",
     "parse_size",
     "run_image_generation_cli",
 ]

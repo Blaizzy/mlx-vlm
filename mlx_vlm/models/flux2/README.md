@@ -28,6 +28,12 @@ snapshot path as `--model`.
 Supported image sizes are 256 to 2048 pixels per side, and both dimensions must
 be multiples of 16.
 
+## Install
+
+```sh
+pip install -U mlx-vlm
+```
+
 ## CLI
 
 ### Generate an image
@@ -58,7 +64,8 @@ python -m mlx_vlm generate \
 ### Edit an image
 
 ```sh
-python -m mlx_vlm edit_image \
+python -m mlx_vlm generate_image \
+  --task edit \
   --model black-forest-labs/FLUX.2-klein-9B \
   --image input/person.png \
   --prompt "Add black sunglasses" \
@@ -71,7 +78,8 @@ python -m mlx_vlm edit_image \
 ### Edit an image with the KV-cache variant
 
 ```sh
-python -m mlx_vlm edit_image \
+python -m mlx_vlm generate_image \
+  --task edit \
   --model black-forest-labs/FLUX.2-klein-9b-kv \
   --image input/person.png \
   --prompt "Add black sunglasses" \
@@ -143,25 +151,22 @@ print(result.path)
 ### Image editing
 
 ```python
-from mlx_vlm.generate.edit_image import (
-    ImageEditRequest,
-    edit_image,
-    load_image_edit_model,
-)
+from mlx_vlm.generate.image import generate_image, load_image_model
 
-model = load_image_edit_model("black-forest-labs/FLUX.2-klein-9b-kv")
+model = load_image_model("black-forest-labs/FLUX.2-klein-9b-kv", task="edit")
 
-request = ImageEditRequest(
-    prompt="Add black sunglasses",
+result = generate_image(
+    model,
+    "Add black sunglasses",
+    task="edit",
     image_paths=("input/person.png",),
     seed=123,
     steps=4,
     width=512,
     height=512,
     guidance=1.0,
+    output_path="outputs/flux2-edit-kv.png",
 )
-
-result = edit_image(model, request, output_path="outputs/flux2-edit-kv.png")
 print(result.array.shape, result.path)
 ```
 
