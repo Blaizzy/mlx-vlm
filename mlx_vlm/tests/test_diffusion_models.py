@@ -19,8 +19,31 @@ class _Tokenizer:
         return "decoded"
 
 
+class _Detokenizer:
+    def __init__(self):
+        self.text = ""
+        self.offset = 0
+
+    def reset(self):
+        self.text = ""
+        self.offset = 0
+
+    def add_token(self, token, skip_special_token_ids=None):
+        self.text += "decoded"
+
+    def finalize(self):
+        pass
+
+    @property
+    def last_segment(self):
+        segment = self.text[self.offset :]
+        self.offset = len(self.text)
+        return segment
+
+
 class _Processor:
     tokenizer = _Tokenizer()
+    detokenizer = _Detokenizer()
 
 
 class TestDiffusionModels(unittest.TestCase):
@@ -201,3 +224,129 @@ class TestDiffusionModels(unittest.TestCase):
             llada_language.LLaDA2MoeModel.__call__ = original_call
 
         self.assertLessEqual(calls["count"], 6)
+
+    def test_nemotron_labs_diffusion(self):
+        from mlx_vlm.models import nemotron_labs_diffusion
+
+        config = nemotron_labs_diffusion.ModelConfig(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": 1000000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+            eos_token_id=3,
+            mask_token_id=127,
+        )
+        model = nemotron_labs_diffusion.Model(config)
+        self.dtype_consistency_test_runner(
+            model.language_model,
+            config.model_type,
+            config.num_hidden_layers,
+        )
+
+        generated = model.language_model.generate(
+            mx.array([[4]], dtype=mx.int32),
+            block_length=4,
+            steps=1,
+            gen_length=8,
+            max_post_steps=4,
+            mask_id=127,
+            eos_id=999,
+        )
+        self.assertEqual(generated.shape, (1, 8))
+
+        ar_generated, ar_nfe = model.language_model.ar_generate(
+            mx.array([[4]], dtype=mx.int32),
+            max_new_tokens=2,
+            eos_token_id=3,
+        )
+        mx.eval(ar_generated)
+        self.assertEqual(ar_generated.shape[0], 1)
+        self.assertLessEqual(ar_generated.shape[1], 3)
+        self.assertGreaterEqual(ar_nfe, 1)
+
+        spec_generated, spec_nfe = model.language_model.linear_spec_generate(
+            mx.array([[4]], dtype=mx.int32),
+            max_new_tokens=2,
+            block_length=2,
+            eos_token_id=3,
+            mask_token_id=127,
+        )
+        mx.eval(spec_generated)
+        self.assertEqual(spec_generated.shape[0], 1)
+        self.assertLessEqual(spec_generated.shape[1], 3)
+        self.assertGreaterEqual(spec_nfe, 1)
+
+        def unexpected_diffusion_generate(*args, **kwargs):
+            raise AssertionError("Default Nemotron generation should use AR")
+
+        model.language_model.generate = unexpected_diffusion_generate
+        default_results = list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=1,
+                temperature=0.0,
+            )
+        )
+        self.assertEqual(default_results[-1].generation_tokens, 1)
+
+        diffusion_calls = {}
+
+        def diffusion_generate(input_ids, **kwargs):
+            diffusion_calls["kwargs"] = kwargs
+            kwargs["stats"]["prompt_time"] = 1.0
+            return mx.array([[5, 3]], dtype=mx.int32)
+
+        model.language_model.generate = diffusion_generate
+        diffusion_results = list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                generation_mode="diffusion",
+                temperature=0.0,
+            )
+        )
+        self.assertTrue(diffusion_calls["kwargs"])
+        self.assertFalse(diffusion_calls["kwargs"]["linear_speculative"])
+        self.assertEqual(diffusion_results[-1].generation_tokens, 2)
+
+        linear_calls = {}
+
+        def generate(input_ids, **kwargs):
+            linear_calls["kwargs"] = kwargs
+            kwargs["stats"]["prompt_time"] = 1.0
+            return mx.array([[5, 3]], dtype=mx.int32)
+
+        model.language_model.generate = generate
+        results = list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                generation_mode="linear_speculative",
+                temperature=0.0,
+            )
+        )
+        self.assertTrue(linear_calls["kwargs"])
+        self.assertTrue(linear_calls["kwargs"]["linear_speculative"])
+        self.assertGreaterEqual(len(results), 1)
+        self.assertEqual(results[-1].generation_tokens, 2)
+        self.assertEqual(results[-1].finish_reason, "stop")

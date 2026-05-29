@@ -380,6 +380,13 @@ def parse_arguments():
         'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
     parser.add_argument(
+        "--gen-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra generation kwargs as JSON. "
+        "Example: --gen-kwargs '{\"linear_speculative\": true}'",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
@@ -606,6 +613,21 @@ def is_masked_diffusion_text_model(model: nn.Module) -> bool:
     return getattr(config, "mask_token_id", None) is not None
 
 
+def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
+    if not is_masked_diffusion_text_model(model):
+        return False
+
+    config = getattr(model, "config", None)
+    if getattr(config, "default_generation_mode", None) != "ar":
+        return True
+
+    generation_mode = kwargs.get("generation_mode")
+    if generation_mode is not None:
+        return generation_mode in ("diffusion", "linear_speculative")
+
+    return bool(kwargs.get("linear_speculative", False))
+
+
 def _prime_cached_prefix_rope_state(
     model: nn.Module,
     full_input_ids: mx.array,
@@ -738,7 +760,7 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    if is_masked_diffusion_text_model(model):
+    if _use_masked_diffusion_text_path(model, kwargs):
         if image is not None or audio is not None or video is not None:
             raise ValueError("Diffusion text generation models are text-only.")
 
@@ -789,6 +811,8 @@ def stream_generate(
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
             stats=generation_stats,
+            linear_speculative=kwargs.get("linear_speculative", False)
+            or kwargs.get("generation_mode") == "linear_speculative",
         )
         mx.eval(generated)
         total_time = time.perf_counter() - tic
@@ -1325,6 +1349,7 @@ def main():
         "editing_threshold": None,
         "max_post_steps": None,
         "stability_steps": None,
+        "gen_kwargs": {},
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
@@ -1409,6 +1434,10 @@ def main():
     # Add processor kwargs from JSON
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
+
+    # Add generation kwargs from JSON
+    if args.gen_kwargs:
+        kwargs.update(args.gen_kwargs)
 
     # Add thinking kwargs
     kwargs["enable_thinking"] = args.enable_thinking
