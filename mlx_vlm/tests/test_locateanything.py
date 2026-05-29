@@ -164,9 +164,7 @@ class TestLocateAnythingModel(unittest.TestCase):
         self.assertIn("multi_modal_projector.layer_norm.weight", out)
         self.assertIn("multi_modal_projector.linear_1.bias", out)
         self.assertIn("multi_modal_projector.linear_2.weight", out)
-        self.assertIn(
-            "language_model.model.layers.0.self_attn.q_proj.weight", out
-        )
+        self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", out)
         # tied lm_head is dropped
         self.assertNotIn("language_model.lm_head.weight", out)
 

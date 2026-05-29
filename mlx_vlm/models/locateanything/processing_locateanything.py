@@ -237,7 +237,9 @@ class LocateAnythingProcessor(ProcessorMixin):
                     if not path.exists():
                         return {}
                 else:
-                    path = Path(hf_hub_download(pretrained_model_name_or_path, filename))
+                    path = Path(
+                        hf_hub_download(pretrained_model_name_or_path, filename)
+                    )
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception:

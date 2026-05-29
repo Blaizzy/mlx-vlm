@@ -30,7 +30,9 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
-        self.rope = nn.RoPE(head_dim, traditional=args.rope_traditional, base=args.rope_theta)
+        self.rope = nn.RoPE(
+            head_dim, traditional=args.rope_traditional, base=args.rope_theta
+        )
 
     def __call__(
         self,
@@ -131,9 +133,7 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         self.model = Qwen2Model(config)
         if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(
-                config.hidden_size, config.vocab_size, bias=False
-            )
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -152,9 +152,7 @@ class LanguageModel(nn.Module):
 
     def sanitize(self, weights):
         return {
-            k: v
-            for k, v in weights.items()
-            if "self_attn.rotary_emb.inv_freq" not in k
+            k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
         }
 
     @property
