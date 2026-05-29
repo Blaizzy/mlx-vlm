@@ -25,6 +25,7 @@ from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_IMAGE_STEPS,
+    DEFAULT_IMAGE_TASK,
     run_image_generation_cli,
 )
 
@@ -83,28 +84,38 @@ def parse_arguments():
         help="Output path for image generation.",
     )
     parser.add_argument(
+        "--task",
+        type=str,
+        choices=("generate", "edit"),
+        default=DEFAULT_IMAGE_TASK,
+        help="Image task to run when --output-modality image is selected.",
+    )
+    parser.add_argument(
         "--size",
         type=str,
-        default=DEFAULT_IMAGE_SIZE,
-        help="Generated image size as WIDTHxHEIGHT.",
+        default=None,
+        help=(
+            "Image size as WIDTHxHEIGHT. Generation defaults to "
+            f"{DEFAULT_IMAGE_SIZE}; editing defaults to the first reference image size."
+        ),
     )
     parser.add_argument(
         "--steps",
         type=int,
         default=DEFAULT_IMAGE_STEPS,
-        help="Number of image generation inference steps.",
+        help="Number of image inference steps.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Seed for image generation. Defaults to a random 32-bit seed.",
+        help="Seed for image generation/editing. Defaults to a random 32-bit seed.",
     )
     parser.add_argument(
         "--guidance",
         type=float,
         default=DEFAULT_IMAGE_GUIDANCE,
-        help="Classifier-free guidance for image generation.",
+        help="Classifier-free guidance for image generation/editing.",
     )
     parser.add_argument(
         "--adapter-path",

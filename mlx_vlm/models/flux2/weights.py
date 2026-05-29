@@ -45,7 +45,7 @@ def load_transformer(model_path: str | Path, variant: Flux2Variant) -> Flux2Tran
     return transformer
 
 
-def load_vae(model_path: str | Path) -> Flux2VAE:
+def load_vae(model_path: str | Path, *, include_encoder: bool = False) -> Flux2VAE:
     raw = _load_safetensors(Path(model_path).expanduser() / "vae")
     weights = {}
     for key, value in raw.items():
@@ -55,6 +55,8 @@ def load_vae(model_path: str | Path) -> Flux2VAE:
             key.startswith("decoder.")
             or key.startswith("post_quant_conv.")
             or key.startswith("bn.")
+            or (include_encoder and key.startswith("encoder."))
+            or (include_encoder and key.startswith("quant_conv."))
         ):
             continue
         mapped = key.replace(".to_out.0.", ".to_out.")
@@ -62,7 +64,11 @@ def load_vae(model_path: str | Path) -> Flux2VAE:
         if tensor.ndim == 4:
             tensor = tensor.transpose(0, 2, 3, 1)
         weights[mapped] = tensor
-    vae = Flux2VAE(decoder_block_out_channels=FULL_DECODER_CHANNELS)
+    vae = Flux2VAE(
+        decoder_block_out_channels=FULL_DECODER_CHANNELS,
+        include_encoder=include_encoder,
+        encoder_block_out_channels=FULL_DECODER_CHANNELS,
+    )
     vae.update(tree_unflatten(list(weights.items())))
     return vae
 

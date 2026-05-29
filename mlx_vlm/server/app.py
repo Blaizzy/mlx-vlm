@@ -19,6 +19,7 @@ from ..generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
 )
+from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
@@ -407,6 +408,42 @@ def get_cached_model(
     if runtime.model_cache:
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
+
+    load_as_edit = model_kind == "image_edit"
+    if load_as_edit:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for image edit models.",
+            )
+        print(f"Loading image edit model from: {model_path}")
+        try:
+            model = load_image_edit_model(model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported image edit model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load image edit model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "family", "image_edit"),
+            text_config=None,
+        )
+        runtime.response_generator = None
+        runtime.apc_manager = None
+        runtime.model_cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": "image_edit",
+            "generation_lock": Lock(),
+        }
+        return model, None, config
 
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)

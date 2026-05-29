@@ -7,6 +7,11 @@ import mlx.core as mx
 import pytest
 
 import mlx_vlm.models.flux2.download as download_module
+from mlx_vlm.generate.edit_image import (
+    ImageEditRequest,
+    image_edit_model_class,
+    is_image_edit_model,
+)
 from mlx_vlm.generate.image import (
     image_generation_model_class,
     is_image_generation_model,
@@ -17,8 +22,8 @@ from mlx_vlm.models.flux2.config import (
     variant_from_local_path,
 )
 from mlx_vlm.models.flux2.download import DOWNLOAD_PATTERNS, validate_model_layout
-from mlx_vlm.models.flux2.model import Flux2ImageGenerationModel
-from mlx_vlm.models.flux2.pipeline import Flux2Image, Flux2RuntimeConfig
+from mlx_vlm.models.flux2.model import Flux2ImageEditModel, Flux2ImageGenerationModel
+from mlx_vlm.models.flux2.pipeline import Flux2Image, Flux2ImageEdit, Flux2RuntimeConfig
 
 image_module = importlib.import_module("mlx_vlm.generate.image")
 
@@ -64,6 +69,16 @@ def _fake_pipeline() -> Flux2Image:
     return pipeline
 
 
+def _fake_edit_pipeline(variant: str = "flux2-klein-9b-kv") -> Flux2ImageEdit:
+    pipeline = Flux2ImageEdit.__new__(Flux2ImageEdit)
+    pipeline.variant = get_variant(variant)
+    pipeline.model_path = None
+    pipeline.runtime_config = Flux2RuntimeConfig(tiled_vae="off")
+    pipeline.tokenizer = type("Tokenizer", (), {"count_tokens": lambda self, text: 7})()
+    pipeline.edit_array = lambda *args, **kwargs: mx.zeros((20, 24, 3), dtype=mx.uint8)
+    return pipeline
+
+
 @pytest.mark.parametrize(
     "alias,variant",
     [
@@ -71,6 +86,7 @@ def _fake_pipeline() -> Flux2Image:
         ("black-forest-labs/FLUX.2-klein-9B", "flux2-klein-9b"),
         ("flux2-base-4B", "flux2-klein-base-4b"),
         ("klein-base-9b", "flux2-klein-base-9b"),
+        ("black-forest-labs/FLUX.2-klein-9b-kv", "flux2-klein-9b-kv"),
     ],
 )
 def test_flux2_variant_aliases(alias: str, variant: str) -> None:
@@ -101,6 +117,30 @@ def test_flux2_declares_image_generation_model_type(
         image_generation_model_class(tmp_path.as_posix()) is Flux2ImageGenerationModel
     )
     assert is_image_generation_model("klein-base-9b")
+
+
+def test_flux2_declares_image_edit_model_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_layout(tmp_path)
+    (tmp_path / "model_index.json").write_text('{"_class_name": "Flux2KleinPipeline"}')
+    (tmp_path / "flux-2-klein-9b-kv.safetensors").write_bytes(b"x")
+
+    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
+        assert repo_id == "black-forest-labs/FLUX.2-klein-9b-kv"
+        return tmp_path
+
+    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
+
+    assert Flux2ImageEditModel.is_image_edit_model
+    assert Flux2ImageEditModel.model_type == "flux2"
+    assert (
+        image_edit_model_class("black-forest-labs/FLUX.2-klein-9b-kv")
+        is Flux2ImageEditModel
+    )
+    assert image_edit_model_class(tmp_path.as_posix()) is Flux2ImageEditModel
+    assert is_image_edit_model("black-forest-labs/FLUX.2-klein-9b-kv")
+    assert is_image_edit_model("black-forest-labs/FLUX.2-klein-9B")
 
 
 def test_flux2_image_model_class_uses_remote_model_index(
@@ -150,6 +190,15 @@ def test_flux2_variant_from_local_path_reads_config(tmp_path: Path) -> None:
     assert variant_from_local_path(tmp_path).name == "flux2-klein-9b"
 
 
+def test_flux2_variant_from_local_path_prefers_kv_marker(tmp_path: Path) -> None:
+    _write_layout(tmp_path)
+    config = tmp_path / "transformer" / "config.json"
+    config.write_text('{"num_layers": 8, "num_attention_heads": 32}')
+    (tmp_path / "flux-2-klein-9b-kv.safetensors").write_bytes(b"x")
+
+    assert variant_from_local_path(tmp_path).name == "flux2-klein-9b-kv"
+
+
 @pytest.mark.parametrize("width,height", [(255, 512), (512, 2050), (513, 512)])
 def test_flux2_validate_dimensions_rejects_bad_sizes(width: int, height: int) -> None:
     with pytest.raises(ValueError):
@@ -191,3 +240,40 @@ def test_flux2_generate_rejects_empty_prompt() -> None:
     pipeline = _fake_pipeline()
     with pytest.raises(ValueError, match="prompt"):
         pipeline.generate("", width=512, height=512)
+
+
+def test_flux2_edit_model_returns_image_result() -> None:
+    model = Flux2ImageEditModel(pipeline=_fake_edit_pipeline(), model_id="kv")
+    result = model.edit(
+        ImageEditRequest(
+            prompt="add sunglasses",
+            image_paths=("reference.png",),
+            seed=9,
+            steps=2,
+            guidance=1.0,
+        )
+    )
+
+    assert result.width == 24
+    assert result.height == 20
+    assert result.metadata["uses_reference_kv_cache"] is True
+    assert result.metadata["reference_count"] == 1
+
+
+def test_flux2_standard_edit_model_reports_non_kv_path() -> None:
+    model = Flux2ImageEditModel(
+        pipeline=_fake_edit_pipeline("flux2-klein-9b"),
+        model_id="standard",
+    )
+    result = model.edit(
+        ImageEditRequest(
+            prompt="add sunglasses",
+            image_paths=("reference.png",),
+            seed=9,
+            steps=2,
+            guidance=1.0,
+        )
+    )
+
+    assert result.variant == "flux2-klein-9b"
+    assert result.metadata["uses_reference_kv_cache"] is False
