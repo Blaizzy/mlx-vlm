@@ -354,6 +354,7 @@ class LanguageModel(nn.Module):
         eos_early_stop: bool = False,
         minimal_topk: int = 1,
         threshold: float = 0.95,
+        min_threshold: Optional[float] = None,
         editing_threshold: float = 0.9,
         max_post_steps: int = 16,
         eos_id: Optional[int] = None,
@@ -381,11 +382,17 @@ class LanguageModel(nn.Module):
         if minimal_topk <= 0:
             raise ValueError("minimal_topk must be a positive integer.")
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
-        num_to_transfer = max(1, int(num_to_transfer))
+        num_to_transfer = min(block_length, max(1, int(num_to_transfer)))
         if max_transfer_per_step is not None:
-            max_transfer_per_step = max(1, int(max_transfer_per_step))
+            max_transfer_per_step = min(
+                block_length, max(1, int(max_transfer_per_step))
+            )
         stability_steps = max(0, int(stability_steps))
         max_post_steps = max(0, int(max_post_steps))
+        threshold = float(threshold)
+        if min_threshold is None:
+            min_threshold = threshold
+        min_threshold = min(threshold, max(0.0, float(min_threshold)))
         visualizer_state = {
             "active": visualize and sys.stdout.isatty(),
             "alternate_screen": False,
@@ -530,6 +537,21 @@ class LanguageModel(nn.Module):
         def forward_cached(tokens: mx.array, cache) -> mx.array:
             return project_hidden(self.model(tokens, cache=cache))
 
+        def reset_block_cache(cache) -> None:
+            for block_layer_cache, prefix_layer_cache in zip(cache, prefix_cache):
+                block_layer_cache.reset_from_prefix(prefix_layer_cache)
+
+        def first_eos_index(tokens: mx.array) -> Optional[int]:
+            token_ids = tokens.tolist()
+            return next(
+                (
+                    index
+                    for index, token_id in enumerate(token_ids)
+                    if token_id in eos_token_ids
+                ),
+                None,
+            )
+
         for prefix_block in range(prefill_blocks):
             prefix_start = prefix_block * block_length
             prefix_end = prefix_start + block_length
@@ -541,6 +563,8 @@ class LanguageModel(nn.Module):
             cur_x = x[:, :current_window_end]
             block_positions = mx.arange(block_length)
             prompt_mask = block_start + block_positions < prompt_length
+            block_cache = [StaticPrefixKVCache.from_prefix(c) for c in prefix_cache]
+            eos_block_index = None
 
             post_steps = 0
             stable_steps = 0
@@ -549,14 +573,13 @@ class LanguageModel(nn.Module):
                 denoising_steps += 1
                 old_block = cur_x[:, -block_length:]
                 active_block_mask = old_block == mask_id
-                active_count = int(active_block_mask.sum().item())
-                has_active = active_count > 0
+                has_active = bool(active_block_mask.any().item())
                 if not has_active:
                     post_steps += 1
                 if post_steps > max_post_steps:
                     break
 
-                block_cache = [StaticPrefixKVCache.from_prefix(c) for c in prefix_cache]
+                reset_block_cache(block_cache)
                 logits = forward_cached(old_block, cache=block_cache)
                 x0, x0_p = self._sample_with_temperature_topk_topp(
                     logits,
@@ -573,34 +596,34 @@ class LanguageModel(nn.Module):
                 transfer_mask = mx.zeros_like(active_block_mask)
                 if has_active:
                     confidence = mx.where(active_block_mask, x0_p, -mx.inf)
-                    high_confidence = (confidence > threshold) & active_block_mask
-                    high_confidence_count = int(high_confidence.sum().item())
-                    if high_confidence_count >= num_to_transfer:
-                        transfer_mask = high_confidence
-                    elif high_confidence_count > 0:
-                        # Avoid forcing extra low-confidence tokens just to
-                        # hit num_to_transfer; they tend to become punctuation
-                        # and repetition artifacts.
-                        transfer_mask = high_confidence
-                    else:
-                        _, indices = _topk(confidence, min(1, active_count))
-                        transfer_mask = (
-                            block_positions[None, None, :] == indices[..., None]
-                        ).any(axis=1)
+                    progress = (denoising_steps - 1) / max(1, steps - 1)
+                    step_threshold = threshold - (threshold - min_threshold) * progress
+                    high_confidence = (confidence > step_threshold) & active_block_mask
+                    _, indices = _topk(confidence, 1)
+                    best_transfer = (
+                        block_positions[None, None, :] == indices[..., None]
+                    ).any(axis=1)
+                    has_high_confidence = high_confidence.any(axis=1, keepdims=True)
+                    # Avoid forcing extra low-confidence tokens just to hit
+                    # num_to_transfer; they tend to become punctuation and
+                    # repetition artifacts. The best token is a fallback only
+                    # when nothing clears the current threshold.
+                    transfer_mask = high_confidence | (
+                        best_transfer & ~has_high_confidence
+                    )
                     if max_transfer_per_step is not None:
                         transfer_confidence = mx.where(
                             transfer_mask, confidence, -mx.inf
                         )
-                        transfer_count = int(transfer_mask.sum().item())
-                        if transfer_count > max_transfer_per_step:
-                            _, indices = _topk(
-                                transfer_confidence, max_transfer_per_step
-                            )
-                            transfer_mask = (
-                                block_positions[None, None, :] == indices[..., None]
-                            ).any(axis=1)
+                        _, indices = _topk(transfer_confidence, max_transfer_per_step)
+                        capped_transfer = (
+                            block_positions[None, None, :] == indices[..., None]
+                        ).any(axis=1)
+                        transfer_mask = transfer_mask & capped_transfer
 
                 editable = (~active_block_mask) & (~prompt_mask[None, :])
+                if eos_block_index is not None:
+                    editable = editable & (block_positions[None, :] <= eos_block_index)
                 edit_confidence = mx.where(editable, x0_p, -mx.inf)
                 edit_mask = (
                     (edit_confidence > editing_threshold) & editable & (x0 != old_block)
@@ -609,11 +632,13 @@ class LanguageModel(nn.Module):
 
                 new_block = mx.where(final_mask, x0, old_block)
                 cur_x = mx.concatenate([cur_x[:, :-block_length], new_block], axis=1)
-                x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
                 if visualizer_state["active"] and bool(final_mask.any().item()):
+                    x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
                     visualize_tokens(x[:, prompt_length:display_end])
 
                 has_edit = bool(edit_mask.any().item())
+                if eos_early_stop and eos_block_index is None and not has_active:
+                    eos_block_index = first_eos_index(new_block[0])
                 if not has_active and not has_edit:
                     stable_steps += 1
                     if stable_steps >= max(1, stability_steps):
@@ -631,7 +656,8 @@ class LanguageModel(nn.Module):
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
                 if not bool((generated == mask_id).any().item()):
-                    if bool((generated == eos_id).any().item()):
+                    generated_ids = generated.tolist()
+                    if any(token_id in eos_token_ids for token_id in generated_ids):
                         break
 
         generated = x[:, prompt_length : prompt_length + gen_length]

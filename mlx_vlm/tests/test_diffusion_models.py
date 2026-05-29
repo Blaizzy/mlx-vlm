@@ -88,6 +88,7 @@ class TestDiffusionModels(unittest.TestCase):
         )
 
         self.assertEqual(generate_kwargs["threshold"], 0.7)
+        self.assertEqual(generate_kwargs["min_threshold"], 0.7)
         self.assertEqual(generate_kwargs["editing_threshold"], 0.5)
         self.assertEqual(generate_kwargs["max_post_steps"], 16)
         self.assertEqual(generate_kwargs["num_to_transfer"], 1)
@@ -111,6 +112,7 @@ class TestDiffusionModels(unittest.TestCase):
                 num_to_transfer=3,
                 max_transfer_per_step=2,
                 threshold=0.8,
+                min_threshold=0.6,
                 editing_threshold=0.7,
                 max_post_steps=2,
                 stability_steps=1,
@@ -123,6 +125,7 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertEqual(generate_kwargs["num_to_transfer"], 3)
         self.assertEqual(generate_kwargs["max_transfer_per_step"], 2)
         self.assertEqual(generate_kwargs["threshold"], 0.8)
+        self.assertEqual(generate_kwargs["min_threshold"], 0.6)
         self.assertEqual(generate_kwargs["editing_threshold"], 0.7)
         self.assertEqual(generate_kwargs["max_post_steps"], 2)
         self.assertEqual(generate_kwargs["stability_steps"], 1)
@@ -141,6 +144,7 @@ class TestDiffusionModels(unittest.TestCase):
         )
 
         self.assertEqual(generate_kwargs["threshold"], 0.7)
+        self.assertEqual(generate_kwargs["min_threshold"], 0.7)
         self.assertEqual(generate_kwargs["editing_threshold"], 0.5)
         self.assertEqual(generate_kwargs["max_post_steps"], 16)
         self.assertEqual(generate_kwargs["num_to_transfer"], 2)

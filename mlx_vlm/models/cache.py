@@ -1184,10 +1184,16 @@ class StaticPrefixKVCache(_BaseCache):
     @classmethod
     def from_prefix(cls, other: "StaticPrefixKVCache") -> "StaticPrefixKVCache":
         cache = cls(other.max_size, other.step, read_only=True)
-        cache.keys = other.keys
-        cache.values = other.values
-        cache.offset = other.offset
+        cache.reset_from_prefix(other)
         return cache
+
+    def reset_from_prefix(self, other: "StaticPrefixKVCache") -> None:
+        self.keys = other.keys
+        self.values = other.values
+        self.offset = other.offset
+        self.max_size = other.max_size
+        self.step = other.step
+        self.read_only = True
 
     def _capacity_for(self, needed: int) -> int:
         if needed <= self.max_size:
