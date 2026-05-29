@@ -98,6 +98,79 @@ class ImageGenerationResponse(BaseModel):
     size: str
 
 
+class ImageEditRequest(FlexibleBaseModel):
+    prompt: str = Field(..., description="Text prompt for image editing.")
+    image: Union[str, List[str]] = Field(
+        ..., description="Local path or paths of reference images."
+    )
+    model: str = Field(..., description="Image edit model name or local snapshot path.")
+    n: int = Field(1, ge=1, le=10, description="Number of images to generate.")
+    size: Optional[str] = Field(
+        None,
+        description="Edited image size as WIDTHxHEIGHT. Width/height fields override this.",
+    )
+    width: Optional[int] = Field(None, description="Edited image width.")
+    height: Optional[int] = Field(None, description="Edited image height.")
+    steps: int = Field(
+        DEFAULT_IMAGE_STEPS,
+        ge=1,
+        description="Number of image edit inference steps.",
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="Base seed. Multiple outputs use (seed + i) values.",
+    )
+    guidance: float = Field(
+        DEFAULT_IMAGE_GUIDANCE,
+        description="Classifier-free guidance scale.",
+    )
+    response_format: Literal["b64_json", "path"] = Field(
+        "b64_json",
+        description="Return base64 PNG data or write files and return local paths.",
+    )
+    output_format: Literal["png"] = Field(
+        "png", description="Output image format. Only PNG is currently supported."
+    )
+    output_path: Optional[str] = Field(
+        None,
+        description="Output file path. For n>1, an index is added to the stem.",
+    )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Output directory for path responses.",
+    )
+    user: Optional[str] = Field(
+        None, description="OpenAI-compatible user identifier; currently ignored."
+    )
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, value):
+        images = [value] if isinstance(value, str) else list(value)
+        if not images:
+            raise ValueError("At least one image is required.")
+        if not all(isinstance(item, str) and item for item in images):
+            raise ValueError("Image paths must be non-empty strings.")
+        return value
+
+
+class ImageEditResponseData(BaseModel):
+    b64_json: Optional[str] = None
+    path: Optional[str] = None
+    revised_prompt: Optional[str] = None
+    mime_type: str = "image/png"
+    width: int
+    height: int
+    seed: int
+
+
+class ImageEditResponse(BaseModel):
+    created: int
+    data: List[ImageEditResponseData]
+    output_format: Literal["png"] = "png"
+    size: str
+
+
 # Models for /responses endpoint
 
 

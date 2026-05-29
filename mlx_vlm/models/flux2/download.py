@@ -26,18 +26,22 @@ def download_model(
     *,
     local_dir: str | Path | None = None,
     token: str | None = None,
+    revision: str | None = None,
+    force_download: bool = False,
     max_workers: int = 16,
 ) -> Path:
     spec = get_variant(variant)
-    if local_dir is None:
+    if local_dir is None and not force_download:
         cached = find_valid_cached_snapshot(spec)
         if cached is not None:
             return cached
 
     kwargs = {
         "repo_id": spec.repo_id,
+        "revision": revision,
         "allow_patterns": list(DOWNLOAD_PATTERNS),
         "token": token or os.environ.get("HF_TOKEN") or None,
+        "force_download": force_download,
         "max_workers": max_workers,
     }
     if local_dir is not None:
