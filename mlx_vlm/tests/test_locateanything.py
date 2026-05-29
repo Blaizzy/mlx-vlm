@@ -149,6 +149,35 @@ class TestLocateAnythingModel(unittest.TestCase):
         # 2x2 merge over 4x4 grid -> 4 merged tokens, each k*k*embed = 4*32
         self.assertEqual(out[0].shape, (4, 4, 32))
 
+    def test_block_mask_single_image_is_noop(self):
+        # Single image -> cu_seqlens == [0, S] -> mask is entirely True, so the
+        # vision attention can safely drop it and use the SDPA flash path.
+        from mlx_vlm.models.locateanything.vision import make_block_attention_mask
+
+        m = make_block_attention_mask(mx.array([0, 16]), 16)
+        self.assertTrue(bool(mx.all(m)))
+
+    def test_block_mask_multi_image_block_diagonal(self):
+        from mlx_vlm.models.locateanything.vision import make_block_attention_mask
+
+        # two blocks: [0:4] and [4:6]
+        m = make_block_attention_mask(mx.array([0, 4, 6]), 6)
+        self.assertTrue(bool(m[0, 3]) and bool(m[4, 5]))  # intra-block attends
+        self.assertFalse(bool(m[0, 4]) or bool(m[3, 5]))  # cross-block blocked
+
+    def test_vision_multi_image_shape(self):
+        # Exercises the multi-image branch that still builds the dense mask.
+        from mlx_vlm.models.locateanything.vision import VisionModel
+
+        vt = VisionModel(tiny_vision_config())
+        pixels = mx.random.uniform(shape=(16 + 8, 14, 14, 3))  # 4x4 + 2x4
+        out = vt(
+            pixels, grid_thw=mx.array([[4, 4], [2, 4]]), grid_shapes=[(4, 4), (2, 4)]
+        )
+        self.assertEqual(len(out), 2)
+        self.assertEqual(out[0].shape, (4, 4, 32))  # 4x4 -> 2x2 merged
+        self.assertEqual(out[1].shape, (2, 4, 32))  # 2x4 -> 1x2 merged
+
     def test_full_forward(self):
         model, _ = self._build_model()
         pixels = mx.random.uniform(shape=(16, 3, 14, 14))

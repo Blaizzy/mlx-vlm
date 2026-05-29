@@ -173,11 +173,14 @@ class Attention(nn.Module):
 
         q, k = apply_rope(q, k, rotary_pos_emb)
 
-        if attention_mask is None:
-            if cu_seqlens is None:
-                raise ValueError(
-                    "Either attention_mask or cu_seqlens must be provided."
-                )
+        if attention_mask is None and cu_seqlens is None:
+            raise ValueError("Either attention_mask or cu_seqlens must be provided.")
+        # A single image (cu_seqlens == [0, S]) has an all-True block mask, i.e.
+        # a no-op. Leave the mask None so SDPA takes the memory-efficient flash
+        # path (O(N)) instead of materializing a dense [S, S] score tensor
+        # (O(N^2)), which OOMs on large frames. Only multi-image batches need
+        # the block-diagonal mask.
+        if attention_mask is None and cu_seqlens.shape[0] > 2:
             attention_mask = make_block_attention_mask(cu_seqlens, seq_length)
 
         q = q.transpose(1, 0, 2)[None, ...]
@@ -374,7 +377,13 @@ class VisionModel(nn.Module):
             )
         )
         cu_seqlens = mx.cumsum(lengths.astype(mx.int32), axis=0)
-        attention_mask = make_block_attention_mask(cu_seqlens, hidden_states.shape[0])
+        # Single image -> no mask (flash path, avoids the dense [S, S] alloc).
+        # Multi-image -> block-diagonal mask so images don't attend across.
+        attention_mask = (
+            make_block_attention_mask(cu_seqlens, hidden_states.shape[0])
+            if grid_thw.shape[0] > 1
+            else None
+        )
 
         encoder_states = (hidden_states,) if output_hidden_states else None
 
