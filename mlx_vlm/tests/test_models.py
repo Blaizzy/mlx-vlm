@@ -159,6 +159,82 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_hrm_text_language_model(self):
+        from mlx_vlm.models import hrm_text
+
+        config = hrm_text.ModelConfig(
+            model_type="hrm_text",
+            vocab_size=128,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            max_position_embeddings=128,
+            H_cycles=2,
+            L_cycles=2,
+            embedding_scale=1.0,
+        )
+        model = hrm_text.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.num_hidden_layers)
+        self.assertEqual(type(cache[0]).__name__, "KVCache")
+
+        fused = {
+            "model.L_module.layers.0.attn.gqkv_proj.weight": mx.zeros((128, 32)),
+            "model.L_module.layers.0.mlp.gate_up_proj.weight": mx.zeros((128, 32)),
+        }
+        sanitized = model.sanitize(fused)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.L_module.layers.0.self_attn.gate_proj.weight"
+            ].shape,
+            (32, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.L_module.layers.0.self_attn.q_proj.weight"
+            ].shape,
+            (32, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.L_module.layers.0.self_attn.k_proj.weight"
+            ].shape,
+            (32, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.L_module.layers.0.self_attn.v_proj.weight"
+            ].shape,
+            (32, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.L_module.layers.0.mlp.gate_proj.weight"
+            ].shape,
+            (64, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.L_module.layers.0.mlp.up_proj.weight"
+            ].shape,
+            (64, 32),
+        )
+
     def test_lfm2_moe_language_model(self):
         from mlx_vlm.models import lfm2_moe
 
