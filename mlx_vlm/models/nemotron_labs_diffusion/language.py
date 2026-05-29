@@ -312,8 +312,11 @@ class LanguageModel(nn.Module):
     ):
         if temperature == 0.0:
             token = mx.argmax(logits, axis=-1)
-            probs = mx.softmax(logits.astype(mx.float32), axis=-1, precise=True)
-            token_prob = mx.take_along_axis(probs, token[..., None], axis=-1)[..., 0]
+            logits_f32 = logits.astype(mx.float32)
+            token_logit = mx.take_along_axis(logits_f32, token[..., None], axis=-1)[
+                ..., 0
+            ]
+            token_prob = mx.exp(token_logit - mx.logsumexp(logits_f32, axis=-1))
             return token, token_prob
 
         if temperature != 1.0:
@@ -321,8 +324,9 @@ class LanguageModel(nn.Module):
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
         token = mx.random.categorical(logits.astype(mx.float32), axis=-1)
-        probs = mx.softmax(logits.astype(mx.float32), axis=-1, precise=True)
-        token_prob = mx.take_along_axis(probs, token[..., None], axis=-1)[..., 0]
+        logits_f32 = logits.astype(mx.float32)
+        token_logit = mx.take_along_axis(logits_f32, token[..., None], axis=-1)[..., 0]
+        token_prob = mx.exp(token_logit - mx.logsumexp(logits_f32, axis=-1))
         return token, token_prob
 
     def _project_hidden(self, hidden_states: mx.array) -> mx.array:
@@ -573,6 +577,7 @@ class LanguageModel(nn.Module):
             recorded_prompt_time = True
 
         total_generated = 0
+        end_length = None
         num_blocks = (gen_length + block_length - 1) // block_length
         for _ in range(num_blocks):
             remaining = gen_length - total_generated
@@ -613,29 +618,29 @@ class LanguageModel(nn.Module):
                     recorded_prompt_time = True
                 x0 = mx.where(mask_index, x0, block)
                 confidence = mx.where(mask_index, token_probs, -mx.inf)
-                remaining_steps = max(1, steps - step_idx)
-                masked_count = int(mask_index.sum().item())
                 if threshold is not None:
-                    transfer_count = masked_count
+                    high_confidence = (confidence >= threshold) & mask_index
+                    _, best_index = _topk(confidence, 1)
+                    best_mask = (
+                        block_positions[None, None, :] == best_index[..., None]
+                    ).any(axis=1)
+                    transfer_mask = mx.where(
+                        high_confidence.any(axis=1)[:, None],
+                        high_confidence,
+                        best_mask,
+                    )
                 else:
+                    remaining_steps = max(1, steps - step_idx)
+                    masked_count = int(mask_index.sum().item())
                     transfer_count = max(
                         1, (masked_count + remaining_steps - 1) // remaining_steps
                     )
-                if max_transfer_per_step is not None:
-                    transfer_count = min(transfer_count, max_transfer_per_step)
-                _, indices = _topk(confidence, min(transfer_count, masked_count))
-                transfer_mask = (
-                    block_positions[None, None, :] == indices[..., None]
-                ).any(axis=1)
-                if threshold is not None:
-                    high_confidence = (confidence >= threshold) & mask_index
-                    if bool(high_confidence.any().item()):
-                        transfer_mask = transfer_mask & high_confidence
-                    else:
-                        _, best_index = _topk(confidence, 1)
-                        transfer_mask = (
-                            block_positions[None, None, :] == best_index[..., None]
-                        ).any(axis=1)
+                    if max_transfer_per_step is not None:
+                        transfer_count = min(transfer_count, max_transfer_per_step)
+                    _, indices = _topk(confidence, min(transfer_count, masked_count))
+                    transfer_mask = (
+                        block_positions[None, None, :] == indices[..., None]
+                    ).any(axis=1)
                 block = mx.where(transfer_mask, x0, block)
                 if visualizer_state["active"] and bool(transfer_mask.any().item()):
                     preview = (
@@ -660,27 +665,20 @@ class LanguageModel(nn.Module):
             generated_block = block[:, :current_block_length]
             generated_blocks.append(generated_block)
             total_generated += current_block_length
-            if (
-                eos_early_stop
-                and _first_token_index(generated_block[0], eos_token_ids) is not None
-            ):
-                break
+            if eos_early_stop:
+                eos_index = _first_token_index(generated_block[0], eos_token_ids)
+                if eos_index is not None:
+                    end_length = total_generated - current_block_length + eos_index + 1
+                    break
 
         generated = (
             mx.concatenate(generated_blocks, axis=1)
             if generated_blocks
             else mx.zeros((1, 0), dtype=inputs.dtype)
         )
-        generated_ids = generated[0].tolist()
-        end = next(
-            (
-                i + 1
-                for i, token_id in enumerate(generated_ids)
-                if token_id in eos_token_ids
-            ),
-            generated.shape[1],
-        )
+        end = end_length if end_length is not None else generated.shape[1]
         if visualizer_state["active"]:
+            generated_ids = generated[0].tolist()
             finish_visualizer()
             if tokenizer is not None:
                 final_text = tokenizer.decode(
