@@ -311,6 +311,13 @@ class PBDDecoder:
         self.config = model.config
         self.token_ids = get_token_ids(model.config)
         self.block_size = int(model.config.text_config.block_size)
+        # decode_ref / handle_pattern hard-code the 6-token block layout
+        # (semantic, box[x1,y1,x2,y2], end). Fail fast if a future checkpoint
+        # changes the block length rather than silently misparsing blocks.
+        assert self.block_size == 6, (
+            f"PBD decode utils assume block_size=6, got {self.block_size}; "
+            "update handle_pattern/decode_ref before using this checkpoint."
+        )
         self.mask_token = self.token_ids["default_mask_token_id"]
         self.im_end = self.token_ids["im_end_token_id"]
 
