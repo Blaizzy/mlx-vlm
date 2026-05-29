@@ -159,6 +159,93 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_lfm2_moe_language_model(self):
+        from mlx_vlm.models import lfm2_moe
+
+        config = lfm2_moe.ModelConfig(
+            model_type="lfm2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            use_expert_bias=True,
+            num_dense_layers=1,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            layer_types=["conv", "full_attention"],
+            tie_word_embeddings=True,
+        )
+
+        model = lfm2_moe.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "ArraysCache")
+        self.assertEqual(type(cache[1]).__name__, "KVCache")
+
+    def test_lfm2_moe_sanitize_stacks_experts(self):
+        from mlx_vlm.models import lfm2_moe
+
+        config = lfm2_moe.ModelConfig(
+            model_type="lfm2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_experts=2,
+            num_experts_per_tok=1,
+            norm_topk_prob=True,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            use_expert_bias=True,
+            num_dense_layers=1,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            layer_types=["conv", "full_attention"],
+        )
+        model = lfm2_moe.Model(config)
+        prefix = "model.layers.1.feed_forward"
+        weights = {
+            f"{prefix}.experts.0.w1.weight": mx.ones((32, 64)),
+            f"{prefix}.experts.1.w1.weight": mx.zeros((32, 64)),
+            f"{prefix}.experts.0.w2.weight": mx.ones((64, 32)),
+            f"{prefix}.experts.1.w2.weight": mx.zeros((64, 32)),
+            f"{prefix}.experts.0.w3.weight": mx.ones((32, 64)),
+            f"{prefix}.experts.1.w3.weight": mx.zeros((32, 64)),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        self.assertIn(f"language_model.{prefix}.switch_mlp.gate_proj.weight", sanitized)
+        self.assertIn(f"language_model.{prefix}.switch_mlp.down_proj.weight", sanitized)
+        self.assertIn(f"language_model.{prefix}.switch_mlp.up_proj.weight", sanitized)
+        self.assertEqual(
+            sanitized[f"language_model.{prefix}.switch_mlp.gate_proj.weight"].shape,
+            (2, 32, 64),
+        )
+        self.assertNotIn(f"language_model.{prefix}.experts.0.w1.weight", sanitized)
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
