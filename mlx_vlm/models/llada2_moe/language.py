@@ -374,7 +374,13 @@ class LanguageModel(nn.Module):
         eos_token_ids = (
             set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
         )
+        if block_length <= 0:
+            raise ValueError("block_length must be a positive integer.")
+        if minimal_topk <= 0:
+            raise ValueError("minimal_topk must be a positive integer.")
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
+        num_to_transfer = max(1, int(num_to_transfer))
+        max_post_steps = max(0, int(max_post_steps))
         visualizer_state = {
             "active": visualize and sys.stdout.isatty(),
             "alternate_screen": False,
@@ -532,10 +538,14 @@ class LanguageModel(nn.Module):
             prompt_mask = block_start + block_positions < prompt_length
 
             post_steps = 0
-            while True:
+            denoising_steps = 0
+            while denoising_steps < steps:
+                denoising_steps += 1
                 old_block = cur_x[:, -block_length:]
                 active_block_mask = old_block == mask_id
-                if not bool(active_block_mask.any().item()):
+                active_count = int(active_block_mask.sum().item())
+                has_active = active_count > 0
+                if not has_active:
                     post_steps += 1
                 if post_steps > max_post_steps:
                     break
@@ -555,14 +565,15 @@ class LanguageModel(nn.Module):
                     recorded_prompt_time = True
 
                 transfer_mask = mx.zeros_like(active_block_mask)
-                if bool(active_block_mask.any().item()):
+                if has_active:
                     confidence = mx.where(active_block_mask, x0_p, -mx.inf)
                     high_confidence = (confidence > threshold) & active_block_mask
                     if int(high_confidence.sum().item()) >= num_to_transfer:
                         transfer_mask = high_confidence
                     else:
-                        available = int(active_block_mask.sum().item())
-                        _, indices = _topk(confidence, min(num_to_transfer, available))
+                        _, indices = _topk(
+                            confidence, min(num_to_transfer, active_count)
+                        )
                         transfer_mask = (
                             block_positions[None, None, :] == indices[..., None]
                         ).any(axis=1)
@@ -577,12 +588,10 @@ class LanguageModel(nn.Module):
                 new_block = mx.where(final_mask, x0, old_block)
                 cur_x = mx.concatenate([cur_x[:, :-block_length], new_block], axis=1)
                 x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
-                if bool(final_mask.any().item()):
+                if visualizer_state["active"] and bool(final_mask.any().item()):
                     visualize_tokens(x[:, prompt_length:display_end])
 
-                if not bool(active_block_mask.any().item()) and not bool(
-                    edit_mask.any().item()
-                ):
+                if not has_active and not bool(edit_mask.any().item()):
                     break
 
             x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
