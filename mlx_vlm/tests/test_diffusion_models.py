@@ -324,6 +324,8 @@ class TestDiffusionModels(unittest.TestCase):
         )
         self.assertTrue(diffusion_calls["kwargs"])
         self.assertFalse(diffusion_calls["kwargs"]["linear_speculative"])
+        self.assertEqual(diffusion_calls["kwargs"]["steps"], 8)
+        self.assertIsNone(diffusion_calls["kwargs"]["threshold"])
         self.assertEqual(diffusion_results[-1].generation_tokens, 2)
 
         linear_calls = {}

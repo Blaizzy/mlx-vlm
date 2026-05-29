@@ -33,6 +33,7 @@ class ModelConfig(BaseModelConfig):
     attn_implementation: str = "sdpa"
     mask_token_id: int = 100
     default_generation_mode: str = "ar"
+    default_diffusion_steps: int = 8
     dlm_paradigm: str = "bidirectional"
     block_size: int = 32
     dlm_loss_weight: Optional[float] = None

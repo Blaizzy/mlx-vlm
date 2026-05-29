@@ -770,14 +770,22 @@ def stream_generate(
         top_k = kwargs.get("top_k", DEFAULT_TOP_K)
         max_denoising_steps = kwargs.get("max_denoising_steps")
         if max_denoising_steps is None:
-            max_denoising_steps = kwargs.get("steps", 32)
+            config = getattr(model, "config", None)
+            max_denoising_steps = kwargs.get(
+                "steps", getattr(config, "default_diffusion_steps", 32)
+            )
         num_to_transfer = kwargs.get(
             "num_to_transfer", DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER
         )
-        threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
-        min_threshold = kwargs.get(
-            "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
-        )
+        config = getattr(model, "config", None)
+        if getattr(config, "default_generation_mode", None) == "ar":
+            threshold = kwargs.get("threshold")
+            min_threshold = kwargs.get("min_threshold")
+        else:
+            threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
+            min_threshold = kwargs.get(
+                "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
+            )
         editing_threshold = kwargs.get(
             "editing_threshold", DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD
         )
