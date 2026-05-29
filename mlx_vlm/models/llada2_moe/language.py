@@ -568,12 +568,16 @@ class LanguageModel(nn.Module):
                 if has_active:
                     confidence = mx.where(active_block_mask, x0_p, -mx.inf)
                     high_confidence = (confidence > threshold) & active_block_mask
-                    if int(high_confidence.sum().item()) >= num_to_transfer:
+                    high_confidence_count = int(high_confidence.sum().item())
+                    if high_confidence_count >= num_to_transfer:
+                        transfer_mask = high_confidence
+                    elif high_confidence_count > 0:
+                        # Avoid forcing extra low-confidence tokens just to
+                        # hit num_to_transfer; they tend to become punctuation
+                        # and repetition artifacts.
                         transfer_mask = high_confidence
                     else:
-                        _, indices = _topk(
-                            confidence, min(num_to_transfer, active_count)
-                        )
+                        _, indices = _topk(confidence, min(1, active_count))
                         transfer_mask = (
                             block_positions[None, None, :] == indices[..., None]
                         ).any(axis=1)

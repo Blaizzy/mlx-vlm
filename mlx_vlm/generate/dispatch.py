@@ -175,7 +175,7 @@ def parse_arguments():
         "--num-to-transfer",
         type=int,
         default=None,
-        help="Minimum number of masked tokens to transfer per diffusion denoising step.",
+        help="Target number of masked tokens to transfer per diffusion denoising step.",
     )
     parser.add_argument(
         "--editing-threshold",
@@ -714,6 +714,13 @@ def stream_generate(
         max_denoising_steps = kwargs.get("max_denoising_steps")
         if max_denoising_steps is None:
             max_denoising_steps = kwargs.get("steps", 32)
+        num_to_transfer = kwargs.get("num_to_transfer", 1)
+        threshold = kwargs.get("threshold")
+        editing_threshold = kwargs.get("editing_threshold")
+        if threshold is None:
+            threshold = 0.7
+        if editing_threshold is None:
+            editing_threshold = 0.5
 
         generation_stats = {}
         tic = time.perf_counter()
@@ -726,10 +733,10 @@ def stream_generate(
             top_p=None if top_p is None or top_p >= 1.0 else top_p,
             top_k=None if top_k is None or top_k <= 0 else top_k,
             eos_early_stop=True,
-            threshold=kwargs.get("threshold", 0.95),
-            editing_threshold=kwargs.get("editing_threshold", 0.9),
-            max_post_steps=kwargs.get("max_post_steps", 4),
-            num_to_transfer=kwargs.get("num_to_transfer", 1),
+            threshold=threshold,
+            editing_threshold=editing_threshold,
+            max_post_steps=kwargs.get("max_post_steps", 16),
+            num_to_transfer=num_to_transfer,
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,

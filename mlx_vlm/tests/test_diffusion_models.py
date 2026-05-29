@@ -87,9 +87,9 @@ class TestDiffusionModels(unittest.TestCase):
             )
         )
 
-        self.assertEqual(generate_kwargs["threshold"], 0.95)
-        self.assertEqual(generate_kwargs["editing_threshold"], 0.9)
-        self.assertEqual(generate_kwargs["max_post_steps"], 4)
+        self.assertEqual(generate_kwargs["threshold"], 0.7)
+        self.assertEqual(generate_kwargs["editing_threshold"], 0.5)
+        self.assertEqual(generate_kwargs["max_post_steps"], 16)
         self.assertEqual(generate_kwargs["num_to_transfer"], 1)
         self.assertEqual(generate_kwargs["block_length"], 32)
         self.assertEqual(generate_kwargs["steps"], 32)
@@ -120,6 +120,24 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertEqual(generate_kwargs["threshold"], 0.8)
         self.assertEqual(generate_kwargs["editing_threshold"], 0.7)
         self.assertEqual(generate_kwargs["max_post_steps"], 2)
+
+        generate_kwargs.clear()
+        next(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=input_ids,
+                max_tokens=8,
+                num_to_transfer=2,
+                temperature=0.0,
+            )
+        )
+
+        self.assertEqual(generate_kwargs["threshold"], 0.7)
+        self.assertEqual(generate_kwargs["editing_threshold"], 0.5)
+        self.assertEqual(generate_kwargs["max_post_steps"], 16)
+        self.assertEqual(generate_kwargs["num_to_transfer"], 2)
 
         model = llada2_moe.Model(config)
 
