@@ -51,6 +51,12 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
+DEFAULT_MASKED_DIFFUSION_THRESHOLD = 0.7
+DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD = 0.5
+DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS = 16
+DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER = 1
+DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS = 2
+DEFAULT_MASKED_DIFFUSION_CACHE_STRATEGY = "prefix"
 
 
 def parse_arguments():
@@ -178,6 +184,12 @@ def parse_arguments():
         help="Target number of masked tokens to transfer per diffusion denoising step.",
     )
     parser.add_argument(
+        "--max-transfer-per-step",
+        type=int,
+        default=None,
+        help="Maximum confident masked tokens to transfer per denoising step.",
+    )
+    parser.add_argument(
         "--editing-threshold",
         type=float,
         default=None,
@@ -188,6 +200,18 @@ def parse_arguments():
         type=int,
         default=None,
         help="Maximum diffusion post-fill editing steps per block.",
+    )
+    parser.add_argument(
+        "--stability-steps",
+        type=int,
+        default=None,
+        help="Stop post-fill refinement after this many stable no-edit steps.",
+    )
+    parser.add_argument(
+        "--cache-strategy",
+        choices=["prefix", "window"],
+        default=None,
+        help="Masked diffusion attention strategy: prefix cache or full block window.",
     )
     parser.add_argument(
         "--diffusion-full-canvas",
@@ -218,7 +242,7 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling, 0.95 for LLaDA2."
+            "Default: 0.9 for confidence-threshold sampling, 0.7 for masked text."
         ),
     )
     parser.add_argument(
@@ -714,13 +738,23 @@ def stream_generate(
         max_denoising_steps = kwargs.get("max_denoising_steps")
         if max_denoising_steps is None:
             max_denoising_steps = kwargs.get("steps", 32)
-        num_to_transfer = kwargs.get("num_to_transfer", 1)
-        threshold = kwargs.get("threshold")
-        editing_threshold = kwargs.get("editing_threshold")
-        if threshold is None:
-            threshold = 0.7
-        if editing_threshold is None:
-            editing_threshold = 0.5
+        num_to_transfer = kwargs.get(
+            "num_to_transfer", DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER
+        )
+        threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
+        editing_threshold = kwargs.get(
+            "editing_threshold", DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD
+        )
+        max_transfer_per_step = kwargs.get("max_transfer_per_step")
+        max_post_steps = kwargs.get(
+            "max_post_steps", DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS
+        )
+        stability_steps = kwargs.get(
+            "stability_steps", DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS
+        )
+        cache_strategy = kwargs.get(
+            "cache_strategy", DEFAULT_MASKED_DIFFUSION_CACHE_STRATEGY
+        )
 
         generation_stats = {}
         tic = time.perf_counter()
@@ -735,8 +769,11 @@ def stream_generate(
             eos_early_stop=True,
             threshold=threshold,
             editing_threshold=editing_threshold,
-            max_post_steps=kwargs.get("max_post_steps", 16),
+            max_post_steps=max_post_steps,
             num_to_transfer=num_to_transfer,
+            max_transfer_per_step=max_transfer_per_step,
+            stability_steps=stability_steps,
+            cache_strategy=cache_strategy,
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
@@ -1272,8 +1309,11 @@ def main():
         "threshold": None,
         "block_length": None,
         "num_to_transfer": None,
+        "max_transfer_per_step": None,
         "editing_threshold": None,
         "max_post_steps": None,
+        "stability_steps": None,
+        "cache_strategy": None,
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
@@ -1411,12 +1451,18 @@ def main():
                 stream_kwargs["block_length"] = args.block_length
             if args.num_to_transfer is not None:
                 stream_kwargs["num_to_transfer"] = args.num_to_transfer
+            if args.max_transfer_per_step is not None:
+                stream_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
             if args.threshold is not None:
                 stream_kwargs["threshold"] = args.threshold
             if args.editing_threshold is not None:
                 stream_kwargs["editing_threshold"] = args.editing_threshold
             if args.max_post_steps is not None:
                 stream_kwargs["max_post_steps"] = args.max_post_steps
+            if args.stability_steps is not None:
+                stream_kwargs["stability_steps"] = args.stability_steps
+            if args.cache_strategy is not None:
+                stream_kwargs["cache_strategy"] = args.cache_strategy
             stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
             diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
@@ -1477,12 +1523,18 @@ def main():
             gen_kwargs["block_length"] = args.block_length
         if args.num_to_transfer is not None:
             gen_kwargs["num_to_transfer"] = args.num_to_transfer
+        if args.max_transfer_per_step is not None:
+            gen_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
         if args.threshold is not None:
             gen_kwargs["threshold"] = args.threshold
         if args.editing_threshold is not None:
             gen_kwargs["editing_threshold"] = args.editing_threshold
         if args.max_post_steps is not None:
             gen_kwargs["max_post_steps"] = args.max_post_steps
+        if args.stability_steps is not None:
+            gen_kwargs["stability_steps"] = args.stability_steps
+        if args.cache_strategy is not None:
+            gen_kwargs["cache_strategy"] = args.cache_strategy
         gen_kwargs.update(diffusion_kwargs_from_args(args, config))
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model

@@ -359,6 +359,9 @@ class LanguageModel(nn.Module):
         eos_id: Optional[int] = None,
         mask_id: Optional[int] = None,
         num_to_transfer: int = 1,
+        max_transfer_per_step: Optional[int] = None,
+        stability_steps: int = 2,
+        cache_strategy: str = "prefix",
         visualize: bool = False,
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
@@ -380,7 +383,12 @@ class LanguageModel(nn.Module):
             raise ValueError("minimal_topk must be a positive integer.")
         steps = max(1, min(steps, max(1, gen_length // minimal_topk)))
         num_to_transfer = max(1, int(num_to_transfer))
+        if max_transfer_per_step is not None:
+            max_transfer_per_step = max(1, int(max_transfer_per_step))
+        stability_steps = max(0, int(stability_steps))
         max_post_steps = max(0, int(max_post_steps))
+        if cache_strategy not in ("prefix", "window"):
+            raise ValueError("cache_strategy must be either 'prefix' or 'window'.")
         visualizer_state = {
             "active": visualize and sys.stdout.isatty(),
             "alternate_screen": False,
@@ -516,6 +524,12 @@ class LanguageModel(nn.Module):
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
         prefix_cache = [StaticPrefixKVCache(total_length) for _ in self.layers]
+        block_diffusion_attention_mask = None
+        if cache_strategy == "window":
+            block_mask = mx.tril(mx.ones((num_blocks, num_blocks), dtype=mx.bool_))
+            block_diffusion_attention_mask = mx.repeat(
+                mx.repeat(block_mask, block_length, axis=0), block_length, axis=1
+            )[None, None, :, :]
 
         def project_hidden(hidden_states: mx.array) -> mx.array:
             if self.config.tie_word_embeddings:
@@ -525,10 +539,15 @@ class LanguageModel(nn.Module):
         def forward_cached(tokens: mx.array, cache) -> mx.array:
             return project_hidden(self.model(tokens, cache=cache))
 
-        for prefix_block in range(prefill_blocks):
-            prefix_start = prefix_block * block_length
-            prefix_end = prefix_start + block_length
-            mx.eval(self.model(x[:, prefix_start:prefix_end], cache=prefix_cache))
+        def forward_window(tokens: mx.array, window_end: int) -> mx.array:
+            mask = block_diffusion_attention_mask[:, :, :window_end, :window_end]
+            return project_hidden(self.model(tokens, mask=mask))[:, -block_length:, :]
+
+        if cache_strategy == "prefix":
+            for prefix_block in range(prefill_blocks):
+                prefix_start = prefix_block * block_length
+                prefix_end = prefix_start + block_length
+                mx.eval(self.model(x[:, prefix_start:prefix_end], cache=prefix_cache))
 
         for num_block in range(prefill_blocks, num_blocks):
             current_window_end = (num_block + 1) * block_length
@@ -538,6 +557,7 @@ class LanguageModel(nn.Module):
             prompt_mask = block_start + block_positions < prompt_length
 
             post_steps = 0
+            stable_steps = 0
             denoising_steps = 0
             while denoising_steps < steps:
                 denoising_steps += 1
@@ -550,8 +570,13 @@ class LanguageModel(nn.Module):
                 if post_steps > max_post_steps:
                     break
 
-                block_cache = [StaticPrefixKVCache.from_prefix(c) for c in prefix_cache]
-                logits = forward_cached(old_block, cache=block_cache)
+                if cache_strategy == "prefix":
+                    block_cache = [
+                        StaticPrefixKVCache.from_prefix(c) for c in prefix_cache
+                    ]
+                    logits = forward_cached(old_block, cache=block_cache)
+                else:
+                    logits = forward_window(cur_x, current_window_end)
                 x0, x0_p = self._sample_with_temperature_topk_topp(
                     logits,
                     temperature=temperature,
@@ -581,6 +606,18 @@ class LanguageModel(nn.Module):
                         transfer_mask = (
                             block_positions[None, None, :] == indices[..., None]
                         ).any(axis=1)
+                    if max_transfer_per_step is not None:
+                        transfer_confidence = mx.where(
+                            transfer_mask, confidence, -mx.inf
+                        )
+                        transfer_count = int(transfer_mask.sum().item())
+                        if transfer_count > max_transfer_per_step:
+                            _, indices = _topk(
+                                transfer_confidence, max_transfer_per_step
+                            )
+                            transfer_mask = (
+                                block_positions[None, None, :] == indices[..., None]
+                            ).any(axis=1)
 
                 editable = (~active_block_mask) & (~prompt_mask[None, :])
                 edit_confidence = mx.where(editable, x0_p, -mx.inf)
@@ -595,13 +632,22 @@ class LanguageModel(nn.Module):
                 if visualizer_state["active"] and bool(final_mask.any().item()):
                     visualize_tokens(x[:, prompt_length:display_end])
 
-                if not has_active and not bool(edit_mask.any().item()):
+                has_edit = bool(edit_mask.any().item())
+                if not has_active and not has_edit:
+                    stable_steps += 1
+                    if stable_steps >= max(1, stability_steps):
+                        break
+                else:
+                    stable_steps = 0
+
+                if not has_active and not has_edit and stability_steps == 0:
                     break
 
             x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
-            mx.eval(
-                self.model(x[:, block_start:current_window_end], cache=prefix_cache)
-            )
+            if cache_strategy == "prefix":
+                mx.eval(
+                    self.model(x[:, block_start:current_window_end], cache=prefix_cache)
+                )
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
                 if not bool((generated == mask_id).any().item()):
