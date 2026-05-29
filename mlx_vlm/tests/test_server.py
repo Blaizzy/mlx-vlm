@@ -618,6 +618,87 @@ def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
     assert all(item["b64_json"] is None for item in payload["data"])
 
 
+def test_images_edits_returns_b64_json(client, monkeypatch):
+    calls = []
+    cache_calls = []
+
+    def fake_get_cached_model(model, **kwargs):
+        cache_calls.append((model, kwargs))
+        return SimpleNamespace(), None, SimpleNamespace(model_type="flux2")
+
+    monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
+
+    def fake_edit_image(model, request, **kwargs):
+        calls.append((request, kwargs))
+        return _fake_image_result(seed=request.seed)
+
+    monkeypatch.setattr(server_openai, "edit_image", fake_edit_image)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "black-forest-labs/FLUX.2-klein-9b-kv",
+            "prompt": "add sunglasses",
+            "image": ["reference.png"],
+            "n": 2,
+            "seed": 30,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["size"] == "16x16"
+    assert [item["seed"] for item in payload["data"]] == [30, 31]
+    assert all(item["b64_json"] for item in payload["data"])
+    assert [call[0].seed for call in calls] == [30, 31]
+    assert calls[0][0].image_paths == ("reference.png",)
+    assert cache_calls == [
+        ("black-forest-labs/FLUX.2-klein-9b-kv", {"model_kind": "image_edit"})
+    ]
+
+
+def test_images_edits_writes_paths(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="flux2"),
+        ),
+    )
+
+    def fake_edit_image(model, request, **kwargs):
+        return _fake_image_result(seed=request.seed, output_path=kwargs["output_path"])
+
+    monkeypatch.setattr(server_openai, "edit_image", fake_edit_image)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "black-forest-labs/FLUX.2-klein-9b-kv",
+            "prompt": "add sunglasses",
+            "image": "reference.png",
+            "n": 2,
+            "seed": 40,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "path",
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    paths = [Path(item["path"]) for item in payload["data"]]
+    assert [path.name for path in paths] == ["edit-40.png", "edit-41.png"]
+    assert all(path.exists() for path in paths)
+    assert all(item["b64_json"] is None for item in payload["data"])
+
+
 class _RecordingSpeculativeLM:
     def __init__(self, draft_kind):
         self.calls = []

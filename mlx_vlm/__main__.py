@@ -8,6 +8,7 @@ if __name__ == "__main__":
     subcommands = {
         "generate",
         "generate_image",
+        "edit_image",
         "convert",
         "chat",
         "chat_ui",

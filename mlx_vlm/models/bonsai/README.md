@@ -22,12 +22,6 @@ snapshot path as `--model`.
 Supported image sizes are 256 to 2048 pixels per side, and both dimensions must
 be multiples of 16.
 
-## Install
-
-```sh
-pip install -U mlx-vlm
-```
-
 ## CLI
 
 ### Generate an image

@@ -5,6 +5,36 @@ import mlx.core as mx
 from mlx_vlm.models.flux2.constants import ModelConfig
 
 
+def patchify_latents(latents: mx.array) -> mx.array:
+    if latents.ndim == 5 and latents.shape[2] == 1:
+        latents = latents[:, :, 0, :, :]
+    if latents.ndim != 4:
+        raise ValueError(f"Expected latents with ndim=4, got shape={latents.shape}")
+    batch_size, num_channels, height, width = latents.shape
+    latents = latents.reshape(batch_size, num_channels, height // 2, 2, width // 2, 2)
+    latents = latents.transpose(0, 1, 3, 5, 2, 4)
+    return latents.reshape(batch_size, num_channels * 4, height // 2, width // 2)
+
+
+def pack_latents(latents: mx.array) -> mx.array:
+    batch_size, num_channels, height, width = latents.shape
+    return latents.reshape(batch_size, num_channels, height * width).transpose(0, 2, 1)
+
+
+def unpack_latents(
+    latents: mx.array, *, latent_height: int, latent_width: int
+) -> mx.array:
+    if latents.ndim == 4:
+        return latents
+    if latents.ndim != 3:
+        raise ValueError(
+            f"Expected packed latents with ndim=3, got shape={latents.shape}"
+        )
+    return latents.reshape(
+        latents.shape[0], latent_height, latent_width, latents.shape[-1]
+    ).transpose(0, 3, 1, 2)
+
+
 def prepare_packed_latents(
     *,
     seed: int,
@@ -23,10 +53,7 @@ def prepare_packed_latents(
         key=mx.random.key(seed),
     ).astype(ModelConfig.precision)
     latent_ids = prepare_grid_ids(latents, t_coord=0)
-    packed = latents.reshape(
-        batch_size, num_latent_channels * 4, latent_height * latent_width
-    )
-    return packed.transpose(0, 2, 1), latent_ids, latent_height, latent_width
+    return pack_latents(latents), latent_ids, latent_height, latent_width
 
 
 def prepare_grid_ids(latents: mx.array, *, t_coord: int) -> mx.array:
