@@ -38,7 +38,7 @@ TiledVAE = Literal["auto", "on", "off"]
 class BonsaiRuntimeConfig:
     evict_text_encoder: bool = True
     evict_transformer: bool = False
-    bucketed_seq_len: bool = True
+    bucketed_seq_len: bool = False
     tiled_vae: TiledVAE = "auto"
     max_sequence_length: int = 512
 
@@ -72,7 +72,7 @@ class BonsaiImage:
         token: str | None = None,
         evict_text_encoder: bool = True,
         evict_transformer: bool = False,
-        bucketed_seq_len: bool = True,
+        bucketed_seq_len: bool = False,
         tiled_vae: TiledVAE = "auto",
         max_sequence_length: int = 512,
     ) -> "BonsaiImage":
