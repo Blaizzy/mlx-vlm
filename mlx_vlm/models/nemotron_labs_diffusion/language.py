@@ -17,6 +17,8 @@ from ..base import (
 from ..cache import KVCache
 from .config import ModelConfig
 
+_HAS_METAL = mx.metal.is_available()
+
 
 def _topk(x: mx.array, k: int, axis: int = -1) -> Tuple[mx.array, mx.array]:
     indices = mx.argpartition(-x, kth=k - 1, axis=axis)[..., :k]
@@ -80,6 +82,280 @@ def _llama4_attention_scale(
     return scale.astype(dtype)[None, None, :, None]
 
 
+_SMALL_ROW_GEMV_KERNEL = (
+    mx.fast.metal_kernel(
+        name="nemotron_small_row_gemv",
+        input_names=["x", "weight"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=r"""
+            uint lane = thread_position_in_grid.x;
+            uint out_block = thread_position_in_grid.y;
+            uint row = thread_position_in_grid.z;
+
+            constexpr int TM = 4;
+            constexpr int TN = 4;
+            constexpr int SN = 32;
+            constexpr int blockN = SN * TN;
+
+            if (row >= R) {
+                return;
+            }
+
+            int out_row = int(out_block * TM);
+            if (out_row >= O) {
+                return;
+            }
+
+            const device T* in_vec = x + row * K;
+            const device T* mat = weight + out_row * K;
+
+            float result[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+            int col = int(lane * TN);
+            int n_iter = K / blockN;
+            int leftover = K - blockN * n_iter;
+
+            for (int iter = 0; iter < n_iter; ++iter) {
+                float v[TN];
+                for (int tn = 0; tn < TN; ++tn) {
+                    v[tn] = static_cast<float>(in_vec[col + tn]);
+                }
+
+                for (int tm = 0; tm < TM; ++tm) {
+                    for (int tn = 0; tn < TN; ++tn) {
+                        result[tm] += static_cast<float>(mat[tm * K + col + tn]) * v[tn];
+                    }
+                }
+
+                col += blockN;
+            }
+
+            if (leftover > 0) {
+                float v[TN];
+                for (int tn = 0; tn < TN; ++tn) {
+                    v[tn] = (col + tn < K) ? static_cast<float>(in_vec[col + tn]) : 0.0f;
+                }
+
+                for (int tm = 0; tm < TM; ++tm) {
+                    for (int tn = 0; tn < TN; ++tn) {
+                        T m = (col + tn < K) ? mat[tm * K + col + tn] : T(0);
+                        result[tm] += static_cast<float>(m) * v[tn];
+                    }
+                }
+            }
+
+            for (int tm = 0; tm < TM; ++tm) {
+                for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                    result[tm] += simd_shuffle_down(result[tm], sn);
+                }
+            }
+
+            if (lane == 0) {
+                for (int tm = 0; tm < TM; ++tm) {
+                    out[row * O + out_row + tm] = static_cast<T>(result[tm]);
+                }
+            }
+        """,
+    )
+    if _HAS_METAL
+    else None
+)
+
+
+def _small_row_gemv_weight(
+    weight: mx.array, x: mx.array, max_sequence_length: int
+) -> Optional[mx.array]:
+    if (
+        _SMALL_ROW_GEMV_KERNEL is None
+        or x.ndim != 3
+        or x.dtype != weight.dtype
+        or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or not (2 <= x.shape[1] <= max_sequence_length)
+    ):
+        return None
+
+    batch, length, in_dim = x.shape
+    out_dim, weight_in_dim = weight.shape
+    if in_dim != weight_in_dim or out_dim < 4 or out_dim % 4 != 0:
+        return None
+
+    rows = batch * length
+    rows8 = ((rows + 7) // 8) * 8
+    out = _SMALL_ROW_GEMV_KERNEL(
+        inputs=[x.reshape(rows, in_dim), weight],
+        template=[
+            ("T", x.dtype),
+            ("K", in_dim),
+            ("O", out_dim),
+            ("R", rows),
+        ],
+        grid=(32, out_dim // 4, rows8),
+        threadgroup=(32, 1, 8),
+        output_shapes=[(rows, out_dim)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return out.reshape(batch, length, out_dim)
+
+
+def _small_row_linear(
+    linear: nn.Linear, x: mx.array, max_sequence_length: int
+) -> Optional[mx.array]:
+    if not isinstance(linear, nn.Linear):
+        return None
+    out = _small_row_gemv_weight(linear.weight, x, max_sequence_length)
+    if out is None:
+        return None
+    bias = getattr(linear, "bias", None)
+    if bias is not None:
+        out = out + bias.astype(out.dtype)
+    return out
+
+
+_SMALL_ROW_SWIGLU_KERNEL = (
+    mx.fast.metal_kernel(
+        name="nemotron_small_row_swiglu",
+        input_names=["x", "gate_weight", "up_weight"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=r"""
+            uint lane = thread_position_in_grid.x;
+            uint out_block = thread_position_in_grid.y;
+            uint row = thread_position_in_grid.z;
+
+            constexpr int TM = 4;
+            constexpr int TN = 4;
+            constexpr int SN = 32;
+            constexpr int blockN = SN * TN;
+
+            if (row >= R) {
+                return;
+            }
+
+            int out_row = int(out_block * TM);
+            if (out_row >= O) {
+                return;
+            }
+
+            const device T* in_vec = x + row * K;
+            const device T* gate_mat = gate_weight + out_row * K;
+            const device T* up_mat = up_weight + out_row * K;
+
+            float gate_result[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float up_result[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+            int col = int(lane * TN);
+            int n_iter = K / blockN;
+            int leftover = K - blockN * n_iter;
+
+            for (int iter = 0; iter < n_iter; ++iter) {
+                float v[TN];
+                for (int tn = 0; tn < TN; ++tn) {
+                    v[tn] = static_cast<float>(in_vec[col + tn]);
+                }
+
+                for (int tm = 0; tm < TM; ++tm) {
+                    for (int tn = 0; tn < TN; ++tn) {
+                        float value = v[tn];
+                        gate_result[tm] +=
+                            static_cast<float>(gate_mat[tm * K + col + tn]) * value;
+                        up_result[tm] +=
+                            static_cast<float>(up_mat[tm * K + col + tn]) * value;
+                    }
+                }
+
+                col += blockN;
+            }
+
+            if (leftover > 0) {
+                float v[TN];
+                for (int tn = 0; tn < TN; ++tn) {
+                    v[tn] = (col + tn < K) ? static_cast<float>(in_vec[col + tn]) : 0.0f;
+                }
+
+                for (int tm = 0; tm < TM; ++tm) {
+                    for (int tn = 0; tn < TN; ++tn) {
+                        float value = v[tn];
+                        T gate_weight_value =
+                            (col + tn < K) ? gate_mat[tm * K + col + tn] : T(0);
+                        T up_weight_value =
+                            (col + tn < K) ? up_mat[tm * K + col + tn] : T(0);
+                        gate_result[tm] += static_cast<float>(gate_weight_value) * value;
+                        up_result[tm] += static_cast<float>(up_weight_value) * value;
+                    }
+                }
+            }
+
+            for (int tm = 0; tm < TM; ++tm) {
+                for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+                    gate_result[tm] += simd_shuffle_down(gate_result[tm], sn);
+                    up_result[tm] += simd_shuffle_down(up_result[tm], sn);
+                }
+            }
+
+            if (lane == 0) {
+                for (int tm = 0; tm < TM; ++tm) {
+                    float gate = static_cast<float>(static_cast<T>(gate_result[tm]));
+                    float up = static_cast<float>(static_cast<T>(up_result[tm]));
+                    float activated = gate / (1.0f + exp(-gate));
+                    out[row * O + out_row + tm] = static_cast<T>(activated * up);
+                }
+            }
+        """,
+    )
+    if _HAS_METAL
+    else None
+)
+
+
+def _small_row_swiglu(
+    gate_proj: nn.Linear,
+    up_proj: nn.Linear,
+    x: mx.array,
+    max_sequence_length: int,
+) -> Optional[mx.array]:
+    if (
+        _SMALL_ROW_SWIGLU_KERNEL is None
+        or not isinstance(gate_proj, nn.Linear)
+        or not isinstance(up_proj, nn.Linear)
+        or getattr(gate_proj, "bias", None) is not None
+        or getattr(up_proj, "bias", None) is not None
+        or x.ndim != 3
+        or x.dtype != gate_proj.weight.dtype
+        or x.dtype != up_proj.weight.dtype
+        or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+        or not (2 <= x.shape[1] <= max_sequence_length)
+    ):
+        return None
+
+    batch, length, in_dim = x.shape
+    out_dim, weight_in_dim = gate_proj.weight.shape
+    up_out_dim, up_weight_in_dim = up_proj.weight.shape
+    if (
+        in_dim != weight_in_dim
+        or in_dim != up_weight_in_dim
+        or out_dim != up_out_dim
+        or out_dim < 4
+        or out_dim % 4 != 0
+    ):
+        return None
+
+    rows = batch * length
+    rows8 = ((rows + 7) // 8) * 8
+    out = _SMALL_ROW_SWIGLU_KERNEL(
+        inputs=[x.reshape(rows, in_dim), gate_proj.weight, up_proj.weight],
+        template=[
+            ("T", x.dtype),
+            ("K", in_dim),
+            ("O", out_dim),
+            ("R", rows),
+        ],
+        grid=(32, out_dim // 4, rows8),
+        threadgroup=(32, 1, 8),
+        output_shapes=[(rows, out_dim)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return out.reshape(batch, length, out_dim)
+
+
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -107,6 +383,23 @@ class MLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         sequence_length = x.shape[-2]
+        if 2 <= sequence_length <= 8:
+            hidden = _small_row_swiglu(
+                self.gate_proj,
+                self.up_proj,
+                x,
+                max_sequence_length=8,
+            )
+            if hidden is not None:
+                down = _small_row_linear(self.down_proj, hidden, max_sequence_length=8)
+                if down is not None:
+                    return down
+                return self.down_proj(hidden)
+            gate = _small_row_linear(self.gate_proj, x, max_sequence_length=8)
+            up = _small_row_linear(self.up_proj, x, max_sequence_length=8)
+            if gate is not None and up is not None:
+                return self.down_proj(swiglu(gate, up))
+
         chunks = 1
         if 2 <= sequence_length <= 8:
             chunks = self.tiny_sequence_chunks
@@ -179,7 +472,10 @@ class Attention(nn.Module):
         attention_scale: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        queries = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
+        queries = _small_row_linear(self.q_proj, x, max_sequence_length=8)
+        if queries is None:
+            queries = self.q_proj(x)
+        queries = queries.reshape(B, L, self.num_heads, self.head_dim)
         keys = self.k_proj(x).reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = self.v_proj(x).reshape(B, L, self.num_key_value_heads, self.head_dim)
 
@@ -211,6 +507,9 @@ class Attention(nn.Module):
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        projected = _small_row_linear(self.o_proj, output, max_sequence_length=8)
+        if projected is not None:
+            return projected
         return self.o_proj(output)
 
 
@@ -374,7 +673,21 @@ class LanguageModel(nn.Module):
 
     def _project_hidden(self, hidden_states: mx.array) -> mx.array:
         if self.config.tie_word_embeddings:
+            out = _small_row_gemv_weight(
+                self.model.embed_tokens.weight,
+                hidden_states,
+                max_sequence_length=8,
+            )
+            if out is not None:
+                return out
             return self.model.embed_tokens.as_linear(hidden_states)
+        out = _small_row_linear(
+            self.diffusion_head,
+            hidden_states,
+            max_sequence_length=8,
+        )
+        if out is not None:
+            return out
         if self.small_sequence_head_chunks > 1 and 2 <= hidden_states.shape[-2] <= 16:
             weight_chunks = mx.split(
                 self.diffusion_head.weight, self.small_sequence_head_chunks, axis=0
@@ -650,8 +963,6 @@ class LanguageModel(nn.Module):
             denoise_steps = max(1, min(steps, block_length))
             for step_idx in range(denoise_steps):
                 mask_index = block == mask_id
-                if not bool(mask_index.any().item()):
-                    break
                 logits = self(
                     block,
                     cache=cache,
@@ -710,6 +1021,8 @@ class LanguageModel(nn.Module):
                         else block
                     )
                     visualize_tokens(preview)
+                if force_completion:
+                    break
                 if not bool((block == mask_id).any().item()):
                     break
 
