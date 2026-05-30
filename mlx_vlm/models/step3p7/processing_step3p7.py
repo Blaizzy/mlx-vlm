@@ -6,7 +6,6 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 
-
 MAX_IMAGE_SIZE = 3024
 
 
@@ -140,7 +139,9 @@ class Step3VLProcessor(ProcessorMixin):
             return [Image.open(images)]
         if images and isinstance(images[0], list):
             images = images[0]
-        return [img if isinstance(img, Image.Image) else Image.open(img) for img in images]
+        return [
+            img if isinstance(img, Image.Image) else Image.open(img) for img in images
+        ]
 
     def __call__(
         self,
@@ -166,19 +167,27 @@ class Step3VLProcessor(ProcessorMixin):
             image_inputs["pixel_values"] = np.concatenate(pixel_values, axis=0)
             image_inputs["num_patches"] = num_patches
             if patch_values:
-                image_inputs["patch_pixel_values"] = np.concatenate(patch_values, axis=0)
+                image_inputs["patch_pixel_values"] = np.concatenate(
+                    patch_values, axis=0
+                )
             encoded = []
             for t in texts:
                 chunks = t.split(self.image_token)
                 if len(chunks) != 2:
-                    raise ValueError("Step-3.7 image prompts must contain one <im_patch> placeholder per image.")
+                    raise ValueError(
+                        "Step-3.7 image prompts must contain one <im_patch> placeholder per image."
+                    )
                 ids = self.tokenizer(chunks[0], add_special_tokens=False).input_ids
                 ids.extend(replacement_ids)
-                ids.extend(self.tokenizer(chunks[1], add_special_tokens=False).input_ids)
+                ids.extend(
+                    self.tokenizer(chunks[1], add_special_tokens=False).input_ids
+                )
                 encoded.append(ids)
             max_len = max(len(ids) for ids in encoded)
             pad = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-            input_ids = np.array([ids + [pad] * (max_len - len(ids)) for ids in encoded])
+            input_ids = np.array(
+                [ids + [pad] * (max_len - len(ids)) for ids in encoded]
+            )
             attention_mask = (input_ids != pad).astype(np.int32)
             text_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
         else:

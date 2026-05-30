@@ -43,7 +43,14 @@ class Model(nn.Module):
         b, h, w, c = x.shape
         return self.vit_large_projector(x.reshape(b, h * w, c))
 
-    def _vision_embeddings(self, pixel_values=None, patch_pixel_values=None, num_patches=None, image_embeds=None, **kwargs):
+    def _vision_embeddings(
+        self,
+        pixel_values=None,
+        patch_pixel_values=None,
+        num_patches=None,
+        image_embeds=None,
+        **kwargs,
+    ):
         if image_embeds is not None:
             return [image_embeds.reshape(-1, image_embeds.shape[-1])]
         if pixel_values is None:
@@ -54,8 +61,12 @@ class Model(nn.Module):
         patch_features = None
         if patch_pixel_values is not None and patch_pixel_values.size > 0:
             if patch_pixel_values.ndim >= 5:
-                patch_pixel_values = patch_pixel_values.reshape(-1, *patch_pixel_values.shape[-3:])
-            patch_features = self._process_image_features(self.vision_model(patch_pixel_values))
+                patch_pixel_values = patch_pixel_values.reshape(
+                    -1, *patch_pixel_values.shape[-3:]
+                )
+            patch_features = self._process_image_features(
+                self.vision_model(patch_pixel_values)
+            )
         if num_patches is None:
             return [image_features.reshape(-1, image_features.shape[-1])]
         merged = []
@@ -64,13 +75,22 @@ class Model(nn.Module):
             count = int(count)
             parts = []
             if count > 0 and patch_features is not None:
-                parts.append(patch_features[cursor : cursor + count].reshape(-1, patch_features.shape[-1]))
+                parts.append(
+                    patch_features[cursor : cursor + count].reshape(
+                        -1, patch_features.shape[-1]
+                    )
+                )
                 cursor += count
             parts.append(image_features[i].reshape(-1, image_features.shape[-1]))
             merged.append(mx.concatenate(parts, axis=0) if len(parts) > 1 else parts[0])
         return merged
 
-    def get_input_embeddings(self, input_ids: Optional[mx.array] = None, pixel_values: Optional[mx.array] = None, **kwargs):
+    def get_input_embeddings(
+        self,
+        input_ids: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
+        **kwargs,
+    ):
         vision_embeddings = self._vision_embeddings(pixel_values=pixel_values, **kwargs)
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         if vision_embeddings is None:
@@ -87,7 +107,9 @@ class Model(nn.Module):
 
     def __call__(self, input_ids, pixel_values=None, mask=None, cache=None, **kwargs):
         features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
-        return self.language_model(input_ids, cache=cache, inputs_embeds=features.inputs_embeds)
+        return self.language_model(
+            input_ids, cache=cache, inputs_embeds=features.inputs_embeds
+        )
 
     def sanitize(self, weights):
         sanitized = {}
@@ -96,7 +118,11 @@ class Model(nn.Module):
                 key = key.replace("model.language_model.", "language_model.model.", 1)
             elif key.startswith("model.layers."):
                 parts = key.split(".")
-                if len(parts) > 2 and parts[2].isdigit() and int(parts[2]) >= self.config.text_config.num_hidden_layers:
+                if (
+                    len(parts) > 2
+                    and parts[2].isdigit()
+                    and int(parts[2]) >= self.config.text_config.num_hidden_layers
+                ):
                     continue
                 key = key.replace("model.", "language_model.model.", 1)
             elif key.startswith("model.embed_tokens.") or key.startswith("model.norm."):
@@ -104,7 +130,9 @@ class Model(nn.Module):
             elif key.startswith("model.vision_model."):
                 key = key.replace("model.vision_model.", "vision_model.", 1)
             elif key.startswith("model.vit_large_projector."):
-                key = key.replace("model.vit_large_projector.", "vit_large_projector.", 1)
+                key = key.replace(
+                    "model.vit_large_projector.", "vit_large_projector.", 1
+                )
             elif key.startswith("lm_head."):
                 key = key.replace("lm_head.", "language_model.lm_head.", 1)
             elif (
@@ -118,7 +146,9 @@ class Model(nn.Module):
             ):
                 key = f"vision_model.{key}"
             if "vision_model." in key:
-                sub = self.vision_model.sanitize({key.replace("vision_model.", "", 1): value})
+                sub = self.vision_model.sanitize(
+                    {key.replace("vision_model.", "", 1): value}
+                )
                 for sk, sv in sub.items():
                     sanitized[f"vision_model.{sk}"] = sv
                 continue

@@ -17,7 +17,9 @@ def _quick_gelu(x: mx.array) -> mx.array:
 
 
 class EncoderRope2D(nn.Module):
-    def __init__(self, dim: int, max_grid_height: int, max_grid_width: int, theta=10000):
+    def __init__(
+        self, dim: int, max_grid_height: int, max_grid_width: int, theta=10000
+    ):
         super().__init__()
         self.dim = dim
         self.max_grid_height = max_grid_height
@@ -26,7 +28,8 @@ class EncoderRope2D(nn.Module):
 
     def _freqs(self, gh: int, gw: int):
         inv_freq = 1.0 / (
-            self.theta ** (mx.arange(0, self.dim // 2, 2, dtype=mx.float32) / (self.dim // 2))
+            self.theta
+            ** (mx.arange(0, self.dim // 2, 2, dtype=mx.float32) / (self.dim // 2))
         )
         rows = mx.arange(gh, dtype=mx.float32)
         cols = mx.arange(gw, dtype=mx.float32)
@@ -34,9 +37,7 @@ class EncoderRope2D(nn.Module):
         freqs_w = cols[:, None] * inv_freq[None, :]
         freqs_h = mx.broadcast_to(freqs_h[:, None, :], (gh, gw, freqs_h.shape[-1]))
         freqs_w = mx.broadcast_to(freqs_w[None, :, :], (gh, gw, freqs_w.shape[-1]))
-        return mx.concatenate([freqs_w, freqs_h], axis=-1).reshape(
-            gh * gw, -1
-        )
+        return mx.concatenate([freqs_w, freqs_h], axis=-1).reshape(gh * gw, -1)
 
     def __call__(self, q: mx.array, k: mx.array, grid_hw: tuple[int, int]):
         gh, gw = grid_hw
@@ -128,22 +129,39 @@ class VisionModel(nn.Module):
         self.use_abs_posemb = config.use_abs_posemb
         self.use_ln_post = config.use_ln_post
         self.conv1 = nn.Conv2d(
-            config.num_channels, config.width, config.patch_size, stride=config.patch_size, bias=False
+            config.num_channels,
+            config.width,
+            config.patch_size,
+            stride=config.patch_size,
+            bias=False,
         )
-        self.ln_pre = nn.LayerNorm(config.width, eps=config.layer_norm_eps) if config.use_ln_pre else None
-        self.ln_post = nn.LayerNorm(config.width, eps=config.layer_norm_eps) if config.use_ln_post else None
+        self.ln_pre = (
+            nn.LayerNorm(config.width, eps=config.layer_norm_eps)
+            if config.use_ln_pre
+            else None
+        )
+        self.ln_post = (
+            nn.LayerNorm(config.width, eps=config.layer_norm_eps)
+            if config.use_ln_post
+            else None
+        )
         grid = config.image_size // config.patch_size
         if self.use_cls_token:
-            self.class_embedding = mx.random.normal((config.width,)) * (config.width**-0.5)
+            self.class_embedding = mx.random.normal((config.width,)) * (
+                config.width**-0.5
+            )
         if self.use_abs_posemb:
             self.posemb_grid_size = grid
-            self.positional_embedding = (
-                mx.random.normal((int(self.use_cls_token) + grid * grid, config.width))
-                * (config.width**-0.5)
-            )
+            self.positional_embedding = mx.random.normal(
+                (int(self.use_cls_token) + grid * grid, config.width)
+            ) * (config.width**-0.5)
         self.transformer = [EncoderVisionBlock(config) for _ in range(config.layers)]
-        self.vit_downsampler1 = nn.Conv2d(config.width, config.width * 2, 3, stride=2, padding=1)
-        self.vit_downsampler2 = nn.Conv2d(config.width * 2, config.width * 4, 3, stride=2, padding=1)
+        self.vit_downsampler1 = nn.Conv2d(
+            config.width, config.width * 2, 3, stride=2, padding=1
+        )
+        self.vit_downsampler2 = nn.Conv2d(
+            config.width * 2, config.width * 4, 3, stride=2, padding=1
+        )
 
     def _pos_embed(self, gh: int, gw: int):
         if self.posemb_grid_size == gh and self.posemb_grid_size == gw:
@@ -169,7 +187,9 @@ class VisionModel(nn.Module):
         gh, gw = h // self.patch_size, w // self.patch_size
         x = self.conv1(pixel_values).reshape(b, gh * gw, self.hidden_size)
         if self.use_cls_token:
-            cls = mx.broadcast_to(self.class_embedding.reshape(1, 1, -1), (b, 1, self.hidden_size))
+            cls = mx.broadcast_to(
+                self.class_embedding.reshape(1, 1, -1), (b, 1, self.hidden_size)
+            )
             x = mx.concatenate([cls, x], axis=1)
         if self.use_abs_posemb:
             x = x + self._pos_embed(gh, gw)
@@ -196,10 +216,18 @@ class VisionModel(nn.Module):
                 key = key.replace("attn.in_proj_weight", "attn.in_proj.weight")
             elif key.endswith("attn.in_proj_bias"):
                 key = key.replace("attn.in_proj_bias", "attn.in_proj.bias")
-            if key.endswith("conv1.weight") and value.ndim == 4 and value.shape[-1] != self.config.num_channels:
+            if (
+                key.endswith("conv1.weight")
+                and value.ndim == 4
+                and value.shape[-1] != self.config.num_channels
+            ):
                 value = value.transpose(0, 2, 3, 1)
-            elif "vit_downsampler" in key and key.endswith(".weight") and value.ndim == 4:
-                expected_in = self.config.width * (2 if "vit_downsampler2" in key else 1)
+            elif (
+                "vit_downsampler" in key and key.endswith(".weight") and value.ndim == 4
+            ):
+                expected_in = self.config.width * (
+                    2 if "vit_downsampler2" in key else 1
+                )
                 if value.shape[-1] != expected_in:
                     value = value.transpose(0, 2, 3, 1)
             sanitized[f"{prefix}{key}"] = value

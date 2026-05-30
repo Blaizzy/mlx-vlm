@@ -136,7 +136,9 @@ class ModelConfig(BaseModelConfig):
         if self.eos_token_id is None:
             self.eos_token_id = self.text_config.eos_token_id
         self.quantization = _sanitize_quantization_config(self.quantization)
-        self.quantization_config = _sanitize_quantization_config(self.quantization_config)
+        self.quantization_config = _sanitize_quantization_config(
+            self.quantization_config
+        )
 
     @classmethod
     def from_dict(cls, params):
