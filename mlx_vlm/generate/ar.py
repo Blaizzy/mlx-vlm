@@ -93,6 +93,7 @@ def generate_step(
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
+    verbose: bool = False,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -297,7 +298,9 @@ def generate_step(
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
             processed_tokens = 0
-            with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
+            with tqdm(
+                total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
+            ) as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     if (
