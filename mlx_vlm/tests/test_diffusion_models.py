@@ -227,6 +227,9 @@ class TestDiffusionModels(unittest.TestCase):
 
     def test_nemotron_labs_diffusion(self):
         from mlx_vlm.models import nemotron_labs_diffusion
+        from mlx_vlm.models.nemotron_labs_diffusion.language import (
+            _chunked_greedy_score_weight,
+        )
 
         config = nemotron_labs_diffusion.ModelConfig(
             model_type="nemotron_labs_diffusion",
@@ -269,6 +272,21 @@ class TestDiffusionModels(unittest.TestCase):
         )
         self.assertEqual(bf16_probs.dtype, mx.bfloat16)
 
+        score_hidden = mx.random.normal((1, 3, 16)).astype(mx.float32)
+        score_weight = mx.random.normal((4096, 16)).astype(mx.float32)
+        score_tokens, score_probs = _chunked_greedy_score_weight(
+            score_weight, score_hidden, chunks=16, return_prob=True
+        )
+        score_logits = score_hidden @ score_weight.T
+        ref_tokens = mx.argmax(score_logits, axis=-1).astype(mx.int32)
+        ref_logits = mx.take_along_axis(score_logits, ref_tokens[..., None], axis=-1)[
+            ..., 0
+        ]
+        ref_probs = mx.exp(ref_logits - mx.logsumexp(score_logits, axis=-1))
+        self.assertEqual(score_tokens.tolist(), ref_tokens.tolist())
+        self.assertTrue(bool(mx.allclose(score_probs, ref_probs).item()))
+
+        diffusion_stats = {}
         generated = model.language_model.generate(
             mx.array([[4]], dtype=mx.int32),
             block_length=4,
@@ -277,8 +295,65 @@ class TestDiffusionModels(unittest.TestCase):
             max_post_steps=4,
             mask_id=127,
             eos_id=999,
+            stats=diffusion_stats,
         )
         self.assertEqual(generated.shape, (1, 8))
+        self.assertEqual(
+            diffusion_stats["diffusion_sampler"], "confidence_threshold_bound"
+        )
+        self.assertGreaterEqual(diffusion_stats["diffusion_denoise_nfe"], 1)
+        self.assertGreaterEqual(diffusion_stats["diffusion_accepted_tokens"], 1)
+        self.assertIn("diffusion_tokens_per_denoise_forward", diffusion_stats)
+
+        for sampler in (
+            "native",
+            "fixed",
+            "confidence_threshold_ref",
+            "confidence_threshold_bound",
+            "cumulative_error",
+        ):
+            with self.subTest(sampler=sampler):
+                sampled = model.language_model.generate(
+                    mx.array([[4]], dtype=mx.int32),
+                    block_length=2,
+                    steps=2,
+                    gen_length=2,
+                    mask_id=127,
+                    eos_id=999,
+                    sampler=sampler,
+                    threshold=0.5,
+                )
+                self.assertEqual(sampled.shape, (1, 2))
+
+        with self.assertRaises(ValueError):
+            model.language_model.generate(
+                mx.array([[4]], dtype=mx.int32),
+                block_length=2,
+                gen_length=2,
+                mask_id=127,
+                eos_id=999,
+                sampler="bogus",
+            )
+
+        mixed = model.language_model.generate(
+            mx.array([[4]], dtype=mx.int32),
+            block_length=2,
+            gen_length=2,
+            mask_id=127,
+            eos_id=999,
+            ar_weight=0.5,
+        )
+        self.assertEqual(mixed.shape, (1, 2))
+
+        with self.assertRaises(ValueError):
+            model.language_model.generate(
+                mx.array([[4]], dtype=mx.int32),
+                block_length=2,
+                gen_length=2,
+                mask_id=127,
+                eos_id=999,
+                ar_weight=1.5,
+            )
 
         ar_generated, ar_nfe = model.language_model.ar_generate(
             mx.array([[4]], dtype=mx.int32),
@@ -335,6 +410,9 @@ class TestDiffusionModels(unittest.TestCase):
                 input_ids=mx.array([[4]], dtype=mx.int32),
                 max_tokens=2,
                 generation_mode="diffusion",
+                sampler="native",
+                sampling_scaling_factor=2.0,
+                head_scoring="chunked",
                 temperature=0.0,
             )
         )
@@ -342,6 +420,9 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertFalse(diffusion_calls["kwargs"]["linear_speculative"])
         self.assertEqual(diffusion_calls["kwargs"]["steps"], 32)
         self.assertEqual(diffusion_calls["kwargs"]["threshold"], 0.9)
+        self.assertEqual(diffusion_calls["kwargs"]["sampler"], "native")
+        self.assertEqual(diffusion_calls["kwargs"]["sampling_scaling_factor"], 2.0)
+        self.assertEqual(diffusion_calls["kwargs"]["head_scoring"], "chunked")
         self.assertEqual(diffusion_results[-1].generation_tokens, 2)
 
         diffusion_calls.clear()

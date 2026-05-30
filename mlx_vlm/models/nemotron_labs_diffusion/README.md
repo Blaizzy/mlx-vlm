@@ -39,6 +39,10 @@ mlx_vlm.generate \
 Pass `generation_mode="diffusion"` to use the masked diffusion path.
 Nemotron defaults to 32 denoising steps and a 0.9 transfer threshold in this mode, matching the upstream dLM example.
 The upstream mode alias `generation_mode="dlm"` is also accepted.
+Sampler variants from the NVIDIA evaluation harness can be selected with `sampler`.
+Supported values are `confidence_threshold_bound` (default), `native`, `fixed`, `confidence_threshold_ref`, and `cumulative_error`.
+For profiling, `head_scoring="chunked"` scores masked rows without concatenating full vocabulary logits; the default remains `head_scoring="full"` because it is usually faster on MLX's optimized matmul path.
+For mixed AR+dLM experiments, pass `ar_weight` between `0.0` and `1.0`; this adds an AR causal block forward during denoising and is disabled by default.
 
 ```sh
 mlx_vlm.generate \
@@ -47,7 +51,7 @@ mlx_vlm.generate \
   --max-tokens 256 \
   --max-denoising-steps 16 \
   --temperature 0.0 \
-  --gen-kwargs '{"generation_mode": "diffusion"}' \
+  --gen-kwargs '{"generation_mode": "diffusion", "sampler": "confidence_threshold_bound"}' \
   --verbose
 ```
 
@@ -170,6 +174,7 @@ print(result.text)
 - AR generation should use the normal CLI without diffusion-specific arguments.
 - Diffusion generation uses masked block denoising. `--verbose` shows the block visualization as masks are filled.
 - The default diffusion schedule uses 32 denoising steps and a 0.9 confidence threshold. Lower `--max-denoising-steps` for speed experiments, but quality can degrade quickly.
+- Diffusion generation records model-level stats such as `diffusion_denoise_nfe`, `diffusion_post_block_nfe`, and `diffusion_tokens_per_denoise_forward`. Use `head_scoring="chunked"` to profile the non-materializing confidence scorer.
 - Diffusion and linear self-speculative generation are exposed through `generation_mode`, for example `--gen-kwargs '{"generation_mode": "diffusion"}'`.
 - Upstream mode names are accepted as aliases: `dlm` for diffusion and `linear_spec` for linear self-speculation.
 - The optional `linear_spec_lora` adapter included in the Hugging Face repo is used only during the diffusion draft phase of linear self-speculation.

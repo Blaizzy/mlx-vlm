@@ -211,6 +211,69 @@ def _small_row_linear(
     return out
 
 
+def _chunked_greedy_score_weight(
+    weight: mx.array,
+    x: mx.array,
+    chunks: int,
+    return_prob: bool,
+) -> Optional[mx.array | Tuple[mx.array, mx.array]]:
+    if (
+        chunks <= 1
+        or x.ndim != 3
+        or x.dtype != weight.dtype
+        or x.dtype not in (mx.bfloat16, mx.float16, mx.float32)
+    ):
+        return None
+
+    _, _, in_dim = x.shape
+    out_dim, weight_in_dim = weight.shape
+    if in_dim != weight_in_dim or out_dim % chunks != 0:
+        return None
+
+    best_token = None
+    best_logit = None
+    normalizer_max = None
+    normalizer_sum = None
+    offset = 0
+    for weight_chunk in mx.split(weight, chunks, axis=0):
+        logits = mx.matmul(x, weight_chunk.T)
+        chunk_token = mx.argmax(logits, axis=-1).astype(mx.int32)
+        chunk_logit = mx.take_along_axis(logits, chunk_token[..., None], axis=-1)[
+            ..., 0
+        ]
+        chunk_token = chunk_token + offset
+
+        if best_logit is None:
+            best_logit = chunk_logit
+            best_token = chunk_token
+        else:
+            take_chunk = chunk_logit > best_logit
+            best_logit = mx.where(take_chunk, chunk_logit, best_logit)
+            best_token = mx.where(take_chunk, chunk_token, best_token)
+
+        if return_prob:
+            logits = logits.astype(mx.float32)
+            chunk_max = mx.max(logits, axis=-1)
+            chunk_sum = mx.sum(mx.exp(logits - chunk_max[..., None]), axis=-1)
+            if normalizer_max is None:
+                normalizer_max = chunk_max
+                normalizer_sum = chunk_sum
+            else:
+                new_max = mx.maximum(normalizer_max, chunk_max)
+                normalizer_sum = normalizer_sum * mx.exp(
+                    normalizer_max - new_max
+                ) + chunk_sum * mx.exp(chunk_max - new_max)
+                normalizer_max = new_max
+
+        offset += weight_chunk.shape[0]
+
+    if not return_prob:
+        return best_token
+
+    log_prob = best_logit.astype(mx.float32) - (normalizer_max + mx.log(normalizer_sum))
+    return best_token, mx.exp(log_prob).astype(x.dtype)
+
+
 _SMALL_ROW_SWIGLU_KERNEL = (
     mx.fast.metal_kernel(
         name="nemotron_small_row_swiglu",
@@ -605,6 +668,9 @@ class LanguageModel(nn.Module):
         self.small_sequence_head_chunks = (
             32 if config.vocab_size >= 4096 and config.vocab_size % 32 == 0 else 1
         )
+        self.greedy_score_chunks = (
+            4 if config.vocab_size >= 4096 and config.vocab_size % 4 == 0 else 1
+        )
         self._linear_spec_lora_loaded = False
 
     def __call__(
@@ -702,12 +768,36 @@ class LanguageModel(nn.Module):
         return self.diffusion_head(hidden_states)
 
     def _greedy_sample_hidden(
-        self, hidden_states: mx.array, return_prob: bool = False
+        self,
+        hidden_states: mx.array,
+        return_prob: bool = False,
+        chunked_score: bool = False,
     ) -> mx.array | Tuple[mx.array, mx.array]:
+        if return_prob and chunked_score:
+            scored = self._chunked_greedy_score_hidden(hidden_states, return_prob=True)
+            if scored is not None:
+                return scored
         logits = self._project_hidden(hidden_states)
         if return_prob:
             return self._sample_with_temperature_topk_topp(logits, temperature=0.0)
         return self._sample_tokens(logits, temperature=0.0)
+
+    def _chunked_greedy_score_hidden(
+        self, hidden_states: mx.array, return_prob: bool
+    ) -> Optional[mx.array | Tuple[mx.array, mx.array]]:
+        if hidden_states.shape[-2] > 32:
+            return None
+        weight = (
+            self.model.embed_tokens.weight
+            if self.config.tie_word_embeddings
+            else self.diffusion_head.weight
+        )
+        return _chunked_greedy_score_weight(
+            weight,
+            hidden_states,
+            chunks=self.greedy_score_chunks,
+            return_prob=return_prob,
+        )
 
     def _sample_from_hidden(
         self,
@@ -716,9 +806,14 @@ class LanguageModel(nn.Module):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         return_prob: bool = False,
+        chunked_score: bool = False,
     ) -> mx.array | Tuple[mx.array, mx.array]:
         if temperature == 0.0:
-            return self._greedy_sample_hidden(hidden_states, return_prob=return_prob)
+            return self._greedy_sample_hidden(
+                hidden_states,
+                return_prob=return_prob,
+                chunked_score=chunked_score,
+            )
 
         logits = self._project_hidden(hidden_states)
         if return_prob:
@@ -815,6 +910,7 @@ class LanguageModel(nn.Module):
         skip_special_tokens: bool = False,
         stats: Optional[Dict[str, float]] = None,
         linear_speculative: bool = False,
+        **kwargs,
     ) -> mx.array:
         if inputs.shape[0] != 1:
             raise ValueError(
@@ -848,10 +944,84 @@ class LanguageModel(nn.Module):
         if block_length <= 0:
             raise ValueError("block_length must be a positive integer.")
         steps = max(1, int(steps))
+        sampler = kwargs.get("sampler")
+        sampling_scaling_factor = float(
+            kwargs.get("sampling_scaling_factor", kwargs.get("factor", 1.0))
+        )
+        ar_weight = kwargs.get("ar_weight", 0.0)
+        head_scoring = kwargs.get("head_scoring")
+        ar_weight = float(ar_weight)
+        if ar_weight < 0.0 or ar_weight > 1.0:
+            raise ValueError("ar_weight must be between 0.0 and 1.0.")
+        sampler_name = (sampler or "confidence_threshold_bound").lower()
+        sampler_aliases = {
+            "default": "confidence_threshold_bound",
+            "optimized": "confidence_threshold_bound",
+            "threshold_bound": "confidence_threshold_bound",
+            "bound": "confidence_threshold_bound",
+            "hf": "native",
+            "upstream": "native",
+            "confidence_threshold": "native",
+            "threshold": "native",
+            "threshold_ref": "confidence_threshold_ref",
+            "ref": "confidence_threshold_ref",
+            "cumulative": "cumulative_error",
+        }
+        sampler_name = sampler_aliases.get(sampler_name, sampler_name)
+        valid_samplers = {
+            "native",
+            "fixed",
+            "confidence_threshold_ref",
+            "confidence_threshold_bound",
+            "cumulative_error",
+        }
+        if sampler_name not in valid_samplers:
+            raise ValueError(
+                "Unsupported Nemotron diffusion sampler "
+                f"{sampler!r}. Expected one of {sorted(valid_samplers)}."
+            )
+        head_scoring_name = (head_scoring or "full").lower()
+        head_scoring_aliases = {
+            "default": "full",
+            "full_logits": "full",
+            "project_full_logits": "full",
+            "chunked_masked": "chunked",
+        }
+        head_scoring_name = head_scoring_aliases.get(
+            head_scoring_name, head_scoring_name
+        )
+        if head_scoring_name not in {"full", "chunked"}:
+            raise ValueError(
+                "Unsupported Nemotron head_scoring "
+                f"{head_scoring!r}. Expected 'full' or 'chunked'."
+            )
+        use_chunked_scoring = head_scoring_name == "chunked"
         if max_transfer_per_step is not None:
             max_transfer_per_step = min(
                 block_length, max(1, int(max_transfer_per_step))
             )
+        if stats is not None:
+            stats["diffusion_sampler"] = sampler_name
+            stats["diffusion_head_scoring"] = (
+                "chunked_masked"
+                if use_chunked_scoring and self.greedy_score_chunks > 1
+                else "project_full_logits"
+            )
+            for key in (
+                "diffusion_blocks",
+                "diffusion_denoise_nfe",
+                "diffusion_post_block_nfe",
+                "diffusion_confidence_steps",
+                "diffusion_argmax_only_steps",
+                "diffusion_masked_rows_scored",
+                "diffusion_accepted_tokens",
+                "diffusion_mixed_ar_forwards",
+            ):
+                stats.setdefault(key, 0.0)
+
+        def add_stat(key: str, value: float = 1.0) -> None:
+            if stats is not None:
+                stats[key] = stats.get(key, 0.0) + float(value)
 
         visualizer_state = {
             "active": visualize and sys.stdout.isatty(),
@@ -984,6 +1154,7 @@ class LanguageModel(nn.Module):
             remaining = gen_length - total_generated
             if remaining <= 0:
                 break
+            add_stat("diffusion_blocks")
             current_block_length = min(block_length, remaining)
             block_positions = mx.arange(current_block_length)
             block = mx.full((1, current_block_length), mask_id, dtype=inputs.dtype)
@@ -1004,6 +1175,8 @@ class LanguageModel(nn.Module):
                 if masked_count == 0:
                     break
                 force_completion = step_idx == denoise_steps - 1
+                add_stat("diffusion_denoise_nfe")
+                add_stat("diffusion_masked_rows_scored", masked_count)
                 masked_positions = mx.sort(
                     mx.where(mask_index[0], block_positions, current_block_length)
                 )[:masked_count]
@@ -1013,8 +1186,29 @@ class LanguageModel(nn.Module):
                     use_cache=False,
                     use_causal_mask=False,
                 )
+                if ar_weight > 0.0:
+                    causal_hidden_states = self.model(
+                        block,
+                        cache=cache,
+                        use_cache=False,
+                        use_causal_mask=True,
+                    )
+                    shifted_causal_hidden_states = mx.concatenate(
+                        [hidden_states[:, :1, :], causal_hidden_states[:, :-1, :]],
+                        axis=1,
+                    )
+                    hidden_states = (
+                        (1.0 - ar_weight) * hidden_states
+                        + ar_weight * shifted_causal_hidden_states
+                    ).astype(hidden_states.dtype)
+                    add_stat("diffusion_mixed_ar_forwards")
                 masked_hidden_states = mx.take(hidden_states, masked_positions, axis=1)
                 need_confidence = not force_completion and masked_count > 1
+                add_stat(
+                    "diffusion_confidence_steps"
+                    if need_confidence
+                    else "diffusion_argmax_only_steps"
+                )
                 if need_confidence:
                     sampled_tokens, token_probs = self._sample_from_hidden(
                         masked_hidden_states,
@@ -1022,6 +1216,7 @@ class LanguageModel(nn.Module):
                         top_k=top_k,
                         top_p=top_p,
                         return_prob=True,
+                        chunked_score=use_chunked_scoring,
                     )
                 else:
                     sampled_tokens = self._sample_from_hidden(
@@ -1065,26 +1260,69 @@ class LanguageModel(nn.Module):
                         masked_positions[None, :], sorted_indices, axis=-1
                     )
                     sorted_positions = mx.arange(masked_count)[None, :]
-                    positional_threshold = 1.0 - 1.0 / (
-                        sorted_positions.astype(sorted_confidence.dtype) + 2.0
-                    )
-                    positional_threshold = mx.where(
-                        sorted_positions == 0,
-                        mx.array(
-                            mx.finfo(sorted_confidence.dtype).min,
-                            dtype=sorted_confidence.dtype,
-                        ),
-                        positional_threshold,
-                    )
-                    lower_bound = 0.5 if min_threshold is None else min_threshold
-                    keep_sorted = (sorted_confidence >= threshold) | (
-                        (sorted_confidence >= lower_bound)
-                        & (sorted_confidence >= positional_threshold)
-                    )
+                    transfer_limit = masked_count
+                    if sampler_name == "fixed":
+                        transfer_limit = min(masked_count, max(1, int(num_to_transfer)))
                     if max_transfer_per_step is not None:
-                        keep_sorted = keep_sorted & (
-                            sorted_positions < max_transfer_per_step
+                        transfer_limit = min(transfer_limit, max_transfer_per_step)
+
+                    if sampler_name == "native":
+                        keep_sorted = sorted_confidence >= threshold
+                    elif sampler_name == "fixed":
+                        keep_sorted = sorted_positions < transfer_limit
+                        keep_sorted = keep_sorted & (sorted_confidence >= threshold)
+                    elif sampler_name == "confidence_threshold_ref":
+                        positional_threshold = 1.0 - sampling_scaling_factor / (
+                            sorted_positions.astype(sorted_confidence.dtype) + 2.0
                         )
+                        positional_threshold = mx.where(
+                            sorted_positions == 0,
+                            mx.array(
+                                mx.finfo(sorted_confidence.dtype).min,
+                                dtype=sorted_confidence.dtype,
+                            ),
+                            positional_threshold,
+                        )
+                        criteria = (sorted_confidence >= threshold) & (
+                            sorted_confidence >= positional_threshold
+                        )
+                        keep_sorted = mx.cumprod(
+                            criteria.astype(mx.int32), axis=1
+                        ).astype(mx.bool_)
+                        keep_sorted = keep_sorted & (sorted_positions < transfer_limit)
+                    elif sampler_name == "cumulative_error":
+                        confidence_floor = mx.array(
+                            1e-12, dtype=sorted_confidence.dtype
+                        )
+                        cumulative_log_confidence = mx.cumsum(
+                            mx.log(mx.maximum(sorted_confidence, confidence_floor)),
+                            axis=1,
+                        )
+                        keep_sorted = cumulative_log_confidence >= mx.log(
+                            mx.array(max(float(threshold), 1e-12))
+                        )
+                        keep_sorted = keep_sorted & (sorted_positions < transfer_limit)
+                    else:
+                        positional_threshold = 1.0 - sampling_scaling_factor / (
+                            sorted_positions.astype(sorted_confidence.dtype) + 2.0
+                        )
+                        positional_threshold = mx.where(
+                            sorted_positions == 0,
+                            mx.array(
+                                mx.finfo(sorted_confidence.dtype).min,
+                                dtype=sorted_confidence.dtype,
+                            ),
+                            positional_threshold,
+                        )
+                        lower_bound = 0.5 if min_threshold is None else min_threshold
+                        keep_sorted = (sorted_confidence >= threshold) | (
+                            (sorted_confidence >= lower_bound)
+                            & (sorted_confidence >= positional_threshold)
+                        )
+                        if max_transfer_per_step is not None:
+                            keep_sorted = keep_sorted & (
+                                sorted_positions < transfer_limit
+                            )
                     keep_sorted = keep_sorted | (sorted_positions == 0)
                     kept_positions = mx.where(
                         keep_sorted, sorted_block_positions, current_block_length
@@ -1107,6 +1345,11 @@ class LanguageModel(nn.Module):
                         block_positions[None, None, :] == transfer_positions[..., None]
                     ).any(axis=1) & mask_index
                 block = mx.where(transfer_mask, sampled_block, block)
+                remaining_masked_count = int((block == mask_id).sum().item())
+                add_stat(
+                    "diffusion_accepted_tokens",
+                    masked_count - remaining_masked_count,
+                )
                 if visualizer_state["active"] and bool(transfer_mask.any().item()):
                     preview = (
                         mx.concatenate(generated_blocks + [block], axis=1)
@@ -1116,7 +1359,7 @@ class LanguageModel(nn.Module):
                     visualize_tokens(preview)
                 if force_completion:
                     break
-                if not bool((block == mask_id).any().item()):
+                if remaining_masked_count == 0:
                     break
 
             generated_block = block[:, :current_block_length]
@@ -1136,6 +1379,7 @@ class LanguageModel(nn.Module):
                 use_cache=True,
                 use_causal_mask=True,
             )
+            add_stat("diffusion_post_block_nfe")
             next_token = self._sample_from_hidden(
                 output_hidden[:, -1:, :],
                 temperature=temperature,
@@ -1149,6 +1393,16 @@ class LanguageModel(nn.Module):
             else mx.zeros((1, 0), dtype=inputs.dtype)
         )
         end = end_length if end_length is not None else generated.shape[1]
+        if stats is not None:
+            stats["diffusion_generated_tokens"] = float(end)
+            stats["diffusion_total_nfe"] = stats.get(
+                "diffusion_denoise_nfe", 0.0
+            ) + stats.get("diffusion_post_block_nfe", 0.0)
+            denoise_nfe = stats.get("diffusion_denoise_nfe", 0.0)
+            if denoise_nfe:
+                stats["diffusion_tokens_per_denoise_forward"] = (
+                    stats.get("diffusion_accepted_tokens", 0.0) / denoise_nfe
+                )
         if visualizer_state["active"]:
             generated_ids = generated[0].tolist()
             finish_visualizer()

@@ -808,6 +808,30 @@ def stream_generate(
         )
 
         generation_stats = {}
+        handled_generation_kwargs = {
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_denoising_steps",
+            "steps",
+            "block_length",
+            "threshold",
+            "min_threshold",
+            "editing_threshold",
+            "max_post_steps",
+            "num_to_transfer",
+            "max_transfer_per_step",
+            "stability_steps",
+            "linear_speculative",
+            "linear_speculation",
+            "generation_mode",
+        }
+        model_generate_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in handled_generation_kwargs
+        }
         tic = time.perf_counter()
         generated = model.language_model.generate(
             input_ids,
@@ -832,6 +856,7 @@ def stream_generate(
             linear_speculative=kwargs.get("linear_speculative", False)
             or kwargs.get("linear_speculation", False)
             or kwargs.get("generation_mode") in ("linear_speculative", "linear_spec"),
+            **model_generate_kwargs,
         )
         mx.eval(generated)
         total_time = time.perf_counter() - tic
