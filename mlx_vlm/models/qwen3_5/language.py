@@ -177,8 +177,7 @@ def _target_verify_weight(weight: mx.array, x: mx.array) -> Optional[mx.array]:
 
 
 def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
-    return (
-        r"""
+    return r"""
     using namespace metal;
 
     constant constexpr int SIMD_SIZE = 32;
@@ -259,9 +258,10 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
       }
       return scale * accum + sum * bias;
     }
-"""
-        .replace("__BITS__", str(bits))
-        .replace("__GS__", str(group_size))
+""".replace(
+        "__BITS__", str(bits)
+    ).replace(
+        "__GS__", str(group_size)
     )
 
 
@@ -480,9 +480,7 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     _, _, K = x.shape
     N = linear.weight.shape[0]
     return (
-        K == linear.weight.shape[1] * 32 // linear.bits
-        and K % 512 == 0
-        and N % 8 == 0
+        K == linear.weight.shape[1] * 32 // linear.bits and K % 512 == 0 and N % 8 == 0
     )
 
 
@@ -536,8 +534,7 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         return None
 
     cache_key = tuple(
-        (id(linear.weight), id(linear.scales), id(linear.biases))
-        for linear in linears
+        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
     )
     cached = getattr(first, "_qwen3_5_fused_decode_linears", None)
     if cached is None or cached[0] != cache_key:
@@ -599,9 +596,7 @@ def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
         output_dtypes=[x.dtype, mx.int32],
     )
     best_tile = mx.argmax(tile_values, axis=-1)
-    return mx.take_along_axis(tile_indices, best_tile[..., None], axis=-1).squeeze(
-        -1
-    )
+    return mx.take_along_axis(tile_indices, best_tile[..., None], axis=-1).squeeze(-1)
 
 
 def _target_verify_timewise(fn, x: mx.array) -> mx.array:
@@ -752,11 +747,7 @@ def _qwen3_5_advance_left_padding_info(cache, steps: int):
 
 def _qwen3_5_lengths_info(cache):
     lengths = getattr(cache, "lengths", None)
-    if not (
-        isinstance(lengths, mx.array)
-        and lengths.ndim > 0
-        and lengths.size > 0
-    ):
+    if not (isinstance(lengths, mx.array) and lengths.ndim > 0 and lengths.size > 0):
         return None
     cached = getattr(cache, "_qwen3_5_lengths_info", None)
     if cached is None or cached[0] is not lengths:
@@ -785,8 +776,7 @@ def _create_qwen3_5_ssm_mask(h: mx.array, cache):
         batch_size = int(left_padding.shape[0]) if left_padding.ndim > 0 else 1
         if (
             lengths is None
-            and getattr(cache, "_qwen3_5_ssm_no_mask_batch_size", None)
-            == batch_size
+            and getattr(cache, "_qwen3_5_ssm_no_mask_batch_size", None) == batch_size
         ):
             return None
         left_padding_info = _qwen3_5_left_padding_info(cache)
@@ -813,11 +803,7 @@ def _create_qwen3_5_attention_mask(h: mx.array, cache):
         delattr(cache, "_qwen3_5_decode_left_padding")
 
     left_padding = getattr(cache, "left_padding", None)
-    if (
-        h.shape[1] == 1
-        and isinstance(left_padding, mx.array)
-        and left_padding.ndim > 0
-    ):
+    if h.shape[1] == 1 and isinstance(left_padding, mx.array) and left_padding.ndim > 0:
         padding_cache = getattr(cache, "_qwen3_5_left_padding_cache", None)
         if padding_cache is None or padding_cache[0] is not left_padding:
             left_padding_info = _qwen3_5_left_padding_info(cache)
@@ -1173,8 +1159,7 @@ def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, blocks):
     dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
     return mx.fast.metal_kernel(
         name=(
-            f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_"
-            f"d{d_size}_v{v_size}_b{blocks}"
+            f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_" f"d{d_size}_v{v_size}_b{blocks}"
         ),
         input_names=["queries", "keys", "values", "pads", "scale", "k_size"],
         output_names=["partials", "sums", "maxs"],
@@ -1286,17 +1271,20 @@ def _qwen3_5_ragged_decode_attention(
         ],
         output_dtypes=[queries.dtype, mx.float32, mx.float32],
     )
-    kernel_2 = _qwen3_5_ragged_sdpa_two_pass_2_kernel(
-        queries.dtype, v_size, blocks
-    )
+    kernel_2 = _qwen3_5_ragged_sdpa_two_pass_2_kernel(queries.dtype, v_size, blocks)
     return kernel_2(
         inputs=[partials, sums, maxs],
-        template=[("T", queries.dtype), ("D_SIZE", int(v_size)), ("BLOCKS", int(blocks))],
+        template=[
+            ("T", queries.dtype),
+            ("D_SIZE", int(v_size)),
+            ("BLOCKS", int(blocks)),
+        ],
         grid=(1024, batch * q_heads, 1),
         threadgroup=(1024, 1, 1),
         output_shapes=[(batch, q_heads, 1, v_size)],
         output_dtypes=[queries.dtype],
     )[0]
+
 
 def _target_verify_left_padded_attention(
     queries: mx.array,
@@ -2060,9 +2048,7 @@ class LanguageModel(nn.Module):
                     raise ValueError("Qwen GDN layers must share conv kernel size.")
 
                 accepted_mx = accepted_array()
-                accepted_bat = mx.concatenate(
-                    [accepted_mx for _ in ssm_caches], axis=0
-                )
+                accepted_bat = mx.concatenate([accepted_mx for _ in ssm_caches], axis=0)
                 state_bat, conv_bat = gated_delta_accept_states(
                     mx.concatenate(intermediate_parts, axis=0),
                     mx.concatenate(conv_input_parts, axis=0),
@@ -2480,9 +2466,7 @@ class LanguageModel(nn.Module):
                         inputs, image_grid_thw, video_grid_thw, rope_mask
                     )
                     if image_grid_thw is None and video_grid_thw is None:
-                        rope_deltas = mx.zeros(
-                            (batch_size, 1), dtype=rope_deltas.dtype
-                        )
+                        rope_deltas = mx.zeros((batch_size, 1), dtype=rope_deltas.dtype)
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:

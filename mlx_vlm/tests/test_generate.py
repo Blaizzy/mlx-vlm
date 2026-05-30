@@ -691,7 +691,9 @@ class TestBatchGenerator:
             yield [2, 11], {"round_pos": 1, "round_len": 2}
             yield [3, 12], {"round_pos": 0, "round_len": 1}
 
-        monkeypatch.setattr(generate_module, "run_speculative_server_rounds", fake_rounds)
+        monkeypatch.setattr(
+            generate_module, "run_speculative_server_rounds", fake_rounds
+        )
 
         batch = SpeculativeGenerationBatch(
             model=SimpleNamespace(),

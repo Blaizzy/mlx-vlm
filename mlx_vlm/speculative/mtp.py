@@ -362,7 +362,9 @@ def _speculative_walk_batch_deferred_uniform(
     return [accepted] * B, [draft_lists[row][: budgets[row]] for row in range(B)]
 
 
-def _sampler_supports_positioned_target(sampler: Callable[[mx.array], mx.array]) -> bool:
+def _sampler_supports_positioned_target(
+    sampler: Callable[[mx.array], mx.array]
+) -> bool:
     return callable(getattr(sampler, "sample_target", None))
 
 
@@ -554,7 +556,8 @@ def _mtp_rounds(
     draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
-        enabled=not greedy_sampling and not _sampler_supports_positioned_target(sampler),
+        enabled=not greedy_sampling
+        and not _sampler_supports_positioned_target(sampler),
     )
 
     # Hidden from prefill is full prompt-length; reduce to a single slot.
@@ -849,7 +852,8 @@ def _mtp_rounds_batch(
         draft_model.reset(model)
     sampler_rng = _SpeculativeSamplerRNG(
         draft_model,
-        enabled=not greedy_sampling and not _sampler_supports_positioned_target(sampler),
+        enabled=not greedy_sampling
+        and not _sampler_supports_positioned_target(sampler),
     )
 
     # First-round hidden: prefill output may have shape [B, L, H]; reduce
@@ -960,14 +964,18 @@ def _mtp_rounds_batch(
                     )
                 )
             else:
-                accepted_list, new_tokens_list = _speculative_walk_batch_deferred_greedy(
-                    lm,
-                    hidden_full,
-                    draft_tokens,
-                    sampler,
-                    budgets,
-                    row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
-                    base_positions=[emitted[active_idx[j]] for j in range(n_active)],
+                accepted_list, new_tokens_list = (
+                    _speculative_walk_batch_deferred_greedy(
+                        lm,
+                        hidden_full,
+                        draft_tokens,
+                        sampler,
+                        budgets,
+                        row_ids=[row_ids[active_idx[j]] for j in range(n_active)],
+                        base_positions=[
+                            emitted[active_idx[j]] for j in range(n_active)
+                        ],
+                    )
                 )
             sampler_rng.target_sampled(
                 sync_draft=not _sampler_supports_positioned_target(sampler)

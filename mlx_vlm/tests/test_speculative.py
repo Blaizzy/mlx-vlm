@@ -618,9 +618,7 @@ def test_qwen3_5_ragged_decode_attention_matches_two_pass_singleton():
     pads = [7, 0]
     scale = 64**-0.5
     key_length = (
-        1100
-        if qwen_language._qwen3_5_device_arch_suffix() in {"d", "s"}
-        else 4112
+        1100 if qwen_language._qwen3_5_device_arch_suffix() in {"d", "s"} else 4112
     )
     queries = mx.random.normal((2, 4, 1, 64), dtype=mx.bfloat16)
     keys = mx.random.normal((2, 2, key_length, 64), dtype=mx.bfloat16)
@@ -803,9 +801,7 @@ def test_qwen3_5_rope_index_ignores_left_padding_for_vision_rows():
         [[0, 10, 100, 101, 11, 12], [20, 21, 22, 23, 24, 25]],
         dtype=mx.int32,
     )
-    attention_mask = mx.array(
-        [[0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.int32
-    )
+    attention_mask = mx.array([[0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]], dtype=mx.int32)
     image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
 
     singleton_pos, singleton_delta = lm.get_rope_index(singleton_ids, image_grid_thw)
@@ -2607,7 +2603,9 @@ def test_qwen3_5_mtp_batch_accept_updates_ragged_cache():
 def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
     text_config = _tiny_qwen3_5_text_config()
     language = qwen_language.LanguageModel(args=text_config)
-    cache = qwen_language.KVCache.merge([qwen_language.KVCache(), qwen_language.KVCache()])
+    cache = qwen_language.KVCache.merge(
+        [qwen_language.KVCache(), qwen_language.KVCache()]
+    )
     keys = mx.arange(2 * 1 * 5 * 4, dtype=mx.float32).reshape(2, 1, 5, 4)
     values = keys + 100
     cache.update_and_fetch(keys, values)

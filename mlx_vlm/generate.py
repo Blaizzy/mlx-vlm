@@ -73,9 +73,7 @@ def _get_batch_cache_eval_interval() -> int:
     try:
         return max(0, int(raw))
     except ValueError:
-        logger.warning(
-            "Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw
-        )
+        logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
         return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
 
 
@@ -1634,11 +1632,7 @@ def _extend_cache(cache_a, cache_b):
         if isinstance(c, cache.KVCache):
             return [c]
         offset = getattr(c, "offset", None)
-        if (
-            hasattr(c, "extract")
-            and isinstance(offset, mx.array)
-            and offset.ndim > 0
-        ):
+        if hasattr(c, "extract") and isinstance(offset, mx.array) and offset.ndim > 0:
             return [c.extract(i) for i in range(int(offset.shape[0]))]
         return None
 
@@ -2391,11 +2385,9 @@ class SpeculativeGenerationBatch:
             return responses
 
         self._append_token_responses(responses, tok_list)
-        while (
-            isinstance(round_meta, dict)
-            and int(round_meta.get("round_pos", 0)) + 1
-            < int(round_meta.get("round_len", 1))
-        ):
+        while isinstance(round_meta, dict) and int(
+            round_meta.get("round_pos", 0)
+        ) + 1 < int(round_meta.get("round_len", 1)):
             try:
                 tok_list, round_meta = next(self._rounds_iter)
             except StopIteration:
@@ -3501,9 +3493,10 @@ class BatchGenerator:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
 
-        if getattr(self._generation_batch, "is_speculative", False) and len(
-            self._generation_batch
-        ) > 0:
+        if (
+            getattr(self._generation_batch, "is_speculative", False)
+            and len(self._generation_batch) > 0
+        ):
             return prompt_responses, generation_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
