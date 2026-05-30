@@ -106,33 +106,19 @@ class TrainingArgs:
 
 
 def vision_language_loss_fn(
-    model, batch, train_on_completions=False, assistant_id=77091
+    model, batch, train_on_completions=False, assistant_id=77091,
 ):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
 
-    batch_size, seq_length = input_ids.shape
-
     if train_on_completions:
-        weight_mask = mx.ones_like(attention_mask)
-
-        assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
-        input_ids_np = np.array(input_ids)
-        for row_idx, row in enumerate(input_ids_np):
-            positions = np.where(row == assistant_id)[0]
-            if positions.size > 0:
-                assistant_response_index[row_idx] = positions[0]
-
-        range_matrix = mx.repeat(
-            mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
-        )
-        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
-            -1, 1
-        )
-        weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)[
-            :, 1:
-        ]
+        if "completion_mask" not in batch:
+            raise ValueError(
+                "train_on_completions=True requires dataset batches to include "
+                "'completion_mask'"
+            )
+        weight_mask = batch["completion_mask"][:, 1:]
     else:
         weight_mask = None
 
@@ -146,7 +132,7 @@ def vision_language_loss_fn(
     kwargs = {
         k: v
         for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
+        if k not in ["input_ids", "pixel_values", "attention_mask", "completion_mask"]
     }
 
     outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
@@ -214,6 +200,11 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
             attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+            completion_mask_batch = (
+                np.zeros((len(items), padded_len), dtype=np.int32)
+                if "completion_mask" in items[0]
+                else None
+            )
 
             for i, item in enumerate(items):
                 arr = np.array(_squeeze_leading_batch_dim(item["input_ids"])).reshape(
@@ -230,6 +221,12 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 else:
                     attention_mask_batch[i, :L] = 1
 
+                if completion_mask_batch is not None:
+                    completion_mask = np.array(
+                        _squeeze_leading_batch_dim(item["completion_mask"])
+                    ).reshape(-1)
+                    completion_mask_batch[i, :L] = completion_mask[:L]
+
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
                 pixel_values_batch = _collate_arrays(
@@ -241,11 +238,19 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 "attention_mask": mx.array(attention_mask_batch),
                 "pixel_values": pixel_values_batch,
             }
+            if completion_mask_batch is not None:
+                batch["completion_mask"] = mx.array(completion_mask_batch)
 
             extra_keys = [
                 k
                 for k in items[0]
-                if k not in ("input_ids", "attention_mask", "pixel_values")
+                if k
+                not in (
+                    "input_ids",
+                    "attention_mask",
+                    "pixel_values",
+                    "completion_mask",
+                )
             ]
             for k in extra_keys:
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]

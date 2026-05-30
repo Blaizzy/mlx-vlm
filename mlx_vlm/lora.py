@@ -5,7 +5,11 @@ import logging
 import mlx.optimizers as optim
 from datasets import load_dataset
 
-from .trainer.datasets import PreferenceVisionDataset, VisionDataset
+from .trainer.datasets import (
+    PreferenceVisionDataset,
+    VisionDataset,
+    resolve_completion_token_ids,
+)
 from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo
 from .trainer.sft_trainer import TrainingArgs, train
 from .trainer.utils import (
@@ -161,6 +165,34 @@ def main(args):
         split=args.split,
     )
 
+    # Auto-detect assistant/end-turn/user token IDs for train_on_completions
+    if args.train_on_completions:
+        args.assistant_id, args.end_turn_id, args.user_id = resolve_completion_token_ids(
+            processor,
+            assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
+            logger=logger,
+        )
+
+        if args.assistant_id is None:
+            args.assistant_id = 77091
+            logger.warning(
+                f"Could not auto-detect assistant_id, using default {args.assistant_id}. "
+                f"Set --assistant-id explicitly for your model."
+            )
+
+        if args.end_turn_id is None and args.user_id is None:
+            logger.warning(
+                "No end_turn_id or user_id detected. Multi-turn masking may not "
+                "work correctly. Set --end-turn-id or --user-id explicitly."
+            )
+
+        logger.info(
+            f"train_on_completions: assistant_id={args.assistant_id}, "
+            f"end_turn_id={args.end_turn_id}, user_id={args.user_id}"
+        )
+
     # Calculate training iterations
     if args.epochs is not None:
         iters = (len(dataset) // args.batch_size) * args.epochs
@@ -180,6 +212,10 @@ def main(args):
             config,
             processor,
             image_resize_shape=args.image_resize_shape,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
         )
     else:
         train_dataset = VisionDataset(
@@ -187,6 +223,10 @@ def main(args):
             config,
             processor,
             image_resize_shape=args.image_resize_shape,
+            train_on_completions=args.train_on_completions,
+            assistant_id=args.assistant_id,
+            end_turn_id=args.end_turn_id,
+            user_id=args.user_id,
         )
 
     # Setup model for training
@@ -293,7 +333,19 @@ if __name__ == "__main__":
     parser.add_argument("--grad-clip", type=float, default=None)
     parser.add_argument("--train-on-completions", action="store_true")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    parser.add_argument("--assistant-id", type=int, default=77091)
+    parser.add_argument(
+        "--assistant-id", type=int, default=None,
+        help="Token ID marking assistant turn start. Auto-detected if not set.",
+    )
+    parser.add_argument(
+        "--end-turn-id", type=int, default=None,
+        help="Token ID marking end of a turn. Auto-detected if not set.",
+    )
+    parser.add_argument(
+        "--user-id", type=int, default=None,
+        help="Token ID marking user turn start. Used as fallback turn boundary "
+             "when --end-turn-id is unavailable. Auto-detected if not set.",
+    )
 
     # LoRA arguments
     parser.add_argument("--lora-alpha", type=float, default=16)

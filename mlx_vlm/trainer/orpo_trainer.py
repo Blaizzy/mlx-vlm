@@ -12,7 +12,12 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 from tqdm import tqdm
 
-from .sft_trainer import TrainingArgs, _collate_arrays, _squeeze_leading_batch_dim
+from .sft_trainer import (
+    TrainingArgs,
+    _collate_arrays,
+    _flat_seq_len,
+    _squeeze_leading_batch_dim,
+)
 from .utils import Colors, grad_checkpoint, save_adapter
 
 
@@ -30,21 +35,27 @@ class ORPOTrainingArgs(TrainingArgs):
     )
 
 
-def get_logps(model, batch, train_on_completions=False, assistant_id=77091):
+def get_logps(
+    model, batch, train_on_completions=False, assistant_id=77091,
+):
     pixel_values = batch["pixel_values"]
     input_ids = batch["input_ids"]
     attention_mask = batch["attention_mask"]
-
-    batch_size, seq_length = input_ids.shape
 
     shifted_input_ids = input_ids[:, :-1]
     shifted_attention_mask = attention_mask[:, :-1]
     targets = input_ids[:, 1:]
 
+    if train_on_completions and "completion_mask" not in batch:
+        raise ValueError(
+            "train_on_completions=True requires dataset batches to include "
+            "'completion_mask'"
+        )
+
     kwargs = {
         k: v
         for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
+        if k not in ["input_ids", "pixel_values", "attention_mask", "completion_mask"]
     }
 
     outputs = model(shifted_input_ids, pixel_values, shifted_attention_mask, **kwargs)
@@ -67,15 +78,7 @@ def get_logps(model, batch, train_on_completions=False, assistant_id=77091):
     base_mask = steps < lengths[:, None]
 
     if train_on_completions:
-        assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
-        input_ids_np = np.array(input_ids)
-        for row_idx, row in enumerate(input_ids_np):
-            positions = np.where(row == assistant_id)[0]
-            if positions.size > 0:
-                assistant_response_index[row_idx] = positions[0]
-
-        assistant_mask = steps <= mx.array(assistant_response_index).reshape(-1, 1)
-        mask = mx.where(assistant_mask, mx.zeros_like(base_mask), base_mask)
+        mask = base_mask * batch["completion_mask"][:, 1:]
     else:
         mask = base_mask
 
@@ -134,16 +137,14 @@ def orpo_loss(
 
 
 def _pad_and_collate(items, prefix, max_seq_length):
-    """Pad and collate input_ids, attention_mask, pixel_values for a given prefix."""
+    """Pad and collate prefixed token, mask, pixel, and extra batch fields."""
     id_key = f"{prefix}_input_ids"
     mask_key = f"{prefix}_attention_mask"
+    completion_mask_key = f"{prefix}_completion_mask"
     pv_key = f"{prefix}_pixel_values"
 
     lengths = [
-        min(
-            np.array(_squeeze_leading_batch_dim(x[id_key])).reshape(-1).shape[0],
-            max_seq_length,
-        )
+        min(_flat_seq_len(x[id_key]), max_seq_length)
         for x in items
     ]
     max_len = min(max(lengths), max_seq_length)
@@ -153,6 +154,11 @@ def _pad_and_collate(items, prefix, max_seq_length):
 
     input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
     attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+    completion_mask_batch = (
+        np.zeros((len(items), padded_len), dtype=np.int32)
+        if completion_mask_key in items[0]
+        else None
+    )
 
     for i, item in enumerate(items):
         arr = np.array(_squeeze_leading_batch_dim(item[id_key])).reshape(-1)
@@ -165,6 +171,12 @@ def _pad_and_collate(items, prefix, max_seq_length):
         else:
             attention_mask_batch[i, :L] = 1
 
+        if completion_mask_batch is not None:
+            completion_mask = np.array(
+                _squeeze_leading_batch_dim(item[completion_mask_key])
+            ).reshape(-1)
+            completion_mask_batch[i, :L] = completion_mask[:L]
+
     pixel_values_batch = None
     if pv_key in items[0] and items[0][pv_key] is not None:
         pixel_values_batch = _collate_arrays(
@@ -176,8 +188,10 @@ def _pad_and_collate(items, prefix, max_seq_length):
         "attention_mask": mx.array(attention_mask_batch),
         "pixel_values": pixel_values_batch,
     }
+    if completion_mask_batch is not None:
+        result["completion_mask"] = mx.array(completion_mask_batch)
 
-    skip = {id_key, mask_key, pv_key}
+    skip = {id_key, mask_key, completion_mask_key, pv_key}
     for k in items[0]:
         if k.startswith(f"{prefix}_") and k not in skip:
             vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
