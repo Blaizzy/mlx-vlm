@@ -200,5 +200,21 @@ class Step3VLProcessor(ProcessorMixin):
     def decode(self, *args, **kwargs):
         return self.tokenizer.decode(*args, **kwargs)
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoTokenizer
+
+        from ...tokenizer_utils import BPEStreamingDetokenizer
+
+        kwargs.setdefault("fix_mistral_regex", True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        tokenizer.mlx_vlm_detokenizer_class = BPEStreamingDetokenizer
+        return cls(
+            tokenizer=tokenizer,
+            chat_template=getattr(tokenizer, "chat_template", None),
+        )
+
 
 __all__ = ["Step3VLProcessor"]
