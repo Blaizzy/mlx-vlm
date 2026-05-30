@@ -2,11 +2,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_vlm.models.locateanything.config import (
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-)
+from mlx_vlm.models.locateanything.config import ModelConfig, TextConfig, VisionConfig
 
 
 def tiny_text_config(**overrides):

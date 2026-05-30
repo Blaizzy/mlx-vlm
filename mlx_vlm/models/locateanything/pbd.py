@@ -18,7 +18,6 @@ from typing import Dict, List, Optional
 
 import mlx.core as mx
 
-from ..cache import KVCache
 from .config import ModelConfig
 from .language import build_magi_block_mask
 
