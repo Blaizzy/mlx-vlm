@@ -15,6 +15,7 @@ class MessageFormat(Enum):
     LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST = "list_with_image_type_text_image_last"
     IMAGE_TOKEN = "image_token"
     IMAGE_TOKEN_PIPE = "image_token_pipe"
+    IMAGE_PATCH_TOKEN = "image_patch_token"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
     IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
@@ -72,6 +73,7 @@ MODEL_CONFIG = {
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -288,6 +290,9 @@ class MessageFormatter:
             MessageFormat.IMAGE_TOKEN_PIPE: partial(
                 self._format_with_token, token="<|image|>"
             ),
+            MessageFormat.IMAGE_PATCH_TOKEN: partial(
+                self._format_with_token, token="<im_patch>"
+            ),
             MessageFormat.START_IMAGE_TOKEN: partial(
                 self._format_with_token, token="<start_of_image>", image_first=False
             ),
@@ -342,6 +347,9 @@ class MessageFormatter:
             )
             image_tokens = [image_builder()] * num_images
             content = image_tokens + content if image_first else content + image_tokens
+
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content = content + [MessageBuilder.audio_message()] * num_audios
 
         return {"role": role, "content": content}
 

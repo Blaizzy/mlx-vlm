@@ -186,6 +186,20 @@ class TestApplyChatTemplateIntegration:
 
         assert result == [{"role": "user", "content": "Make a program to find pi"}]
 
+    def test_step3p7_formats_image_patch_token(self):
+        """Step-3.7 prompts should include the placeholder its processor expands."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "step3p7"},
+            "What do you see?",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
+
     def test_tool_call_arguments_json_string_is_normalized(self):
         """OpenAI-style JSON-string tool call arguments should become dicts."""
         from mlx_vlm.prompt_utils import apply_chat_template
