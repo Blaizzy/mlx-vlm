@@ -254,6 +254,21 @@ class TestDiffusionModels(unittest.TestCase):
             config.num_hidden_layers,
         )
 
+        model.language_model.update(
+            tree_map(lambda p: p.astype(mx.bfloat16), model.language_model.parameters())
+        )
+        bf16_outputs = model.language_model(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            attention_mask=mx.array([[1, 1, 0]], dtype=mx.int32),
+        )
+        self.assertEqual(bf16_outputs.logits.dtype, mx.bfloat16)
+        bf16_filtered = model.language_model._top_k_logits(bf16_outputs.logits, 2)
+        self.assertEqual(bf16_filtered.dtype, mx.bfloat16)
+        _, bf16_probs = model.language_model._sample_with_temperature_topk_topp(
+            bf16_outputs.logits
+        )
+        self.assertEqual(bf16_probs.dtype, mx.bfloat16)
+
         generated = model.language_model.generate(
             mx.array([[4]], dtype=mx.int32),
             block_length=4,
@@ -281,6 +296,7 @@ class TestDiffusionModels(unittest.TestCase):
             block_length=2,
             eos_token_id=3,
             mask_token_id=127,
+            threshold=0.5,
         )
         mx.eval(spec_generated)
         self.assertEqual(spec_generated.shape[0], 1)

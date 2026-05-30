@@ -51,19 +51,21 @@ def _wrap_text(text: str, width: int) -> str:
 def _make_bidirectional_mask(
     attention_mask: Optional[mx.array], x: mx.array
 ) -> Optional[mx.array]:
+    zero = mx.array(0, dtype=x.dtype)
+    neg_large = mx.array(mx.finfo(x.dtype).min, dtype=x.dtype)
     if attention_mask is None:
         return None
     if attention_mask.ndim == 4:
         if attention_mask.dtype == mx.bool_:
             return attention_mask
-        return mx.where(attention_mask.astype(mx.bool_), 0.0, mx.finfo(x.dtype).min)
+        return mx.where(attention_mask.astype(mx.bool_), zero, neg_large)
     if attention_mask.ndim != 2:
         return attention_mask
 
     if attention_mask.shape[-1] == 0 or bool(mx.all(attention_mask).item()):
         return None
     mask = attention_mask[:, None, None, :].astype(mx.bool_)
-    return mx.where(mask, 0.0, mx.finfo(x.dtype).min).astype(x.dtype)
+    return mx.where(mask, zero, neg_large)
 
 
 def _llama4_attention_scale(
@@ -284,7 +286,8 @@ class LanguageModel(nn.Module):
         if k is None or k <= 0:
             return logits
         values = _topk(logits, k=k, axis=-1)[0]
-        return mx.where(logits < values[..., -1:], mx.finfo(logits.dtype).min, logits)
+        neg_large = mx.array(mx.finfo(logits.dtype).min, dtype=logits.dtype)
+        return mx.where(logits < values[..., -1:], neg_large, logits)
 
     @staticmethod
     def _top_p_logits(logits: mx.array, p: Optional[float]) -> mx.array:
@@ -301,7 +304,8 @@ class LanguageModel(nn.Module):
         )
         inverse_indices = mx.argsort(sorted_indices, axis=-1)
         mask = mx.take_along_axis(sorted_mask, inverse_indices, axis=-1)
-        return mx.where(mask, mx.finfo(logits.dtype).min, logits)
+        neg_large = mx.array(mx.finfo(logits.dtype).min, dtype=logits.dtype)
+        return mx.where(mask, neg_large, logits)
 
     def _sample_with_temperature_topk_topp(
         self,
@@ -312,11 +316,8 @@ class LanguageModel(nn.Module):
     ):
         if temperature == 0.0:
             token = mx.argmax(logits, axis=-1)
-            logits_f32 = logits.astype(mx.float32)
-            token_logit = mx.take_along_axis(logits_f32, token[..., None], axis=-1)[
-                ..., 0
-            ]
-            token_prob = mx.exp(token_logit - mx.logsumexp(logits_f32, axis=-1))
+            token_logit = mx.take_along_axis(logits, token[..., None], axis=-1)[..., 0]
+            token_prob = mx.exp(token_logit - mx.logsumexp(logits, axis=-1))
             return token, token_prob
 
         if temperature != 1.0:
@@ -324,9 +325,8 @@ class LanguageModel(nn.Module):
         logits = self._top_k_logits(logits, top_k)
         logits = self._top_p_logits(logits, top_p)
         token = mx.random.categorical(logits.astype(mx.float32), axis=-1)
-        logits_f32 = logits.astype(mx.float32)
-        token_logit = mx.take_along_axis(logits_f32, token[..., None], axis=-1)[..., 0]
-        token_prob = mx.exp(token_logit - mx.logsumexp(logits_f32, axis=-1))
+        token_logit = mx.take_along_axis(logits, token[..., None], axis=-1)[..., 0]
+        token_prob = mx.exp(token_logit - mx.logsumexp(logits, axis=-1))
         return token, token_prob
 
     def _project_hidden(self, hidden_states: mx.array) -> mx.array:
@@ -617,7 +617,10 @@ class LanguageModel(nn.Module):
                     stats["prompt_tokens"] = float(inputs.size)
                     recorded_prompt_time = True
                 x0 = mx.where(mask_index, x0, block)
-                confidence = mx.where(mask_index, token_probs, -mx.inf)
+                neg_large = mx.array(
+                    mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
+                )
+                confidence = mx.where(mask_index, token_probs, neg_large)
                 if threshold is not None:
                     high_confidence = (confidence >= threshold) & mask_index
                     _, best_index = _topk(confidence, 1)
@@ -835,7 +838,10 @@ class LanguageModel(nn.Module):
                         top_k=top_k,
                         top_p=top_p,
                     )
-                    draft_conf = mx.where(is_mask, draft_probs, -mx.inf)
+                    neg_large = mx.array(
+                        mx.finfo(draft_probs.dtype).min, dtype=draft_probs.dtype
+                    )
+                    draft_conf = mx.where(is_mask, draft_probs, neg_large)
                     unmask = draft_conf >= threshold
                     if not bool(unmask.any().item()):
                         _, best_idx = _topk(draft_conf, 1)
@@ -972,7 +978,10 @@ class LanguageModel(nn.Module):
                         top_k=top_k,
                         top_p=top_p,
                     )
-                    draft_conf = mx.where(is_mask, draft_probs, -mx.inf)
+                    neg_large = mx.array(
+                        mx.finfo(draft_probs.dtype).min, dtype=draft_probs.dtype
+                    )
+                    draft_conf = mx.where(is_mask, draft_probs, neg_large)
                     unmask = draft_conf >= threshold
                     if not bool(unmask.any().item()):
                         _, best_idx = _topk(draft_conf, 1)
