@@ -6,7 +6,36 @@ from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 
+from ...tokenizer_utils import BPEStreamingDetokenizer
+
 MAX_IMAGE_SIZE = 3024
+
+
+def _patch_step_byte_level_decoder(tokenizer):
+    vocab = getattr(tokenizer, "vocab", None)
+    if vocab is None and hasattr(tokenizer, "get_vocab"):
+        try:
+            vocab = tokenizer.get_vocab()
+        except Exception:
+            vocab = None
+
+    if not isinstance(vocab, dict) or not any(
+        isinstance(token, str) and token.startswith(("Ġ", "Ċ")) for token in vocab
+    ):
+        return tokenizer
+
+    backend_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
+    if backend_tokenizer is None:
+        return tokenizer
+
+    try:
+        from tokenizers import decoders
+
+        backend_tokenizer.decoder = decoders.ByteLevel()
+    except Exception:
+        pass
+
+    return tokenizer
 
 
 class ImagePatcher:
@@ -87,6 +116,25 @@ class ImagePatcher:
 class Step3VLProcessor(ProcessorMixin):
     attributes = ["tokenizer"]
     tokenizer_class = "AutoTokenizer"
+    detokenizer_class = BPEStreamingDetokenizer
+
+    @property
+    def detokenizer(self):
+        detokenizer = getattr(self, "_detokenizer", None)
+        tokenizer = getattr(self, "tokenizer", None)
+        if detokenizer is None and tokenizer is not None:
+            detokenizer = self.detokenizer_class(tokenizer)
+            self._detokenizer = detokenizer
+        return detokenizer
+
+    @detokenizer.setter
+    def detokenizer(self, _detokenizer):
+        tokenizer = getattr(self, "tokenizer", None)
+        self._detokenizer = (
+            self.detokenizer_class(tokenizer)
+            if tokenizer is not None
+            else _detokenizer
+        )
 
     def __init__(self, tokenizer=None, chat_template=None, **kwargs):
         super().__init__(tokenizer=tokenizer, chat_template=chat_template, **kwargs)
@@ -208,6 +256,7 @@ class Step3VLProcessor(ProcessorMixin):
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, **kwargs
         )
+        _patch_step_byte_level_decoder(tokenizer)
         return cls(
             tokenizer=tokenizer,
             chat_template=getattr(tokenizer, "chat_template", None),

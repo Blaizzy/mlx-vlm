@@ -1171,8 +1171,13 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
 class TestStep3VLProcessor(unittest.TestCase):
     def test_from_pretrained_uses_fixed_tokenizer(self):
         from mlx_vlm.models.step3p7.processing_step3p7 import Step3VLProcessor
+        from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
 
-        tokenizer = _mock_tokenizer(chat_template="template")
+        tokenizer = _mock_tokenizer(
+            chat_template="template",
+            vocab={"Got": 0, "Ġit": 1},
+            backend_tokenizer=SimpleNamespace(decoder="bad"),
+        )
 
         def _fake_init(self, tokenizer=None, chat_template=None, **kwargs):
             self.tokenizer = tokenizer
@@ -1194,6 +1199,14 @@ class TestStep3VLProcessor(unittest.TestCase):
             fix_mistral_regex=True,
         )
         self.assertIs(processor.tokenizer, tokenizer)
+        self.assertIs(processor.detokenizer_class, BPEStreamingDetokenizer)
+        self.assertIn("ByteLevel", repr(tokenizer.backend_tokenizer.decoder))
+
+        processor.detokenizer = object()
+        processor.detokenizer.add_token(0)
+        processor.detokenizer.add_token(1)
+        processor.detokenizer.finalize()
+        self.assertEqual(processor.detokenizer.text, "Got it")
 
 
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
