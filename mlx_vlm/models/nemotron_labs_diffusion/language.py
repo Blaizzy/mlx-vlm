@@ -83,6 +83,8 @@ def _llama4_attention_scale(
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.small_sequence_chunks = 7 if config.intermediate_size % 7 == 0 else 1
+        self.tiny_sequence_chunks = 28 if config.intermediate_size % 28 == 0 else 1
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=config.mlp_bias
         )
@@ -93,8 +95,31 @@ class MLP(nn.Module):
             config.intermediate_size, config.hidden_size, bias=config.mlp_bias
         )
 
+    @staticmethod
+    def _chunked_linear(linear: nn.Linear, x: mx.array, chunks: int) -> mx.array:
+        weight_chunks = mx.split(linear.weight, chunks, axis=0)
+        outputs = [mx.matmul(x, weight.T) for weight in weight_chunks]
+        bias = getattr(linear, "bias", None)
+        if bias is not None:
+            bias_chunks = mx.split(bias, chunks, axis=0)
+            outputs = [output + bias for output, bias in zip(outputs, bias_chunks)]
+        return mx.concatenate(outputs, axis=-1)
+
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        sequence_length = x.shape[-2]
+        chunks = 1
+        if 2 <= sequence_length <= 8:
+            chunks = self.tiny_sequence_chunks
+        elif sequence_length <= 16:
+            chunks = self.small_sequence_chunks
+
+        if chunks > 1:
+            gate = self._chunked_linear(self.gate_proj, x, chunks)
+            up = self._chunked_linear(self.up_proj, x, chunks)
+        else:
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+        return self.down_proj(swiglu(gate, up))
 
 
 class DraftLoRALinear(nn.Module):
@@ -151,6 +176,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         use_cache: bool = True,
+        attention_scale: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, _ = x.shape
         queries = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim)
@@ -164,9 +190,11 @@ class Attention(nn.Module):
         offset = cache.offset if cache is not None else 0
         queries = self.rope(queries, offset=offset)
         keys = self.rope(keys, offset=offset)
-        queries = queries * _llama4_attention_scale(
-            self.config, L, offset, queries.dtype
-        )
+        if attention_scale is None:
+            attention_scale = _llama4_attention_scale(
+                self.config, L, offset, queries.dtype
+            )
+        queries = queries * attention_scale
 
         if cache is not None:
             if use_cache:
@@ -202,9 +230,14 @@ class DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         use_cache: bool = True,
+        attention_scale: Optional[mx.array] = None,
     ) -> mx.array:
         r = self.self_attn(
-            self.input_layernorm(x), mask=mask, cache=cache, use_cache=use_cache
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            use_cache=use_cache,
+            attention_scale=attention_scale,
         )
         h = x + r
         return h + self.mlp(self.post_attention_layernorm(h))
@@ -237,8 +270,19 @@ class NemotronLabsDiffusionEncoder(nn.Module):
             layer_mask = _make_bidirectional_mask(
                 mask if mask is not None else attention_mask, h
             )
+        first_cache = cache[0] if cache else None
+        offset = first_cache.offset if first_cache is not None else 0
+        attention_scale = _llama4_attention_scale(
+            self.config, h.shape[1], offset, h.dtype
+        )
         for layer, layer_cache in zip(self.layers, cache):
-            h = layer(h, mask=layer_mask, cache=layer_cache, use_cache=use_cache)
+            h = layer(
+                h,
+                mask=layer_mask,
+                cache=layer_cache,
+                use_cache=use_cache,
+                attention_scale=attention_scale,
+            )
         return self.norm(h)
 
 
@@ -256,6 +300,9 @@ class LanguageModel(nn.Module):
             self.diffusion_head = nn.Linear(
                 config.hidden_size, config.vocab_size, bias=False
             )
+        self.small_sequence_head_chunks = (
+            32 if config.vocab_size >= 4096 and config.vocab_size % 32 == 0 else 1
+        )
         self._linear_spec_lora_loaded = False
 
     def __call__(
@@ -275,11 +322,7 @@ class LanguageModel(nn.Module):
             use_cache=kwargs.get("use_cache", True),
             use_causal_mask=kwargs.get("use_causal_mask", True),
         )
-        if self.config.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.diffusion_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=self._project_hidden(out))
 
     @staticmethod
     def _top_k_logits(logits: mx.array, k: Optional[int]) -> mx.array:
@@ -332,6 +375,14 @@ class LanguageModel(nn.Module):
     def _project_hidden(self, hidden_states: mx.array) -> mx.array:
         if self.config.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden_states)
+        if self.small_sequence_head_chunks > 1 and 2 <= hidden_states.shape[-2] <= 16:
+            weight_chunks = mx.split(
+                self.diffusion_head.weight, self.small_sequence_head_chunks, axis=0
+            )
+            return mx.concatenate(
+                [mx.matmul(hidden_states, weight.T) for weight in weight_chunks],
+                axis=-1,
+            )
         return self.diffusion_head(hidden_states)
 
     def _sample_tokens(
@@ -558,14 +609,15 @@ class LanguageModel(nn.Module):
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
         cache = self.make_cache()
-        prefill_logits = self(
+        prefill_hidden = self.model(
             inputs,
             cache=cache,
             use_cache=True,
             use_causal_mask=True,
-        ).logits
+        )
+        prefill_logits = self._project_hidden(prefill_hidden[:, -1:, :])[:, -1, :]
         next_token = self._sample_tokens(
-            prefill_logits[:, -1, :],
+            prefill_logits,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
@@ -595,7 +647,8 @@ class LanguageModel(nn.Module):
                 )
                 visualize_tokens(preview, force=True)
 
-            for step_idx in range(steps):
+            denoise_steps = max(1, min(steps, block_length))
+            for step_idx in range(denoise_steps):
                 mask_index = block == mask_id
                 if not bool(mask_index.any().item()):
                     break
@@ -621,7 +674,10 @@ class LanguageModel(nn.Module):
                     mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
                 )
                 confidence = mx.where(mask_index, token_probs, neg_large)
-                if threshold is not None:
+                force_completion = step_idx == denoise_steps - 1
+                if force_completion:
+                    transfer_mask = mask_index
+                elif threshold is not None:
                     high_confidence = (confidence >= threshold) & mask_index
                     _, best_index = _topk(confidence, 1)
                     best_mask = (
@@ -633,8 +689,10 @@ class LanguageModel(nn.Module):
                         best_mask,
                     )
                 else:
-                    remaining_steps = max(1, steps - step_idx)
                     masked_count = int(mask_index.sum().item())
+                    if masked_count == 0:
+                        break
+                    remaining_steps = max(1, denoise_steps - step_idx)
                     transfer_count = max(
                         1, (masked_count + remaining_steps - 1) // remaining_steps
                     )
@@ -652,15 +710,18 @@ class LanguageModel(nn.Module):
                         else block
                     )
                     visualize_tokens(preview)
+                if not bool((block == mask_id).any().item()):
+                    break
 
-            output = self(
+            output_hidden = self.model(
                 block,
                 cache=cache,
                 use_cache=True,
                 use_causal_mask=True,
             )
+            next_logits = self._project_hidden(output_hidden[:, -1:, :])[:, -1, :]
             next_token = self._sample_tokens(
-                output.logits[:, -1, :],
+                next_logits,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
