@@ -177,6 +177,17 @@ def parse_arguments():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
+        "--generation-mode",
+        type=str,
+        choices=("slow", "fast", "hybrid"),
+        default="slow",
+        help=(
+            "Decoding mode for models exposing a custom block decoder via "
+            "pbd_generate (e.g. LocateAnything Parallel Box Decoding). "
+            "'slow' is standard autoregressive decoding."
+        ),
+    )
+    parser.add_argument(
         "--max-denoising-steps",
         type=int,
         default=None,
@@ -679,6 +690,8 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
+    # Consumed here so it never propagates to generate_step / other models.
+    generation_mode = kwargs.pop("generation_mode", "slow")
 
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
@@ -817,6 +830,47 @@ def stream_generate(
                 else "length"
             ),
             text_already_printed=bool(generation_stats.get("text_already_printed")),
+        )
+        return
+
+    # Models that expose a custom block decoder (e.g. LocateAnything Parallel Box
+    # Decoding) opt in via `pbd_generate`. Routed by capability + requested mode,
+    # mirroring how image-generation models are dispatched by capability above;
+    # the default "slow" mode falls through to standard AR decoding below.
+    if generation_mode in ("fast", "hybrid") and hasattr(model, "pbd_generate"):
+        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+        pbd_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k in ("image_grid_hws", "_grid_shapes", "image_token_id")
+        }
+        tic = time.perf_counter()
+        generated_tokens = model.pbd_generate(
+            input_ids,
+            pixel_values=pixel_values,
+            generation_mode=generation_mode,
+            max_tokens=max_tokens,
+            **pbd_kwargs,
+        )
+        total_time = max(time.perf_counter() - tic, 1e-9)
+        text = tokenizer.decode(
+            generated_tokens, skip_special_tokens=skip_special_tokens
+        )
+        yield GenerationResult(
+            text=text,
+            token=generated_tokens[-1] if generated_tokens else None,
+            logprobs=None,
+            prompt_tokens=int(input_ids.size),
+            generation_tokens=len(generated_tokens),
+            total_tokens=int(input_ids.size) + len(generated_tokens),
+            generation_tps=len(generated_tokens) / total_time,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=(
+                "stop"
+                if generated_tokens
+                and generated_tokens[-1] == getattr(tokenizer, "eos_token_id", None)
+                else "length"
+            ),
         )
         return
 
@@ -1504,6 +1558,7 @@ def main():
             "fps": args.fps,
             "temperature": args.temperature,
             "max_tokens": args.max_tokens,
+            "generation_mode": getattr(args, "generation_mode", "slow"),
             "repetition_penalty": args.repetition_penalty,
             "repetition_context_size": args.repetition_context_size,
             "presence_penalty": args.presence_penalty,
