@@ -1387,6 +1387,100 @@ class TestSamplerArgs:
         )
 
 
+@pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
+def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
+    pbar = MagicMock()
+
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.no_chunked_prefill = False
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(ar_module, "tqdm") as mock_tqdm,
+    ):
+        mock_tqdm.return_value.__enter__.return_value = pbar
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            prefill_step_size=2,
+            verbose=verbose,
+        )
+
+        next(gen)
+
+    mock_tqdm.assert_called_once()
+    assert mock_tqdm.call_args.kwargs["disable"] is disabled
+    assert pbar.update.call_count > 0
+
+
+def test_stream_generate_forwards_verbose_to_generate_step():
+    captured = {}
+
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        def reset(self):
+            self.segments = []
+
+        def add_token(self, token, skip_special_token_ids=None):
+            self.segments.append(str(token))
+
+        @property
+        def last_segment(self):
+            return self.segments.pop(0) if self.segments else ""
+
+        def finalize(self):
+            pass
+
+    def fake_generate_step(*args, **kwargs):
+        captured["verbose"] = kwargs.get("verbose")
+        yield 7, mx.zeros((4,))
+
+    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
+    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+                verbose=True,
+            )
+        )
+
+    assert captured["verbose"] is True
+
+
 def test_normalize_resize_shape_expands_single_value():
     assert normalize_resize_shape([224]) == (224, 224)
 
