@@ -1000,74 +1000,113 @@ class LanguageModel(nn.Module):
             denoise_range = range(denoise_steps) if current_block_length > 1 else ()
             for step_idx in denoise_range:
                 mask_index = block == mask_id
+                masked_count = int(mask_index.sum().item())
+                if masked_count == 0:
+                    break
                 force_completion = step_idx == denoise_steps - 1
+                masked_positions = mx.sort(
+                    mx.where(mask_index[0], block_positions, current_block_length)
+                )[:masked_count]
                 hidden_states = self.model(
                     block,
                     cache=cache,
                     use_cache=False,
                     use_causal_mask=False,
                 )
-                if force_completion:
-                    x0 = self._sample_from_hidden(
-                        hidden_states,
-                        temperature=temperature,
-                        top_k=top_k,
-                        top_p=top_p,
-                    )
-                    token_probs = None
-                else:
-                    x0, token_probs = self._sample_from_hidden(
-                        hidden_states,
+                masked_hidden_states = mx.take(hidden_states, masked_positions, axis=1)
+                need_confidence = not force_completion and masked_count > 1
+                if need_confidence:
+                    sampled_tokens, token_probs = self._sample_from_hidden(
+                        masked_hidden_states,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
                         return_prob=True,
                     )
+                else:
+                    sampled_tokens = self._sample_from_hidden(
+                        masked_hidden_states,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+                    token_probs = None
                 if stats is not None and not recorded_prompt_time:
                     if token_probs is None:
-                        mx.eval(x0)
+                        mx.eval(sampled_tokens)
                     else:
-                        mx.eval(x0, token_probs)
+                        mx.eval(sampled_tokens, token_probs)
                     stats["prompt_time"] = time.perf_counter() - prompt_tic
                     stats["prompt_tokens"] = float(inputs.size)
                     recorded_prompt_time = True
-                x0 = mx.where(mask_index, x0, block)
-                if force_completion:
+
+                position_matches = block_positions[None, :] == masked_positions[:, None]
+                sampled_block = mx.sum(
+                    mx.where(
+                        position_matches,
+                        sampled_tokens[0, :, None],
+                        mx.zeros(
+                            (masked_count, current_block_length), dtype=block.dtype
+                        ),
+                    ),
+                    axis=0,
+                    keepdims=True,
+                ).astype(block.dtype)
+                sampled_block = mx.where(mask_index, sampled_block, block)
+
+                if force_completion or masked_count == 1:
                     transfer_mask = mask_index
                 elif threshold is not None:
-                    neg_large = mx.array(
-                        mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
+                    sorted_indices = mx.argsort(-token_probs, axis=-1)
+                    sorted_confidence = mx.take_along_axis(
+                        token_probs, sorted_indices, axis=-1
                     )
-                    confidence = mx.where(mask_index, token_probs, neg_large)
-                    high_confidence = (confidence >= threshold) & mask_index
-                    _, best_index = _topk(confidence, 1)
-                    best_mask = (
-                        block_positions[None, None, :] == best_index[..., None]
-                    ).any(axis=1)
-                    transfer_mask = mx.where(
-                        high_confidence.any(axis=1)[:, None],
-                        high_confidence,
-                        best_mask,
+                    sorted_block_positions = mx.take_along_axis(
+                        masked_positions[None, :], sorted_indices, axis=-1
                     )
+                    sorted_positions = mx.arange(masked_count)[None, :]
+                    positional_threshold = 1.0 - 1.0 / (
+                        sorted_positions.astype(sorted_confidence.dtype) + 2.0
+                    )
+                    positional_threshold = mx.where(
+                        sorted_positions == 0,
+                        mx.array(
+                            mx.finfo(sorted_confidence.dtype).min,
+                            dtype=sorted_confidence.dtype,
+                        ),
+                        positional_threshold,
+                    )
+                    lower_bound = 0.5 if min_threshold is None else min_threshold
+                    keep_sorted = (sorted_confidence >= threshold) | (
+                        (sorted_confidence >= lower_bound)
+                        & (sorted_confidence >= positional_threshold)
+                    )
+                    if max_transfer_per_step is not None:
+                        keep_sorted = keep_sorted & (
+                            sorted_positions < max_transfer_per_step
+                        )
+                    keep_sorted = keep_sorted | (sorted_positions == 0)
+                    kept_positions = mx.where(
+                        keep_sorted, sorted_block_positions, current_block_length
+                    )
+                    transfer_mask = (
+                        block_positions[None, None, :] == kept_positions[..., None]
+                    ).any(axis=1) & mask_index
                 else:
-                    neg_large = mx.array(
-                        mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
-                    )
-                    confidence = mx.where(mask_index, token_probs, neg_large)
-                    masked_count = int(mask_index.sum().item())
-                    if masked_count == 0:
-                        break
                     remaining_steps = max(1, denoise_steps - step_idx)
                     transfer_count = max(
                         1, (masked_count + remaining_steps - 1) // remaining_steps
                     )
                     if max_transfer_per_step is not None:
                         transfer_count = min(transfer_count, max_transfer_per_step)
-                    _, indices = _topk(confidence, min(transfer_count, masked_count))
+                    _, indices = _topk(token_probs, min(transfer_count, masked_count))
+                    transfer_positions = mx.take_along_axis(
+                        masked_positions[None, :], indices, axis=-1
+                    )
                     transfer_mask = (
-                        block_positions[None, None, :] == indices[..., None]
-                    ).any(axis=1)
-                block = mx.where(transfer_mask, x0, block)
+                        block_positions[None, None, :] == transfer_positions[..., None]
+                    ).any(axis=1) & mask_index
+                block = mx.where(transfer_mask, sampled_block, block)
                 if visualizer_state["active"] and bool(transfer_mask.any().item()):
                     preview = (
                         mx.concatenate(generated_blocks + [block], axis=1)
@@ -1213,9 +1252,9 @@ class LanguageModel(nn.Module):
             raise ValueError("Linear speculative decoding requires batch size 1.")
         if block_length <= 0:
             raise ValueError("block_length must be a positive integer.")
-        # Treat block_length as a cap; acceptance is low beyond 8 and larger
-        # windows make each draft/verify pair slower without changing output.
-        draft_window = min(block_length, 8)
+        max_draft_window = min(block_length, 32)
+        base_draft_window = min(max_draft_window, 8)
+        draft_window = base_draft_window
 
         mask_token_id = (
             self.config.mask_token_id if mask_token_id is None else mask_token_id
@@ -1287,7 +1326,7 @@ class LanguageModel(nn.Module):
                     unmask = draft_conf >= threshold
                     if not bool(unmask.any().item()):
                         _, best_idx = _topk(draft_conf, 1)
-                        positions = mx.arange(block_length)
+                        positions = mx.arange(current_block_length)
                         unmask = (positions[None, None, :] == best_idx[..., None]).any(
                             axis=1
                         )
@@ -1337,6 +1376,13 @@ class LanguageModel(nn.Module):
             if eos_index is not None:
                 generated[-1] = accepted_tokens[:, : eos_index + 1]
                 break
+            if accepted == current_block_length and draft_window < max_draft_window:
+                draft_window = min(max_draft_window, draft_window * 2)
+            elif (
+                accepted <= max(1, current_block_length // 2)
+                and draft_window > base_draft_window
+            ):
+                draft_window = max(base_draft_window, draft_window // 2)
 
         return (
             mx.concatenate([prompt_ids, mx.concatenate(generated, axis=1)], axis=1),
@@ -1361,9 +1407,9 @@ class LanguageModel(nn.Module):
             raise ValueError("Linear speculative decoding requires batch size 1.")
         if block_length <= 0:
             raise ValueError("block_length must be a positive integer.")
-        # Treat block_length as a cap; acceptance is low beyond 8 and larger
-        # windows make each draft/verify pair slower without changing output.
-        draft_window = min(block_length, 8)
+        max_draft_window = min(block_length, 32)
+        base_draft_window = min(max_draft_window, 8)
+        draft_window = base_draft_window
 
         mask_token_id = (
             self.config.mask_token_id if mask_token_id is None else mask_token_id
@@ -1433,7 +1479,7 @@ class LanguageModel(nn.Module):
                     unmask = draft_conf >= threshold
                     if not bool(unmask.any().item()):
                         _, best_idx = _topk(draft_conf, 1)
-                        positions = mx.arange(block_length)
+                        positions = mx.arange(current_block_length)
                         unmask = (positions[None, None, :] == best_idx[..., None]).any(
                             axis=1
                         )
@@ -1484,6 +1530,13 @@ class LanguageModel(nn.Module):
             total_generated += accepted_tokens.shape[1]
             if eos_index is not None:
                 break
+            if accepted == current_block_length and draft_window < max_draft_window:
+                draft_window = min(max_draft_window, draft_window * 2)
+            elif (
+                accepted <= max(1, current_block_length // 2)
+                and draft_window > base_draft_window
+            ):
+                draft_window = max(base_draft_window, draft_window // 2)
 
     def sanitize(self, weights):
         if self.config.tie_word_embeddings:
