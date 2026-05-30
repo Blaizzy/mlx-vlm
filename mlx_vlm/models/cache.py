@@ -281,30 +281,42 @@ class BatchQuantizedKVCache(_BaseCache):
             return
 
         max_idx = max(self._idx, other._idx)
+        self_len = 0 if self.keys is None else self.keys[0].shape[-2]
+        other_len = 0 if other.keys is None else other.keys[0].shape[-2]
+        max_size = max(max_idx, self_len, other_len)
+        ref_keys = self.keys if self.keys is not None else other.keys
+        ref_values = self.values if self.values is not None else other.values
+
+        def _empty_like(parts, batch_size: int):
+            out = []
+            for part in parts:
+                shape = list(part.shape)
+                shape[0] = batch_size
+                shape[-2] = 0
+                out.append(mx.zeros(tuple(shape), dtype=part.dtype))
+            return tuple(out)
 
         def _pad_quant(cache_obj):
             if cache_obj.keys is None:
-                return None
+                batch_size = int(cache_obj.offset.shape[0])
+                keys = _empty_like(ref_keys, batch_size)
+                values = _empty_like(ref_values, batch_size)
+            else:
+                keys = cache_obj.keys
+                values = cache_obj.values
             left = max_idx - cache_obj._idx
-            right_total = max(
-                cache_obj.keys[0].shape[-2],
-                max_idx,
-            )
-            right = right_total - cache_obj.keys[0].shape[-2] - left
+            right = max_size - keys[0].shape[-2] - left
             if right < 0:
-                trimmed_keys = tuple(
-                    k[..., : right_total - left, :] for k in cache_obj.keys
-                )
-                trimmed_values = tuple(
-                    v[..., : right_total - left, :] for v in cache_obj.values
-                )
+                trimmed_keys = tuple(k[..., : max_size - left, :] for k in keys)
+                trimmed_values = tuple(v[..., : max_size - left, :] for v in values)
                 right = 0
             else:
-                trimmed_keys = cache_obj.keys
-                trimmed_values = cache_obj.values
+                trimmed_keys = keys
+                trimmed_values = values
 
             if left != 0 or right != 0:
-                pad_spec = [(0, 0), (0, 0), (left, right), (0, 0)]
+                pad_spec = [(0, 0)] * len(trimmed_keys[0].shape)
+                pad_spec[-2] = (left, right)
                 padded_keys = tuple(mx.pad(k, pad_spec) for k in trimmed_keys)
                 padded_values = tuple(mx.pad(v, pad_spec) for v in trimmed_values)
             else:
@@ -316,29 +328,6 @@ class BatchQuantizedKVCache(_BaseCache):
 
         r_self = _pad_quant(self)
         r_other = _pad_quant(other)
-
-        if r_self is None and r_other is None:
-            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
-            self.offset = mx.concatenate([self.offset, other.offset])
-            return
-        if r_self is None:
-            ok, ov, oo, olp = r_other
-            slp = self.left_padding + max_idx
-            self.keys = ok
-            self.values = ov
-            self.offset = mx.concatenate([self.offset, oo])
-            self.left_padding = mx.concatenate([slp, olp])
-            self._idx = max_idx
-            return
-        if r_other is None:
-            sk, sv, so, slp = r_self
-            olp = other.left_padding + max_idx
-            self.keys = sk
-            self.values = sv
-            self.offset = mx.concatenate([so, other.offset])
-            self.left_padding = mx.concatenate([slp, olp])
-            self._idx = max_idx
-            return
 
         sk, sv, so, slp = r_self
         ok, ov, oo, olp = r_other
