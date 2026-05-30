@@ -1,20 +1,25 @@
 import base64
 import json
 import time
+from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 import mlx_vlm.server as server
 import mlx_vlm.server.generation as server_generation
+import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
+from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -266,6 +271,301 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def _unstarted_response_generator():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model_path = "demo"
+    gen.adapter_path = None
+    gen.model = None
+    gen.processor = None
+    gen.config = None
+    gen.stop_tokens = set()
+    gen.vision_cache = None
+    gen.draft_model = None
+    gen.draft_kind = None
+    gen.kv_bits = None
+    gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+    gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+    gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+    gen.top_logprobs_k = 0
+    gen.apc_manager = None
+    gen.tokenizer = None
+    gen.requests = Queue()
+    gen._stop = False
+    gen._ready = Event()
+    gen._load_error = None
+    gen._cancelled = set()
+    gen._cancel_lock = Lock()
+    return gen
+
+
+def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        hidden_size=5376,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="gemma4_assistant",
+            backbone_hidden_size=1536,
+        )
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+
+    gen._initialize_model()
+
+    assert gen.model is model
+    assert gen.processor is processor
+    assert gen.draft_model is None
+    assert gen.draft_kind is None
+
+
+def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
+    class FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    class FakeBatchGenerator:
+        def __init__(self, *args, **kwargs):
+            self.unprocessed_prompts = []
+            self.has_pending_prompts = False
+
+        def insert(self, *args, **kwargs):
+            return (1,)
+
+        def next(self, **kwargs):
+            return [], [
+                SimpleNamespace(
+                    uid=1,
+                    token=7,
+                    token_logprob=0.0,
+                    finish_reason="length",
+                )
+            ]
+
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        hidden_size=5376,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="gemma4_assistant",
+            backbone_hidden_size=1536,
+        )
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(
+        server_generation,
+        "make_streaming_detokenizer",
+        lambda _processor: FakeDetokenizer(),
+    )
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+    gen._gpu_embed = lambda raw_inputs, images=None: (
+        mx.array([[raw_inputs["token"]]], dtype=mx.int32),
+        {},
+    )
+
+    rqueue = Queue()
+    gen.requests.put(
+        (
+            rqueue,
+            {"token": 1},
+            1,
+            server.GenerationArguments(max_tokens=1),
+            None,
+        )
+    )
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+    try:
+        ctx = rqueue.get(timeout=1)
+        token = rqueue.get(timeout=1)
+        done = rqueue.get(timeout=1)
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
+
+    assert isinstance(ctx, server.GenerationContext)
+    assert token.text == "7"
+    assert token.finish_reason == "length"
+    assert done is None
+    assert gen.draft_model is None
+    assert gen.draft_kind is None
+
+
+def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+
+    rqueue = Queue()
+    pending = [
+        (
+            rqueue,
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        )
+    ]
+    calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pending, False
+        return [], True
+
+    error = RuntimeError("speculative prefill failed")
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=error)
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.utils.speculative_prefill_kwargs",
+        lambda *_args, **_kwargs: {},
+    )
+
+    gen._run_speculative()
+
+    assert rqueue.get(timeout=1) is error
+    assert rqueue.get(timeout=1) is None
+
+
+def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+
+    class BrokenQueue:
+        def put(self, item):
+            raise RuntimeError("client went away")
+
+    good_queue = Queue()
+    pending = [
+        (
+            BrokenQueue(),
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        ),
+        (
+            good_queue,
+            {"input_ids": mx.array([[1]], dtype=mx.int32)},
+            1,
+            server.GenerationArguments(max_tokens=2),
+            None,
+        ),
+    ]
+    calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pending, False
+        return [], True
+
+    error = RuntimeError("speculative prefill failed")
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=error)
+
+    gen._run_speculative()
+
+    assert good_queue.get(timeout=1) is error
+    assert good_queue.get(timeout=1) is None
+
+
+def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace(language_model=SimpleNamespace())
+    gen.processor = SimpleNamespace()
+    gen.draft_model = SimpleNamespace(
+        config=SimpleNamespace(target_layer_ids=[1, 2]), accept_lens=[]
+    )
+    gen.draft_kind = "dflash"
+    gen.stop_tokens = set()
+    rqueue = Queue()
+
+    calls = {"clear_cache": 0, "collect": 0}
+    collect_calls = {"count": 0}
+
+    def collect_pending_requests(**_kwargs):
+        collect_calls["count"] += 1
+        if collect_calls["count"] > 1:
+            return [], True
+        return [
+            (
+                rqueue,
+                {"input_ids": mx.array([[1]], dtype=mx.int32)},
+                1,
+                server.GenerationArguments(max_tokens=2),
+                None,
+            )
+        ], False
+
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=RuntimeError("boom"))
+    monkeypatch.setattr(
+        server_generation.mx,
+        "clear_cache",
+        lambda: calls.__setitem__("clear_cache", calls["clear_cache"] + 1),
+    )
+    monkeypatch.setattr(
+        server_generation.gc,
+        "collect",
+        lambda: calls.__setitem__("collect", calls["collect"] + 1),
+    )
+
+    gen._run_speculative()
+
+    assert calls == {"clear_cache": 1, "collect": 1}
+
+
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
     def repo(repo_id, file_names):
         return SimpleNamespace(
@@ -311,6 +611,187 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
     assert "local/single-file-model" in ids
     assert "local/sharded-model" in ids
     assert "missing/weights" not in ids
+
+
+def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
+    image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
+    data = ImageGenerationResult(
+        array=mx.array(np.array(image)),
+        seed=seed,
+        width=16,
+        height=16,
+        steps=1,
+        model="bonsai",
+        family="bonsai",
+        variant="ternary",
+        guidance=1.0,
+        peak_memory=0.0,
+        prompt_tokens=5,
+    )
+    if output_path is not None:
+        data.save(output_path)
+    return data
+
+
+def test_images_generations_returns_b64_json(client, monkeypatch):
+    calls = []
+    cache_calls = []
+
+    def fake_get_cached_model(model, **kwargs):
+        cache_calls.append((model, kwargs))
+        return SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        fake_get_cached_model,
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        calls.append(request)
+        return _fake_image_result(seed=request.seed)
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "bonsai-ternary",
+            "prompt": "bonsai",
+            "n": 2,
+            "seed": 10,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["size"] == "256x256"
+    assert [item["seed"] for item in payload["data"]] == [10, 11]
+    assert all(item["b64_json"] for item in payload["data"])
+    assert [call.seed for call in calls] == [10, 11]
+    assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
+
+
+def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="bonsai"),
+        ),
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        return _fake_image_result(seed=request.seed, output_path=kwargs["output_path"])
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "bonsai-ternary",
+            "prompt": "bonsai",
+            "n": 2,
+            "seed": 20,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "path",
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    paths = [Path(item["path"]) for item in payload["data"]]
+    assert [path.name for path in paths] == ["image-20.png", "image-21.png"]
+    assert all(path.exists() for path in paths)
+    assert all(item["b64_json"] is None for item in payload["data"])
+
+
+def test_images_edits_returns_b64_json(client, monkeypatch):
+    calls = []
+    cache_calls = []
+
+    def fake_get_cached_model(model, **kwargs):
+        cache_calls.append((model, kwargs))
+        return SimpleNamespace(), None, SimpleNamespace(model_type="flux2")
+
+    monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
+
+    def fake_edit_image(model, request, **kwargs):
+        calls.append((request, kwargs))
+        return _fake_image_result(seed=request.seed)
+
+    monkeypatch.setattr(server_openai, "edit_image", fake_edit_image)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "black-forest-labs/FLUX.2-klein-9b-kv",
+            "prompt": "add sunglasses",
+            "image": ["reference.png"],
+            "n": 2,
+            "seed": 30,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["size"] == "16x16"
+    assert [item["seed"] for item in payload["data"]] == [30, 31]
+    assert all(item["b64_json"] for item in payload["data"])
+    assert [call[0].seed for call in calls] == [30, 31]
+    assert calls[0][0].image_paths == ("reference.png",)
+    assert cache_calls == [
+        ("black-forest-labs/FLUX.2-klein-9b-kv", {"model_kind": "image_edit"})
+    ]
+
+
+def test_images_edits_writes_paths(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="flux2"),
+        ),
+    )
+
+    def fake_edit_image(model, request, **kwargs):
+        return _fake_image_result(seed=request.seed, output_path=kwargs["output_path"])
+
+    monkeypatch.setattr(server_openai, "edit_image", fake_edit_image)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "black-forest-labs/FLUX.2-klein-9b-kv",
+            "prompt": "add sunglasses",
+            "image": "reference.png",
+            "n": 2,
+            "seed": 40,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "path",
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    paths = [Path(item["path"]) for item in payload["data"]]
+    assert [path.name for path in paths] == ["edit-40.png", "edit-41.png"]
+    assert all(path.exists() for path in paths)
+    assert all(item["b64_json"] is None for item in payload["data"])
 
 
 class _RecordingSpeculativeLM:
@@ -537,6 +1018,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
                 "enable_thinking": False,
                 "thinking_budget": 24,
                 "thinking_start_token": "<think>",
+                "thinking_end_token": "</think>",
             },
         )
 
@@ -544,6 +1026,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_template.call_args.kwargs["enable_thinking"] is False
     assert mock_template.call_args.kwargs["thinking_budget"] == 24
     assert mock_template.call_args.kwargs["thinking_start_token"] == "<think>"
+    assert mock_template.call_args.kwargs["thinking_end_token"] == "</think>"
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["top_k"] == 40
     assert mock_generate.call_args.kwargs["min_p"] == 0.08
@@ -552,6 +1035,7 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
+    assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
 
 
 def test_responses_previous_response_id_replays_stored_items(client):
@@ -2869,6 +3353,8 @@ class TestResponseGenerator:
             logit_bias={3: -0.5},
             enable_thinking=False,
             thinking_budget=100,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
             logits_processors=[processor],
             tenant_id="tenant-a",
         )
@@ -2885,14 +3371,21 @@ class TestResponseGenerator:
         assert kw["logit_bias"] == {3: -0.5}
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 100
+        assert kw["thinking_start_token"] == "<think>"
+        assert kw["thinking_end_token"] == "</think>"
         assert kw["logits_processors"] == [processor]
         assert kw["apc_tenant"] == "tenant-a"
 
     def test_generate_arguments_to_template_kwargs(self):
-        args = server.GenerationArguments(enable_thinking=False, thinking_budget=50)
+        args = server.GenerationArguments(
+            enable_thinking=False,
+            thinking_budget=50,
+            thinking_end_token="</think>",
+        )
         kw = args.to_template_kwargs()
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 50
+        assert kw["thinking_end_token"] == "</think>"
 
     def test_generate_arguments_omits_none_optionals(self):
         args = server.GenerationArguments()
@@ -2979,6 +3472,7 @@ class TestResponseGenerator:
             enable_thinking=False,
             thinking_budget=None,
             thinking_start_token=None,
+            thinking_end_token=None,
         )
         args = server._build_gen_args(req, tenant_id="tenant-a")
         assert args.max_tokens == 128
@@ -3009,6 +3503,7 @@ class TestResponseGenerator:
             enable_thinking=True,
             thinking_budget=None,
             thinking_start_token=None,
+            thinking_end_token=None,
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 256

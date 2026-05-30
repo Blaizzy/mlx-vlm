@@ -125,6 +125,6 @@ exceeds the speedup it buys.
   only regime `RotatingKVCache` ever produces. Long-prompt mask paths are
   effectively dead code today.
 - **Batched generation.** Continuous-batching support is in
-  `_mtp_rounds_batch` (`mlx_vlm/generate.py`). For targets whose KV caches
-  don't implement `.filter()`, finished rows are kept in the batch and
+  `_mtp_rounds_batch` (`mlx_vlm/generate/dispatch.py`). For targets whose KV
+  caches don't implement `.filter()`, finished rows are kept in the batch and
   simply stop emitting; throughput doesn't shrink with retired rows.

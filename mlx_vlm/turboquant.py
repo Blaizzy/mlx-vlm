@@ -4287,7 +4287,7 @@ class _TurboQuantMSECodec:
         return self.score_prepared(self.prepare_queries(queries), state)
 
     def weighted_sum(self, weights: mx.array, state: TurboQuantMSEState) -> mx.array:
-        if weights.shape[-2] == 1:
+        if not self.use_rht and weights.shape[-2] == 1:
             fast_output = _metal_mse_weighted_sum(
                 weights,
                 state,
@@ -4327,8 +4327,11 @@ class _TurboQuantMSECodec:
         self, scores: mx.array, state: TurboQuantMSEState
     ) -> tuple[mx.array, mx.array, mx.array]:
         max_scores = mx.max(scores, axis=-1)
-        # Metal kernel fast path: only for single-query decode (L=1)
-        if scores.ndim == 5 and scores.shape[-2] == 1:
+        # Metal kernel fast path: only for single-query decode (L=1).
+        # Skip under RHT: these L=1 value kernels undo the codec rotation with
+        # matmul(., rotation) and do not implement the RHT inverse, so they
+        # corrupt the output when use_rht is set (the codec default).
+        if not self.use_rht and scores.ndim == 5 and scores.shape[-2] == 1:
             max_scores_2d = max_scores.reshape(
                 max_scores.shape[0],
                 max_scores.shape[1],

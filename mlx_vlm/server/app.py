@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from threading import Lock
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 
@@ -18,6 +19,8 @@ from ..generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
 )
+from ..generate.edit_image import load_image_edit_model
+from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -68,6 +71,7 @@ def _server_runtime_snapshot() -> dict:
     return {
         "loaded_model": runtime.model_cache.get("model_path", None),
         "loaded_adapter": runtime.model_cache.get("adapter_path", None),
+        "model_kind": runtime.model_cache.get("model_kind", "text_generation"),
         "loaded_context_size": native_context_size,
         "configured_context_limit": configured_context_limit,
         "effective_context_limit": effective_context_limit,
@@ -133,6 +137,7 @@ def _build_gen_args(
         enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
+        thinking_end_token=getattr(request, "thinking_end_token", None),
         tenant_id=tenant_id,
     )
     if processor is not None:
@@ -376,7 +381,12 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 _INHERIT_ADAPTER = object()
 
 
-def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
+def get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
@@ -385,7 +395,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         cached = runtime.model_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path)
+    cache_key = (model_path, adapter_path, model_kind)
 
     # Return from cache if already loaded and matches the requested paths
     if runtime.model_cache.get("cache_key") == cache_key:
@@ -400,6 +410,80 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     if runtime.model_cache:
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
+
+    load_as_edit = model_kind == "image_edit"
+    if load_as_edit:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for image edit models.",
+            )
+        print(f"Loading image edit model from: {model_path}")
+        try:
+            model = load_image_edit_model(model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported image edit model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load image edit model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "family", "image_edit"),
+            text_config=None,
+        )
+        runtime.response_generator = None
+        runtime.apc_manager = None
+        runtime.model_cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": "image_edit",
+            "generation_lock": Lock(),
+        }
+        return model, None, config
+
+    load_as_image = model_kind == "image_generation" or (
+        model_kind == "auto" and is_image_generation_model(model_path)
+    )
+    if load_as_image:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for image generation models.",
+            )
+        print(f"Loading image generation model from: {model_path}")
+        try:
+            model = load_image_generation_model(model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported image generation model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load image generation model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "family", "image_generation"),
+            text_config=None,
+        )
+        runtime.response_generator = None
+        runtime.apc_manager = None
+        runtime.model_cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": "image_generation",
+            "generation_lock": Lock(),
+        }
+        return model, None, config
 
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)

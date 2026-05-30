@@ -15,6 +15,11 @@ from ..generate import (
     DEFAULT_TOP_P,
     normalize_resize_shape,
 )
+from ..generate.image import (
+    DEFAULT_IMAGE_GUIDANCE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_IMAGE_STEPS,
+)
 
 
 def get_server_max_tokens():
@@ -28,6 +33,143 @@ class FlexibleBaseModel(BaseModel):
 
 
 # OpenAI API Models
+
+
+class ImageGenerationRequest(FlexibleBaseModel):
+    prompt: str = Field(..., description="Text prompt for image generation.")
+    model: str = Field(
+        "",
+        description="Image generation model name or local snapshot path.",
+    )
+    n: int = Field(1, ge=1, le=10, description="Number of images to generate.")
+    size: Optional[str] = Field(
+        DEFAULT_IMAGE_SIZE,
+        description="Image size as WIDTHxHEIGHT. Width/height fields override this.",
+    )
+    width: Optional[int] = Field(None, description="Generated image width.")
+    height: Optional[int] = Field(None, description="Generated image height.")
+    steps: int = Field(
+        DEFAULT_IMAGE_STEPS,
+        ge=1,
+        description="Number of image generation inference steps.",
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="Base seed. Multiple outputs use (seed + i) values.",
+    )
+    guidance: float = Field(
+        DEFAULT_IMAGE_GUIDANCE,
+        description="Classifier-free guidance scale.",
+    )
+    response_format: Literal["b64_json", "path"] = Field(
+        "b64_json",
+        description="Return base64 PNG data or write files and return local paths.",
+    )
+    output_format: Literal["png"] = Field(
+        "png", description="Output image format. Only PNG is currently supported."
+    )
+    output_path: Optional[str] = Field(
+        None,
+        description="Output file path. For n>1, an index is added to the stem.",
+    )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Output directory for path responses.",
+    )
+    user: Optional[str] = Field(
+        None, description="OpenAI-compatible user identifier; currently ignored."
+    )
+
+
+class ImageGenerationResponseData(BaseModel):
+    b64_json: Optional[str] = None
+    path: Optional[str] = None
+    revised_prompt: Optional[str] = None
+    mime_type: str = "image/png"
+    width: int
+    height: int
+    seed: int
+
+
+class ImageGenerationResponse(BaseModel):
+    created: int
+    data: List[ImageGenerationResponseData]
+    output_format: Literal["png"] = "png"
+    size: str
+
+
+class ImageEditRequest(FlexibleBaseModel):
+    prompt: str = Field(..., description="Text prompt for image editing.")
+    image: Union[str, List[str]] = Field(
+        ..., description="Local path or paths of reference images."
+    )
+    model: str = Field(..., description="Image edit model name or local snapshot path.")
+    n: int = Field(1, ge=1, le=10, description="Number of images to generate.")
+    size: Optional[str] = Field(
+        None,
+        description="Edited image size as WIDTHxHEIGHT. Width/height fields override this.",
+    )
+    width: Optional[int] = Field(None, description="Edited image width.")
+    height: Optional[int] = Field(None, description="Edited image height.")
+    steps: int = Field(
+        DEFAULT_IMAGE_STEPS,
+        ge=1,
+        description="Number of image edit inference steps.",
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="Base seed. Multiple outputs use (seed + i) values.",
+    )
+    guidance: float = Field(
+        DEFAULT_IMAGE_GUIDANCE,
+        description="Classifier-free guidance scale.",
+    )
+    response_format: Literal["b64_json", "path"] = Field(
+        "b64_json",
+        description="Return base64 PNG data or write files and return local paths.",
+    )
+    output_format: Literal["png"] = Field(
+        "png", description="Output image format. Only PNG is currently supported."
+    )
+    output_path: Optional[str] = Field(
+        None,
+        description="Output file path. For n>1, an index is added to the stem.",
+    )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Output directory for path responses.",
+    )
+    user: Optional[str] = Field(
+        None, description="OpenAI-compatible user identifier; currently ignored."
+    )
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, value):
+        images = [value] if isinstance(value, str) else list(value)
+        if not images:
+            raise ValueError("At least one image is required.")
+        if not all(isinstance(item, str) and item for item in images):
+            raise ValueError("Image paths must be non-empty strings.")
+        return value
+
+
+class ImageEditResponseData(BaseModel):
+    b64_json: Optional[str] = None
+    path: Optional[str] = None
+    revised_prompt: Optional[str] = None
+    mime_type: str = "image/png"
+    width: int
+    height: int
+    seed: int
+
+
+class ImageEditResponse(BaseModel):
+    created: int
+    data: List[ImageEditResponseData]
+    output_format: Literal["png"] = "png"
+    size: str
+
 
 # Models for /responses endpoint
 
@@ -169,6 +311,7 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -477,6 +620,7 @@ class VLMRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
     logprobs: Optional[bool] = Field(
         None,
         description="Return log-probabilities for each output token.",
@@ -644,6 +788,7 @@ class AnthropicRequest(FlexibleBaseModel):
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    thinking_end_token: Optional[str] = None
     response_format: Optional[Any] = None
 
 

@@ -1168,6 +1168,47 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
         self.assertEqual(processor.image_end_token, "[IMG_END]")
 
 
+class TestStep3VLProcessor(unittest.TestCase):
+    def test_from_pretrained_uses_fixed_tokenizer(self):
+        from mlx_vlm.models.step3p7.processing_step3p7 import Step3VLProcessor
+        from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
+
+        tokenizer = _mock_tokenizer(
+            chat_template="template",
+            vocab={"Got": 0, "Ġit": 1},
+            backend_tokenizer=SimpleNamespace(decoder="bad"),
+        )
+
+        def _fake_init(self, tokenizer=None, chat_template=None, **kwargs):
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+        with (
+            patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+            ) as from_pretrained,
+            patch.object(Step3VLProcessor, "__init__", _fake_init),
+        ):
+            processor = Step3VLProcessor.from_pretrained(
+                "step-model", trust_remote_code=True
+            )
+
+        from_pretrained.assert_called_once_with(
+            "step-model",
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
+        self.assertIs(processor.tokenizer, tokenizer)
+        self.assertIs(processor.detokenizer_class, BPEStreamingDetokenizer)
+        self.assertIn("ByteLevel", repr(tokenizer.backend_tokenizer.decoder))
+
+        processor.detokenizer = object()
+        processor.detokenizer.add_token(0)
+        processor.detokenizer.add_token(1)
+        processor.detokenizer.finalize()
+        self.assertEqual(processor.detokenizer.text, "Got it")
+
+
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.multi_modality.processing_multi_modality import (
