@@ -131,9 +131,7 @@ class Step3VLProcessor(ProcessorMixin):
     def detokenizer(self, _detokenizer):
         tokenizer = getattr(self, "tokenizer", None)
         self._detokenizer = (
-            self.detokenizer_class(tokenizer)
-            if tokenizer is not None
-            else _detokenizer
+            self.detokenizer_class(tokenizer) if tokenizer is not None else _detokenizer
         )
 
     def __init__(self, tokenizer=None, chat_template=None, **kwargs):
