@@ -119,6 +119,34 @@ class TestExtend:
         assert c1.keys[0].shape[0] == 2
         assert c1.left_padding.shape[0] == 2
 
+    def test_extend_handles_filtered_non_step_aligned_capacity(self):
+        c1 = BatchQuantizedKVCache([7, 7], group_size=GROUP_SIZE, bits=BITS)
+        k1, v1 = _rand_kv(2, 512)
+        c1.update_and_fetch(k1, v1)
+        mx.eval(c1.keys)
+
+        # Filtering rows can trim common left padding and leave a backing
+        # sequence length that is no longer aligned to the allocation step.
+        c1.filter(mx.array([0], mx.int32))
+        mx.eval(c1.keys)
+        assert c1.keys[0].shape[-2] == 505
+        assert c1._idx == 505
+
+        c2 = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        k2, v2 = _rand_kv(1, 500)
+        c2.update_and_fetch(k2, v2)
+        mx.eval(c2.keys)
+        assert c2.keys[0].shape[-2] == 512
+        assert c2._idx == 500
+
+        c1.extend(c2)
+        mx.eval(c1.keys)
+
+        assert c1.keys[0].shape[0] == 2
+        assert c1.keys[0].shape[-2] == 512
+        assert c1._idx == 505
+        assert c1.left_padding.tolist() == [0, 5]
+
     def test_extend_empty_into_populated(self):
         c1 = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
         k1, v1 = _rand_kv(1, 4)
@@ -140,6 +168,8 @@ class TestExtend:
         c1.extend(c2)
         assert c1._idx == 4
         assert c1.keys is not None
+        assert c1.keys[0].shape[0] == 2
+        assert c1.offset.shape[0] == 2
 
 
 class TestState:
