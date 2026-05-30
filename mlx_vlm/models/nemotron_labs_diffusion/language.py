@@ -1185,11 +1185,11 @@ class LanguageModel(nn.Module):
 
             denoise_steps = max(1, min(steps, current_block_length))
             denoise_range = range(denoise_steps) if current_block_length > 1 else ()
+            masked_count = max(0, current_block_length - 1)
             for step_idx in denoise_range:
-                mask_index = block == mask_id
-                masked_count = int(mask_index.sum().item())
                 if masked_count == 0:
                     break
+                mask_index = block == mask_id
                 force_completion = step_idx == denoise_steps - 1
                 add_stat("diffusion_denoise_nfe")
                 add_stat("diffusion_masked_rows_scored", masked_count)
@@ -1267,6 +1267,7 @@ class LanguageModel(nn.Module):
 
                 if force_completion or masked_count == 1:
                     transfer_mask = mask_index
+                    accepted_count = masked_count
                 elif threshold is not None:
                     sorted_indices = mx.argsort(-token_probs, axis=-1)
                     sorted_confidence = mx.take_along_axis(
@@ -1346,6 +1347,7 @@ class LanguageModel(nn.Module):
                     transfer_mask = (
                         block_positions[None, None, :] == kept_positions[..., None]
                     ).any(axis=1) & mask_index
+                    accepted_count = int(transfer_mask.sum().item())
                 else:
                     remaining_steps = max(1, denoise_steps - step_idx)
                     transfer_count = max(
@@ -1360,12 +1362,9 @@ class LanguageModel(nn.Module):
                     transfer_mask = (
                         block_positions[None, None, :] == transfer_positions[..., None]
                     ).any(axis=1) & mask_index
+                    accepted_count = min(transfer_count, masked_count)
                 block = mx.where(transfer_mask, sampled_block, block)
-                remaining_masked_count = int((block == mask_id).sum().item())
-                add_stat(
-                    "diffusion_accepted_tokens",
-                    masked_count - remaining_masked_count,
-                )
+                add_stat("diffusion_accepted_tokens", accepted_count)
                 if visualizer_state["active"] and bool(transfer_mask.any().item()):
                     preview = (
                         mx.concatenate(generated_blocks + [block], axis=1)
@@ -1375,7 +1374,8 @@ class LanguageModel(nn.Module):
                     visualize_tokens(preview)
                 if force_completion:
                     break
-                if remaining_masked_count == 0:
+                masked_count -= accepted_count
+                if masked_count == 0:
                     break
 
             generated_block = block[:, :current_block_length]
