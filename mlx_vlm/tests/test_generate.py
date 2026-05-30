@@ -27,6 +27,7 @@ from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
+image_module = __import__("mlx_vlm.generate.image", fromlist=[""])
 
 # ============================================================================
 # Fixtures and Mock Classes
@@ -1476,6 +1477,7 @@ def test_generate_image_cli_routes_before_vlm_load():
     args = Namespace(
         model="bonsai-ternary",
         output_modality="image",
+        task="generate",
         output="out.png",
         size="512x512",
         steps=4,
@@ -1494,6 +1496,44 @@ def test_generate_image_cli_routes_before_vlm_load():
     mock_load.assert_not_called()
 
 
+def test_generate_image_cli_edit_task_loads_edit_model_and_saves_output(tmp_path):
+    output_path = tmp_path / "edited.png"
+    args = Namespace(
+        model="black-forest-labs/FLUX.2-klein-9b-kv",
+        task="edit",
+        image=["reference.png"],
+        prompt=["add", "sunglasses"],
+        output=str(output_path),
+        size="256x512",
+        steps=2,
+        seed=7,
+        guidance=1.0,
+    )
+    result = SimpleNamespace(
+        path=output_path,
+        seed=7,
+        width=256,
+        height=512,
+        steps=2,
+        variant="flux2-klein-9b-kv",
+    )
+    model = SimpleNamespace()
+
+    with (
+        patch.object(image_module, "load_image_model", return_value=model),
+        patch.object(image_module, "generate_image", return_value=result) as mock_edit,
+    ):
+        image_module.run_image_generation_cli(args)
+
+    edit_request = mock_edit.call_args.args[1]
+    assert edit_request.prompt == "add sunglasses"
+    assert edit_request.image_paths == ("reference.png",)
+    assert edit_request.width == 256
+    assert edit_request.height == 512
+    assert mock_edit.call_args.kwargs["task"] == "edit"
+    assert mock_edit.call_args.kwargs["output_path"] == output_path
+
+
 def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
 
@@ -1502,7 +1542,8 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.thinking_start_token == "<think>"
     assert args.thinking_end_token == "</think>"
     assert args.output_modality == "text"
-    assert args.size == "512x512"
+    assert args.task == "generate"
+    assert args.size is None
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):

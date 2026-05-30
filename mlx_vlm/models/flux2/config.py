@@ -13,6 +13,9 @@ class Flux2Variant:
     local_dir_name: str
     transformer_overrides: dict[str, int]
     text_encoder_overrides: dict[str, int]
+    supports_generation: bool = True
+    supports_edit: bool = False
+    uses_reference_kv_cache: bool = False
 
 
 FLUX2_KLEIN_4B_TRANSFORMER = {
@@ -66,6 +69,7 @@ VARIANTS: dict[str, Flux2Variant] = {
         local_dir_name="FLUX.2-klein-9B",
         transformer_overrides=FLUX2_KLEIN_9B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_9B_TEXT_ENCODER,
+        supports_edit=True,
     ),
     "flux2-klein-base-4b": Flux2Variant(
         name="flux2-klein-base-4b",
@@ -99,6 +103,22 @@ VARIANTS: dict[str, Flux2Variant] = {
         transformer_overrides=FLUX2_KLEIN_9B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_9B_TEXT_ENCODER,
     ),
+    "flux2-klein-9b-kv": Flux2Variant(
+        name="flux2-klein-9b-kv",
+        aliases=(
+            "flux2-klein-9b-kv",
+            "flux2-klein-9B-kv",
+            "klein-9b-kv",
+            "klein-9B-kv",
+            "black-forest-labs/FLUX.2-klein-9b-kv",
+        ),
+        repo_id="black-forest-labs/FLUX.2-klein-9b-kv",
+        local_dir_name="FLUX.2-klein-9b-kv",
+        transformer_overrides=FLUX2_KLEIN_9B_TRANSFORMER,
+        text_encoder_overrides=FLUX2_KLEIN_9B_TEXT_ENCODER,
+        supports_edit=True,
+        uses_reference_kv_cache=True,
+    ),
 }
 
 _ALIASES = {
@@ -122,6 +142,8 @@ def get_variant(name: str | Flux2Variant = "flux2-klein-4b") -> Flux2Variant:
 def variant_from_local_path(model_path: str | Path) -> Flux2Variant:
     root = Path(model_path).expanduser()
     name = str(root).lower()
+    if "kv" in name or (root / "flux-2-klein-9b-kv.safetensors").exists():
+        return VARIANTS["flux2-klein-9b-kv"]
     if "base" in name and "9b" in name:
         return VARIANTS["flux2-klein-base-9b"]
     if "base" in name and "4b" in name:

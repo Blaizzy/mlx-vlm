@@ -25,6 +25,7 @@ from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
     DEFAULT_IMAGE_STEPS,
+    DEFAULT_IMAGE_TASK,
     run_image_generation_cli,
 )
 
@@ -51,6 +52,12 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
+DEFAULT_MASKED_DIFFUSION_THRESHOLD = 0.7
+DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD = 0.5
+DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS = 16
+DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER = 1
+DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS = 2
+DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD = DEFAULT_MASKED_DIFFUSION_THRESHOLD
 
 
 def parse_arguments():
@@ -77,28 +84,38 @@ def parse_arguments():
         help="Output path for image generation.",
     )
     parser.add_argument(
+        "--task",
+        type=str,
+        choices=("generate", "edit"),
+        default=DEFAULT_IMAGE_TASK,
+        help="Image task to run when --output-modality image is selected.",
+    )
+    parser.add_argument(
         "--size",
         type=str,
-        default=DEFAULT_IMAGE_SIZE,
-        help="Generated image size as WIDTHxHEIGHT.",
+        default=None,
+        help=(
+            "Image size as WIDTHxHEIGHT. Generation defaults to "
+            f"{DEFAULT_IMAGE_SIZE}; editing defaults to the first reference image size."
+        ),
     )
     parser.add_argument(
         "--steps",
         type=int,
         default=DEFAULT_IMAGE_STEPS,
-        help="Number of image generation inference steps.",
+        help="Number of image inference steps.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Seed for image generation. Defaults to a random 32-bit seed.",
+        help="Seed for image generation/editing. Defaults to a random 32-bit seed.",
     )
     parser.add_argument(
         "--guidance",
         type=float,
         default=DEFAULT_IMAGE_GUIDANCE,
-        help="Classifier-free guidance for image generation.",
+        help="Classifier-free guidance for image generation/editing.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -166,6 +183,42 @@ def parse_arguments():
         help="Maximum denoising steps for diffusion generation.",
     )
     parser.add_argument(
+        "--block-length",
+        type=int,
+        default=None,
+        help="Block length for diffusion text generation.",
+    )
+    parser.add_argument(
+        "--num-to-transfer",
+        type=int,
+        default=None,
+        help="Target number of masked tokens to transfer per diffusion denoising step.",
+    )
+    parser.add_argument(
+        "--max-transfer-per-step",
+        type=int,
+        default=None,
+        help="Maximum confident masked tokens to transfer per denoising step.",
+    )
+    parser.add_argument(
+        "--editing-threshold",
+        type=float,
+        default=None,
+        help="Confidence threshold for diffusion post-fill token edits.",
+    )
+    parser.add_argument(
+        "--max-post-steps",
+        type=int,
+        default=None,
+        help="Maximum diffusion post-fill editing steps per block.",
+    )
+    parser.add_argument(
+        "--stability-steps",
+        type=int,
+        default=None,
+        help="Stop post-fill refinement after this many stable no-edit steps.",
+    )
+    parser.add_argument(
         "--diffusion-full-canvas",
         action="store_true",
         help=(
@@ -189,13 +242,19 @@ def parse_arguments():
         help="Canvas update sampler for diffusion generation.",
     )
     parser.add_argument(
-        "--diffusion-threshold",
+        "--threshold",
         type=float,
-        default=0.9,
+        default=None,
         help=(
-            "Token probability threshold for "
-            "--diffusion-sampler confidence-threshold."
+            "Token probability threshold for diffusion confidence transfer. "
+            "Default: 0.9 for confidence-threshold sampling, 0.7 for masked text."
         ),
+    )
+    parser.add_argument(
+        "--min-threshold",
+        type=float,
+        default=None,
+        help="Lowest token probability threshold for masked diffusion transfer.",
     )
     parser.add_argument(
         "--temperature",
@@ -542,6 +601,11 @@ from .diffusion import (
 )
 
 
+def is_masked_diffusion_text_model(model: nn.Module) -> bool:
+    config = getattr(model, "config", None)
+    return getattr(config, "mask_token_id", None) is not None
+
+
 def _prime_cached_prefix_rope_state(
     model: nn.Module,
     full_input_ids: mx.array,
@@ -674,27 +738,53 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    if getattr(model.config, "model_type", None) == "llada2_moe":
+    if is_masked_diffusion_text_model(model):
         if image is not None or audio is not None or video is not None:
-            raise ValueError("LLaDA2 MoE is a text-only model.")
+            raise ValueError("Diffusion text generation models are text-only.")
 
         max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
         temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
         top_p = kwargs.get("top_p", DEFAULT_TOP_P)
         top_k = kwargs.get("top_k", DEFAULT_TOP_K)
+        max_denoising_steps = kwargs.get("max_denoising_steps")
+        if max_denoising_steps is None:
+            max_denoising_steps = kwargs.get("steps", 32)
+        num_to_transfer = kwargs.get(
+            "num_to_transfer", DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER
+        )
+        threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
+        min_threshold = kwargs.get(
+            "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
+        )
+        editing_threshold = kwargs.get(
+            "editing_threshold", DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD
+        )
+        max_transfer_per_step = kwargs.get("max_transfer_per_step")
+        max_post_steps = kwargs.get(
+            "max_post_steps", DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS
+        )
+        stability_steps = kwargs.get(
+            "stability_steps", DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS
+        )
 
         generation_stats = {}
         tic = time.perf_counter()
         generated = model.language_model.generate(
             input_ids,
             temperature=temperature,
+            block_length=kwargs.get("block_length", 32),
+            steps=max_denoising_steps,
             gen_length=max_tokens,
             top_p=None if top_p is None or top_p >= 1.0 else top_p,
             top_k=None if top_k is None or top_k <= 0 else top_k,
             eos_early_stop=True,
-            threshold=kwargs.get("threshold", 0.95),
-            editing_threshold=kwargs.get("editing_threshold", 0.9),
-            max_post_steps=kwargs.get("max_post_steps", 4),
+            threshold=threshold,
+            min_threshold=min_threshold,
+            editing_threshold=editing_threshold,
+            max_post_steps=max_post_steps,
+            num_to_transfer=num_to_transfer,
+            max_transfer_per_step=max_transfer_per_step,
+            stability_steps=stability_steps,
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
@@ -1227,7 +1317,14 @@ def main():
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
         "diffusion_sampler": "auto-regressive-euler",
-        "diffusion_threshold": 0.9,
+        "threshold": None,
+        "min_threshold": None,
+        "block_length": None,
+        "num_to_transfer": None,
+        "max_transfer_per_step": None,
+        "editing_threshold": None,
+        "max_post_steps": None,
+        "stability_steps": None,
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
@@ -1325,6 +1422,7 @@ def main():
         from ..vision_cache import VisionFeatureCache
 
         vision_cache = VisionFeatureCache()
+        is_masked_text_diffusion = is_masked_diffusion_text_model(model)
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
@@ -1356,6 +1454,25 @@ def main():
                 stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
+            if is_masked_text_diffusion:
+                if args.max_denoising_steps is not None:
+                    stream_kwargs["max_denoising_steps"] = args.max_denoising_steps
+                if args.block_length is not None:
+                    stream_kwargs["block_length"] = args.block_length
+                if args.num_to_transfer is not None:
+                    stream_kwargs["num_to_transfer"] = args.num_to_transfer
+                if args.max_transfer_per_step is not None:
+                    stream_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
+                if args.threshold is not None:
+                    stream_kwargs["threshold"] = args.threshold
+                if args.min_threshold is not None:
+                    stream_kwargs["min_threshold"] = args.min_threshold
+                if args.editing_threshold is not None:
+                    stream_kwargs["editing_threshold"] = args.editing_threshold
+                if args.max_post_steps is not None:
+                    stream_kwargs["max_post_steps"] = args.max_post_steps
+                if args.stability_steps is not None:
+                    stream_kwargs["stability_steps"] = args.stability_steps
             stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
             diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
@@ -1407,6 +1524,25 @@ def main():
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
+        if is_masked_diffusion_text_model(model):
+            if args.max_denoising_steps is not None:
+                gen_kwargs["max_denoising_steps"] = args.max_denoising_steps
+            if args.block_length is not None:
+                gen_kwargs["block_length"] = args.block_length
+            if args.num_to_transfer is not None:
+                gen_kwargs["num_to_transfer"] = args.num_to_transfer
+            if args.max_transfer_per_step is not None:
+                gen_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
+            if args.threshold is not None:
+                gen_kwargs["threshold"] = args.threshold
+            if args.min_threshold is not None:
+                gen_kwargs["min_threshold"] = args.min_threshold
+            if args.editing_threshold is not None:
+                gen_kwargs["editing_threshold"] = args.editing_threshold
+            if args.max_post_steps is not None:
+                gen_kwargs["max_post_steps"] = args.max_post_steps
+            if args.stability_steps is not None:
+                gen_kwargs["stability_steps"] = args.stability_steps
         gen_kwargs.update(diffusion_kwargs_from_args(args, config))
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
