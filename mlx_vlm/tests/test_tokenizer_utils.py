@@ -694,6 +694,23 @@ class TestBPEStreamingDetokenizer:
         # Should share the same byte decoder
         assert det1._byte_decoder is det2._byte_decoder
 
+    def test_decodes_step_style_space_tokens(self):
+        tokenizer = MockBPETokenizer()
+        tokenizer.vocab = {
+            "Got": 0,
+            "Ġit": 1,
+            ",": 2,
+            "Ġthe": 3,
+            "Ġuser": 4,
+        }
+        detokenizer = BPEStreamingDetokenizer(tokenizer)
+
+        for token in [0, 1, 2, 3, 4]:
+            detokenizer.add_token(token)
+        detokenizer.finalize()
+
+        assert detokenizer.text == "Got it, the user"
+
 
 # ============================================================================
 # Tests for TokenizerWrapper
