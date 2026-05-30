@@ -343,6 +343,9 @@ class MessageFormatter:
             image_tokens = [image_builder()] * num_images
             content = image_tokens + content if image_first else content + image_tokens
 
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content = content + [MessageBuilder.audio_message()] * num_audios
+
         return {"role": role, "content": content}
 
     def _format_text_only(
