@@ -176,6 +176,38 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
+    class FakeResponseGenerator:
+        def __init__(self, model_path, adapter_path=None, **kwargs):
+            self.model_path = model_path
+            self.adapter_path = adapter_path
+            self.model = SimpleNamespace()
+            self.processor = SimpleNamespace()
+            self.config = SimpleNamespace(model_type="qwen2_vl")
+
+        def wait_until_ready(self):
+            return self.model, self.processor, self.config
+
+        def stop_and_join(self):
+            pass
+
+    monkeypatch.setattr(server._app_module, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+
+    server.get_cached_model("demo-model", "adapter-a")
+    server.get_cached_model("demo-model")
+
+    assert server.runtime.model_cache["cache_key"] == (
+        "demo-model",
+        "adapter-a",
+        "auto",
+    )
+    assert server.runtime.model_cache["adapter_path"] == "adapter-a"
+
+
 def _unstarted_response_generator():
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model_path = "demo"
@@ -941,6 +973,67 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
     assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
+
+
+@pytest.mark.parametrize(
+    ("include_adapter", "adapter_path", "expected_adapter"),
+    [
+        (False, None, server._INHERIT_ADAPTER),
+        (True, "adapter-a", "adapter-a"),
+        (True, None, None),
+    ],
+)
+def test_responses_endpoint_forwards_adapter_path_or_inherits(
+    client, monkeypatch, include_adapter, adapter_path, expected_adapter
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=1,
+        generation_tokens=1,
+        total_tokens=2,
+    )
+    get_cached_model = MagicMock(return_value=(model, processor, config))
+    payload = {"model": "demo", "input": "Hello"}
+    if include_adapter:
+        payload["adapter_path"] = adapter_path
+
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server, "get_cached_model", get_cached_model)
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+    monkeypatch.setattr(server, "generate", MagicMock(return_value=result))
+
+    response = client.post("/responses", json=payload)
+
+    assert response.status_code == 200
+    assert get_cached_model.call_args.args == ("demo", expected_adapter)
+
+
+def test_responses_input_tokens_endpoint_forwards_adapter_path(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    get_cached_model = MagicMock(return_value=(model, processor, config))
+    response_generator = SimpleNamespace(
+        _cpu_preprocess=MagicMock(
+            return_value={"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
+        )
+    )
+
+    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
+    monkeypatch.setattr(server, "get_cached_model", get_cached_model)
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(
+        "/responses/input_tokens",
+        json={"model": "demo", "input": "Hello", "adapter_path": "adapter-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 3}
+    assert get_cached_model.call_args.args == ("demo", "adapter-a")
 
 
 def test_responses_previous_response_id_replays_stored_items(client):
