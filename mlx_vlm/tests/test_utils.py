@@ -11,7 +11,7 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.utils import quantize_model
 
-from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization, _save_processor
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
@@ -285,6 +285,39 @@ def test_convert_preserves_existing_deepseek_v4_quantization():
         "bits": 8,
         "mode": "mxfp8",
     }
+
+
+def test_save_processor_without_save_pretrained_does_not_raise():
+    """A processor lacking save_pretrained must be skipped, not crash convert.
+
+    Regression for custom processors (e.g. moondream3's Moondream3Processor)
+    that are plain classes: a missing save_pretrained used to abort conversion
+    before save_config() could write the quantization block.
+    """
+
+    class NoSaveProcessor:
+        pass
+
+    # Must return cleanly so the caller can still run save_config afterwards.
+    _save_processor(NoSaveProcessor(), Path("/nonexistent/does-not-matter"))
+
+
+def test_save_processor_calls_save_pretrained():
+    processor = MagicMock()
+    mlx_path = Path("/tmp/mlx-convert-out")
+
+    _save_processor(processor, mlx_path)
+
+    processor.save_pretrained.assert_called_once_with(mlx_path)
+
+
+def test_save_processor_propagates_save_pretrained_failure():
+    processor = MagicMock()
+    processor.save_pretrained.side_effect = RuntimeError("boom")
+
+    # A genuine save failure must surface rather than yield a broken artifact.
+    with pytest.raises(RuntimeError, match="boom"):
+        _save_processor(processor, Path("/tmp/mlx-convert-out"))
 
 
 def test_prepare_inputs():

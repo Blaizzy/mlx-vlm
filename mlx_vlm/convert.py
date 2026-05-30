@@ -71,6 +71,29 @@ def _preserve_existing_deepseek_v4_quantization(
     config["quantization_config"] = quantization
 
 
+def _save_processor(processor, mlx_path: Path) -> None:
+    """Save processor files, tolerating processors without ``save_pretrained``.
+
+    Some custom mlx-vlm processors (e.g. moondream3's ``Moondream3Processor``)
+    are plain classes registered via ``install_auto_processor_patch`` and don't
+    implement ``save_pretrained``. Skipping the save in that case lets conversion
+    proceed to ``save_config``, which writes the model ``config.json`` (including
+    the ``quantization`` block) -- otherwise a quantized checkpoint is written
+    with a config that has no quantization and fails to load.
+
+    Processors that do implement ``save_pretrained`` are saved normally; genuine
+    save failures are left to propagate rather than producing a broken artifact.
+    """
+    save_pretrained = getattr(processor, "save_pretrained", None)
+    if not callable(save_pretrained):
+        print(
+            f"[WARNING] {type(processor).__name__} has no save_pretrained(); "
+            "skipping processor save."
+        )
+        return
+    save_pretrained(mlx_path)
+
+
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module
 ) -> Callable[[str, nn.Module], Union[bool, dict]]:
@@ -242,7 +265,7 @@ def convert(
                 shutil.rmtree(dest)
             shutil.copytree(item, dest)
 
-    processor.save_pretrained(mlx_path)
+    _save_processor(processor, mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
 
