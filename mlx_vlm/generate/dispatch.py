@@ -623,9 +623,17 @@ def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) ->
 
     generation_mode = kwargs.get("generation_mode")
     if generation_mode is not None:
-        return generation_mode in ("diffusion", "linear_speculative")
+        return generation_mode in (
+            "diffusion",
+            "dlm",
+            "linear_speculative",
+            "linear_spec",
+        )
 
-    return bool(kwargs.get("linear_speculative", False))
+    return bool(
+        kwargs.get("linear_speculative", False)
+        or kwargs.get("linear_speculation", False)
+    )
 
 
 def _prime_cached_prefix_rope_state(
@@ -822,7 +830,8 @@ def stream_generate(
             skip_special_tokens=skip_special_tokens,
             stats=generation_stats,
             linear_speculative=kwargs.get("linear_speculative", False)
-            or kwargs.get("generation_mode") == "linear_speculative",
+            or kwargs.get("linear_speculation", False)
+            or kwargs.get("generation_mode") in ("linear_speculative", "linear_spec"),
         )
         mx.eval(generated)
         total_time = time.perf_counter() - tic

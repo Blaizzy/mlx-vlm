@@ -344,6 +344,21 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertEqual(diffusion_calls["kwargs"]["threshold"], 0.9)
         self.assertEqual(diffusion_results[-1].generation_tokens, 2)
 
+        diffusion_calls.clear()
+        list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                generation_mode="dlm",
+                temperature=0.0,
+            )
+        )
+        self.assertTrue(diffusion_calls["kwargs"])
+        self.assertFalse(diffusion_calls["kwargs"]["linear_speculative"])
+
         linear_calls = {}
 
         def generate(input_ids, **kwargs):
@@ -368,3 +383,31 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[-1].generation_tokens, 2)
         self.assertEqual(results[-1].finish_reason, "stop")
+
+        linear_calls.clear()
+        list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                generation_mode="linear_spec",
+                temperature=0.0,
+            )
+        )
+        self.assertTrue(linear_calls["kwargs"]["linear_speculative"])
+
+        linear_calls.clear()
+        list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                linear_speculation=True,
+                temperature=0.0,
+            )
+        )
+        self.assertTrue(linear_calls["kwargs"]["linear_speculative"])
