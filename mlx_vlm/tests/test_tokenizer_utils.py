@@ -9,6 +9,7 @@ from mlx_vlm.tokenizer_utils import (
     SPMStreamingDetokenizer,
     StreamingDetokenizer,
     TokenizerWrapper,
+    _is_byte_level_bpe_vocab,
     _is_bpe_decoder,
     _is_spm_decoder,
     _is_spm_decoder_no_space,
@@ -199,6 +200,50 @@ class TestIsBpeDecoder:
     def test_non_dict(self):
         assert _is_bpe_decoder("ByteLevel") is False
         assert _is_bpe_decoder(None) is False
+
+
+class TestIsByteLevelBpeVocab:
+    """Tests for byte-level BPE vocabulary detection."""
+
+    def test_detects_byte_level_bpe_vocab(self):
+        tokenizer_content = {
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "Ċ": 0,
+                    "The": 1,
+                    "Ġuser": 2,
+                },
+            }
+        }
+
+        assert _is_byte_level_bpe_vocab(tokenizer_content) is True
+
+    def test_rejects_spm_vocab(self):
+        tokenizer_content = {
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "▁The": 0,
+                    "▁user": 1,
+                },
+            }
+        }
+
+        assert _is_byte_level_bpe_vocab(tokenizer_content) is False
+
+    def test_rejects_non_bpe_model(self):
+        tokenizer_content = {
+            "model": {
+                "type": "Unigram",
+                "vocab": {
+                    "Ċ": 0,
+                    "Ġuser": 1,
+                },
+            }
+        }
+
+        assert _is_byte_level_bpe_vocab(tokenizer_content) is False
 
 
 # ============================================================================
