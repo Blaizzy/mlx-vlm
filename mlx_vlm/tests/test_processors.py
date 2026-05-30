@@ -1169,9 +1169,8 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
 
 
 class TestStep3VLProcessor(unittest.TestCase):
-    def test_from_pretrained_uses_fixed_tokenizer_and_bpe_detokenizer(self):
+    def test_from_pretrained_uses_fixed_tokenizer(self):
         from mlx_vlm.models.step3p7.processing_step3p7 import Step3VLProcessor
-        from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
 
         tokenizer = _mock_tokenizer(chat_template="template")
 
@@ -1195,10 +1194,6 @@ class TestStep3VLProcessor(unittest.TestCase):
             fix_mistral_regex=True,
         )
         self.assertIs(processor.tokenizer, tokenizer)
-        self.assertIs(
-            tokenizer.mlx_vlm_detokenizer_class,
-            BPEStreamingDetokenizer,
-        )
 
 
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):

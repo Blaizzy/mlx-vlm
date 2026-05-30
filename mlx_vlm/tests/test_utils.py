@@ -586,28 +586,6 @@ def test_load_processor_propagates_auto_processor_errors():
             load_processor(Path("/tmp/model"), eos_token_ids=2)
 
 
-def test_load_processor_honors_custom_detokenizer_class():
-    class CustomDetokenizer:
-        def __init__(self, tokenizer):
-            self.tokenizer = tokenizer
-
-    tokenizer = SimpleNamespace(
-        eos_token_id=2,
-        mlx_vlm_detokenizer_class=CustomDetokenizer,
-    )
-    processor = SimpleNamespace(tokenizer=tokenizer)
-
-    with (
-        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", return_value=processor),
-        patch("mlx_vlm.utils.load_tokenizer") as load_tokenizer_mock,
-    ):
-        loaded = load_processor(Path("/tmp/model"))
-
-    assert isinstance(loaded.detokenizer, CustomDetokenizer)
-    assert loaded.detokenizer.tokenizer is tokenizer
-    load_tokenizer_mock.assert_not_called()
-
-
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():
     class TinyInner(nn.Module):
         def __init__(self):

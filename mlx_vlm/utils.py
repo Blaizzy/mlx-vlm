@@ -647,15 +647,12 @@ def load_processor(
 
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
+        detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
+
         # Get the tokenizer object
         tokenizer_obj = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        detokenizer_class = getattr(
-            tokenizer_obj, "mlx_vlm_detokenizer_class", None
-        ) or getattr(processor, "mlx_vlm_detokenizer_class", None)
-        if detokenizer_class is None:
-            detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
         # Instantiate the detokenizer
         processor.detokenizer = detokenizer_class(tokenizer_obj)
