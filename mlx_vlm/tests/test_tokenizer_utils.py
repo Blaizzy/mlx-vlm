@@ -1,5 +1,7 @@
 """Tests for tokenizer_utils module."""
 
+import json
+
 import pytest
 
 from mlx_vlm.tokenizer_utils import (
@@ -9,11 +11,13 @@ from mlx_vlm.tokenizer_utils import (
     SPMStreamingDetokenizer,
     StreamingDetokenizer,
     TokenizerWrapper,
+    _has_bytelevel_pretokenizer,
     _is_bpe_decoder,
     _is_spm_decoder,
     _is_spm_decoder_no_space,
     _match,
     _remove_space,
+    load_tokenizer,
     make_streaming_detokenizer,
 )
 
@@ -199,6 +203,53 @@ class TestIsBpeDecoder:
     def test_non_dict(self):
         assert _is_bpe_decoder("ByteLevel") is False
         assert _is_bpe_decoder(None) is False
+
+
+class TestHasBytelevelPretokenizer:
+    """Tests for _has_bytelevel_pretokenizer function."""
+
+    def test_direct_bytelevel_pretokenizer(self):
+        assert _has_bytelevel_pretokenizer({"type": "ByteLevel"}) is True
+
+    def test_sequence_bytelevel_pretokenizer(self):
+        pre_tokenizer = {
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": ".*"}},
+                {"type": "ByteLevel", "add_prefix_space": False},
+            ],
+        }
+        assert _has_bytelevel_pretokenizer(pre_tokenizer) is True
+
+    def test_non_bytelevel_pretokenizer(self):
+        assert _has_bytelevel_pretokenizer({"type": "Metaspace"}) is False
+        assert _has_bytelevel_pretokenizer(None) is False
+
+
+def test_load_tokenizer_prefers_bytelevel_pretokenizer_over_spm_decoder(tmp_path):
+    tokenizer_json = {
+        "pre_tokenizer": {
+            "type": "Sequence",
+            "pretokenizers": [
+                {"type": "Split", "pattern": {"Regex": ".*"}},
+                {"type": "ByteLevel", "add_prefix_space": False},
+            ],
+        },
+        "decoder": {
+            "type": "Sequence",
+            "decoders": [
+                {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                {"type": "ByteFallback"},
+                {"type": "Fuse"},
+                {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+            ],
+        },
+    }
+    (tmp_path / "tokenizer.json").write_text(
+        json.dumps(tokenizer_json), encoding="utf-8"
+    )
+
+    assert load_tokenizer(tmp_path, return_tokenizer=False) is BPEStreamingDetokenizer
 
 
 # ============================================================================
