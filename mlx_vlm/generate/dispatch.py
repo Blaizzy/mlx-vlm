@@ -820,50 +820,6 @@ def stream_generate(
         )
         return
 
-    # LocateAnything Parallel Box Decoding (opt-in). Only fast/hybrid route here;
-    # "slow" stays on the default AR path below so the oracle is untouched.
-    locate_mode = kwargs.get("generation_mode", None)
-    if (
-        getattr(model.config, "model_type", None) == "locateanything"
-        and locate_mode in ("fast", "hybrid")
-        and hasattr(model, "pbd_generate")
-    ):
-        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-        pbd_kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if k in ("image_grid_hws", "_grid_shapes", "image_token_id")
-        }
-        tic = time.perf_counter()
-        generated_tokens = model.pbd_generate(
-            input_ids,
-            pixel_values=pixel_values,
-            generation_mode=locate_mode,
-            max_tokens=max_tokens,
-            **pbd_kwargs,
-        )
-        total_time = max(time.perf_counter() - tic, 1e-9)
-        text = tokenizer.decode(
-            generated_tokens, skip_special_tokens=skip_special_tokens
-        )
-        yield GenerationResult(
-            text=text,
-            token=generated_tokens[-1] if generated_tokens else None,
-            logprobs=None,
-            prompt_tokens=int(input_ids.size),
-            generation_tokens=len(generated_tokens),
-            total_tokens=int(input_ids.size) + len(generated_tokens),
-            generation_tps=len(generated_tokens) / total_time,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=(
-                "stop"
-                if generated_tokens
-                and generated_tokens[-1] == getattr(tokenizer, "eos_token_id", None)
-                else "length"
-            ),
-        )
-        return
-
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
         cached = vision_cache.get(image)
