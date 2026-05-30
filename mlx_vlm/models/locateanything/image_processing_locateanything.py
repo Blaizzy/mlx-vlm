@@ -113,6 +113,26 @@ class LocateAnythingImageProcessor(_base_image_processor()):
         grid_hw = (H // patch_size, W // patch_size)
         return patches, grid_hw
 
+    def _to_pil(self, image) -> Image.Image:
+        """Accept a PIL image or an mx.array (CHW/HWC) and return a PIL image.
+
+        transformers' ``make_list_of_images``/``valid_images`` reject ``mx.array``,
+        so array inputs are converted here, before any PIL-only processing.
+        """
+        if isinstance(image, Image.Image):
+            return image
+        if isinstance(image, mx.array):
+            arr = image
+            if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
+                arr = arr.transpose(1, 2, 0)
+            if arr.dtype in (mx.float32, mx.float16, mx.bfloat16):
+                arr = (arr * 255).astype(mx.uint8)
+            h, w, _ = arr.shape
+            return Image.frombytes("RGB", (w, h), bytes(arr.reshape(-1).tolist()))
+        raise ValueError(
+            f"Invalid image type {type(image)}. Expected PIL.Image.Image or mx.array."
+        )
+
     def _preprocess(self, image) -> Tuple[mx.array, Tuple[int, int]]:
         image = self.rescale(image, self.merge_kernel_size)
         image = self.to_mlx(image)
@@ -126,30 +146,17 @@ class LocateAnythingImageProcessor(_base_image_processor()):
         **kwargs,
     ):
         from transformers.feature_extraction_utils import BatchFeature
-        from transformers.image_utils import make_list_of_images, valid_images
 
-        images = make_list_of_images(images)
-
-        if not valid_images(images):
-            raise ValueError(
-                "Invalid image type. Must be of type PIL.Image.Image or mx.array."
-            )
+        # Normalize a single image to a list; mx.array -> PIL conversion and
+        # type validation happen in _to_pil (before any PIL-only processing).
+        if isinstance(images, (mx.array, Image.Image)):
+            images = [images]
 
         pixel_values_list = []
         image_grid_hws = []
 
         for image in images:
-            if isinstance(image, mx.array):
-                arr = image
-                if arr.ndim == 3 and arr.shape[0] in [1, 3, 4]:
-                    arr = arr.transpose(1, 2, 0)
-                if arr.dtype in [mx.float32, mx.float16, mx.bfloat16]:
-                    arr = (arr * 255).astype(mx.uint8)
-                h, w, _ = arr.shape
-                flat_data = arr.reshape(-1).tolist()
-                image = Image.frombytes("RGB", (w, h), bytes(flat_data))
-
-            patches, image_grid_hw = self._preprocess(image)
+            patches, image_grid_hw = self._preprocess(self._to_pil(image))
             pixel_values_list.append(patches)
             image_grid_hws.append(image_grid_hw)
 

@@ -369,6 +369,54 @@ class TestLocateAnythingPBD(unittest.TestCase):
         self.assertEqual(out["type"], "coord_box")
         self.assertFalse(out["need_switch_to_ar"])
 
+    def test_pbd_slow_respects_max_tokens(self):
+        from mlx_vlm.models.locateanything.locateanything import Model
+
+        cfg = ModelConfig(
+            text_config=tiny_text_config(),
+            vision_config=tiny_vision_config(),
+            image_token_index=5,
+            vocab_size=128,
+        )
+        model = Model(cfg)
+        input_ids = mx.array([[5, 5, 5, 5, 1, 2, 3]])
+        kw = dict(
+            pixel_values=mx.random.uniform(shape=(16, 3, 14, 14)),
+            image_grid_hws=mx.array([[4, 4]]),
+            _grid_shapes=[(4, 4)],
+        )
+        for mt in (0, 1, 4):
+            out = model.pbd_generate(
+                input_ids, generation_mode="slow", max_tokens=mt, **kw
+            )
+            self.assertLessEqual(len(out), mt)
+
+
+class TestLocateAnythingImageProcessor(unittest.TestCase):
+    def test_accepts_mx_array_and_pil(self):
+        from PIL import Image
+
+        from mlx_vlm.models.locateanything.image_processing_locateanything import (
+            LocateAnythingImageProcessor,
+        )
+
+        proc = LocateAnythingImageProcessor()
+        # 56x56 -> grid 4x4 (divisible by merge*patch = 28)
+        arr = proc(mx.zeros((56, 56, 3)))
+        self.assertEqual(arr["pixel_values"].shape[1:], (3, 14, 14))
+        self.assertEqual(arr["image_grid_hws"].tolist(), [[4, 4]])
+        # PIL path still works (regression)
+        pil = proc(Image.new("RGB", (56, 56)))
+        self.assertEqual(pil["image_grid_hws"].tolist(), [[4, 4]])
+
+    def test_rejects_unknown_type(self):
+        from mlx_vlm.models.locateanything.image_processing_locateanything import (
+            LocateAnythingImageProcessor,
+        )
+
+        with self.assertRaises(ValueError):
+            LocateAnythingImageProcessor()("not-an-image")
+
 
 if __name__ == "__main__":
     unittest.main()

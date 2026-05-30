@@ -404,7 +404,7 @@ class PBDDecoder:
             out_type, tokens = self._consume_block(block_logits)
             generated.extend(tokens)
             if out_type == "im_end":
-                return generated[prompt_len:]
+                return generated[prompt_len : prompt_len + max_tokens]
             if self.mode == "hybrid" and out_type == "error_box":
                 use_mtp = False
         else:
@@ -413,7 +413,7 @@ class PBDDecoder:
             out_type, token = self._sample_ar(logits)
             generated.append(token)
             if out_type == "im_end":
-                return generated[prompt_len:]
+                return generated[prompt_len : prompt_len + max_tokens]
 
         while len(generated) < prompt_len + max_tokens:
             if use_mtp:
@@ -433,7 +433,7 @@ class PBDDecoder:
                 if self.mode == "hybrid" and out_type == "box_end_ar":
                     use_mtp = True
 
-        return generated[prompt_len:]
+        return generated[prompt_len : prompt_len + max_tokens]
 
     def _mtp_prefill(self, inputs_embeds: mx.array, cache) -> mx.array:
         """First MTP forward using prefilled embeddings (image tokens fused)."""
