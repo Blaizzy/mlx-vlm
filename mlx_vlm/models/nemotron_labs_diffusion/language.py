@@ -437,6 +437,8 @@ class MLP(nn.Module):
 
     @staticmethod
     def _chunked_linear(linear: nn.Linear, x: mx.array, chunks: int) -> mx.array:
+        if not isinstance(linear, nn.Linear):
+            return linear(x)
         weight_chunks = mx.split(linear.weight, chunks, axis=0)
         outputs = [mx.matmul(x, weight.T) for weight in weight_chunks]
         bias = getattr(linear, "bias", None)
@@ -486,9 +488,15 @@ class DraftLoRALinear(nn.Module):
         super().__init__()
         self.linear = linear
         self.scale = scale
-        out_dim, in_dim = linear.weight.shape
-        self.lora_a = mx.zeros((in_dim, rank), dtype=linear.weight.dtype)
-        self.lora_b = mx.zeros((rank, out_dim), dtype=linear.weight.dtype)
+        out_dim, packed_or_in_dim = linear.weight.shape
+        if isinstance(linear, nn.QuantizedLinear):
+            in_dim = (packed_or_in_dim * 32) // linear.bits
+            self.lora_dtype = linear.scales.dtype
+        else:
+            in_dim = packed_or_in_dim
+            self.lora_dtype = linear.weight.dtype
+        self.lora_a = mx.zeros((in_dim, rank), dtype=self.lora_dtype)
+        self.lora_b = mx.zeros((rank, out_dim), dtype=self.lora_dtype)
         self.enabled = False
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -757,7 +765,11 @@ class LanguageModel(nn.Module):
         )
         if out is not None:
             return out
-        if self.small_sequence_head_chunks > 1 and 2 <= hidden_states.shape[-2] <= 16:
+        if (
+            isinstance(self.diffusion_head, nn.Linear)
+            and self.small_sequence_head_chunks > 1
+            and 2 <= hidden_states.shape[-2] <= 16
+        ):
             weight_chunks = mx.split(
                 self.diffusion_head.weight, self.small_sequence_head_chunks, axis=0
             )
@@ -792,6 +804,10 @@ class LanguageModel(nn.Module):
             if self.config.tie_word_embeddings
             else self.diffusion_head.weight
         )
+        if not self.config.tie_word_embeddings and not isinstance(
+            self.diffusion_head, nn.Linear
+        ):
+            return None
         return _chunked_greedy_score_weight(
             weight,
             hidden_states,
@@ -873,8 +889,8 @@ class LanguageModel(nn.Module):
             key_b = f"{prefix}.lora_B.weight"
             if key_a not in weights or key_b not in weights:
                 return False
-            o_proj.lora_a = weights[key_a].T.astype(o_proj.linear.weight.dtype)
-            o_proj.lora_b = weights[key_b].T.astype(o_proj.linear.weight.dtype)
+            o_proj.lora_a = weights[key_a].T.astype(o_proj.lora_dtype)
+            o_proj.lora_b = weights[key_b].T.astype(o_proj.lora_dtype)
 
         self._linear_spec_lora_loaded = True
         return True
