@@ -1179,9 +1179,12 @@ class TestStep3VLProcessor(unittest.TestCase):
             self.tokenizer = tokenizer
             self.chat_template = chat_template
 
-        with patch(
-            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
-        ) as from_pretrained, patch.object(Step3VLProcessor, "__init__", _fake_init):
+        with (
+            patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+            ) as from_pretrained,
+            patch.object(Step3VLProcessor, "__init__", _fake_init),
+        ):
             processor = Step3VLProcessor.from_pretrained(
                 "step-model", trust_remote_code=True
             )
