@@ -359,8 +359,9 @@ def _small_row_swiglu(
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
-        self.small_sequence_chunks = 7 if config.intermediate_size % 7 == 0 else 1
+        self.small_sequence_chunks = 4 if config.intermediate_size % 4 == 0 else 1
         self.tiny_sequence_chunks = 28 if config.intermediate_size % 28 == 0 else 1
+        self.medium_sequence_chunks = 4 if config.intermediate_size % 4 == 0 else 1
         self.gate_proj = nn.Linear(
             config.hidden_size, config.intermediate_size, bias=config.mlp_bias
         )
@@ -405,6 +406,8 @@ class MLP(nn.Module):
             chunks = self.tiny_sequence_chunks
         elif sequence_length <= 16:
             chunks = self.small_sequence_chunks
+        elif sequence_length <= 32:
+            chunks = self.medium_sequence_chunks
 
         if chunks > 1:
             gate = self._chunked_linear(self.gate_proj, x, chunks)
@@ -698,6 +701,40 @@ class LanguageModel(nn.Module):
             )
         return self.diffusion_head(hidden_states)
 
+    def _greedy_sample_hidden(
+        self, hidden_states: mx.array, return_prob: bool = False
+    ) -> mx.array | Tuple[mx.array, mx.array]:
+        logits = self._project_hidden(hidden_states)
+        if return_prob:
+            return self._sample_with_temperature_topk_topp(logits, temperature=0.0)
+        return self._sample_tokens(logits, temperature=0.0)
+
+    def _sample_from_hidden(
+        self,
+        hidden_states: mx.array,
+        temperature: float = 0.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        return_prob: bool = False,
+    ) -> mx.array | Tuple[mx.array, mx.array]:
+        if temperature == 0.0:
+            return self._greedy_sample_hidden(hidden_states, return_prob=return_prob)
+
+        logits = self._project_hidden(hidden_states)
+        if return_prob:
+            return self._sample_with_temperature_topk_topp(
+                logits,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
+        return self._sample_tokens(
+            logits,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+
     def _sample_tokens(
         self,
         logits: mx.array,
@@ -928,13 +965,12 @@ class LanguageModel(nn.Module):
             use_cache=True,
             use_causal_mask=True,
         )
-        prefill_logits = self._project_hidden(prefill_hidden[:, -1:, :])[:, -1, :]
-        next_token = self._sample_tokens(
-            prefill_logits,
+        next_token = self._sample_from_hidden(
+            prefill_hidden[:, -1:, :],
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
-        )[:, None]
+        )
         mx.eval(next_token)
         if stats is not None:
             stats["prompt_time"] = time.perf_counter() - prompt_tic
@@ -949,8 +985,8 @@ class LanguageModel(nn.Module):
             if remaining <= 0:
                 break
             current_block_length = min(block_length, remaining)
-            block_positions = mx.arange(block_length)
-            block = mx.full((1, block_length), mask_id, dtype=inputs.dtype)
+            block_positions = mx.arange(current_block_length)
+            block = mx.full((1, current_block_length), mask_id, dtype=inputs.dtype)
             block[:, 0] = next_token[:, 0]
             if visualizer_state["active"]:
                 preview = (
@@ -960,35 +996,49 @@ class LanguageModel(nn.Module):
                 )
                 visualize_tokens(preview, force=True)
 
-            denoise_steps = max(1, min(steps, block_length))
-            for step_idx in range(denoise_steps):
+            denoise_steps = max(1, min(steps, current_block_length))
+            denoise_range = range(denoise_steps) if current_block_length > 1 else ()
+            for step_idx in denoise_range:
                 mask_index = block == mask_id
-                logits = self(
+                force_completion = step_idx == denoise_steps - 1
+                hidden_states = self.model(
                     block,
                     cache=cache,
                     use_cache=False,
                     use_causal_mask=False,
-                ).logits
-                x0, token_probs = self._sample_with_temperature_topk_topp(
-                    logits,
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
                 )
+                if force_completion:
+                    x0 = self._sample_from_hidden(
+                        hidden_states,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                    )
+                    token_probs = None
+                else:
+                    x0, token_probs = self._sample_from_hidden(
+                        hidden_states,
+                        temperature=temperature,
+                        top_k=top_k,
+                        top_p=top_p,
+                        return_prob=True,
+                    )
                 if stats is not None and not recorded_prompt_time:
-                    mx.eval(x0, token_probs)
+                    if token_probs is None:
+                        mx.eval(x0)
+                    else:
+                        mx.eval(x0, token_probs)
                     stats["prompt_time"] = time.perf_counter() - prompt_tic
                     stats["prompt_tokens"] = float(inputs.size)
                     recorded_prompt_time = True
                 x0 = mx.where(mask_index, x0, block)
-                neg_large = mx.array(
-                    mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
-                )
-                confidence = mx.where(mask_index, token_probs, neg_large)
-                force_completion = step_idx == denoise_steps - 1
                 if force_completion:
                     transfer_mask = mask_index
                 elif threshold is not None:
+                    neg_large = mx.array(
+                        mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
+                    )
+                    confidence = mx.where(mask_index, token_probs, neg_large)
                     high_confidence = (confidence >= threshold) & mask_index
                     _, best_index = _topk(confidence, 1)
                     best_mask = (
@@ -1000,6 +1050,10 @@ class LanguageModel(nn.Module):
                         best_mask,
                     )
                 else:
+                    neg_large = mx.array(
+                        mx.finfo(token_probs.dtype).min, dtype=token_probs.dtype
+                    )
+                    confidence = mx.where(mask_index, token_probs, neg_large)
                     masked_count = int(mask_index.sum().item())
                     if masked_count == 0:
                         break
@@ -1026,19 +1080,6 @@ class LanguageModel(nn.Module):
                 if not bool((block == mask_id).any().item()):
                     break
 
-            output_hidden = self.model(
-                block,
-                cache=cache,
-                use_cache=True,
-                use_causal_mask=True,
-            )
-            next_logits = self._project_hidden(output_hidden[:, -1:, :])[:, -1, :]
-            next_token = self._sample_tokens(
-                next_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )[:, None]
             generated_block = block[:, :current_block_length]
             generated_blocks.append(generated_block)
             total_generated += current_block_length
@@ -1047,6 +1088,21 @@ class LanguageModel(nn.Module):
                 if eos_index is not None:
                     end_length = total_generated - current_block_length + eos_index + 1
                     break
+            if total_generated >= gen_length:
+                break
+
+            output_hidden = self.model(
+                block,
+                cache=cache,
+                use_cache=True,
+                use_causal_mask=True,
+            )
+            next_token = self._sample_from_hidden(
+                output_hidden[:, -1:, :],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
 
         generated = (
             mx.concatenate(generated_blocks, axis=1)
@@ -1089,28 +1145,27 @@ class LanguageModel(nn.Module):
 
         prompt_tic = time.perf_counter()
         cache = self.make_cache()
-        prefill = self(
+        prefill_hidden = self.model(
             prompt_ids,
             cache=cache,
             use_cache=True,
             use_causal_mask=True,
-        ).logits
-        mx.eval(prefill)
+        )
+        next_token = self._sample_from_hidden(
+            prefill_hidden[:, -1:, :],
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        mx.eval(next_token)
         if stats is not None:
             stats["prompt_time"] = time.perf_counter() - prompt_tic
             stats["prompt_tokens"] = float(prompt_ids.size)
 
         generated = []
-        next_logits = prefill[:, -1, :]
         nfe = 0
         for _ in range(max_new_tokens):
             nfe += 1
-            next_token = self._sample_tokens(
-                next_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-            )[:, None]
             generated.append(next_token)
             if bool(
                 mx.array(
@@ -1120,12 +1175,18 @@ class LanguageModel(nn.Module):
                 .item()
             ):
                 break
-            next_logits = self(
+            next_hidden = self.model(
                 next_token,
                 cache=cache,
                 use_cache=True,
                 use_causal_mask=True,
-            ).logits[:, -1, :]
+            )
+            next_token = self._sample_from_hidden(
+                next_hidden[:, -1:, :],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+            )
 
         if not generated:
             return prompt_ids, nfe
@@ -1152,6 +1213,9 @@ class LanguageModel(nn.Module):
             raise ValueError("Linear speculative decoding requires batch size 1.")
         if block_length <= 0:
             raise ValueError("block_length must be a positive integer.")
+        # Treat block_length as a cap; acceptance is low beyond 8 and larger
+        # windows make each draft/verify pair slower without changing output.
+        draft_window = min(block_length, 8)
 
         mask_token_id = (
             self.config.mask_token_id if mask_token_id is None else mask_token_id
@@ -1166,23 +1230,23 @@ class LanguageModel(nn.Module):
 
         prompt_tic = time.perf_counter()
         cache = self.make_cache()
-        prefill = self(
+        prefill_hidden = self.model(
             prompt_ids,
             cache=cache,
             use_cache=True,
             use_causal_mask=True,
-        ).logits
-        mx.eval(prefill)
+        )
+        next_token = self._sample_from_hidden(
+            prefill_hidden[:, -1:, :],
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        mx.eval(next_token)
         if stats is not None:
             stats["prompt_time"] = time.perf_counter() - prompt_tic
             stats["prompt_tokens"] = float(prompt_ids.size)
 
-        next_token = self._sample_tokens(
-            prefill[:, -1, :],
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )[:, None]
         generated = [next_token]
         total_generated = 1
         nfe = 1
@@ -1192,25 +1256,29 @@ class LanguageModel(nn.Module):
 
         while total_generated < max_new_tokens:
             cache_len = cache[0].offset
-            block = mx.full((1, block_length), mask_token_id, dtype=prompt_ids.dtype)
+            current_block_length = min(draft_window, max_new_tokens - total_generated)
+            block = mx.full(
+                (1, current_block_length), mask_token_id, dtype=prompt_ids.dtype
+            )
             block[:, 0] = next_token[:, 0]
 
             while bool((block == mask_token_id).any().item()):
                 self.set_linear_spec_lora_enabled(True)
-                draft_logits = self(
+                draft_hidden = self.model(
                     block,
                     cache=cache,
                     use_cache=False,
                     use_causal_mask=False,
-                ).logits
+                )
                 nfe += 1
                 is_mask = block == mask_token_id
                 if threshold > 0:
-                    draft_tokens, draft_probs = self._sample_with_temperature_topk_topp(
-                        draft_logits,
+                    draft_tokens, draft_probs = self._sample_from_hidden(
+                        draft_hidden,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
+                        return_prob=True,
                     )
                     neg_large = mx.array(
                         mx.finfo(draft_probs.dtype).min, dtype=draft_probs.dtype
@@ -1225,8 +1293,8 @@ class LanguageModel(nn.Module):
                         )
                     block = mx.where(unmask, draft_tokens, block)
                 else:
-                    draft_tokens = self._sample_tokens(
-                        draft_logits,
+                    draft_tokens = self._sample_from_hidden(
+                        draft_hidden,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
@@ -1235,15 +1303,15 @@ class LanguageModel(nn.Module):
                     break
 
             self.set_linear_spec_lora_enabled(False)
-            verify_logits = self(
+            verify_hidden = self.model(
                 block,
                 cache=cache,
                 use_cache=True,
                 use_causal_mask=True,
-            ).logits
+            )
             nfe += 1
-            ar_tokens = self._sample_tokens(
-                verify_logits,
+            ar_tokens = self._sample_from_hidden(
+                verify_hidden,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -1252,7 +1320,7 @@ class LanguageModel(nn.Module):
             ar_token_ids = ar_tokens[0].tolist()
             block_ids = block[0].tolist()
             accepted = 1
-            for i in range(block_length - 1):
+            for i in range(current_block_length - 1):
                 if ar_token_ids[i] == block_ids[i + 1]:
                     accepted += 1
                 else:
@@ -1293,6 +1361,9 @@ class LanguageModel(nn.Module):
             raise ValueError("Linear speculative decoding requires batch size 1.")
         if block_length <= 0:
             raise ValueError("block_length must be a positive integer.")
+        # Treat block_length as a cap; acceptance is low beyond 8 and larger
+        # windows make each draft/verify pair slower without changing output.
+        draft_window = min(block_length, 8)
 
         mask_token_id = (
             self.config.mask_token_id if mask_token_id is None else mask_token_id
@@ -1307,24 +1378,23 @@ class LanguageModel(nn.Module):
 
         prompt_tic = time.perf_counter()
         cache = self.make_cache()
-        prefill = self(
+        prefill_hidden = self.model(
             prompt_ids,
             cache=cache,
             use_cache=True,
             use_causal_mask=True,
-        ).logits
-        mx.eval(prefill)
+        )
+        next_token = self._sample_from_hidden(
+            prefill_hidden[:, -1:, :],
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+        )
+        mx.eval(next_token)
         if stats is not None:
             stats["prompt_time"] = time.perf_counter() - prompt_tic
             stats["prompt_tokens"] = float(prompt_ids.size)
 
-        next_token = self._sample_tokens(
-            prefill[:, -1, :],
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-        )[:, None]
-        mx.eval(next_token)
         yield next_token
         total_generated = 1
 
@@ -1333,24 +1403,28 @@ class LanguageModel(nn.Module):
 
         while total_generated < max_new_tokens:
             cache_len = cache[0].offset
-            block = mx.full((1, block_length), mask_token_id, dtype=prompt_ids.dtype)
+            current_block_length = min(draft_window, max_new_tokens - total_generated)
+            block = mx.full(
+                (1, current_block_length), mask_token_id, dtype=prompt_ids.dtype
+            )
             block[:, 0] = next_token[:, 0]
 
             while bool((block == mask_token_id).any().item()):
                 self.set_linear_spec_lora_enabled(True)
-                draft_logits = self(
+                draft_hidden = self.model(
                     block,
                     cache=cache,
                     use_cache=False,
                     use_causal_mask=False,
-                ).logits
+                )
                 is_mask = block == mask_token_id
                 if threshold > 0:
-                    draft_tokens, draft_probs = self._sample_with_temperature_topk_topp(
-                        draft_logits,
+                    draft_tokens, draft_probs = self._sample_from_hidden(
+                        draft_hidden,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
+                        return_prob=True,
                     )
                     neg_large = mx.array(
                         mx.finfo(draft_probs.dtype).min, dtype=draft_probs.dtype
@@ -1365,8 +1439,8 @@ class LanguageModel(nn.Module):
                         )
                     block = mx.where(unmask, draft_tokens, block)
                 else:
-                    draft_tokens = self._sample_tokens(
-                        draft_logits,
+                    draft_tokens = self._sample_from_hidden(
+                        draft_hidden,
                         temperature=temperature,
                         top_k=top_k,
                         top_p=top_p,
@@ -1375,14 +1449,14 @@ class LanguageModel(nn.Module):
                     break
 
             self.set_linear_spec_lora_enabled(False)
-            verify_logits = self(
+            verify_hidden = self.model(
                 block,
                 cache=cache,
                 use_cache=True,
                 use_causal_mask=True,
-            ).logits
-            ar_tokens = self._sample_tokens(
-                verify_logits,
+            )
+            ar_tokens = self._sample_from_hidden(
+                verify_hidden,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -1391,7 +1465,7 @@ class LanguageModel(nn.Module):
             ar_token_ids = ar_tokens[0].tolist()
             block_ids = block[0].tolist()
             accepted = 1
-            for i in range(block_length - 1):
+            for i in range(current_block_length - 1):
                 if ar_token_ids[i] == block_ids[i + 1]:
                     accepted += 1
                 else:
