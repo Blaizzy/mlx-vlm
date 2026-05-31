@@ -20,6 +20,99 @@ from .config import ModelConfig
 _HAS_METAL = mx.metal.is_available()
 
 
+def _load_mlx_steel_gemm_header() -> Optional[str]:
+    include_root = Path(mx.__file__).parent / "include"
+    if not include_root.exists():
+        return None
+
+    seen: set[Path] = set()
+
+    def expand(include_path: str) -> str:
+        path = include_root / include_path
+        if path in seen:
+            return ""
+        seen.add(path)
+        lines = []
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith('#include "mlx/') and stripped.endswith('"'):
+                lines.append(expand(stripped[len('#include "') : -1]))
+            elif stripped != "#pragma once":
+                lines.append(line)
+        return "\n".join(lines)
+
+    try:
+        return expand("mlx/backend/metal/kernels/steel/gemm/gemm.h")
+    except OSError:
+        return None
+
+
+def _make_bm32_linear_kernel():
+    header = _load_mlx_steel_gemm_header()
+    if header is None:
+        return None
+
+    return mx.fast.metal_kernel(
+        name="nemotron_bm32_steel_linear_nt",
+        input_names=["x", "weight"],
+        output_names=["out"],
+        header=header + "\nusing namespace metal;\nusing namespace mlx::steel;\n",
+        source=r"""
+            constexpr short BM = 32;
+            constexpr short BN = 64;
+            constexpr short BK = 16;
+            constexpr short WM = 2;
+            constexpr short WN = 2;
+
+            using gemm_kernel = GEMMKernel<
+                T, T, BM, BN, BK, WM, WN,
+                false, true, true, true, float>;
+            using loader_a_t = typename gemm_kernel::loader_a_t;
+            using loader_b_t = typename gemm_kernel::loader_b_t;
+            using mma_t = typename gemm_kernel::mma_t;
+
+            const uint tid_x = threadgroup_position_in_grid.x;
+            const uint tid_y = threadgroup_position_in_grid.y;
+            const int c_row = int(tid_y) * BM;
+            const int c_col = int(tid_x) * BN;
+
+            const device T* A = x + c_row * K;
+            const device T* B = weight + c_col * K;
+            device T* D = out + c_row * O + c_col;
+
+            threadgroup T As[gemm_kernel::tgp_mem_size_a];
+            threadgroup T Bs[gemm_kernel::tgp_mem_size_b];
+            threadgroup_barrier(mem_flags::mem_none);
+
+            thread mma_t mma_op(
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+            thread loader_a_t loader_a(
+                A, K, As, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            thread loader_b_t loader_b(
+                B, K, Bs, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+
+            for (int kk = 0; kk < K / BK; ++kk) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                loader_a.load_unsafe();
+                loader_b.load_unsafe();
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                mma_op.mma(As, Bs);
+
+                loader_a.next();
+                loader_b.next();
+            }
+
+            threadgroup_barrier(mem_flags::mem_none);
+            mma_op.store_result(D, O);
+        """,
+    )
+
+
+_BM32_LINEAR_KERNEL = _make_bm32_linear_kernel() if _HAS_METAL else None
+
+
 def _topk(x: mx.array, k: int, axis: int = -1) -> Tuple[mx.array, mx.array]:
     indices = mx.argpartition(-x, kth=k - 1, axis=axis)[..., :k]
     values = mx.take_along_axis(x, indices, axis=axis)
@@ -205,6 +298,46 @@ def _small_row_linear(
     out = _small_row_gemv_weight(linear.weight, x, max_sequence_length)
     if out is None:
         return None
+    bias = getattr(linear, "bias", None)
+    if bias is not None:
+        out = out + bias.astype(out.dtype)
+    return out
+
+
+def _bm32_linear(linear: nn.Linear, x: mx.array) -> Optional[mx.array]:
+    if (
+        _BM32_LINEAR_KERNEL is None
+        or not isinstance(linear, nn.Linear)
+        or x.ndim != 3
+        or x.dtype != linear.weight.dtype
+        or x.dtype != mx.bfloat16
+        or x.shape[-2] != 32
+    ):
+        return None
+
+    batch, length, in_dim = x.shape
+    rows = batch * length
+    out_dim, weight_in_dim = linear.weight.shape
+    if (
+        in_dim != weight_in_dim
+        or rows % 32 != 0
+        or out_dim % 64 != 0
+        or in_dim % 16 != 0
+    ):
+        return None
+
+    out = _BM32_LINEAR_KERNEL(
+        inputs=[x.reshape(rows, in_dim), linear.weight],
+        template=[
+            ("T", x.dtype),
+            ("K", in_dim),
+            ("O", out_dim),
+        ],
+        grid=(128 * (out_dim // 64), rows // 32, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(rows, out_dim)],
+        output_dtypes=[x.dtype],
+    )[0].reshape(batch, length, out_dim)
     bias = getattr(linear, "bias", None)
     if bias is not None:
         out = out + bias.astype(out.dtype)
@@ -449,6 +582,12 @@ class MLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         sequence_length = x.shape[-2]
+        if sequence_length == 32:
+            gate = _bm32_linear(self.gate_proj, x)
+            up = _bm32_linear(self.up_proj, x)
+            if gate is not None and up is not None:
+                return self.down_proj(swiglu(gate, up))
+
         if 2 <= sequence_length <= 8:
             hidden = _small_row_swiglu(
                 self.gate_proj,
