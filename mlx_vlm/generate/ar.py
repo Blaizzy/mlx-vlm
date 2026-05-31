@@ -647,9 +647,15 @@ def _extend_cache(cache_a, cache_b):
         return cache_b
     if not cache_b:
         return cache_a
+    extended = []
     for ca, cb in zip(cache_a, cache_b):
+        if not hasattr(ca, "left_padding") and hasattr(ca.__class__, "merge"):
+            ca = ca.__class__.merge([ca])
+        if not hasattr(cb, "left_padding") and hasattr(cb.__class__, "merge"):
+            cb = cb.__class__.merge([cb])
         ca.extend(cb)
-    return cache_a
+        extended.append(ca)
+    return extended
 
 
 def _make_cache(
@@ -1901,6 +1907,26 @@ class PromptProcessingBatch:
                 else:
                     rope_deltas = rope_deltas[:target_b]
             gen_batch._rope_deltas = rope_deltas
+
+        # Final prefill produces the first generated token and mutates the
+        # prompt cache. Materialize that boundary before the decode loop so
+        # the first decode step does not inherit the full lazy prefill graph.
+        cache_states = []
+        for c in self.prompt_cache:
+            try:
+                cache_states.append(c.state)
+            except (AttributeError, TypeError):
+                pass
+        eval_targets = [first_tokens]
+        if cache_states:
+            eval_targets.append(cache_states)
+        if compute_logprobs and isinstance(gen_batch, GenerationBatch):
+            eval_targets.append(gen_batch._next_lps)
+        if top_logprobs_k > 0 and isinstance(gen_batch, GenerationBatch):
+            eval_targets.extend([gen_batch._next_top_idx, gen_batch._next_top_lp])
+        if rope_deltas is not None:
+            eval_targets.append(rope_deltas)
+        mx.eval(*eval_targets)
 
         # APC: harvest the post-prefill K/V into hashed blocks. Done after the
         # final prefill forward but before the cache references are released

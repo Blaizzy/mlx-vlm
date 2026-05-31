@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import BatchKVCache, KVCache
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -807,6 +808,42 @@ class TestBatchGenerator:
         first = plain.next()
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
+
+    def test_generation_batch_extend_promotes_singleton_kv_cache(self):
+        def make_kv_cache(value):
+            c = KVCache()
+            keys = mx.full((1, 2, 3, 4), value, dtype=mx.float32)
+            values = mx.full((1, 2, 3, 4), value + 1, dtype=mx.float32)
+            c.update_and_fetch(keys, values)
+            return c
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        first = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(1.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+        second = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(3.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        first.extend(second)
+
+        assert isinstance(first.prompt_cache[0], BatchKVCache)
+        assert first.prompt_cache[0].left_padding.tolist() == [0, 0]
+        assert first.prompt_cache[0].keys.shape[0] == 2
+        assert first._next_tokens.tolist() == [5, 6]
 
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(

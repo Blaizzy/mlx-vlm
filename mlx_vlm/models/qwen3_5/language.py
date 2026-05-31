@@ -1834,11 +1834,12 @@ class Qwen3_5Model(nn.Module):
                     pad = min(max(int(pad), 0), h.shape[1])
                     row_inputs = inputs[row : row + 1, pad:]
                     row_embeds = h[row : row + 1, pad:]
-                    row_position_ids = (
-                        None
-                        if position_ids is None
-                        else position_ids[:, row : row + 1, pad:]
-                    )
+                    row_position_ids = None
+                    if position_ids is not None:
+                        if position_ids.ndim == 2:
+                            row_position_ids = position_ids[row : row + 1, pad:]
+                        else:
+                            row_position_ids = position_ids[:, row : row + 1, pad:]
                     current_cache = []
                     for cache_entry in cache:
                         if cache_entry is None:

@@ -1,7 +1,42 @@
+from functools import partial
 from typing import Optional
 
 import mlx.core as mx
-from mlx_lm.models.gated_delta import compute_g, gated_delta_update  # noqa: F401
+import mlx.nn as nn
+from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+
+
+@partial(mx.compile, shapeless=True)
+def compute_g(A_log, a, dt_bias):
+    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
+
+
+@partial(mx.compile, shapeless=True)
+def _compute_g_beta(A_log, a, b, dt_bias):
+    return compute_g(A_log, a, dt_bias), mx.sigmoid(b)
+
+
+def gated_delta_update(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    use_kernel: bool = True,
+):
+    g, beta = _compute_g_beta(A_log, a, b, dt_bias)
+    if state is None:
+        B, _, _Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+    return gated_delta_kernel(q, k, v, g, beta, state, mask)
 
 
 def _make_gated_delta_with_states_kernel(has_mask: bool = False):
@@ -153,8 +188,7 @@ def gated_delta_update_with_states(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ):
-    beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
+    g, beta = _compute_g_beta(A_log, a, b, dt_bias)
     if state is None:
         B, _, _Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
@@ -459,8 +493,7 @@ def gated_delta_state_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> mx.array:
-    beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
+    g, beta = _compute_g_beta(A_log, a, b, dt_bias)
     if state is None:
         B, _, _Hk, Dk = k.shape
         Hv, Dv = v.shape[-2:]
