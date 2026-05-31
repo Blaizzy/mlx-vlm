@@ -1100,9 +1100,6 @@ class LanguageModel(nn.Module):
             raise ValueError("block_length must be a positive integer.")
         steps = max(1, int(steps))
         sampler = kwargs.get("sampler")
-        sampling_scaling_factor = float(
-            kwargs.get("sampling_scaling_factor", kwargs.get("factor", 1.0))
-        )
         ar_weight = kwargs.get("ar_weight", 0.0)
         head_scoring = kwargs.get("head_scoring")
         ar_weight = float(ar_weight)
@@ -1135,6 +1132,17 @@ class LanguageModel(nn.Module):
                 "Unsupported Nemotron diffusion sampler "
                 f"{sampler!r}. Expected one of {sorted(valid_samplers)}."
             )
+        sampling_scaling_factor_arg = kwargs.get(
+            "sampling_scaling_factor", kwargs.get("factor")
+        )
+        if sampling_scaling_factor_arg is None:
+            sampling_scaling_factor = (
+                getattr(self.config, "default_diffusion_sampling_scaling_factor", 2.0)
+                if sampler_name == "confidence_threshold_bound"
+                else 1.0
+            )
+        else:
+            sampling_scaling_factor = float(sampling_scaling_factor_arg)
         head_scoring_name = (head_scoring or "full").lower()
         head_scoring_aliases = {
             "default": "full",
