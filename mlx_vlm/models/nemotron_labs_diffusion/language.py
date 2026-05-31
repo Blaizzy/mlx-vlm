@@ -175,6 +175,44 @@ def _llama4_attention_scale(
     return scale.astype(dtype)[None, None, :, None]
 
 
+def _transformers_eager_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    mask: Optional[mx.array | str],
+) -> mx.array:
+    if keys.shape[1] != queries.shape[1]:
+        repeats = queries.shape[1] // keys.shape[1]
+        keys = mx.repeat(keys, repeats, axis=1)
+        values = mx.repeat(values, repeats, axis=1)
+
+    scores = (
+        mx.matmul(
+            queries.astype(mx.float32),
+            keys.astype(mx.float32).transpose(0, 1, 3, 2),
+        )
+        * scale
+    )
+    if isinstance(mask, str):
+        if mask != "causal":
+            raise ValueError(f"Unsupported attention mask {mask!r}.")
+        query_length = queries.shape[-2]
+        key_length = keys.shape[-2]
+        query_positions = mx.arange(query_length)[:, None] + (
+            key_length - query_length
+        )
+        key_positions = mx.arange(key_length)[None, :]
+        causal = key_positions <= query_positions
+        neg_large = mx.array(mx.finfo(scores.dtype).min, dtype=scores.dtype)
+        scores = mx.where(causal[None, None, :, :], scores, neg_large)
+    elif mask is not None:
+        scores = scores + mask.astype(scores.dtype)
+
+    weights = mx.softmax(scores, axis=-1).astype(queries.dtype)
+    return mx.matmul(weights, values)
+
+
 _SMALL_ROW_GEMV_KERNEL = (
     mx.fast.metal_kernel(
         name="nemotron_small_row_gemv",
@@ -555,6 +593,7 @@ def _small_row_swiglu(
 class MLP(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.use_bm32 = True
         self.small_sequence_chunks = 4 if config.intermediate_size % 4 == 0 else 1
         self.tiny_sequence_chunks = 28 if config.intermediate_size % 28 == 0 else 1
         self.medium_sequence_chunks = 4 if config.intermediate_size % 4 == 0 else 1
@@ -582,7 +621,7 @@ class MLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         sequence_length = x.shape[-2]
-        if sequence_length == 32:
+        if self.use_bm32 and sequence_length == 32:
             gate = _bm32_linear(self.gate_proj, x)
             up = _bm32_linear(self.up_proj, x)
             if gate is not None and up is not None:
@@ -650,6 +689,7 @@ class Attention(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.use_transformers_eager_attention = False
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
@@ -716,9 +756,14 @@ class Attention(nn.Module):
                     [cache.values[..., : cache.offset, :], values], axis=2
                 )
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if self.use_transformers_eager_attention:
+            output = _transformers_eager_attention(
+                queries, keys, values, scale=self.scale, mask=mask
+            )
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         projected = _small_row_linear(self.o_proj, output, max_sequence_length=8)
         if projected is not None:
@@ -819,6 +864,11 @@ class LanguageModel(nn.Module):
             4 if config.vocab_size >= 4096 and config.vocab_size % 4 == 0 else 1
         )
         self._linear_spec_lora_loaded = False
+
+    def _set_transformers_parity_runtime(self, enabled: bool) -> None:
+        for layer in self.model.layers:
+            layer.self_attn.use_transformers_eager_attention = enabled
+            layer.mlp.use_bm32 = not enabled
 
     def __call__(
         self,
@@ -1105,9 +1155,10 @@ class LanguageModel(nn.Module):
         ar_weight = float(ar_weight)
         if ar_weight < 0.0 or ar_weight > 1.0:
             raise ValueError("ar_weight must be between 0.0 and 1.0.")
-        sampler_name = (sampler or "confidence_threshold_bound").lower()
+        default_sampler_name = getattr(self.config, "default_diffusion_sampler", "native")
+        sampler_name = (sampler or default_sampler_name).lower()
         sampler_aliases = {
-            "default": "confidence_threshold_bound",
+            "default": default_sampler_name.lower(),
             "optimized": "confidence_threshold_bound",
             "threshold_bound": "confidence_threshold_bound",
             "bound": "confidence_threshold_bound",
@@ -1143,6 +1194,17 @@ class LanguageModel(nn.Module):
             )
         else:
             sampling_scaling_factor = float(sampling_scaling_factor_arg)
+        if min_threshold is None and sampler_name == "confidence_threshold_bound":
+            min_threshold = getattr(self.config, "default_diffusion_min_threshold", 0.4)
+        if min_threshold is not None:
+            min_threshold = float(min_threshold)
+        transformers_parity_arg = kwargs.get("transformers_parity")
+        transformers_parity = (
+            sampler_name == "native"
+            if transformers_parity_arg is None
+            else bool(transformers_parity_arg)
+        )
+        self._set_transformers_parity_runtime(transformers_parity)
         head_scoring_name = (head_scoring or "full").lower()
         head_scoring_aliases = {
             "default": "full",
@@ -1170,6 +1232,11 @@ class LanguageModel(nn.Module):
                 if use_chunked_scoring and self.greedy_score_chunks > 1
                 else "project_full_logits"
             )
+            stats["diffusion_min_threshold"] = (
+                float(min_threshold) if min_threshold is not None else float("nan")
+            )
+            stats["diffusion_sampling_scaling_factor"] = sampling_scaling_factor
+            stats["diffusion_transformers_parity"] = float(transformers_parity)
             for key in (
                 "diffusion_blocks",
                 "diffusion_denoise_nfe",
@@ -1591,6 +1658,7 @@ class LanguageModel(nn.Module):
         stats: Optional[Dict[str, float]] = None,
         **kwargs,
     ) -> tuple[mx.array, int]:
+        self._set_transformers_parity_runtime(False)
         if eos_token_id is None:
             eos_token_id = self.config.eos_token_id
         eos_token_ids = (
@@ -1665,6 +1733,7 @@ class LanguageModel(nn.Module):
         stats: Optional[Dict[str, float]] = None,
         **kwargs,
     ) -> tuple[mx.array, int]:
+        self._set_transformers_parity_runtime(False)
         if prompt_ids.shape[0] != 1:
             raise ValueError("Linear speculative decoding requires batch size 1.")
         if block_length <= 0:
@@ -1820,6 +1889,7 @@ class LanguageModel(nn.Module):
         stats: Optional[Dict[str, float]] = None,
         **kwargs,
     ):
+        self._set_transformers_parity_runtime(False)
         if prompt_ids.shape[0] != 1:
             raise ValueError("Linear speculative decoding requires batch size 1.")
         if block_length <= 0:

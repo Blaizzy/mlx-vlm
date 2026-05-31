@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import mlx.core as mx
@@ -298,9 +299,9 @@ class TestDiffusionModels(unittest.TestCase):
             stats=diffusion_stats,
         )
         self.assertEqual(generated.shape, (1, 8))
-        self.assertEqual(
-            diffusion_stats["diffusion_sampler"], "confidence_threshold_bound"
-        )
+        self.assertEqual(diffusion_stats["diffusion_sampler"], "native")
+        self.assertTrue(math.isnan(diffusion_stats["diffusion_min_threshold"]))
+        self.assertEqual(diffusion_stats["diffusion_transformers_parity"], 1.0)
         self.assertGreaterEqual(diffusion_stats["diffusion_denoise_nfe"], 1)
         self.assertGreaterEqual(diffusion_stats["diffusion_accepted_tokens"], 1)
         self.assertIn("diffusion_tokens_per_denoise_forward", diffusion_stats)
