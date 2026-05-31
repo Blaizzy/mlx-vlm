@@ -71,23 +71,26 @@ def process_tool_calls(model_output: str, tool_module, tools):
                     .removesuffix(tool_module.tool_call_end)
                 )
                 try:
-                    tool_call = tool_module.parse_tool_call(call, tools)
-                    args = tool_call["arguments"]
-                    called_tools.append(
-                        {
-                            "type": "function",
-                            "index": i,
-                            "id": str(uuid.uuid4()),
-                            "function": {
-                                "name": tool_call["name"].strip(),
-                                "arguments": (
-                                    args
-                                    if isinstance(args, str)
-                                    else json.dumps(args, ensure_ascii=False)
-                                ),
-                            },
-                        }
-                    )
+                    tool_calls = tool_module.parse_tool_call(call, tools)
+                    if isinstance(tool_calls, dict):
+                        tool_calls = [tool_calls]
+                    for tool_call in tool_calls:
+                        args = tool_call["arguments"]
+                        called_tools.append(
+                            {
+                                "type": "function",
+                                "index": len(called_tools),
+                                "id": str(uuid.uuid4()),
+                                "function": {
+                                    "name": tool_call["name"].strip(),
+                                    "arguments": (
+                                        args
+                                        if isinstance(args, str)
+                                        else json.dumps(args, ensure_ascii=False)
+                                    ),
+                                },
+                            }
+                        )
                 except Exception:
                     print(f"Invalid tool call: {call}")
     return dict(calls=called_tools, remaining_text=remaining)
