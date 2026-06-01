@@ -36,7 +36,8 @@ mlx_vlm.generate \
 
 ### Diffusion generation
 
-Pass `generation_mode="diffusion"` to use the masked diffusion path.
+Pass `generation_mode="diffusion"` through `--gen-kwargs` to use the masked diffusion path.
+`generation_mode` is a model-specific generation kwarg interpreted by the Nemotron backend.
 Nemotron defaults to the upstream/Transformers transfer policy with a 32-step denoising cap and a 0.9 transfer threshold.
 This native mode also uses a Transformers-parity runtime for the denoise encoder.
 The upstream mode alias `generation_mode="dlm"` is also accepted.
@@ -59,7 +60,8 @@ mlx_vlm.generate \
 
 ### Linear self-speculative generation
 
-Use `--gen-kwargs` for model-specific generation options. The bundled `linear_spec_lora` adapter is loaded automatically when available.
+Use `--gen-kwargs` for model-specific generation options. `generation_mode="linear_speculative"` is passed through to the Nemotron backend, where it enables the linear self-speculative path.
+The bundled `linear_spec_lora` adapter is loaded automatically when available.
 The upstream mode alias `generation_mode="linear_spec"` is also accepted.
 
 ```sh
@@ -177,6 +179,6 @@ print(result.text)
 - Diffusion generation uses masked block denoising. `--verbose` shows the block visualization as masks are filled.
 - The default diffusion schedule uses 32 denoising steps and a 0.9 confidence threshold. Lower `--max-denoising-steps` for speed experiments, but quality can degrade quickly.
 - Diffusion generation records model-level stats such as `diffusion_denoise_nfe`, `diffusion_post_block_nfe`, and `diffusion_tokens_per_denoise_forward`. Use `head_scoring="chunked"` to profile the non-materializing confidence scorer.
-- Diffusion and linear self-speculative generation are exposed through `generation_mode`, for example `--gen-kwargs '{"generation_mode": "diffusion"}'`.
+- Diffusion and linear self-speculative generation are exposed through the model-specific `generation_mode` kwarg, for example `--gen-kwargs '{"generation_mode": "diffusion"}'`.
 - Upstream mode names are accepted as aliases: `dlm` for diffusion and `linear_spec` for linear self-speculation.
 - The optional `linear_spec_lora` adapter included in the Hugging Face repo is used only during the diffusion draft phase of linear self-speculation.
