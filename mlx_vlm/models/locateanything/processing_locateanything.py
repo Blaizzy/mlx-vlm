@@ -215,6 +215,72 @@ class LocateAnythingProcessor(ProcessorMixin):
         image_processor_input_names = self.image_processor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
+    def save_pretrained(self, save_directory, **kwargs):
+        """Save the tokenizer and LocateAnything processor configuration."""
+        save_dir = Path(save_directory)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_files = []
+        chat_template = self.chat_template or getattr(
+            self.tokenizer, "chat_template", None
+        )
+        if chat_template is not None and hasattr(self.tokenizer, "chat_template"):
+            self.tokenizer.chat_template = chat_template
+
+        if self.tokenizer is not None and hasattr(self.tokenizer, "save_pretrained"):
+            tokenizer_files = self.tokenizer.save_pretrained(str(save_dir), **kwargs)
+            if tokenizer_files is not None:
+                saved_files.extend(tokenizer_files)
+
+        auto_map = {
+            "AutoImageProcessor": (
+                "image_processing_locateanything.LocateAnythingImageProcessor"
+            ),
+            "AutoProcessor": "processing_locateanything.LocateAnythingProcessor",
+        }
+        image_config = {
+            "auto_map": auto_map,
+            "image_processor_type": type(self.image_processor).__name__,
+            "image_mean": [float(x) for x in self.image_processor.image_mean],
+            "image_std": [float(x) for x in self.image_processor.image_std],
+            "in_token_limit": int(self.image_processor.in_token_limit),
+            "merge_kernel_size": list(self.image_processor.merge_kernel_size),
+            "patch_size": int(self.image_processor.patch_size),
+            "processor_class": type(self).__name__,
+        }
+        processor_config = {
+            "auto_map": auto_map,
+            "image_end_token": self.image_end_token,
+            "image_placeholder": "image",
+            "image_start_token": self.image_start_token,
+            "image_token": self.image_token,
+            "in_token_limit": image_config["in_token_limit"],
+            "merge_kernel_size": image_config["merge_kernel_size"],
+            "patch_size": image_config["patch_size"],
+            "processor_class": type(self).__name__,
+            "video_placeholder": "video",
+            "video_token": self.image_token,
+        }
+        if chat_template is not None:
+            processor_config["chat_template"] = chat_template
+
+        for filename, config in (
+            ("processor_config.json", processor_config),
+            ("preprocessor_config.json", image_config),
+        ):
+            path = save_dir / filename
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, sort_keys=True)
+            saved_files.append(str(path))
+
+        if chat_template is not None:
+            path = save_dir / "chat_template.json"
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"chat_template": chat_template}, f, indent=2)
+            saved_files.append(str(path))
+
+        return tuple(saved_files)
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         """Load the processor from a pretrained model path."""
