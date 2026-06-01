@@ -3,6 +3,7 @@ import gc
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound
 
 from .. import apc as _apc
 from ..generate import (
@@ -113,6 +115,8 @@ def _build_gen_args(
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
+        seed=getattr(request, "seed", None),
+        logprobs=bool(getattr(request, "logprobs", False)),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         repetition_context_size=_request_field_or_default(
             request,
@@ -608,15 +612,25 @@ def models_endpoint():
         )
         return required_files.issubset(file_names) and has_weights
 
-    # Scan the cache directory for downloaded mlx models
-    hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-    downloaded_models = [repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)]
+    # Scan the cache directory for downloaded mlx models when it exists.
+    try:
+        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
+        downloaded_models = [
+            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
+        ]
+    except CacheNotFound:
+        downloaded_models = []
 
     # Create a list of available models
     models = [
         {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
         for repo in downloaded_models
     ]
+    loaded_model = runtime.model_cache.get("model_path")
+    if loaded_model and all(model["id"] != loaded_model for model in models):
+        models.append(
+            {"id": loaded_model, "object": "model", "created": int(time.time())}
+        )
 
     response = {"object": "list", "data": models}
 

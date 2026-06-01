@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import BatchKVCache, KVCache
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -18,6 +19,7 @@ from mlx_vlm.generate import (
     GenerationBatch,
     GenerationResult,
     PromptProcessingBatch,
+    SpeculativeGenerationBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
 )
@@ -691,6 +693,75 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [3]
 
+    def test_generation_batch_uses_greedy_hidden_argmax_without_logprobs(self):
+        class FastArgmaxModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                del cache
+                self.calls.append(kwargs)
+                assert kwargs["return_hidden"] is True
+                assert kwargs["skip_logits"] is True
+                hidden = mx.ones((input_ids.shape[0], input_ids.shape[1], 3))
+                return SimpleNamespace(hidden_states=[hidden])
+
+            def speculative_argmax_from_hidden(self, hidden):
+                return mx.full((hidden.shape[0], hidden.shape[1]), 7, dtype=mx.int32)
+
+        model = FastArgmaxModel()
+        batch = GenerationBatch(
+            model=model,
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2, 2],
+            greedy_sampling=True,
+        )
+        batch.compute_logprobs = False
+
+        first = batch.next()
+        assert [r.token for r in first] == [5, 6]
+        assert batch._next_tokens.tolist() == [7, 7]
+        assert model.calls == [{"return_hidden": True, "skip_logits": True}]
+
+    def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
+        def fake_rounds(*args, **kwargs):
+            del args, kwargs
+            yield [1, 10], {"round_pos": 0, "round_len": 2}
+            yield [2, 11], {"round_pos": 1, "round_len": 2}
+            yield [3, 12], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100, 200],
+            first_tokens=mx.array([0, 9], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[10, 10],
+            hidden=mx.zeros((2, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0], [9]], dtype=mx.int32),
+        )
+
+        first = batch.next()
+        assert [(r.uid, r.token) for r in first] == [(100, 0), (200, 9)]
+
+        second = batch.next()
+        assert [(r.uid, r.token) for r in second] == [
+            (100, 1),
+            (200, 10),
+            (100, 2),
+            (200, 11),
+        ]
+
     def test_generation_batch_extend_keeps_processor_context_aligned(self):
         class FixedLogitModel:
             def __call__(self, input_ids, cache=None, **kwargs):
@@ -737,6 +808,42 @@ class TestBatchGenerator:
         first = plain.next()
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
+
+    def test_generation_batch_extend_promotes_singleton_kv_cache(self):
+        def make_kv_cache(value):
+            c = KVCache()
+            keys = mx.full((1, 2, 3, 4), value, dtype=mx.float32)
+            values = mx.full((1, 2, 3, 4), value + 1, dtype=mx.float32)
+            c.update_and_fetch(keys, values)
+            return c
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        first = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(1.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+        second = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(3.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        first.extend(second)
+
+        assert isinstance(first.prompt_cache[0], BatchKVCache)
+        assert first.prompt_cache[0].left_padding.tolist() == [0, 0]
+        assert first.prompt_cache[0].keys.shape[0] == 2
+        assert first._next_tokens.tolist() == [5, 6]
 
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
@@ -1385,6 +1492,100 @@ class TestSamplerArgs:
         mock_make_logits_processors.assert_called_once_with(
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
         )
+
+
+@pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
+def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
+    pbar = MagicMock()
+
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.no_chunked_prefill = False
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(ar_module, "tqdm") as mock_tqdm,
+    ):
+        mock_tqdm.return_value.__enter__.return_value = pbar
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            prefill_step_size=2,
+            verbose=verbose,
+        )
+
+        next(gen)
+
+    mock_tqdm.assert_called_once()
+    assert mock_tqdm.call_args.kwargs["disable"] is disabled
+    assert pbar.update.call_count > 0
+
+
+def test_stream_generate_forwards_verbose_to_generate_step():
+    captured = {}
+
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        def reset(self):
+            self.segments = []
+
+        def add_token(self, token, skip_special_token_ids=None):
+            self.segments.append(str(token))
+
+        @property
+        def last_segment(self):
+            return self.segments.pop(0) if self.segments else ""
+
+        def finalize(self):
+            pass
+
+    def fake_generate_step(*args, **kwargs):
+        captured["verbose"] = kwargs.get("verbose")
+        yield 7, mx.zeros((4,))
+
+    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
+    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+                verbose=True,
+            )
+        )
+
+    assert captured["verbose"] is True
 
 
 def test_normalize_resize_shape_expands_single_value():

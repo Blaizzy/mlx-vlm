@@ -366,7 +366,15 @@ class LanguageModel(nn.Module):
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
         stats: Optional[Dict[str, float]] = None,
+        **kwargs,
     ) -> mx.array:
+        generation_mode = kwargs.pop("generation_mode", None)
+        if generation_mode in ("linear_speculative", "linear_spec") or kwargs.pop(
+            "linear_speculative", False
+        ):
+            raise ValueError(
+                "LLaDA2 MoE does not support linear_speculative generation."
+            )
         if inputs.shape[0] != 1:
             raise ValueError(
                 "LLaDA2 MoE diffusion generation currently supports batch size 1."

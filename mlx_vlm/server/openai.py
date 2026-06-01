@@ -101,6 +101,14 @@ def _looks_like_audio_reference(value: str) -> bool:
     )
 
 
+def _adapter_path_or_inherit(request):
+    return (
+        request.adapter_path
+        if "adapter_path" in request.model_fields_set
+        else _INHERIT_ADAPTER
+    )
+
+
 def _decode_input_audio_data(input_audio: InputAudio):
     data = input_audio["data"]
     if not isinstance(data, str):
@@ -570,7 +578,9 @@ async def responses_input_tokens_endpoint(request: Request):
     body = await request.json()
     openai_request = OpenAIRequest(**body)
     try:
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
         del model
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
@@ -722,7 +732,9 @@ async def responses_endpoint(request: Request):
 
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
 
         kwargs = {}
 

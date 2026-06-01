@@ -277,6 +277,9 @@ class OpenAIRequest(FlexibleBaseModel):
         ..., description="Input text or list of chat messages."
     )
     model: str = Field(..., description="The model to use for generation.")
+    adapter_path: Optional[str] = Field(
+        None, description="The path to the adapter weights."
+    )
     max_output_tokens: int = Field(
         default_factory=get_server_max_tokens,
         description="Maximum number of tokens to generate.",

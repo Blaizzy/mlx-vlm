@@ -380,6 +380,13 @@ def parse_arguments():
         'Example: --processor-kwargs \'{"cropping": false, "max_patches": 3}\'',
     )
     parser.add_argument(
+        "--gen-kwargs",
+        type=json.loads,
+        default={},
+        help="Extra generation kwargs as JSON. "
+        "Example: --gen-kwargs '{\"custom_arg\": true}'",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
@@ -606,6 +613,21 @@ def is_masked_diffusion_text_model(model: nn.Module) -> bool:
     return getattr(config, "mask_token_id", None) is not None
 
 
+def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
+    if not is_masked_diffusion_text_model(model):
+        return False
+
+    config = getattr(model, "config", None)
+    if getattr(config, "default_generation_mode", None) != "ar":
+        return True
+
+    generation_mode = kwargs.get("generation_mode")
+    if generation_mode is not None:
+        return generation_mode != "ar"
+
+    return False
+
+
 def _prime_cached_prefix_rope_state(
     model: nn.Module,
     full_input_ids: mx.array,
@@ -738,7 +760,7 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    if is_masked_diffusion_text_model(model):
+    if _use_masked_diffusion_text_path(model, kwargs):
         if image is not None or audio is not None or video is not None:
             raise ValueError("Diffusion text generation models are text-only.")
 
@@ -748,14 +770,24 @@ def stream_generate(
         top_k = kwargs.get("top_k", DEFAULT_TOP_K)
         max_denoising_steps = kwargs.get("max_denoising_steps")
         if max_denoising_steps is None:
-            max_denoising_steps = kwargs.get("steps", 32)
+            config = getattr(model, "config", None)
+            max_denoising_steps = kwargs.get(
+                "steps", getattr(config, "default_diffusion_steps", 32)
+            )
         num_to_transfer = kwargs.get(
             "num_to_transfer", DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER
         )
-        threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
-        min_threshold = kwargs.get(
-            "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
-        )
+        config = getattr(model, "config", None)
+        if getattr(config, "default_generation_mode", None) == "ar":
+            threshold = kwargs.get(
+                "threshold", getattr(config, "default_diffusion_threshold", None)
+            )
+            min_threshold = kwargs.get("min_threshold")
+        else:
+            threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
+            min_threshold = kwargs.get(
+                "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
+            )
         editing_threshold = kwargs.get(
             "editing_threshold", DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD
         )
@@ -768,6 +800,27 @@ def stream_generate(
         )
 
         generation_stats = {}
+        handled_generation_kwargs = {
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_denoising_steps",
+            "steps",
+            "block_length",
+            "threshold",
+            "min_threshold",
+            "editing_threshold",
+            "max_post_steps",
+            "num_to_transfer",
+            "max_transfer_per_step",
+            "stability_steps",
+        }
+        model_generate_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in handled_generation_kwargs
+        }
         tic = time.perf_counter()
         generated = model.language_model.generate(
             input_ids,
@@ -789,6 +842,7 @@ def stream_generate(
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
             stats=generation_stats,
+            **model_generate_kwargs,
         )
         mx.eval(generated)
         total_time = time.perf_counter() - tic
@@ -1046,6 +1100,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            verbose=verbose,
             **kwargs,
         )
         tic = time.perf_counter()
@@ -1325,6 +1380,7 @@ def main():
         "editing_threshold": None,
         "max_post_steps": None,
         "stability_steps": None,
+        "gen_kwargs": {},
     }
     for name, default in diffusion_arg_defaults.items():
         if not hasattr(args, name):
@@ -1409,6 +1465,10 @@ def main():
     # Add processor kwargs from JSON
     if args.processor_kwargs:
         kwargs.update(args.processor_kwargs)
+
+    # Add generation kwargs from JSON
+    if args.gen_kwargs:
+        kwargs.update(args.gen_kwargs)
 
     # Add thinking kwargs
     kwargs["enable_thinking"] = args.enable_thinking
