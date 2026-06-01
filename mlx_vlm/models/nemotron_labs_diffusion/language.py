@@ -1115,6 +1115,10 @@ class LanguageModel(nn.Module):
         linear_speculative: bool = False,
         **kwargs,
     ) -> mx.array:
+        generation_mode = kwargs.get("generation_mode")
+        if generation_mode in ("linear_speculative", "linear_spec"):
+            linear_speculative = True
+
         if inputs.shape[0] != 1:
             raise ValueError(
                 "Nemotron Labs Diffusion generation currently supports batch size 1."

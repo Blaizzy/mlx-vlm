@@ -384,7 +384,7 @@ def parse_arguments():
         type=json.loads,
         default={},
         help="Extra generation kwargs as JSON. "
-        "Example: --gen-kwargs '{\"linear_speculative\": true}'",
+        "Example: --gen-kwargs '{\"custom_arg\": true}'",
     )
     parser.add_argument(
         "--prefill-step-size",
@@ -623,17 +623,9 @@ def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) ->
 
     generation_mode = kwargs.get("generation_mode")
     if generation_mode is not None:
-        return generation_mode in (
-            "diffusion",
-            "dlm",
-            "linear_speculative",
-            "linear_spec",
-        )
+        return generation_mode != "ar"
 
-    return bool(
-        kwargs.get("linear_speculative", False)
-        or kwargs.get("linear_speculation", False)
-    )
+    return False
 
 
 def _prime_cached_prefix_rope_state(
@@ -823,9 +815,6 @@ def stream_generate(
             "num_to_transfer",
             "max_transfer_per_step",
             "stability_steps",
-            "linear_speculative",
-            "linear_speculation",
-            "generation_mode",
         }
         model_generate_kwargs = {
             key: value
@@ -853,9 +842,6 @@ def stream_generate(
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
             stats=generation_stats,
-            linear_speculative=kwargs.get("linear_speculative", False)
-            or kwargs.get("linear_speculation", False)
-            or kwargs.get("generation_mode") in ("linear_speculative", "linear_spec"),
             **model_generate_kwargs,
         )
         mx.eval(generated)

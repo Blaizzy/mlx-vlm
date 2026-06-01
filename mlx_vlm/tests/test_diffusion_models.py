@@ -226,6 +226,56 @@ class TestDiffusionModels(unittest.TestCase):
 
         self.assertLessEqual(calls["count"], 6)
 
+    def test_llada_stream_generate_ignores_extra_cli_kwargs(self):
+        from mlx_vlm.models import llada2_moe
+
+        config = llada2_moe.ModelConfig(
+            model_type="llada2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rotary_dim=8,
+            num_experts=None,
+            max_position_embeddings=128,
+            pad_token_id=3,
+            eos_token_id=3,
+            mask_token_id=127,
+        )
+        model = llada2_moe.Model(config)
+
+        results = list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                steps=1,
+                fps=2.0,
+                temperature=0.0,
+            )
+        )
+
+        self.assertEqual(results[-1].generation_tokens, 2)
+
+        with self.assertRaisesRegex(ValueError, "does not support linear_speculative"):
+            list(
+                stream_generate(
+                    model,
+                    _Processor(),
+                    prompt="ignored",
+                    input_ids=mx.array([[4]], dtype=mx.int32),
+                    max_tokens=2,
+                    generation_mode="diffusion",
+                    linear_speculative=True,
+                    temperature=0.0,
+                )
+            )
+
     def test_nemotron_labs_diffusion(self):
         from mlx_vlm.models import nemotron_labs_diffusion
         from mlx_vlm.models.nemotron_labs_diffusion.language import (
@@ -418,7 +468,7 @@ class TestDiffusionModels(unittest.TestCase):
             )
         )
         self.assertTrue(diffusion_calls["kwargs"])
-        self.assertFalse(diffusion_calls["kwargs"]["linear_speculative"])
+        self.assertNotIn("linear_speculative", diffusion_calls["kwargs"])
         self.assertEqual(diffusion_calls["kwargs"]["steps"], 32)
         self.assertEqual(diffusion_calls["kwargs"]["threshold"], 0.9)
         self.assertEqual(diffusion_calls["kwargs"]["sampler"], "native")
@@ -439,7 +489,7 @@ class TestDiffusionModels(unittest.TestCase):
             )
         )
         self.assertTrue(diffusion_calls["kwargs"])
-        self.assertFalse(diffusion_calls["kwargs"]["linear_speculative"])
+        self.assertNotIn("linear_speculative", diffusion_calls["kwargs"])
 
         linear_calls = {}
 
@@ -457,6 +507,7 @@ class TestDiffusionModels(unittest.TestCase):
                 input_ids=mx.array([[4]], dtype=mx.int32),
                 max_tokens=2,
                 generation_mode="linear_speculative",
+                linear_speculative=True,
                 temperature=0.0,
             )
         )
@@ -465,31 +516,3 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[-1].generation_tokens, 2)
         self.assertEqual(results[-1].finish_reason, "stop")
-
-        linear_calls.clear()
-        list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                generation_mode="linear_spec",
-                temperature=0.0,
-            )
-        )
-        self.assertTrue(linear_calls["kwargs"]["linear_speculative"])
-
-        linear_calls.clear()
-        list(
-            stream_generate(
-                model,
-                _Processor(),
-                prompt="ignored",
-                input_ids=mx.array([[4]], dtype=mx.int32),
-                max_tokens=2,
-                linear_speculation=True,
-                temperature=0.0,
-            )
-        )
-        self.assertTrue(linear_calls["kwargs"]["linear_speculative"])
