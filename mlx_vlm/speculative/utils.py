@@ -132,6 +132,7 @@ def run_speculative_server_rounds(
     shared_kv_states: Optional[dict] = None,
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
+    row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
 
@@ -173,25 +174,6 @@ def run_speculative_server_rounds(
         return
 
     if draft_kind == "mtp":
-        if batch_size == 1:
-            yield from (
-                ([tok], state)
-                for tok, state in _mtp_rounds(
-                    model,
-                    draft_model,
-                    prompt_cache,
-                    hidden,
-                    shared_kv_states,
-                    first_bonus=int(first_bonus.reshape(-1).item()),
-                    max_tokens=max_tokens,
-                    sampler=sampler,
-                    draft_block_size=draft_block_size,
-                    token_dtype=token_dtype,
-                    greedy_sampling=greedy_sampling,
-                )
-            )
-            return
-
         yield from _mtp_rounds_batch(
             model,
             draft_model,
@@ -206,6 +188,7 @@ def run_speculative_server_rounds(
             stop_check=stop_check,
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
+            row_ids=row_ids,
         )
         return
 

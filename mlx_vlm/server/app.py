@@ -115,6 +115,8 @@ def _build_gen_args(
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
+        seed=getattr(request, "seed", None),
+        logprobs=bool(getattr(request, "logprobs", False)),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         repetition_context_size=_request_field_or_default(
             request,
