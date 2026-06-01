@@ -380,6 +380,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if not lazy:
         mx.eval(model.parameters())
 
+    model.model_path = model_path
     model.eval()
     return model
 
