@@ -41,10 +41,8 @@ Nemotron defaults to the upstream/Transformers transfer policy with a 32-step de
 This native mode also uses a Transformers-parity runtime for the denoise encoder.
 The upstream mode alias `generation_mode="dlm"` is also accepted.
 Sampler variants from the NVIDIA evaluation harness can be selected with `sampler`.
-Supported values are `native` (default), `confidence_threshold_bound`, `streaming_dllm`, `fixed`, `confidence_threshold_ref`, and `cumulative_error`.
+Supported values are `native` (default), `confidence_threshold_bound`, `fixed`, `confidence_threshold_ref`, and `cumulative_error`.
 For faster MLX experiments, opt into the bounded sampler with `sampler="confidence_threshold_bound"`; it uses `min_threshold=0.45` by default and keeps the optimized MLX kernels.
-The `streaming_dllm` sampler implements the Streaming-dLLM dynamic confidence rule: the transfer threshold is reduced as the current block fills, controlled by `confidence_alpha` (default `0.9`).
-Aliases `streaming`, `dynamic_confidence`, and `context_aware` are also accepted.
 For profiling, `head_scoring="chunked"` scores masked rows without concatenating full vocabulary logits; the default remains `head_scoring="full"` because it is usually faster on MLX's optimized matmul path.
 For mixed AR+dLM experiments, pass `ar_weight` between `0.0` and `1.0`; this adds an AR causal block forward during denoising and is disabled by default.
 

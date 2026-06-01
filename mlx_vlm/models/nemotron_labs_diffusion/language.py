@@ -199,9 +199,7 @@ def _transformers_eager_attention(
             raise ValueError(f"Unsupported attention mask {mask!r}.")
         query_length = queries.shape[-2]
         key_length = keys.shape[-2]
-        query_positions = mx.arange(query_length)[:, None] + (
-            key_length - query_length
-        )
+        query_positions = mx.arange(query_length)[:, None] + (key_length - query_length)
         key_positions = mx.arange(key_length)[None, :]
         causal = key_positions <= query_positions
         neg_large = mx.array(mx.finfo(scores.dtype).min, dtype=scores.dtype)
@@ -1155,18 +1153,15 @@ class LanguageModel(nn.Module):
         ar_weight = float(ar_weight)
         if ar_weight < 0.0 or ar_weight > 1.0:
             raise ValueError("ar_weight must be between 0.0 and 1.0.")
-        default_sampler_name = getattr(self.config, "default_diffusion_sampler", "native")
+        default_sampler_name = getattr(
+            self.config, "default_diffusion_sampler", "native"
+        )
         sampler_name = (sampler or default_sampler_name).lower()
         sampler_aliases = {
             "default": default_sampler_name.lower(),
             "optimized": "confidence_threshold_bound",
             "threshold_bound": "confidence_threshold_bound",
             "bound": "confidence_threshold_bound",
-            "streaming": "streaming_dllm",
-            "streaming-dllm": "streaming_dllm",
-            "dynamic": "streaming_dllm",
-            "dynamic_confidence": "streaming_dllm",
-            "context_aware": "streaming_dllm",
             "hf": "native",
             "upstream": "native",
             "confidence_threshold": "native",
@@ -1181,7 +1176,6 @@ class LanguageModel(nn.Module):
             "fixed",
             "confidence_threshold_ref",
             "confidence_threshold_bound",
-            "streaming_dllm",
             "cumulative_error",
         }
         if sampler_name not in valid_samplers:
@@ -1204,17 +1198,6 @@ class LanguageModel(nn.Module):
             min_threshold = getattr(self.config, "default_diffusion_min_threshold", 0.4)
         if min_threshold is not None:
             min_threshold = float(min_threshold)
-        confidence_alpha = float(
-            kwargs.get(
-                "confidence_alpha",
-                kwargs.get(
-                    "dynamic_confidence_alpha",
-                    getattr(self.config, "default_diffusion_confidence_alpha", 0.3),
-                ),
-            )
-        )
-        if confidence_alpha < 0.0 or confidence_alpha > 1.0:
-            raise ValueError("confidence_alpha must be between 0.0 and 1.0.")
         transformers_parity_arg = kwargs.get("transformers_parity")
         transformers_parity = (
             sampler_name == "native"
@@ -1253,7 +1236,6 @@ class LanguageModel(nn.Module):
                 float(min_threshold) if min_threshold is not None else float("nan")
             )
             stats["diffusion_sampling_scaling_factor"] = sampling_scaling_factor
-            stats["diffusion_confidence_alpha"] = confidence_alpha
             stats["diffusion_transformers_parity"] = float(transformers_parity)
             for key in (
                 "diffusion_blocks",
@@ -1539,18 +1521,6 @@ class LanguageModel(nn.Module):
                             criteria.astype(mx.int32), axis=1
                         ).astype(mx.bool_)
                         keep_sorted = keep_sorted & (sorted_positions < transfer_limit)
-                    elif sampler_name == "streaming_dllm":
-                        mask_ratio = masked_count / current_block_length
-                        adjusted_threshold = float(threshold) * (
-                            1.0 - confidence_alpha * (1.0 - mask_ratio)
-                        )
-                        keep_sorted = sorted_confidence >= mx.array(
-                            adjusted_threshold, dtype=sorted_confidence.dtype
-                        )
-                        if max_transfer_per_step is not None:
-                            keep_sorted = keep_sorted & (
-                                sorted_positions < transfer_limit
-                            )
                     elif sampler_name == "cumulative_error":
                         confidence_floor = mx.array(
                             1e-12, dtype=sorted_confidence.dtype
@@ -1609,19 +1579,6 @@ class LanguageModel(nn.Module):
                     accepted_count = min(transfer_count, masked_count)
                 block = mx.where(transfer_mask, sampled_block, block)
                 add_stat("diffusion_accepted_tokens", accepted_count)
-                if (
-                    eos_early_stop
-                    and sampler_name == "streaming_dllm"
-                    and end_length is None
-                ):
-                    block_ids = block[0].tolist()
-                    for eos_position, token_id in enumerate(block_ids):
-                        if token_id in eos_token_ids and mask_id not in block_ids[
-                            : eos_position + 1
-                        ]:
-                            end_length = total_generated + eos_position + 1
-                            add_stat("diffusion_eos_early_exit")
-                            break
                 if visualizer_state["active"] and bool(transfer_mask.any().item()):
                     preview = (
                         mx.concatenate(generated_blocks + [block], axis=1)

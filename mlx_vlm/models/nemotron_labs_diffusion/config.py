@@ -38,7 +38,6 @@ class ModelConfig(BaseModelConfig):
     default_diffusion_threshold: Optional[float] = 0.9
     default_diffusion_min_threshold: Optional[float] = 0.45
     default_diffusion_sampling_scaling_factor: float = 2.0
-    default_diffusion_confidence_alpha: float = 0.9
     dlm_paradigm: str = "bidirectional"
     block_size: int = 32
     dlm_loss_weight: Optional[float] = None

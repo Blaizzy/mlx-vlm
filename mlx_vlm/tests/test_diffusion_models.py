@@ -226,44 +226,6 @@ class TestDiffusionModels(unittest.TestCase):
 
         self.assertLessEqual(calls["count"], 6)
 
-    def test_nemotron_streaming_dllm_sampler(self):
-        from mlx_vlm.models import nemotron_labs_diffusion
-
-        config = nemotron_labs_diffusion.ModelConfig(
-            vocab_size=64,
-            hidden_size=32,
-            intermediate_size=64,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            max_position_embeddings=64,
-            eos_token_id=11,
-            mask_token_id=10,
-        )
-        model = nemotron_labs_diffusion.Model(config)
-        stats = {}
-
-        generated = model.language_model.generate(
-            mx.array([[1, 2, 3]], dtype=mx.int32),
-            gen_length=8,
-            block_length=4,
-            steps=4,
-            sampler="dynamic_confidence",
-            threshold=0.9,
-            confidence_alpha=0.4,
-            temperature=0.0,
-            mask_id=10,
-            eos_id=11,
-            stats=stats,
-        )
-        mx.eval(generated)
-
-        self.assertEqual(generated.shape, (1, 8))
-        self.assertEqual(stats["diffusion_sampler"], "streaming_dllm")
-        self.assertEqual(stats["diffusion_confidence_alpha"], 0.4)
-        self.assertEqual(stats["diffusion_transformers_parity"], 0.0)
-
     def test_nemotron_labs_diffusion(self):
         from mlx_vlm.models import nemotron_labs_diffusion
         from mlx_vlm.models.nemotron_labs_diffusion.language import (
@@ -349,7 +311,6 @@ class TestDiffusionModels(unittest.TestCase):
             "fixed",
             "confidence_threshold_ref",
             "confidence_threshold_bound",
-            "streaming_dllm",
             "cumulative_error",
         ):
             with self.subTest(sampler=sampler):
