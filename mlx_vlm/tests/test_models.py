@@ -743,6 +743,81 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_locateanything(self):
+        from mlx_vlm.models import locateanything
+
+        text_config = locateanything.TextConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+            rms_norm_eps=1e-6,
+            rope_theta=1000000.0,
+            max_position_embeddings=512,
+            tie_word_embeddings=True,
+        )
+
+        vision_config = locateanything.VisionConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=64,
+            patch_size=14,
+            init_pos_emb_height=8,
+            init_pos_emb_width=8,
+            num_channels=3,
+            merge_kernel_size=[2, 2],
+        )
+
+        config = locateanything.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_index=5,
+            vocab_size=128,
+        )
+
+        model = locateanything.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        model = locateanything.Model(config)
+        pixels = mx.random.uniform(shape=(16, 14, 14, 3))
+        image_features = model.vision_tower(
+            pixels,
+            grid_thw=mx.array([[4, 4]]),
+            grid_shapes=[(4, 4)],
+        )
+        self.assertEqual(len(image_features), 1)
+        self.assertEqual(image_features[0].shape, (4, 4, 32))
+
+        projected = model.multi_modal_projector(image_features)
+        self.assertEqual(projected.shape, (4, 64))
+
+        input_ids = mx.array([[5, 5, 5, 5, 1, 2, 3]])
+        pixel_values = mx.random.uniform(shape=(16, 3, 14, 14))
+        embeddings = model.get_input_embeddings(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_hws=mx.array([[4, 4]]),
+            _grid_shapes=[(4, 4)],
+        )
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 7, 64))
+
+        out = model(
+            input_ids,
+            pixel_values=pixel_values,
+            image_grid_hws=mx.array([[4, 4]]),
+            _grid_shapes=[(4, 4)],
+        )
+        self.assertEqual(out.logits.shape, (1, 7, 128))
+
     def test_smolvlm_text_config_infers_heads_from_head_dim(self):
         from mlx_vlm.models import smolvlm
 
