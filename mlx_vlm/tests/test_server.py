@@ -550,6 +550,70 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
     assert "missing/weights" not in ids
 
 
+def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+    )
+    monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {
+            "id": "/models/local-qwen",
+            "object": "model",
+            "created": response.json()["data"][0]["created"],
+        }
+    ]
+
+
+def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
+    def repo(repo_id, file_names):
+        return SimpleNamespace(
+            repo_id=repo_id,
+            repo_type="model",
+            last_modified=123.0,
+            refs={
+                "main": SimpleNamespace(
+                    files=[
+                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
+                        for file_name in file_names
+                    ]
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        lambda: SimpleNamespace(
+            repos=[
+                repo(
+                    "local/sharded-model",
+                    [
+                        "config.json",
+                        "model.safetensors.index.json",
+                        "tokenizer_config.json",
+                    ],
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setitem(server.runtime.model_cache, "model_path", "local/sharded-model")
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert [model["id"] for model in response.json()["data"]].count(
+        "local/sharded-model"
+    ) == 1
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
