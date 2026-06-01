@@ -1,4 +1,4 @@
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -8,7 +8,6 @@ from mlx_lm.models.activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
-    create_ssm_mask,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -16,6 +15,7 @@ from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
 from .gated_delta import (
+    gated_delta_accept_states,
     gated_delta_state_update,
     gated_delta_update,
     gated_delta_update_with_states,
@@ -64,6 +64,12 @@ def _precise_swiglu(h, gate, x):
     gate = nn.silu(gate.astype(mx.float32))
     x = x.astype(mx.float32)
     return (gate * x).astype(h.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
+    out = mx.sum(conv_input.astype(mx.float32) * weight[None, :, :], axis=1)
+    return out.astype(conv_input.dtype)[:, None, :]
 
 
 _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
@@ -147,7 +153,7 @@ def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
         target_verify
         and x.ndim == 3
         and x.shape[1] > 1
-        and isinstance(linear, nn.Linear)
+        and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
     )
 
 
@@ -170,16 +176,463 @@ def _target_verify_weight(weight: mx.array, x: mx.array) -> Optional[mx.array]:
     return out.reshape(B, L, O)
 
 
+def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
+    return r"""
+    using namespace metal;
+
+    constant constexpr int SIMD_SIZE = 32;
+    constant constexpr int BITS = __BITS__;
+    constant constexpr int GS = __GS__;
+    constant constexpr int PACK_FACTOR = (BITS == 5 ? 8 : 32 / BITS);
+    constant constexpr int BYTES_PER_PACK = (BITS == 5 ? 5 : 32 / 8);
+    constant constexpr int PACKS_PER_THREAD = 2;
+    constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
+    constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
+    constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
+    constant constexpr int RESULTS_PER_SIMDGROUP = 4;
+    constant constexpr int NUM_SIMDGROUPS = 2;
+    constant constexpr int BN = RESULTS_PER_SIMDGROUP * NUM_SIMDGROUPS;
+
+    template <typename T>
+    inline float load_vector_exact(const device T* x, thread float* x_thread) {
+      float sum = 0.0f;
+      if (BITS == 4) {
+        for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
+          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 16.0f;
+          x_thread[i + 2] = x[i + 2] / 256.0f;
+          x_thread[i + 3] = x[i + 3] / 4096.0f;
+        }
+      } else if (BITS == 5) {
+        for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
+          sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3] + x[i + 4] + x[i + 5] +
+              x[i + 6] + x[i + 7];
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 32.0f;
+          x_thread[i + 2] = x[i + 2] / 4.0f;
+          x_thread[i + 3] = x[i + 3] / 128.0f;
+          x_thread[i + 4] = x[i + 4] / 16.0f;
+          x_thread[i + 5] = x[i + 5] / 2.0f;
+          x_thread[i + 6] = x[i + 6] / 64.0f;
+          x_thread[i + 7] = x[i + 7] / 8.0f;
+        }
+      }
+      return sum;
+    }
+
+    inline float qdot_exact(
+        const device uint8_t* w,
+        const thread float* x_thread,
+        float scale,
+        float bias,
+        float sum) {
+      float accum = 0.0f;
+      if (BITS == 4) {
+        const device uint16_t* ws = (const device uint16_t*)w;
+        for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
+          accum +=
+              (x_thread[4 * i] * (ws[i] & 0x000f) +
+               x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+               x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+               x_thread[4 * i + 3] * (ws[i] & 0xf000));
+        }
+      } else if (BITS == 5) {
+        for (int i = 0; i < (VALUES_PER_THREAD / 8); i++) {
+          const thread float* xt = x_thread + 8 * i;
+          const device uint8_t* wb = w + 5 * i;
+
+          accum += (wb[0] & 0x1f) * xt[0];
+          accum += (wb[0] & 0xe0) * xt[1];
+          accum += (wb[1] & 0x3) * (xt[1] * 256.0f);
+          accum += (wb[1] & 0x7c) * xt[2];
+          accum += (wb[1] & 0x80) * xt[3];
+          accum += (wb[2] & 0xf) * (xt[3] * 256.0f);
+          accum += (wb[2] & 0xf0) * xt[4];
+          accum += (wb[3] & 0x1) * (xt[4] * 256.0f);
+          accum += (wb[3] & 0x3e) * xt[5];
+          accum += (wb[3] & 0xc0) * xt[6];
+          accum += (wb[4] & 0x7) * (xt[6] * 256.0f);
+          accum += (wb[4] & 0xf8) * xt[7];
+        }
+      }
+      return scale * accum + sum * bias;
+    }
+""".replace(
+        "__BITS__", str(bits)
+    ).replace(
+        "__GS__", str(group_size)
+    )
+
+
+_TARGET_VERIFY_QMV_SOURCE = r"""
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    const device uint8_t* ws_base =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* scales_base =
+        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* biases_base =
+        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* x_base =
+        x + int(b_idx) * VERIFY_T * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
+
+    float result[VERIFY_T][RESULTS_PER_SIMDGROUP];
+    float x_thread[VERIFY_T][VALUES_PER_THREAD];
+    for (int t = 0; t < VERIFY_T; ++t) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        result[t][row] = 0.0f;
+      }
+    }
+
+    const device uint8_t* ws = ws_base;
+    const device T* sc = scales_base;
+    const device T* bs = biases_base;
+    const device T* xk = x_base;
+
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      float sums[VERIFY_T];
+      for (int t = 0; t < VERIFY_T; ++t) {
+        sums[t] = load_vector_exact<T>(xk + t * K_SIZE, x_thread[t]);
+      }
+
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        const device T* sl = sc + row * in_vec_size_g;
+        const device T* bl = bs + row * in_vec_size_g;
+        float s = float(sl[0]);
+        float b = float(bl[0]);
+        for (int t = 0; t < VERIFY_T; ++t) {
+          result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
+        }
+      }
+
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+    for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+      int n = out_row + row;
+      for (int t = 0; t < VERIFY_T; ++t) {
+        float r = simd_sum(result[t][row]);
+        if (simd_lid == 0) {
+          y[(int(b_idx) * VERIFY_T + t) * N_SIZE + n] = T(r);
+        }
+      }
+    }
+"""
+
+
+_TARGET_VERIFY_QARGMAX_SOURCE = r"""
+    uint n_tile = threadgroup_position_in_grid.y;
+    uint b_idx = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    int out_row = int(n_tile) * BN + int(simd_gid) * RESULTS_PER_SIMDGROUP;
+    int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+    int in_vec_size_g = K_SIZE / GS;
+
+    threadgroup float tile_best_values[VERIFY_T][NUM_SIMDGROUPS];
+    threadgroup int tile_best_indices[VERIFY_T][NUM_SIMDGROUPS];
+
+    const device uint8_t* ws_base =
+        (const device uint8_t*)w + out_row * in_vec_size_w +
+        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
+    const device T* scales_base =
+        scales + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* biases_base =
+        biases + out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
+    const device T* x_base =
+        x + int(b_idx) * VERIFY_T * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
+
+    float result[VERIFY_T][RESULTS_PER_SIMDGROUP];
+    float x_thread[VERIFY_T][VALUES_PER_THREAD];
+    for (int t = 0; t < VERIFY_T; ++t) {
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        result[t][row] = 0.0f;
+      }
+    }
+
+    const device uint8_t* ws = ws_base;
+    const device T* sc = scales_base;
+    const device T* bs = biases_base;
+    const device T* xk = x_base;
+
+    for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
+      float sums[VERIFY_T];
+      for (int t = 0; t < VERIFY_T; ++t) {
+        sums[t] = load_vector_exact<T>(xk + t * K_SIZE, x_thread[t]);
+      }
+
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        const device uint8_t* wl = ws + row * in_vec_size_w;
+        const device T* sl = sc + row * in_vec_size_g;
+        const device T* bl = bs + row * in_vec_size_g;
+        float s = float(sl[0]);
+        float b = float(bl[0]);
+        for (int t = 0; t < VERIFY_T; ++t) {
+          result[t][row] += qdot_exact(wl, x_thread[t], s, b, sums[t]);
+        }
+      }
+
+      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+      sc += BLOCK_SIZE / GS;
+      bs += BLOCK_SIZE / GS;
+      xk += BLOCK_SIZE;
+    }
+
+    for (int t = 0; t < VERIFY_T; ++t) {
+      float best_value = -3.4028234663852886e38f;
+      int best_index = 0;
+      for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
+        int n = out_row + row;
+        if (n < N_SIZE) {
+          float rounded = float(T(simd_sum(result[t][row])));
+          if (rounded > best_value) {
+            best_value = rounded;
+            best_index = n;
+          }
+        }
+      }
+
+      if (simd_lid == 0) {
+        tile_best_values[t][simd_gid] = best_value;
+        tile_best_indices[t][simd_gid] = best_index;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_gid == 0 && simd_lid == 0) {
+      for (int t = 0; t < VERIFY_T; ++t) {
+        float best = tile_best_values[t][0];
+        int best_idx = tile_best_indices[t][0];
+        for (int i = 1; i < NUM_SIMDGROUPS; ++i) {
+          float candidate = tile_best_values[t][i];
+          int candidate_idx = tile_best_indices[t][i];
+          if (candidate > best) {
+            best = candidate;
+            best_idx = candidate_idx;
+          }
+        }
+        int offset = (int(b_idx) * VERIFY_T + t) * NUM_TILES + int(n_tile);
+        tile_values[offset] = T(best);
+        tile_indices[offset] = best_idx;
+      }
+    }
+"""
+
+
+@lru_cache(maxsize=None)
+def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qmv_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["y"],
+        header=_target_verify_qlinear_header(bits, group_size),
+        source=_TARGET_VERIFY_QMV_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_qargmax_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases"],
+        output_names=["tile_values", "tile_indices"],
+        header=_target_verify_qlinear_header(bits, group_size),
+        source=_TARGET_VERIFY_QARGMAX_SOURCE,
+    )
+
+
+def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+    if (
+        not isinstance(linear, nn.QuantizedLinear)
+        or x.ndim != 3
+        or x.shape[1] < 1
+        or linear.bits not in (4, 5)
+        or linear.mode != "affine"
+        or linear.biases is None
+        or x.dtype not in (mx.bfloat16, mx.float16)
+        or linear.scales.dtype != x.dtype
+        or linear.biases.dtype != x.dtype
+    ):
+        return False
+
+    _, _, K = x.shape
+    N = linear.weight.shape[0]
+    return (
+        K == linear.weight.shape[1] * 32 // linear.bits and K % 512 == 0 and N % 8 == 0
+    )
+
+
+def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
+    if not _can_target_verify_quantized(linear, x):
+        return None
+
+    B, T, K = x.shape
+    N = linear.weight.shape[0]
+
+    x = mx.contiguous(x)
+    kernel = _target_verify_qmv_kernel(linear.bits, linear.group_size, x.dtype, T, K, N)
+    out = kernel(
+        inputs=[x, linear.weight, linear.scales, linear.biases],
+        template=[
+            ("T", x.dtype),
+            ("VERIFY_T", int(T)),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+        ],
+        grid=(32, 2 * (N // 8), B),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(B, T, N)],
+        output_dtypes=[x.dtype],
+    )[0]
+    if "bias" in linear:
+        out = out + linear["bias"]
+    return out
+
+
+def _decode_quantized_linears_fused(linears, x: mx.array):
+    if (
+        x.ndim != 3
+        or x.shape[1] != 1
+        or len(linears) != 4
+        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
+    ):
+        return None
+
+    first = linears[0]
+    if not all(
+        linear.bits == first.bits
+        and linear.group_size == first.group_size
+        and linear.mode == first.mode
+        and linear.biases is not None
+        and linear.scales.dtype == x.dtype
+        and linear.biases.dtype == x.dtype
+        and "bias" not in linear
+        for linear in linears
+    ):
+        return None
+
+    cache_key = tuple(
+        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
+    )
+    cached = getattr(first, "_qwen3_5_fused_decode_linears", None)
+    if cached is None or cached[0] != cache_key:
+        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
+        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
+        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
+        split_indices = []
+        offset = 0
+        for linear in linears[:-1]:
+            offset += linear.weight.shape[0]
+            split_indices.append(offset)
+        mx.eval(weights, scales, biases)
+        cached = (cache_key, weights, scales, biases, split_indices)
+        first._qwen3_5_fused_decode_linears = cached
+
+    _, weights, scales, biases, split_indices = cached
+    output = mx.quantized_matmul(
+        x,
+        weights,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=first.group_size,
+        bits=first.bits,
+        mode=first.mode,
+    )
+    return tuple(mx.split(output, split_indices, axis=-1))
+
+
+def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
+    if not _can_target_verify_quantized(linear, x) or "bias" in linear:
+        return None
+
+    B, T, K = x.shape
+    if T == 1 and 1 < B <= 4:
+        out = _target_verify_quantized_argmax(linear, x.transpose(1, 0, 2))
+        if out is not None:
+            return out.transpose(1, 0)
+
+    N = linear.weight.shape[0]
+    num_tiles = N // 8
+
+    x = mx.contiguous(x)
+    kernel = _target_verify_qargmax_kernel(
+        linear.bits, linear.group_size, x.dtype, T, K, N
+    )
+    tile_values, tile_indices = kernel(
+        inputs=[x, linear.weight, linear.scales, linear.biases],
+        template=[
+            ("T", x.dtype),
+            ("VERIFY_T", int(T)),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+            ("NUM_TILES", int(num_tiles)),
+        ],
+        grid=(32, 2 * num_tiles, B),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(B, T, num_tiles), (B, T, num_tiles)],
+        output_dtypes=[x.dtype, mx.int32],
+    )
+    best_tile = mx.argmax(tile_values, axis=-1)
+    return mx.take_along_axis(tile_indices, best_tile[..., None], axis=-1).squeeze(-1)
+
+
+def _target_verify_timewise(fn, x: mx.array) -> mx.array:
+    return mx.concatenate([fn(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+
+
+def _target_verify_singletons(fn, x: mx.array) -> mx.array:
+    rows = []
+    for row in range(x.shape[0]):
+        rows.append(
+            mx.concatenate(
+                [fn(x[row : row + 1, i : i + 1]) for i in range(x.shape[1])],
+                axis=1,
+            )
+        )
+    return mx.concatenate(rows, axis=0)
+
+
 def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
     if not _use_target_verify_dense(linear, x, target_verify):
         return linear(x)
 
-    if "bias" not in linear:
+    if isinstance(linear, nn.QuantizedLinear):
+        if x.shape[0] == 1:
+            return linear(x)
+        out = _target_verify_quantized_linear(linear, x)
+        if out is not None:
+            return out
+        return _target_verify_timewise(linear, x)
+
+    if isinstance(linear, nn.Linear) and "bias" not in linear:
         out = _target_verify_weight(linear.weight, x)
         if out is not None:
             return out
 
-    return mx.concatenate([linear(x[:, i : i + 1]) for i in range(x.shape[1])], axis=1)
+    return _target_verify_singletons(linear, x)
 
 
 def _target_verify_linears(linears, x: mx.array, target_verify: bool):
@@ -187,8 +640,13 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
         target_verify
         and x.ndim == 3
         and x.shape[1] > 1
-        and all(isinstance(linear, nn.Linear) for linear in linears)
+        and all(
+            isinstance(linear, (nn.Linear, nn.QuantizedLinear)) for linear in linears
+        )
     ):
+        out = _decode_quantized_linears_fused(linears, x)
+        if out is not None:
+            return out
         return tuple(linear(x) for linear in linears)
 
     return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
@@ -202,10 +660,175 @@ def _target_verify_embedding_as_linear(embedding, x: mx.array, target_verify: bo
     if out is not None:
         return out
 
+    return _target_verify_timewise(embedding.as_linear, x)
+
+
+def _extract_row_cache(cache_entry, row: int):
+    if isinstance(cache_entry, ArraysCache):
+        row_cache = ArraysCache(size=len(cache_entry.cache))
+        row_cache.cache = [
+            None if cached is None else cached[row : row + 1]
+            for cached in cache_entry.cache
+        ]
+        lengths = getattr(cache_entry, "lengths", None)
+        if lengths is not None:
+            row_cache.lengths = lengths[row : row + 1]
+        return row_cache
+
+    if hasattr(cache_entry, "extract") and not cache_entry.empty():
+        return cache_entry.extract(row)
+
+    if hasattr(cache_entry, "left_padding"):
+        row_cache = KVCache()
+        return row_cache
+
+    return cache_entry
+
+
+def _is_single_row_batch_cache(cache_entry) -> bool:
+    left_padding = getattr(cache_entry, "left_padding", None)
+    return (
+        isinstance(left_padding, mx.array)
+        and left_padding.ndim > 0
+        and left_padding.size == 1
+    )
+
+
+def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
+    if pad <= 0:
+        return x
+    if x.shape[1] >= target_length:
+        return x
     return mx.concatenate(
-        [embedding.as_linear(x[:, i : i + 1]) for i in range(x.shape[1])],
+        [
+            mx.zeros((x.shape[0], pad, *x.shape[2:]), dtype=x.dtype),
+            x,
+        ],
         axis=1,
     )
+
+
+def _qwen3_5_left_padding_info(cache):
+    left_padding = getattr(cache, "left_padding", None)
+    if not (
+        isinstance(left_padding, mx.array)
+        and left_padding.ndim > 0
+        and left_padding.size > 0
+    ):
+        return None
+
+    cached = getattr(cache, "_qwen3_5_left_padding_info", None)
+    if cached is None or cached[0] is not left_padding:
+        pads = tuple(int(p) for p in left_padding.tolist())
+        cached = (left_padding, pads, max(pads) if pads else 0)
+        cache._qwen3_5_left_padding_info = cached
+    return cached[1], cached[2]
+
+
+def _qwen3_5_set_left_padding_info(cache, pads):
+    left_padding = getattr(cache, "left_padding", None)
+    if not isinstance(left_padding, mx.array):
+        return
+    pads = tuple(int(p) for p in pads)
+    cache._qwen3_5_left_padding_info = (
+        left_padding,
+        pads,
+        max(pads) if pads else 0,
+    )
+
+
+def _qwen3_5_advance_left_padding_info(cache, steps: int):
+    cached = getattr(cache, "_qwen3_5_left_padding_info", None)
+    if cached is None:
+        return
+    _left_padding, pads, _max_pad = cached
+    _qwen3_5_set_left_padding_info(cache, (p - steps for p in pads))
+
+
+def _qwen3_5_lengths_info(cache):
+    lengths = getattr(cache, "lengths", None)
+    if not (isinstance(lengths, mx.array) and lengths.ndim > 0 and lengths.size > 0):
+        return None
+    cached = getattr(cache, "_qwen3_5_lengths_info", None)
+    if cached is None or cached[0] is not lengths:
+        values = tuple(int(v) for v in lengths.tolist())
+        cached = (lengths, min(values) if values else 0)
+        cache._qwen3_5_lengths_info = cached
+    return cached[1]
+
+
+def _qwen3_5_advance_lengths_info(cache, steps: int):
+    lengths = getattr(cache, "lengths", None)
+    cached = getattr(cache, "_qwen3_5_lengths_info", None)
+    if cached is None or not isinstance(lengths, mx.array):
+        return
+    _lengths, min_value = cached
+    cache._qwen3_5_lengths_info = (lengths, min_value - steps)
+
+
+def _create_qwen3_5_ssm_mask(h: mx.array, cache):
+    if not (cache and hasattr(cache, "make_mask")):
+        return None
+
+    lengths = getattr(cache, "lengths", None)
+    left_padding = getattr(cache, "left_padding", None)
+    if isinstance(left_padding, mx.array):
+        batch_size = int(left_padding.shape[0]) if left_padding.ndim > 0 else 1
+        if (
+            lengths is None
+            and getattr(cache, "_qwen3_5_ssm_no_mask_batch_size", None) == batch_size
+        ):
+            return None
+        left_padding_info = _qwen3_5_left_padding_info(cache)
+        max_left_padding = left_padding_info[1] if left_padding_info else 0
+        if max_left_padding <= 0:
+            if lengths is None:
+                cache._qwen3_5_ssm_no_mask_batch_size = batch_size
+            return None
+        if hasattr(cache, "_qwen3_5_ssm_no_mask_batch_size"):
+            delattr(cache, "_qwen3_5_ssm_no_mask_batch_size")
+
+    lengths_min = _qwen3_5_lengths_info(cache)
+    if lengths_min is not None and lengths_min >= h.shape[1]:
+        return None
+
+    return cache.make_mask(h.shape[1])
+
+
+def _create_qwen3_5_attention_mask(h: mx.array, cache):
+    if cache is None:
+        return create_attention_mask(h, cache)
+
+    if hasattr(cache, "_qwen3_5_decode_left_padding"):
+        delattr(cache, "_qwen3_5_decode_left_padding")
+
+    left_padding = getattr(cache, "left_padding", None)
+    if h.shape[1] == 1 and isinstance(left_padding, mx.array) and left_padding.ndim > 0:
+        padding_cache = getattr(cache, "_qwen3_5_left_padding_cache", None)
+        if padding_cache is None or padding_cache[0] is not left_padding:
+            left_padding_info = _qwen3_5_left_padding_info(cache)
+            pads = list(left_padding_info[0]) if left_padding_info else []
+            padding_cache = (left_padding, pads, max(pads) if pads else 0)
+            cache._qwen3_5_left_padding_cache = padding_cache
+        pads = padding_cache[1]
+        if padding_cache[2] <= 0:
+            return None
+        cache._qwen3_5_decode_left_padding = pads
+        return "left_padded_decode"
+    return create_attention_mask(h, cache)
+
+
+def _set_qwen3_5_decode_left_padding(caches, layers, pads):
+    if caches is None:
+        return
+    for layer, cache_entry in zip(layers, caches):
+        if layer.is_linear or cache_entry is None:
+            continue
+        if pads is None:
+            if hasattr(cache_entry, "_qwen3_5_decode_left_padding"):
+                delattr(cache_entry, "_qwen3_5_decode_left_padding")
+        else:
+            cache_entry._qwen3_5_decode_left_padding = pads
 
 
 def _gated_delta_update_verify_decode(
@@ -232,6 +855,500 @@ def _gated_delta_update_verify_decode(
         mask,
         use_kernel=use_kernel,
     )
+
+
+_QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE = r"""
+    uint q_batch_head_idx = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D_SIZE / BD;
+    constexpr int v_per_thread = V_SIZE / BD;
+
+    typedef float U;
+    thread U q[qk_per_thread];
+    thread U k[qk_per_thread];
+    thread U o[v_per_thread];
+    threadgroup U outputs[BN * BD];
+    threadgroup U max_scores[BN];
+    threadgroup U sum_exp_scores[BN];
+
+    int K_SIZE = int(k_size[0]);
+    int batch_idx = int(q_batch_head_idx) / NUM_Q_HEADS;
+    int q_head_idx = int(q_batch_head_idx) - batch_idx * NUM_Q_HEADS;
+    int kv_head_idx = q_head_idx / GQA_FACTOR;
+    int pad = int(pads[batch_idx]);
+    int N = K_SIZE - pad;
+
+    const device T* qptr =
+        queries + int(q_batch_head_idx) * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* kptr =
+        keys + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * D_SIZE +
+        (pad + int(simd_gid)) * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* vptr =
+        values + (batch_idx * NUM_KV_HEADS + kv_head_idx) * K_SIZE * V_SIZE +
+        (pad + int(simd_gid)) * V_SIZE + int(simd_lid) * v_per_thread;
+    device T* optr =
+        out + int(q_batch_head_idx) * V_SIZE + int(simd_gid) * v_per_thread;
+
+    U s = U(scale[0]);
+    for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = s * qptr[i];
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+        o[i] = 0;
+    }
+
+    U max_score = -3.4028234663852886e38f;
+    U sum_exp_score = 0;
+
+    for (int i = int(simd_gid); i < N; i += BN) {
+        for (int j = 0; j < qk_per_thread; j++) {
+            k[j] = kptr[j];
+        }
+
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * k[j];
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * vptr[j];
+        }
+
+        kptr += BN * D_SIZE;
+        vptr += BN * V_SIZE;
+    }
+
+    if (simd_lid == 0) {
+        max_scores[simd_gid] = max_score;
+        sum_exp_scores[simd_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    max_score = max_scores[simd_lid];
+    U new_max = simd_max(max_score);
+    U factor = fast::exp(max_score - new_max);
+    sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+    for (int i = 0; i < v_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < v_per_thread; i++) {
+            optr[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+_QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE = r"""
+    uint simd_lid = thread_index_in_simdgroup;
+    uint kv_head_idx = threadgroup_position_in_grid.x;
+    uint batch_idx = threadgroup_position_in_grid.y;
+    uint block_idx = threadgroup_position_in_grid.z;
+    uint gqa_idx = thread_position_in_threadgroup.y;
+
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D_SIZE / BD;
+    constexpr int v_per_thread = V_SIZE / BD;
+
+    typedef float U;
+    thread U q[qk_per_thread];
+    thread U o[v_per_thread] = {0};
+
+    int K_SIZE = int(k_size[0]);
+    int q_head_idx = int(GQA_FACTOR * kv_head_idx + gqa_idx);
+    int q_batch_head_idx = int(batch_idx) * NUM_Q_HEADS + q_head_idx;
+    int pad = int(pads[batch_idx]);
+    int N = K_SIZE - pad;
+
+    const device T* qptr =
+        queries + q_batch_head_idx * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* kptr =
+        keys + (int(batch_idx) * NUM_KV_HEADS + int(kv_head_idx)) *
+                   K_SIZE * D_SIZE +
+        (pad + int(block_idx)) * D_SIZE + int(simd_lid) * qk_per_thread;
+    const device T* vptr =
+        values + (int(batch_idx) * NUM_KV_HEADS + int(kv_head_idx)) *
+                     K_SIZE * V_SIZE +
+        (pad + int(block_idx)) * V_SIZE + int(simd_lid) * v_per_thread;
+    device T* optr =
+        partials + q_batch_head_idx * BLOCKS * V_SIZE +
+        int(block_idx) * V_SIZE + int(simd_lid) * v_per_thread;
+    device float* sump =
+        sums + q_batch_head_idx * BLOCKS + int(block_idx);
+    device float* maxp =
+        maxs + q_batch_head_idx * BLOCKS + int(block_idx);
+
+    U s = U(scale[0]);
+    for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = s * qptr[i];
+    }
+
+    U max_score = -3.4028234663852886e38f;
+    U sum_exp_score = 0;
+
+    for (int i = int(block_idx); i < N; i += BLOCKS) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * kptr[j];
+        }
+        score = simd_sum(score);
+
+        U new_max = max(max_score, score);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(score - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * vptr[j];
+        }
+
+        kptr += BLOCKS * D_SIZE;
+        vptr += BLOCKS * V_SIZE;
+    }
+
+    if (simd_lid == 0) {
+        sump[0] = sum_exp_score;
+        maxp[0] = max_score;
+    }
+    for (int i = 0; i < v_per_thread; i++) {
+        optr[i] = static_cast<T>(o[i]);
+    }
+"""
+
+
+_QWEN3_5_RAGGED_SDPA_TWO_PASS_2_SOURCE = r"""
+    uint q_batch_head_idx = threadgroup_position_in_grid.y;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int elem_per_thread = D_SIZE / BD;
+
+    typedef float U;
+    thread U o[elem_per_thread] = {0};
+    threadgroup U outputs[BN * BD];
+
+    const device T* part =
+        partials + int(q_batch_head_idx) * BLOCKS * D_SIZE +
+        int(simd_gid) * D_SIZE + int(simd_lid) * elem_per_thread;
+    const device float* sump = sums + int(q_batch_head_idx) * BLOCKS;
+    const device float* maxp = maxs + int(q_batch_head_idx) * BLOCKS;
+    device T* optr =
+        out + int(q_batch_head_idx) * D_SIZE + int(simd_gid) * elem_per_thread;
+
+    U sum_exp_score = 0.0;
+    U max_score = -3.4028234663852886e38f;
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        max_score = max(max_score, maxp[int(simd_lid) + BN * b]);
+    }
+    max_score = simd_max(max_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(maxp[int(simd_lid) + BN * b] - max_score);
+        sum_exp_score += factor * sump[int(simd_lid) + BN * b];
+    }
+    sum_exp_score = simd_sum(sum_exp_score);
+
+    for (int b = 0; b < BLOCKS / BN; ++b) {
+        U factor = fast::exp(maxp[int(simd_gid)] - max_score);
+        for (int i = 0; i < elem_per_thread; i++) {
+            o[i] += factor * static_cast<U>(part[i]);
+        }
+        maxp += BN;
+        sump += BN;
+        part += BN * D_SIZE;
+    }
+
+    for (int i = 0; i < elem_per_thread; i++) {
+        outputs[simd_lid * BD + simd_gid] = o[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o[i] = simd_sum(outputs[simd_gid * BD + simd_lid]);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (simd_lid == 0) {
+        for (int i = 0; i < elem_per_thread; i++) {
+            optr[i] = static_cast<T>(o[i]);
+        }
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _qwen3_5_device_arch_suffix() -> str:
+    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+    return str(info.get("architecture", ""))[-1:]
+
+
+def _qwen3_5_sdpa_vector_blocks(seq_len: int, gqa_factor: int) -> int:
+    devc = _qwen3_5_device_arch_suffix()
+    n_simds = gqa_factor
+    if devc == "s":
+        blocks = 64
+        if seq_len > 1024 and n_simds > 4:
+            if seq_len <= 8192:
+                blocks = 128
+            elif seq_len <= 32768:
+                blocks = 256
+            elif seq_len <= 65536:
+                blocks = 512
+            else:
+                blocks = 1024
+        return blocks
+    if devc == "d":
+        blocks = 128
+        if n_simds <= 2 and seq_len > 8192:
+            blocks = 256
+        elif n_simds >= 6:
+            if 16384 <= seq_len < 65536:
+                blocks = 512
+            elif seq_len >= 65536:
+                blocks = 1024
+        return blocks
+    if n_simds >= 4:
+        return 64
+    return 32
+
+
+def _qwen3_5_sdpa_vector_plan(seq_len: int, q_heads: int, kv_heads: int):
+    devc = _qwen3_5_device_arch_suffix()
+    if (devc in {"d", "s"} and seq_len >= 1024) or (
+        kv_heads < q_heads and seq_len >= 4096
+    ):
+        return ("two_pass", _qwen3_5_sdpa_vector_blocks(seq_len, q_heads // kv_heads))
+    return ("one_pass", 0)
+
+
+@lru_cache(maxsize=None)
+def _qwen3_5_ragged_sdpa_one_pass_kernel(dtype, d_size, v_size):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=f"qwen3_5_ragged_sdpa_1p_{dtype_name}_d{d_size}_v{v_size}",
+        input_names=["queries", "keys", "values", "pads", "scale", "k_size"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_QWEN3_5_RAGGED_SDPA_ONE_PASS_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _qwen3_5_ragged_sdpa_two_pass_1_kernel(dtype, d_size, v_size, blocks):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            f"qwen3_5_ragged_sdpa_2p1_{dtype_name}_" f"d{d_size}_v{v_size}_b{blocks}"
+        ),
+        input_names=["queries", "keys", "values", "pads", "scale", "k_size"],
+        output_names=["partials", "sums", "maxs"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_QWEN3_5_RAGGED_SDPA_TWO_PASS_1_SOURCE,
+    )
+
+
+@lru_cache(maxsize=None)
+def _qwen3_5_ragged_sdpa_two_pass_2_kernel(dtype, v_size, blocks):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=f"qwen3_5_ragged_sdpa_2p2_{dtype_name}_v{v_size}_b{blocks}",
+        input_names=["partials", "sums", "maxs"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=_QWEN3_5_RAGGED_SDPA_TWO_PASS_2_SOURCE,
+    )
+
+
+@lru_cache(maxsize=128)
+def _qwen3_5_cached_i32_array(values):
+    return mx.array(values, dtype=mx.int32)
+
+
+@lru_cache(maxsize=128)
+def _qwen3_5_cached_sdpa_scalars(scale: float, k_size: int):
+    return (
+        mx.array([scale], dtype=mx.float32),
+        mx.array([k_size], dtype=mx.int32),
+    )
+
+
+def _qwen3_5_ragged_decode_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    pads: List[int],
+    scale: float,
+) -> Optional[mx.array]:
+    if (
+        queries.ndim != 4
+        or keys.ndim != 4
+        or values.ndim != 4
+        or queries.shape[2] != 1
+        or queries.dtype not in (mx.bfloat16, mx.float16)
+        or keys.dtype != queries.dtype
+        or values.dtype != queries.dtype
+    ):
+        return None
+
+    batch, q_heads, _, d_size = queries.shape
+    pads = tuple(int(p) for p in pads)
+    if len(pads) != batch or any(p < 0 for p in pads):
+        return None
+    kv_heads = keys.shape[1]
+    k_size = keys.shape[2]
+    v_size = values.shape[-1]
+    if (
+        q_heads % kv_heads != 0
+        or d_size != v_size
+        or d_size not in (64, 96, 128, 256)
+        or any(p >= k_size for p in pads)
+    ):
+        return None
+
+    plans = [_qwen3_5_sdpa_vector_plan(k_size - pad, q_heads, kv_heads) for pad in pads]
+    if len(set(plans)) != 1:
+        return None
+    mode, blocks = plans[0]
+
+    queries = mx.contiguous(queries)
+    keys = mx.contiguous(keys)
+    values = mx.contiguous(values)
+    pads_array = _qwen3_5_cached_i32_array(pads)
+    scale_array, k_size_array = _qwen3_5_cached_sdpa_scalars(float(scale), int(k_size))
+    template = [
+        ("T", queries.dtype),
+        ("D_SIZE", int(d_size)),
+        ("V_SIZE", int(v_size)),
+        ("NUM_Q_HEADS", int(q_heads)),
+        ("NUM_KV_HEADS", int(kv_heads)),
+        ("GQA_FACTOR", int(q_heads // kv_heads)),
+    ]
+
+    if mode == "one_pass":
+        kernel = _qwen3_5_ragged_sdpa_one_pass_kernel(queries.dtype, d_size, v_size)
+        return kernel(
+            inputs=[queries, keys, values, pads_array, scale_array, k_size_array],
+            template=template,
+            grid=(1024, batch * q_heads, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(batch, q_heads, 1, v_size)],
+            output_dtypes=[queries.dtype],
+        )[0]
+
+    kernel_1 = _qwen3_5_ragged_sdpa_two_pass_1_kernel(
+        queries.dtype, d_size, v_size, blocks
+    )
+    partials, sums, maxs = kernel_1(
+        inputs=[queries, keys, values, pads_array, scale_array, k_size_array],
+        template=[*template, ("BLOCKS", int(blocks))],
+        grid=(32 * kv_heads, (q_heads // kv_heads) * batch, blocks),
+        threadgroup=(32, q_heads // kv_heads, 1),
+        output_shapes=[
+            (batch, q_heads, 1, blocks, v_size),
+            (batch, q_heads, 1, blocks),
+            (batch, q_heads, 1, blocks),
+        ],
+        output_dtypes=[queries.dtype, mx.float32, mx.float32],
+    )
+    kernel_2 = _qwen3_5_ragged_sdpa_two_pass_2_kernel(queries.dtype, v_size, blocks)
+    return kernel_2(
+        inputs=[partials, sums, maxs],
+        template=[
+            ("T", queries.dtype),
+            ("D_SIZE", int(v_size)),
+            ("BLOCKS", int(blocks)),
+        ],
+        grid=(1024, batch * q_heads, 1),
+        threadgroup=(1024, 1, 1),
+        output_shapes=[(batch, q_heads, 1, v_size)],
+        output_dtypes=[queries.dtype],
+    )[0]
+
+
+def _target_verify_left_padded_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    *,
+    cache,
+    scale: float,
+    mask: Optional[mx.array],
+) -> Optional[mx.array]:
+    if hasattr(cache, "bits") or queries.ndim != 4 or keys.ndim != 4:
+        return None
+
+    pads = getattr(cache, "_qwen3_5_decode_left_padding", None)
+    if pads is None:
+        left_padding_info = _qwen3_5_left_padding_info(cache)
+        if left_padding_info is None or left_padding_info[1] <= 0:
+            return None
+        pads = list(left_padding_info[0])
+    if max(pads) <= 0:
+        return None
+
+    output = _qwen3_5_ragged_decode_attention(queries, keys, values, pads, scale)
+    if output is not None:
+        return output
+
+    row_outputs = {}
+    for pad in sorted(set(pads)):
+        rows = [i for i, row_pad in enumerate(pads) if row_pad == pad]
+        row_idx = mx.array(rows, dtype=mx.int32)
+        group_queries = mx.take(queries, row_idx, axis=0)
+        group_keys = mx.take(keys, row_idx, axis=0)[:, :, pad:, :]
+        group_values = mx.take(values, row_idx, axis=0)[:, :, pad:, :]
+
+        if group_queries.shape[2] > 1:
+            prefix_len = group_keys.shape[-2] - group_queries.shape[2]
+            group_output = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        group_queries[:, :, i : i + 1, :],
+                        group_keys[:, :, : prefix_len + i + 1, :],
+                        group_values[:, :, : prefix_len + i + 1, :],
+                        cache=None,
+                        scale=scale,
+                        mask=None,
+                    )
+                    for i in range(group_queries.shape[2])
+                ],
+                axis=2,
+            )
+        else:
+            group_output = scaled_dot_product_attention(
+                group_queries,
+                group_keys,
+                group_values,
+                cache=None,
+                scale=scale,
+                mask=None,
+            )
+
+        for j, row in enumerate(rows):
+            row_outputs[row] = group_output[j : j + 1]
+
+    return mx.concatenate([row_outputs[i] for i in range(queries.shape[0])], axis=0)
 
 
 class Qwen3_5Attention(nn.Module):
@@ -283,7 +1400,6 @@ class Qwen3_5Attention(nn.Module):
         target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
-
         q_proj_output, keys, values = _target_verify_linears(
             (self.q_proj, self.k_proj, self.v_proj), x, target_verify
         )
@@ -322,14 +1438,33 @@ class Qwen3_5Attention(nn.Module):
             queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if mask is not None and isinstance(mask, mx.array):
-            if isinstance(kv_seq_len, mx.array):
+            if (
+                cache is not None
+                and hasattr(cache, "_idx")
+                and hasattr(cache, "left_padding")
+            ):
+                kv_seq_len = int(cache._idx) + L
+            elif isinstance(kv_seq_len, mx.array):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        if target_verify and L > 1:
+        left_padded_decode = (
+            mask == "left_padded_decode" if isinstance(mask, str) else False
+        )
+        if left_padded_decode:
+            mask = None
+
+        if (target_verify and L > 1) or left_padded_decode:
+            output = _target_verify_left_padded_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
+        else:
+            output = None
+
+        if output is None and target_verify and L > 1:
             prefix_len = keys.shape[-2] - L
             output = mx.concatenate(
                 [
@@ -339,13 +1474,17 @@ class Qwen3_5Attention(nn.Module):
                         values[:, :, : prefix_len + i + 1, :],
                         cache=cache,
                         scale=self.scale,
-                        mask=None,
+                        mask=(
+                            mask[..., i : i + 1, : prefix_len + i + 1]
+                            if isinstance(mask, mx.array) and mask.ndim >= 4
+                            else None
+                        ),
                     )
                     for i in range(L)
                 ],
                 axis=2,
             )
-        else:
+        elif output is None:
             output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
@@ -417,6 +1556,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     def _causal_conv1d_verify(self, conv_input: mx.array, steps: int) -> mx.array:
         return self.conv1d(conv_input)
 
+    def _causal_conv1d_decode(self, conv_input: mx.array) -> mx.array:
+        cached = getattr(self, "_qwen3_5_decode_conv_weight", None)
+        cache_key = id(self.conv1d.weight)
+        if cached is None or cached[0] != cache_key:
+            weight = self.conv1d.weight[:, :, 0].T.astype(mx.float32)
+            mx.eval(weight)
+            cached = (cache_key, weight)
+            self._qwen3_5_decode_conv_weight = cached
+
+        weight = cached[1]
+        return _qwen3_5_decode_depthwise_conv(conv_input, weight)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -465,6 +1616,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         if gdn_sink is not None:
             conv_out = nn.silu(self._causal_conv1d_verify(conv_input, S))
+        elif (
+            S == 1
+            and conv_input.shape[1] == self.conv_kernel_size
+            and self.conv1d.weight.dtype in (mx.bfloat16, mx.float16)
+        ):
+            conv_out = nn.silu(self._causal_conv1d_decode(conv_input))
         else:
             conv_out = nn.silu(self.conv1d(conv_input))
 
@@ -535,6 +1692,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             cache[1] = state
             if hasattr(cache, "advance"):
                 cache.advance(S)
+                _qwen3_5_advance_left_padding_info(cache, S)
+                _qwen3_5_advance_lengths_info(cache, S)
 
         out = self.norm(out, z)
         return _target_verify_linear(
@@ -620,8 +1779,102 @@ class Qwen3_5Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
+        fa_cache = cache[self.fa_idx]
+        if (
+            h.shape[0] == 1
+            and hidden_sink is None
+            and gdn_sink is None
+            and fa_cache is not None
+            and _is_single_row_batch_cache(fa_cache)
+        ):
+            row_cache = []
+            for cache_entry in cache:
+                if cache_entry is None:
+                    row_cache.append(None)
+                elif _is_single_row_batch_cache(cache_entry):
+                    row_cache.append(_extract_row_cache(cache_entry, 0))
+                else:
+                    row_cache.append(cache_entry)
+
+            row_out = self(
+                inputs,
+                inputs_embeds=h,
+                cache=row_cache,
+                position_ids=position_ids,
+            )
+            for i, cache_entry in enumerate(row_cache):
+                if cache[i] is None or cache_entry is None:
+                    continue
+                if hasattr(cache[i].__class__, "merge"):
+                    cache[i] = cache[i].__class__.merge([cache_entry])
+            return row_out
+
+        if (
+            h.shape[0] > 1
+            and h.shape[1] > 1
+            and hidden_sink is None
+            and gdn_sink is None
+            and fa_cache is not None
+            and hasattr(fa_cache, "extract")
+            and hasattr(fa_cache.__class__, "merge")
+            and isinstance(getattr(fa_cache, "offset", None), mx.array)
+            and fa_cache.offset.ndim > 0
+        ):
+            query_left_padding = mx.minimum(mx.maximum(-fa_cache.offset, 0), h.shape[1])
+            cache_left_padding = getattr(fa_cache, "left_padding", None)
+            has_left_padding = (
+                isinstance(cache_left_padding, mx.array)
+                and cache_left_padding.ndim > 0
+                and int(cache_left_padding.max().item()) > 0
+            )
+            if has_left_padding or int(query_left_padding.max().item()) > 0:
+                row_outputs = []
+                row_caches = [[] for _ in cache]
+                for row, pad in enumerate(query_left_padding.tolist()):
+                    pad = min(max(int(pad), 0), h.shape[1])
+                    row_inputs = inputs[row : row + 1, pad:]
+                    row_embeds = h[row : row + 1, pad:]
+                    row_position_ids = None
+                    if position_ids is not None:
+                        if position_ids.ndim == 2:
+                            row_position_ids = position_ids[row : row + 1, pad:]
+                        else:
+                            row_position_ids = position_ids[:, row : row + 1, pad:]
+                    current_cache = []
+                    for cache_entry in cache:
+                        if cache_entry is None:
+                            current_cache.append(None)
+                        else:
+                            current_cache.append(_extract_row_cache(cache_entry, row))
+
+                    row_out = self(
+                        row_inputs,
+                        inputs_embeds=row_embeds,
+                        cache=current_cache,
+                        position_ids=row_position_ids,
+                    )
+                    if pad > 0:
+                        row_out = _pad_row_time(row_out, pad, h.shape[1])
+                    row_outputs.append(row_out)
+                    for i, cache_entry in enumerate(current_cache):
+                        row_caches[i].append(cache_entry)
+
+                for i, entries in enumerate(row_caches):
+                    if cache[i] is None:
+                        continue
+                    if hasattr(cache[i].__class__, "merge"):
+                        cache[i] = cache[i].__class__.merge(entries)
+                return mx.concatenate(row_outputs, axis=0)
+
+        fa_mask = _create_qwen3_5_attention_mask(h, cache[self.fa_idx])
+        ssm_mask = _create_qwen3_5_ssm_mask(h, cache[self.ssm_idx])
+        decode_left_padding = (
+            getattr(cache[self.fa_idx], "_qwen3_5_decode_left_padding", None)
+            if isinstance(fa_mask, str) and fa_mask == "left_padded_decode"
+            else None
+        )
+        _set_qwen3_5_decode_left_padding(cache, self.layers, decode_left_padding)
+
         position_embeddings = None
         if position_ids is not None:
             for layer in self.layers:
@@ -671,13 +1924,31 @@ class LanguageModel(nn.Module):
         block_size: int,
     ) -> int:
         if isinstance(accepted, int):
-            accepted = mx.array([accepted])
+            accepted_list = [int(accepted)]
+        elif isinstance(accepted, mx.array):
+            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
+        else:
+            accepted_list = [int(x) for x in accepted]
 
-        max_a = int(accepted.max().item())
+        max_a = max(accepted_list)
         n = max_a + 1
         trim = block_size - n
-        is_batch = accepted.size > 1
-        valid_ends = accepted + 1
+        is_batch = len(accepted_list) > 1
+        valid_ends_list = [a + 1 for a in accepted_list]
+        accepted_mx = None
+        valid_ends_mx = None
+
+        def accepted_array():
+            nonlocal accepted_mx
+            if accepted_mx is None:
+                accepted_mx = mx.array(accepted_list, dtype=mx.int32)
+            return accepted_mx
+
+        def valid_ends_array():
+            nonlocal valid_ends_mx
+            if valid_ends_mx is None:
+                valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
+            return valid_ends_mx
 
         # Separate trimmable (KV) caches from SSM caches.
         ssm_caches = []
@@ -687,12 +1958,31 @@ class LanguageModel(nn.Module):
             if c.is_trimmable():
                 if trim > 0:
                     c.trim(trim)
-                if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                right_trimmed = False
+                if is_batch and max_a > 0:
+                    extra_trim_list = [max_a - a for a in accepted_list]
+                    if any(extra_trim_list):
+                        prepare = getattr(c, "prepare", None)
+                        finalize = getattr(c, "finalize", None)
+                        if (
+                            c.keys is not None
+                            and callable(prepare)
+                            and callable(finalize)
+                        ):
+                            prepare(right_padding=extra_trim_list)
+                            finalize()
+                            right_trimmed = True
+                if (
+                    is_batch
+                    and not right_trimmed
+                    and hasattr(c, "_idx")
+                    and c.keys is not None
+                    and max_a > 0
+                ):
                     kv_len = c._idx
-                    ve = valid_ends.tolist()
                     verify_start = kv_len - n
-                    for bi in range(accepted.shape[0]):
-                        start = verify_start + int(ve[bi])
+                    for bi, ve in enumerate(valid_ends_list):
+                        start = verify_start + ve
                         if start < kv_len:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
@@ -703,48 +1993,95 @@ class LanguageModel(nn.Module):
             return max_a
 
         if all(len(s) > 11 and s[11] is not None for s in gdn_states):
-            a0 = int(accepted[0].item()) if not is_batch else None
-            for j, c in enumerate(ssm_caches):
-                (
-                    _q,
-                    _k,
-                    _v,
-                    _a,
-                    _b,
-                    _A_log,
-                    _dt_bias,
-                    _init_state,
-                    _mask,
-                    conv_input,
-                    K,
-                    intermediate_states,
-                    *_,
-                ) = gdn_states[j]
-                if is_batch:
-                    acc_list = accepted.tolist()
-                    state_steps = intermediate_states.shape[1]
-                    states = [
-                        (
-                            intermediate_states[bi, int(acc_list[bi])]
-                            if int(acc_list[bi]) < state_steps
-                            else c[1][bi]
+            a0 = accepted_list[0] if not is_batch else None
+            if is_batch:
+                intermediate_parts = []
+                conv_input_parts = []
+                live_state_parts = []
+                live_conv_parts = []
+                layer_batch_sizes = []
+                kernel_sizes = []
+
+                for j, c in enumerate(ssm_caches):
+                    (
+                        _q,
+                        _k,
+                        _v,
+                        _a,
+                        _b,
+                        _A_log,
+                        _dt_bias,
+                        _init_state,
+                        _mask,
+                        conv_input,
+                        K,
+                        intermediate_states,
+                        *_,
+                    ) = gdn_states[j]
+                    rows = intermediate_states.shape[0]
+                    layer_batch_sizes.append(rows)
+                    kernel_sizes.append(int(K))
+                    intermediate_parts.append(intermediate_states)
+                    conv_input_parts.append(conv_input)
+
+                    live_state = c[1]
+                    if live_state is None:
+                        live_state = mx.zeros(
+                            (
+                                rows,
+                                intermediate_states.shape[2],
+                                intermediate_states.shape[3],
+                                intermediate_states.shape[4],
+                            ),
+                            dtype=intermediate_states.dtype,
                         )
-                        for bi in range(len(acc_list))
-                    ]
-                    c[1] = mx.stack(states, axis=0)
-                    slices = [
-                        (
-                            conv_input[
-                                bi : bi + 1,
-                                int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
-                            ]
-                            if int(acc_list[bi]) < state_steps
-                            else c[0][bi : bi + 1]
+                    live_state_parts.append(live_state)
+
+                    live_conv = c[0]
+                    if live_conv is None:
+                        live_conv = mx.zeros(
+                            (rows, int(K) - 1, conv_input.shape[-1]),
+                            dtype=conv_input.dtype,
                         )
-                        for bi in range(len(acc_list))
-                    ]
-                    c[0] = mx.concatenate(slices, axis=0)
-                else:
+                    live_conv_parts.append(live_conv)
+
+                if len(set(kernel_sizes)) != 1:
+                    raise ValueError("Qwen GDN layers must share conv kernel size.")
+
+                accepted_mx = accepted_array()
+                accepted_bat = mx.concatenate([accepted_mx for _ in ssm_caches], axis=0)
+                state_bat, conv_bat = gated_delta_accept_states(
+                    mx.concatenate(intermediate_parts, axis=0),
+                    mx.concatenate(conv_input_parts, axis=0),
+                    mx.concatenate(live_state_parts, axis=0),
+                    mx.concatenate(live_conv_parts, axis=0),
+                    accepted_bat,
+                    kernel_sizes[0],
+                    use_kernel=True,
+                )
+
+                offset = 0
+                for c, rows in zip(ssm_caches, layer_batch_sizes):
+                    c[1] = state_bat[offset : offset + rows]
+                    c[0] = conv_bat[offset : offset + rows]
+                    offset += rows
+            else:
+                for j, c in enumerate(ssm_caches):
+                    (
+                        _q,
+                        _k,
+                        _v,
+                        _a,
+                        _b,
+                        _A_log,
+                        _dt_bias,
+                        _init_state,
+                        _mask,
+                        conv_input,
+                        K,
+                        intermediate_states,
+                        *_,
+                    ) = gdn_states[j]
                     if a0 < intermediate_states.shape[1]:
                         c[1] = intermediate_states[:, a0]
                         c[0] = conv_input[:, a0 + 1 : a0 + K]
@@ -786,7 +2123,7 @@ class LanguageModel(nn.Module):
             a_list.append(a)
             b_list.append(b)
             if is_batch:
-                steps_list.append(valid_ends.astype(mx.int32))
+                steps_list.append(valid_ends_array())
             else:
                 steps_list.append(mx.full((batch_rows,), n, dtype=mx.int32))
             A_log_list.append(
@@ -841,7 +2178,7 @@ class LanguageModel(nn.Module):
         )
 
         # Scatter results back to individual caches.
-        a0 = int(accepted[0].item()) if not is_batch else None
+        a0 = accepted_list[0] if not is_batch else None
         state_offset = 0
         for j, c in enumerate(ssm_caches):
             batch_rows = layer_batch_sizes[j]
@@ -849,13 +2186,12 @@ class LanguageModel(nn.Module):
             state_offset += batch_rows
             conv_input, K = conv_data[j]
             if is_batch:
-                acc_list = accepted.tolist()
                 slices = [
                     conv_input[
                         bi : bi + 1,
-                        int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
+                        accepted_list[bi] + 1 : accepted_list[bi] + K,
                     ]
-                    for bi in range(accepted.shape[0])
+                    for bi in range(len(accepted_list))
                 ]
                 c[0] = mx.concatenate(slices, axis=0)
             else:
@@ -888,21 +2224,20 @@ class LanguageModel(nn.Module):
             )
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
-                input_ids = mx.where(
-                    attention_mask[i] == 1, input_ids, mx.zeros_like(input_ids)
-                )
+                row_mask = attention_mask[i].tolist()
+                input_tokens = [
+                    token
+                    for token, keep in zip(input_ids.tolist(), row_mask)
+                    if keep == 1
+                ]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = mx.sum(
-                    mx.where(
-                        input_ids == vision_start_token_id,
-                        mx.arange(input_ids.shape[0]),
-                        mx.zeros_like(input_ids),
-                    )
-                )
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum().item()
-                video_nums = (vision_tokens == video_token_id).sum().item()
-                input_tokens = input_ids.tolist()
+                vision_tokens = [
+                    input_tokens[idx + 1]
+                    for idx, token in enumerate(input_tokens[:-1])
+                    if token == vision_start_token_id
+                ]
+                image_nums = sum(token == image_token_id for token in vision_tokens)
+                video_nums = sum(token == video_token_id for token in vision_tokens)
                 llm_pos_ids_list: list = []
                 st = 0
                 remain_images, remain_videos = image_nums, video_nums
@@ -984,7 +2319,19 @@ class LanguageModel(nn.Module):
                     llm_pos_ids_list.append(t_index + st_idx)
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                mask = mx.array(attention_mask[i] == 1)
+                compact_max_position = llm_positions.max()
+                padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
+                compact_positions = llm_positions.tolist()
+                compact_idx = 0
+                for col, keep in enumerate(row_mask):
+                    if keep == 1:
+                        for dim in range(3):
+                            padded_positions[dim][col] = compact_positions[dim][
+                                compact_idx
+                            ]
+                        compact_idx += 1
+                llm_positions = mx.array(padded_positions, dtype=position_ids.dtype)
+                mask = mx.array(row_mask, dtype=mx.bool_)
                 expanded_mask = mx.expand_dims(mask, axis=0)
                 expanded_mask = mx.broadcast_to(expanded_mask, (3, 1, mask.shape[0]))
                 expanded_positions = mx.expand_dims(llm_positions, axis=1)
@@ -1001,7 +2348,7 @@ class LanguageModel(nn.Module):
                 )
                 position_ids = updated_position_ids
                 mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
+                    compact_max_position + 1 - len(input_tokens)
                 )
             mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
@@ -1036,17 +2383,25 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        attention_mask = kwargs.pop("attention_mask", None)
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        if (
+            mask is None
+            and attention_mask is not None
+            and attention_mask.shape[-1] == inputs.shape[-1]
+        ):
+            mask = attention_mask
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
 
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
+        c0 = None
         if cache and cache[self.model.fa_idx] is not None:
             c0 = cache[self.model.fa_idx]
             cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
@@ -1056,6 +2411,16 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
+
+        if mask is None and c0 is not None and cache_offset == 0:
+            left_padding = getattr(c0, "left_padding", None)
+            if (
+                isinstance(left_padding, mx.array)
+                and left_padding.ndim > 0
+                and left_padding.size >= inputs.shape[0]
+            ):
+                positions = mx.arange(inputs.shape[-1])[None, :]
+                mask = positions >= left_padding[: inputs.shape[0], None]
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -1101,6 +2466,8 @@ class LanguageModel(nn.Module):
                     position_ids, rope_deltas = self.get_rope_index(
                         inputs, image_grid_thw, video_grid_thw, rope_mask
                     )
+                    if image_grid_thw is None and video_grid_thw is None:
+                        rope_deltas = mx.zeros((batch_size, 1), dtype=rope_deltas.dtype)
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
@@ -1166,7 +2533,18 @@ class LanguageModel(nn.Module):
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(hidden)
+        out = _target_verify_quantized_linear(self.lm_head, hidden)
+        if out is not None:
+            return out
         return self.lm_head(hidden)
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
+        if not self.args.tie_word_embeddings:
+            out = _target_verify_quantized_argmax(self.lm_head, hidden)
+            if out is not None:
+                return out
+        logits = self.speculative_logits_from_hidden(hidden)
+        return mx.argmax(logits, axis=-1)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(

@@ -5,7 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ....models.base import create_attention_mask
-from ....models.cache import KVCache
+from ....models.cache import BatchKVCache, KVCache
 from ....models.qwen3_5.language import Qwen3_5DecoderLayer
 from ....models.qwen3_5_moe.language import Qwen3_5MoeDecoderLayer
 from .config import Qwen3_5MTPConfig
@@ -14,7 +14,8 @@ from .config import Qwen3_5MTPConfig
 class Qwen3_5MTPDraftModel(nn.Module):
     supports_greedy_draft_argmax = True
     prefer_requested_block_size = True
-    requires_uniform_batch_acceptance = True
+    requires_uniform_batch_acceptance = False
+    supports_ragged_batch_acceptance = True
 
     def __init__(self, config: Qwen3_5MTPConfig):
         super().__init__()
@@ -90,15 +91,19 @@ class Qwen3_5MTPDraftModel(nn.Module):
         )
         return self
 
-    def make_cache(self) -> List[KVCache]:
+    def make_cache(self, left_padding: Optional[List[int]] = None) -> List[KVCache]:
+        if left_padding is not None:
+            return [BatchKVCache(left_padding) for _ in self.layers]
         return [KVCache() for _ in self.layers]
 
-    def reset(self, target_model) -> List[KVCache]:
+    def reset(
+        self, target_model, left_padding: Optional[List[int]] = None
+    ) -> List[KVCache]:
         self.bind(target_model)
         self.accept_lens = []
         self.draft_lens = []
         self._draft_round = 0
-        self._cache = self.make_cache()
+        self._cache = self.make_cache(left_padding)
         self._seed_token = None
         self._seed_hidden = None
         self._next_position = 0
@@ -126,7 +131,8 @@ class Qwen3_5MTPDraftModel(nn.Module):
             position = kv_valid_len
         self._kv_valid_len = kv_valid_len
         self._position = position
-        if not self._cache or self._cache[0].offset == 0:
+        cache_empty = not self._cache or all(cache.empty() for cache in self._cache)
+        if cache_empty:
             self._next_position = kv_valid_len
 
     def _draft_start_position(self):
@@ -272,12 +278,7 @@ class Qwen3_5MTPDraftModel(nn.Module):
         token_dtype: mx.Dtype = mx.int32,
         greedy: bool = False,
     ) -> None:
-        """Extend the Qwen MTP drafter cache after a batched verify step.
-
-        Qwen's native MTP drafter uses its own recurrent cache. For now the
-        batched path is restricted to lockstep acceptance so this cache keeps a
-        single scalar offset, matching normal decode's aligned batch invariant.
-        """
+        """Extend the Qwen MTP drafter cache after a batched verify step."""
         if len(accepted) <= 1:
             self.accept_verified_tokens(
                 verify_hidden,
@@ -290,43 +291,113 @@ class Qwen3_5MTPDraftModel(nn.Module):
             )
             return
 
-        accepted_set = {int(a) for a in accepted}
-        if len(accepted_set) != 1:
-            raise ValueError(
-                "Qwen MTP batched cache update requires uniform acceptance."
+        accepted = [int(a) for a in accepted]
+        keep_appended = [min(a, self._round_appended) for a in accepted]
+        trims = [self._round_appended - keep for keep in keep_appended]
+        if any(trims):
+            if len(set(trims)) == 1:
+                trim = trims[0]
+                for cache in self._cache:
+                    cache.trim(trim)
+                self._next_position = (
+                    self._next_position - trim
+                    if isinstance(self._next_position, int)
+                    else self._next_position - trim
+                )
+            elif all(hasattr(cache, "prepare") for cache in self._cache) and all(
+                hasattr(cache, "finalize") for cache in self._cache
+            ):
+                for cache in self._cache:
+                    cache.prepare(right_padding=trims)
+                for cache in self._cache:
+                    cache.finalize()
+                if isinstance(self._next_position, mx.array):
+                    self._next_position = self._next_position - mx.array(
+                        trims, dtype=mx.int32
+                    )
+                else:
+                    self._next_position = mx.full(
+                        (len(accepted),), self._next_position, dtype=mx.int32
+                    ) - mx.array(trims, dtype=mx.int32)
+            else:
+                raise ValueError(
+                    "Qwen MTP ragged batch acceptance requires a batch-aware cache."
+                )
+
+        draft_rows = draft_tokens.tolist()
+        row_tokens = []
+        row_hiddens = []
+        for row, accepted_i in enumerate(accepted):
+            tokens_i = []
+            hiddens_i = []
+            for draft_idx in range(keep_appended[row], accepted_i):
+                tokens_i.append(int(draft_rows[row][draft_idx]))
+                hiddens_i.append(
+                    verify_hidden[row : row + 1, draft_idx : draft_idx + 1, :]
+                )
+            if new_tokens[row]:
+                tokens_i.append(int(new_tokens[row][-1]))
+                hiddens_i.append(
+                    verify_hidden[row : row + 1, accepted_i : accepted_i + 1, :]
+                )
+            row_tokens.append(tokens_i)
+            row_hiddens.append(hiddens_i)
+
+        lengths = [len(tokens_i) for tokens_i in row_tokens]
+        max_len = max(lengths) if lengths else 0
+        if max_len > 0:
+            token_data = []
+            hidden_rows = []
+            for tokens_i, hiddens_i in zip(row_tokens, row_hiddens):
+                token_data.extend(tokens_i)
+                pad = max_len - len(tokens_i)
+                if pad:
+                    token_data.extend([0] * pad)
+                if hiddens_i:
+                    hidden_row = mx.concatenate(hiddens_i, axis=1)
+                else:
+                    hidden_row = mx.zeros(
+                        (1, 0, verify_hidden.shape[-1]), dtype=verify_hidden.dtype
+                    )
+                if pad:
+                    hidden_row = mx.concatenate(
+                        [
+                            hidden_row,
+                            mx.zeros(
+                                (1, pad, verify_hidden.shape[-1]),
+                                dtype=verify_hidden.dtype,
+                            ),
+                        ],
+                        axis=1,
+                    )
+                hidden_rows.append(hidden_row)
+
+            tokens = mx.array(token_data, dtype=token_dtype).reshape(
+                len(row_tokens), max_len
             )
-        accepted_i = accepted_set.pop()
+            hiddens = mx.concatenate(hidden_rows, axis=0)
+            right_padding = [max_len - length for length in lengths]
+            if any(right_padding):
+                for cache in self._cache:
+                    prepare = getattr(cache, "prepare", None)
+                    if callable(prepare):
+                        prepare(right_padding=right_padding, lengths=lengths)
 
-        keep_appended = min(accepted_i, self._round_appended)
-        trim = self._round_appended - keep_appended
-        if trim > 0:
-            for cache in self._cache:
-                cache.trim(trim)
-            self._next_position = (
-                self._next_position - trim
-                if isinstance(self._next_position, int)
-                else self._next_position - trim
-            )
-
-        token_chunks = []
-        hidden_chunks = []
-        for draft_idx in range(keep_appended, accepted_i):
-            token_chunks.append(draft_tokens[:, draft_idx : draft_idx + 1])
-            hidden_chunks.append(verify_hidden[:, draft_idx : draft_idx + 1, :])
-
-        if all(new_tokens):
-            bonus = mx.array(
-                [[int(row_tokens[-1])] for row_tokens in new_tokens],
-                dtype=token_dtype,
-            )
-            token_chunks.append(bonus)
-            hidden_chunks.append(verify_hidden[:, accepted_i : accepted_i + 1, :])
-
-        if token_chunks:
-            tokens = mx.concatenate(token_chunks, axis=1).astype(token_dtype)
-            hiddens = mx.concatenate(hidden_chunks, axis=1)
             h = self._forward_tokens(tokens, hiddens, token_dtype)
-            self._set_seed_from_hidden(h[:, -1:, :], sampler, greedy)
+
+            if any(right_padding):
+                for cache in self._cache:
+                    finalize = getattr(cache, "finalize", None)
+                    if callable(finalize):
+                        finalize()
+                if isinstance(self._next_position, mx.array):
+                    self._next_position = self._next_position - mx.array(
+                        right_padding, dtype=mx.int32
+                    )
+
+            last_idx = mx.array([length - 1 for length in lengths], dtype=mx.int32)
+            last_hidden = mx.take_along_axis(h, last_idx[:, None, None], axis=1)
+            self._set_seed_from_hidden(last_hidden, sampler, greedy)
         self._round_appended = 0
 
     def filter_batch(self, keep) -> None:
@@ -335,7 +406,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
             keep = mx.array(keep, dtype=mx.int32)
 
         for cache in self._cache:
-            if cache.keys is not None:
+            cache_filter = getattr(cache, "filter", None)
+            if callable(cache_filter):
+                cache_filter(keep)
+            elif cache.keys is not None:
                 cache.keys = cache.keys[keep]
                 cache.values = cache.values[keep]
 

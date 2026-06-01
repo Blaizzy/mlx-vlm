@@ -22,6 +22,7 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
@@ -102,6 +103,86 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def _position_seed(seed: int, row_id: int, position: int) -> int:
+    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
+    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
+    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
+    x ^= x >> 16
+    x = (x * 0x7FEB352D) & 0xFFFFFFFF
+    x ^= x >> 15
+    return int(x & 0xFFFFFFFF)
+
+
+def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
+    return mx.stack(
+        [
+            mx.random.key(_position_seed(seed, row, pos))
+            for row, pos in zip(row_ids, positions)
+        ]
+    )
+
+
+class _PositionedTargetSampler:
+    """Server sampler with stateless target draws for ragged verification."""
+
+    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.seed = DEFAULT_SEED if seed is None else int(seed)
+
+    def __call__(self, logprobs: mx.array) -> mx.array:
+        if self.top_p > 0 and self.top_p < 1.0:
+            return top_p_sampling(logprobs, self.top_p, self.temperature)
+        return mx.random.categorical(logprobs * (1 / self.temperature))
+
+    def sample_target(
+        self,
+        logprobs: mx.array,
+        *,
+        row_ids: List[int],
+        positions: List[int],
+    ) -> mx.array:
+        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
+            raise ValueError("row_ids and positions must match logprobs batch size.")
+        keys = _position_keys(self.seed, row_ids, positions)
+        if self.top_p > 0 and self.top_p < 1.0:
+            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
+
+    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
+
+    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
+        if logprobs.dtype == mx.bfloat16:
+            logprobs = logprobs.astype(mx.float32)
+        probs = mx.softmax(logprobs / self.temperature, axis=-1)
+        sorted_indices = mx.argsort(probs, axis=-1)
+        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
+        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+        top_probs = mx.where(
+            cumulative_probs > 1 - self.top_p,
+            sorted_probs,
+            mx.zeros_like(sorted_probs),
+        )
+        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
+        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+
+
+def _sample_last_token(
+    logits: mx.array,
+    sampler: Callable[[mx.array], mx.array],
+    *,
+    row_ids: Optional[List[int]] = None,
+    positions: Optional[List[int]] = None,
+):
+    logits = logits[:, -1, :]
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    sample_target = getattr(sampler, "sample_target", None)
+    if callable(sample_target) and row_ids is not None and positions is not None:
+        return sample_target(logprobs, row_ids=row_ids, positions=positions)
+    return sampler(logprobs)
 
 
 def get_server_enable_thinking():
@@ -438,6 +519,7 @@ class GenerationArguments:
     top_k: int = 0
     min_p: float = 0.0
     seed: Optional[int] = None
+    logprobs: bool = False
     repetition_penalty: Optional[float] = None
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     presence_penalty: Optional[float] = None
@@ -465,6 +547,8 @@ class GenerationArguments:
             "min_p": self.min_p,
             "enable_thinking": self.enable_thinking,
         }
+        if self.seed is not None:
+            kw["seed"] = self.seed
         if self.repetition_penalty is not None:
             kw["repetition_penalty"] = self.repetition_penalty
         if self.repetition_context_size is not None:
@@ -799,14 +883,11 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
-
-        def sampler(logprobs: mx.array) -> mx.array:
-            if args.top_p > 0 and args.top_p < 1.0:
-                return top_p_sampling(logprobs, args.top_p, args.temperature)
-            else:
-                return mx.random.categorical(logprobs * (1 / args.temperature))
-
-        return sampler
+        return _PositionedTargetSampler(
+            temperature=args.temperature,
+            top_p=args.top_p,
+            seed=args.seed,
+        )
 
     def _make_logits_processors(
         self, args: GenerationArguments
@@ -932,7 +1013,7 @@ class ResponseGenerator:
 
         self._ready.set()
 
-        if self.draft_model is not None:
+        if self.draft_model is not None and self.draft_kind != "mtp":
             self._run_speculative()
             return
 
@@ -946,8 +1027,19 @@ class ResponseGenerator:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
+                active_batch = bool(active)
+                coalesce_s = (
+                    get_speculative_batch_coalesce_s()
+                    if (
+                        not active_batch
+                        and self.draft_model is not None
+                        and self.draft_kind == "mtp"
+                    )
+                    else 0.0
+                )
                 new_items, should_stop = self._collect_pending_requests(
-                    active=bool(active)
+                    active=active_batch,
+                    coalesce_s=coalesce_s,
                 )
                 if should_stop:
                     break
@@ -964,6 +1056,11 @@ class ResponseGenerator:
                             except Exception:
                                 pass
 
+                if new_items and batch_gen is not None and not active:
+                    if not batch_gen.has_work:
+                        batch_gen.close()
+                        batch_gen = None
+
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
@@ -975,9 +1072,14 @@ class ResponseGenerator:
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
-                            top_logprobs_k=self.top_logprobs_k,
+                            compute_logprobs=bool(args.logprobs),
+                            top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
+                            draft_model=self.draft_model,
+                            draft_kind=self.draft_kind,
+                            draft_block_size=_get_draft_block_size_from_env(),
+                            greedy_sampling=args.temperature == 0,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1044,6 +1146,9 @@ class ResponseGenerator:
                 batch_gen = None
                 mx.clear_cache()
                 gc.collect()
+
+        if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
+            batch_gen.close()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
@@ -1143,7 +1248,13 @@ class ResponseGenerator:
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
-                first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
+                sample_row_ids = [0] * B
+                first_bonus = _sample_last_token(
+                    out.logits,
+                    sampler,
+                    row_ids=sample_row_ids,
+                    positions=[0] * B,
+                )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
                 for uid in uids:
@@ -1171,7 +1282,7 @@ class ResponseGenerator:
                             token=tok,
                             logprobs=0.0,
                             finish_reason=finish,
-                            peak_memory=mx.get_peak_memory() / 1e9,
+                            peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
                         )
                     )
@@ -1214,6 +1325,7 @@ class ResponseGenerator:
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
+                    row_ids=sample_row_ids,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
@@ -1237,7 +1349,7 @@ class ResponseGenerator:
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
-                                peak_memory=mx.get_peak_memory() / 1e9,
+                                peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
                             )
                         )
@@ -1304,10 +1416,14 @@ class ResponseGenerator:
             rqueue = info["rqueue"]
 
             tok = r.token
-            if hasattr(tok, "item"):
+            if tok is None:
+                text = info["streamer"].finalize()
+                tok = 0
+            elif hasattr(tok, "item"):
                 tok = tok.item()
-
-            text = self._stream_text(info, tok, r.finish_reason)
+                text = self._stream_text(info, tok, r.finish_reason)
+            else:
+                text = self._stream_text(info, tok, r.finish_reason)
 
             lp = r.token_logprob
 
