@@ -25,7 +25,9 @@ class VisionEmbedder(nn.Module):
 
     def __init__(self, config: VisionConfig):
         super().__init__()
+        self.model_type = config.model_type
         patch_dim = config.model_patch_size * config.model_patch_size * 3
+        self.patch_dim = patch_dim
         self.patch_ln1 = nn.LayerNorm(patch_dim)
         self.patch_dense = nn.Linear(patch_dim, config.mm_embed_dim)
         self.patch_ln2 = nn.LayerNorm(config.mm_embed_dim)
@@ -39,6 +41,10 @@ class VisionEmbedder(nn.Module):
         pixel_values: mx.array,
         image_position_ids: Optional[mx.array] = None,
     ) -> mx.array:
+        if pixel_values.ndim == 4 and pixel_values.shape[-1] == self.patch_dim:
+            pixel_values = pixel_values.reshape(
+                pixel_values.shape[0], -1, self.patch_dim
+            )
         hidden_states = self.patch_ln1(pixel_values)
         hidden_states = self.patch_dense(hidden_states)
         hidden_states = self.patch_ln2(hidden_states)

@@ -2955,23 +2955,15 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
-        # Gemma 4 unified uses an encoder-free vision embedder (no transformer
-        # blocks / feature layers), so the generic vision_test_runner does not
-        # apply. Exercise the embedder directly across dtypes instead.
         patch_dim = config.vision_config.model_patch_size**2 * 3
-        image_position_ids = mx.array(
-            [[[0, 0], [1, 0], [0, 1], [1, 1]]], dtype=mx.int32
+        self.vision_test_runner(
+            model.vision_embedder,
+            config.vision_config.model_type,
+            config.vision_config.mm_embed_dim,
+            patch_dim,
+            (4, 1),
+            vision_feature_layer=0,
         )
-        for t in [mx.float32, mx.float16]:
-            model.vision_embedder.update(
-                tree_map(lambda p: p.astype(t), model.vision_embedder.parameters())
-            )
-            embedder_input = mx.random.uniform(shape=(1, 4, patch_dim)).astype(t)
-            embedded = model.vision_embedder(embedder_input, image_position_ids)
-            self.assertEqual(
-                embedded.shape, (1, 4, config.vision_config.mm_embed_dim)
-            )
-            self.assertEqual(embedded.dtype, t)
         # Restore float32 params so the subsequent full-model forwards run in a
         # consistent dtype.
         model.vision_embedder.update(
