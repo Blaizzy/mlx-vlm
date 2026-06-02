@@ -5220,6 +5220,37 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "gemma4")
 
+    def test_gemma4_unified_input_embeddings(self):
+        from mlx_vlm.models import gemma4_unified
+
+        model = gemma4_unified.Model(
+            gemma4_unified.ModelConfig(
+                text_config=gemma4_unified.TextConfig(
+                    hidden_size=16,
+                    num_hidden_layers=2,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    num_global_key_value_heads=1,
+                    head_dim=8,
+                    global_head_dim=8,
+                    vocab_size=32,
+                    hidden_size_per_layer_input=0,
+                    sliding_window=32,
+                    sliding_window_pattern=1,
+                    attention_k_eq_v=True,
+                ),
+                vision_config=None,
+                audio_config=None,
+                vocab_size=32,
+                hidden_size=16,
+                image_token_id=31,
+                audio_token_id=30,
+                video_token_id=None,
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "gemma4_unified")
+
     def test_glm4v_input_embeddings(self):
         from mlx_vlm.models import glm4v
 
