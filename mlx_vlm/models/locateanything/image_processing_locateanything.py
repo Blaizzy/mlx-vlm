@@ -1,23 +1,9 @@
-"""
-MLX-based LocateAnything image processor.
-
-Mirrors the HF LocateAnything preprocessing: rescale to the token limit, then
-bicubic-resize up to a multiple of ``merge_kernel_size * patch_size``, convert
-to MLX, normalize, and patchify. The output contract matches what the MoonViT
-``VisionModel`` consumes.
-
-LocateAnything differs from Kimi-VL only in the normalization constants
-(``0.5`` mean/std) and ``in_token_limit`` (see ``preprocessor_config.json``).
-"""
-
 import math
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
 from PIL import Image
 
-# Bound here so handed-off arrays are stream-independent on the generation
-# thread (thread-local stream architecture; mirrors the Kimi-VL processor).
 _materialize = mx.eval
 
 LOCATEANYTHING_IMAGE_MEAN = (0.5, 0.5, 0.5)
@@ -55,8 +41,6 @@ class LocateAnythingImageProcessor(_base_image_processor()):
     def rescale(
         self, image: Image.Image, merge_kernel_size: List[int] = None
     ) -> Image.Image:
-        """Rescale to the token limit, then bicubic-resize up to a multiple of
-        ``merge_kernel_size * patch_size`` (matches the HF reference exactly)."""
         if merge_kernel_size is None:
             merge_kernel_size = self.merge_kernel_size
 
@@ -70,8 +54,6 @@ class LocateAnythingImageProcessor(_base_image_processor()):
             new_w, new_h = int(w * scale), int(h * scale)
             image = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
 
-        # Resize up so grid dimensions are divisible by merge_kernel_size,
-        # preserving all image content (HF uses ceil + bicubic, not cropping).
         new_w, new_h = image.size
         pad_w = merge_kernel_size[1] * patch_size
         pad_h = merge_kernel_size[0] * patch_size
@@ -87,20 +69,17 @@ class LocateAnythingImageProcessor(_base_image_processor()):
         return image
 
     def to_mlx(self, image: Image.Image) -> mx.array:
-        """Convert PIL image to a CHW MLX array normalized to [0, 1]."""
         image = image.convert("RGB")
         w, h = image.size
         arr = mx.array(list(image.getdata()), dtype=mx.float32).reshape(h, w, 3) / 255.0
         return arr.transpose(2, 0, 1)
 
     def normalize(self, image: mx.array) -> mx.array:
-        """Normalize with the configured mean and std."""
         mean = mx.array(self.image_mean, dtype=mx.float32).reshape(3, 1, 1)
         std = mx.array(self.image_std, dtype=mx.float32).reshape(3, 1, 1)
         return (image - mean) / std
 
     def patchify(self, image: mx.array) -> Tuple[mx.array, Tuple[int, int]]:
-        """Convert a CHW image into [num_patches, C, patch, patch]."""
         patch_size = self.patch_size
         C, H, W = image.shape
 
@@ -114,11 +93,6 @@ class LocateAnythingImageProcessor(_base_image_processor()):
         return patches, grid_hw
 
     def _to_pil(self, image) -> Image.Image:
-        """Accept a PIL image or an mx.array (CHW/HWC) and return a PIL image.
-
-        transformers' ``make_list_of_images``/``valid_images`` reject ``mx.array``,
-        so array inputs are converted here, before any PIL-only processing.
-        """
         if isinstance(image, Image.Image):
             return image
         if isinstance(image, mx.array):
@@ -147,8 +121,6 @@ class LocateAnythingImageProcessor(_base_image_processor()):
     ):
         from transformers.feature_extraction_utils import BatchFeature
 
-        # Normalize a single image to a list; mx.array -> PIL conversion and
-        # type validation happen in _to_pil (before any PIL-only processing).
         if isinstance(images, (mx.array, Image.Image)):
             images = [images]
 

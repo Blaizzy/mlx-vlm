@@ -124,23 +124,14 @@ def view_as_real(x):
 def apply_rope(
     q: mx.array, k: mx.array, freqs_cis: mx.array
 ) -> tuple[mx.array, mx.array]:
-    """
-    Args: (The leading dimensions of all inputs should be the same)
-        q: query, array of shape (..., num_heads, head_dim)
-        k: key, array of shape (..., num_heads, head_dim)
-        freqs_cis: array of shape (..., head_dim/2), dtype=mx.complex64. It contains the precomputed cis(freqs) for each position in the 2D grid.
-    Returns:
-        xq_out, xk_out: arrays of shape (..., num_heads, head_dim)
-    """
     _apply_rope_input_validation(q, freqs_cis)
     _apply_rope_input_validation(k, freqs_cis)
 
-    freqs_cis = mx.expand_dims(freqs_cis, axis=-2)  # ..., 1, head_dim/2
-    # ..., num_heads, head_dim/2
+    freqs_cis = mx.expand_dims(freqs_cis, axis=-2)
     q_ = view_as_complex(q.astype(mx.float32).reshape(*q.shape[:-1], -1, 2))
     k_ = view_as_complex(k.astype(mx.float32).reshape(*k.shape[:-1], -1, 2))
-    q_out = view_as_real(q_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
-    k_out = view_as_real(k_ * freqs_cis).flatten(-2)  # ..., num_heads, head_dim
+    q_out = view_as_real(q_ * freqs_cis).flatten(-2)
+    k_out = view_as_real(k_ * freqs_cis).flatten(-2)
     return q_out.astype(q.dtype), k_out.astype(k.dtype)
 
 
@@ -175,11 +166,6 @@ class Attention(nn.Module):
 
         if attention_mask is None and cu_seqlens is None:
             raise ValueError("Either attention_mask or cu_seqlens must be provided.")
-        # A single image (cu_seqlens == [0, S]) has an all-True block mask, i.e.
-        # a no-op. Leave the mask None so SDPA takes the memory-efficient flash
-        # path (O(N)) instead of materializing a dense [S, S] score tensor
-        # (O(N^2)), which OOMs on large frames. Only multi-image batches need
-        # the block-diagonal mask.
         if attention_mask is None and cu_seqlens.shape[0] > 2:
             attention_mask = make_block_attention_mask(cu_seqlens, seq_length)
 
@@ -198,7 +184,6 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, dim, hidden_dim):
         super().__init__()
-        # MoonViT uses PytorchGELUTanh; MLX's "precise" GELU is the tanh approximation.
         self.activation_fn = nn.GELU(approx="precise")
         self.fc0 = nn.Linear(dim, hidden_dim)
         self.fc1 = nn.Linear(hidden_dim, dim)
@@ -232,20 +217,6 @@ class Qwen2VLVisionBlock(nn.Module):
 
 
 class Rope2DPosEmb(nn.Module):
-    """2D rotary position embedding with multi-resolution support.
-
-    Refs:
-    - RoFormer: https://arxiv.org/abs/2104.09864
-    - VisionLLaMA: https://arxiv.org/abs/2403.00522
-    - https://github.com/Meituan-AutoML/VisionLLaMA/blob/main/dit/models.py
-
-    Args:
-        dim (int): usually the multi-head attention dimension, should be divisible by 4
-        max_height (int): the maximum height of the 2D grid
-        max_width (int): the maximum width of the 2D grid
-        theta_base (float): the base of the theta
-    """
-
     def __init__(self, dim: int, max_height: int, max_width: int, theta_base=10000):
         super().__init__()
         self.dim = dim
@@ -264,16 +235,14 @@ class Rope2DPosEmb(nn.Module):
         y_pos = flat_pos // self.max_width
         dim_range = mx.arange(0, self.dim, 4)[: (self.dim // 4)].astype(mx.float32)
         freqs = 1.0 / (self.theta_base ** (dim_range / self.dim))
-        x_freqs = mx.outer(x_pos, freqs)  # N, C/4
-        y_freqs = mx.outer(y_pos, freqs)  # N, C/4
+        x_freqs = mx.outer(x_pos, freqs)
+        y_freqs = mx.outer(y_pos, freqs)
 
-        x_cis = mx.cos(x_freqs) + 1j * mx.sin(x_freqs)  # N, C/4
-        y_cis = mx.cos(y_freqs) + 1j * mx.sin(y_freqs)  # N, C/4
+        x_cis = mx.cos(x_freqs) + 1j * mx.sin(x_freqs)
+        y_cis = mx.cos(y_freqs) + 1j * mx.sin(y_freqs)
 
-        # N, C/4, 2
         freqs_cis = mx.stack([x_cis, y_cis], axis=-1)
 
-        # max_height, max_width, C/2
         freqs_cis = freqs_cis.reshape(self.max_height, self.max_width, -1)
         return freqs_cis
 
@@ -369,7 +338,6 @@ class VisionModel(nn.Module):
             grid_thw, grid_shapes=grid_shapes
         )
 
-        # Calculate cu_seqlens for each item in the batch
         lengths = mx.concatenate(
             (
                 mx.zeros((1,), dtype=grid_thw.dtype),
@@ -377,8 +345,6 @@ class VisionModel(nn.Module):
             )
         )
         cu_seqlens = mx.cumsum(lengths.astype(mx.int32), axis=0)
-        # Single image -> no mask (flash path, avoids the dense [S, S] alloc).
-        # Multi-image -> block-diagonal mask so images don't attend across.
         attention_mask = (
             make_block_attention_mask(cu_seqlens, hidden_states.shape[0])
             if grid_thw.shape[0] > 1
@@ -414,10 +380,6 @@ class VisionModel(nn.Module):
             if "position_ids" in k:
                 continue
             elif "patch_embed.proj.weight" in k:
-                # PyTorch conv2d weight tensors have shape:
-                #   [out_channels, in_channels, kH, KW]
-                # MLX conv2d expects the weight be of shape:
-                #   [out_channels, kH, KW, in_channels]
                 if check_array_shape(v):
                     sanitized_weights[k] = v
                 else:

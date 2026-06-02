@@ -6,14 +6,6 @@ from ..base import BaseModelConfig
 
 @dataclass
 class VisionConfig(BaseModelConfig):
-    """MoonViT-SO-400M vision encoder config (shared architecture with Kimi-VL).
-
-    HuggingFace ``config.json`` provides the fields with their transformers
-    names (``hidden_size``/``num_hidden_layers``/``num_attention_heads``).
-    ``__post_init__`` derives the aliases (``embed_dim``/``depth``/``num_heads``)
-    consumed by ``vision.py`` (ported from ``kimi_vl``).
-    """
-
     model_type: str = "moonvit"
     hidden_size: int = 1152
     num_hidden_layers: int = 27
@@ -28,7 +20,6 @@ class VisionConfig(BaseModelConfig):
     def __post_init__(self):
         if self.merge_kernel_size is None:
             self.merge_kernel_size = [2, 2]
-        # Aliases used by the MoonViT port in vision.py
         self.depth = self.num_hidden_layers
         self.num_heads = self.num_attention_heads
         self.embed_dim = self.hidden_size
@@ -37,8 +28,6 @@ class VisionConfig(BaseModelConfig):
 
 @dataclass
 class TextConfig(BaseModelConfig):
-    """Qwen2.5-3B-Instruct text backbone (standard Qwen2, 1D RoPE)."""
-
     model_type: str = "qwen2"
     hidden_size: int = 2048
     num_hidden_layers: int = 36
@@ -52,7 +41,6 @@ class TextConfig(BaseModelConfig):
     rope_scaling: Optional[dict] = None
     max_position_embeddings: int = 32768
     tie_word_embeddings: bool = True
-    # Parallel Box Decoding (PBD) fields
     block_size: int = 6
     causal_attn: bool = False
     text_mask_token_id: int = 151676
@@ -69,7 +57,6 @@ class ModelConfig(BaseModelConfig):
     text_config: TextConfig
     vision_config: VisionConfig
     model_type: str = "locateanything"
-    # Grounding / structural token ids (root level of config.json)
     image_token_index: int = 151665
     box_start_token_id: int = 151668
     box_end_token_id: int = 151669
@@ -81,5 +68,4 @@ class ModelConfig(BaseModelConfig):
     mlp_connector_layers: int = 2
     vocab_size: int = 152681
     eos_token_id: Optional[List[int]] = None
-    # MTP block length for Parallel Box Decoding (mirrors text_config.block_size)
     n_future_tokens: int = 6

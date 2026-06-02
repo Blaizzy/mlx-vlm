@@ -11,14 +11,6 @@ from .vision import VisionModel
 
 
 class LocateAnythingMultiModalProjector(nn.Module):
-    """2-layer MLP connector (HF ``mlp1``).
-
-    HF stores it as ``nn.Sequential(LayerNorm(vit*4), Linear(vit*4, llm),
-    GELU, Linear(llm, llm))`` -> params at ``mlp1.0``/``mlp1.1``/``mlp1.3``.
-    The patch-merged vision features arrive as a list of ``[merged, k*k, vit]``
-    tensors which are concatenated and flattened to ``[total, vit*k*k]``.
-    """
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         vit_hidden = config.vision_config.hidden_size
@@ -119,12 +111,6 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ) -> List[int]:
-        """Parallel Box Decoding entry point (fast / hybrid / slow).
-
-        Returns the list of generated token ids (excluding the prompt). ``slow``
-        is pure auto-regressive and matches the default AR path; ``fast`` and
-        ``hybrid`` use the MTP block decoder in :mod:`.pbd`.
-        """
         from .pbd import PBDDecoder
 
         embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
@@ -138,8 +124,6 @@ class Model(nn.Module):
     def sanitize(self, weights):
         sanitized = {}
         for k, v in weights.items():
-            # Tied embeddings: the language model reuses embed_tokens as the
-            # output projection, so the stored lm_head is redundant.
             if k == "language_model.lm_head.weight":
                 continue
 

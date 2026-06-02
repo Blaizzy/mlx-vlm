@@ -1,19 +1,3 @@
-"""Parallel Box Decoding (PBD) for LocateAnything-3B.
-
-PBD decodes bounding boxes in fixed-length blocks of ``block_size`` tokens using
-multi-token prediction (MTP) under a non-causal "magi" block-attention mask, so
-that the four coordinates of a box are predicted jointly and consistently.
-
-Three modes (ported from the reference ``modeling_locateanything.generate``):
-  - ``fast``  : MTP only, never falls back to AR.
-  - ``slow``  : pure auto-regressive decoding (the AR oracle).
-  - ``hybrid``: MTP first, fall back to AR on format irregularity, switch back
-                to MTP on ``box_end``.
-
-The decode/sample utilities (:func:`sample_block`, :func:`decode_bbox_avg`,
-:func:`handle_pattern`) mirror ``generate_utils.py`` from the HF release.
-"""
-
 from typing import Dict, List, Optional
 
 import mlx.core as mx
@@ -23,7 +7,6 @@ from .language import build_magi_block_mask
 
 
 def get_token_ids(config: ModelConfig) -> Dict[str, int]:
-    """Collect the structural token ids PBD needs into a flat dict."""
     text = config.text_config
     eos = config.eos_token_id
     im_end = eos[0] if isinstance(eos, (list, tuple)) and eos else 151645
@@ -46,8 +29,6 @@ def _softmax(logits: mx.array) -> mx.array:
     return mx.softmax(logits.astype(mx.float32), axis=-1)
 
 
-# mx.eval under an alias: the block logits must be materialized before the KV
-# cache is rewound, otherwise the lazy graph aliases the reused buffer region.
 _materialize = getattr(mx, "eval")
 
 
@@ -57,7 +38,6 @@ def is_valid_box_frame(
     start_thresh: float = 0.6,
     end_thresh: float = 0.2,
 ) -> str:
-    """Classify a 6-position probability block (mirrors HF ``is_valid_box_frame``)."""
     box_start = token_ids["box_start_token_id"]
     box_end = token_ids["box_end_token_id"]
     null_id = token_ids["null_token_id"]
@@ -73,13 +53,6 @@ def is_valid_box_frame(
         ):
             return "empty_box"
 
-    # Position 0 is the bridge prediction; a real box requires it to favour
-    # box_start over the terminal tokens (null / im_end). The reference
-    # ``is_valid_box_frame`` keys only off position 5, which spuriously accepts
-    # a terminal block ``[im_end, null, null, null, null, null]`` (whose
-    # position-5 null passes ``end_thresh``) as a box. Gating on the bridge
-    # token lets the terminal block fall through to ``handle_pattern``, which
-    # stops generation — keeping hybrid/fast aligned with the AR oracle.
     p_start = float(probs[0, box_start])
     if p_start < float(probs[0, im_end]) or p_start < float(probs[0, null_id]):
         return "illegal_box"
@@ -100,11 +73,6 @@ def decode_bbox_avg(
     end_thresh: float = 0.2,
     generation_mode: str = "hybrid",
 ) -> Optional[List[int]]:
-    """Decode a coordinate box from a 6-position prob block.
-
-    Returns ``[box_start, c1, c2, c3, c4, box_end]`` (ints) or ``None`` when the
-    block is not a well-formed box. Mirrors HF ``decode_bbox_avg``.
-    """
     coord_start = token_ids["coord_start_token_id"]
     coord_end = token_ids["coord_end_token_id"]
     box_start = token_ids["box_start_token_id"]
@@ -118,7 +86,6 @@ def decode_bbox_avg(
     if box_type == "illegal_box":
         return None
 
-    # Top-k over coordinate positions 1..4.
     sub = probs[1:5]
     order = mx.argsort(-sub, axis=-1)[:, :keep_k]
     pos_ids = mx.take_along_axis(
@@ -150,7 +117,7 @@ def decode_bbox_avg(
                 and (max(valid_ids) - min(valid_ids)) > 60
             )
             final_coords.append(0 if is_abnormal else first_id)
-        else:  # fast
+        else:
             final_coords.append(first_id)
 
     return [box_start, *final_coords, box_end]
@@ -162,7 +129,6 @@ def decode_ref(
     keep_k: int = 5,
     start_thresh: float = 0.6,
 ) -> Optional[List[int]]:
-    """Decode a ``<ref>...`` text block (mirrors HF ``decode_ref``)."""
     ref_start = token_ids["ref_start_token_id"]
     coord_start = token_ids["coord_start_token_id"]
     coord_end = token_ids["coord_end_token_id"]
@@ -195,11 +161,6 @@ def sample_block(
     generation_mode: str = "hybrid",
     keep_k: int = 5,
 ) -> List[int]:
-    """Greedy block sampler. ``block_logits`` is ``[block_size, vocab]``.
-
-    Returns the decoded token sequence for the block: a coord/empty box, a ref
-    object, or the greedy argmax tokens when no structured box is recognised.
-    """
     probs = _softmax(block_logits)
     x0 = mx.argmax(probs, axis=-1).tolist()
 
@@ -217,10 +178,6 @@ def sample_block(
 def handle_pattern(
     x0: List[int], token_ids: Dict[str, int], generation_mode: str = "hybrid"
 ) -> Dict:
-    """Validate a decoded block and decide tokens / mode-switch / termination.
-
-    Mirrors HF ``handle_pattern``.
-    """
     null_id = token_ids["null_token_id"]
     im_end = token_ids["im_end_token_id"]
     box_start = token_ids["box_start_token_id"]
@@ -296,8 +253,6 @@ def handle_pattern(
 
 
 class PBDDecoder:
-    """Drives Parallel Box Decoding over a prepared LocateAnything model."""
-
     def __init__(self, model, generation_mode: str = "hybrid"):
         assert generation_mode in (
             "fast",
@@ -310,9 +265,6 @@ class PBDDecoder:
         self.config = model.config
         self.token_ids = get_token_ids(model.config)
         self.block_size = int(model.config.text_config.block_size)
-        # decode_ref / handle_pattern hard-code the 6-token block layout
-        # (semantic, box[x1,y1,x2,y2], end). Fail fast if a future checkpoint
-        # changes the block length rather than silently misparsing blocks.
         assert self.block_size == 6, (
             f"PBD decode utils assume block_size=6, got {self.block_size}; "
             "update handle_pattern/decode_ref before using this checkpoint."
@@ -321,12 +273,6 @@ class PBDDecoder:
         self.im_end = self.token_ids["im_end_token_id"]
 
     def _forward_mtp(self, generated: List[int], cache) -> mx.array:
-        """One MTP forward; returns block logits ``[block_size, vocab]``.
-
-        Builds the ``[tail + bridge + (B-1) masks]`` window, runs the magi
-        block-mask forward, then rewinds the KV cache by ``block_size`` so only
-        the accepted prefix (+ recomputed tail) remains cached.
-        """
         B = self.block_size
         acc = cache[0].offset
         tail = generated[acc:]
@@ -343,9 +289,6 @@ class PBDDecoder:
         inputs = mx.array([window], dtype=mx.int32)
         out = self.lm(inputs, mask=mask, cache=cache, position_ids=position_ids)
 
-        # Materialize before trim: the cache buffer region holding the block KV
-        # is rewound and reused by the next forward, so the lazy logits must be
-        # evaluated first to avoid aliasing the overwritten buffer.
         block_logits = out.logits[0, -B:, :]
         _materialize(block_logits)
         for c in cache:
@@ -354,7 +297,6 @@ class PBDDecoder:
         return block_logits
 
     def _forward_ar(self, generated: List[int], cache) -> mx.array:
-        """One causal AR forward over the uncached tail; returns last logits."""
         acc = cache[0].offset
         tail = generated[acc:]
         inputs = mx.array([tail], dtype=mx.int32)
@@ -369,8 +311,6 @@ class PBDDecoder:
         none_id = self.token_ids["none_token_id"]
 
         if self.mode == "hybrid":
-            # Mirrors HF ``_sample_token_in_ar``: in the hybrid AR phase any
-            # token that is not box_end / coord / none terminates generation.
             if token == box_end:
                 out_type = "box_end_ar"
             elif coord_start <= token <= coord_end or token == none_id:
@@ -388,14 +328,10 @@ class PBDDecoder:
         cache,
         max_tokens: int = 2048,
     ) -> List[int]:
-        """Run PBD and return the generated token ids (excluding the prompt)."""
         prompt = input_ids[0].tolist()
         generated = list(prompt)
         prompt_len = len(prompt)
 
-        # Prefill: forward the prompt once. For MTP modes the first forward is a
-        # magi block forward (prompt + bridge + masks); for slow mode it is a
-        # plain causal prefill.
         use_mtp = self.mode in ("fast", "hybrid")
 
         if use_mtp:
@@ -435,9 +371,7 @@ class PBDDecoder:
         return generated[prompt_len : prompt_len + max_tokens]
 
     def _mtp_prefill(self, inputs_embeds: mx.array, cache) -> mx.array:
-        """First MTP forward using prefilled embeddings (image tokens fused)."""
         B = self.block_size
-        # window = prompt_embeds + bridge(dup last) + (B-1) masks
         bridge = inputs_embeds[:, -1:, :]
         mask_embed = self.lm.model.embed_tokens(mx.array([[self.mask_token]]))
         mask_block = mx.broadcast_to(mask_embed, (1, B - 1, inputs_embeds.shape[-1]))

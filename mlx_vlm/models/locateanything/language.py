@@ -14,22 +14,14 @@ from .config import TextConfig
 
 
 def _rope_cos_sin(position_ids: mx.array, head_dim: int, base: float) -> tuple:
-    """Rotary cos/sin for arbitrary (possibly non-contiguous) positions.
-
-    PBD/MTP reuses the last prefix position for the duplicated bridge token, so
-    RoPE offsets are not a simple contiguous range and ``nn.RoPE`` (integer
-    offset only) cannot express them. ``position_ids`` has shape ``[1, L]``;
-    returns ``cos``/``sin`` of shape ``[1, 1, L, head_dim]``.
-    """
     half = head_dim // 2
     inv_freq = base ** (-mx.arange(0, half, dtype=mx.float32) / half)
-    freqs = position_ids[..., None].astype(mx.float32) * inv_freq  # [1, L, half]
-    emb = mx.concatenate([freqs, freqs], axis=-1)  # [1, L, head_dim]
+    freqs = position_ids[..., None].astype(mx.float32) * inv_freq
+    emb = mx.concatenate([freqs, freqs], axis=-1)
     return mx.cos(emb)[:, None, :, :], mx.sin(emb)[:, None, :, :]
 
 
 def _apply_rope_with_cos_sin(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    """Apply rotary embedding using precomputed cos/sin (non-traditional layout)."""
     half = x.shape[-1] // 2
     x1, x2 = x[..., :half], x[..., half:]
     rotated = mx.concatenate([-x2, x1], axis=-1)
@@ -39,23 +31,13 @@ def _apply_rope_with_cos_sin(x: mx.array, cos: mx.array, sin: mx.array) -> mx.ar
 def build_magi_block_mask(
     kv_len: int, q_len: int, block_size: int, dtype: mx.Dtype = mx.float32
 ) -> mx.array:
-    """Dense additive equivalent of HF ``build_magi_ranges`` (non-AR case).
-
-    The last ``block_size`` query rows form the MTP "magi" window: they attend
-    bidirectionally to each other and to the cached/recomputed prefix, but NOT
-    to the bridge column at ``kv_len - block_size - 1`` (the duplicated last
-    accepted token). The leading ``q_len - block_size`` rows are causal.
-
-    Returns ``[1, 1, q_len, kv_len]`` with 0 for allowed and ``-inf`` masked.
-    Global query positions are ``kv_len - q_len + i`` for row ``i``.
-    """
     q_global_start = kv_len - q_len
     window_start_k = kv_len - block_size
     blocked_k = window_start_k - 1
 
     q_idx = mx.arange(q_len).reshape(q_len, 1)
     k_idx = mx.arange(kv_len).reshape(1, kv_len)
-    g_idx = q_idx + q_global_start  # global query position per row
+    g_idx = q_idx + q_global_start
 
     in_window = q_idx >= (q_len - block_size)
 
@@ -107,7 +89,6 @@ class Attention(nn.Module):
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if position_ids is not None:
-            # PBD/MTP path: explicit (possibly non-contiguous) RoPE positions.
             cos, sin = _rope_cos_sin(position_ids, head_dim, self.rope.base)
             queries = _apply_rope_with_cos_sin(queries, cos, sin)
             keys = _apply_rope_with_cos_sin(keys, cos, sin)

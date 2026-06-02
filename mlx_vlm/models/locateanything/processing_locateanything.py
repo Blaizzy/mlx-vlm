@@ -1,12 +1,3 @@
-"""
-MLX-based LocateAnything processor.
-
-Wraps the MLX-native LocateAnything image processor and a fast Qwen2 tokenizer
-into a single processor. Image placeholders emitted by the chat template
-(``<image-N>``) are expanded into ``<img>``-wrapped ``<IMG_CONTEXT>`` runs whose
-length follows the MoonViT patch grid divided by the merge kernel.
-"""
-
 import json
 import re
 import warnings
@@ -25,7 +16,6 @@ from .image_processing_locateanything import LocateAnythingImageProcessor
 
 
 def _validate_images_text_input_order(images, text):
-    """Swap reversed (text, images) arguments for backward compatibility."""
     if images is not None and text is not None:
         images_is_text = isinstance(images, str) or (
             isinstance(images, (list, tuple))
@@ -55,8 +45,6 @@ if not hasattr(processing_utils, "_validate_images_text_input_order"):
 
 
 class LocateAnythingProcessor(ProcessorMixin):
-    """MLX-based processor for LocateAnything-3B (MoonViT + Qwen2.5)."""
-
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
     image_processor_class = "LocateAnythingImageProcessor"
@@ -84,7 +72,6 @@ class LocateAnythingProcessor(ProcessorMixin):
         ] = None,
         **kwargs,
     ) -> BatchFeature:
-        """Prepare one or several sequence(s) and image(s) for the model."""
         if images is None and text is None:
             raise ValueError("You have to specify at least one of `images` or `text`.")
 
@@ -105,9 +92,6 @@ class LocateAnythingProcessor(ProcessorMixin):
                 "Invalid input text. Please provide a string, or a list of strings"
             )
 
-        # Expand each `<image-N>` placeholder into the `<img>`-wrapped run of
-        # `<IMG_CONTEXT>` tokens sized by the patch grid / merge kernel. Images
-        # are consumed in the order their placeholders appear across the batch.
         if image_grid_hws is not None and text is not None:
             merge_length = (
                 self.image_processor.merge_kernel_size[0]
@@ -167,11 +151,9 @@ class LocateAnythingProcessor(ProcessorMixin):
         return BatchFeature(data=data)
 
     def batch_decode(self, *args, **kwargs):
-        """Forward to tokenizer's batch_decode."""
         return self.tokenizer.batch_decode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
-        """Forward to tokenizer's decode."""
         return self.tokenizer.decode(*args, **kwargs)
 
     def apply_chat_template(
@@ -182,7 +164,6 @@ class LocateAnythingProcessor(ProcessorMixin):
         tokenize=False,
         **kwargs,
     ):
-        """Render a conversation with the jinja2 chat template."""
         if chat_template is None:
             chat_template = self.chat_template
         if chat_template is None:
@@ -210,13 +191,11 @@ class LocateAnythingProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        """Merge tokenizer and image-processor input names."""
         tokenizer_input_names = self.tokenizer.model_input_names
         image_processor_input_names = self.image_processor.model_input_names
         return list(dict.fromkeys(tokenizer_input_names + image_processor_input_names))
 
     def save_pretrained(self, save_directory, **kwargs):
-        """Save the tokenizer and LocateAnything processor configuration."""
         save_dir = Path(save_directory)
         save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -283,7 +262,6 @@ class LocateAnythingProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        """Load the processor from a pretrained model path."""
         from huggingface_hub import hf_hub_download
 
         kwargs.pop("trust_remote_code", None)
@@ -323,7 +301,6 @@ class LocateAnythingProcessor(ProcessorMixin):
 
         image_processor = LocateAnythingImageProcessor(**image_processor_config)
 
-        # Prefer the bundled chat_template.json, then the tokenizer's template.
         chat_template = None
         chat_tpl_cfg = _load_json("chat_template.json")
         if "chat_template" in chat_tpl_cfg:
