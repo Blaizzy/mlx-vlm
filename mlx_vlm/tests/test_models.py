@@ -2900,6 +2900,120 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
+    def test_gemma4_unified(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import gemma4_unified
+        from mlx_vlm.utils import load_model, save_config, save_weights
+
+        text_config = gemma4_unified.TextConfig(
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            vocab_size=64,
+            hidden_size_per_layer_input=0,
+            sliding_window=32,
+            sliding_window_pattern=2,
+            attention_k_eq_v=True,
+        )
+        vision_config = gemma4_unified.VisionConfig(
+            patch_size=2,
+            pooling_kernel_size=2,
+            model_patch_size=4,
+            mm_embed_dim=32,
+            output_proj_dims=32,
+            mm_posemb_size=16,
+            num_soft_tokens=4,
+        )
+        audio_config = gemma4_unified.AudioConfig(
+            audio_samples_per_token=8,
+            audio_embed_dim=8,
+            hidden_size=8,
+            output_proj_dims=8,
+        )
+        config = gemma4_unified.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=audio_config,
+            vocab_size=64,
+            image_token_id=63,
+            audio_token_id=62,
+            video_token_id=61,
+        )
+        model = gemma4_unified.Model(config)
+
+        input_ids = mx.array([[0, 63, 63, 63, 63, 1]], dtype=mx.int32)
+        pixel_values = mx.random.uniform(shape=(1, 4, 4 * 4 * 3))
+        image_position_ids = mx.array(
+            [[[0, 0], [1, 0], [0, 1], [1, 1]]], dtype=mx.int32
+        )
+        output = model(
+            input_ids,
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
+        )
+        self.assertEqual(output.logits.shape, (1, 6, config.vocab_size))
+
+        input_ids_audio = mx.array([[0, 62, 62, 1]], dtype=mx.int32)
+        input_features = mx.random.uniform(shape=(1, 2, 8))
+        input_features_mask = mx.array([[True, True]])
+        output = model(
+            input_ids_audio,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+        )
+        self.assertEqual(output.logits.shape, (1, 4, config.vocab_size))
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            model_path = Path(model_dir)
+            save_weights(model_path, model)
+            save_config(
+                {
+                    "model_type": "gemma4_unified",
+                    "vocab_size": config.vocab_size,
+                    "image_token_id": config.image_token_id,
+                    "audio_token_id": config.audio_token_id,
+                    "video_token_id": config.video_token_id,
+                    "text_config": vars(text_config).copy(),
+                    "vision_config": vars(vision_config).copy(),
+                    "audio_config": vars(audio_config).copy(),
+                },
+                model_path / "config.json",
+            )
+            loaded_model = load_model(model_path)
+
+        output = loaded_model(mx.array([[0, 1, 2]], dtype=mx.int32))
+        self.assertEqual(output.logits.shape, (1, 3, config.vocab_size))
+
+        sanitized = model.sanitize(
+            {
+                "model.language_model.embed_tokens.weight": mx.zeros((64, 32)),
+                "model.vision_embedder.patch_dense.weight": mx.zeros((32, 48)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("vision_embedder.patch_dense.weight", sanitized)
+        self.assertNotIn("lm_head.weight", sanitized)
+
+        loaded = gemma4_unified.ModelConfig.from_dict(
+            {
+                "model_type": "gemma4_unified",
+                "eoa_token_index": 258883,
+                "text_config": {"model_type": "gemma4_unified_text"},
+                "vision_config": {"model_type": "gemma4_unified_vision"},
+                "audio_config": {"model_type": "gemma4_unified_audio"},
+            }
+        )
+        self.assertEqual(loaded.eoa_token_id, 258883)
+        self.assertEqual(loaded.text_config.model_type, "gemma4_unified_text")
+
     def test_gemma4_moe(self):
         """Gemma 4 MoE variant: MoE, K-eq-V, no per-layer inputs."""
         from mlx_vlm.models import gemma4

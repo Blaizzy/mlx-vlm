@@ -865,7 +865,8 @@ class ResponseGenerator:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
-            if self.model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+            if self.model.config.model_type
+            in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)

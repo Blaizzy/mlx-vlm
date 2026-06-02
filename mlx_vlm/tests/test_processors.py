@@ -87,6 +87,55 @@ def _mock_ip(**extra):
     )()
 
 
+class TestGemma4UnifiedProcessor(unittest.TestCase):
+    def test_image_processor_outputs_merged_patches_and_positions(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+        )
+
+        processor = Gemma4UnifiedImageProcessor(
+            patch_size=2,
+            pooling_kernel_size=2,
+            max_soft_tokens=4,
+            do_resize=False,
+            do_rescale=False,
+        )
+        image = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8))
+
+        data, num_soft_tokens = processor(image)
+
+        self.assertEqual(data["pixel_values"].shape, (1, 4, 48))
+        self.assertEqual(data["image_position_ids"].shape, (1, 4, 2))
+        self.assertEqual(num_soft_tokens, [4])
+        self.assertEqual(
+            data["image_position_ids"][0].tolist(),
+            [[0, 0], [1, 0], [0, 1], [1, 1]],
+        )
+
+    def test_audio_feature_extractor_chunks_waveforms(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedAudioFeatureExtractor,
+        )
+
+        extractor = Gemma4UnifiedAudioFeatureExtractor(
+            audio_samples_per_token=4,
+            feature_size=4,
+        )
+
+        result = extractor(
+            [
+                np.arange(6, dtype=np.float32),
+                np.arange(9, dtype=np.float32),
+            ]
+        )
+
+        self.assertEqual(result["input_features"].shape, (2, 3, 4))
+        self.assertEqual(
+            result["input_features_mask"].tolist(),
+            [[True, True, False], [True, True, True]],
+        )
+
+
 # ── Base class with shared test_with_image / test_text_only ───────────────────
 
 
