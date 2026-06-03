@@ -642,11 +642,8 @@ class LanguageModel(nn.Module):
         del gdn_states  # API-parity placeholder; Gemma 4 has no SSM/GDN state.
         if isinstance(accepted, int):
             accepted = mx.array([accepted])
-        elif isinstance(accepted, (list, tuple)):
-            # The batched MTP path (speculative/mtp.py) passes ``accepted`` as a
-            # plain Python list, which has no ``.max()``. Convert so the
-            # mx-array ops below work, matching the qwen3_5 rollback hook.
-            accepted = mx.array(accepted)
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
 
         max_a = int(accepted.max().item())
         n = max_a + 1
