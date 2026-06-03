@@ -479,9 +479,16 @@ class Gemma4TextModel(nn.Module):
         """Create attention masks, deduplicated by layer type."""
         mask = {}
         masks = []
+        has_audio_tokens = (
+            mm_token_type_ids is not None
+            and int(mx.sum(mm_token_type_ids == 3).item()) > 0
+        )
+        # Audio spans are sequential; keep mixed image+audio prompts causal to
+        # avoid the vision block overlay dominating quantized unified models.
         use_bidirectional_vision = (
             getattr(self.config, "use_bidirectional_attention", None) == "vision"
             and mm_token_type_ids is not None
+            and not has_audio_tokens
             and h.shape[1] > 1
         )
         for l, c in zip(self.layers, cache):
