@@ -40,7 +40,7 @@ def _position_ids(batch=2, seq_len=4):
     return mx.stack([base, base + 3, base + 7])
 
 
-def test_mrope_rotary_embedding_registers_helper_arrays_in_parameters():
+def test_mrope_rotary_embedding_exposes_private_helper_arrays_for_eager_eval():
     class Host(nn.Module):
         def __init__(self):
             super().__init__()
@@ -53,11 +53,11 @@ def test_mrope_rotary_embedding_registers_helper_arrays_in_parameters():
     host = Host()
 
     assert isinstance(host.rotary_emb, nn.Module)
-    assert "rotary_emb" in host.parameters()
-    rotary_params = host.parameters()["rotary_emb"]
-    assert rotary_params["inv_freq"] is host.rotary_emb.inv_freq
-    assert rotary_params["position_selector"] is host.rotary_emb.position_selector
+    assert tree_flatten(host.parameters()) == []
     assert tree_flatten(host.trainable_parameters()) == []
+    eager_arrays = host.rotary_emb.eager_eval_arrays()
+    assert eager_arrays[0] is host.rotary_emb.inv_freq
+    assert eager_arrays[1] is host.rotary_emb.position_selector
 
 
 @pytest.mark.parametrize(

@@ -534,7 +534,7 @@ class MRoPERotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.style = style
-        self.inv_freq = compute_inv_freq(dim, base)
+        self._inv_freq = compute_inv_freq(dim, base)
         self.attention_scaling = attention_scaling
         self.cast_output = cast_output
         self._mrope_section = list(
@@ -546,21 +546,33 @@ class MRoPERotaryEmbedding(nn.Module):
             )
         )
         if _has_mrope_apply_selector(style):
-            self.position_selector = mrope_position_selector(
+            self._position_selector = mrope_position_selector(
                 style,
                 self.mrope_section,
                 self.inv_freq.shape[0],
             )
         else:
-            self.position_selector = None
+            self._position_selector = None
         self.pairing = _pairing_for_style(style)
         self.fused_apply = self.position_selector is not None and _HAS_METAL
         self._compiled_apply = {} if self.fused_apply else None
-        self.freeze()
 
     @property
     def mrope_section(self):
         return self._mrope_section
+
+    @property
+    def inv_freq(self):
+        return self._inv_freq
+
+    @property
+    def position_selector(self):
+        return self._position_selector
+
+    def eager_eval_arrays(self):
+        if self._position_selector is None:
+            return [self._inv_freq]
+        return [self._inv_freq, self._position_selector]
 
     def __call__(self, x, position_ids):
         freqs = compute_mrope_frequencies(
