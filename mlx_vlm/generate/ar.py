@@ -538,6 +538,8 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "full_text_row_masked_out_mask",
     "position_ids",
     "pos_hw",
+    "mm_token_type_ids",
+    "token_type_ids",
 }
 
 APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")

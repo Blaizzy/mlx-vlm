@@ -153,9 +153,32 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         def __call__(self, text, **kwargs):
             self.last_text = text
             texts = [text] if isinstance(text, str) else text
+            special_tokens = {
+                self.image_token: self.image_token_id,
+                self.audio_token: self.audio_token_id,
+                self.video_token: self.video_token_id,
+            }
+            input_ids = []
+            attention_mask = []
+            for item in texts:
+                ids = []
+                i = 0
+                while i < len(item):
+                    matched = False
+                    for token, token_id in special_tokens.items():
+                        if token and item.startswith(token, i):
+                            ids.append(token_id)
+                            i += len(token)
+                            matched = True
+                            break
+                    if not matched:
+                        ids.append((ord(item[i]) % 50) + 1)
+                        i += 1
+                input_ids.append(ids)
+                attention_mask.append([1] * len(ids))
             return {
-                "input_ids": [[1, 2, 3, 4] for _ in texts],
-                "attention_mask": [[1, 1, 1, 1] for _ in texts],
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
             }
 
     def _make_gemma4_unified_processor(self, image_processor=None):
@@ -284,6 +307,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
 
         self.assertIsInstance(result["input_ids"], mx.array)
         self.assertIsInstance(result["pixel_values"], mx.array)
+        self.assertIn("mm_token_type_ids", result)
+        self.assertEqual(int(mx.sum(result["mm_token_type_ids"] == 1).item()), 4)
         self.assertEqual(result["pixel_values"].shape, (1, 4, 48))
         self.assertEqual(result["image_position_ids"].shape, (1, 4, 2))
         self.assertIn(
@@ -307,6 +332,20 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
 
         self.assertIn("<|image|>", rendered)
+
+    def test_call_returns_hf_compatible_mm_token_type_ids(self):
+        processor, tokenizer = self._make_gemma4_unified_processor()
+
+        result = processor(
+            text=[
+                tokenizer.image_token
+                + tokenizer.video_token
+                + tokenizer.audio_token
+                + "describe"
+            ]
+        )
+
+        self.assertEqual(result["mm_token_type_ids"].tolist()[0][:3], [1, 2, 3])
 
 
 # ── Base class with shared test_with_image / test_text_only ───────────────────

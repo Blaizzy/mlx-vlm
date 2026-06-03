@@ -479,6 +479,7 @@ class Gemma4Processor(ProcessorMixin):
 
         # Pop return_tensors - we handle conversion ourselves via to_mlx()
         kwargs.pop("return_tensors", None)
+        kwargs.setdefault("return_mm_token_type_ids", True)
 
         if isinstance(text, str):
             text = [text]
@@ -613,11 +614,11 @@ class Gemma4Processor(ProcessorMixin):
             mm_token_type_ids = np.zeros_like(array_ids)
             if self.image_token_id is not None:
                 mm_token_type_ids[array_ids == self.image_token_id] = 1
-            if self.audio_token_id is not None:
-                mm_token_type_ids[array_ids == self.audio_token_id] = 2
             if self.video_token_id is not None:
-                mm_token_type_ids[array_ids == self.video_token_id] = 3
-            text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
+                mm_token_type_ids[array_ids == self.video_token_id] = 2
+            if self.audio_token_id is not None:
+                mm_token_type_ids[array_ids == self.audio_token_id] = 3
+            text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
         # num_frames_per_video is Python-side metadata; keep it out of to_mlx
         video_meta = {}
@@ -795,7 +796,7 @@ class Gemma4Processor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        tokenizer_input_names = self.tokenizer.model_input_names + ["token_type_ids"]
+        tokenizer_input_names = self.tokenizer.model_input_names + ["mm_token_type_ids"]
         image_processor_input_names = self.image_processor.model_input_names
         all_names = list(tokenizer_input_names + image_processor_input_names)
         return list(dict.fromkeys(all_names))
