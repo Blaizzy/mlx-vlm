@@ -65,9 +65,6 @@ class Model(nn.Module):
         super().__init__()
         self.model_type = config.model_type
         self.config = config
-        self.no_chunked_prefill = (
-            getattr(config.text_config, "use_bidirectional_attention", None) == "vision"
-        )
 
         self.language_model = LanguageModel(config.text_config)
         self.vocab_size = config.text_config.vocab_size

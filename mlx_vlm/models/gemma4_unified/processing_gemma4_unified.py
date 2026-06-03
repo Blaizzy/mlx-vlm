@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import mlx.core as mx
 import numpy as np
 from transformers.feature_extraction_utils import BatchFeature
 
@@ -249,27 +248,6 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
             tokenizer=tokenizer,
             **kwargs,
         )
-
-    def __call__(self, *args, **kwargs):
-        kwargs.setdefault("return_mm_token_type_ids", True)
-        inputs = super().__call__(*args, **kwargs)
-
-        # Match Transformers' Gemma4Unified ids for the bidirectional mask:
-        # image=1, video=2, audio=3. The shared Gemma4 processor historically
-        # used audio=2, video=3.
-        mm_token_type_ids = inputs.get("mm_token_type_ids")
-        if mm_token_type_ids is not None:
-            was_mlx = isinstance(mm_token_type_ids, mx.array)
-            remapped = np.array(mm_token_type_ids)
-            remapped = remapped.copy()
-            remapped[remapped == 2] = -1
-            remapped[remapped == 3] = 2
-            remapped[remapped == -1] = 3
-            inputs["mm_token_type_ids"] = (
-                mx.array(remapped) if was_mlx else remapped.tolist()
-            )
-
-        return inputs
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):

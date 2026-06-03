@@ -5276,36 +5276,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "gemma4_unified")
 
-    def test_gemma4_unified_vision_tokens_use_bidirectional_mask(self):
-        from mlx_vlm.models import gemma4_unified
-        from mlx_vlm.models.gemma4.language import Gemma4TextModel
-
-        config = gemma4_unified.TextConfig(
-            hidden_size=8,
-            num_hidden_layers=1,
-            intermediate_size=16,
-            num_attention_heads=1,
-            num_key_value_heads=1,
-            num_global_key_value_heads=1,
-            head_dim=8,
-            global_head_dim=8,
-            vocab_size=32,
-            hidden_size_per_layer_input=0,
-            sliding_window=8,
-            sliding_window_pattern=1,
-            layer_types=["full_attention"],
-            use_bidirectional_attention="vision",
-        )
-        model = Gemma4TextModel(config)
-        hidden_states = mx.zeros((1, 4, config.hidden_size))
-        mm_token_type_ids = mx.array([[0, 1, 1, 0]])
-
-        mask = model._make_masks(hidden_states, [None], mm_token_type_ids)[0]
-
-        self.assertTrue(bool(mask[0, 0, 1, 2].item()))
-        self.assertFalse(bool(mask[0, 0, 0, 2].item()))
-        self.assertTrue(bool(mask[0, 0, 3, 2].item()))
-
     def test_glm4v_input_embeddings(self):
         from mlx_vlm.models import glm4v
 
