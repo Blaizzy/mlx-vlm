@@ -55,24 +55,6 @@ MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
-def _eager_eval_arrays(model: nn.Module) -> list[mx.array]:
-    arrays = []
-    for _, module in model.named_modules():
-        get_arrays = getattr(module, "eager_eval_arrays", None)
-        if not callable(get_arrays):
-            continue
-        arrays.extend(
-            value
-            for _, value in tree_flatten(get_arrays())
-            if isinstance(value, mx.array)
-        )
-    return arrays
-
-
-def _eval_model_parameters(model: nn.Module) -> None:
-    mx.eval(model.parameters(), *_eager_eval_arrays(model))
-
-
 def _e4m3_decode_table() -> mx.array:
     """Return a 256-entry ``float32`` LUT mapping every E4M3FN byte to its value.
 
@@ -620,7 +602,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model.load_weights(list(weights.items()))
 
     if not lazy:
-        _eval_model_parameters(model)
+        mx.eval(model.parameters())
 
     model.model_path = model_path
     model.eval()
@@ -803,7 +785,7 @@ def sharded_load(
         inner.pipeline(pipeline_group)
 
     print("Materializing")
-    _eval_model_parameters(model.language_model)
+    mx.eval(model.language_model.parameters())
     model.eval()
 
     # Synchronize processes to avoid timeout

@@ -556,6 +556,7 @@ class MRoPERotaryEmbedding(nn.Module):
         self.pairing = _pairing_for_style(style)
         self.fused_apply = self.position_selector is not None and _HAS_METAL
         self._compiled_apply = {} if self.fused_apply else None
+        self.eval_cached_arrays()
 
     @property
     def mrope_section(self):
@@ -573,6 +574,9 @@ class MRoPERotaryEmbedding(nn.Module):
         if self._position_selector is None:
             return [self._inv_freq]
         return [self._inv_freq, self._position_selector]
+
+    def eval_cached_arrays(self):
+        mx.eval(*self.eager_eval_arrays())
 
     def __call__(self, x, position_ids):
         freqs = compute_mrope_frequencies(

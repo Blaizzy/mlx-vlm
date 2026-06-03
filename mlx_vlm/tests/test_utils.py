@@ -9,16 +9,12 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from mlx.utils import tree_flatten
 from mlx_lm.utils import quantize_model
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
-from mlx_vlm.models.rope_utils import MRoPERotaryEmbedding
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
-    _eager_eval_arrays,
-    _eval_model_parameters,
     _load_safetensors,
     get_model_and_args,
     load,
@@ -47,43 +43,6 @@ class MockTorch:
     @staticmethod
     def tensor(data):
         return MockTensor(data)
-
-
-def test_eager_eval_arrays_collects_rotary_helpers_without_strict_load_shim(
-    monkeypatch,
-):
-    class Host(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = mx.array([1.0])
-            self.rotary_emb = MRoPERotaryEmbedding(
-                dim=8,
-                mrope_section=[2, 1, 1],
-                style="interleaved",
-            )
-
-    model = Host()
-    weights = {"weight": mx.array([2.0])}
-
-    parameter_keys = {key for key, _ in tree_flatten(model.parameters())}
-    assert parameter_keys == {"weight"}
-
-    model.load_weights(list(weights.items()))
-    assert model.weight.item() == 2.0
-
-    eager_arrays = _eager_eval_arrays(model)
-    assert eager_arrays[0] is model.rotary_emb.inv_freq
-    assert eager_arrays[1] is model.rotary_emb.position_selector
-
-    eval_args = []
-    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
-
-    _eval_model_parameters(model)
-
-    flat_eval_params = dict(tree_flatten(eval_args[0][0]))
-    assert flat_eval_params["weight"] is model.weight
-    assert eval_args[0][1] is model.rotary_emb.inv_freq
-    assert eval_args[0][2] is model.rotary_emb.position_selector
 
 
 class MockProcessor:
