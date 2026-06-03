@@ -1893,5 +1893,98 @@ class TestPatchChainsForUnknownModelType(unittest.TestCase):
                 AutoProcessor.from_pretrained(tmpdir)
 
 
+class TestLocateAnythingProcessor(unittest.TestCase):
+    def test_save_pretrained_round_trips_custom_config(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from transformers import PreTrainedTokenizerBase
+
+        from mlx_vlm.models.locateanything.image_processing_locateanything import (
+            LocateAnythingImageProcessor,
+        )
+        from mlx_vlm.models.locateanything.processing_locateanything import (
+            LocateAnythingProcessor,
+        )
+
+        class DummyTokenizer(PreTrainedTokenizerBase):
+            model_input_names = ["input_ids", "attention_mask"]
+            vocab_files_names = {}
+
+            def __init__(self, chat_template=None):
+                super().__init__(chat_template=chat_template)
+                self.eos_token = "<eos>"
+                self.pad_token = "<pad>"
+
+            def save_pretrained(self, save_directory, **kwargs):
+                path = Path(save_directory) / "tokenizer_config.json"
+                path.write_text(
+                    json.dumps({"tokenizer_class": "DummyTokenizer"}),
+                    encoding="utf-8",
+                )
+                return (str(path),)
+
+            def batch_decode(self, *args, **kwargs):
+                return []
+
+            def decode(self, *args, **kwargs):
+                return ""
+
+            def convert_tokens_to_ids(self, token):
+                return 1
+
+            def __call__(self, *args, **kwargs):
+                return {"input_ids": [[1]], "attention_mask": [[1]]}
+
+        chat_template = "{{ messages }}"
+        processor = LocateAnythingProcessor(
+            image_processor=LocateAnythingImageProcessor(
+                patch_size=28,
+                merge_kernel_size=[2, 4],
+                in_token_limit=1234,
+            ),
+            tokenizer=DummyTokenizer(chat_template=chat_template),
+            chat_template=chat_template,
+        )
+
+        with TemporaryDirectory() as tmp:
+            saved_files = processor.save_pretrained(tmp)
+
+            processor_config = json.loads(
+                (Path(tmp) / "processor_config.json").read_text(encoding="utf-8")
+            )
+            preprocessor_config = json.loads(
+                (Path(tmp) / "preprocessor_config.json").read_text(encoding="utf-8")
+            )
+            chat_template_config = json.loads(
+                (Path(tmp) / "chat_template.json").read_text(encoding="utf-8")
+            )
+
+            self.assertIn(str(Path(tmp) / "processor_config.json"), saved_files)
+            self.assertEqual(
+                processor_config["processor_class"],
+                "LocateAnythingProcessor",
+            )
+            self.assertEqual(processor_config["chat_template"], chat_template)
+            self.assertEqual(preprocessor_config["patch_size"], 28)
+            self.assertEqual(preprocessor_config["merge_kernel_size"], [2, 4])
+            self.assertEqual(preprocessor_config["in_token_limit"], 1234)
+            self.assertEqual(chat_template_config["chat_template"], chat_template)
+
+            with patch(
+                "mlx_vlm.models.locateanything.processing_locateanything."
+                "AutoTokenizer.from_pretrained",
+                return_value=DummyTokenizer(),
+            ):
+                reloaded = LocateAnythingProcessor.from_pretrained(tmp)
+
+            self.assertEqual(reloaded.image_processor.patch_size, 28)
+            self.assertEqual(reloaded.image_processor.merge_kernel_size, [2, 4])
+            self.assertEqual(reloaded.image_processor.in_token_limit, 1234)
+            self.assertEqual(reloaded.chat_template, chat_template)
+            self.assertEqual(reloaded.tokenizer.chat_template, chat_template)
+
+
 if __name__ == "__main__":
     unittest.main()
