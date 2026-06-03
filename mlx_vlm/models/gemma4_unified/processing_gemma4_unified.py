@@ -239,6 +239,7 @@ class Gemma4UnifiedAudioFeatureExtractor:
 
 
 class Gemma4UnifiedProcessor(Gemma4Processor):
+    model_type = "gemma4_unified"
     image_processor_class = "Gemma4UnifiedImageProcessor"
 
     def __init__(self, image_processor=None, tokenizer=None, **kwargs):
