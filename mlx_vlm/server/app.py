@@ -43,6 +43,7 @@ from .generation import (
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
@@ -248,9 +249,20 @@ def _build_structured_logits_processors(request, processor):
     return [logits_processor]
 
 
-def _count_thinking_tag_tokens(text: str) -> int:
+def _count_thinking_tag_tokens(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
+    if (
+        thinking_start_token
+        and thinking_end_token
+        and thinking_start_token in text
+        and thinking_end_token in text
+    ):
+        return 2
     # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
     if "<|channel>thought" in text and "<channel|>" in text:
         count = 4
@@ -259,32 +271,13 @@ def _count_thinking_tag_tokens(text: str) -> int:
     return count
 
 
-def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+def _split_thinking(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    # Handle <|channel>thought...<channel|> format (gemma4)
-    # Also handle partial tag: text starting with "thought\n" (continuation)
-    if "<|channel>thought" in text or (
-        "<channel|>" in text and text.lstrip().startswith("thought")
-    ):
-        parts = text.split("<channel|>", 1)
-        if len(parts) == 2:
-            reasoning = (
-                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-            )
-            content = parts[1].strip()
-            return reasoning or None, content
-        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-        return reasoning or None, ""
-    # Handle <think>...</think> format (qwen3.5 etc)
-    # Also handle partial: output starts with thinking text + </think> (no opening tag)
-    if "<think>" in text or "</think>" in text:
-        parts = text.split("</think>", 1)
-        if len(parts) == 2:
-            reasoning = parts[0].replace("<think>", "").strip()
-            content = parts[1].strip()
-            return reasoning or None, content
-        return parts[0].replace("<think>", "").strip(), ""
-    return None, text
+    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:

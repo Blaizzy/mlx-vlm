@@ -17,6 +17,7 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
+import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import (
@@ -268,6 +269,26 @@ MTP_DRAFTER_COMPAT_CASES = [
         id="target-hidden-size",
     ),
 ]
+
+
+def test_gemma4_rollback_speculative_cache_accepts_python_list():
+    class DummyCache:
+        keys = None
+
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+
+    max_a = gemma4_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, [0, 2], block_size=4
+    )
+
+    assert max_a == 2
+    assert cache.trims == [1]
 
 
 def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():

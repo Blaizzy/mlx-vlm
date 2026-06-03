@@ -21,7 +21,11 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .responses_state import process_tool_calls, suppress_tool_call_content
+from .responses_state import (
+    ThinkingStreamState,
+    process_tool_calls,
+    suppress_tool_call_content,
+)
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
 
@@ -429,8 +433,12 @@ def _anthropic_content_from_generation(
     full_text: str,
     parsed_tool_calls: Optional[List[Any]] = None,
     include_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    reasoning, content = _split_thinking(full_text)
+    reasoning, content = _split_thinking(
+        full_text, thinking_start_token, thinking_end_token
+    )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
         blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
@@ -529,8 +537,11 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                in_thinking = False
-                accumulated = ""
+                thinking_state = ThinkingStreamState(
+                    gen_args.enable_thinking,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
                 in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
                 message_started = False
@@ -646,47 +657,15 @@ async def anthropic_messages_endpoint(http_request: Request):
                             output_tokens += 1
                         delta = token.text
                         full_output += delta
-                        accumulated += delta
                         metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
                         for event in start_message_event():
                             yield event
 
-                        delta_reasoning = None
-                        delta_content = None
-                        if not in_thinking and (
-                            "<|channel>thought" in accumulated
-                            or "<think>" in accumulated
-                        ):
-                            in_thinking = True
-                            accumulated = ""
-                        elif in_thinking and (
-                            "<channel|>" in accumulated or "</think>" in accumulated
-                        ):
-                            if open_block_type == "thinking":
-                                yield _sse_event(
-                                    "content_block_delta",
-                                    {
-                                        "type": "content_block_delta",
-                                        "index": block_index,
-                                        "delta": {
-                                            "type": "signature_delta",
-                                            "signature": "",
-                                        },
-                                    },
-                                )
-                            yield close_open_block()
-                            in_thinking = False
-                            accumulated = ""
-                        elif in_thinking:
-                            delta_reasoning = delta
-                        elif not in_thinking and (
-                            "<|channel>" in accumulated or "<think" in accumulated
-                        ):
-                            pass
-                        else:
-                            delta_content = delta
+                        thinking_delta = thinking_state.feed(delta)
+                        delta_reasoning = thinking_delta.reasoning
+                        delta_content = thinking_delta.content
 
                         in_tool_call, delta_content = suppress_tool_call_content(
                             full_output, in_tool_call, tc_start, delta_content
@@ -705,7 +684,23 @@ async def anthropic_messages_endpoint(http_request: Request):
                                     },
                                 },
                             )
-                        elif delta_content:
+                        if (
+                            thinking_delta.thinking_closed
+                            and open_block_type == "thinking"
+                        ):
+                            yield _sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "signature_delta",
+                                        "signature": "",
+                                    },
+                                },
+                            )
+                            yield close_open_block()
+                        if delta_content:
                             text_output += delta_content
                             yield open_block("text")
                             yield _sse_event(
@@ -799,7 +794,13 @@ async def anthropic_messages_endpoint(http_request: Request):
                     yield _sse_event("message_stop", {"type": "message_stop"})
 
                     completion_tokens = max(
-                        0, output_tokens - _count_thinking_tag_tokens(full_output)
+                        0,
+                        output_tokens
+                        - _count_thinking_tag_tokens(
+                            full_output,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/v1/messages",
@@ -948,6 +949,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                 response_text,
                 parsed_tool_calls=parsed_tool_calls,
                 include_thinking=bool(gen_args.enable_thinking),
+                thinking_start_token=gen_args.thinking_start_token,
+                thinking_end_token=gen_args.thinking_end_token,
             )
             stop_reason = _anthropic_stop_reason(
                 finish_reason,
@@ -966,7 +969,13 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
 
             completion_tokens = max(
-                0, output_tokens - _count_thinking_tag_tokens(full_text)
+                0,
+                output_tokens
+                - _count_thinking_tag_tokens(
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                ),
             )
             envelope = _build_metrics_envelope(
                 endpoint="/v1/messages",

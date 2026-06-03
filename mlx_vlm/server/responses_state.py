@@ -20,6 +20,134 @@ class StoredResponse:
     previous_response_id: Optional[str] = None
 
 
+@dataclass
+class ThinkingStreamDelta:
+    reasoning: Optional[str] = None
+    content: Optional[str] = None
+    thinking_closed: bool = False
+
+
+class ThinkingStreamState:
+    """Split streamed thinking delimiters from user-visible content."""
+
+    _DEFAULT_OPEN_CLOSE_MARKERS = (
+        ("<|channel>thought", "<channel|>"),
+        ("<think>", "</think>"),
+    )
+
+    def __init__(
+        self,
+        enable_thinking: bool = False,
+        thinking_start_token: Optional[str] = None,
+        thinking_end_token: Optional[str] = None,
+    ):
+        self.open_close_markers = self._build_open_close_markers(
+            thinking_start_token, thinking_end_token
+        )
+        self.open_markers = tuple(marker for marker, _ in self.open_close_markers)
+        self.close_markers = tuple(marker for _, marker in self.open_close_markers)
+        self.in_thinking = bool(enable_thinking)
+        self.thinking_done = False
+        self.buffer = ""
+
+    def feed(self, text: str) -> ThinkingStreamDelta:
+        self.buffer += text or ""
+        reasoning = []
+        content = []
+        thinking_closed = False
+
+        while self.buffer:
+            if self.in_thinking:
+                idx, marker = self._find_first(self.buffer, self.close_markers)
+                if idx < 0:
+                    emit, self.buffer = self._split_partial(
+                        self.buffer, self.close_markers
+                    )
+                    emit = self._strip_open_marker(emit)
+                    if emit:
+                        reasoning.append(emit)
+                    break
+
+                before = self._strip_open_marker(self.buffer[:idx])
+                if before:
+                    reasoning.append(before)
+
+                self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+                self.in_thinking = False
+                self.thinking_done = True
+                thinking_closed = True
+                continue
+
+            if self.thinking_done:
+                content.append(self.buffer)
+                self.buffer = ""
+                break
+
+            idx, marker = self._find_first(self.buffer, self.open_markers)
+            if idx < 0:
+                emit, self.buffer = self._split_partial(self.buffer, self.open_markers)
+                if emit:
+                    content.append(emit)
+                break
+
+            if idx:
+                content.append(self.buffer[:idx])
+
+            self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+            self.in_thinking = True
+
+        return ThinkingStreamDelta(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+            thinking_closed=thinking_closed,
+        )
+
+    @classmethod
+    def _build_open_close_markers(
+        cls,
+        thinking_start_token: Optional[str],
+        thinking_end_token: Optional[str],
+    ) -> Tuple[Tuple[str, str], ...]:
+        markers = []
+        if thinking_start_token and thinking_end_token:
+            markers.append((thinking_start_token, thinking_end_token))
+        for marker_pair in cls._DEFAULT_OPEN_CLOSE_MARKERS:
+            if marker_pair not in markers:
+                markers.append(marker_pair)
+        return tuple(markers)
+
+    @staticmethod
+    def _find_first(text: str, markers: Tuple[str, ...]) -> Tuple[int, str]:
+        found_idx = -1
+        found_marker = ""
+        for marker in markers:
+            idx = text.find(marker)
+            if idx >= 0 and (found_idx < 0 or idx < found_idx):
+                found_idx = idx
+                found_marker = marker
+        return found_idx, found_marker
+
+    @staticmethod
+    def _split_partial(text: str, markers: Tuple[str, ...]) -> Tuple[str, str]:
+        hold = 0
+        for marker in markers:
+            max_len = min(len(marker) - 1, len(text))
+            for length in range(max_len, 0, -1):
+                if text.endswith(marker[:length]):
+                    hold = max(hold, length)
+                    break
+        if hold:
+            return text[:-hold], text[-hold:]
+        return text, ""
+
+    def _strip_open_marker(self, text: str) -> str:
+        for marker in self.open_markers:
+            if marker in text:
+                before, after = text.split(marker, 1)
+                return before + after.lstrip("\n")
+        return text
+
+
 response_store: Dict[str, StoredResponse] = {}
 response_store_order: deque = deque()
 response_store_lock = Lock()
@@ -113,29 +241,78 @@ def _sse_event(event_type: str, payload: Dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, default=_jsonable)}\n\n"
 
 
-def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+def _clean_reasoning(reasoning: str, start_marker: str) -> str:
+    reasoning = reasoning.replace(start_marker, "")
+    if start_marker == "<|channel>thought":
+        reasoning = reasoning.lstrip("thought")
+    return reasoning.strip()
+
+
+def _split_thinking(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
 
-    if "<think>" in text and "</think>" in text:
-        start = text.find("<think>")
-        end = text.find("</think>")
-        if start < end:
-            reasoning = text[start + len("<think>") : end].strip()
-            content = (text[:start] + text[end + len("</think>") :]).strip()
-            return reasoning or None, content
-
-    if "<|channel>thought" in text and "<channel|>" in text:
-        start_marker = "<|channel>thought"
-        end_marker = "<channel|>"
+    for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
         start = text.find(start_marker)
-        end = text.find(end_marker, start)
-        if start < end:
+        end = text.find(end_marker, start if start >= 0 else 0)
+        if start >= 0 and start < end:
             reasoning = text[start + len(start_marker) : end].strip()
             content = (text[:start] + text[end + len(end_marker) :]).strip()
             return reasoning or None, content
 
+        if end_marker in text:
+            reasoning, content = text.split(end_marker, 1)
+            reasoning = _clean_reasoning(reasoning, start_marker)
+            return reasoning or None, content.strip()
+
+        if start_marker in text:
+            reasoning = _clean_reasoning(text, start_marker)
+            return reasoning or None, ""
+
     return None, text.strip()
+
+
+def _response_output_items_from_text(
+    full_text: str,
+    message_id: str,
+    tool_module: Any,
+    chat_tools: List[Any],
+    tool_registry: Dict[str, str],
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
+    reasoning, content = _split_thinking(
+        full_text, thinking_start_token, thinking_end_token
+    )
+    if tool_module is not None and chat_tools:
+        tc = process_tool_calls(full_text, tool_module, chat_tools)
+        if tc["calls"]:
+            items = [
+                _tool_call_to_response_item(call, tool_registry) for call in tc["calls"]
+            ]
+            _, remaining = _split_thinking(
+                tc.get("remaining_text") or "",
+                thinking_start_token,
+                thinking_end_token,
+            )
+            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
+            return items, remaining, reasoning, "tool_calls"
+    item = {
+        "id": message_id,
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": content, "annotations": []}],
+    }
+    if reasoning:
+        item["reasoning"] = reasoning
+    return [item], content, reasoning, "stop"
 
 
 def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:
@@ -408,32 +585,3 @@ def _tool_call_to_response_item(
         "arguments": arguments,
         "status": "completed",
     }
-
-
-def _response_output_items_from_text(
-    full_text: str,
-    message_id: str,
-    tool_module: Any,
-    chat_tools: List[Any],
-    tool_registry: Dict[str, str],
-) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
-    reasoning, content = _split_thinking(full_text)
-    if tool_module is not None and chat_tools:
-        tc = process_tool_calls(full_text, tool_module, chat_tools)
-        if tc["calls"]:
-            items = [
-                _tool_call_to_response_item(call, tool_registry) for call in tc["calls"]
-            ]
-            _, remaining = _split_thinking(tc.get("remaining_text") or "")
-            remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
-            return items, remaining, reasoning, "tool_calls"
-    item = {
-        "id": message_id,
-        "type": "message",
-        "status": "completed",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": content, "annotations": []}],
-    }
-    if reasoning:
-        item["reasoning"] = reasoning
-    return [item], content, reasoning, "stop"
