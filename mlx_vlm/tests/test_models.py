@@ -5315,6 +5315,59 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "gemma4_unified")
 
+    def test_gemma4_unified_updates_chunked_prefill_for_visual_bidir(self):
+        from mlx_vlm.models import gemma4_unified
+
+        model = gemma4_unified.Model(
+            gemma4_unified.ModelConfig(
+                text_config=gemma4_unified.TextConfig(
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=1,
+                    num_key_value_heads=1,
+                    num_global_key_value_heads=1,
+                    head_dim=8,
+                    global_head_dim=8,
+                    vocab_size=64,
+                    vocab_size_per_layer_input=64,
+                    hidden_size_per_layer_input=0,
+                    sliding_window=8,
+                    sliding_window_pattern=1,
+                    layer_types=["full_attention"],
+                    use_bidirectional_attention="vision",
+                ),
+                vision_config=None,
+                audio_config=None,
+                vocab_size=64,
+                hidden_size=8,
+                image_token_id=31,
+                audio_token_id=30,
+                video_token_id=29,
+            )
+        )
+
+        input_ids = mx.array([[1, 2, 3]])
+        text_only_types = mx.array([[0, 0, 0]])
+        visual_types = mx.array([[0, 1, 1, 0]])
+        mixed_audio_types = mx.array([[0, 1, 1, 3]])
+
+        model.get_input_embeddings(input_ids, mm_token_type_ids=text_only_types)
+        self.assertFalse(model.no_chunked_prefill)
+        self.assertFalse(model.language_model.no_chunked_prefill)
+
+        model.get_input_embeddings(
+            mx.array([[1, 2, 3, 4]]), mm_token_type_ids=visual_types
+        )
+        self.assertTrue(model.no_chunked_prefill)
+        self.assertTrue(model.language_model.no_chunked_prefill)
+
+        model.get_input_embeddings(
+            mx.array([[1, 2, 3, 4]]), mm_token_type_ids=mixed_audio_types
+        )
+        self.assertFalse(model.no_chunked_prefill)
+        self.assertFalse(model.language_model.no_chunked_prefill)
+
     def test_gemma4_unified_vision_tokens_use_bidirectional_mask(self):
         from mlx_vlm.models import gemma4_unified
         from mlx_vlm.models.gemma4.language import Gemma4TextModel
@@ -5344,6 +5397,62 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertTrue(bool(mask[0, 0, 1, 2].item()))
         self.assertFalse(bool(mask[0, 0, 0, 2].item()))
         self.assertTrue(bool(mask[0, 0, 3, 2].item()))
+
+    def test_gemma4_unified_text_only_mm_ids_keep_causal_mask(self):
+        from mlx_vlm.models import gemma4_unified
+        from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+        config = gemma4_unified.TextConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            intermediate_size=16,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            hidden_size_per_layer_input=0,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=["full_attention"],
+            use_bidirectional_attention="vision",
+        )
+        model = Gemma4TextModel(config)
+        hidden_states = mx.zeros((1, 4, config.hidden_size))
+        mm_token_type_ids = mx.array([[0, 0, 0, 0]])
+
+        mask = model._make_masks(hidden_states, [None], mm_token_type_ids)[0]
+
+        self.assertEqual(mask, "causal")
+
+    def test_gemma4_full_attention_cached_chunk_uses_causal_mask(self):
+        from mlx_vlm.models import cache, gemma4_unified
+        from mlx_vlm.models.gemma4.language import Gemma4TextModel
+
+        config = gemma4_unified.TextConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            intermediate_size=16,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            hidden_size_per_layer_input=0,
+            sliding_window=8,
+            sliding_window_pattern=1,
+            layer_types=["full_attention"],
+        )
+        model = Gemma4TextModel(config)
+        hidden_states = mx.zeros((1, 4, config.hidden_size))
+        kv_cache = cache.KVCache()
+        kv_cache.offset = 8
+
+        mask = model._make_masks(hidden_states, [kv_cache])[0]
+
+        self.assertEqual(mask, "causal")
 
     def test_gemma4_unified_audio_tokens_keep_vision_mask_causal(self):
         from mlx_vlm.models import gemma4_unified
