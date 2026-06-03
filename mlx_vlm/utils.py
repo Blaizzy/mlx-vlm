@@ -56,13 +56,20 @@ SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
 
 def _e4m3_decode_table() -> mx.array:
+    """Return a 256-entry ``float32`` LUT mapping every E4M3FN byte to its value.
+
+    OCP ``E4M3FN``: 1 sign / 4 exponent (bias 7) / 3 mantissa bits,
+    no infinities, and ``(exp=15, mant=7)`` reserved for NaN (max finite
+    magnitude is therefore 448). This matches the byte convention MLX uses for
+    ``nvfp4`` scales (verified empirically).
+    """
     table = []
     for byte in range(256):
         sign = (byte >> 7) & 1
         exponent = (byte >> 3) & 0xF
         mantissa = byte & 0x7
         if exponent == 0:
-            value = (mantissa / 8.0) * 2.0**-6
+            value = (mantissa / 8.0) * 2.0**-6  # subnormal
         elif exponent == 15 and mantissa == 7:
             value = float("nan")
         else:
@@ -71,32 +78,44 @@ def _e4m3_decode_table() -> mx.array:
     return mx.array(table, dtype=mx.float32)
 
 
+# Built once; reused by every NVFP4 fold.
 _E4M3_DECODE_LUT = _e4m3_decode_table()
 
 
 def _f32_to_e4m3(x: mx.array) -> mx.array:
+    """Encode non-negative ``float32`` values to ``E4M3FN`` bytes.
+
+    Pure-MLX bit manipulation (MLX exposes no float8 dtype). Saturates to 448
+    on overflow and flushes to the subnormal grid / zero on underflow. Inputs
+    are assumed ``>= 0`` (NVFP4 group scales are magnitudes), so the sign bit is
+    always 0.
+    """
     x = mx.maximum(x.astype(mx.float32), 0.0)
     bits = x.view(mx.uint32)
-    fexp = (bits >> 23) & 0xFF
-    fman = bits & 0x7FFFFF
+    fexp = (bits >> 23) & 0xFF  # fp32 exponent, bias 127
+    fman = bits & 0x7FFFFF  # fp32 mantissa, 23 bits
 
+    # Normal path: target E4M3 biased exponent e = (fexp - 127) + 7.
     exponent = fexp.astype(mx.int32) - 120
-    drop = 20
+    drop = 20  # 23 -> 3 mantissa bits
     round_bit = (fman >> (drop - 1)) & 1
     sticky = (fman & ((1 << (drop - 1)) - 1)) != 0
     mantissa = fman >> drop
     roundup = round_bit & (sticky.astype(mx.uint32) | (mantissa & 1))
     mantissa = mantissa + roundup
-    carry = mantissa >> 3
+    carry = mantissa >> 3  # mantissa overflowed past 7 -> bump exponent
     mantissa = mantissa & 0x7
     exponent = exponent + carry.astype(mx.int32)
 
+    # Saturate: e > 15, or the NaN slot (e == 15, mant == 7), clamps to 448.
     over = (exponent > 15) | ((exponent == 15) & (mantissa == 7))
     exponent = mx.where(over, mx.array(15, mx.int32), exponent)
     mantissa = mx.where(over, mx.array(6, mx.uint32), mantissa)
     normal_byte = (exponent.astype(mx.uint32) << 3) | mantissa
     normal_valid = exponent >= 1
 
+    # Subnormal path: value = m * 2^-9, so m = round(x * 512) (RNE).
+    # m == 8 lands exactly on the smallest normal (0x08 = e1 m0 = 2^-6).
     sub = x * 512.0
     sub_floor = mx.floor(sub)
     frac = sub - sub_floor
@@ -112,6 +131,27 @@ def _transform_compressed_tensors_nvfp4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Dict[str, mx.array]:
+    """Fold compressed-tensors NVFP4 weights into MLX-native ``nvfp4`` weights.
+
+    A ``nvfp4-pack-quantized`` checkpoint stores, per quantized Linear:
+
+    - ``<p>.weight_packed``       ``uint8``  ``[out, in // 2]``
+      (2x E2M1 per byte)
+    - ``<p>.weight_scale``        ``uint8``  ``[out, in // 16]``
+      (E4M3 per group of 16, loaded by ``mx.load`` as raw bytes -- the same
+      byte layout MLX uses for nvfp4 scales)
+    - ``<p>.weight_global_scale`` ``float32`` ``[1]`` (per-tensor; the real
+      weight is ``fp4 * weight_scale / weight_global_scale``)
+
+    MLX ``nvfp4`` ``QuantizedLinear`` expects ``<p>.weight`` (``uint32``) plus
+    ``<p>.scales`` (``uint8`` E4M3) and is single-level: the per-tensor global
+    scale is not representable (and is rejected on the Metal backend). Both
+    decodes are linear in the FP4 codes, so the global scale can be folded
+    directly into the per-group E4M3 scales:
+    ``scale_mlx = E4M3(weight_scale / global_scale)``. We keep the original
+    packed E2M1 codes bit-exact, avoiding the weight dequantize/re-quantize
+    round-trip entirely.
+    """
     packed_suffix = ".weight_packed"
 
     new_weights = {}
@@ -122,10 +162,18 @@ def _transform_compressed_tensors_nvfp4_weights(
             scale = weights[f"{prefix}.weight_scale"]
             global_scale = weights[f"{prefix}.weight_global_scale"].astype(mx.float32)
 
+            # weight_packed is uint8 [out, in//2]; reinterpret as uint32
+            # [out, in//8] to match MLX's nvfp4 layout (bit-identical).
             new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
+
+            # Fold the per-tensor global scale into the per-group E4M3 scales:
+            # decode E4M3 -> divide by global scale -> re-encode E4M3.
+            # The FP4 codes are untouched; only the much smaller scale tensor
+            # is re-rounded once.
             decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
             new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
         elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
+            # Consumed alongside their ``.weight_packed``.
             continue
         else:
             new_weights[key] = weights[key]
@@ -137,6 +185,22 @@ def _transform_compressed_tensors_int4_weights(
     weights: Dict[str, mx.array],
     quantization_config: Dict[str, Any],
 ) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
+    """Remap compressed-tensors INT4 ``pack-quantized`` weights to MLX affine.
+
+    A symmetric int4 ``pack-quantized`` checkpoint stores, per quantized Linear:
+
+    - ``<p>.weight_packed`` ``int32`` ``[out, in // 8]``
+      (8x int4 per word, LSB-first)
+    - ``<p>.weight_scale``  (``bf16``/``float``)
+      ``[out, in // group_size]``
+    - ``<p>.weight_shape``  ``int64`` ``[2]`` (unused by MLX)
+
+    MLX affine ``QuantizedLinear`` uses the same int4 packing and dequantizes as
+    ``w * scale + bias``. Symmetric int4 stores values in ``[0, 15]``
+    representing ``[-8, 7]``, i.e. ``value = packed - 8``, so we set
+    ``bias = -8 * scale``. The packed ``int32`` is bit-identical to MLX's
+    ``uint32`` layout (reinterpreted via ``view``).
+    """
     weights_cfg = (
         quantization_config.get("config_groups", {})
         .get("group_0", {})
@@ -155,6 +219,7 @@ def _transform_compressed_tensors_int4_weights(
             new_weights[f"{prefix}.scales"] = scale
             new_weights[f"{prefix}.biases"] = -(2 ** (bits - 1)) * scale
         elif key.endswith(".weight_scale") or key.endswith(".weight_shape"):
+            # Consumed alongside their ``.weight_packed`` (shape is unused).
             continue
         else:
             new_weights[key] = weights[key]
@@ -166,6 +231,11 @@ def _transform_compressed_tensors_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Transform compressed-tensors weights before model-specific sanitization.
+
+    This runs before MoE expert stacking so per-expert tensors have already been
+    renamed to MLX-native ``.weight`` / ``.scales`` / ``.biases`` keys.
+    """
     if quantization_config is None:
         return weights, None
     if quantization_config.get("quant_method") != "compressed-tensors":
