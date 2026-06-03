@@ -33,6 +33,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -1433,9 +1434,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split
-                        in_thinking = False
-                        accumulated = ""
+                        thinking_state = ThinkingStreamState(gen_args.enable_thinking)
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -1453,35 +1452,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if token is None:
                                 break
                             output_tokens += 1
-                            accumulated += token.text
                             full_output += token.text
                             metrics.record_chunk(token)
 
                             # Detect thinking boundaries
-                            delta_reasoning = None
-                            delta_content = None
-
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
-                            ):
-                                in_thinking = True
-                                accumulated = ""
-                                # Don't emit opening tag tokens
-                            elif in_thinking and (
-                                "<channel|>" in accumulated or "</think>" in accumulated
-                            ):
-                                in_thinking = False
-                                accumulated = ""
-                                # Don't emit closing tag tokens
-                            elif in_thinking:
-                                delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
-                            ):
-                                pass  # Partial tag, don't emit yet
-                            else:
-                                delta_content = token.text
+                            thinking_delta = thinking_state.feed(token.text)
+                            delta_reasoning = thinking_delta.reasoning
+                            delta_content = thinking_delta.content
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -1505,8 +1482,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             # Skip empty deltas (e.g. suppressed tool-call tokens)
                             has_payload = (
-                                delta_content is not None
-                                or delta_reasoning is not None
+                                bool(delta_content)
+                                or bool(delta_reasoning)
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
@@ -1590,6 +1567,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
+                        thinking_state = ThinkingStreamState(gen_args.enable_thinking)
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1602,11 +1580,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            if chunk.text:
+                            thinking_delta = thinking_state.feed(chunk.text)
+                            if thinking_delta.content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
-                                            role="assistant", content=chunk.text
+                                            role="assistant",
+                                            content=thinking_delta.content,
+                                            reasoning=thinking_delta.reasoning,
                                         )
                                     )
                                 ]

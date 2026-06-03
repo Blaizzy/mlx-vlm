@@ -29,6 +29,35 @@ def client():
         yield test_client
 
 
+def _gemma_thinking_channel_chunks():
+    return [
+        server.StreamingToken(text="", token=100, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=45518, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=107, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=101, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=236832, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text="<|channel>thought\n<channel|>7",
+            token=808,
+            logprobs=0.0,
+            finish_reason=None,
+        ),
+        server.StreamingToken(
+            text=" *", token=236743, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="", token=236828, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text=" 8", token=578, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text=" =", token=236743, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="", token=236810, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=236825, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text=" 56", token=106, logprobs=0.0, finish_reason="stop"
+        ),
+    ]
+
+
 @pytest.mark.parametrize("value", [224, "22", [1.0], [1.5], [True], [1, 2, 3]])
 def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     response = client.post(
@@ -1600,6 +1629,60 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].logit_bias == {12: -1.5}
 
 
+def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                _gemma_thinking_channel_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "What's 7*8?"}],
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+    assert "<|channel>" not in response.text
+    assert "<channel|>" not in response.text
+
+
 @pytest.mark.parametrize(
     "audio_data_factory",
     [
@@ -2359,6 +2442,57 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
     assert '"cache_read_input_tokens": 2' in body
     assert '"input_tokens": 1' in body
     assert "event: message_stop" in body
+
+
+def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                _gemma_thinking_channel_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "What's 7*8?"}],
+                "max_tokens": 16,
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = [
+        event["delta"] for event in events if event.get("type") == "content_block_delta"
+    ]
+
+    assert "".join(delta.get("text") or "" for delta in deltas) == "7 * 8 = 56"
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == ""
+    assert "<|channel>" not in response.text
+    assert "<channel|>" not in response.text
 
 
 def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
@@ -3925,6 +4059,39 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(text)
         assert reasoning == "Only thinking."
         assert content == ""
+
+
+class TestThinkingStreamState:
+    """Tests for streaming thinking tag parsing."""
+
+    @pytest.mark.parametrize("enable_thinking", [False, True])
+    def test_gemma_channel_markers_and_content_in_same_delta(self, enable_thinking):
+        state = server.ThinkingStreamState(enable_thinking=enable_thinking)
+        reasoning = []
+        content = []
+
+        for token in _gemma_thinking_channel_chunks():
+            delta = state.feed(token.text)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == ""
+        assert "".join(content) == "7 * 8 = 56"
+
+    def test_think_close_can_emit_reasoning_tail_and_content(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+
+        first = state.feed("thinking")
+        second = state.feed(" tail</think>\n\nAnswer")
+
+        assert first.reasoning == "thinking"
+        assert first.content is None
+        assert first.thinking_closed is False
+        assert second.reasoning == " tail"
+        assert second.content == "Answer"
+        assert second.thinking_closed is True
 
 
 class TestChatMessageSchema:

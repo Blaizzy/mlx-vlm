@@ -20,6 +20,113 @@ class StoredResponse:
     previous_response_id: Optional[str] = None
 
 
+@dataclass
+class ThinkingStreamDelta:
+    reasoning: Optional[str] = None
+    content: Optional[str] = None
+    thinking_closed: bool = False
+
+
+class ThinkingStreamState:
+    """Split streamed thinking delimiters from user-visible content."""
+
+    _OPEN_CLOSE_MARKERS = (
+        ("<|channel>thought", "<channel|>"),
+        ("<think>", "</think>"),
+    )
+    _OPEN_MARKERS = tuple(marker for marker, _ in _OPEN_CLOSE_MARKERS)
+    _CLOSE_MARKERS = tuple(marker for _, marker in _OPEN_CLOSE_MARKERS)
+
+    def __init__(self, enable_thinking: bool = False):
+        self.in_thinking = bool(enable_thinking)
+        self.thinking_done = False
+        self.buffer = ""
+
+    def feed(self, text: str) -> ThinkingStreamDelta:
+        self.buffer += text or ""
+        reasoning = []
+        content = []
+        thinking_closed = False
+
+        while self.buffer:
+            if self.in_thinking:
+                idx, marker = self._find_first(self.buffer, self._CLOSE_MARKERS)
+                if idx < 0:
+                    emit, self.buffer = self._split_partial(
+                        self.buffer, self._CLOSE_MARKERS
+                    )
+                    emit = self._strip_open_marker(emit)
+                    if emit:
+                        reasoning.append(emit)
+                    break
+
+                before = self._strip_open_marker(self.buffer[:idx])
+                if before:
+                    reasoning.append(before)
+
+                self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+                self.in_thinking = False
+                self.thinking_done = True
+                thinking_closed = True
+                continue
+
+            if self.thinking_done:
+                content.append(self.buffer)
+                self.buffer = ""
+                break
+
+            idx, marker = self._find_first(self.buffer, self._OPEN_MARKERS)
+            if idx < 0:
+                emit, self.buffer = self._split_partial(self.buffer, self._OPEN_MARKERS)
+                if emit:
+                    content.append(emit)
+                break
+
+            if idx:
+                content.append(self.buffer[:idx])
+
+            self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
+            self.in_thinking = True
+
+        return ThinkingStreamDelta(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+            thinking_closed=thinking_closed,
+        )
+
+    @classmethod
+    def _find_first(cls, text: str, markers: Tuple[str, ...]) -> Tuple[int, str]:
+        found_idx = -1
+        found_marker = ""
+        for marker in markers:
+            idx = text.find(marker)
+            if idx >= 0 and (found_idx < 0 or idx < found_idx):
+                found_idx = idx
+                found_marker = marker
+        return found_idx, found_marker
+
+    @classmethod
+    def _split_partial(cls, text: str, markers: Tuple[str, ...]) -> Tuple[str, str]:
+        hold = 0
+        for marker in markers:
+            max_len = min(len(marker) - 1, len(text))
+            for length in range(max_len, 0, -1):
+                if text.endswith(marker[:length]):
+                    hold = max(hold, length)
+                    break
+        if hold:
+            return text[:-hold], text[-hold:]
+        return text, ""
+
+    @classmethod
+    def _strip_open_marker(cls, text: str) -> str:
+        for marker in cls._OPEN_MARKERS:
+            if marker in text:
+                before, after = text.split(marker, 1)
+                return before + after.lstrip("\n")
+        return text
+
+
 response_store: Dict[str, StoredResponse] = {}
 response_store_order: deque = deque()
 response_store_lock = Lock()
