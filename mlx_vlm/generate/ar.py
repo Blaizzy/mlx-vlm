@@ -538,6 +538,8 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "full_text_row_masked_out_mask",
     "position_ids",
     "pos_hw",
+    "mm_token_type_ids",
+    "token_type_ids",
 }
 
 APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
@@ -2975,7 +2977,7 @@ def _generate_batch(
 
     add_special_tokens = (
         getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
         else True
     )
 

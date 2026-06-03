@@ -369,6 +369,7 @@ class Gemma4VideoProcessor:
 class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
+    model_type = "gemma4"
     attributes = ["image_processor", "tokenizer"]
     image_processor_class = "Gemma4ImageProcessor"
     tokenizer_class = "AutoTokenizer"
@@ -467,6 +468,7 @@ class Gemma4Processor(ProcessorMixin):
         audio: Optional[List] = None,
         videos: Optional[List] = None,
         fps: Optional[Union[float, List[float]]] = None,
+        return_mm_token_type_ids: bool = True,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and audio is None and videos is None:
@@ -602,8 +604,6 @@ class Gemma4Processor(ProcessorMixin):
             ]
 
         # ── Tokenize text ───────────────────────────────────────────────
-        # Pop return_mm_token_type_ids before passing remaining kwargs to tokenizer
-        return_mm_token_type_ids = kwargs.pop("return_mm_token_type_ids", False)
         text_inputs = self.tokenizer(text=text, **kwargs)
 
         # Generate multimodal token type IDs
@@ -612,11 +612,11 @@ class Gemma4Processor(ProcessorMixin):
             mm_token_type_ids = np.zeros_like(array_ids)
             if self.image_token_id is not None:
                 mm_token_type_ids[array_ids == self.image_token_id] = 1
-            if self.audio_token_id is not None:
-                mm_token_type_ids[array_ids == self.audio_token_id] = 2
             if self.video_token_id is not None:
-                mm_token_type_ids[array_ids == self.video_token_id] = 3
-            text_inputs["token_type_ids"] = mm_token_type_ids.tolist()
+                mm_token_type_ids[array_ids == self.video_token_id] = 2
+            if self.audio_token_id is not None:
+                mm_token_type_ids[array_ids == self.audio_token_id] = 3
+            text_inputs["mm_token_type_ids"] = mm_token_type_ids.tolist()
 
         # num_frames_per_video is Python-side metadata; keep it out of to_mlx
         video_meta = {}
@@ -653,10 +653,138 @@ class Gemma4Processor(ProcessorMixin):
                 config.setdefault("audio_ms_per_token", self.audio_ms_per_token)
                 config_path.write_text(json.dumps(config, indent=2))
 
+    def _extract_media_from_messages(self, messages):
+        images, audio, videos = [], [], []
+        counts = {"images": 0, "audio": 0, "videos": 0}
+
+        def _source(item, *keys):
+            for key in keys:
+                value = item.get(key)
+                if isinstance(value, dict):
+                    value = (
+                        value.get("url")
+                        or value.get("path")
+                        or value.get("data")
+                        or value.get("bytes")
+                    )
+                if value is not None:
+                    return value
+            return None
+
+        def _walk(content):
+            if not isinstance(content, list):
+                return
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type in {"image", "input_image", "image_url"}:
+                    counts["images"] += 1
+                    src = _source(item, "image", "image_url", "url")
+                    if src is not None:
+                        images.append(src)
+                elif item_type in {"audio", "input_audio", "audio_url"}:
+                    counts["audio"] += 1
+                    src = _source(item, "audio", "input_audio", "audio_url", "url")
+                    if src is not None:
+                        audio.append(src)
+                elif item_type in {"video", "input_video", "video_url"}:
+                    counts["videos"] += 1
+                    src = _source(item, "video", "input_video", "video_url", "url")
+                    if src is not None:
+                        videos.append(src)
+
+        if isinstance(messages, dict):
+            _walk(messages.get("content"))
+        elif isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict):
+                    _walk(message.get("content"))
+
+        return images, audio, videos, counts
+
+    @staticmethod
+    def _as_list(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        return [value]
+
     def apply_chat_template(self, messages, **kwargs):
+        """Render Gemma 4 multimodal chat and optionally prepare MLX inputs.
+
+        Hugging Face tokenizers only render text. For Gemma 4 processors we also
+        accept image/audio/video payloads embedded in message content and, when
+        requested, return the full multimodal tensor dictionary.
+        """
+        from ...prompt_utils import apply_chat_template as _apply_chat_template
+        from ...utils import prepare_inputs
+
         kwargs.setdefault("enable_thinking", False)
-        kwargs.setdefault("tokenize", False)
-        return self.tokenizer.apply_chat_template(messages, **kwargs)
+        tokenize = kwargs.pop("tokenize", False)
+        return_dict = kwargs.pop("return_dict", False)
+        return_tensors = kwargs.pop("return_tensors", "mlx")
+        add_generation_prompt = kwargs.pop("add_generation_prompt", True)
+
+        explicit_images = kwargs.pop("images", None)
+        explicit_images = kwargs.pop("image", explicit_images)
+        explicit_audio = kwargs.pop("audio", None)
+        explicit_videos = kwargs.pop("videos", None)
+        explicit_videos = kwargs.pop("video", explicit_videos)
+
+        processor_kwargs = {}
+        for key in (
+            "padding",
+            "padding_side",
+            "pad_to_uniform_size",
+            "resize_shape",
+            "return_mm_token_type_ids",
+            "truncation",
+            "max_length",
+        ):
+            if key in kwargs:
+                processor_kwargs[key] = kwargs.pop(key)
+
+        extracted_images, extracted_audio, extracted_videos, counts = (
+            self._extract_media_from_messages(messages)
+        )
+        images = self._as_list(explicit_images) or extracted_images
+        audio = self._as_list(explicit_audio) or extracted_audio
+        videos = self._as_list(explicit_videos) or extracted_videos
+
+        num_images = counts["images"] or len(images)
+        num_audios = counts["audio"] or len(audio)
+
+        model_type = getattr(self, "model_type", "gemma4")
+        prompt = _apply_chat_template(
+            self.tokenizer,
+            {"model_type": model_type},
+            messages,
+            add_generation_prompt=add_generation_prompt,
+            num_images=num_images,
+            num_audios=num_audios,
+            **kwargs,
+        )
+
+        if not tokenize:
+            return prompt
+
+        inputs = prepare_inputs(
+            self,
+            images=images or None,
+            audio=audio or None,
+            videos=videos or None,
+            prompts=prompt,
+            return_tensors=return_tensors,
+            add_special_tokens=False,
+            **processor_kwargs,
+        )
+        if return_dict:
+            return inputs
+        return inputs["input_ids"]
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -666,7 +794,7 @@ class Gemma4Processor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        tokenizer_input_names = self.tokenizer.model_input_names + ["token_type_ids"]
+        tokenizer_input_names = self.tokenizer.model_input_names + ["mm_token_type_ids"]
         image_processor_input_names = self.image_processor.model_input_names
         all_names = list(tokenizer_input_names + image_processor_input_names)
         return list(dict.fromkeys(all_names))

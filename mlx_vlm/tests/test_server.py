@@ -29,6 +29,35 @@ def client():
         yield test_client
 
 
+def _gemma_thinking_channel_chunks():
+    return [
+        server.StreamingToken(text="", token=100, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=45518, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=107, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=101, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=236832, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text="<|channel>thought\n<channel|>7",
+            token=808,
+            logprobs=0.0,
+            finish_reason=None,
+        ),
+        server.StreamingToken(
+            text=" *", token=236743, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="", token=236828, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text=" 8", token=578, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text=" =", token=236743, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="", token=236810, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=236825, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text=" 56", token=106, logprobs=0.0, finish_reason="stop"
+        ),
+    ]
+
+
 @pytest.mark.parametrize("value", [224, "22", [1.0], [1.5], [True], [1, 2, 3]])
 def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     response = client.post(
@@ -1600,6 +1629,121 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].logit_bias == {12: -1.5}
 
 
+def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                _gemma_thinking_channel_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "What's 7*8?"}],
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+    assert "<|channel>" not in response.text
+    assert "<channel|>" not in response.text
+
+
+def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
+    assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
+
+
 @pytest.mark.parametrize(
     "audio_data_factory",
     [
@@ -2038,6 +2182,49 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
 
 
+def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
+    client, monkeypatch
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=4, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "system": "Use short answers.",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "Be precise."}],
+                    },
+                    {"role": "user", "content": "Introduce the project."},
+                ],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {"role": "system", "content": "Use short answers.\nBe precise."},
+        {"role": "user", "content": "Hello"},
+        {"role": "user", "content": "Introduce the project."},
+    ]
+
+
 def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
@@ -2359,6 +2546,115 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
     assert '"cache_read_input_tokens": 2' in body
     assert '"input_tokens": 1' in body
     assert "event: message_stop" in body
+
+
+def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                _gemma_thinking_channel_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "What's 7*8?"}],
+                "max_tokens": 16,
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = [
+        event["delta"] for event in events if event.get("type") == "content_block_delta"
+    ]
+
+    assert "".join(delta.get("text") or "" for delta in deltas) == "7 * 8 = 56"
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == ""
+    assert "<|channel>" not in response.text
+    assert "<channel|>" not in response.text
+
+
+def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                [
+                    server.StreamingToken(
+                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 16,
+                "stream": True,
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = [
+        event["delta"] for event in events if event.get("type") == "content_block_delta"
+    ]
+
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
+    assert "".join(delta.get("text") or "" for delta in deltas) == "Custom answer."
 
 
 def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
@@ -3925,6 +4221,61 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(text)
         assert reasoning == "Only thinking."
         assert content == ""
+
+    def test_custom_thinking_markers(self):
+        text = "<analysis>Custom reasoning.</analysis>Custom answer."
+        reasoning, content = server._split_thinking(text, "<analysis>", "</analysis>")
+        assert reasoning == "Custom reasoning."
+        assert content == "Custom answer."
+
+
+class TestThinkingStreamState:
+    """Tests for streaming thinking tag parsing."""
+
+    @pytest.mark.parametrize("enable_thinking", [False, True])
+    def test_gemma_channel_markers_and_content_in_same_delta(self, enable_thinking):
+        state = server.ThinkingStreamState(enable_thinking=enable_thinking)
+        reasoning = []
+        content = []
+
+        for token in _gemma_thinking_channel_chunks():
+            delta = state.feed(token.text)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == ""
+        assert "".join(content) == "7 * 8 = 56"
+
+    def test_think_close_can_emit_reasoning_tail_and_content(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+
+        first = state.feed("thinking")
+        second = state.feed(" tail</think>\n\nAnswer")
+
+        assert first.reasoning == "thinking"
+        assert first.content is None
+        assert first.thinking_closed is False
+        assert second.reasoning == " tail"
+        assert second.content == "Answer"
+        assert second.thinking_closed is True
+
+    def test_custom_markers_split_same_delta_content(self):
+        state = server.ThinkingStreamState(
+            enable_thinking=False,
+            thinking_start_token="<analysis>",
+            thinking_end_token="</analysis>",
+        )
+
+        first = state.feed("<ana")
+        second = state.feed("lysis>Custom reasoning.</analysis>Custom answer.")
+
+        assert first.reasoning is None
+        assert first.content is None
+        assert second.reasoning == "Custom reasoning."
+        assert second.content == "Custom answer."
+        assert second.thinking_closed is True
 
 
 class TestChatMessageSchema:

@@ -17,6 +17,7 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 import mlx_vlm.models.deepseek_v4.language as deepseek_language
+import mlx_vlm.models.gemma4.language as gemma4_language
 import mlx_vlm.models.qwen3_5.language as qwen_language
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import (
@@ -42,6 +43,7 @@ from mlx_vlm.speculative.drafters.deepseek_v4_mtp.split import split_deepseek_v4
 from mlx_vlm.speculative.drafters.eagle3 import Eagle3DraftModel
 from mlx_vlm.speculative.drafters.eagle3 import ModelConfig as Eagle3Config
 from mlx_vlm.speculative.drafters.eagle3 import TextConfig as Eagle3TextConfig
+from mlx_vlm.speculative.drafters.gemma4_assistant import Gemma4AssistantDraftModel
 from mlx_vlm.speculative.drafters.gemma4_assistant.masked_embedder import MaskedEmbedder
 from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     make_drafter_masks,
@@ -249,7 +251,12 @@ MTP_DRAFTER_COMPAT_CASES = [
     pytest.param(
         "gemma4_assistant",
         "backbone_hidden_size",
-        id="backbone-hidden-size",
+        id="gemma4-backbone-hidden-size",
+    ),
+    pytest.param(
+        "gemma4_unified_assistant",
+        "backbone_hidden_size",
+        id="gemma4-unified-backbone-hidden-size",
     ),
     pytest.param(
         "qwen3_5_mtp",
@@ -262,6 +269,26 @@ MTP_DRAFTER_COMPAT_CASES = [
         id="target-hidden-size",
     ),
 ]
+
+
+def test_gemma4_rollback_speculative_cache_accepts_python_list():
+    class DummyCache:
+        keys = None
+
+        def __init__(self):
+            self.trims = []
+
+        def trim(self, n):
+            self.trims.append(n)
+
+    cache = DummyCache()
+
+    max_a = gemma4_language.LanguageModel.rollback_speculative_cache(
+        SimpleNamespace(), [cache], None, [0, 2], block_size=4
+    )
+
+    assert max_a == 2
+    assert cache.trims == [1]
 
 
 def test_qwen_rollback_speculative_cache_flattens_batch_per_layer():
@@ -2166,6 +2193,12 @@ def test_kind_none_autodetects_mtp_for_gemma4_assistant(tmp_path):
     assert resolve_drafter_kind(path) == "mtp"
 
 
+def test_kind_none_autodetects_mtp_for_gemma4_unified_assistant(tmp_path):
+    path = _make_drafter_dir(tmp_path, "gemma4_unified_assistant")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path) == "mtp"
+
+
 def test_kind_none_autodetects_mtp_for_qwen3_5_mtp(tmp_path):
     path = _make_drafter_dir(tmp_path, "qwen3_5_mtp")
     assert resolve_drafter_kind(path, None) == "mtp"
@@ -2219,6 +2252,7 @@ def test_mtp_drafter_compatibility_rejects_mismatched_target(
     "model_type",
     [
         "gemma4_assistant",
+        "gemma4_unified_assistant",
         "qwen3_5_mtp",
         "deepseek_v4_mtp",
         "custom_mtp",
@@ -2248,6 +2282,30 @@ def test_model_loader_uses_speculators_model_type_for_eagle3_config():
 
     assert model_type == "eagle3"
     assert arch.Model is Eagle3DraftModel
+
+
+def test_model_loader_uses_gemma4_unified_assistant_drafter():
+    arch, model_type = get_model_and_args({"model_type": "gemma4_unified_assistant"})
+
+    assert model_type == "gemma4_unified_assistant"
+    assert arch.Model is Gemma4AssistantDraftModel
+
+    config = arch.ModelConfig.from_dict(
+        {
+            "model_type": "gemma4_unified_assistant",
+            "backbone_hidden_size": 3840,
+            "text_config": {
+                "model_type": "gemma4_unified_text",
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "num_kv_shared_layers": 0,
+            },
+        }
+    )
+    assert config.model_type == "gemma4_unified_assistant"
+    assert config.backbone_hidden_size == 3840
+    assert config.text_config.model_type == "gemma4_unified_text"
+    assert config.text_config.num_kv_shared_layers == 4
 
 
 def test_kind_none_falls_back_to_default_for_unknown_model_type(tmp_path):
