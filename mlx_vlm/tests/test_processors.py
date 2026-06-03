@@ -347,6 +347,21 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
 
         self.assertEqual(result["mm_token_type_ids"].tolist()[0][:3], [1, 2, 3])
 
+    def test_prepare_inputs_respects_mm_token_type_ids_override(self):
+        from mlx_vlm.utils import prepare_inputs
+
+        processor, tokenizer = self._make_gemma4_unified_processor()
+        image = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8))
+
+        result = prepare_inputs(
+            processor,
+            images=[image],
+            prompts=tokenizer.image_token + "describe",
+            return_mm_token_type_ids=False,
+        )
+
+        self.assertNotIn("mm_token_type_ids", result)
+
 
 # ── Base class with shared test_with_image / test_text_only ───────────────────
 

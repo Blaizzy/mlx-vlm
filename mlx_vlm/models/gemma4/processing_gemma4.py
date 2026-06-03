@@ -468,6 +468,7 @@ class Gemma4Processor(ProcessorMixin):
         audio: Optional[List] = None,
         videos: Optional[List] = None,
         fps: Optional[Union[float, List[float]]] = None,
+        return_mm_token_type_ids: bool = True,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and audio is None and videos is None:
@@ -479,7 +480,6 @@ class Gemma4Processor(ProcessorMixin):
 
         # Pop return_tensors - we handle conversion ourselves via to_mlx()
         kwargs.pop("return_tensors", None)
-        kwargs.setdefault("return_mm_token_type_ids", True)
 
         if isinstance(text, str):
             text = [text]
@@ -604,8 +604,6 @@ class Gemma4Processor(ProcessorMixin):
             ]
 
         # ── Tokenize text ───────────────────────────────────────────────
-        # Pop return_mm_token_type_ids before passing remaining kwargs to tokenizer
-        return_mm_token_type_ids = kwargs.pop("return_mm_token_type_ids", False)
         text_inputs = self.tokenizer(text=text, **kwargs)
 
         # Generate multimodal token type IDs
