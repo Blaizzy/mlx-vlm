@@ -53,6 +53,25 @@ MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
+_COMPUTED_ROTARY_PARAMETER_SUFFIXES = (
+    "rotary_emb.inv_freq",
+    "rotary_emb.position_selector",
+)
+
+
+def _add_missing_computed_parameters(model: nn.Module, weights: dict) -> dict:
+    missing = {
+        key: value
+        for key, value in tree_flatten(model.parameters())
+        if key.endswith(_COMPUTED_ROTARY_PARAMETER_SUFFIXES) and key not in weights
+    }
+    if not missing:
+        return weights
+
+    weights = dict(weights)
+    weights.update(missing)
+    return weights
+
 
 def quantize_activations(model: nn.Module) -> nn.Module:
 
@@ -375,6 +394,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
+    weights = _add_missing_computed_parameters(model, weights)
     model.load_weights(list(weights.items()))
 
     if not lazy:

@@ -2,6 +2,7 @@ from functools import lru_cache
 from typing import Optional, Sequence
 
 import mlx.core as mx
+import mlx.nn as nn
 
 _HAS_METAL = mx.metal.is_available()
 _HALF_SPLIT = "half_split"
@@ -194,13 +195,13 @@ def _rotary_apply_kernel(
         return None
 
     if pairing == _EVEN_ODD:
-        pair_source = f"""
+        pair_source = """
         int freq_idx = slot;
         int d = freq_idx * 2;
         int pair_d = d + 1;
         """
     else:
-        pair_source = f"""
+        pair_source = """
         int freq_idx = slot;
         int d = freq_idx;
         int pair_d = d + half_dim;
@@ -507,7 +508,7 @@ def compute_mrope_frequencies(
     return apply_mrope_frequency_layout(freqs, mrope_section, style=style)
 
 
-class MRoPERotaryEmbedding:
+class MRoPERotaryEmbedding(nn.Module):
     """Shared language-side rotary embedding for MRoPE models.
 
     ``style`` selects whether frequency layout is applied in the embedding
@@ -528,6 +529,7 @@ class MRoPERotaryEmbedding:
         cast_output: bool = True,
         style: str = "interleaved",
     ):
+        super().__init__()
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
@@ -535,7 +537,7 @@ class MRoPERotaryEmbedding:
         self.inv_freq = compute_inv_freq(dim, base)
         self.attention_scaling = attention_scaling
         self.cast_output = cast_output
-        self.mrope_section = list(
+        self._mrope_section = list(
             mrope_section
             if mrope_section is not None
             else get_mrope_section(
@@ -554,6 +556,11 @@ class MRoPERotaryEmbedding:
         self.pairing = _pairing_for_style(style)
         self.fused_apply = self.position_selector is not None and _HAS_METAL
         self._compiled_apply = {} if self.fused_apply else None
+        self.freeze()
+
+    @property
+    def mrope_section(self):
+        return self._mrope_section
 
     def __call__(self, x, position_ids):
         freqs = compute_mrope_frequencies(

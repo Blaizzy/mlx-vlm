@@ -1,5 +1,7 @@
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
@@ -36,6 +38,26 @@ def _disable_metal_fast_path(fn):
 def _position_ids(batch=2, seq_len=4):
     base = mx.arange(batch * seq_len, dtype=mx.int32).reshape(batch, seq_len)
     return mx.stack([base, base + 3, base + 7])
+
+
+def test_mrope_rotary_embedding_registers_helper_arrays_in_parameters():
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = MRoPERotaryEmbedding(
+                dim=8,
+                mrope_section=[2, 1, 1],
+                style="interleaved",
+            )
+
+    host = Host()
+
+    assert isinstance(host.rotary_emb, nn.Module)
+    assert "rotary_emb" in host.parameters()
+    rotary_params = host.parameters()["rotary_emb"]
+    assert rotary_params["inv_freq"] is host.rotary_emb.inv_freq
+    assert rotary_params["position_selector"] is host.rotary_emb.position_selector
+    assert tree_flatten(host.trainable_parameters()) == []
 
 
 @pytest.mark.parametrize(

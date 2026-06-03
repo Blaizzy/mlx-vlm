@@ -12,9 +12,11 @@ import pytest
 from mlx_lm.utils import quantize_model
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.models.rope_utils import MRoPERotaryEmbedding
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _add_missing_computed_parameters,
     _load_safetensors,
     get_model_and_args,
     load,
@@ -43,6 +45,31 @@ class MockTorch:
     @staticmethod
     def tensor(data):
         return MockTensor(data)
+
+
+def test_add_missing_computed_parameters_backfills_rotary_helpers_for_strict_load():
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.array([1.0])
+            self.rotary_emb = MRoPERotaryEmbedding(
+                dim=8,
+                mrope_section=[2, 1, 1],
+                style="interleaved",
+            )
+
+    model = Host()
+    weights = {"weight": mx.array([2.0])}
+
+    patched = _add_missing_computed_parameters(model, weights)
+
+    assert "rotary_emb.inv_freq" not in weights
+    assert "rotary_emb.position_selector" not in weights
+    assert patched["rotary_emb.inv_freq"] is model.rotary_emb.inv_freq
+    assert patched["rotary_emb.position_selector"] is model.rotary_emb.position_selector
+
+    model.load_weights(list(patched.items()))
+    assert model.weight.item() == 2.0
 
 
 class MockProcessor:
@@ -413,11 +440,11 @@ def test_load_passes_revision():
         patch(
             "mlx_vlm.utils.load_model",
             return_value=model_mock,
-        ) as mock_load_model,
+        ),
         patch(
             "mlx_vlm.utils.load_processor",
             return_value=processor_mock,
-        ) as mock_load_processor,
+        ),
         patch("mlx_vlm.utils.load_image_processor", return_value=None),
     ):
         mock_get_model_path.return_value = Path("/tmp/model")
