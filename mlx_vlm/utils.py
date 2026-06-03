@@ -1232,16 +1232,9 @@ def process_inputs(
     if "add_special_tokens" in parameters:
         args["add_special_tokens"] = add_special_tokens
 
-    accepts_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-    )
     for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
-    if "return_mm_token_type_ids" in kwargs and (
-        accepts_kwargs or "return_mm_token_type_ids" in parameters
-    ):
-        args["return_mm_token_type_ids"] = kwargs["return_mm_token_type_ids"]
 
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:
