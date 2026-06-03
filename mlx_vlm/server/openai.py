@@ -954,6 +954,8 @@ async def responses_endpoint(request: Request):
                             tool_module,
                             chat_tools,
                             tool_registry,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
                         )
                     )
                     tool_output_items = [
@@ -1169,6 +1171,8 @@ async def responses_endpoint(request: Request):
                         tool_module,
                         chat_tools,
                         tool_registry,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1434,7 +1438,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState(gen_args.enable_thinking)
+                        thinking_state = ThinkingStreamState(
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -1567,7 +1575,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState(gen_args.enable_thinking)
+                        thinking_state = ThinkingStreamState(
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1620,7 +1632,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
-                        0, output_tokens - _count_thinking_tag_tokens(metrics_text)
+                        0,
+                        output_tokens
+                        - _count_thinking_tag_tokens(
+                            metrics_text,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/chat/completions",
@@ -1789,11 +1807,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
 
-                reasoning, content = _split_thinking(full_text)
+                reasoning, content = _split_thinking(
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
-                    full_text
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
                 )
 
                 usage_stats = UsageStats.from_metrics(
@@ -1811,7 +1835,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     if tc["calls"]:
                         parsed_tool_calls = tc["calls"]
                         # Clean thinking tags and control tokens from remaining text
-                        _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        _, clean_remaining = _split_thinking(
+                            tc["remaining_text"] or "",
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         if clean_remaining:
                             # Strip model control tokens
                             clean_remaining = re.sub(

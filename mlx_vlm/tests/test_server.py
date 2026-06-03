@@ -1683,6 +1683,67 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
     assert "<channel|>" not in response.text
 
 
+def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
+    assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
+
+
 @pytest.mark.parametrize(
     "audio_data_factory",
     [
@@ -2536,6 +2597,64 @@ def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
     assert "".join(delta.get("thinking") or "" for delta in deltas) == ""
     assert "<|channel>" not in response.text
     assert "<channel|>" not in response.text
+
+
+def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                [
+                    server.StreamingToken(
+                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 16,
+                "stream": True,
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = [
+        event["delta"] for event in events if event.get("type") == "content_block_delta"
+    ]
+
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
+    assert "".join(delta.get("text") or "" for delta in deltas) == "Custom answer."
 
 
 def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
@@ -4103,6 +4222,12 @@ class TestSplitThinking:
         assert reasoning == "Only thinking."
         assert content == ""
 
+    def test_custom_thinking_markers(self):
+        text = "<analysis>Custom reasoning.</analysis>Custom answer."
+        reasoning, content = server._split_thinking(text, "<analysis>", "</analysis>")
+        assert reasoning == "Custom reasoning."
+        assert content == "Custom answer."
+
 
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
@@ -4134,6 +4259,22 @@ class TestThinkingStreamState:
         assert first.thinking_closed is False
         assert second.reasoning == " tail"
         assert second.content == "Answer"
+        assert second.thinking_closed is True
+
+    def test_custom_markers_split_same_delta_content(self):
+        state = server.ThinkingStreamState(
+            enable_thinking=False,
+            thinking_start_token="<analysis>",
+            thinking_end_token="</analysis>",
+        )
+
+        first = state.feed("<ana")
+        second = state.feed("lysis>Custom reasoning.</analysis>Custom answer.")
+
+        assert first.reasoning is None
+        assert first.content is None
+        assert second.reasoning == "Custom reasoning."
+        assert second.content == "Custom answer."
         assert second.thinking_closed is True
 
 
