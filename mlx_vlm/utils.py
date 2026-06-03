@@ -45,6 +45,7 @@ MODEL_REMAPPING = {
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
+    "cohere2moe": "cohere2_moe",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -52,6 +53,144 @@ MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
+
+
+def _e4m3_decode_table() -> mx.array:
+    table = []
+    for byte in range(256):
+        sign = (byte >> 7) & 1
+        exponent = (byte >> 3) & 0xF
+        mantissa = byte & 0x7
+        if exponent == 0:
+            value = (mantissa / 8.0) * 2.0**-6
+        elif exponent == 15 and mantissa == 7:
+            value = float("nan")
+        else:
+            value = (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
+        table.append(-value if sign else value)
+    return mx.array(table, dtype=mx.float32)
+
+
+_E4M3_DECODE_LUT = _e4m3_decode_table()
+
+
+def _f32_to_e4m3(x: mx.array) -> mx.array:
+    x = mx.maximum(x.astype(mx.float32), 0.0)
+    bits = x.view(mx.uint32)
+    fexp = (bits >> 23) & 0xFF
+    fman = bits & 0x7FFFFF
+
+    exponent = fexp.astype(mx.int32) - 120
+    drop = 20
+    round_bit = (fman >> (drop - 1)) & 1
+    sticky = (fman & ((1 << (drop - 1)) - 1)) != 0
+    mantissa = fman >> drop
+    roundup = round_bit & (sticky.astype(mx.uint32) | (mantissa & 1))
+    mantissa = mantissa + roundup
+    carry = mantissa >> 3
+    mantissa = mantissa & 0x7
+    exponent = exponent + carry.astype(mx.int32)
+
+    over = (exponent > 15) | ((exponent == 15) & (mantissa == 7))
+    exponent = mx.where(over, mx.array(15, mx.int32), exponent)
+    mantissa = mx.where(over, mx.array(6, mx.uint32), mantissa)
+    normal_byte = (exponent.astype(mx.uint32) << 3) | mantissa
+    normal_valid = exponent >= 1
+
+    sub = x * 512.0
+    sub_floor = mx.floor(sub)
+    frac = sub - sub_floor
+    sub_floor_u32 = sub_floor.astype(mx.uint32)
+    up = (frac > 0.5) | ((frac == 0.5) & ((sub_floor_u32 & 1) == 1))
+    sub_byte = sub_floor_u32 + up.astype(mx.uint32)
+
+    byte = mx.where(normal_valid, normal_byte, sub_byte)
+    return byte.astype(mx.uint8)
+
+
+def _transform_compressed_tensors_nvfp4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Dict[str, mx.array]:
+    packed_suffix = ".weight_packed"
+
+    new_weights = {}
+    for key in list(weights.keys()):
+        if key.endswith(packed_suffix):
+            prefix = key[: -len(packed_suffix)]
+            packed = weights[key]
+            scale = weights[f"{prefix}.weight_scale"]
+            global_scale = weights[f"{prefix}.weight_global_scale"].astype(mx.float32)
+
+            new_weights[f"{prefix}.weight"] = packed.view(mx.uint32)
+            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+            new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+        elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
+            continue
+        else:
+            new_weights[key] = weights[key]
+
+    return new_weights
+
+
+def _transform_compressed_tensors_int4_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
+    weights_cfg = (
+        quantization_config.get("config_groups", {})
+        .get("group_0", {})
+        .get("weights", {})
+    )
+    group_size = weights_cfg.get("group_size", 32)
+    bits = weights_cfg.get("num_bits", 4)
+    packed_suffix = ".weight_packed"
+
+    new_weights = {}
+    for key in list(weights.keys()):
+        if key.endswith(packed_suffix):
+            prefix = key[: -len(packed_suffix)]
+            scale = weights[f"{prefix}.weight_scale"]
+            new_weights[f"{prefix}.weight"] = weights[key].view(mx.uint32)
+            new_weights[f"{prefix}.scales"] = scale
+            new_weights[f"{prefix}.biases"] = -(2 ** (bits - 1)) * scale
+        elif key.endswith(".weight_scale") or key.endswith(".weight_shape"):
+            continue
+        else:
+            new_weights[key] = weights[key]
+
+    return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
+def _transform_compressed_tensors_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    if quantization_config is None:
+        return weights, None
+    if quantization_config.get("quant_method") != "compressed-tensors":
+        return weights, None
+    if not any(key.endswith(".weight_packed") for key in weights):
+        return weights, None
+
+    weights_cfg = (
+        quantization_config.get("config_groups", {})
+        .get("group_0", {})
+        .get("weights", {})
+    )
+    ct_format = quantization_config.get("format") or quantization_config.get(
+        "config_groups", {}
+    ).get("group_0", {}).get("format")
+    quant_type = weights_cfg.get("type")
+
+    if ct_format == "nvfp4-pack-quantized":
+        return _transform_compressed_tensors_nvfp4_weights(
+            weights, quantization_config
+        ), {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    if ct_format == "pack-quantized" and quant_type == "int":
+        return _transform_compressed_tensors_int4_weights(weights, quantization_config)
+
+    return weights, None
 
 
 def quantize_activations(model: nn.Module) -> nn.Module:
@@ -273,6 +412,21 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model_config = update_module_configs(model_config, model_class, config, modules)
 
     model = model_class.Model(model_config)
+
+    quantization_config = config.get("quantization_config", None)
+    if quantization_config is None:
+        quantization_config = config.get("text_config", {}).get(
+            "quantization_config", None
+        )
+        if quantization_config is not None:
+            config["quantization_config"] = quantization_config
+
+    weights, transformed_quantization = _transform_compressed_tensors_weights(
+        weights, quantization_config
+    )
+    if transformed_quantization is not None:
+        config["quantization"] = transformed_quantization
+        config["quantization_config"] = transformed_quantization
 
     if not is_mlx_format:
         # Sanitize weights
