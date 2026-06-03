@@ -277,6 +277,45 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "ArraysCache")
         self.assertEqual(type(cache[1]).__name__, "KVCache")
 
+    def test_cohere2_moe_language_model(self):
+        from mlx_vlm.models import cohere2_moe
+
+        config = cohere2_moe.ModelConfig(
+            model_type="cohere2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            layer_norm_eps=1e-5,
+            sliding_window=8,
+            layer_types=["sliding_attention", "full_attention"],
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            moe_num_shared_experts=1,
+            logit_scale=1.0,
+        )
+
+        model = cohere2_moe.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
+        self.assertEqual(type(cache[1]).__name__, "KVCache")
+
     def test_lfm2_moe_sanitize_stacks_experts(self):
         from mlx_vlm.models import lfm2_moe
 
