@@ -12,6 +12,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "deepseek_v4_mtp": "mtp",
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
+    "gemma4_unified_assistant": "mtp",
     "qwen3_5_mtp": "mtp",
 }
 

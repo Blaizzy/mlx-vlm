@@ -720,7 +720,7 @@ def stream_generate(
 
     add_special_tokens = (
         getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4"]
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
         else True
     )
 
