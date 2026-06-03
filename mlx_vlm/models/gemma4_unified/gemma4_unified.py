@@ -31,9 +31,7 @@ class VisionEmbedder(nn.Module):
         self.patch_ln1 = nn.LayerNorm(patch_dim)
         self.patch_dense = nn.Linear(patch_dim, config.mm_embed_dim)
         self.patch_ln2 = nn.LayerNorm(config.mm_embed_dim)
-        self.pos_embedding = mx.zeros(
-            (config.mm_posemb_size, 2, config.mm_embed_dim)
-        )
+        self.pos_embedding = mx.zeros((config.mm_posemb_size, 2, config.mm_embed_dim))
         self.pos_norm = nn.LayerNorm(config.mm_embed_dim)
 
     def __call__(
@@ -171,7 +169,10 @@ class Model(nn.Module):
         video_token_id = getattr(self.config, "video_token_id", None)
 
         per_layer_inputs = None
-        if input_ids is not None and self.language_model.model.hidden_size_per_layer_input:
+        if (
+            input_ids is not None
+            and self.language_model.model.hidden_size_per_layer_input
+        ):
             image_mask_ids = input_ids == self.config.image_token_id
             audio_mask_ids = input_ids == self.config.audio_token_id
             mm_mask = image_mask_ids | audio_mask_ids

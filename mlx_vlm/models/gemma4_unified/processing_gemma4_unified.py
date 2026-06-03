@@ -146,9 +146,7 @@ class Gemma4UnifiedImageProcessor(Gemma4ImageProcessor):
                 image, model_patch_size
             )
             num_soft_tokens_per_image.append(patches.shape[0])
-            patches, positions = _pad_patches(
-                patches, positions, max_soft_tokens
-            )
+            patches, positions = _pad_patches(patches, positions, max_soft_tokens)
             pixel_values.append(patches)
             image_position_ids.append(positions)
 

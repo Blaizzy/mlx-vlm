@@ -251,7 +251,6 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
 
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedImageProcessor,
-            Gemma4UnifiedProcessor,
         )
 
         processor, tokenizer = self._make_gemma4_unified_processor(
@@ -287,7 +286,9 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         self.assertIsInstance(result["pixel_values"], mx.array)
         self.assertEqual(result["pixel_values"].shape, (1, 4, 48))
         self.assertEqual(result["image_position_ids"].shape, (1, 4, 2))
-        self.assertIn("<boi><|image|><|image|><|image|><|image|><eoi>", tokenizer.last_text[0])
+        self.assertIn(
+            "<boi><|image|><|image|><|image|><|image|><eoi>", tokenizer.last_text[0]
+        )
 
     def test_apply_chat_template_renders_media_placeholder_without_tokenizing(self):
         processor, _ = self._make_gemma4_unified_processor()
