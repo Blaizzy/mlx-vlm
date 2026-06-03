@@ -104,6 +104,38 @@ def _anthropic_system_text(system: Optional[Union[str, List[Any]]]) -> Optional[
     return "\n".join(parts).strip() or None
 
 
+def _normalize_anthropic_system_messages(body: Any) -> Any:
+    if not isinstance(body, dict):
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    normalized_messages = []
+    system_parts = []
+    saw_system_message = False
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            saw_system_message = True
+            text = _anthropic_system_text(message.get("content"))
+            if text:
+                system_parts.append(text)
+            continue
+        normalized_messages.append(message)
+
+    if not saw_system_message:
+        return body
+
+    normalized_body = dict(body)
+    normalized_body["messages"] = normalized_messages
+    existing_system = _anthropic_system_text(normalized_body.get("system"))
+    if existing_system:
+        system_parts.insert(0, existing_system)
+    if system_parts:
+        normalized_body["system"] = "\n".join(system_parts)
+    return normalized_body
+
+
 def _anthropic_image_source_to_ref(source: Any) -> Optional[str]:
     source = _as_plain_dict(source)
     if not isinstance(source, dict):
@@ -423,7 +455,7 @@ def _anthropic_content_from_generation(
 async def anthropic_messages_endpoint(http_request: Request):
     request_start = time.perf_counter()
     try:
-        body = await http_request.json()
+        body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
     except Exception as e:
         return _anthropic_error_response(400, f"Invalid request body: {e}")
@@ -986,7 +1018,7 @@ async def anthropic_messages_endpoint(http_request: Request):
 
 async def anthropic_count_tokens_endpoint(http_request: Request):
     try:
-        body = await http_request.json()
+        body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
         model, processor, config = get_cached_model(request.model)
         processed_messages, images, tools, tool_choice = (

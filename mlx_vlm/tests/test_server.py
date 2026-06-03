@@ -2121,6 +2121,49 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
 
 
+def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
+    client, monkeypatch
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=4, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "system": "Use short answers.",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "Be precise."}],
+                    },
+                    {"role": "user", "content": "Introduce the project."},
+                ],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {"role": "system", "content": "Use short answers.\nBe precise."},
+        {"role": "user", "content": "Hello"},
+        {"role": "user", "content": "Introduce the project."},
+    ]
+
+
 def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
