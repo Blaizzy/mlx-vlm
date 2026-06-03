@@ -5315,53 +5315,25 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "gemma4_unified")
 
-    def test_gemma4_unified_updates_chunked_prefill_for_visual_bidir(self):
-        from mlx_vlm.models import gemma4_unified
-
-        model = gemma4_unified.Model(
-            gemma4_unified.ModelConfig(
-                text_config=gemma4_unified.TextConfig(
-                    hidden_size=8,
-                    num_hidden_layers=1,
-                    intermediate_size=16,
-                    num_attention_heads=1,
-                    num_key_value_heads=1,
-                    num_global_key_value_heads=1,
-                    head_dim=8,
-                    global_head_dim=8,
-                    vocab_size=64,
-                    vocab_size_per_layer_input=64,
-                    hidden_size_per_layer_input=0,
-                    sliding_window=8,
-                    sliding_window_pattern=1,
-                    layer_types=["full_attention"],
-                    use_bidirectional_attention="vision",
-                ),
-                vision_config=None,
-                audio_config=None,
-                vocab_size=64,
-                hidden_size=8,
-                image_token_id=31,
-                audio_token_id=30,
-                video_token_id=29,
-            )
-        )
-
-        input_ids = mx.array([[1, 2, 3]])
         text_only_types = mx.array([[0, 0, 0]])
         visual_types = mx.array([[0, 1, 1, 0]])
         mixed_audio_types = mx.array([[0, 1, 1, 3]])
 
-        model.get_input_embeddings(input_ids, mm_token_type_ids=text_only_types)
+        # Text-only Gemma4 unified prompts should keep chunked prefill enabled.
+        model.get_input_embeddings(
+            mx.array([[1, 2, 3]]), mm_token_type_ids=text_only_types
+        )
         self.assertFalse(model.no_chunked_prefill)
         self.assertFalse(model.language_model.no_chunked_prefill)
 
+        # Visual token spans need the bidirectional mask overlay, so do not chunk.
         model.get_input_embeddings(
             mx.array([[1, 2, 3, 4]]), mm_token_type_ids=visual_types
         )
         self.assertTrue(model.no_chunked_prefill)
         self.assertTrue(model.language_model.no_chunked_prefill)
 
+        # Mixed audio prompts stay causal and can use chunked prefill.
         model.get_input_embeddings(
             mx.array([[1, 2, 3, 4]]), mm_token_type_ids=mixed_audio_types
         )
