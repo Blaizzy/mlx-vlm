@@ -265,6 +265,7 @@ class MessageFormatter:
             "qwen3_5_moe",
             "qwen3_omni_moe",
             "gemma4",
+            "gemma4_unified",
             "minicpmv4_6",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, role, **kwargs)

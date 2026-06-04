@@ -9,6 +9,7 @@ from ..base import install_auto_processor_patch, load_chat_template
 from ..gemma4.processing_gemma4 import (
     Gemma4ImageProcessor,
     Gemma4Processor,
+    Gemma4VideoProcessor,
     _convert_to_rgb,
     _to_channel_first,
 )
@@ -158,6 +159,95 @@ class Gemma4UnifiedImageProcessor(Gemma4ImageProcessor):
         return data, num_soft_tokens_per_image
 
 
+class Gemma4UnifiedVideoProcessor(Gemma4VideoProcessor):
+    model_input_names = ["pixel_values_videos", "video_position_ids"]
+
+    def __init__(
+        self,
+        model_patch_size: Optional[int] = None,
+        mm_posemb_size: Optional[int] = None,
+        num_soft_tokens: Optional[int] = None,
+        **kwargs,
+    ):
+        if num_soft_tokens is not None and "max_soft_tokens" not in kwargs:
+            kwargs["max_soft_tokens"] = num_soft_tokens
+        self.do_resize = kwargs.pop("do_resize", True)
+        super().__init__(**kwargs)
+        self.model_patch_size = model_patch_size or (
+            self.patch_size * self.pooling_kernel_size
+        )
+        self.mm_posemb_size = mm_posemb_size
+
+    def __call__(self, videos, fps=None):
+        if not isinstance(videos, list):
+            videos = [videos]
+
+        max_patches = self.max_soft_tokens * self.pooling_kernel_size**2
+
+        if fps is None:
+            fps = [self.default_fps] * len(videos)
+        elif not isinstance(fps, list):
+            fps = [fps] * len(videos)
+
+        processed = []
+        processed_positions = []
+        num_frames_per_video = []
+        num_soft_tokens_per_frame = []
+        frame_timestamps = []
+
+        for i, video in enumerate(videos):
+            if not isinstance(video, np.ndarray):
+                video = np.asarray(video)
+            if video.ndim != 4:
+                raise ValueError(
+                    f"Expected video as (T, C, H, W), got shape {video.shape}."
+                )
+
+            video = self._sample_frames(video, self.num_frames)
+            if self.do_resize:
+                video = self._resize_frames(video, max_patches)
+
+            video_f = video.astype(np.float32)
+            if self.do_rescale and video.dtype == np.uint8:
+                video_f = video_f * self.rescale_factor
+
+            if self.do_normalize:
+                mean = np.array(self.image_mean, dtype=np.float32)[:, None, None]
+                std = np.array(self.image_std, dtype=np.float32)[:, None, None]
+                video_f = (video_f - mean) / std
+
+            frame_patches = []
+            frame_positions = []
+            tokens_per_frame = None
+            for frame in video_f:
+                patches, positions = _convert_image_to_model_patches(
+                    frame, self.model_patch_size
+                )
+                if tokens_per_frame is None:
+                    tokens_per_frame = patches.shape[0]
+                patches, positions = _pad_patches(
+                    patches, positions, self.max_soft_tokens
+                )
+                frame_patches.append(patches)
+                frame_positions.append(positions)
+
+            T = video_f.shape[0]
+            processed.append(np.stack(frame_patches))
+            processed_positions.append(np.stack(frame_positions))
+            num_frames_per_video.append(T)
+            num_soft_tokens_per_frame.append(int(tokens_per_frame or 0))
+            sr = fps[i] if fps[i] and fps[i] > 0 else self.default_fps
+            frame_timestamps.append([float(j) / float(sr) for j in range(T)])
+
+        return {
+            "pixel_values_videos": np.concatenate(processed, axis=0),
+            "video_position_ids": np.concatenate(processed_positions, axis=0),
+            "num_frames_per_video": num_frames_per_video,
+            "num_soft_tokens_per_frame": num_soft_tokens_per_frame,
+            "frame_timestamps": frame_timestamps,
+        }
+
+
 class Gemma4UnifiedAudioFeatureExtractor:
     model_input_names = ["input_features", "input_features_mask"]
 
@@ -241,11 +331,24 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
     image_processor_class = "Gemma4UnifiedImageProcessor"
 
     def __init__(self, image_processor=None, tokenizer=None, **kwargs):
+        video_processor = kwargs.pop("video_processor", None)
         if image_processor is None:
             image_processor = Gemma4UnifiedImageProcessor()
+        if video_processor is None:
+            video_processor = Gemma4UnifiedVideoProcessor(
+                patch_size=getattr(image_processor, "patch_size", 16),
+                pooling_kernel_size=getattr(image_processor, "pooling_kernel_size", 3),
+                model_patch_size=getattr(image_processor, "model_patch_size", None),
+                do_rescale=getattr(image_processor, "do_rescale", True),
+                rescale_factor=getattr(image_processor, "rescale_factor", 1 / 255),
+                do_normalize=getattr(image_processor, "do_normalize", False),
+                image_mean=getattr(image_processor, "image_mean", None),
+                image_std=getattr(image_processor, "image_std", None),
+            )
         super().__init__(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            video_processor=video_processor,
             **kwargs,
         )
 
@@ -294,12 +397,32 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
             ip_config = dict(proc_config["image_processor"])
         ip_config.pop("image_processor_type", None)
 
+        vp_config = {}
+        if isinstance(proc_config.get("video_processor"), dict):
+            vp_config = dict(proc_config["video_processor"])
+        else:
+            for key in (
+                "patch_size",
+                "pooling_kernel_size",
+                "model_patch_size",
+                "mm_posemb_size",
+                "do_rescale",
+                "rescale_factor",
+                "do_normalize",
+                "image_mean",
+                "image_std",
+            ):
+                if key in ip_config:
+                    vp_config[key] = ip_config[key]
+        vp_config.pop("video_processor_type", None)
+
         fe_config = {}
         if isinstance(proc_config.get("feature_extractor"), dict):
             fe_config = dict(proc_config["feature_extractor"])
         fe_config.pop("feature_extractor_type", None)
 
         image_processor = Gemma4UnifiedImageProcessor(**ip_config)
+        video_processor = Gemma4UnifiedVideoProcessor(**vp_config)
         feature_extractor = Gemma4UnifiedAudioFeatureExtractor(**fe_config)
 
         image_seq_length = proc_config.get(
@@ -315,6 +438,7 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
             audio_seq_length=audio_seq_length,
             audio_ms_per_token=audio_ms_per_token,
             feature_extractor=feature_extractor,
+            video_processor=video_processor,
             chat_template=tokenizer.chat_template,
         )
 
@@ -322,6 +446,7 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
 __all__ = [
     "Gemma4UnifiedAudioFeatureExtractor",
     "Gemma4UnifiedImageProcessor",
+    "Gemma4UnifiedVideoProcessor",
     "Gemma4UnifiedProcessor",
 ]
 

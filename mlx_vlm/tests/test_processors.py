@@ -143,6 +143,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
                         parts.append(self.image_token)
                     elif item["type"] == "audio":
                         parts.append(self.audio_token)
+                    elif item["type"] == "video":
+                        parts.append(self.video_token)
                     else:
                         parts.append(item.get("text", item.get("content", "")))
             if add_generation_prompt:
@@ -181,7 +183,9 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
                 "attention_mask": attention_mask,
             }
 
-    def _make_gemma4_unified_processor(self, image_processor=None):
+    def _make_gemma4_unified_processor(
+        self, image_processor=None, video_processor=None
+    ):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedImageProcessor,
             Gemma4UnifiedProcessor,
@@ -200,7 +204,7 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         processor.tokenizer = tokenizer
         processor.image_processor = image_processor
         processor.feature_extractor = None
-        processor.video_processor = None
+        processor.video_processor = video_processor
         processor.image_seq_length = 4
         processor.audio_seq_length = 750
         processor.audio_ms_per_token = 40
@@ -245,6 +249,32 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             data["image_position_ids"][0].tolist(),
             [[0, 0], [1, 0], [0, 1], [1, 1]],
         )
+
+    def test_video_processor_outputs_merged_patches_and_positions(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        processor = Gemma4UnifiedVideoProcessor(
+            patch_size=2,
+            pooling_kernel_size=2,
+            max_soft_tokens=70,
+            do_resize=False,
+            do_rescale=False,
+        )
+        video = np.zeros((2, 3, 4, 8), dtype=np.uint8)
+
+        data = processor([video], fps=[1.0])
+
+        self.assertEqual(data["pixel_values_videos"].shape, (2, 70, 48))
+        self.assertEqual(data["video_position_ids"].shape, (2, 70, 2))
+        self.assertEqual(data["num_frames_per_video"], [2])
+        self.assertEqual(data["num_soft_tokens_per_frame"], [2])
+        self.assertEqual(
+            data["video_position_ids"][0, :4].tolist(),
+            [[0, 0], [1, 0], [-1, -1], [-1, -1]],
+        )
+        self.assertTrue(np.all(data["video_position_ids"][0, 2:] == -1))
 
     def test_audio_feature_extractor_chunks_waveforms(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
@@ -315,6 +345,36 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             "<boi><|image|><|image|><|image|><|image|><eoi>", tokenizer.last_text[0]
         )
 
+    def test_call_returns_patchified_video_inputs(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        processor, tokenizer = self._make_gemma4_unified_processor(
+            video_processor=Gemma4UnifiedVideoProcessor(
+                patch_size=2,
+                pooling_kernel_size=2,
+                max_soft_tokens=70,
+                do_resize=False,
+                do_rescale=False,
+            ),
+        )
+        video = np.zeros((2, 3, 4, 8), dtype=np.uint8)
+
+        result = processor(
+            text=[tokenizer.video_token + "describe"],
+            videos=[video],
+            fps=[1.0],
+        )
+
+        self.assertIsInstance(result["pixel_values_videos"], mx.array)
+        self.assertEqual(result["pixel_values_videos"].shape, (2, 70, 48))
+        self.assertEqual(result["video_position_ids"].shape, (2, 70, 2))
+        self.assertEqual(int(mx.sum(result["mm_token_type_ids"] == 2).item()), 4)
+        self.assertIn("<boi><|video|><|video|><eoi>", tokenizer.last_text[0])
+
     def test_apply_chat_template_renders_media_placeholder_without_tokenizing(self):
         processor, _ = self._make_gemma4_unified_processor()
         rendered = processor.apply_chat_template(
@@ -332,6 +392,24 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
 
         self.assertIn("<|image|>", rendered)
+
+    def test_apply_chat_template_renders_video_placeholder_without_tokenizing(self):
+        processor, _ = self._make_gemma4_unified_processor()
+        rendered = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": "clip.mp4"},
+                        {"type": "text", "text": "Describe this video."},
+                    ],
+                }
+            ],
+            tokenize=False,
+            enable_thinking=False,
+        )
+
+        self.assertIn("<|video|>", rendered)
 
     def test_call_returns_hf_compatible_mm_token_type_ids(self):
         processor, tokenizer = self._make_gemma4_unified_processor()
