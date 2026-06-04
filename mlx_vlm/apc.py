@@ -311,9 +311,9 @@ def _cache_entry_is_single_row_for_apc(c: Any) -> bool:
             lm_cache.ChunkedKVCache,
         ),
     ):
-        return _array_has_single_row(getattr(c, "keys", None)) and _array_has_single_row(
-            getattr(c, "values", None)
-        )
+        return _array_has_single_row(
+            getattr(c, "keys", None)
+        ) and _array_has_single_row(getattr(c, "values", None))
     if isinstance(c, lm_cache.ArraysCache):
         states = getattr(c, "cache", [])
         if any(
@@ -2876,7 +2876,7 @@ class APCManager:
             free_now = _free_ram_bytes()
             if free_now is not None and free_now < self._disk_min_free_ram_bytes:
                 logger.info(
-                    "APC: skipping exact disk restore " "(free RAM %.1f GB < %.1f GB)",
+                    "APC: skipping exact disk restore (free RAM %.1f GB < %.1f GB)",
                     free_now / (1 << 30),
                     self._disk_min_free_ram_bytes / (1 << 30),
                 )
