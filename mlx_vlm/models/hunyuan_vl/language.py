@@ -125,14 +125,19 @@ def apply_rotary_pos_emb(
         cos: Cosine values with shape (seq_len, head_dim)
         sin: Sine values with shape (seq_len, head_dim)
     """
+    origin_dtype = q.dtype
+
     # Expand cos/sin to (1, 1, seq_len, head_dim) for broadcasting
     cos = cos[None, None, :, :]
     sin = sin[None, None, :, :]
 
+    q, k = q.astype(mx.float32), k.astype(mx.float32)
+    cos, sin = cos.astype(mx.float32), sin.astype(mx.float32)
+
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
 
-    return q_embed, k_embed
+    return q_embed.astype(origin_dtype), k_embed.astype(origin_dtype)
 
 
 class Attention(nn.Module):
