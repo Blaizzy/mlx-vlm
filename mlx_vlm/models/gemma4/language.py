@@ -483,26 +483,40 @@ class Gemma4TextModel(nn.Module):
             mm_token_type_ids is not None
             and int(mx.sum(mm_token_type_ids == 3).item()) > 0
         )
+        has_visual_tokens = (
+            mm_token_type_ids is not None
+            and int(mx.sum((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
+            > 0
+        )
         # Audio spans are sequential; keep mixed image+audio prompts causal to
         # avoid the vision block overlay dominating quantized unified models.
         use_bidirectional_vision = (
             getattr(self.config, "use_bidirectional_attention", None) == "vision"
             and mm_token_type_ids is not None
+            and has_visual_tokens
             and not has_audio_tokens
             and h.shape[1] > 1
         )
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
-                return_array = (
-                    h.shape[1] > 1
-                    and c is not None
-                    and int(mx.max(mx.array(c.offset)).item()) > 0
-                ) or use_bidirectional_vision
                 if l.layer_type == "full_attention":
+                    # Full attention can use MLX's causal mask even when
+                    # prefilling against an existing KV prefix. Only materialize
+                    # a mask for batch left-padding or the Gemma 4 vision
+                    # bidirectional overlay.
+                    return_array = (
+                        use_bidirectional_vision
+                        or getattr(c, "left_padding", None) is not None
+                    )
                     mask["full_attention"] = create_attention_mask(
                         h, c, return_array=return_array
                     )
                 elif l.layer_type == "sliding_attention":
+                    return_array = (
+                        h.shape[1] > 1
+                        and c is not None
+                        and int(mx.max(mx.array(c.offset)).item()) > 0
+                    ) or use_bidirectional_vision
                     mask["sliding_attention"] = create_attention_mask(
                         h, c, window_size=self.window_size, return_array=return_array
                     )
