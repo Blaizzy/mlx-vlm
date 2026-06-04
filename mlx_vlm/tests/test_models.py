@@ -5367,6 +5367,18 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self.assertFalse(model.no_chunked_prefill)
         self.assertFalse(model.language_model.no_chunked_prefill)
+        self.assertTrue(
+            model.chunked_prefill_policy(
+                input_ids=mx.array([[1, 2, 3]]),
+                draft_model=SimpleNamespace(),
+                draft_kind="mtp",
+                prefill_kwargs={
+                    "mm_token_type_ids": text_only_types,
+                    "return_hidden": True,
+                    "return_shared_kv": True,
+                },
+            )
+        )
 
         # Visual token spans need the bidirectional mask overlay, so do not chunk.
         model.get_input_embeddings(
@@ -5374,6 +5386,18 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self.assertTrue(model.no_chunked_prefill)
         self.assertTrue(model.language_model.no_chunked_prefill)
+        self.assertFalse(
+            model.chunked_prefill_policy(
+                input_ids=mx.array([[1, 2, 3, 4]]),
+                draft_model=SimpleNamespace(),
+                draft_kind="mtp",
+                prefill_kwargs={
+                    "mm_token_type_ids": visual_types,
+                    "return_hidden": True,
+                    "return_shared_kv": True,
+                },
+            )
+        )
 
         # Mixed audio prompts stay causal and can use chunked prefill.
         model.get_input_embeddings(
@@ -5381,6 +5405,28 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self.assertFalse(model.no_chunked_prefill)
         self.assertFalse(model.language_model.no_chunked_prefill)
+        self.assertTrue(
+            model.language_model.chunked_prefill_policy(
+                draft_model=SimpleNamespace(),
+                draft_kind="mtp",
+                prefill_kwargs={
+                    "mm_token_type_ids": mixed_audio_types,
+                    "return_hidden": True,
+                    "return_shared_kv": True,
+                },
+            )
+        )
+        self.assertFalse(
+            model.chunked_prefill_policy(
+                input_ids=mx.array([[1, 2, 3, 4]]),
+                draft_model=SimpleNamespace(),
+                draft_kind="dflash",
+                prefill_kwargs={
+                    "mm_token_type_ids": mixed_audio_types,
+                    "capture_layer_ids": [0],
+                },
+            )
+        )
 
     def test_gemma4_unified_vision_tokens_use_bidirectional_mask(self):
         from mlx_vlm.models import gemma4_unified
