@@ -375,6 +375,13 @@ async def images_generations_endpoint(request: Request):
                         count=image_request.n,
                         seed=seed,
                     )
+                    extra = {}
+                    if image_request.auto_json_caption is not None:
+                        extra["auto_json_caption"] = image_request.auto_json_caption
+                    if image_request.prompt_expansion_model is not None:
+                        extra["prompt_expansion_model"] = (
+                            image_request.prompt_expansion_model
+                        )
                     core_request = CoreImageGenerationRequest(
                         prompt=image_request.prompt,
                         seed=seed,
@@ -383,6 +390,7 @@ async def images_generations_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra=extra,
                     )
                     result = generate_image(
                         model,
@@ -400,6 +408,7 @@ async def images_generations_endpoint(request: Request):
                 height=result.height,
                 seed=result.seed,
                 path=str(result.path) if result.path is not None else None,
+                revised_prompt=result.metadata.get("revised_prompt"),
             )
             if image_request.response_format == "b64_json":
                 item.b64_json = result.to_b64_json()

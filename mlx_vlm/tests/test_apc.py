@@ -291,6 +291,50 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
     assert extracted[1].offset == 12
 
 
+def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
+    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+    from mlx_vlm.generate.ar import PromptProcessingBatch
+
+    token_ids = list(range(12))
+    arrays = ArraysCache(size=1)
+    arrays[0] = mx.ones((1, 3, 5))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 4))
+    kv.values = mx.ones((1, 1, len(token_ids), 4)) * 2
+    kv.offset = len(token_ids)
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = mx.ones((1, 1, 8, 4)) * 3
+    rotating.values = mx.ones((1, 1, 8, 4)) * 4
+    rotating.offset = len(token_ids)
+    rotating._idx = 4
+
+    batch = PromptProcessingBatch.__new__(PromptProcessingBatch)
+    batch.uids = [0]
+    batch.prompt_cache = [arrays, kv, rotating]
+    batch._right_pad_per_row = None
+    batch._left_padding_per_row = [0]
+    batch._suffix_lens = [len(token_ids)]
+    batch._processed_prompt_columns = len(token_ids)
+    batch._apc_mode = "exact"
+    batch._apc_manager = APCManager(num_blocks=4, block_size=4)
+    batch._apc_meta = [
+        {
+            "full_input_ids": token_ids,
+            "prefix_len": 0,
+            "checkpoint_len": len(token_ids),
+            "extra_hash": 0,
+        }
+    ]
+
+    assert extract_prompt_cache_from_batch(batch.prompt_cache, 0) is None
+
+    batch._store_apc_exact_checkpoints()
+
+    assert batch._apc_meta[0]["checkpoint_done"] is True
+    assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
+
+
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     monkeypatch.setenv("APC_MAX_POOL_TENSORS", "2")
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "2")

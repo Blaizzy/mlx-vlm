@@ -118,6 +118,15 @@ def parse_arguments():
         help="Classifier-free guidance for image generation/editing.",
     )
     parser.add_argument(
+        "--prompt-expansion-model",
+        type=str,
+        default=None,
+        help=(
+            "Text model path or Hugging Face repo used to expand plain image "
+            "prompts into Ideogram 4 JSON captions."
+        ),
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
