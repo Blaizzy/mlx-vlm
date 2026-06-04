@@ -550,6 +550,8 @@ class Gemma4Processor(ProcessorMixin):
 
             pvv = video_data["pixel_values_videos"]
             video_inputs["pixel_values_videos"] = pvv
+            if "video_position_ids" in video_data:
+                video_inputs["video_position_ids"] = video_data["video_position_ids"]
             video_inputs["num_frames_per_video"] = num_frames_per_video
 
         # ── Process audio ───────────────────────────────────────────────
@@ -744,6 +746,7 @@ class Gemma4Processor(ProcessorMixin):
             "return_mm_token_type_ids",
             "truncation",
             "max_length",
+            "fps",
         ):
             if key in kwargs:
                 processor_kwargs[key] = kwargs.pop(key)
@@ -759,6 +762,11 @@ class Gemma4Processor(ProcessorMixin):
         num_audios = counts["audio"] or len(audio)
 
         model_type = getattr(self, "model_type", "gemma4")
+        template_kwargs = dict(kwargs)
+        if videos:
+            template_kwargs["video"] = videos
+            if "fps" in processor_kwargs:
+                template_kwargs["fps"] = processor_kwargs["fps"]
         prompt = _apply_chat_template(
             self.tokenizer,
             {"model_type": model_type},
@@ -766,7 +774,7 @@ class Gemma4Processor(ProcessorMixin):
             add_generation_prompt=add_generation_prompt,
             num_images=num_images,
             num_audios=num_audios,
-            **kwargs,
+            **template_kwargs,
         )
 
         if not tokenize:
@@ -796,7 +804,14 @@ class Gemma4Processor(ProcessorMixin):
     def model_input_names(self):
         tokenizer_input_names = self.tokenizer.model_input_names + ["mm_token_type_ids"]
         image_processor_input_names = self.image_processor.model_input_names
-        all_names = list(tokenizer_input_names + image_processor_input_names)
+        video_processor_input_names = getattr(
+            getattr(self, "video_processor", None), "model_input_names", []
+        )
+        all_names = list(
+            tokenizer_input_names
+            + image_processor_input_names
+            + video_processor_input_names
+        )
         return list(dict.fromkeys(all_names))
 
     @classmethod
