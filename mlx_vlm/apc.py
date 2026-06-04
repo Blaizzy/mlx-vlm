@@ -295,6 +295,41 @@ def _cache_entry_supports_block_apc(c: Any) -> bool:
     return isinstance(c, lm_cache.KVCache)
 
 
+def _array_has_single_row(a: Any) -> bool:
+    shape = getattr(a, "shape", None)
+    return shape is None or len(shape) == 0 or int(shape[0]) == 1
+
+
+def _cache_entry_is_single_row_for_apc(c: Any) -> bool:
+    from mlx_lm.models import cache as lm_cache
+
+    if isinstance(
+        c,
+        (
+            lm_cache.KVCache,
+            lm_cache.RotatingKVCache,
+            lm_cache.ChunkedKVCache,
+        ),
+    ):
+        return _array_has_single_row(getattr(c, "keys", None)) and _array_has_single_row(
+            getattr(c, "values", None)
+        )
+    if isinstance(c, lm_cache.ArraysCache):
+        states = getattr(c, "cache", [])
+        if any(
+            state is not None and not _array_has_single_row(state) for state in states
+        ):
+            return False
+        return _array_has_single_row(
+            getattr(c, "left_padding", None)
+        ) and _array_has_single_row(getattr(c, "lengths", None))
+    if isinstance(c, lm_cache.CacheList):
+        return all(_cache_entry_is_single_row_for_apc(sub_c) for sub_c in c.caches)
+    if isinstance(c, tuple):
+        return all(_cache_entry_is_single_row_for_apc(sub_c) for sub_c in c)
+    return False
+
+
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
     h = hashlib.sha256()
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
@@ -3546,13 +3581,17 @@ def extract_prompt_cache_from_batch(
 ) -> Optional[List[Any]]:
     """Extract one row from batch-aware caches as single-row cache objects."""
 
+    if not all(callable(getattr(c, "extract", None)) for c in batch_caches):
+        if batch_idx == 0 and all(
+            _cache_entry_is_single_row_for_apc(c) for c in batch_caches
+        ):
+            return _clone_prompt_cache_for_apc(batch_caches)
+        return None
+
     out: List[Any] = []
     eval_targets: List[mx.array] = []
     for c in batch_caches:
-        extract = getattr(c, "extract", None)
-        if not callable(extract):
-            return None
-        extracted = extract(batch_idx)
+        extracted = c.extract(batch_idx)
         out.append(extracted)
         _collect_mx_arrays(extracted.state, eval_targets)
     if eval_targets:

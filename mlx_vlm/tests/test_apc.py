@@ -291,6 +291,52 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
     assert extracted[1].offset == 12
 
 
+def test_extract_prompt_cache_supports_single_row_exact_cache():
+    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+
+    token_ids = list(range(12))
+    arrays = ArraysCache(size=1)
+    arrays[0] = mx.ones((1, 3, 5))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 4))
+    kv.values = mx.ones((1, 1, len(token_ids), 4)) * 2
+    kv.offset = len(token_ids)
+    rotating = RotatingKVCache(max_size=8, keep=0)
+    rotating.keys = mx.ones((1, 1, 8, 4)) * 3
+    rotating.values = mx.ones((1, 1, 8, 4)) * 4
+    rotating.offset = len(token_ids)
+    rotating._idx = 4
+
+    extracted = extract_prompt_cache_from_batch([arrays, kv, rotating], 0)
+
+    assert extracted is not None
+    assert extracted[0] is not arrays
+    assert extracted[1] is not kv
+    assert extracted[2] is not rotating
+    _assert_allclose(extracted[0][0], arrays[0])
+    _assert_allclose(extracted[1].keys, kv.keys)
+    _assert_allclose(extracted[1].values, kv.values)
+    _assert_allclose(extracted[2].keys, rotating.keys)
+    _assert_allclose(extracted[2].values, rotating.values)
+
+    manager = APCManager(num_blocks=4, block_size=4)
+    assert manager.store_exact_cache(token_ids, extracted)
+    assert manager.stats_snapshot()["exact_stores"] == 1
+
+
+def test_extract_prompt_cache_rejects_multi_row_without_extract():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    arrays = ArraysCache(size=1)
+    arrays[0] = mx.ones((2, 3, 5))
+    kv = KVCache()
+    kv.keys = mx.ones((2, 1, 8, 4))
+    kv.values = mx.ones((2, 1, 8, 4))
+    kv.offset = 8
+
+    assert extract_prompt_cache_from_batch([arrays, kv], 0) is None
+
+
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
     monkeypatch.setenv("APC_MAX_POOL_TENSORS", "2")
     monkeypatch.setenv("APC_DISK_SHARD_MAX_BLOCKS", "2")
