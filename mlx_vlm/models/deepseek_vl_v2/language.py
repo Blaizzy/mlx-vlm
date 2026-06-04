@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
+from ...mla_fp8 import Fp8MLAKVCache, mla_fp8_attention, mla_fp8_decode_method
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -110,6 +111,9 @@ class DeepseekV2Attention(nn.Module):
         self.q_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
 
         self.scale = self.q_head_dim**-0.5
+        # Absorbed projections (kv_b_proj split into nope/value), built lazily and only
+        # used by the opt-in FP8 latent cache path. ``None`` until first FP8 decode.
+        self._absorbed = None
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(
@@ -175,6 +179,74 @@ class DeepseekV2Attention(nn.Module):
                     **rope_kwargs,
                 )
 
+    def _ensure_absorbed(self):
+        """Split ``kv_b_proj`` into absorbed nope/value matrices (lazy, cached).
+
+        ``kv_b_proj.weight`` is ``(num_heads*(qk_nope_head_dim+v_head_dim), kv_lora_rank)``.
+        Reshaped per head and split, it yields the projections that let the cached latent
+        act as both K and V — exactly mlx-lm deepseek_v3's absorbed form.
+        """
+        if self._absorbed is not None:
+            return
+        kv = self.kv_b_proj
+        if isinstance(kv, nn.QuantizedLinear):
+            w = mx.dequantize(
+                kv.weight,
+                kv.scales,
+                kv.biases,
+                group_size=kv.group_size,
+                bits=kv.bits,
+                mode=getattr(kv, "mode", "affine"),
+            )
+        else:
+            w = kv.weight
+        head_dim = self.qk_nope_head_dim + self.v_head_dim
+        w = w.reshape(self.num_heads, head_dim, self.kv_lora_rank)
+        w_knope = mx.contiguous(w[:, : self.qk_nope_head_dim, :])  # (H, nope, lora)
+        w_v = mx.contiguous(w[:, self.qk_nope_head_dim :, :])  # (H, vhead, lora)
+        self._absorbed = (w_knope, w_v)
+
+    def _forward_fp8(
+        self, x: mx.array, mask: Optional[Any], cache: "Fp8MLAKVCache"
+    ) -> mx.array:
+        """Absorbed-MLA attention over the FP8 latent cache (opt-in path)."""
+        B, L, _ = x.shape
+        self._ensure_absorbed()
+        w_knope, w_v = self._absorbed
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(x)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
+        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(x)
+        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
+        latent = self.kv_a_layernorm(compressed_kv)  # (B, L, lora)
+        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+
+        q_pe = self.rope(q_pe, cache.offset)  # (B, H, L, rope)
+        k_pe = self.rope(k_pe, cache.offset)[:, 0]  # (B, L, rope), rope key is shared
+
+        # Fold kv_b_proj into the query (qa = W_knope^T q_nope) -> (B, H, L, lora)
+        qa = mx.einsum("hnk,bhln->bhlk", w_knope, q_nope.astype(w_knope.dtype))
+        attn_mask = mask if isinstance(mask, mx.array) else None
+        o_lat = mla_fp8_attention(
+            qa,
+            q_pe,
+            latent,
+            k_pe,
+            cache,
+            self.scale,
+            method=mla_fp8_decode_method(),
+            mask=attn_mask,
+        )
+        # Fold kv_b_proj value part back out (out = W_v o_lat) -> (B, H, L, vhead)
+        out = mx.einsum("hvk,bhlk->bhlv", w_v, o_lat.astype(w_v.dtype))
+        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(out)
+
     def __call__(
         self,
         x: mx.array,
@@ -182,6 +254,9 @@ class DeepseekV2Attention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, D = x.shape
+
+        if isinstance(cache, Fp8MLAKVCache):
+            return self._forward_fp8(x, mask, cache)
 
         if self.q_lora_rank is None:
             q = self.q_proj(x)
