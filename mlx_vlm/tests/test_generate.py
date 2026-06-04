@@ -424,8 +424,15 @@ class TestGenerationBatch:
         ]
         # Falcon OCR singleton: (1, 1) broadcasts to (B, 1).
         assert self._capture(mx.array([[5]], dtype=mx.int32), 4).tolist() == [[5]] * 4
-        with pytest.raises(RuntimeError, match="does not match"):
-            self._capture(mx.array([[5], [7]], dtype=mx.int32), 3)
+        assert self._capture(mx.array([[5], [7]], dtype=mx.int32), 3).tolist() == [
+            [5],
+            [7],
+            [7],
+        ]
+        assert self._capture(mx.array([[5], [7], [9]], dtype=mx.int32), 2).tolist() == [
+            [5],
+            [7],
+        ]
 
 
 # ============================================================================

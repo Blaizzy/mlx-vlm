@@ -2002,9 +2002,17 @@ class PromptProcessingBatch:
         if rope_deltas.shape[0] == 1 and B > 1:
             rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
         if rope_deltas.shape[0] != B:
-            raise RuntimeError(
-                f"_rope_deltas shape {rope_deltas.shape} does not match prefill batch size {B}"
-            )
+            if rope_deltas.shape[0] > B:
+                rope_deltas = rope_deltas[:B]
+            else:
+                pad = B - rope_deltas.shape[0]
+                rope_deltas = mx.concatenate(
+                    [
+                        rope_deltas,
+                        mx.broadcast_to(rope_deltas[-1:], (pad, rope_deltas.shape[1])),
+                    ],
+                    axis=0,
+                )
         return rope_deltas
 
 
