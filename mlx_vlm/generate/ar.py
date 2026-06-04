@@ -1668,6 +1668,13 @@ class PromptProcessingBatch:
         )
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
+    def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
+        # Single-request cold batches use an unbatched cache that is already
+        # row-specific, so there is nothing to extract.
+        if batch_idx == 0 and len(self.uids) == 1 and self._right_pad_per_row is None:
+            return self.prompt_cache
+        return _apc.extract_prompt_cache_from_batch(self.prompt_cache, batch_idx)
+
     def _store_apc_exact_checkpoints(self) -> None:
         if self._apc_manager is None or self._apc_mode != "exact":
             return
@@ -1679,10 +1686,7 @@ class PromptProcessingBatch:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
-            prompt_cache = _apc.extract_prompt_cache_from_batch(
-                self.prompt_cache,
-                batch_idx,
-            )
+            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
             if prompt_cache is None:
                 continue
             self._apc_manager.store_exact_cache(
@@ -1946,10 +1950,7 @@ class PromptProcessingBatch:
                     if meta is None:
                         continue
                     if self._apc_mode == "exact":
-                        prompt_cache = _apc.extract_prompt_cache_from_batch(
-                            self.prompt_cache,
-                            batch_idx,
-                        )
+                        prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                         if prompt_cache is not None:
                             self._apc_manager.store_exact_cache(
                                 meta["full_input_ids"],
