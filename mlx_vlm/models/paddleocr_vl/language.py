@@ -418,9 +418,14 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                if self._position_ids is not None:
+                batch_size, seq_length = inputs.shape
+                cached_position_ids_match = (
+                    self._position_ids is not None
+                    and self._position_ids.shape[1] == batch_size
+                    and self._position_ids.shape[2] >= cache_offset + seq_length
+                )
+                if cached_position_ids_match:
                     # Use stored position_ids, sliced for current chunk
-                    seq_length = inputs.shape[1]
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
                     ]

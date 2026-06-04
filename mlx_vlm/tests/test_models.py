@@ -5688,6 +5688,97 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "paddleocr_vl")
 
+    def test_paddleocr_vl_text_only_clears_mrope_state(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        model = paddleocr_vl.Model(
+            paddleocr_vl.ModelConfig(
+                text_config=paddleocr_vl.TextConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=4,
+                    num_hidden_layers=1,
+                    intermediate_size=8,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    vocab_size=10,
+                    head_dim=2,
+                ),
+                vision_config=paddleocr_vl.VisionConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=4,
+                    intermediate_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                ),
+                model_type="paddleocr_vl",
+                image_token_id=9,
+                vision_start_token_id=8,
+            )
+        )
+
+        model.language_model._position_ids = mx.array([[[0, 1]]], dtype=mx.int32)
+        model.language_model._rope_deltas = mx.array([[4]], dtype=mx.int32)
+
+        model.get_input_embeddings(mx.array([[1, 2]], dtype=mx.int32))
+
+        self.assertIsNone(model.language_model._position_ids)
+        self.assertIsNone(model.language_model._rope_deltas)
+
+    def test_paddleocr_vl_prefill_recomputes_stale_position_ids(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        text_config = paddleocr_vl.TextConfig(
+            model_type="paddleocr_vl",
+            hidden_size=4,
+            num_hidden_layers=1,
+            intermediate_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            vocab_size=10,
+            head_dim=2,
+        )
+        config = paddleocr_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=paddleocr_vl.VisionConfig(
+                model_type="paddleocr_vl",
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+            ),
+            model_type="paddleocr_vl",
+            image_token_id=9,
+            vision_start_token_id=8,
+        )
+        lm = paddleocr_vl.LanguageModel(text_config, config)
+
+        captured = {}
+
+        class _CapturingInnerModel:
+            class _Embed:
+                def __call__(self, inputs):
+                    return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
+
+            embed_tokens = _Embed()
+
+            def __call__(self, inputs, inputs_embeds=None, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
+
+        lm.model = _CapturingInnerModel()
+        lm.lm_head = lambda x: x
+        lm._position_ids = mx.array([[[0, 1, 2]]], dtype=mx.int32)
+        lm._rope_deltas = mx.array([[3]], dtype=mx.int32)
+
+        class _Cache:
+            _idx = 0
+            offset = mx.array(0)
+
+        lm(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=[_Cache()])
+
+        self.assertEqual(captured["position_ids"].shape, (3, 2, 2))
+        self.assertEqual(lm._rope_deltas.tolist(), [[0], [0]])
+
     def test_phi3_v_input_embeddings(self):
         from mlx_vlm.models import phi3_v
         from mlx_vlm.models.base import InputEmbeddingsFeatures
