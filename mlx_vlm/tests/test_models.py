@@ -2939,6 +2939,48 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
+    def test_gemma4_quant_predicate_keeps_mlp_at_requested_bits(self):
+        from mlx_vlm.models import gemma4
+
+        model = gemma4.LanguageModel(
+            gemma4.TextConfig(
+                model_type="gemma4_text",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=2,
+                num_key_value_heads=1,
+                head_dim=16,
+                global_head_dim=16,
+                vocab_size=64,
+                vocab_size_per_layer_input=64,
+                hidden_size_per_layer_input=0,
+                num_kv_shared_layers=0,
+                sliding_window=32,
+            )
+        )
+        predicate = model.quant_predicate
+        quantizable = SimpleNamespace(to_quantized=lambda *args, **kwargs: None)
+
+        self.assertEqual(
+            predicate("language_model.model.layers.0.router.proj", quantizable),
+            {"group_size": 64, "bits": 8},
+        )
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            self.assertTrue(
+                predicate(
+                    f"language_model.model.layers.0.mlp.{projection}", quantizable
+                )
+            )
+        self.assertTrue(
+            predicate("language_model.model.layers.0.self_attn.q_proj", quantizable)
+        )
+        self.assertFalse(
+            predicate(
+                "language_model.model.layers.0.input_layernorm", SimpleNamespace()
+            )
+        )
+
     def test_gemma4_unified(self):
         import tempfile
         from pathlib import Path

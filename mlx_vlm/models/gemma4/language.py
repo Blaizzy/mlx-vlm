@@ -766,8 +766,6 @@ class LanguageModel(nn.Module):
                 return False
             if "router" in path:
                 return {"group_size": 64, "bits": 8}
-            if path.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
-                return {"group_size": 64, "bits": 8}
             return True
 
         return predicate
