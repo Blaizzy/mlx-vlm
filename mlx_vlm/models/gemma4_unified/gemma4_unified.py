@@ -402,5 +402,8 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    def make_cache(self):
+        return self.language_model.make_cache()
+
 
 VisionModel = VisionEmbedder
