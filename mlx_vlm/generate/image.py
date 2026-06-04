@@ -606,6 +606,10 @@ def run_image_generation_cli(args: Any) -> None:
             else Path("outputs") / f"image-{seed}.png"
         )
         model = load_image_model(args.model, task="generate", **load_kwargs)
+        extra = dict(getattr(args, "gen_kwargs", {}) or {})
+        prompt_expansion_model = getattr(args, "prompt_expansion_model", None)
+        if prompt_expansion_model is not None:
+            extra["prompt_expansion_model"] = prompt_expansion_model
         request = ImageGenerationRequest(
             prompt=prompt,
             seed=seed,
@@ -613,7 +617,7 @@ def run_image_generation_cli(args: Any) -> None:
             width=width,
             height=height,
             guidance=args.guidance,
-            extra=dict(getattr(args, "gen_kwargs", {}) or {}),
+            extra=extra,
         )
         result = generate_image(
             model,

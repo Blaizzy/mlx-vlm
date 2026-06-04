@@ -18,6 +18,8 @@ from .config import (
 )
 from .download import download_model, validate_model_layout
 from .latent_norm import get_latent_norm
+from .prompting import NormalizedPrompt
+from .prompting import prepare_prompt as prepare_ideogram_prompt
 from .scheduler import get_preset, get_schedule_for_resolution, make_step_intervals
 from .transformer import LLM_TOKEN_INDICATOR, OUTPUT_IMAGE_INDICATOR
 from .weights import PRECISION, load_text_encoder, load_transformer, load_vae
@@ -103,6 +105,25 @@ class Ideogram4ImagePipeline:
         )
         return Image.fromarray(np.array(array))
 
+    def prepare_prompt(
+        self,
+        prompt: str,
+        *,
+        auto_json_caption: bool = True,
+        prompt_expansion_model: str | None = None,
+        width: int | None = None,
+        height: int | None = None,
+        warn: bool = True,
+    ) -> NormalizedPrompt:
+        return prepare_ideogram_prompt(
+            prompt,
+            auto_json_caption=auto_json_caption,
+            prompt_expansion_model=prompt_expansion_model,
+            width=width,
+            height=height,
+            warn=warn,
+        )
+
     def generate_array(
         self,
         prompt: str,
@@ -115,8 +136,18 @@ class Ideogram4ImagePipeline:
         **kwargs: Any,
     ) -> tuple[mx.array, dict[str, Any]]:
         validate_dimensions(width=width, height=height)
-        if not prompt:
+        if not prompt.strip():
             raise ValueError("prompt must not be empty")
+
+        auto_json_value = kwargs.get("auto_json_caption", True)
+        auto_json_caption = True if auto_json_value is None else bool(auto_json_value)
+        prepared_prompt = self.prepare_prompt(
+            prompt,
+            auto_json_caption=auto_json_caption,
+            prompt_expansion_model=kwargs.get("prompt_expansion_model"),
+            width=width,
+            height=height,
+        )
 
         preset = get_preset(kwargs.get("sampler_preset"))
         num_steps = int(
@@ -141,7 +172,7 @@ class Ideogram4ImagePipeline:
 
         mu = float(kwargs.get("mu", preset.mu))
         std = float(kwargs.get("std", preset.std))
-        inputs = self._build_inputs(prompt, height=height, width=width)
+        inputs = self._build_inputs(prepared_prompt.text, height=height, width=width)
         llm_features = self._encode_text(
             inputs["text_token_ids"],
             num_image_tokens=inputs["num_image_tokens"],
@@ -224,6 +255,19 @@ class Ideogram4ImagePipeline:
             "prompt_tokens": int(inputs["num_text_tokens"]),
             "architecture": "single_stream_dit",
             "weight_load": "fp8_dequantized_to_bf16",
+            "auto_json_caption": auto_json_caption,
+            "prompt_was_wrapped": prepared_prompt.was_wrapped,
+            "prompt_is_json_caption": prepared_prompt.is_json_caption,
+            "prompt_is_structured_caption": prepared_prompt.is_structured_caption,
+            "prompt_warnings": list(prepared_prompt.warnings),
+            "revised_prompt": (
+                prepared_prompt.text
+                if prepared_prompt.was_wrapped or prepared_prompt.prompt_expansion_used
+                else None
+            ),
+            "prompt_expansion_model": prepared_prompt.prompt_expansion_model,
+            "prompt_expansion_used": prepared_prompt.prompt_expansion_used,
+            "prompt_expansion_error": prepared_prompt.prompt_expansion_error,
         }
 
     def _ensure_text_encoder(self) -> None:
