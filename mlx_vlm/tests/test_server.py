@@ -800,6 +800,52 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
 
 
+def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="ideogram4"),
+        ),
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        calls.append(request)
+        result = _fake_image_result(seed=request.seed)
+        result.metadata["revised_prompt"] = '{"compositional_deconstruction":{}}'
+        return result
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "ideogram-ai/ideogram-4-fp8",
+            "prompt": "A red cube.",
+            "seed": 10,
+            "size": "256x256",
+            "steps": 1,
+            "auto_json_caption": True,
+            "prompt_expansion_model": "tiny-text-model",
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls[0].extra == {
+        "auto_json_caption": True,
+        "prompt_expansion_model": "tiny-text-model",
+    }
+    assert (
+        response.json()["data"][0]["revised_prompt"]
+        == '{"compositional_deconstruction":{}}'
+    )
+
+
 def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
     monkeypatch.setattr(
         server,

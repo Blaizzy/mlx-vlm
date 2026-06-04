@@ -61,6 +61,17 @@ class ImageGenerationRequest(FlexibleBaseModel):
         DEFAULT_IMAGE_GUIDANCE,
         description="Classifier-free guidance scale.",
     )
+    auto_json_caption: Optional[bool] = Field(
+        None,
+        description="For Ideogram 4, wrap plain prompts into JSON captions.",
+    )
+    prompt_expansion_model: Optional[str] = Field(
+        None,
+        description=(
+            "Text model path or Hugging Face repo used to expand plain "
+            "Ideogram 4 prompts into structured JSON captions."
+        ),
+    )
     response_format: Literal["b64_json", "path"] = Field(
         "b64_json",
         description="Return base64 PNG data or write files and return local paths.",
