@@ -315,9 +315,17 @@ def skip_multimodal_module(path: str) -> bool:
     return any(module in path for module in multimodal_modules)
 
 
+def _has_quantized_weights(path: str, weights: Optional[Dict[str, mx.array]]) -> bool:
+    return weights is not None and f"{path}.scales" in weights
+
+
 def get_class_predicate(skip_vision=False, weights=None, quantization_config=None):
     def predicate(p, m):
-        if skip_multimodal_module(p) and skip_vision:
+        if (
+            skip_multimodal_module(p)
+            and skip_vision
+            and not _has_quantized_weights(p, weights)
+        ):
             return False
         if quantization_config is not None and p in quantization_config:
             return quantization_config[p]
@@ -586,8 +594,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         )
 
         def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
+            # Skip legacy multimodal layers unless the checkpoint has quantized
+            # tensors for this exact module.
+            if (
+                skip_multimodal_module(p)
+                and skip_vision
+                and not _has_quantized_weights(p, weights)
+            ):
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
