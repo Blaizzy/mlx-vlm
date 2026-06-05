@@ -486,12 +486,20 @@ class LanguageModel(nn.Module):
                 ]
             elif inputs is not None:
                 # Compute position_ids on the fly (for non-chunked prefill)
-                position_ids = self.get_xdrope_input_positions(
-                    input_tokens=inputs[0].tolist(),
-                    image_grid_thw=kwargs.get("image_grid_thw", None),
-                    image_token_id=self.config.image_token_id,
-                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
-                )[None, ...]
+                position_ids = mx.stack(
+                    [
+                        self.get_xdrope_input_positions(
+                            input_tokens=row,
+                            image_grid_thw=kwargs.get("image_grid_thw", None),
+                            image_token_id=self.config.image_token_id,
+                            spatial_merge_size=(
+                                self.config.vision_config.spatial_merge_size
+                            ),
+                        )
+                        for row in inputs.tolist()
+                    ],
+                    axis=0,
+                )
                 # Store for potential future chunks
                 self._position_ids = position_ids
 
