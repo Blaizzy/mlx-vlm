@@ -375,14 +375,20 @@ class Gemma4TextModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_scale = config.hidden_size**0.5
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared = config.num_hidden_layers - num_kv_shared
         self.layers = [
-            DecoderLayer(config, layer_idx=i, kv_shared_only=kv_shared_only)
+            DecoderLayer(
+                config,
+                layer_idx=i,
+                kv_shared_only=kv_shared_only
+                or (num_kv_shared > 0 and i >= first_kv_shared),
+            )
             for i in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-        self.first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
+        self.first_kv_shared_layer_idx = first_kv_shared
         self.previous_kvs = list(range(len(self.layers)))
         if num_kv_shared > 0:
             N = len(self.layers)
