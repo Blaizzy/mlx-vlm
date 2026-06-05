@@ -20,6 +20,55 @@ Capabilities:
 
 > **K-eq-V**: Full attention layers reuse key projections as values (no separate `v_proj`), reducing parameters and memory while using `num_global_key_value_heads` for the KV dimension.
 
+## Base vs Instruct models
+
+Gemma 4 comes in **base (pretrained)** and **instruct (`-it`)** variants. They use the same `load()` / `generate()` Python API, but prompt formatting differs.
+
+| Variant | Example IDs | Chat template | Typical use |
+|---------|-------------|---------------|-------------|
+| **Base** | `google/gemma-4-e4b`, `google/gemma-4-e2b` | None | Completion / fine-tuning; pass raw prompt text |
+| **Instruct** | `google/gemma-4-e4b-it`, `google/gemma-4-31b-it` | Yes | Chat, tools, multimodal Q&A |
+
+### Python API: when to call `apply_chat_template`
+
+`mlx-vlm` does **not** assume every model uses a chat template (same idea as Hugging Face Transformers). Callers format prompts explicitly:
+
+- **Base models** — pass your prompt string directly to `generate()`. No chat template is required or expected.
+- **Instruct models** — call `apply_chat_template()` (or `processor.apply_chat_template()`) **before** `generate()`. The CLI applies this for you; the Python API does not.
+
+```python
+from mlx_vlm import load, generate
+
+# Base: raw prompt is fine
+model, processor = load("google/gemma-4-e4b")
+result = generate(model, processor, prompt="The capital of France is", max_tokens=32)
+
+# Instruct: apply the chat template first
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model, processor = load("google/gemma-4-e4b-it")
+prompt = apply_chat_template(processor, model.config, "What is the capital of France?")
+result = generate(model, processor, prompt=prompt, max_tokens=128)
+```
+
+Passing a raw user string to an **instruct** checkpoint without templating can produce degenerate output (for example, repeating the prompt). That is expected when the model is used outside its chat format.
+
+### Instruct: thinking vs non-thinking
+
+All Gemma 4 **instruct** models support optional chain-of-thought reasoning. **Thinking is off by default.**
+
+| Mode | CLI | Python (`apply_chat_template`) |
+|------|-----|--------------------------------|
+| **Non-thinking (default)** | omit `--enable-thinking` | default / `chat_template_kwargs={"enable_thinking": False}` |
+| **Thinking** | `--enable-thinking` | `chat_template_kwargs={"enable_thinking": True}` |
+| **Thinking + budget** | `--enable-thinking --thinking-budget 512` | set budget via `generate(..., thinking_budget=512, enable_thinking=True)` |
+
+Notes:
+
+- Reasoning is gated by the chat template (`enable_thinking=True` inserts the thinking channel). It is not enabled automatically.
+- On **26B / 31B instruct** checkpoints, the template may include an empty thinking channel when thinking is disabled. This stabilizes output by suppressing stray thought tokens.
+- Thinking output uses `<|channel>...<channel|>` delimiters between reasoning and the final answer (see [Thinking mode](#thinking-mode-chain-of-thought) below).
+
 ## Install
 
 ```sh

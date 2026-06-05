@@ -173,6 +173,66 @@ class TestApplyChatTemplateIntegration:
                 }
             ]
 
+    def test_gemma4_unified_formats_image_and_audio_messages(self):
+        """Gemma 4 Unified should use typed multimodal content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the inputs.",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {
+                        "type": "text",
+                        "text": "Describe the inputs.",
+                        "content": "Describe the inputs.",
+                    },
+                    {"type": "audio"},
+                ],
+            }
+        ]
+
+    def test_gemma4_unified_formats_video_messages(self):
+        """Gemma 4 Unified should use typed video content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {
+                        "type": "text",
+                        "text": "Describe the video.",
+                        "content": "Describe the video.",
+                    },
+                ],
+            }
+        ]
+
     def test_text_only_formats_regular_chat_message(self):
         """Text-only models should use regular role/content messages with no image tokens."""
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -185,6 +245,20 @@ class TestApplyChatTemplateIntegration:
         )
 
         assert result == [{"role": "user", "content": "Make a program to find pi"}]
+
+    def test_step3p7_formats_image_patch_token(self):
+        """Step-3.7 prompts should include the placeholder its processor expands."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "step3p7"},
+            "What do you see?",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
 
     def test_tool_call_arguments_json_string_is_normalized(self):
         """OpenAI-style JSON-string tool call arguments should become dicts."""

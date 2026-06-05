@@ -12,6 +12,7 @@ from mlx_lm.tokenizer_utils import _infer_tool_parser as _mlx_lm_infer_tool_pars
 # Additional patterns not covered by mlx_lm
 _EXTRA_PATTERNS = [
     ("<|tool_call>", "gemma4"),
+    ("<|START_ACTION|>", "cohere2_moe"),
 ]
 
 

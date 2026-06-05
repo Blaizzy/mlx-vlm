@@ -3,7 +3,17 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ....models.base import BaseModelConfig
-from ....models.qwen3_5.config import TextConfig
+from ....models.qwen3_5.config import TextConfig as DenseTextConfig
+from ....models.qwen3_5_moe.config import TextConfig as MoeTextConfig
+
+
+class TextConfig:
+    @classmethod
+    def from_dict(cls, params: dict):
+        text_config_cls = (
+            MoeTextConfig if "moe" in params.get("model_type", "") else DenseTextConfig
+        )
+        return text_config_cls.from_dict(params)
 
 
 @dataclass

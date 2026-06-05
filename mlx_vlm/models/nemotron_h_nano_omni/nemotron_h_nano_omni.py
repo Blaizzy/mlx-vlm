@@ -122,9 +122,15 @@ class Model(nn.Module):
         if not isinstance(input_features, mx.array):
             input_features = mx.array(input_features)
         lm_head = self.language_model.lm_head
-        compute_dtype = (
-            lm_head.scales.dtype if hasattr(lm_head, "scales") else lm_head.weight.dtype
-        )
+        if hasattr(lm_head, "scales"):
+            s_dtype = lm_head.scales.dtype
+            # nvfp4 packs the per-group scales as uint8 (and other packed
+            # quant modes can use uint32), so the scales' dtype is not a
+            # usable *compute* dtype for the audio features. Fall back to
+            # bfloat16, which matches the model's declared torch_dtype.
+            compute_dtype = mx.bfloat16 if s_dtype in (mx.uint8, mx.uint32) else s_dtype
+        else:
+            compute_dtype = lm_head.weight.dtype
         input_features = input_features.astype(compute_dtype)
 
         if feature_attention_mask is not None and not isinstance(

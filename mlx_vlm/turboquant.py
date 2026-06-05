@@ -6,7 +6,7 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import _BaseCache, create_attention_mask
+from mlx_lm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
@@ -1329,12 +1329,30 @@ def _metal_polar_turbo_score(
     return mx.expand_dims(scores, axis=3)
 
 
+def _value_rotate_inverse(
+    weighted_rot: mx.array, rotation: mx.array, signs: Optional[mx.array]
+) -> mx.array:
+    """Undo the codec rotation on a Metal value-kernel result.
+
+    The L=1 value kernels return the weighted value sum in the codec's
+    *rotated* space. Map it back to model space with the same inverse the
+    codec uses: an explicit Randomized Hadamard inverse when the codec runs
+    with RHT (``signs`` provided), otherwise the dense-rotation matmul.
+    Mirrors ``_TurboQuantMSECodec._rotate_inverse`` so the kernel fast path
+    stays valid under RHT instead of being skipped for the einsum fallback.
+    """
+    if signs is not None:
+        return _rht_inverse(weighted_rot, signs)
+    return mx.matmul(weighted_rot, rotation)
+
+
 def _metal_mse_weighted_sum(
     weights: mx.array,
     state: TurboQuantMSEState,
     bits: int,
     codebook: mx.array,
     rotation: mx.array,
+    signs: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1374,7 +1392,7 @@ def _metal_mse_weighted_sum(
                 output_shapes=[(B, H, R, D)],
                 output_dtypes=[mx.float32],
             )[0]
-            output = mx.matmul(weighted_rot, rotation)
+            output = _value_rotate_inverse(weighted_rot, rotation, signs)
             return mx.expand_dims(output, axis=3)
 
     kernel = _mse_weighted_rot_kernel()
@@ -1398,7 +1416,7 @@ def _metal_mse_weighted_sum(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation)
+    output = _value_rotate_inverse(weighted_rot, rotation, signs)
     return mx.expand_dims(output, axis=3)
 
 
@@ -1408,6 +1426,7 @@ def _metal_mse_weighted_sum_from_scores(
     bits: int,
     codebook: mx.array,
     rotation: mx.array,
+    signs: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1454,7 +1473,7 @@ def _metal_mse_weighted_sum_from_scores(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation)
+    output = _value_rotate_inverse(weighted_rot, rotation, signs)
     return mx.expand_dims(output, axis=3)
 
 
@@ -1465,6 +1484,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
     codebook: mx.array,
     rotation: mx.array,
     max_scores: mx.array,
+    signs: Optional[mx.array] = None,
 ) -> Optional[mx.array]:
     if (
         bits <= 0
@@ -1509,7 +1529,7 @@ def _metal_mse_weighted_sum_sum_from_scores(
         output_shapes=[(B, H, R, D)],
         output_dtypes=[mx.float32],
     )[0]
-    output = mx.matmul(weighted_rot, rotation)
+    output = _value_rotate_inverse(weighted_rot, rotation, signs)
     return mx.expand_dims(output, axis=3)
 
 
@@ -4294,6 +4314,7 @@ class _TurboQuantMSECodec:
                 self.bits,
                 self.codebook,
                 self.rotation,
+                self.signs,
             )
             if fast_output is not None:
                 return fast_output
@@ -4311,23 +4332,26 @@ class _TurboQuantMSECodec:
     def weighted_sum_from_scores(
         self, scores: mx.array, state: TurboQuantMSEState
     ) -> mx.array:
-        if not self.use_rht:
-            fast_output = _metal_mse_weighted_sum_from_scores(
-                scores,
-                state,
-                self.bits,
-                self.codebook,
-                self.rotation,
-            )
-            if fast_output is not None:
-                return fast_output
+        fast_output = _metal_mse_weighted_sum_from_scores(
+            scores,
+            state,
+            self.bits,
+            self.codebook,
+            self.rotation,
+            self.signs,
+        )
+        if fast_output is not None:
+            return fast_output
         return self.weighted_sum(mx.softmax(scores, axis=-1), state)
 
     def weighted_sum_stats_from_scores(
         self, scores: mx.array, state: TurboQuantMSEState
     ) -> tuple[mx.array, mx.array, mx.array]:
         max_scores = mx.max(scores, axis=-1)
-        # Metal kernel fast path: only for single-query decode (L=1)
+        # Metal kernel fast path: only for single-query decode (L=1). The
+        # kernel returns the weighted sum in rotated space; the wrapper applies
+        # the codec's RHT-aware inverse (via ``signs``), so this stays valid
+        # whether or not the codec uses RHT.
         if scores.ndim == 5 and scores.shape[-2] == 1:
             max_scores_2d = max_scores.reshape(
                 max_scores.shape[0],
@@ -4341,6 +4365,7 @@ class _TurboQuantMSECodec:
                 self.codebook,
                 self.rotation,
                 max_scores_2d,
+                self.signs,
             )
             if fast_output is not None:
                 denom = mx.sum(mx.exp(scores - max_scores[..., None]), axis=-1)
@@ -4973,6 +4998,10 @@ class TurboQuantKVCache(_BaseCache):
             or not isinstance(self.key_codec, _TurboQuantMSECodec)
             or not isinstance(self.value_codec, _TurboQuantMSECodec)
         ):
+            return None, None
+
+        # RHT codecs use Hadamard rotation; this fused kernel applies dense rotation.
+        if self.key_codec.use_rht or self.value_codec.use_rht:
             return None, None
 
         key_bits = int(self.key_codec.bits)
@@ -6259,8 +6288,10 @@ class BatchTurboQuantKVCache(_BaseCache):
     def empty(self):
         return self.keys is None
 
-    def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        return create_causal_mask(
+            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+        )
 
     @property
     def group_size(self):
