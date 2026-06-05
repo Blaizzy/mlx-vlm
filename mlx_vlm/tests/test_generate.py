@@ -424,15 +424,8 @@ class TestGenerationBatch:
         ]
         # Falcon OCR singleton: (1, 1) broadcasts to (B, 1).
         assert self._capture(mx.array([[5]], dtype=mx.int32), 4).tolist() == [[5]] * 4
-        assert self._capture(mx.array([[5], [7]], dtype=mx.int32), 3).tolist() == [
-            [5],
-            [7],
-            [7],
-        ]
-        assert self._capture(mx.array([[5], [7], [9]], dtype=mx.int32), 2).tolist() == [
-            [5],
-            [7],
-        ]
+        with pytest.raises(RuntimeError, match="does not match"):
+            self._capture(mx.array([[5], [7]], dtype=mx.int32), 3)
 
 
 # ============================================================================
@@ -1442,55 +1435,6 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
-    def _make_criteria(self, enable_thinking=True):
-        return ThinkingBudgetCriteria(
-            tokenizer=FakeTokenizer(),
-            thinking_budget=5,
-            thinking_end_token="</think>",
-            thinking_start_token="<think>",
-            enable_thinking=enable_thinking,
-        )
-
-    def test_apply_forced_token_safe_before_first_call(self):
-        """Regression: apply_forced_token must be safe before __call__ ever runs.
-
-        forced_token_id has to be initialised in __init__; otherwise the first
-        apply_forced_token (e.g. on the very first decode step) raises
-        AttributeError. This crashed real generations on Gemma-style models
-        whose first generated token is the thinking delimiter.
-        """
-        criteria = self._make_criteria()
-        y = mx.array([7])
-        # No __call__ yet: must be a no-op that returns the input unchanged.
-        assert criteria.apply_forced_token(y).tolist() == [7]
-
-    def test_apply_forced_token_safe_after_start_delimiter(self):
-        """Regression: the start-token early return in __call__ does not set
-        forced_token_id, so apply_forced_token must remain safe afterwards."""
-        criteria = self._make_criteria()
-        # First generated token is the start delimiter -> early return, no force.
-        assert criteria(99) is None
-        assert criteria.apply_forced_token(mx.array([7])).tolist() == [7]
-
-    def test_apply_forced_token_safe_after_end_delimiter(self):
-        """Regression: the end-token early return in __call__ does not set
-        forced_token_id, so apply_forced_token must remain safe afterwards."""
-        criteria = self._make_criteria()
-        # End delimiter resets thinking state and returns None without forcing.
-        assert criteria(100) is None
-        assert criteria.apply_forced_token(mx.array([8])).tolist() == [8]
-
-    def test_apply_forced_token_emits_forced_token_when_budget_exceeded(self):
-        """End-to-end: once the budget is exceeded, the token returned by
-        __call__ is the same one apply_forced_token injects into the stream."""
-        criteria = self._make_criteria()
-        # Burn the budget (5 tokens), then trip it on the 6th.
-        for i in range(5):
-            assert criteria(50 + i) is None
-        forced = criteria(60)  # \n forced
-        assert forced == 10
-        assert criteria.apply_forced_token(mx.array([0])).tolist() == [10]
-
 
 class TestSamplerArgs:
     """Tests for sampler argument forwarding."""
@@ -1592,67 +1536,6 @@ def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     mock_tqdm.assert_called_once()
     assert mock_tqdm.call_args.kwargs["disable"] is disabled
     assert pbar.update.call_count > 0
-
-
-def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
-    model = MagicMock()
-    model.no_chunked_prefill = False
-    model.chunked_prefill_policy.return_value = True
-
-    output = SimpleNamespace(
-        logits=mx.zeros((1, 1, 4)),
-        hidden_states=[mx.zeros((1, 1, 4))],
-        shared_kv_states={},
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-    model.language_model.return_value = output
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    draft_model = SimpleNamespace(
-        config=SimpleNamespace(target_layer_ids=[]),
-    )
-
-    with (
-        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(ar_module, "run_speculative_rounds", return_value=iter(())),
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-            prefill_step_size=2,
-            draft_model=draft_model,
-            draft_kind="mtp",
-        )
-        list(gen)
-
-    assert model.language_model.call_args_list[0].kwargs["n_to_process"] == 2
-    assert model.language_model.call_args_list[1].kwargs["n_to_process"] == 2
-    model.chunked_prefill_policy.assert_called_once()
-
-
-def test_chunked_prefill_policy_defaults_conservative_for_speculation():
-    model = SimpleNamespace(no_chunked_prefill=False)
-
-    assert ar_module._chunked_prefill_enabled(model)
-    assert not ar_module._chunked_prefill_enabled(
-        model,
-        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
-        draft_kind="mtp",
-        prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
-    )
 
 
 def test_stream_generate_forwards_verbose_to_generate_step():

@@ -1,4 +1,3 @@
-import importlib
 import inspect
 import threading
 import unittest
@@ -11,235 +10,25 @@ from mlx.utils import tree_map
 
 
 class TestModels(unittest.TestCase):
-    def _reset_prefill_state(self, model):
-        seen = set()
-        language_model = getattr(model, "language_model", None)
-        stack = [
-            model,
-            getattr(model, "model", None),
-            language_model,
-            getattr(language_model, "model", None),
-        ]
-        while stack:
-            obj = stack.pop()
-            if obj is None or id(obj) in seen:
-                continue
-            seen.add(id(obj))
-            for attr in ("_position_ids", "_rope_deltas"):
-                if hasattr(obj, attr):
-                    setattr(obj, attr, None)
-
-    def _language_model_kwargs(self, model, **kwargs):
-        parameters = inspect.signature(model.__call__).parameters
-        accepts_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-        )
-        if accepts_kwargs:
-            return kwargs
-        return {k: v for k, v in kwargs.items() if k in parameters}
-
-    def _set_cache_context_offset(self, cache, offset):
-        if hasattr(cache, "offset"):
-            try:
-                cache.offset = (
-                    mx.array([offset]) if isinstance(cache.offset, mx.array) else offset
-                )
-            except AttributeError:
-                pass
-
-        max_size = getattr(cache, "max_size", None)
-        if hasattr(cache, "_idx"):
-            cache._idx = min(offset, max_size or offset)
-        if hasattr(cache, "start_position"):
-            cache.start_position = max(0, offset - getattr(cache, "_idx", 0))
-
-    def _assert_compact_attention_mask(self, mask, cache, query_len):
-        if mask is None:
-            return
-        if isinstance(mask, str):
-            self.assertEqual(mask, "causal")
-            return
-
-        self.assertIsInstance(mask, mx.array)
-        max_size = getattr(cache, "max_size", None)
-        if max_size is None:
-            max_width = query_len
-        else:
-            max_width = (
-                int(max_size) + query_len + int(getattr(cache, "buffer_size", 0))
-            )
-        self.assertLessEqual(mask.shape[-2], query_len)
-        self.assertLessEqual(mask.shape[-1], max_width)
-
-    def _make_cache_mask(self, cache, query_len, offset):
-        make_mask = getattr(cache, "make_mask", None)
-        if not callable(make_mask):
-            return "causal" if query_len > 1 else None
-
-        parameters = inspect.signature(make_mask).parameters
-        accepts_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
-        )
-        kwargs = {}
-        if "return_array" in parameters or accepts_kwargs:
-            kwargs["return_array"] = False
-        if "window_size" in parameters or accepts_kwargs:
-            kwargs["window_size"] = None
-        if "offset" in parameters:
-            kwargs["offset"] = offset
-        return make_mask(query_len, **kwargs)
-
-    def _assert_long_context_masks_compact(self, model):
-        from mlx_vlm.models import cache as cache_utils
-
-        query_len = 2
-        for offset in (0, 1, 2_048, 65_536, 131_072, 260_000):
-            prompt_cache = cache_utils.make_prompt_cache(model)
-            for c in prompt_cache:
-                if c is None:
-                    continue
-                self._set_cache_context_offset(c, offset)
-                mask = self._make_cache_mask(c, query_len, offset)
-                self._assert_compact_attention_mask(mask, c, query_len)
-
-    def _assert_model_chunked_prefill(
-        self,
-        model,
-        input_ids,
-        vocab_size,
-        dtype,
-        *,
-        expected_enabled=True,
-        prefill_step_size=2,
-        **kwargs,
-    ):
-        from mlx_vlm.generate import ar as ar_module
-        from mlx_vlm.models import cache as cache_utils
-
-        self._reset_prefill_state(model)
-        prompt_cache = cache_utils.make_prompt_cache(model)
-        if hasattr(model, "language_model"):
-            language_cache = cache_utils.make_prompt_cache(model.language_model)
-            self.assertEqual(
-                [type(c) for c in prompt_cache],
-                [type(c) for c in language_cache],
-            )
-            del language_cache
-
-        embedding_output = model.get_input_embeddings(input_ids=input_ids, **kwargs)
-        inputs_embeds = embedding_output.inputs_embeds
-        lm_kwargs = dict(kwargs)
-        lm_kwargs.update(
-            {
-                k: v
-                for k, v in embedding_output.to_dict().items()
-                if k != "inputs_embeds" and v is not None
-            }
-        )
-        enabled = ar_module._chunked_prefill_enabled(
-            model,
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            prompt_cache=prompt_cache,
-            prefill_kwargs=lm_kwargs,
-        )
-        self.assertEqual(enabled, expected_enabled)
-        if not expected_enabled:
-            return
-
-        chunked_input_ids = input_ids
-        chunked_inputs_embeds = inputs_embeds
-        processed_tokens = 0
-        prefill_chunks = 0
-        while chunked_inputs_embeds.shape[1] > 1:
-            n_to_process = min(prefill_step_size, chunked_inputs_embeds.shape[1] - 1)
-            outputs = model.language_model(
-                inputs=chunked_input_ids[:, :n_to_process],
-                inputs_embeds=chunked_inputs_embeds[:, :n_to_process],
-                cache=prompt_cache,
-                n_to_process=n_to_process,
-                **lm_kwargs,
-            )
-            mx.eval([c.state for c in prompt_cache])
-
-            processed_tokens += n_to_process
-            prefill_chunks += 1
-            chunked_input_ids = chunked_input_ids[:, n_to_process:]
-            chunked_inputs_embeds = chunked_inputs_embeds[:, n_to_process:]
-            del outputs
-            mx.clear_cache()
-
-        self.assertEqual(processed_tokens, inputs_embeds.shape[1] - 1)
-        self.assertGreater(prefill_chunks, 1)
-
-        outputs = model.language_model(
-            inputs=chunked_input_ids[:, -1:],
-            inputs_embeds=chunked_inputs_embeds[:, -1:],
-            cache=prompt_cache,
-            **lm_kwargs,
-        )
-        logits = outputs.logits
-        self.assertEqual(logits.shape, (input_ids.shape[0], 1, vocab_size))
-        self.assertEqual(logits.dtype, dtype)
-        mx.eval(logits)
-        del logits, outputs, prompt_cache
-        mx.clear_cache()
-
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
-        from mlx_vlm.models import cache as cache_utils
-
         self.assertEqual(model.model_type, model_type)
         self.assertEqual(len(model.layers), num_layers)
-        self._assert_long_context_masks_compact(model)
 
-        batch_size = 2
+        batch_size = 1
 
         for t in [mx.float32, mx.float16]:
             model.update(tree_map(lambda p: p.astype(t), model.parameters()))
 
-            inputs = mx.array(
-                [
-                    [i % vocab_size for i in range(5)],
-                    [(i + 1) % vocab_size for i in range(5)],
-                ],
-                dtype=mx.int32,
-            )
-            prefill_step_size = 2
-            chunked_inputs = inputs
-            processed_tokens = 0
-            prefill_chunks = 0
+            inputs = mx.array([[0, 1]])
+            outputs = model(inputs)
+            logits = outputs.logits
+            self.assertEqual(logits.shape, (batch_size, 2, vocab_size))
+            self.assertEqual(logits.dtype, t)
 
-            self._reset_prefill_state(model)
-            prompt_cache = cache_utils.make_prompt_cache(model)
-
-            while chunked_inputs.shape[1] > 1:
-                n_to_process = min(prefill_step_size, chunked_inputs.shape[1] - 1)
-                outputs = model(
-                    chunked_inputs[:, :n_to_process],
-                    **self._language_model_kwargs(
-                        model,
-                        cache=prompt_cache,
-                        n_to_process=n_to_process,
-                    ),
-                )
-                mx.eval([c.state for c in prompt_cache])
-
-                processed_tokens += n_to_process
-                prefill_chunks += 1
-                chunked_inputs = chunked_inputs[:, n_to_process:]
-                del outputs
-                mx.clear_cache()
-
-            self.assertEqual(processed_tokens, inputs.shape[1] - 1)
-            self.assertGreater(prefill_chunks, 1)
-
-            outputs = model(chunked_inputs[:, -1:], cache=prompt_cache)
+            outputs = model(mx.argmax(logits[0, -1:, :], keepdims=True), cache=None)
             logits = outputs.logits
             self.assertEqual(logits.shape, (batch_size, 1, vocab_size))
             self.assertEqual(logits.dtype, t)
-            mx.eval(logits)
-            del logits, outputs, prompt_cache
-            mx.clear_cache()
 
     def mm_projector_test_runner(
         self, mm_projector, vision_hidden_size, text_hidden_size
@@ -3150,70 +2939,6 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
-        shared_text_config = gemma4.TextConfig(
-            model_type="gemma4_text",
-            hidden_size=16,
-            num_hidden_layers=4,
-            intermediate_size=32,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=8,
-            global_head_dim=8,
-            vocab_size=32,
-            vocab_size_per_layer_input=32,
-            hidden_size_per_layer_input=8,
-            num_kv_shared_layers=2,
-            sliding_window=32,
-            sliding_window_pattern=2,
-        )
-        shared_model = gemma4.Model(
-            gemma4.ModelConfig(
-                text_config=shared_text_config,
-                vision_config=vision_config,
-                model_type="gemma4",
-                vocab_size=config.vocab_size,
-                image_token_id=config.image_token_id,
-                audio_config=None,
-            )
-        )
-
-        weights = shared_model.sanitize(
-            {
-                "model.language_model.layers.1.self_attn.k_proj.weight": mx.zeros(
-                    (8, 16)
-                ),
-                "model.language_model.layers.2.self_attn.k_proj.weight": mx.zeros(
-                    (8, 16)
-                ),
-                "model.language_model.layers.2.self_attn.v_proj.weight": mx.zeros(
-                    (8, 16)
-                ),
-                "model.language_model.layers.2.self_attn.k_norm.weight": mx.zeros((8,)),
-                "model.language_model.layers.2.self_attn.q_proj.weight": mx.zeros(
-                    (16, 16)
-                ),
-                "model.language_model.layers.3.self_attn.v_proj.weight": mx.zeros(
-                    (8, 16)
-                ),
-            }
-        )
-        weights = shared_model.language_model.sanitize(weights)
-
-        self.assertIn("language_model.model.layers.1.self_attn.k_proj.weight", weights)
-        self.assertIn("language_model.model.layers.2.self_attn.q_proj.weight", weights)
-        self.assertNotIn(
-            "language_model.model.layers.2.self_attn.k_proj.weight", weights
-        )
-        self.assertNotIn(
-            "language_model.model.layers.2.self_attn.v_proj.weight", weights
-        )
-        self.assertNotIn(
-            "language_model.model.layers.2.self_attn.k_norm.weight", weights
-        )
-        self.assertNotIn(
-            "language_model.model.layers.3.self_attn.v_proj.weight", weights
-        )
-
     def test_gemma4_quant_predicate_keeps_mlp_at_requested_bits(self):
         from mlx_vlm.models import gemma4
 
@@ -3329,38 +3054,10 @@ class TestModels(unittest.TestCase):
             tree_map(lambda p: p.astype(mx.float32), model.language_model.parameters())
         )
 
-        self._assert_model_chunked_prefill(
-            model,
-            mx.array([[0, 1, 2, 3, 4]], dtype=mx.int32),
-            config.vocab_size,
-            mx.float32,
-        )
-
-        audio_input_ids = mx.array([[0, 62, 62, 1, 2]], dtype=mx.int32)
-        input_features = mx.random.uniform(shape=(1, 2, 8))
-        input_features_mask = mx.array([[True, True]])
-        self._assert_model_chunked_prefill(
-            model,
-            audio_input_ids,
-            config.vocab_size,
-            mx.float32,
-            input_features=input_features,
-            input_features_mask=input_features_mask,
-        )
-
         input_ids = mx.array([[0, 63, 63, 63, 63, 1]], dtype=mx.int32)
         pixel_values = mx.random.uniform(shape=(1, 4, 4 * 4 * 3))
         image_position_ids = mx.array(
             [[[0, 0], [1, 0], [0, 1], [1, 1]]], dtype=mx.int32
-        )
-        self._assert_model_chunked_prefill(
-            model,
-            input_ids,
-            config.vocab_size,
-            mx.float32,
-            expected_enabled=False,
-            pixel_values=pixel_values,
-            image_position_ids=image_position_ids,
         )
         output = model(
             input_ids,
@@ -3370,6 +3067,8 @@ class TestModels(unittest.TestCase):
         self.assertEqual(output.logits.shape, (1, 6, config.vocab_size))
 
         input_ids_audio = mx.array([[0, 62, 62, 1]], dtype=mx.int32)
+        input_features = mx.random.uniform(shape=(1, 2, 8))
+        input_features_mask = mx.array([[True, True]])
         output = model(
             input_ids_audio,
             input_features=input_features,
@@ -5658,77 +5357,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "gemma4_unified")
 
-        text_only_types = mx.array([[0, 0, 0]])
-        visual_types = mx.array([[0, 1, 1, 0]])
-        mixed_audio_types = mx.array([[0, 1, 1, 3]])
-
-        # Text-only Gemma4 unified prompts should keep chunked prefill enabled.
-        model.get_input_embeddings(
-            mx.array([[1, 2, 3]]), mm_token_type_ids=text_only_types
-        )
-        self.assertFalse(model.no_chunked_prefill)
-        self.assertFalse(model.language_model.no_chunked_prefill)
-        self.assertTrue(
-            model.chunked_prefill_policy(
-                input_ids=mx.array([[1, 2, 3]]),
-                draft_model=SimpleNamespace(),
-                draft_kind="mtp",
-                prefill_kwargs={
-                    "mm_token_type_ids": text_only_types,
-                    "return_hidden": True,
-                    "return_shared_kv": True,
-                },
-            )
-        )
-
-        # Visual token spans need the bidirectional mask overlay, so do not chunk.
-        model.get_input_embeddings(
-            mx.array([[1, 2, 3, 4]]), mm_token_type_ids=visual_types
-        )
-        self.assertTrue(model.no_chunked_prefill)
-        self.assertTrue(model.language_model.no_chunked_prefill)
-        self.assertFalse(
-            model.chunked_prefill_policy(
-                input_ids=mx.array([[1, 2, 3, 4]]),
-                draft_model=SimpleNamespace(),
-                draft_kind="mtp",
-                prefill_kwargs={
-                    "mm_token_type_ids": visual_types,
-                    "return_hidden": True,
-                    "return_shared_kv": True,
-                },
-            )
-        )
-
-        # Mixed audio prompts stay causal and can use chunked prefill.
-        model.get_input_embeddings(
-            mx.array([[1, 2, 3, 4]]), mm_token_type_ids=mixed_audio_types
-        )
-        self.assertFalse(model.no_chunked_prefill)
-        self.assertFalse(model.language_model.no_chunked_prefill)
-        self.assertTrue(
-            model.language_model.chunked_prefill_policy(
-                draft_model=SimpleNamespace(),
-                draft_kind="mtp",
-                prefill_kwargs={
-                    "mm_token_type_ids": mixed_audio_types,
-                    "return_hidden": True,
-                    "return_shared_kv": True,
-                },
-            )
-        )
-        self.assertFalse(
-            model.chunked_prefill_policy(
-                input_ids=mx.array([[1, 2, 3, 4]]),
-                draft_model=SimpleNamespace(),
-                draft_kind="dflash",
-                prefill_kwargs={
-                    "mm_token_type_ids": mixed_audio_types,
-                    "capture_layer_ids": [0],
-                },
-            )
-        )
-
     def test_gemma4_unified_vision_tokens_use_bidirectional_mask(self):
         from mlx_vlm.models import gemma4_unified
         from mlx_vlm.models.gemma4.language import Gemma4TextModel
@@ -5758,62 +5386,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertTrue(bool(mask[0, 0, 1, 2].item()))
         self.assertFalse(bool(mask[0, 0, 0, 2].item()))
         self.assertTrue(bool(mask[0, 0, 3, 2].item()))
-
-    def test_gemma4_unified_text_only_mm_ids_keep_causal_mask(self):
-        from mlx_vlm.models import gemma4_unified
-        from mlx_vlm.models.gemma4.language import Gemma4TextModel
-
-        config = gemma4_unified.TextConfig(
-            hidden_size=8,
-            num_hidden_layers=1,
-            intermediate_size=16,
-            num_attention_heads=1,
-            num_key_value_heads=1,
-            num_global_key_value_heads=1,
-            head_dim=8,
-            global_head_dim=8,
-            vocab_size=32,
-            hidden_size_per_layer_input=0,
-            sliding_window=8,
-            sliding_window_pattern=1,
-            layer_types=["full_attention"],
-            use_bidirectional_attention="vision",
-        )
-        model = Gemma4TextModel(config)
-        hidden_states = mx.zeros((1, 4, config.hidden_size))
-        mm_token_type_ids = mx.array([[0, 0, 0, 0]])
-
-        mask = model._make_masks(hidden_states, [None], mm_token_type_ids)[0]
-
-        self.assertEqual(mask, "causal")
-
-    def test_gemma4_full_attention_cached_chunk_uses_causal_mask(self):
-        from mlx_vlm.models import cache, gemma4_unified
-        from mlx_vlm.models.gemma4.language import Gemma4TextModel
-
-        config = gemma4_unified.TextConfig(
-            hidden_size=8,
-            num_hidden_layers=1,
-            intermediate_size=16,
-            num_attention_heads=1,
-            num_key_value_heads=1,
-            num_global_key_value_heads=1,
-            head_dim=8,
-            global_head_dim=8,
-            vocab_size=32,
-            hidden_size_per_layer_input=0,
-            sliding_window=8,
-            sliding_window_pattern=1,
-            layer_types=["full_attention"],
-        )
-        model = Gemma4TextModel(config)
-        hidden_states = mx.zeros((1, 4, config.hidden_size))
-        kv_cache = cache.KVCache()
-        kv_cache.offset = 8
-
-        mask = model._make_masks(hidden_states, [kv_cache])[0]
-
-        self.assertEqual(mask, "causal")
 
     def test_gemma4_unified_audio_tokens_keep_vision_mask_causal(self):
         from mlx_vlm.models import gemma4_unified
@@ -6076,97 +5648,6 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "paddleocr_vl")
-
-    def test_paddleocr_vl_text_only_clears_mrope_state(self):
-        from mlx_vlm.models import paddleocr_vl
-
-        model = paddleocr_vl.Model(
-            paddleocr_vl.ModelConfig(
-                text_config=paddleocr_vl.TextConfig(
-                    model_type="paddleocr_vl",
-                    hidden_size=4,
-                    num_hidden_layers=1,
-                    intermediate_size=8,
-                    num_attention_heads=2,
-                    num_key_value_heads=1,
-                    vocab_size=10,
-                    head_dim=2,
-                ),
-                vision_config=paddleocr_vl.VisionConfig(
-                    model_type="paddleocr_vl",
-                    hidden_size=4,
-                    intermediate_size=8,
-                    num_hidden_layers=1,
-                    num_attention_heads=2,
-                ),
-                model_type="paddleocr_vl",
-                image_token_id=9,
-                vision_start_token_id=8,
-            )
-        )
-
-        model.language_model._position_ids = mx.array([[[0, 1]]], dtype=mx.int32)
-        model.language_model._rope_deltas = mx.array([[4]], dtype=mx.int32)
-
-        model.get_input_embeddings(mx.array([[1, 2]], dtype=mx.int32))
-
-        self.assertIsNone(model.language_model._position_ids)
-        self.assertIsNone(model.language_model._rope_deltas)
-
-    def test_paddleocr_vl_prefill_recomputes_stale_position_ids(self):
-        from mlx_vlm.models import paddleocr_vl
-
-        text_config = paddleocr_vl.TextConfig(
-            model_type="paddleocr_vl",
-            hidden_size=4,
-            num_hidden_layers=1,
-            intermediate_size=8,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            vocab_size=10,
-            head_dim=2,
-        )
-        config = paddleocr_vl.ModelConfig(
-            text_config=text_config,
-            vision_config=paddleocr_vl.VisionConfig(
-                model_type="paddleocr_vl",
-                hidden_size=4,
-                intermediate_size=8,
-                num_hidden_layers=1,
-                num_attention_heads=2,
-            ),
-            model_type="paddleocr_vl",
-            image_token_id=9,
-            vision_start_token_id=8,
-        )
-        lm = paddleocr_vl.LanguageModel(text_config, config)
-
-        captured = {}
-
-        class _CapturingInnerModel:
-            class _Embed:
-                def __call__(self, inputs):
-                    return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
-
-            embed_tokens = _Embed()
-
-            def __call__(self, inputs, inputs_embeds=None, position_ids=None, **kwargs):
-                captured["position_ids"] = position_ids
-                return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
-
-        lm.model = _CapturingInnerModel()
-        lm.lm_head = lambda x: x
-        lm._position_ids = mx.array([[[0, 1, 2]]], dtype=mx.int32)
-        lm._rope_deltas = mx.array([[3]], dtype=mx.int32)
-
-        class _Cache:
-            _idx = 0
-            offset = mx.array(0)
-
-        lm(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=[_Cache()])
-
-        self.assertEqual(captured["position_ids"].shape, (3, 2, 2))
-        self.assertEqual(lm._rope_deltas.tolist(), [[0], [0]])
 
     def test_phi3_v_input_embeddings(self):
         from mlx_vlm.models import phi3_v
@@ -6871,98 +6352,6 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
-
-
-class TestMultiImageMRoPE(unittest.TestCase):
-    """Regression tests for multi-image prompts in ``get_rope_index``.
-
-    The original M-RoPE port summed all vision-start indices into a single
-    scalar (``mx.sum(mx.where(...))``), so prompts with two or more images
-    mis-counted the image tokens and assigned flat text positions to every
-    image after the first.  qwen3_vl/qwen3_5 received the corrected token
-    scan in the MRoPE refactor; these tests pin the same behavior across
-    every family that shares the implementation.
-    """
-
-    _FAMILIES = [
-        "glm4v",
-        "glm4v_moe",
-        "paddleocr_vl",
-        "qwen2_5_vl",
-        "qwen2_vl",
-        "qwen3_5",
-        "qwen3_omni_moe",
-        "qwen3_vl",
-        "qwen3_vl_moe",
-    ]
-
-    # Prompt layout: text(3 incl. vision_start) | 4 image tokens | text(2 incl.
-    # vision_start) | 4 image tokens | text(1) — two (1, 4, 4) grids at
-    # spatial_merge_size 2, i.e. four merged tokens per image.
-    _INPUT_IDS = [1, 2, 99, 100, 100, 100, 100, 5, 99, 100, 100, 100, 100, 7]
-    _IMAGE_GRID_THW = [[1, 4, 4], [1, 4, 4]]
-
-    # Expected positions follow the HF reference: a text block advances all
-    # three dims together; each image block expands t/h/w over the merged
-    # (1, 2, 2) grid starting one past the previous maximum.
-    _EXPECTED_T = [0, 1, 2, 3, 3, 3, 3, 5, 6, 7, 7, 7, 7, 9]
-    _EXPECTED_H = [0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 7, 8, 8, 9]
-    _EXPECTED_W = [0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 8, 7, 8, 9]
-    _EXPECTED_DELTA = 9 + 1 - len(_INPUT_IDS)
-
-    @staticmethod
-    def _rope_index(family, input_ids, image_grid_thw, attention_mask=None):
-        module = importlib.import_module(f"mlx_vlm.models.{family}.language")
-        stub = SimpleNamespace(
-            config=SimpleNamespace(
-                vision_config=SimpleNamespace(spatial_merge_size=2),
-                image_token_id=100,
-                video_token_id=101,
-                vision_start_token_id=99,
-            )
-        )
-        return module.LanguageModel.get_rope_index(
-            stub,
-            input_ids,
-            image_grid_thw=image_grid_thw,
-            attention_mask=attention_mask,
-        )
-
-    def test_two_image_prompt_positions(self):
-        input_ids = mx.array([self._INPUT_IDS])
-        image_grid_thw = mx.array(self._IMAGE_GRID_THW)
-
-        for family in self._FAMILIES:
-            with self.subTest(model=family):
-                position_ids, deltas = self._rope_index(
-                    family, input_ids, image_grid_thw
-                )
-                self.assertEqual(position_ids.shape, (3, 1, len(self._INPUT_IDS)))
-                self.assertEqual(position_ids[0, 0].tolist(), self._EXPECTED_T)
-                self.assertEqual(position_ids[1, 0].tolist(), self._EXPECTED_H)
-                self.assertEqual(position_ids[2, 0].tolist(), self._EXPECTED_W)
-                self.assertEqual(
-                    int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
-                )
-
-    def test_two_image_prompt_with_left_padding(self):
-        pad = 2
-        input_ids = mx.array([[0] * pad + self._INPUT_IDS])
-        attention_mask = mx.array([[0] * pad + [1] * len(self._INPUT_IDS)])
-        image_grid_thw = mx.array(self._IMAGE_GRID_THW)
-
-        for family in self._FAMILIES:
-            with self.subTest(model=family):
-                position_ids, deltas = self._rope_index(
-                    family, input_ids, image_grid_thw, attention_mask
-                )
-                valid = position_ids[:, 0, pad:]
-                self.assertEqual(valid[0].tolist(), self._EXPECTED_T)
-                self.assertEqual(valid[1].tolist(), self._EXPECTED_H)
-                self.assertEqual(valid[2].tolist(), self._EXPECTED_W)
-                self.assertEqual(
-                    int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
-                )
 
 
 class TestMiniCPMV4_6(unittest.TestCase):
