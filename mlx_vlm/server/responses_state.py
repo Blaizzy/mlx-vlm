@@ -42,6 +42,7 @@ class ThinkingStreamState:
         ("<think>", "</think>"),
         ("<|START_THINKING|>", "<|END_THINKING|>"),
     )
+
     def __init__(
         self,
         enable_thinking: bool = False,
@@ -86,9 +87,7 @@ class ThinkingStreamState:
                 continue
 
             if self.thinking_done:
-                emit, self.buffer = self._split_partial(
-                    self.buffer, _CONTENT_MARKERS
-                )
+                emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
                 emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)

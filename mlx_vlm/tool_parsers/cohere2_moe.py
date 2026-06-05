@@ -1,6 +1,5 @@
 import json
 
-
 tool_call_start = "<|START_ACTION|>"
 tool_call_end = "<|END_ACTION|>"
 
