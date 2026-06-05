@@ -915,6 +915,13 @@ def stream_generate(
             multimodal_token_ids,
         )
 
+    def _apc_prefix_has_media_tokens(prefix_len: int) -> bool:
+        return _apc.prefix_contains_media_tokens(
+            full_input_ids_list,
+            prefix_len,
+            multimodal_token_ids,
+        )
+
     if is_diffusion_model(model):
         yield from stream_diffusion_generate_from_kwargs(
             model,
@@ -986,6 +993,10 @@ def stream_generate(
             matched_blocks, prefix_len = apc_manager.lookup_prefix(
                 full_input_ids_list, extra_hash=apc_extra_hash
             )
+            if prefix_len > 0 and _apc_prefix_has_media_tokens(prefix_len):
+                apc_manager.release(matched_blocks)
+                matched_blocks = []
+                prefix_len = 0
             exact_prompt_cache = None
             exact_prefix_len = 0
             if prefix_len < input_ids.shape[1]:

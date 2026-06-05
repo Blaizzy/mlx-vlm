@@ -2150,6 +2150,15 @@ class BatchGenerator:
             self._apc_media_token_ids(),
         )
 
+    def _apc_prefix_has_media_tokens(
+        self, ids_list: List[int], prefix_len: int
+    ) -> bool:
+        return _apc.prefix_contains_media_tokens(
+            ids_list,
+            prefix_len,
+            self._apc_media_token_ids(),
+        )
+
     def _apc_exact_checkpoint_len(self, ids_list: List[int]) -> int:
         if self.apc_manager is None or getattr(self, "apc_mode", "block") != "exact":
             return 0
@@ -2196,6 +2205,10 @@ class BatchGenerator:
         matched, prefix_len = self.apc_manager.lookup_prefix(
             ids_list, extra_hash=extra_hash
         )
+        if prefix_len > 0 and self._apc_prefix_has_media_tokens(ids_list, prefix_len):
+            self.apc_manager.release(matched)
+            matched = []
+            prefix_len = 0
         exact_cache = None
         exact_prefix_len = 0
         if prefix_len < len(ids_list):

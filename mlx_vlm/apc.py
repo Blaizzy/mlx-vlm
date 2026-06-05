@@ -403,6 +403,19 @@ def prefix_leaves_text_only_suffix(
     return int(prefix_len) >= media_safe_prefix_min(token_ids, media_token_ids)
 
 
+def prefix_contains_media_tokens(
+    token_ids: Sequence[int],
+    prefix_len: int,
+    media_token_ids: Iterable[int],
+) -> bool:
+    """Return whether the prefix itself contains media placeholder tokens."""
+    media_ids = {int(token_id) for token_id in media_token_ids}
+    if not media_ids or prefix_len <= 0:
+        return False
+    prefix_end = min(int(prefix_len), len(token_ids))
+    return any(int(token_id) in media_ids for token_id in token_ids[:prefix_end])
+
+
 def adjust_prefix_to_text_suffix_boundary(
     token_ids: Sequence[int],
     desired_prefix_len: int,
