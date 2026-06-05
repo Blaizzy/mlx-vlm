@@ -4277,6 +4277,24 @@ class TestResponseGenerator:
 
         assert schema["required"] == ["animal"]
 
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_chat_response_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
+            text=None,
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_responses_text_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format=None,
+            text={"format": {"type": format_type}},
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
     def test_build_structured_logits_processors_uses_tokenizer(self):
         req = SimpleNamespace(
             response_format={
@@ -4286,6 +4304,24 @@ class TestResponseGenerator:
                     "schema": {"type": "object"},
                 },
             },
+            text=None,
+        )
+        proc = SimpleNamespace(tokenizer=object())
+
+        with patch.object(
+            server, "build_json_schema_logits_processor", return_value="processor"
+        ) as mock_build:
+            processors = server._build_structured_logits_processors(req, proc)
+
+        assert processors == ["processor"]
+        assert mock_build.call_args.args[1] == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_build_structured_logits_processors_for_json_object_aliases(
+        self, format_type
+    ):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
             text=None,
         )
         proc = SimpleNamespace(tokenizer=object())
