@@ -901,6 +901,27 @@ def stream_generate(
     apc_extra_hash = 0
     apc_mode: Optional[str] = None
 
+    multimodal_token_ids = _apc.multimodal_token_ids_from_config(model.config)
+    apc_safe_prefix_min = _apc.media_safe_prefix_min(
+        full_input_ids_list,
+        multimodal_token_ids,
+    )
+    apc_safe_prefix_lookup_min = max(0, apc_safe_prefix_min - 1)
+
+    def _apc_suffix_is_text_only(prefix_len: int) -> bool:
+        return _apc.prefix_leaves_text_only_suffix(
+            full_input_ids_list,
+            prefix_len,
+            multimodal_token_ids,
+        )
+
+    def _apc_prefix_has_media_tokens(prefix_len: int) -> bool:
+        return _apc.prefix_contains_media_tokens(
+            full_input_ids_list,
+            prefix_len,
+            multimodal_token_ids,
+        )
+
     if is_diffusion_model(model):
         yield from stream_diffusion_generate_from_kwargs(
             model,
@@ -926,21 +947,14 @@ def stream_generate(
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+            if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
+                model, input_ids, mask, kwargs
+            ):
                 reused_prefix_len = prefix_len
                 # Trim to only new tokens
                 input_ids = input_ids[:, prefix_len:]
-                # Only skip vision if no image tokens in the new (trimmed) tokens
-                image_token_id = getattr(
-                    model.config, "image_token_id", None
-                ) or getattr(model.config, "image_token_index", None)
-                new_ids = input_ids.flatten().tolist()
-                has_image_in_new = (
-                    image_token_id is not None and image_token_id in new_ids
-                )
-                if not has_image_in_new:
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
                 # Reuse the saved KV cache (trimmed to prefix length)
                 kv_cache = prompt_cache_state.cache
                 # Trim cache to prefix_len in case it includes generated tokens
@@ -961,34 +975,35 @@ def stream_generate(
             exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                 full_input_ids_list,
                 extra_hash=apc_extra_hash,
+                min_prefix_tokens=apc_safe_prefix_lookup_min,
             )
             if (
                 exact_prompt_cache is not None
                 and exact_prefix_len > 0
                 and exact_prefix_len < input_ids.shape[1]
+                and _apc_suffix_is_text_only(exact_prefix_len)
                 and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
             ):
                 reused_prefix_len = exact_prefix_len
                 input_ids = input_ids[:, exact_prefix_len:]
-                image_token_id = getattr(
-                    model.config, "image_token_id", None
-                ) or getattr(model.config, "image_token_index", None)
-                new_ids = input_ids.flatten().tolist()
-                if image_token_id is None or image_token_id not in new_ids:
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
                 kwargs["prompt_cache"] = exact_prompt_cache
         else:
             matched_blocks, prefix_len = apc_manager.lookup_prefix(
                 full_input_ids_list, extra_hash=apc_extra_hash
             )
+            if prefix_len > 0 and _apc_prefix_has_media_tokens(prefix_len):
+                apc_manager.release(matched_blocks)
+                matched_blocks = []
+                prefix_len = 0
             exact_prompt_cache = None
             exact_prefix_len = 0
             if prefix_len < input_ids.shape[1]:
                 exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                     full_input_ids_list,
                     extra_hash=apc_extra_hash,
-                    min_prefix_tokens=prefix_len,
+                    min_prefix_tokens=max(prefix_len, apc_safe_prefix_lookup_min),
                 )
             disk_prompt_cache = None
             disk_prefix_len = 0
@@ -997,7 +1012,11 @@ def stream_generate(
                     apc_manager.lookup_prefix_disk_cache(
                         full_input_ids_list,
                         extra_hash=apc_extra_hash,
-                        min_prefix_tokens=max(prefix_len, exact_prefix_len),
+                        min_prefix_tokens=max(
+                            prefix_len,
+                            exact_prefix_len,
+                            apc_safe_prefix_lookup_min,
+                        ),
                         allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
                     )
                 )
@@ -1007,45 +1026,36 @@ def stream_generate(
             ):
                 if matched_blocks:
                     apc_manager.release(matched_blocks)
-                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if _apc_suffix_is_text_only(
+                    disk_prefix_len
+                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     reused_prefix_len = disk_prefix_len
                     input_ids = input_ids[:, disk_prefix_len:]
-                    image_token_id = getattr(
-                        model.config, "image_token_id", None
-                    ) or getattr(model.config, "image_token_index", None)
-                    new_ids = input_ids.flatten().tolist()
-                    if image_token_id is None or image_token_id not in new_ids:
-                        pixel_values = None
-                        kwargs.pop("cached_image_features", None)
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = disk_prompt_cache
             elif (
                 exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
             ):
                 if matched_blocks:
                     apc_manager.release(matched_blocks)
-                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if _apc_suffix_is_text_only(
+                    exact_prefix_len
+                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     reused_prefix_len = exact_prefix_len
                     input_ids = input_ids[:, exact_prefix_len:]
-                    image_token_id = getattr(
-                        model.config, "image_token_id", None
-                    ) or getattr(model.config, "image_token_index", None)
-                    new_ids = input_ids.flatten().tolist()
-                    if image_token_id is None or image_token_id not in new_ids:
-                        pixel_values = None
-                        kwargs.pop("cached_image_features", None)
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = exact_prompt_cache
             elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
-                if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if _apc_suffix_is_text_only(
+                    prefix_len
+                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     apc_blocks_in_use = matched_blocks
                     reused_prefix_len = prefix_len
                     input_ids = input_ids[:, prefix_len:]
-                    image_token_id = getattr(
-                        model.config, "image_token_id", None
-                    ) or getattr(model.config, "image_token_index", None)
-                    new_ids = input_ids.flatten().tolist()
-                    if image_token_id is None or image_token_id not in new_ids:
-                        pixel_values = None
-                        kwargs.pop("cached_image_features", None)
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
                         min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
@@ -1090,10 +1100,14 @@ def stream_generate(
         exact_checkpoint_len = None
         exact_checkpoint = None
         if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
-            exact_checkpoint_len = max(
-                1,
+            exact_checkpoint_len = _apc.adjust_prefix_to_text_suffix_boundary(
+                full_input_ids_list,
                 len(full_input_ids_list) - apc_manager.exact_cache_guard_tokens,
+                multimodal_token_ids,
+                max_prefix_tokens=len(full_input_ids_list) - 1,
             )
+            if exact_checkpoint_len <= 0:
+                exact_checkpoint_len = None
 
             def exact_checkpoint(prefix_len: int, prompt_cache: List[Any]) -> None:
                 apc_manager.store_exact_cache(
