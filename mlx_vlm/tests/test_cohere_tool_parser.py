@@ -1,6 +1,6 @@
 import json
 
-from mlx_vlm.tool_parsers.cohere import parse_tool_call
+from mlx_vlm.tool_parsers.cohere2_moe import parse_tool_call
 
 
 def test_cohere_action_array_parses_to_openai_tool_calls():
