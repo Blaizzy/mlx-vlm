@@ -42,9 +42,7 @@ class TestModels(unittest.TestCase):
         if hasattr(cache, "offset"):
             try:
                 cache.offset = (
-                    mx.array([offset])
-                    if isinstance(cache.offset, mx.array)
-                    else offset
+                    mx.array([offset]) if isinstance(cache.offset, mx.array) else offset
                 )
             except AttributeError:
                 pass
@@ -67,8 +65,8 @@ class TestModels(unittest.TestCase):
         if max_size is None:
             max_width = query_len
         else:
-            max_width = int(max_size) + query_len + int(
-                getattr(cache, "buffer_size", 0)
+            max_width = (
+                int(max_size) + query_len + int(getattr(cache, "buffer_size", 0))
             )
         self.assertLessEqual(mask.shape[-2], query_len)
         self.assertLessEqual(mask.shape[-1], max_width)
@@ -154,9 +152,7 @@ class TestModels(unittest.TestCase):
         processed_tokens = 0
         prefill_chunks = 0
         while chunked_inputs_embeds.shape[1] > 1:
-            n_to_process = min(
-                prefill_step_size, chunked_inputs_embeds.shape[1] - 1
-            )
+            n_to_process = min(prefill_step_size, chunked_inputs_embeds.shape[1] - 1)
             outputs = model.language_model(
                 inputs=chunked_input_ids[:, :n_to_process],
                 inputs_embeds=chunked_inputs_embeds[:, :n_to_process],
