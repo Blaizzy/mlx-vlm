@@ -37,6 +37,72 @@ class TestModels(unittest.TestCase):
             return kwargs
         return {k: v for k, v in kwargs.items() if k in parameters}
 
+    def _set_cache_context_offset(self, cache, offset):
+        if hasattr(cache, "offset"):
+            try:
+                cache.offset = (
+                    mx.array([offset])
+                    if isinstance(cache.offset, mx.array)
+                    else offset
+                )
+            except AttributeError:
+                pass
+
+        max_size = getattr(cache, "max_size", None)
+        if hasattr(cache, "_idx"):
+            cache._idx = min(offset, max_size or offset)
+        if hasattr(cache, "start_position"):
+            cache.start_position = max(0, offset - getattr(cache, "_idx", 0))
+
+    def _assert_compact_attention_mask(self, mask, cache, query_len):
+        if mask is None:
+            return
+        if isinstance(mask, str):
+            self.assertEqual(mask, "causal")
+            return
+
+        self.assertIsInstance(mask, mx.array)
+        max_size = getattr(cache, "max_size", None)
+        if max_size is None:
+            max_width = query_len
+        else:
+            max_width = int(max_size) + query_len + int(
+                getattr(cache, "buffer_size", 0)
+            )
+        self.assertLessEqual(mask.shape[-2], query_len)
+        self.assertLessEqual(mask.shape[-1], max_width)
+
+    def _make_cache_mask(self, cache, query_len, offset):
+        make_mask = getattr(cache, "make_mask", None)
+        if not callable(make_mask):
+            return "causal" if query_len > 1 else None
+
+        parameters = inspect.signature(make_mask).parameters
+        accepts_kwargs = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        )
+        kwargs = {}
+        if "return_array" in parameters or accepts_kwargs:
+            kwargs["return_array"] = False
+        if "window_size" in parameters or accepts_kwargs:
+            kwargs["window_size"] = None
+        if "offset" in parameters:
+            kwargs["offset"] = offset
+        return make_mask(query_len, **kwargs)
+
+    def _assert_long_context_masks_compact(self, model):
+        from mlx_vlm.models import cache as cache_utils
+
+        query_len = 2
+        for offset in (0, 1, 2_048, 65_536, 131_072, 260_000):
+            prompt_cache = cache_utils.make_prompt_cache(model)
+            for c in prompt_cache:
+                if c is None:
+                    continue
+                self._set_cache_context_offset(c, offset)
+                mask = self._make_cache_mask(c, query_len, offset)
+                self._assert_compact_attention_mask(mask, c, query_len)
+
     def _assert_model_chunked_prefill(
         self,
         model,
@@ -127,13 +193,20 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(model.model_type, model_type)
         self.assertEqual(len(model.layers), num_layers)
+        self._assert_long_context_masks_compact(model)
 
-        batch_size = 1
+        batch_size = 2
 
         for t in [mx.float32, mx.float16]:
             model.update(tree_map(lambda p: p.astype(t), model.parameters()))
 
-            inputs = mx.array([[0, 1, 2, 3, 4]])
+            inputs = mx.array(
+                [
+                    [i % vocab_size for i in range(5)],
+                    [(i + 1) % vocab_size for i in range(5)],
+                ],
+                dtype=mx.int32,
+            )
             prefill_step_size = 2
             chunked_inputs = inputs
             processed_tokens = 0
