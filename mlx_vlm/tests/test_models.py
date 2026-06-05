@@ -2993,9 +2993,7 @@ class TestModels(unittest.TestCase):
                 "model.language_model.layers.2.self_attn.v_proj.weight": mx.zeros(
                     (8, 16)
                 ),
-                "model.language_model.layers.2.self_attn.k_norm.weight": mx.zeros(
-                    (8,)
-                ),
+                "model.language_model.layers.2.self_attn.k_norm.weight": mx.zeros((8,)),
                 "model.language_model.layers.2.self_attn.q_proj.weight": mx.zeros(
                     (16, 16)
                 ),
