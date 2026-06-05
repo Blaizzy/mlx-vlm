@@ -6,6 +6,7 @@ from .processing_gemma4_unified import (
     Gemma4UnifiedAudioFeatureExtractor,
     Gemma4UnifiedImageProcessor,
     Gemma4UnifiedProcessor,
+    Gemma4UnifiedVideoProcessor,
 )
 
 ImageProcessor = Gemma4UnifiedImageProcessor
@@ -15,6 +16,7 @@ __all__ = [
     "Gemma4UnifiedAudioFeatureExtractor",
     "Gemma4UnifiedImageProcessor",
     "Gemma4UnifiedProcessor",
+    "Gemma4UnifiedVideoProcessor",
     "ImageProcessor",
     "LanguageModel",
     "Model",

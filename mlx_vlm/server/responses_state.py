@@ -10,6 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
+_CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
+
+
+def _strip_content_markers(text: str) -> str:
+    for marker in _CONTENT_MARKERS:
+        text = text.replace(marker, "")
+    return text
 
 
 @dataclass
@@ -33,6 +40,7 @@ class ThinkingStreamState:
     _DEFAULT_OPEN_CLOSE_MARKERS = (
         ("<|channel>thought", "<channel|>"),
         ("<think>", "</think>"),
+        ("<|START_THINKING|>", "<|END_THINKING|>"),
     )
 
     def __init__(
@@ -79,19 +87,24 @@ class ThinkingStreamState:
                 continue
 
             if self.thinking_done:
-                content.append(self.buffer)
-                self.buffer = ""
+                emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
+                emit = _strip_content_markers(emit)
+                if emit:
+                    content.append(emit)
                 break
 
             idx, marker = self._find_first(self.buffer, self.open_markers)
             if idx < 0:
                 emit, self.buffer = self._split_partial(self.buffer, self.open_markers)
+                emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)
                 break
 
             if idx:
-                content.append(self.buffer[:idx])
+                emit = _strip_content_markers(self.buffer[:idx])
+                if emit:
+                    content.append(emit)
 
             self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
             self.in_thinking = True
@@ -192,30 +205,32 @@ def process_tool_calls(model_output: str, tool_module, tools):
         matches = re.findall(pattern, model_output)
         if matches:
             remaining = re.sub(pattern, " ", model_output).strip()
-            for i, match in enumerate(matches):
+            for match in matches:
                 call = (
                     match.strip()
                     .removeprefix(tool_module.tool_call_start)
                     .removesuffix(tool_module.tool_call_end)
                 )
                 try:
-                    tool_call = tool_module.parse_tool_call(call, tools)
-                    args = tool_call["arguments"]
-                    called_tools.append(
-                        {
-                            "type": "function",
-                            "index": i,
-                            "id": str(uuid.uuid4()),
-                            "function": {
-                                "name": tool_call["name"].strip(),
-                                "arguments": (
-                                    args
-                                    if isinstance(args, str)
-                                    else json.dumps(args, ensure_ascii=False)
-                                ),
+                    parsed = tool_module.parse_tool_call(call, tools)
+                    parsed_calls = parsed if isinstance(parsed, list) else [parsed]
+                    for tool_call in parsed_calls:
+                        args = tool_call["arguments"]
+                        called_tools.append(
+                            {
+                                "type": "function",
+                                "index": len(called_tools),
+                                "id": str(uuid.uuid4()),
+                                "function": {
+                                    "name": tool_call["name"].strip(),
+                                    "arguments": (
+                                        args
+                                        if isinstance(args, str)
+                                        else json.dumps(args, ensure_ascii=False)
+                                    ),
+                                },
                             },
-                        }
-                    )
+                        )
                 except Exception:
                     print(f"Invalid tool call: {call}")
     return dict(calls=called_tools, remaining_text=remaining)
@@ -263,19 +278,21 @@ def _split_thinking(
         end = text.find(end_marker, start if start >= 0 else 0)
         if start >= 0 and start < end:
             reasoning = text[start + len(start_marker) : end].strip()
-            content = (text[:start] + text[end + len(end_marker) :]).strip()
+            content = _strip_content_markers(
+                text[:start] + text[end + len(end_marker) :]
+            ).strip()
             return reasoning or None, content
 
         if end_marker in text:
             reasoning, content = text.split(end_marker, 1)
             reasoning = _clean_reasoning(reasoning, start_marker)
-            return reasoning or None, content.strip()
+            return reasoning or None, _strip_content_markers(content).strip()
 
         if start_marker in text:
             reasoning = _clean_reasoning(text, start_marker)
             return reasoning or None, ""
 
-    return None, text.strip()
+    return None, _strip_content_markers(text).strip()
 
 
 def _response_output_items_from_text(

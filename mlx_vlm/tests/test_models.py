@@ -1,3 +1,4 @@
+import importlib
 import inspect
 import threading
 import unittest
@@ -6016,6 +6017,97 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "paddleocr_vl")
 
+    def test_paddleocr_vl_text_only_clears_mrope_state(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        model = paddleocr_vl.Model(
+            paddleocr_vl.ModelConfig(
+                text_config=paddleocr_vl.TextConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=4,
+                    num_hidden_layers=1,
+                    intermediate_size=8,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    vocab_size=10,
+                    head_dim=2,
+                ),
+                vision_config=paddleocr_vl.VisionConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=4,
+                    intermediate_size=8,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                ),
+                model_type="paddleocr_vl",
+                image_token_id=9,
+                vision_start_token_id=8,
+            )
+        )
+
+        model.language_model._position_ids = mx.array([[[0, 1]]], dtype=mx.int32)
+        model.language_model._rope_deltas = mx.array([[4]], dtype=mx.int32)
+
+        model.get_input_embeddings(mx.array([[1, 2]], dtype=mx.int32))
+
+        self.assertIsNone(model.language_model._position_ids)
+        self.assertIsNone(model.language_model._rope_deltas)
+
+    def test_paddleocr_vl_prefill_recomputes_stale_position_ids(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        text_config = paddleocr_vl.TextConfig(
+            model_type="paddleocr_vl",
+            hidden_size=4,
+            num_hidden_layers=1,
+            intermediate_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            vocab_size=10,
+            head_dim=2,
+        )
+        config = paddleocr_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=paddleocr_vl.VisionConfig(
+                model_type="paddleocr_vl",
+                hidden_size=4,
+                intermediate_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+            ),
+            model_type="paddleocr_vl",
+            image_token_id=9,
+            vision_start_token_id=8,
+        )
+        lm = paddleocr_vl.LanguageModel(text_config, config)
+
+        captured = {}
+
+        class _CapturingInnerModel:
+            class _Embed:
+                def __call__(self, inputs):
+                    return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
+
+            embed_tokens = _Embed()
+
+            def __call__(self, inputs, inputs_embeds=None, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 4))
+
+        lm.model = _CapturingInnerModel()
+        lm.lm_head = lambda x: x
+        lm._position_ids = mx.array([[[0, 1, 2]]], dtype=mx.int32)
+        lm._rope_deltas = mx.array([[3]], dtype=mx.int32)
+
+        class _Cache:
+            _idx = 0
+            offset = mx.array(0)
+
+        lm(mx.array([[1, 2], [3, 4]], dtype=mx.int32), cache=[_Cache()])
+
+        self.assertEqual(captured["position_ids"].shape, (3, 2, 2))
+        self.assertEqual(lm._rope_deltas.tolist(), [[0], [0]])
+
     def test_phi3_v_input_embeddings(self):
         from mlx_vlm.models import phi3_v
         from mlx_vlm.models.base import InputEmbeddingsFeatures
@@ -6719,6 +6811,98 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
+
+
+class TestMultiImageMRoPE(unittest.TestCase):
+    """Regression tests for multi-image prompts in ``get_rope_index``.
+
+    The original M-RoPE port summed all vision-start indices into a single
+    scalar (``mx.sum(mx.where(...))``), so prompts with two or more images
+    mis-counted the image tokens and assigned flat text positions to every
+    image after the first.  qwen3_vl/qwen3_5 received the corrected token
+    scan in the MRoPE refactor; these tests pin the same behavior across
+    every family that shares the implementation.
+    """
+
+    _FAMILIES = [
+        "glm4v",
+        "glm4v_moe",
+        "paddleocr_vl",
+        "qwen2_5_vl",
+        "qwen2_vl",
+        "qwen3_5",
+        "qwen3_omni_moe",
+        "qwen3_vl",
+        "qwen3_vl_moe",
+    ]
+
+    # Prompt layout: text(3 incl. vision_start) | 4 image tokens | text(2 incl.
+    # vision_start) | 4 image tokens | text(1) — two (1, 4, 4) grids at
+    # spatial_merge_size 2, i.e. four merged tokens per image.
+    _INPUT_IDS = [1, 2, 99, 100, 100, 100, 100, 5, 99, 100, 100, 100, 100, 7]
+    _IMAGE_GRID_THW = [[1, 4, 4], [1, 4, 4]]
+
+    # Expected positions follow the HF reference: a text block advances all
+    # three dims together; each image block expands t/h/w over the merged
+    # (1, 2, 2) grid starting one past the previous maximum.
+    _EXPECTED_T = [0, 1, 2, 3, 3, 3, 3, 5, 6, 7, 7, 7, 7, 9]
+    _EXPECTED_H = [0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 7, 8, 8, 9]
+    _EXPECTED_W = [0, 1, 2, 3, 4, 3, 4, 5, 6, 7, 8, 7, 8, 9]
+    _EXPECTED_DELTA = 9 + 1 - len(_INPUT_IDS)
+
+    @staticmethod
+    def _rope_index(family, input_ids, image_grid_thw, attention_mask=None):
+        module = importlib.import_module(f"mlx_vlm.models.{family}.language")
+        stub = SimpleNamespace(
+            config=SimpleNamespace(
+                vision_config=SimpleNamespace(spatial_merge_size=2),
+                image_token_id=100,
+                video_token_id=101,
+                vision_start_token_id=99,
+            )
+        )
+        return module.LanguageModel.get_rope_index(
+            stub,
+            input_ids,
+            image_grid_thw=image_grid_thw,
+            attention_mask=attention_mask,
+        )
+
+    def test_two_image_prompt_positions(self):
+        input_ids = mx.array([self._INPUT_IDS])
+        image_grid_thw = mx.array(self._IMAGE_GRID_THW)
+
+        for family in self._FAMILIES:
+            with self.subTest(model=family):
+                position_ids, deltas = self._rope_index(
+                    family, input_ids, image_grid_thw
+                )
+                self.assertEqual(position_ids.shape, (3, 1, len(self._INPUT_IDS)))
+                self.assertEqual(position_ids[0, 0].tolist(), self._EXPECTED_T)
+                self.assertEqual(position_ids[1, 0].tolist(), self._EXPECTED_H)
+                self.assertEqual(position_ids[2, 0].tolist(), self._EXPECTED_W)
+                self.assertEqual(
+                    int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
+                )
+
+    def test_two_image_prompt_with_left_padding(self):
+        pad = 2
+        input_ids = mx.array([[0] * pad + self._INPUT_IDS])
+        attention_mask = mx.array([[0] * pad + [1] * len(self._INPUT_IDS)])
+        image_grid_thw = mx.array(self._IMAGE_GRID_THW)
+
+        for family in self._FAMILIES:
+            with self.subTest(model=family):
+                position_ids, deltas = self._rope_index(
+                    family, input_ids, image_grid_thw, attention_mask
+                )
+                valid = position_ids[:, 0, pad:]
+                self.assertEqual(valid[0].tolist(), self._EXPECTED_T)
+                self.assertEqual(valid[1].tolist(), self._EXPECTED_H)
+                self.assertEqual(valid[2].tolist(), self._EXPECTED_W)
+                self.assertEqual(
+                    int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
+                )
 
 
 class TestMiniCPMV4_6(unittest.TestCase):

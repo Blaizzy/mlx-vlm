@@ -37,6 +37,12 @@ IMAGE_DOWNLOAD_PATTERNS = (
     "**/*.model",
     "**/*.tiktoken",
 )
+IMAGE_METADATA_DOWNLOAD_PATTERNS = (
+    "model_index.json",
+    "config.json",
+    "manifest.json",
+    "**/config.json",
+)
 
 ImageOutputFormat = Literal["b64_json", "path"]
 ImageTask = Literal["generate", "edit"]
@@ -312,12 +318,26 @@ def _resolve_image_model_path(
     )
 
 
+def _resolve_image_model_metadata_path(model: str) -> Path | None:
+    model_path = Path(model).expanduser()
+    if model_path.exists():
+        return model_path
+    return get_model_path(
+        model,
+        allow_patterns=list(IMAGE_METADATA_DOWNLOAD_PATTERNS),
+    )
+
+
 def image_generation_model_class(model: str | None) -> type[Any] | None:
     if model is None:
         return None
 
+    alias_model_class = _supported_image_model_class(_model_type_from_id(model), model)
+    if alias_model_class is not None:
+        return alias_model_class
+
     try:
-        resolved_path = _resolve_image_model_path(model)
+        resolved_path = _resolve_image_model_metadata_path(model)
     except Exception:
         resolved_path = None
     local_model_types = (
@@ -570,6 +590,7 @@ def run_image_generation_cli(args: Any) -> None:
             width=width,
             height=height,
             guidance=args.guidance,
+            extra=dict(getattr(args, "gen_kwargs", {}) or {}),
         )
         result = generate_image(
             model,
@@ -585,6 +606,10 @@ def run_image_generation_cli(args: Any) -> None:
             else Path("outputs") / f"image-{seed}.png"
         )
         model = load_image_model(args.model, task="generate", **load_kwargs)
+        extra = dict(getattr(args, "gen_kwargs", {}) or {})
+        prompt_expansion_model = getattr(args, "prompt_expansion_model", None)
+        if prompt_expansion_model is not None:
+            extra["prompt_expansion_model"] = prompt_expansion_model
         request = ImageGenerationRequest(
             prompt=prompt,
             seed=seed,
@@ -592,6 +617,7 @@ def run_image_generation_cli(args: Any) -> None:
             width=width,
             height=height,
             guidance=args.guidance,
+            extra=extra,
         )
         result = generate_image(
             model,

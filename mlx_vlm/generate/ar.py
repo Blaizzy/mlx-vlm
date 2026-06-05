@@ -1734,6 +1734,13 @@ class PromptProcessingBatch:
         )
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
+    def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
+        # Single-request cold batches use an unbatched cache that is already
+        # row-specific, so there is nothing to extract.
+        if batch_idx == 0 and len(self.uids) == 1 and self._right_pad_per_row is None:
+            return self.prompt_cache
+        return _apc.extract_prompt_cache_from_batch(self.prompt_cache, batch_idx)
+
     def _store_apc_exact_checkpoints(self) -> None:
         if self._apc_manager is None or self._apc_mode != "exact":
             return
@@ -1745,10 +1752,7 @@ class PromptProcessingBatch:
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
-            prompt_cache = _apc.extract_prompt_cache_from_batch(
-                self.prompt_cache,
-                batch_idx,
-            )
+            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
             if prompt_cache is None:
                 continue
             self._apc_manager.store_exact_cache(
@@ -2012,10 +2016,7 @@ class PromptProcessingBatch:
                     if meta is None:
                         continue
                     if self._apc_mode == "exact":
-                        prompt_cache = _apc.extract_prompt_cache_from_batch(
-                            self.prompt_cache,
-                            batch_idx,
-                        )
+                        prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
                         if prompt_cache is not None:
                             self._apc_manager.store_exact_cache(
                                 meta["full_input_ids"],
@@ -2068,9 +2069,17 @@ class PromptProcessingBatch:
         if rope_deltas.shape[0] == 1 and B > 1:
             rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
         if rope_deltas.shape[0] != B:
-            raise RuntimeError(
-                f"_rope_deltas shape {rope_deltas.shape} does not match prefill batch size {B}"
-            )
+            if rope_deltas.shape[0] > B:
+                rope_deltas = rope_deltas[:B]
+            else:
+                pad = B - rope_deltas.shape[0]
+                rope_deltas = mx.concatenate(
+                    [
+                        rope_deltas,
+                        mx.broadcast_to(rope_deltas[-1:], (pad, rope_deltas.shape[1])),
+                    ],
+                    axis=0,
+                )
         return rope_deltas
 
 

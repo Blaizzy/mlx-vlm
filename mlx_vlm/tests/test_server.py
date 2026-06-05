@@ -72,6 +72,21 @@ def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     assert response.status_code == 422
 
 
+def test_chat_completions_endpoint_requires_model(client):
+    response = client.post(
+        "/chat/completions",
+        json={"messages": [{"role": "user", "content": "Hello"}]},
+    )
+
+    assert response.status_code == 422
+    detail = response.json().get("detail", [])
+    assert any(err.get("loc") == ["body", "model"] for err in detail)
+
+
+def test_chat_request_schema_requires_model():
+    assert "model" in server.ChatRequest.model_json_schema()["required"]
+
+
 def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     resize_shape = server.ChatRequest.model_json_schema()["properties"]["resize_shape"]
     lengths = {
@@ -798,6 +813,52 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert all(item["b64_json"] for item in payload["data"])
     assert [call.seed for call in calls] == [10, 11]
     assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
+
+
+def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="ideogram4"),
+        ),
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        calls.append(request)
+        result = _fake_image_result(seed=request.seed)
+        result.metadata["revised_prompt"] = '{"compositional_deconstruction":{}}'
+        return result
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "ideogram-ai/ideogram-4-fp8",
+            "prompt": "A red cube.",
+            "seed": 10,
+            "size": "256x256",
+            "steps": 1,
+            "auto_json_caption": True,
+            "prompt_expansion_model": "tiny-text-model",
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls[0].extra == {
+        "auto_json_caption": True,
+        "prompt_expansion_model": "tiny-text-model",
+    }
+    assert (
+        response.json()["data"][0]["revised_prompt"]
+        == '{"compositional_deconstruction":{}}'
+    )
 
 
 def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
@@ -3908,6 +3969,70 @@ class TestResponseGenerator:
         assert calls == [({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)]
         assert processors == ["repetition-processor", custom_processor]
 
+    def test_server_generation_delays_structured_processors_for_thinking_prompt(
+        self, monkeypatch
+    ):
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        repetition_processor = lambda tokens, logits: logits
+        structured_processor = lambda tokens, logits: logits
+
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [repetition_processor],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 10, 3]], dtype=mx.int32),
+        )
+
+        assert processors[0] is repetition_processor
+        assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
+        assert processors[1].processor is structured_processor
+
+    def test_server_generation_keeps_structured_processors_active_without_open_thinking(
+        self, monkeypatch
+    ):
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        structured_processor = lambda tokens, logits: logits
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 10, 3, 20]], dtype=mx.int32),
+        )
+
+        assert processors == [structured_processor]
+
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
             max_output_tokens=128,
@@ -4167,6 +4292,24 @@ class TestResponseGenerator:
 
         assert schema["required"] == ["animal"]
 
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_chat_response_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
+            text=None,
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_responses_text_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format=None,
+            text={"format": {"type": format_type}},
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
     def test_build_structured_logits_processors_uses_tokenizer(self):
         req = SimpleNamespace(
             response_format={
@@ -4176,6 +4319,24 @@ class TestResponseGenerator:
                     "schema": {"type": "object"},
                 },
             },
+            text=None,
+        )
+        proc = SimpleNamespace(tokenizer=object())
+
+        with patch.object(
+            server, "build_json_schema_logits_processor", return_value="processor"
+        ) as mock_build:
+            processors = server._build_structured_logits_processors(req, proc)
+
+        assert processors == ["processor"]
+        assert mock_build.call_args.args[1] == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_build_structured_logits_processors_for_json_object_aliases(
+        self, format_type
+    ):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
             text=None,
         )
         proc = SimpleNamespace(tokenizer=object())
@@ -4228,6 +4389,15 @@ class TestSplitThinking:
         assert reasoning == "Custom reasoning."
         assert content == "Custom answer."
 
+    def test_cohere_thinking_markers_strip_text_markers(self):
+        text = (
+            "<|START_THINKING|>Custom reasoning.<|END_THINKING|>"
+            "<|START_TEXT|>Custom answer.<|END_TEXT|>"
+        )
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Custom reasoning."
+        assert content == "Custom answer."
+
 
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
@@ -4276,6 +4446,26 @@ class TestThinkingStreamState:
         assert second.reasoning == "Custom reasoning."
         assert second.content == "Custom answer."
         assert second.thinking_closed is True
+
+    def test_cohere_text_markers_are_suppressed_across_chunks(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+        reasoning = []
+        content = []
+
+        for chunk in [
+            "Custom reasoning.",
+            "<|END_THINKING|><|START_",
+            "TEXT|>Custom answer.<|END_",
+            "TEXT|>",
+        ]:
+            delta = state.feed(chunk)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == "Custom reasoning."
+        assert "".join(content) == "Custom answer."
 
 
 class TestChatMessageSchema:
@@ -4371,6 +4561,30 @@ class TestProcessToolCalls:
         result = server.process_tool_calls("Just text.", module, [])
         assert result["calls"] == []
         assert result["remaining_text"] == "Just text."
+
+    def test_parser_can_return_multiple_tool_calls(self):
+        module = SimpleNamespace(
+            tool_call_start="<tc>",
+            tool_call_end="</tc>",
+            parse_tool_call=lambda call, tools: [
+                {"name": "grep", "arguments": {"pattern": "foo"}},
+                {"name": "read", "arguments": {"path": "file.py"}},
+            ],
+        )
+
+        result = server.process_tool_calls("Before <tc>[]</tc> after", module, [])
+
+        assert result["remaining_text"] == "Before   after"
+        assert [call["function"]["name"] for call in result["calls"]] == [
+            "grep",
+            "read",
+        ]
+        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+            "pattern": "foo"
+        }
+        assert json.loads(result["calls"][1]["function"]["arguments"]) == {
+            "path": "file.py"
+        }
 
 
 class TestCountThinkingTagTokens:
