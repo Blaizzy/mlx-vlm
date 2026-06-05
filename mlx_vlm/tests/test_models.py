@@ -2940,10 +2940,7 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
-    def test_gemma4_sanitize_drops_unused_shared_kv_weights(self):
-        from mlx_vlm.models import gemma4
-
-        text_config = gemma4.TextConfig(
+        shared_text_config = gemma4.TextConfig(
             model_type="gemma4_text",
             hidden_size=16,
             num_hidden_layers=4,
@@ -2959,30 +2956,18 @@ class TestModels(unittest.TestCase):
             sliding_window=32,
             sliding_window_pattern=2,
         )
-        model = gemma4.Model(
+        shared_model = gemma4.Model(
             gemma4.ModelConfig(
-                text_config=text_config,
-                vision_config=gemma4.VisionConfig(
-                    hidden_size=16,
-                    num_hidden_layers=1,
-                    intermediate_size=32,
-                    num_attention_heads=2,
-                    num_key_value_heads=2,
-                    head_dim=8,
-                    patch_size=16,
-                    pooling_kernel_size=2,
-                    default_output_length=4,
-                    position_embedding_size=64,
-                    use_clipped_linears=False,
-                ),
+                text_config=shared_text_config,
+                vision_config=vision_config,
                 model_type="gemma4",
-                vocab_size=32,
-                image_token_id=31,
+                vocab_size=config.vocab_size,
+                image_token_id=config.image_token_id,
                 audio_config=None,
             )
         )
 
-        weights = model.sanitize(
+        weights = shared_model.sanitize(
             {
                 "model.language_model.layers.1.self_attn.k_proj.weight": mx.zeros(
                     (8, 16)
@@ -3002,7 +2987,7 @@ class TestModels(unittest.TestCase):
                 ),
             }
         )
-        weights = model.language_model.sanitize(weights)
+        weights = shared_model.language_model.sanitize(weights)
 
         self.assertIn("language_model.model.layers.1.self_attn.k_proj.weight", weights)
         self.assertIn("language_model.model.layers.2.self_attn.q_proj.weight", weights)
