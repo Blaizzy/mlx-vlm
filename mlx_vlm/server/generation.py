@@ -38,6 +38,7 @@ from ..speculative.utils import (
     speculative_hidden_state,
     speculative_prefill_kwargs,
 )
+from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
@@ -891,7 +892,7 @@ class ResponseGenerator:
         )
 
     def _make_logits_processors(
-        self, args: GenerationArguments
+        self, args: GenerationArguments, input_ids: Optional[mx.array] = None
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
         processors = make_logits_processors(
             args.logit_bias,
@@ -903,8 +904,62 @@ class ResponseGenerator:
             args.frequency_context_size,
         )
         if args.logits_processors is not None:
-            processors.extend(args.logits_processors)
+            request_processors = args.logits_processors
+            if input_ids is not None and self._prompt_has_open_thinking(
+                args, input_ids
+            ):
+                request_processors = self._wrap_processors_until_thinking_done(
+                    args, request_processors
+                )
+            processors.extend(request_processors)
         return processors
+
+    def _thinking_token_ids(self, args: GenerationArguments) -> Tuple[int, int]:
+        tokenizer = self.tokenizer
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+        thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+        return thinking_start_token_id, thinking_end_token_id
+
+    def _prompt_has_open_thinking(
+        self, args: GenerationArguments, input_ids: mx.array
+    ) -> bool:
+        if not args.enable_thinking:
+            return False
+        thinking_start_token_id, thinking_end_token_id = self._thinking_token_ids(args)
+        tokens = input_ids.flatten().tolist()
+        try:
+            last_start = len(tokens) - 1 - tokens[::-1].index(thinking_start_token_id)
+        except ValueError:
+            return False
+        try:
+            last_end = len(tokens) - 1 - tokens[::-1].index(thinking_end_token_id)
+        except ValueError:
+            last_end = -1
+        return last_start > last_end
+
+    def _wrap_processors_until_thinking_done(
+        self,
+        args: GenerationArguments,
+        processors: List[Callable[[mx.array, mx.array], mx.array]],
+    ) -> List[Callable[[mx.array, mx.array], mx.array]]:
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        return [
+            ThinkingAwareLogitsProcessor(
+                processor=processor,
+                tokenizer=self.tokenizer,
+                thinking_start_token=thinking_start_token,
+                thinking_end_token=thinking_end_token,
+                enable_thinking=True,
+            )
+            for processor in processors
+        ]
 
     def _make_thinking_budget_criteria(
         self, args: GenerationArguments, input_ids: mx.array
@@ -914,12 +969,7 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
-        thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
-        )[-1]
-        enable_thinking = bool(args.enable_thinking) and (
-            thinking_start_token_id in input_ids.flatten().tolist()
-        )
+        enable_thinking = self._prompt_has_open_thinking(args, input_ids)
         return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=args.thinking_budget,
@@ -1111,7 +1161,9 @@ class ResponseGenerator:
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
-                            logits_processors=[self._make_logits_processors(args)],
+                            logits_processors=[
+                                self._make_logits_processors(args, input_ids)
+                            ],
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:

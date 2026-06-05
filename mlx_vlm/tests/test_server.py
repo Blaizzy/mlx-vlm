@@ -3954,6 +3954,70 @@ class TestResponseGenerator:
         assert calls == [({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)]
         assert processors == ["repetition-processor", custom_processor]
 
+    def test_server_generation_delays_structured_processors_for_thinking_prompt(
+        self, monkeypatch
+    ):
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        repetition_processor = lambda tokens, logits: logits
+        structured_processor = lambda tokens, logits: logits
+
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [repetition_processor],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 10, 3]], dtype=mx.int32),
+        )
+
+        assert processors[0] is repetition_processor
+        assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
+        assert processors[1].processor is structured_processor
+
+    def test_server_generation_keeps_structured_processors_active_without_open_thinking(
+        self, monkeypatch
+    ):
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        structured_processor = lambda tokens, logits: logits
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 10, 3, 20]], dtype=mx.int32),
+        )
+
+        assert processors == [structured_processor]
+
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
             max_output_tokens=128,
@@ -4213,6 +4277,24 @@ class TestResponseGenerator:
 
         assert schema["required"] == ["animal"]
 
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_chat_response_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
+            text=None,
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_responses_text_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format=None,
+            text={"format": {"type": format_type}},
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
     def test_build_structured_logits_processors_uses_tokenizer(self):
         req = SimpleNamespace(
             response_format={
@@ -4222,6 +4304,24 @@ class TestResponseGenerator:
                     "schema": {"type": "object"},
                 },
             },
+            text=None,
+        )
+        proc = SimpleNamespace(tokenizer=object())
+
+        with patch.object(
+            server, "build_json_schema_logits_processor", return_value="processor"
+        ) as mock_build:
+            processors = server._build_structured_logits_processors(req, proc)
+
+        assert processors == ["processor"]
+        assert mock_build.call_args.args[1] == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_build_structured_logits_processors_for_json_object_aliases(
+        self, format_type
+    ):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
             text=None,
         )
         proc = SimpleNamespace(tokenizer=object())

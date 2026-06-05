@@ -222,6 +222,8 @@ def _extract_response_format_schema(request) -> Optional[Union[str, dict]]:
     format_type = response_format.get("type")
     if format_type in (None, "text"):
         return None
+    if format_type in ("json_object", "object"):
+        return {"type": "object"}
     if format_type != "json_schema":
         raise ValueError(f"Unsupported response_format type: {format_type!r}")
 
