@@ -9,7 +9,6 @@ if TYPE_CHECKING:
 
 from ..generate import (
     DEFAULT_MAX_TOKENS,
-    DEFAULT_MODEL_PATH,
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
@@ -593,7 +592,7 @@ StreamEvent = Union[
 
 class VLMRequest(FlexibleBaseModel):
     model: str = Field(
-        DEFAULT_MODEL_PATH,
+        ...,
         description="The path to the local model directory or Hugging Face repo.",
     )
     adapter_path: Optional[str] = Field(
