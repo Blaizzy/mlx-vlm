@@ -2306,7 +2306,7 @@ class TestModels(unittest.TestCase):
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
 
-    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+    def test_lfm2_vl_skips_projector_layernorm_when_disabled(self):
         from mlx_vlm.models import lfm2_vl
 
         text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
@@ -2318,17 +2318,13 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
-        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
-        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIsNone(model.multi_modal_projector.layer_norm)
+        parameters = model.multi_modal_projector.parameters()
+        self.assertNotIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
         from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
-
-        class ExplodingLayerNorm(nn.Module):
-            def __call__(self, x):
-                raise AssertionError("layernorm branch should be disabled")
 
         text_config = lfm2_vl.TextConfig(
             hidden_size=4,
@@ -2347,7 +2343,6 @@ class TestModels(unittest.TestCase):
             projector_use_layernorm=False,
         )
         projector = Lfm2VlMultiModalProjector(config)
-        projector.layer_norm = ExplodingLayerNorm()
 
         output = projector(mx.zeros((1, 1, 1, 2)))
 

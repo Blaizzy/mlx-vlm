@@ -20,6 +20,9 @@ import math
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
+from transformers.feature_extraction_utils import BatchFeature
+from transformers.image_processing_base import ImageProcessingMixin
 from transformers.models.lfm2_vl.processing_lfm2_vl import (
     Lfm2VlProcessor,
     Lfm2VlProcessorKwargs,
@@ -61,7 +64,190 @@ def _normalize_image_layout_axis(values, num_images: int) -> list[int]:
     return [int(v) for v in values]
 
 
-# Try to import the slow image processor to force its use
+def _round_by_factor(number: float, factor: int) -> int:
+    return round(number / factor) * factor
+
+
+def _smart_resize(
+    height: int,
+    width: int,
+    downsample_factor: int,
+    min_image_tokens: int,
+    max_image_tokens: int,
+    encoder_patch_size: int,
+) -> tuple[int, int]:
+    total_factor = encoder_patch_size * downsample_factor
+    min_pixels = min_image_tokens * encoder_patch_size**2 * downsample_factor**2
+    max_pixels = max_image_tokens * encoder_patch_size**2 * downsample_factor**2
+
+    h_bar = max(total_factor, _round_by_factor(height, total_factor))
+    w_bar = max(total_factor, _round_by_factor(width, total_factor))
+
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(
+            total_factor,
+            math.floor(height / beta / total_factor) * total_factor,
+        )
+        w_bar = max(
+            total_factor,
+            math.floor(width / beta / total_factor) * total_factor,
+        )
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / total_factor) * total_factor
+        w_bar = math.ceil(width * beta / total_factor) * total_factor
+
+    return w_bar, h_bar
+
+
+def _convert_image_to_patches(image: np.ndarray, patch_size: int) -> np.ndarray:
+    height, width, channels = image.shape
+    num_patches_height = height // patch_size
+    num_patches_width = width // patch_size
+    image = image[: num_patches_height * patch_size, : num_patches_width * patch_size]
+    patches = image.reshape(
+        num_patches_height,
+        patch_size,
+        num_patches_width,
+        patch_size,
+        channels,
+    )
+    patches = patches.transpose(0, 2, 1, 3, 4)
+    return patches.reshape(num_patches_height * num_patches_width, -1)
+
+
+def _pad_along_first_dim(
+    array: np.ndarray, target_length: int
+) -> tuple[np.ndarray, np.ndarray]:
+    current_length = array.shape[0]
+    mask = np.ones((target_length,), dtype=np.int32)
+    if current_length >= target_length:
+        return array[:target_length], mask
+
+    pad_shape = (target_length - current_length,) + array.shape[1:]
+    padded = np.concatenate(
+        [array, np.zeros(pad_shape, dtype=array.dtype)],
+        axis=0,
+    )
+    mask[current_length:] = 0
+    return padded, mask
+
+
+class Lfm2VlNumpyImageProcessor(ImageProcessingMixin):
+    """PIL/NumPy image processor compatible with the LFM2-VL packed-patch input."""
+
+    model_input_names = ["pixel_values", "pixel_attention_mask", "spatial_shapes"]
+
+    def __init__(self, **kwargs):
+        self.image_mean = kwargs.get("image_mean", [0.5, 0.5, 0.5])
+        self.image_std = kwargs.get("image_std", [0.5, 0.5, 0.5])
+        self.rescale_factor = kwargs.get("rescale_factor", 1 / 255)
+        self.do_rescale = kwargs.get("do_rescale", True)
+        self.do_normalize = kwargs.get("do_normalize", True)
+        self.do_resize = kwargs.get("do_resize", True)
+        self.do_pad = kwargs.get("do_pad", True)
+        self.downsample_factor = kwargs.get("downsample_factor", 2)
+        self.encoder_patch_size = kwargs.get(
+            "encoder_patch_size", kwargs.get("patch_size", 16)
+        )
+        self.patch_size = self.encoder_patch_size
+        self.min_image_tokens = kwargs.get("min_image_tokens", 64)
+        self.max_image_tokens = kwargs.get("max_image_tokens", 256)
+        self.tile_size = kwargs.get("tile_size", 512)
+        self.max_pixels_tolerance = kwargs.get("max_pixels_tolerance", 2.0)
+        self.do_image_splitting = False
+        self.use_thumbnail = False
+        self.max_num_patches = kwargs.get(
+            "max_num_patches",
+            self.max_image_tokens * self.downsample_factor**2,
+        )
+
+    def fetch_images(self, images):
+        if isinstance(images, (list, tuple)):
+            return [self.fetch_images(image) for image in images]
+        if isinstance(images, (str, Path)):
+            return Image.open(images)
+        return images
+
+    def _to_rgb_image(self, image):
+        if isinstance(image, np.ndarray):
+            image = Image.fromarray(image)
+        if not isinstance(image, Image.Image):
+            raise TypeError(f"Unsupported image type: {type(image)}")
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+        return image
+
+    def _flatten_images(self, images):
+        if isinstance(images, (list, tuple)):
+            flattened = []
+            for image in images:
+                flattened.extend(self._flatten_images(image))
+            return flattened
+        return [images]
+
+    def preprocess(self, images, return_tensors=None, **kwargs):
+        images = self._flatten_images(self.fetch_images(images))
+        pixel_values = []
+        pixel_attention_mask = []
+        spatial_shapes = []
+
+        for image in images:
+            image = self._to_rgb_image(image)
+            width, height = image.size
+
+            if self.do_resize:
+                target_width, target_height = _smart_resize(
+                    height=height,
+                    width=width,
+                    downsample_factor=self.downsample_factor,
+                    min_image_tokens=self.min_image_tokens,
+                    max_image_tokens=self.max_image_tokens,
+                    encoder_patch_size=self.encoder_patch_size,
+                )
+                image = image.resize(
+                    (target_width, target_height), Image.Resampling.BILINEAR
+                )
+            else:
+                target_width, target_height = width, height
+
+            array = np.array(image, dtype=np.float32)
+            if self.do_rescale:
+                array *= self.rescale_factor
+            if self.do_normalize:
+                mean = np.array(self.image_mean, dtype=np.float32)
+                std = np.array(self.image_std, dtype=np.float32)
+                array = (array - mean) / std
+
+            patches = _convert_image_to_patches(array, self.encoder_patch_size)
+            h_patches = target_height // self.encoder_patch_size
+            w_patches = target_width // self.encoder_patch_size
+
+            if self.do_pad:
+                patches, mask = _pad_along_first_dim(patches, self.max_num_patches)
+            else:
+                mask = np.ones((patches.shape[0],), dtype=np.int32)
+
+            pixel_values.append(patches)
+            pixel_attention_mask.append(mask)
+            spatial_shapes.append((h_patches, w_patches))
+
+        data = {
+            "pixel_values": np.stack(pixel_values),
+            "pixel_attention_mask": np.stack(pixel_attention_mask),
+            "spatial_shapes": np.array(spatial_shapes, dtype=np.int32),
+        }
+        tensor_type = "np" if return_tensors == "np" else None
+        return BatchFeature(data=data, tensor_type=tensor_type)
+
+    def __call__(self, images, return_tensors=None, **kwargs):
+        return self.preprocess(images, return_tensors=return_tensors, **kwargs)
+
+
+# Try to import the slow image processor to force its use. Some Transformers
+# versions import torch from the SigLIP2 processor module, so fall back to a
+# local PIL/NumPy implementation when torch/torchvision are absent.
 try:
     from transformers.models.siglip2.image_processing_siglip2 import (
         Siglip2ImageProcessor,
@@ -69,7 +255,8 @@ try:
 
     _SLOW_PROCESSOR_AVAILABLE = True
 except ImportError:
-    _SLOW_PROCESSOR_AVAILABLE = False
+    Siglip2ImageProcessor = Lfm2VlNumpyImageProcessor
+    _SLOW_PROCESSOR_AVAILABLE = True
 
 # Remove return_row_col_info from the defaults since the slow image processor
 # (Siglip2ImageProcessor) doesn't support it - only the fast version does.
@@ -165,18 +352,29 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
             cls, pretrained_model_name_or_path, **kwargs
         )
 
-    config_path = (
-        model_path / "preprocessor_config.json"
-        if is_local
-        else Path(
-            hf_hub_download(pretrained_model_name_or_path, "preprocessor_config.json")
-        )
-    )
+    if is_local:
+        config_path = model_path / "processor_config.json"
+        if not config_path.exists():
+            config_path = model_path / "preprocessor_config.json"
+    else:
+        try:
+            config_path = Path(
+                hf_hub_download(pretrained_model_name_or_path, "processor_config.json")
+            )
+        except Exception:
+            config_path = Path(
+                hf_hub_download(
+                    pretrained_model_name_or_path, "preprocessor_config.json"
+                )
+            )
 
     image_processor_config = {}
     if config_path.exists():
         with open(config_path, "r", encoding="utf-8") as f:
             image_processor_config = json.load(f)
+        image_processor_config = image_processor_config.get(
+            "image_processor", image_processor_config
+        )
 
     for key in (
         "image_processor_type",
