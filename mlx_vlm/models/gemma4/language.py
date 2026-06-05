@@ -672,6 +672,42 @@ class LanguageModel(nn.Module):
     def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
         return self.model.norm(hidden)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if getattr(self, "no_chunked_prefill", False):
+            return False
+
+        token_types = prefill_kwargs.get("mm_token_type_ids", None)
+        if token_types is None:
+            token_types = prefill_kwargs.get("token_type_ids", None)
+        if (
+            getattr(self.config, "use_bidirectional_attention", None) == "vision"
+            and token_types is not None
+        ):
+            has_visual = int(mx.sum((token_types == 1) | (token_types == 2)).item()) > 0
+            has_audio = int(mx.sum(token_types == 3).item()) > 0
+            if has_visual and not has_audio:
+                return False
+
+        if draft_model is not None:
+            return (
+                draft_kind == "mtp"
+                and bool(prefill_kwargs.get("return_hidden", False))
+                and bool(prefill_kwargs.get("return_shared_kv", False))
+            )
+
+        return True
+
     def __call__(
         self,
         inputs: mx.array = None,
@@ -809,8 +845,6 @@ class LanguageModel(nn.Module):
             if not hasattr(m, "to_quantized"):
                 return False
             if "router" in path:
-                return {"group_size": 64, "bits": 8}
-            if path.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
                 return {"group_size": 64, "bits": 8}
             return True
 

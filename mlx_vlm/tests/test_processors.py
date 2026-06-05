@@ -1815,6 +1815,28 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
 
+    def test_numpy_image_processor_outputs_packed_patches(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _num_image_tokens_from_patch_grid,
+        )
+
+        processor = Lfm2VlNumpyImageProcessor(
+            encoder_patch_size=16,
+            downsample_factor=2,
+            min_image_tokens=64,
+            max_image_tokens=256,
+            max_num_patches=1024,
+        )
+
+        result = processor(_make_image(), return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["pixel_attention_mask"].shape, (1, 1024))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[16, 16]])
+        self.assertEqual(int(result["pixel_attention_mask"].sum()), 256)
+        self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
+
     def test_scalar_image_rows_and_cols_are_supported(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
 
@@ -1869,19 +1891,22 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "preprocessor_config.json").write_text(
+            (Path(tmpdir) / "processor_config.json").write_text(
                 json.dumps(
                     {
-                        "image_processor_type": "Lfm2VlImageProcessorFast",
-                        "do_resize": False,
-                        "do_image_splitting": True,
-                        "do_normalize": True,
-                        "do_rescale": True,
-                        "image_mean": [0.5, 0.5, 0.5],
-                        "image_std": [0.5, 0.5, 0.5],
-                        "max_num_patches": 1024,
-                        "patch_size": 16,
-                        "return_row_col_info": True,
+                        "image_processor": {
+                            "image_processor_type": "Lfm2VlImageProcessorFast",
+                            "do_resize": False,
+                            "do_image_splitting": True,
+                            "do_normalize": True,
+                            "do_rescale": True,
+                            "image_mean": [0.5, 0.5, 0.5],
+                            "image_std": [0.5, 0.5, 0.5],
+                            "max_num_patches": 1024,
+                            "patch_size": 16,
+                            "return_row_col_info": True,
+                        },
+                        "processor_class": "Lfm2VlProcessor",
                     }
                 )
             )

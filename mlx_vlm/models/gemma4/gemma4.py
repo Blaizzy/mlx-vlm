@@ -279,3 +279,6 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.model.layers
+
+    def make_cache(self):
+        return self.language_model.make_cache()
