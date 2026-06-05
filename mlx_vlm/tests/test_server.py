@@ -4374,6 +4374,15 @@ class TestSplitThinking:
         assert reasoning == "Custom reasoning."
         assert content == "Custom answer."
 
+    def test_cohere_thinking_markers_strip_text_markers(self):
+        text = (
+            "<|START_THINKING|>Custom reasoning.<|END_THINKING|>"
+            "<|START_TEXT|>Custom answer.<|END_TEXT|>"
+        )
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Custom reasoning."
+        assert content == "Custom answer."
+
 
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
@@ -4422,6 +4431,26 @@ class TestThinkingStreamState:
         assert second.reasoning == "Custom reasoning."
         assert second.content == "Custom answer."
         assert second.thinking_closed is True
+
+    def test_cohere_text_markers_are_suppressed_across_chunks(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+        reasoning = []
+        content = []
+
+        for chunk in [
+            "Custom reasoning.",
+            "<|END_THINKING|><|START_",
+            "TEXT|>Custom answer.<|END_",
+            "TEXT|>",
+        ]:
+            delta = state.feed(chunk)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == "Custom reasoning."
+        assert "".join(content) == "Custom answer."
 
 
 class TestChatMessageSchema:
@@ -4517,6 +4546,30 @@ class TestProcessToolCalls:
         result = server.process_tool_calls("Just text.", module, [])
         assert result["calls"] == []
         assert result["remaining_text"] == "Just text."
+
+    def test_parser_can_return_multiple_tool_calls(self):
+        module = SimpleNamespace(
+            tool_call_start="<tc>",
+            tool_call_end="</tc>",
+            parse_tool_call=lambda call, tools: [
+                {"name": "grep", "arguments": {"pattern": "foo"}},
+                {"name": "read", "arguments": {"path": "file.py"}},
+            ],
+        )
+
+        result = server.process_tool_calls("Before <tc>[]</tc> after", module, [])
+
+        assert result["remaining_text"] == "Before   after"
+        assert [call["function"]["name"] for call in result["calls"]] == [
+            "grep",
+            "read",
+        ]
+        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+            "pattern": "foo"
+        }
+        assert json.loads(result["calls"][1]["function"]["arguments"]) == {
+            "path": "file.py"
+        }
 
 
 class TestCountThinkingTagTokens:
