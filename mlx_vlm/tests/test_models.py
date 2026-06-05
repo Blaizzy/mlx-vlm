@@ -3054,10 +3054,131 @@ class TestModels(unittest.TestCase):
             tree_map(lambda p: p.astype(mx.float32), model.language_model.parameters())
         )
 
+        from mlx_vlm.generate import ar as ar_module
+        from mlx_vlm.models import cache as cache_utils
+
+        def reset_prefill_state(target_model):
+            seen = set()
+            language_model = getattr(target_model, "language_model", None)
+            stack = [
+                target_model,
+                getattr(target_model, "model", None),
+                language_model,
+                getattr(language_model, "model", None),
+            ]
+            while stack:
+                obj = stack.pop()
+                if obj is None or id(obj) in seen:
+                    continue
+                seen.add(id(obj))
+                for attr in ("_position_ids", "_rope_deltas"):
+                    if hasattr(obj, attr):
+                        setattr(obj, attr, None)
+
+        def assert_model_chunked_prefill(
+            input_ids,
+            dtype,
+            *,
+            expected_enabled=True,
+            prefill_step_size=2,
+            **kwargs,
+        ):
+            reset_prefill_state(model)
+            prompt_cache = cache_utils.make_prompt_cache(model)
+            language_cache = cache_utils.make_prompt_cache(model.language_model)
+            self.assertEqual(
+                [type(c) for c in prompt_cache],
+                [type(c) for c in language_cache],
+            )
+            del language_cache
+
+            embedding_output = model.get_input_embeddings(input_ids=input_ids, **kwargs)
+            inputs_embeds = embedding_output.inputs_embeds
+            lm_kwargs = dict(kwargs)
+            lm_kwargs.update(
+                {
+                    k: v
+                    for k, v in embedding_output.to_dict().items()
+                    if k != "inputs_embeds" and v is not None
+                }
+            )
+            enabled = ar_module._chunked_prefill_enabled(
+                model,
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                prompt_cache=prompt_cache,
+                prefill_kwargs=lm_kwargs,
+            )
+            self.assertEqual(enabled, expected_enabled)
+            if not expected_enabled:
+                return
+
+            chunked_input_ids = input_ids
+            chunked_inputs_embeds = inputs_embeds
+            processed_tokens = 0
+            prefill_chunks = 0
+            while chunked_inputs_embeds.shape[1] > 1:
+                n_to_process = min(
+                    prefill_step_size, chunked_inputs_embeds.shape[1] - 1
+                )
+                outputs = model.language_model(
+                    inputs=chunked_input_ids[:, :n_to_process],
+                    inputs_embeds=chunked_inputs_embeds[:, :n_to_process],
+                    cache=prompt_cache,
+                    n_to_process=n_to_process,
+                    **lm_kwargs,
+                )
+                mx.eval([c.state for c in prompt_cache])
+
+                processed_tokens += n_to_process
+                prefill_chunks += 1
+                chunked_input_ids = chunked_input_ids[:, n_to_process:]
+                chunked_inputs_embeds = chunked_inputs_embeds[:, n_to_process:]
+                del outputs
+                mx.clear_cache()
+
+            self.assertEqual(processed_tokens, inputs_embeds.shape[1] - 1)
+            self.assertGreater(prefill_chunks, 1)
+
+            outputs = model.language_model(
+                inputs=chunked_input_ids[:, -1:],
+                inputs_embeds=chunked_inputs_embeds[:, -1:],
+                cache=prompt_cache,
+                **lm_kwargs,
+            )
+            logits = outputs.logits
+            self.assertEqual(logits.shape, (input_ids.shape[0], 1, config.vocab_size))
+            self.assertEqual(logits.dtype, dtype)
+            mx.eval(logits)
+            del logits, outputs, prompt_cache
+            mx.clear_cache()
+
+        assert_model_chunked_prefill(
+            mx.array([[0, 1, 2, 3, 4]], dtype=mx.int32),
+            mx.float32,
+        )
+
+        audio_input_ids = mx.array([[0, 62, 62, 1, 2]], dtype=mx.int32)
+        input_features = mx.random.uniform(shape=(1, 2, 8))
+        input_features_mask = mx.array([[True, True]])
+        assert_model_chunked_prefill(
+            audio_input_ids,
+            mx.float32,
+            input_features=input_features,
+            input_features_mask=input_features_mask,
+        )
+
         input_ids = mx.array([[0, 63, 63, 63, 63, 1]], dtype=mx.int32)
         pixel_values = mx.random.uniform(shape=(1, 4, 4 * 4 * 3))
         image_position_ids = mx.array(
             [[[0, 0], [1, 0], [0, 1], [1, 1]]], dtype=mx.int32
+        )
+        assert_model_chunked_prefill(
+            input_ids,
+            mx.float32,
+            expected_enabled=False,
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
         )
         output = model(
             input_ids,
@@ -3067,8 +3188,6 @@ class TestModels(unittest.TestCase):
         self.assertEqual(output.logits.shape, (1, 6, config.vocab_size))
 
         input_ids_audio = mx.array([[0, 62, 62, 1]], dtype=mx.int32)
-        input_features = mx.random.uniform(shape=(1, 2, 8))
-        input_features_mask = mx.array([[True, True]])
         output = model(
             input_ids_audio,
             input_features=input_features,
