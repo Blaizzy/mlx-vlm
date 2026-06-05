@@ -89,8 +89,13 @@ def _chunked_prefill_enabled(
     if any(getattr(candidate, "no_chunked_prefill", False) for candidate in candidates):
         return False
 
-    # Hidden-state speculative prefill is model-contract dependent. Keep unknown
-    # target models conservative unless they expose a chunked_prefill_policy.
+    # MTP only needs the final-position hidden state and shared K/V from the
+    # post-prefill step, so earlier prompt columns can use normal chunking.
+    if draft_kind == "mtp":
+        return True
+
+    # Other hidden-state speculative prefill is model-contract dependent. Keep
+    # unknown target models conservative unless they expose a policy.
     return draft_model is None
 
 

@@ -1643,15 +1643,26 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
     model.chunked_prefill_policy.assert_called_once()
 
 
-def test_chunked_prefill_policy_defaults_conservative_for_speculation():
+def test_chunked_prefill_policy_defaults_to_chunking_for_mtp_speculation():
     model = SimpleNamespace(no_chunked_prefill=False)
 
     assert ar_module._chunked_prefill_enabled(model)
-    assert not ar_module._chunked_prefill_enabled(
+    assert ar_module._chunked_prefill_enabled(
         model,
         draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
         draft_kind="mtp",
         prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
+    )
+
+
+def test_chunked_prefill_policy_stays_conservative_for_hidden_capture_speculation():
+    model = SimpleNamespace(no_chunked_prefill=False)
+
+    assert not ar_module._chunked_prefill_enabled(
+        model,
+        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
+        draft_kind="dflash",
+        prefill_kwargs={"capture_layer_ids": [1, 2]},
     )
 
 
