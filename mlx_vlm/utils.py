@@ -315,6 +315,23 @@ def skip_multimodal_module(path: str) -> bool:
     return any(module in path for module in multimodal_modules)
 
 
+def get_class_predicate(skip_vision=False, weights=None, quantization_config=None):
+    def predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if quantization_config is not None and p in quantization_config:
+            return quantization_config[p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        if weights is not None:
+            return f"{p}.scales" in weights
+        return True
+
+    return predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
