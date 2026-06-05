@@ -3150,6 +3150,70 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
+        shared_text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            sliding_window=32,
+            sliding_window_pattern=2,
+        )
+        shared_model = gemma4.Model(
+            gemma4.ModelConfig(
+                text_config=shared_text_config,
+                vision_config=vision_config,
+                model_type="gemma4",
+                vocab_size=config.vocab_size,
+                image_token_id=config.image_token_id,
+                audio_config=None,
+            )
+        )
+
+        weights = shared_model.sanitize(
+            {
+                "model.language_model.layers.1.self_attn.k_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.k_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.v_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+                "model.language_model.layers.2.self_attn.k_norm.weight": mx.zeros((8,)),
+                "model.language_model.layers.2.self_attn.q_proj.weight": mx.zeros(
+                    (16, 16)
+                ),
+                "model.language_model.layers.3.self_attn.v_proj.weight": mx.zeros(
+                    (8, 16)
+                ),
+            }
+        )
+        weights = shared_model.language_model.sanitize(weights)
+
+        self.assertIn("language_model.model.layers.1.self_attn.k_proj.weight", weights)
+        self.assertIn("language_model.model.layers.2.self_attn.q_proj.weight", weights)
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.k_proj.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.v_proj.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.2.self_attn.k_norm.weight", weights
+        )
+        self.assertNotIn(
+            "language_model.model.layers.3.self_attn.v_proj.weight", weights
+        )
+
     def test_gemma4_quant_predicate_keeps_mlp_at_requested_bits(self):
         from mlx_vlm.models import gemma4
 
