@@ -23,6 +23,7 @@ import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
+    BatchQuantizedKVCache,
     BufferedRotatingKVCache,
     CacheList,
     KVCache,
@@ -77,6 +78,7 @@ from mlx_vlm.speculative.utils import (
     _speculative_walk_deferred_greedy,
     speculative_prefill_kwargs,
 )
+from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
@@ -916,6 +918,50 @@ def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
 
     assert bool(mx.array_equal(singleton_decode, batch_decode).item())
     assert isinstance(batch_cache[1], BatchKVCache)
+
+
+def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.hidden_size = 64
+    text_config.intermediate_size = 128
+    text_config.num_hidden_layers = 2
+    text_config.num_attention_heads = 2
+    text_config.num_key_value_heads = 1
+    text_config.head_dim = 32
+    text_config.full_attention_interval = 2
+    model = qwen_language.Qwen3_5Model(text_config)
+
+    batch_arrays = ArraysCache(size=2)
+    batch_arrays.left_padding = mx.array([0], dtype=mx.int32)
+    quantized_cache = BatchQuantizedKVCache([0], group_size=32, bits=8)
+    prompt_cache = [batch_arrays, quantized_cache]
+
+    prompt = mx.array([[1, 2, 3]], dtype=mx.int32)
+    model(prompt, cache=prompt_cache)
+    mx.eval(prompt_cache[1].state)
+
+    assert prompt_cache[1] is quantized_cache
+    assert quantized_cache.keys is not None
+    assert quantized_cache._idx == 3
+    assert quantized_cache.offset.tolist() == [3]
+
+    decode = mx.array([[4]], dtype=mx.int32)
+    model(decode, cache=prompt_cache)
+    mx.eval(prompt_cache[1].state)
+
+    assert prompt_cache[1] is quantized_cache
+    assert quantized_cache._idx == 4
+    assert quantized_cache.offset.tolist() == [4]
+
+
+def test_qwen3_5_single_row_shortcut_skips_quantized_batch_caches():
+    assert qwen_language._is_single_row_batch_cache(BatchKVCache([0]))
+    assert not qwen_language._is_single_row_batch_cache(
+        BatchQuantizedKVCache([0], group_size=32, bits=8)
+    )
+    assert not qwen_language._is_single_row_batch_cache(
+        BatchTurboQuantKVCache([0], bits=3.5)
+    )
 
 
 def test_speculative_walk_accepts_until_first_mismatch():
