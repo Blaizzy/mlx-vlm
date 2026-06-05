@@ -134,6 +134,30 @@ class Model(nn.Module):
         )
         self.language_model.no_chunked_prefill = self.no_chunked_prefill
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if self._should_disable_chunked_prefill(input_ids, **prefill_kwargs):
+            return False
+
+        if draft_model is not None:
+            return (
+                draft_kind == "mtp"
+                and bool(prefill_kwargs.get("return_hidden", False))
+                and bool(prefill_kwargs.get("return_shared_kv", False))
+            )
+
+        return True
+
     def _placeholder_mask(
         self,
         input_ids: mx.array,
@@ -377,6 +401,9 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.model.layers
+
+    def make_cache(self):
+        return self.language_model.make_cache()
 
 
 VisionModel = VisionEmbedder
