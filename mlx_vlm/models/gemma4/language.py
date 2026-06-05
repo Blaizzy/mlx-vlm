@@ -375,14 +375,20 @@ class Gemma4TextModel(nn.Module):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_scale = config.hidden_size**0.5
+        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared = config.num_hidden_layers - num_kv_shared
         self.layers = [
-            DecoderLayer(config, layer_idx=i, kv_shared_only=kv_shared_only)
+            DecoderLayer(
+                config,
+                layer_idx=i,
+                kv_shared_only=kv_shared_only
+                or (num_kv_shared > 0 and i >= first_kv_shared),
+            )
             for i in range(config.num_hidden_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        num_kv_shared = getattr(config, "num_kv_shared_layers", 0)
-        self.first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared
+        self.first_kv_shared_layer_idx = first_kv_shared
         self.previous_kvs = list(range(len(self.layers)))
         if num_kv_shared > 0:
             N = len(self.layers)
@@ -753,6 +759,8 @@ class LanguageModel(nn.Module):
         for k, v in weights.items():
             if "self_attn.rotary_emb" in k:
                 continue
+            if self._is_unused_shared_kv_weight(k):
+                continue
             if any(
                 s in k for s in ["input_max", "input_min", "output_max", "output_min"]
             ):
@@ -760,6 +768,28 @@ class LanguageModel(nn.Module):
                     continue
             sanitized[k] = v
         return sanitized
+
+    def _is_unused_shared_kv_weight(self, key: str) -> bool:
+        prefix = "language_model.model.layers."
+        if not key.startswith(prefix):
+            return False
+
+        parts = key[len(prefix) :].split(".")
+        if len(parts) < 4 or parts[1] != "self_attn":
+            return False
+
+        try:
+            layer_idx = int(parts[0])
+        except ValueError:
+            return False
+        if layer_idx >= len(self.model.layers):
+            return False
+
+        attn = self.model.layers[layer_idx].self_attn
+        if not getattr(attn, "is_kv_shared_layer", False):
+            return False
+
+        return parts[2] in {"k_proj", "v_proj", "k_norm", "v_norm"}
 
     @property
     def layers(self):
