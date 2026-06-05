@@ -16,13 +16,18 @@ from ..prompt_utils import apply_chat_template
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
 from .generation import (
+    GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .responses_state import process_tool_calls, suppress_tool_call_content
+from .responses_state import (
+    ThinkingStreamState,
+    process_tool_calls,
+    suppress_tool_call_content,
+)
 from .runtime import runtime
-from .schemas import AnthropicMessageResponse, AnthropicRequest
+from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -97,6 +102,38 @@ def _anthropic_system_text(system: Optional[Union[str, List[Any]]]) -> Optional[
         elif item is not None:
             parts.append(str(item))
     return "\n".join(parts).strip() or None
+
+
+def _normalize_anthropic_system_messages(body: Any) -> Any:
+    if not isinstance(body, dict):
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    normalized_messages = []
+    system_parts = []
+    saw_system_message = False
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "system":
+            saw_system_message = True
+            text = _anthropic_system_text(message.get("content"))
+            if text:
+                system_parts.append(text)
+            continue
+        normalized_messages.append(message)
+
+    if not saw_system_message:
+        return body
+
+    normalized_body = dict(body)
+    normalized_body["messages"] = normalized_messages
+    existing_system = _anthropic_system_text(normalized_body.get("system"))
+    if existing_system:
+        system_parts.insert(0, existing_system)
+    if system_parts:
+        normalized_body["system"] = "\n".join(system_parts)
+    return normalized_body
 
 
 def _anthropic_image_source_to_ref(source: Any) -> Optional[str]:
@@ -396,8 +433,12 @@ def _anthropic_content_from_generation(
     full_text: str,
     parsed_tool_calls: Optional[List[Any]] = None,
     include_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    reasoning, content = _split_thinking(full_text)
+    reasoning, content = _split_thinking(
+        full_text, thinking_start_token, thinking_end_token
+    )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
         blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
@@ -418,7 +459,7 @@ def _anthropic_content_from_generation(
 async def anthropic_messages_endpoint(http_request: Request):
     request_start = time.perf_counter()
     try:
-        body = await http_request.json()
+        body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
     except Exception as e:
         return _anthropic_error_response(400, f"Invalid request body: {e}")
@@ -487,10 +528,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 token_iterator = None
                 token_iter = None
                 metrics_finalized = False
-                token_times: List[float] = []
-                prompt_tps = None
-                generation_tps = None
-                peak_memory = 0.0
+                metrics = GenerationMetrics()
                 prompt_tokens = 0
                 output_tokens = 0
                 finish_reason = None
@@ -499,10 +537,14 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                in_thinking = False
-                accumulated = ""
+                thinking_state = ThinkingStreamState(
+                    gen_args.enable_thinking,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
                 in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
+                message_started = False
 
                 def close_open_block():
                     nonlocal open_block_type, block_index
@@ -540,6 +582,28 @@ async def anthropic_messages_endpoint(http_request: Request):
                         },
                     )
 
+                def start_message_event():
+                    nonlocal message_started
+                    if message_started:
+                        return
+                    message_started = True
+                    start_message = AnthropicMessageResponse(
+                        id=message_id,
+                        content=[],
+                        model=request.model,
+                        stop_reason=None,
+                        usage=AnthropicUsage.from_metrics(
+                            metrics, prompt_tokens, output_tokens
+                        ),
+                    )
+                    yield _sse_event(
+                        "message_start",
+                        {
+                            "type": "message_start",
+                            "message": start_message.model_dump(),
+                        },
+                    )
+
                 try:
                     if runtime.response_generator is not None:
                         ctx, token_iter = await asyncio.to_thread(
@@ -564,13 +628,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
-                            temperature=request.temperature,
-                            max_tokens=gen_args.max_tokens,
-                            top_p=request.top_p,
                             vision_cache=runtime.model_cache.get("vision_cache"),
-                            logits_processors=gen_args.logits_processors,
                             apc_manager=runtime.apc_manager,
-                            apc_tenant=gen_args.tenant_id,
+                            **gen_args.to_generate_kwargs(),
                         )
 
                         def _next_token():
@@ -581,24 +641,6 @@ async def anthropic_messages_endpoint(http_request: Request):
 
                         token_source = "generate"
 
-                    start_message = AnthropicMessageResponse(
-                        id=message_id,
-                        content=[],
-                        model=request.model,
-                        stop_reason=None,
-                        usage={
-                            "input_tokens": prompt_tokens,
-                            "output_tokens": 0,
-                        },
-                    )
-                    yield _sse_event(
-                        "message_start",
-                        {
-                            "type": "message_start",
-                            "message": start_message.model_dump(),
-                        },
-                    )
-
                     while True:
                         token = await asyncio.to_thread(_next_token)
                         if token is None:
@@ -606,56 +648,24 @@ async def anthropic_messages_endpoint(http_request: Request):
                         if not hasattr(token, "text"):
                             continue
 
-                        output_tokens += 1
+                        # GenerationResult.generation_tokens is cumulative;
+                        # StreamingToken lacks the field and is counted one-at-a-time.
+                        token_count = getattr(token, "generation_tokens", None)
+                        if token_count is not None:
+                            output_tokens = int(token_count)
+                        else:
+                            output_tokens += 1
                         delta = token.text
                         full_output += delta
-                        accumulated += delta
-                        token_times.append(time.perf_counter())
-                        prompt_tps = getattr(token, "prompt_tps", prompt_tps)
-                        generation_tps = getattr(
-                            token, "generation_tps", generation_tps
-                        )
-                        peak_memory = max(
-                            peak_memory,
-                            float(getattr(token, "peak_memory", 0.0) or 0.0),
-                        )
+                        metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
+                        for event in start_message_event():
+                            yield event
 
-                        delta_reasoning = None
-                        delta_content = None
-                        if not in_thinking and (
-                            "<|channel>thought" in accumulated
-                            or "<think>" in accumulated
-                        ):
-                            in_thinking = True
-                            accumulated = ""
-                        elif in_thinking and (
-                            "<channel|>" in accumulated or "</think>" in accumulated
-                        ):
-                            if open_block_type == "thinking":
-                                yield _sse_event(
-                                    "content_block_delta",
-                                    {
-                                        "type": "content_block_delta",
-                                        "index": block_index,
-                                        "delta": {
-                                            "type": "signature_delta",
-                                            "signature": "",
-                                        },
-                                    },
-                                )
-                            yield close_open_block()
-                            in_thinking = False
-                            accumulated = ""
-                        elif in_thinking:
-                            delta_reasoning = delta
-                        elif not in_thinking and (
-                            "<|channel>" in accumulated or "<think" in accumulated
-                        ):
-                            pass
-                        else:
-                            delta_content = delta
+                        thinking_delta = thinking_state.feed(delta)
+                        delta_reasoning = thinking_delta.reasoning
+                        delta_content = thinking_delta.content
 
                         in_tool_call, delta_content = suppress_tool_call_content(
                             full_output, in_tool_call, tc_start, delta_content
@@ -674,7 +684,23 @@ async def anthropic_messages_endpoint(http_request: Request):
                                     },
                                 },
                             )
-                        elif delta_content:
+                        if (
+                            thinking_delta.thinking_closed
+                            and open_block_type == "thinking"
+                        ):
+                            yield _sse_event(
+                                "content_block_delta",
+                                {
+                                    "type": "content_block_delta",
+                                    "index": block_index,
+                                    "delta": {
+                                        "type": "signature_delta",
+                                        "signature": "",
+                                    },
+                                },
+                            )
+                            yield close_open_block()
+                        if delta_content:
                             text_output += delta_content
                             yield open_block("text")
                             yield _sse_event(
@@ -693,6 +719,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                             finish_reason = token.finish_reason
                             break
 
+                    for event in start_message_event():
+                        yield event
                     yield close_open_block()
 
                     parsed_tool_calls = None
@@ -766,7 +794,13 @@ async def anthropic_messages_endpoint(http_request: Request):
                     yield _sse_event("message_stop", {"type": "message_stop"})
 
                     completion_tokens = max(
-                        0, output_tokens - _count_thinking_tag_tokens(full_output)
+                        0,
+                        output_tokens
+                        - _count_thinking_tag_tokens(
+                            full_output,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/v1/messages",
@@ -778,10 +812,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                         generated_tokens=output_tokens,
                         request_elapsed_s=time.perf_counter() - request_start,
                         request_started_s=request_start,
-                        token_times=token_times,
-                        prompt_tps=prompt_tps,
-                        generation_tps=generation_tps,
-                        peak_memory_gb=peak_memory or None,
+                        token_times=metrics.token_times,
+                        prompt_tps=metrics.prompt_tps,
+                        generation_tps=metrics.generation_tps,
+                        peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=anth_stop_reason,
                         image_count=len(images),
                         structured_output=bool(gen_args.logits_processors),
@@ -847,20 +881,15 @@ async def anthropic_messages_endpoint(http_request: Request):
             full_text = ""
             prompt_tokens = 0
             output_tokens = 0
-            peak_memory = 0.0
-            token_times: List[float] = []
-            prompt_tps = None
-            generation_tps = None
+            metrics = GenerationMetrics()
             finish_reason = None
 
             if runtime.response_generator is not None:
 
                 def _blocking_generate():
+                    metrics = GenerationMetrics()
                     text = ""
                     ot = 0
-                    tt: List[float] = []
-                    ptps = None
-                    pm = 0.0
                     fr = None
                     ctx, token_iter = runtime.response_generator.generate(
                         prompt=formatted_prompt,
@@ -871,9 +900,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     for tok in token_iter:
                         text += tok.text
                         ot += 1
-                        tt.append(time.perf_counter())
-                        ptps = getattr(tok, "prompt_tps", ptps)
-                        pm = max(pm, float(getattr(tok, "peak_memory", 0.0) or 0.0))
+                        metrics.record_chunk(tok)
                         if tok.finish_reason:
                             fr = tok.finish_reason
                             break
@@ -881,16 +908,14 @@ async def anthropic_messages_endpoint(http_request: Request):
                         token_iter.close()
                     except Exception:
                         pass
-                    return ctx.prompt_tokens, text, ot, tt, ptps, pm, fr
+                    return ctx.prompt_tokens, text, ot, fr, metrics
 
                 (
                     prompt_tokens,
                     full_text,
                     output_tokens,
-                    token_times,
-                    prompt_tps,
-                    peak_memory,
                     finish_reason,
+                    metrics,
                 ) = await asyncio.to_thread(_blocking_generate)
             else:
                 result = generate(
@@ -906,10 +931,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                 full_text = result.text
                 prompt_tokens = result.prompt_tokens
                 output_tokens = result.generation_tokens
-                prompt_tps = getattr(result, "prompt_tps", None)
-                generation_tps = getattr(result, "generation_tps", None)
-                peak_memory = float(getattr(result, "peak_memory", 0.0) or 0.0)
-                finish_reason = "stop"
+                metrics.record_result(result)
+                finish_reason = getattr(result, "finish_reason", None) or "stop"
 
             parsed_tool_calls = None
             response_text = full_text
@@ -926,6 +949,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                 response_text,
                 parsed_tool_calls=parsed_tool_calls,
                 include_thinking=bool(gen_args.enable_thinking),
+                thinking_start_token=gen_args.thinking_start_token,
+                thinking_end_token=gen_args.thinking_end_token,
             )
             stop_reason = _anthropic_stop_reason(
                 finish_reason,
@@ -938,14 +963,19 @@ async def anthropic_messages_endpoint(http_request: Request):
                 model=request.model,
                 stop_reason=stop_reason,
                 stop_sequence=stop_sequence,
-                usage={
-                    "input_tokens": prompt_tokens,
-                    "output_tokens": output_tokens,
-                },
+                usage=AnthropicUsage.from_metrics(
+                    metrics, prompt_tokens, output_tokens
+                ),
             )
 
             completion_tokens = max(
-                0, output_tokens - _count_thinking_tag_tokens(full_text)
+                0,
+                output_tokens
+                - _count_thinking_tag_tokens(
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                ),
             )
             envelope = _build_metrics_envelope(
                 endpoint="/v1/messages",
@@ -961,10 +991,10 @@ async def anthropic_messages_endpoint(http_request: Request):
                 generated_tokens=output_tokens,
                 request_elapsed_s=time.perf_counter() - request_start,
                 request_started_s=request_start,
-                token_times=token_times,
-                prompt_tps=prompt_tps,
-                generation_tps=generation_tps,
-                peak_memory_gb=peak_memory or None,
+                token_times=metrics.token_times,
+                prompt_tps=metrics.prompt_tps,
+                generation_tps=metrics.generation_tps,
+                peak_memory_gb=metrics.peak_memory or None,
                 finish_reason=stop_reason,
                 image_count=len(images),
                 structured_output=bool(gen_args.logits_processors),
@@ -1010,7 +1040,7 @@ async def anthropic_messages_endpoint(http_request: Request):
 
 async def anthropic_count_tokens_endpoint(http_request: Request):
     try:
-        body = await http_request.json()
+        body = _normalize_anthropic_system_messages(await http_request.json())
         request = _anthropic_request_with_derived_fields(AnthropicRequest(**body))
         model, processor, config = get_cached_model(request.model)
         processed_messages, images, tools, tool_choice = (

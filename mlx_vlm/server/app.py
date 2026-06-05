@@ -3,7 +3,9 @@ import gc
 import logging
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
+from threading import Lock
 from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 
@@ -11,9 +13,16 @@ import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound
 
 from .. import apc as _apc
-from ..generate import DEFAULT_TEMPERATURE, DEFAULT_TOP_P
+from ..generate import (
+    DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_P,
+)
+from ..generate.edit_image import load_image_edit_model
+from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -34,6 +43,7 @@ from .generation import (
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
@@ -64,6 +74,7 @@ def _server_runtime_snapshot() -> dict:
     return {
         "loaded_model": runtime.model_cache.get("model_path", None),
         "loaded_adapter": runtime.model_cache.get("adapter_path", None),
+        "model_kind": runtime.model_cache.get("model_kind", "text_generation"),
         "loaded_context_size": native_context_size,
         "configured_context_limit": configured_context_limit,
         "effective_context_limit": effective_context_limit,
@@ -105,16 +116,31 @@ def _build_gen_args(
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
+        seed=getattr(request, "seed", None),
+        logprobs=bool(getattr(request, "logprobs", False)),
         repetition_penalty=getattr(request, "repetition_penalty", None),
-        repetition_context_size=getattr(request, "repetition_context_size", None),
+        repetition_context_size=_request_field_or_default(
+            request,
+            "repetition_context_size",
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        ),
         presence_penalty=getattr(request, "presence_penalty", None),
-        presence_context_size=getattr(request, "presence_context_size", None),
+        presence_context_size=_request_field_or_default(
+            request,
+            "presence_context_size",
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        ),
         frequency_penalty=getattr(request, "frequency_penalty", None),
-        frequency_context_size=getattr(request, "frequency_context_size", None),
+        frequency_context_size=_request_field_or_default(
+            request,
+            "frequency_context_size",
+            DEFAULT_REPETITION_CONTEXT_SIZE,
+        ),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
+        thinking_end_token=getattr(request, "thinking_end_token", None),
         tenant_id=tenant_id,
     )
     if processor is not None:
@@ -223,9 +249,20 @@ def _build_structured_logits_processors(request, processor):
     return [logits_processor]
 
 
-def _count_thinking_tag_tokens(text: str) -> int:
+def _count_thinking_tag_tokens(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
+    if (
+        thinking_start_token
+        and thinking_end_token
+        and thinking_start_token in text
+        and thinking_end_token in text
+    ):
+        return 2
     # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
     if "<|channel>thought" in text and "<channel|>" in text:
         count = 4
@@ -234,32 +271,13 @@ def _count_thinking_tag_tokens(text: str) -> int:
     return count
 
 
-def _split_thinking(text: str) -> Tuple[Optional[str], str]:
+def _split_thinking(
+    text: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    # Handle <|channel>thought...<channel|> format (gemma4)
-    # Also handle partial tag: text starting with "thought\n" (continuation)
-    if "<|channel>thought" in text or (
-        "<channel|>" in text and text.lstrip().startswith("thought")
-    ):
-        parts = text.split("<channel|>", 1)
-        if len(parts) == 2:
-            reasoning = (
-                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-            )
-            content = parts[1].strip()
-            return reasoning or None, content
-        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-        return reasoning or None, ""
-    # Handle <think>...</think> format (qwen3.5 etc)
-    # Also handle partial: output starts with thinking text + </think> (no opening tag)
-    if "<think>" in text or "</think>" in text:
-        parts = text.split("</think>", 1)
-        if len(parts) == 2:
-            reasoning = parts[0].replace("<think>", "").strip()
-            content = parts[1].strip()
-            return reasoning or None, content
-        return parts[0].replace("<think>", "").strip(), ""
-    return None, text
+    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -358,7 +376,12 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 _INHERIT_ADAPTER = object()
 
 
-def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
+def get_cached_model(
+    model_path: str,
+    adapter_path=_INHERIT_ADAPTER,
+    *,
+    model_kind: str = "auto",
+):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
@@ -367,7 +390,7 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         cached = runtime.model_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path)
+    cache_key = (model_path, adapter_path, model_kind)
 
     # Return from cache if already loaded and matches the requested paths
     if runtime.model_cache.get("cache_key") == cache_key:
@@ -382,6 +405,80 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
     if runtime.model_cache:
         print("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
+
+    load_as_edit = model_kind == "image_edit"
+    if load_as_edit:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for image edit models.",
+            )
+        print(f"Loading image edit model from: {model_path}")
+        try:
+            model = load_image_edit_model(model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported image edit model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load image edit model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "family", "image_edit"),
+            text_config=None,
+        )
+        runtime.response_generator = None
+        runtime.apc_manager = None
+        runtime.model_cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": "image_edit",
+            "generation_lock": Lock(),
+        }
+        return model, None, config
+
+    load_as_image = model_kind == "image_generation" or (
+        model_kind == "auto" and is_image_generation_model(model_path)
+    )
+    if load_as_image:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for image generation models.",
+            )
+        print(f"Loading image generation model from: {model_path}")
+        try:
+            model = load_image_generation_model(model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported image generation model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load image generation model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "family", "image_generation"),
+            text_config=None,
+        )
+        runtime.response_generator = None
+        runtime.apc_manager = None
+        runtime.model_cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": "image_generation",
+            "generation_lock": Lock(),
+        }
+        return model, None, config
 
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
@@ -508,15 +605,25 @@ def models_endpoint():
         )
         return required_files.issubset(file_names) and has_weights
 
-    # Scan the cache directory for downloaded mlx models
-    hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-    downloaded_models = [repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)]
+    # Scan the cache directory for downloaded mlx models when it exists.
+    try:
+        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
+        downloaded_models = [
+            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
+        ]
+    except CacheNotFound:
+        downloaded_models = []
 
     # Create a list of available models
     models = [
         {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
         for repo in downloaded_models
     ]
+    loaded_model = runtime.model_cache.get("model_path")
+    if loaded_model and all(model["id"] != loaded_model for model in models):
+        models.append(
+            {"id": loaded_model, "object": "model", "created": int(time.time())}
+        )
 
     response = {"object": "list", "data": models}
 

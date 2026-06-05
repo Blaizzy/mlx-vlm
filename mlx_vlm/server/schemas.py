@@ -1,8 +1,11 @@
 import os
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import Required, TypeAlias, TypedDict
+
+if TYPE_CHECKING:
+    from .generation import GenerationMetrics
 
 from ..generate import (
     DEFAULT_MAX_TOKENS,
@@ -11,6 +14,11 @@ from ..generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     normalize_resize_shape,
+)
+from ..generate.image import (
+    DEFAULT_IMAGE_GUIDANCE,
+    DEFAULT_IMAGE_SIZE,
+    DEFAULT_IMAGE_STEPS,
 )
 
 
@@ -25,6 +33,154 @@ class FlexibleBaseModel(BaseModel):
 
 
 # OpenAI API Models
+
+
+class ImageGenerationRequest(FlexibleBaseModel):
+    prompt: str = Field(..., description="Text prompt for image generation.")
+    model: str = Field(
+        "",
+        description="Image generation model name or local snapshot path.",
+    )
+    n: int = Field(1, ge=1, le=10, description="Number of images to generate.")
+    size: Optional[str] = Field(
+        DEFAULT_IMAGE_SIZE,
+        description="Image size as WIDTHxHEIGHT. Width/height fields override this.",
+    )
+    width: Optional[int] = Field(None, description="Generated image width.")
+    height: Optional[int] = Field(None, description="Generated image height.")
+    steps: int = Field(
+        DEFAULT_IMAGE_STEPS,
+        ge=1,
+        description="Number of image generation inference steps.",
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="Base seed. Multiple outputs use (seed + i) values.",
+    )
+    guidance: float = Field(
+        DEFAULT_IMAGE_GUIDANCE,
+        description="Classifier-free guidance scale.",
+    )
+    auto_json_caption: Optional[bool] = Field(
+        None,
+        description="For Ideogram 4, wrap plain prompts into JSON captions.",
+    )
+    prompt_expansion_model: Optional[str] = Field(
+        None,
+        description=(
+            "Text model path or Hugging Face repo used to expand plain "
+            "Ideogram 4 prompts into structured JSON captions."
+        ),
+    )
+    response_format: Literal["b64_json", "path"] = Field(
+        "b64_json",
+        description="Return base64 PNG data or write files and return local paths.",
+    )
+    output_format: Literal["png"] = Field(
+        "png", description="Output image format. Only PNG is currently supported."
+    )
+    output_path: Optional[str] = Field(
+        None,
+        description="Output file path. For n>1, an index is added to the stem.",
+    )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Output directory for path responses.",
+    )
+    user: Optional[str] = Field(
+        None, description="OpenAI-compatible user identifier; currently ignored."
+    )
+
+
+class ImageGenerationResponseData(BaseModel):
+    b64_json: Optional[str] = None
+    path: Optional[str] = None
+    revised_prompt: Optional[str] = None
+    mime_type: str = "image/png"
+    width: int
+    height: int
+    seed: int
+
+
+class ImageGenerationResponse(BaseModel):
+    created: int
+    data: List[ImageGenerationResponseData]
+    output_format: Literal["png"] = "png"
+    size: str
+
+
+class ImageEditRequest(FlexibleBaseModel):
+    prompt: str = Field(..., description="Text prompt for image editing.")
+    image: Union[str, List[str]] = Field(
+        ..., description="Local path or paths of reference images."
+    )
+    model: str = Field(..., description="Image edit model name or local snapshot path.")
+    n: int = Field(1, ge=1, le=10, description="Number of images to generate.")
+    size: Optional[str] = Field(
+        None,
+        description="Edited image size as WIDTHxHEIGHT. Width/height fields override this.",
+    )
+    width: Optional[int] = Field(None, description="Edited image width.")
+    height: Optional[int] = Field(None, description="Edited image height.")
+    steps: int = Field(
+        DEFAULT_IMAGE_STEPS,
+        ge=1,
+        description="Number of image edit inference steps.",
+    )
+    seed: Optional[int] = Field(
+        None,
+        description="Base seed. Multiple outputs use (seed + i) values.",
+    )
+    guidance: float = Field(
+        DEFAULT_IMAGE_GUIDANCE,
+        description="Classifier-free guidance scale.",
+    )
+    response_format: Literal["b64_json", "path"] = Field(
+        "b64_json",
+        description="Return base64 PNG data or write files and return local paths.",
+    )
+    output_format: Literal["png"] = Field(
+        "png", description="Output image format. Only PNG is currently supported."
+    )
+    output_path: Optional[str] = Field(
+        None,
+        description="Output file path. For n>1, an index is added to the stem.",
+    )
+    output_dir: Optional[str] = Field(
+        None,
+        description="Output directory for path responses.",
+    )
+    user: Optional[str] = Field(
+        None, description="OpenAI-compatible user identifier; currently ignored."
+    )
+
+    @field_validator("image")
+    @classmethod
+    def validate_image(cls, value):
+        images = [value] if isinstance(value, str) else list(value)
+        if not images:
+            raise ValueError("At least one image is required.")
+        if not all(isinstance(item, str) and item for item in images):
+            raise ValueError("Image paths must be non-empty strings.")
+        return value
+
+
+class ImageEditResponseData(BaseModel):
+    b64_json: Optional[str] = None
+    path: Optional[str] = None
+    revised_prompt: Optional[str] = None
+    mime_type: str = "image/png"
+    width: int
+    height: int
+    seed: int
+
+
+class ImageEditResponse(BaseModel):
+    created: int
+    data: List[ImageEditResponseData]
+    output_format: Literal["png"] = "png"
+    size: str
+
 
 # Models for /responses endpoint
 
@@ -132,6 +288,9 @@ class OpenAIRequest(FlexibleBaseModel):
         ..., description="Input text or list of chat messages."
     )
     model: str = Field(..., description="The model to use for generation.")
+    adapter_path: Optional[str] = Field(
+        None, description="The path to the adapter weights."
+    )
     max_output_tokens: int = Field(
         default_factory=get_server_max_tokens,
         description="Maximum number of tokens to generate.",
@@ -166,6 +325,7 @@ class OpenAIRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -191,12 +351,88 @@ class OpenAIRequest(FlexibleBaseModel):
     )
 
 
+class PromptTokensDetails(BaseModel):
+    cached_tokens: int = 0
+
+
 class OpenAIUsage(BaseModel):
     """Token usage details including input tokens, output tokens, breakdown, and total tokens used."""
 
     input_tokens: int
+    input_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
     output_tokens: int
     total_tokens: int
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: "GenerationMetrics", input_tokens: int, output_tokens: int
+    ) -> "OpenAIUsage":
+        # Per spec, `input_tokens` is the total prompt count; cached portion is
+        # reported separately in `input_tokens_details.cached_tokens`.
+        return cls(
+            input_tokens=input_tokens,
+            input_tokens_details=PromptTokensDetails(
+                cached_tokens=metrics.cached_tokens
+            ),
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+
+
+class GenerationTimings(BaseModel):
+    """Per-request timing breakdown."""
+
+    prompt_n: int
+    cache_n: int
+    predicted_n: int
+    prompt_ms: float
+    prompt_per_token_ms: float
+    prompt_per_second: float
+    predicted_ms: float
+    predicted_per_token_ms: float
+    predicted_per_second: float
+    peak_memory: float = 0.0
+
+    @staticmethod
+    def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
+        if len(token_times) < 2:
+            return None
+        elapsed = token_times[-1] - token_times[0]
+        return (len(token_times) - 1) / elapsed if elapsed > 0 else None
+
+    @classmethod
+    def from_metrics(
+        cls,
+        metrics: "GenerationMetrics",
+        prompt_tokens: int,
+        output_tokens: int,
+    ) -> "GenerationTimings":
+        generation_tps = metrics.generation_tps or cls._derive_gen_tps(
+            metrics.token_times
+        )
+        cached_tokens = metrics.cached_tokens
+        prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
+        prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
+        prompt_ms = prompt_s * 1000.0
+        predicted_ms = (
+            output_tokens / generation_tps * 1000.0 if generation_tps else 0.0
+        )
+        return cls(
+            prompt_n=prompt_n,
+            cache_n=int(cached_tokens),
+            predicted_n=int(output_tokens),
+            prompt_ms=prompt_ms,
+            prompt_per_token_ms=(prompt_ms / prompt_n) if prompt_n else 0.0,
+            prompt_per_second=(prompt_n / prompt_s) if prompt_s else 0.0,
+            predicted_ms=predicted_ms,
+            predicted_per_token_ms=(
+                predicted_ms / output_tokens if output_tokens else 0.0
+            ),
+            predicted_per_second=float(generation_tps or 0.0),
+            peak_memory=float(metrics.peak_memory or 0.0),
+        )
 
 
 class OpenAIErrorObject(BaseModel):
@@ -398,6 +634,7 @@ class VLMRequest(FlexibleBaseModel):
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
+    thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
     logprobs: Optional[bool] = Field(
         None,
         description="Return log-probabilities for each output token.",
@@ -434,24 +671,39 @@ class GenerationRequest(VLMRequest):
     )
 
 
-class PromptTokensDetails(BaseModel):
-    cached_tokens: int = 0
-
-
 class UsageStats(BaseModel):
-    """OpenAI-compatible usage statistics for chat completions."""
+    """OpenAI-compatible usage statistics for chat completions. Throughput and
+    memory metrics live in `GenerationTimings` (sibling `timings` field on the
+    response) to keep this object spec-clean."""
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
-    prompt_tokens_details: PromptTokensDetails = PromptTokensDetails()
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    peak_memory: float = 0.0
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: "GenerationMetrics", prompt_tokens: int, completion_tokens: int
+    ) -> "UsageStats":
+        return cls(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+            prompt_tokens_details=PromptTokensDetails(
+                cached_tokens=metrics.cached_tokens
+            ),
+        )
+
+
+class StreamOptions(BaseModel):
+    include_usage: bool = False
 
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    stream_options: Optional[StreamOptions] = None
 
 
 class TopLogprob(BaseModel):
@@ -485,6 +737,7 @@ class ChatResponse(BaseModel):
     model: str = ""
     choices: List[ChatChoice] = []
     usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
 
 
 class ChatStreamChoice(BaseModel):
@@ -501,6 +754,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
 
 
 # Models for Anthropic-compatible /v1/messages endpoint
@@ -548,12 +802,30 @@ class AnthropicRequest(FlexibleBaseModel):
     enable_thinking: Optional[bool] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
+    thinking_end_token: Optional[str] = None
     response_format: Optional[Any] = None
 
 
 class AnthropicUsage(BaseModel):
     input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     output_tokens: int = 0
+
+    @classmethod
+    def from_metrics(
+        cls, metrics: "GenerationMetrics", prompt_tokens: int, output_tokens: int
+    ) -> "AnthropicUsage":
+        # Per spec, `input_tokens` excludes the cached portion, which is
+        # reported via `cache_read_input_tokens`. We don't currently distinguish
+        # cache creation from reads, so `cache_creation_input_tokens` stays 0.
+        cached_tokens = max(0, int(metrics.cached_tokens))
+        return cls(
+            input_tokens=max(0, int(prompt_tokens) - cached_tokens),
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=cached_tokens,
+            output_tokens=int(output_tokens),
+        )
 
 
 class AnthropicMessageResponse(BaseModel):

@@ -12,6 +12,11 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..rope_utils import (
+    apply_rotary_pos_emb_even_odd,
+    compute_selected_mrope_cos_sin,
+    mrope_section_selectors,
+)
 from .config import ModelConfig, TextConfig
 
 
@@ -50,43 +55,11 @@ class Ernie4_5RotaryEmbedding:
             ]
         )
         self.inv_freq = inv_freq_3d
-
-    def _recomposition_to_3d(self, freq):
-        """Recompose frequencies for 3D positions matching PyTorch's approach.
-
-        Args:
-            freq: [3, batch, seq_len, dim//2] - frequencies for T, H, W dimensions
-
-        Returns:
-            Recomposed frequencies [batch, seq_len, dim]
-        """
-        # Split by mrope_section
-        h_dim, w_dim, t_dim = self.mrope_section
-
-        # freq shape: [3, batch, seq_len, half_dim]
-        # Split each dimension's frequencies
-        freq_parts = []
-        for i in range(3):
-            freq_parts.append(mx.split(freq[i], [h_dim, h_dim + w_dim], axis=-1))
-
-        # Recompose: freq_h from dim 1, freq_w from dim 2, freq_t from dim 0
-        # This matches PyTorch's (i + 1) % 3 indexing
-        freq_h = freq_parts[1][0]  # H from position 1
-        freq_w = freq_parts[2][1]  # W from position 2
-        freq_t = freq_parts[0][2]  # T from position 0
-
-        # Interleave H and W: [h0, w0, h1, w1, ...]
-        freq_hw = mx.stack([freq_h, freq_w], axis=-1).reshape(
-            freq_h.shape[0], freq_h.shape[1], -1
+        self.position_selector, self.frequency_selector = mrope_section_selectors(
+            self.mrope_section,
+            position_axes=(1, 2, 0),
+            interleave_sections=(0, 1),
         )
-
-        # Concatenate HW and T
-        freq_hwt = mx.concatenate([freq_hw, freq_t], axis=-1)
-
-        # Repeat interleave by 2 for full head_dim
-        freq_full = mx.repeat(freq_hwt, 2, axis=-1)
-
-        return freq_full
 
     def __call__(self, x, position_ids):
         """
@@ -103,43 +76,17 @@ class Ernie4_5RotaryEmbedding:
             # 1D positions - expand to 3D with same values
             position_ids = mx.stack([position_ids, position_ids, position_ids], axis=-1)
 
-        batch_size, seq_len, _ = position_ids.shape
-
         # position_ids: [batch, seq_len, 3] -> [3, batch, seq_len]
         position_ids = position_ids.transpose(2, 0, 1).astype(mx.float32)
 
-        # inv_freq: [dim//2] -> [1, 1, dim//2, 1] for broadcasting
-        inv_freq_expanded = self.inv_freq[None, None, :, None]  # [1, 1, dim//2, 1]
-        inv_freq_expanded = mx.broadcast_to(
-            inv_freq_expanded, (3, batch_size, self.dim // 2, 1)
+        cos, sin = compute_selected_mrope_cos_sin(
+            position_ids,
+            self.inv_freq,
+            self.position_selector,
+            self.frequency_selector,
         )
 
-        # position_ids: [3, batch, seq_len] -> [3, batch, 1, seq_len]
-        position_ids_expanded = position_ids[:, :, None, :]
-
-        # freqs: [3, batch, dim//2, seq_len] -> [3, batch, seq_len, dim//2]
-        freqs = (inv_freq_expanded * position_ids_expanded).transpose(0, 1, 3, 2)
-
-        cos = mx.cos(freqs)
-        sin = mx.sin(freqs)
-
-        # Recompose to 3D
-        cos = self._recomposition_to_3d(cos)
-        sin = self._recomposition_to_3d(sin)
-
         return cos.astype(x.dtype), sin.astype(x.dtype)
-
-
-def rotate_half_interleaved(x):
-    """Rotates using interleaved pattern: [-x1, x0, -x3, x2, ...].
-
-    This matches PyTorch's rotation: stack([-x[1::2], x[0::2]], dim=-1).reshape()
-    """
-    x_even = x[..., 0::2]  # [x0, x2, x4, ...]
-    x_odd = x[..., 1::2]  # [x1, x3, x5, ...]
-    # Stack as [-odd, even] and reshape
-    rotated = mx.stack([-x_odd, x_even], axis=-1)
-    return rotated.reshape(x.shape)
 
 
 def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
@@ -153,24 +100,7 @@ def apply_rotary_pos_emb(q, k, cos_pos, sin_pos):
         cos_pos: [batch, seq_len, head_dim]
         sin_pos: [batch, seq_len, head_dim]
     """
-    orig_dtype = q.dtype
-    # Expand for heads dimension
-
-    cos_pos = mx.expand_dims(cos_pos, axis=1)  # [batch, 1, seq_len, head_dim]
-    sin_pos = mx.expand_dims(sin_pos, axis=1)
-
-    # Apply rotation: q_rotated = q * cos + rotate_half(q) * sin
-    q_rotated = rotate_half_interleaved(q)
-    k_rotated = rotate_half_interleaved(k)
-
-    q_embed = (q.astype(mx.float32) * cos_pos) + (
-        q_rotated.astype(mx.float32) * sin_pos
-    )
-    k_embed = (k.astype(mx.float32) * cos_pos) + (
-        k_rotated.astype(mx.float32) * sin_pos
-    )
-
-    return q_embed.astype(orig_dtype), k_embed.astype(orig_dtype)
+    return apply_rotary_pos_emb_even_odd(q, k, cos_pos, sin_pos, cos_layout="full")
 
 
 class Attention(nn.Module):
@@ -207,6 +137,7 @@ class Attention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -229,7 +160,10 @@ class Attention(nn.Module):
             position_ids = mx.arange(offset, offset + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
 
-        cos, sin = self.rotary_emb(values, position_ids)
+        if position_embeddings is None:
+            cos, sin = self.rotary_emb(values, position_ids)
+        else:
+            cos, sin = position_embeddings
         queries, keys = apply_rotary_pos_emb(queries, keys, cos, sin)
 
         if cache is not None:
@@ -410,9 +344,16 @@ class Ernie4_5VLDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[KVCache] = None,
         position_ids: Optional[mx.array] = None,
+        position_embeddings: Optional[tuple[mx.array, mx.array]] = None,
         token_type_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
         h = x + r
         if isinstance(self.mlp, Ernie4_5_MoeMLP):
             r = self.mlp(
@@ -458,9 +399,19 @@ class Ernie4_5Model(nn.Module):
             mask = create_attention_mask(
                 h, cache[0] if cache and cache[0] is not None else cache
             )
+        position_embeddings = None
+        if position_ids is not None and self.layers:
+            position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
         for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, c, position_ids, token_type_ids=token_type_ids)
+            h = layer(
+                h,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                token_type_ids=token_type_ids,
+            )
 
         return self.norm(h)
 

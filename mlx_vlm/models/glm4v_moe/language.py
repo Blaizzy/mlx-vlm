@@ -2,7 +2,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
@@ -10,6 +9,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
 
 
@@ -87,52 +87,15 @@ class GLM4VRotaryEmbedding(nn.Module):
         return cos.astype(x.dtype), sin.astype(x.dtype)
 
 
-def rotate_half_llm(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return mx.concatenate([-x2, x1], axis=-1)
-
-
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, mrope_section):
-    """
-    Applies Rotary Position Embedding with Multimodal Sections to the query and key tensors.
-    Args:
-        q (mx.array): The query tensor.
-        k (mx.array): The key tensor.
-        cos (mx.array): The cosine part of the rotary embedding.
-        sin (mx.array): The sine part of the rotary embedding.
-        mrope_section (List[int]): Multimodal rope section for channel dimension of temporal, height and width.
-        unsqueeze_dim (int, optional): Dimension to unsqueeze. Defaults to 1.
-    Returns:
-        tuple(mx.array): The rotated query and key tensors.
-    """
-
-    mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
-
-    cos = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(cos, mrope_section, axis=-1))], axis=-1
-    )[
-        :, None, :, :
-    ]  # unsqueeze dim 1
-    sin = mx.concatenate(
-        [m[i % 3] for i, m in enumerate(mx.split(sin, mrope_section, axis=-1))], axis=-1
-    )[:, None, :, :]
-
-    rotary_dim = cos.shape[-1]
-    q_rot = q[..., :rotary_dim]
-    q_pass = q[..., rotary_dim:]
-
-    k_rot = k[..., :rotary_dim]
-    k_pass = k[..., rotary_dim:]
-
-    q_embed = (q_rot * cos) + (rotate_half_llm(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half_llm(k_rot) * sin)
-
-    q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
-    k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
-
-    return q_embed, k_embed
+    return _apply_mrope(
+        q,
+        k,
+        cos,
+        sin,
+        mrope_section=mrope_section,
+        style="sectioned_half_split",
+    )
 
 
 class Glm4vMoeAttention(nn.Module):
@@ -420,21 +383,20 @@ class LanguageModel(nn.Module):
             )
             image_index, video_index = 0, 0
             for i, input_ids in enumerate(total_input_ids):
-                input_ids = mx.where(
-                    attention_mask[i] == 1, input_ids, mx.zeros_like(input_ids)
-                )
+                row_mask = attention_mask[i].tolist()
+                input_tokens = [
+                    token
+                    for token, keep in zip(input_ids.tolist(), row_mask)
+                    if keep == 1
+                ]
                 image_nums, video_nums = 0, 0
-                vision_start_indices = mx.sum(
-                    mx.where(
-                        input_ids == vision_start_token_id,
-                        mx.arange(input_ids.shape[0]),
-                        mx.zeros_like(input_ids),
-                    )
-                )
-                vision_tokens = input_ids[vision_start_indices + 1]
-                image_nums = (vision_tokens == image_token_id).sum().item()
-                video_nums = (vision_tokens == video_token_id).sum().item()
-                input_tokens = input_ids.tolist()
+                vision_tokens = [
+                    input_tokens[idx + 1]
+                    for idx, token in enumerate(input_tokens[:-1])
+                    if token == vision_start_token_id
+                ]
+                image_nums = sum(token == image_token_id for token in vision_tokens)
+                video_nums = sum(token == video_token_id for token in vision_tokens)
                 llm_pos_ids_list: list = []
                 st = 0
                 remain_images, remain_videos = image_nums, video_nums
@@ -526,7 +488,19 @@ class LanguageModel(nn.Module):
                     llm_pos_ids_list.append(t_index + st_idx)
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
-                mask = mx.array(attention_mask[i] == 1)
+                compact_max_position = llm_positions.max()
+                padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
+                compact_positions = llm_positions.tolist()
+                compact_idx = 0
+                for col, keep in enumerate(row_mask):
+                    if keep == 1:
+                        for dim in range(3):
+                            padded_positions[dim][col] = compact_positions[dim][
+                                compact_idx
+                            ]
+                        compact_idx += 1
+                llm_positions = mx.array(padded_positions, dtype=position_ids.dtype)
+                mask = mx.array(row_mask, dtype=mx.bool_)
                 expanded_mask = mx.expand_dims(mask, axis=0)
                 expanded_mask = mx.broadcast_to(expanded_mask, (3, 1, mask.shape[0]))
                 expanded_positions = mx.expand_dims(llm_positions, axis=1)
@@ -543,7 +517,7 @@ class LanguageModel(nn.Module):
                 )
                 position_ids = updated_position_ids
                 mrope_position_deltas.append(
-                    llm_positions.max() + 1 - len(total_input_ids[i])
+                    compact_max_position + 1 - len(input_tokens)
                 )
             mrope_position_deltas = mx.array(mrope_position_deltas).reshape(-1, 1)
             return position_ids, mrope_position_deltas
