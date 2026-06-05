@@ -105,6 +105,18 @@ class TrainingArgs:
     )
 
 
+def _resolve_adapter_file(args: TrainingArgs) -> Path:
+    adapter_file = getattr(args, "adapter_file", None)
+    if adapter_file:
+        return Path(adapter_file)
+
+    adapter_path = getattr(args, "adapter_path", None)
+    if adapter_path:
+        return Path(adapter_path) / "adapters.safetensors"
+
+    return Path(TrainingArgs.__dataclass_fields__["adapter_file"].default)
+
+
 def vision_language_loss_fn(
     model, batch, train_on_completions=False, assistant_id=77091
 ):
@@ -355,6 +367,8 @@ def train(
             f"{Colors.OKBLUE}No validation dataset provided — training will run without validation.{Colors.ENDC}"
         )
 
+    adapter_file = _resolve_adapter_file(args)
+
     # Enable gradient checkpointing if requested
     if args.grad_checkpoint:
         for module in model.children().values():
@@ -499,20 +513,18 @@ def train(
 
         # Save checkpoint
         if it % args.steps_per_save == 0 and rank == 0:
-            save_adapter(model, args.adapter_file)
-            checkpoint = (
-                Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
-            )
+            save_adapter(model, adapter_file)
+            checkpoint = adapter_file.parent / f"{it:07d}_adapters.safetensors"
             save_adapter(model, checkpoint)
             print(
                 f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                f"{adapter_file} and {checkpoint}.{Colors.ENDC}",
                 flush=True,
             )
 
     # Save final weights
     if rank == 0:
-        save_adapter(model, args.adapter_file)
+        save_adapter(model, adapter_file)
         print(
-            f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
+            f"{Colors.OKGREEN}Saved final adapter weights to {adapter_file}.{Colors.ENDC}"
         )

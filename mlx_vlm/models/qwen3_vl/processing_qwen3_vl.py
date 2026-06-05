@@ -19,6 +19,21 @@ from transformers.video_processing_utils import BaseVideoProcessor
 
 from ..base import load_chat_template, to_mlx
 
+_IMAGE_PROCESSOR_KWARGS = {
+    "min_pixels",
+    "max_pixels",
+    "resized_height",
+    "resized_width",
+}
+
+
+def _pop_image_processor_kwargs(kwargs):
+    return {
+        name: kwargs.pop(name)
+        for name in list(kwargs.keys())
+        if name in _IMAGE_PROCESSOR_KWARGS
+    }
+
 
 def _smart_resize_video(
     num_frames: int,
@@ -167,15 +182,34 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
             images = [images]
         return [_to_numpy_image(img) for img in images]
 
-    def _process_one(self, image: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    def _process_one(
+        self,
+        image: np.ndarray,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        resized_height: Optional[int] = None,
+        resized_width: Optional[int] = None,
+    ) -> Tuple[np.ndarray, List[int]]:
         C, H, W = image.shape
-        resized_h, resized_w = _smart_resize_image(
-            H,
-            W,
-            factor=self.patch_size * self.merge_size,
-            min_pixels=self.min_pixels,
-            max_pixels=self.max_pixels,
-        )
+        factor = self.patch_size * self.merge_size
+        if (resized_height is None) != (resized_width is None):
+            raise ValueError(
+                "resized_height and resized_width must be provided together."
+            )
+        if resized_height is not None:
+            resized_h, resized_w = _smart_resize_image(
+                resized_height,
+                resized_width,
+                factor=factor,
+            )
+        else:
+            resized_h, resized_w = _smart_resize_image(
+                H,
+                W,
+                factor=factor,
+                min_pixels=self.min_pixels if min_pixels is None else min_pixels,
+                max_pixels=self.max_pixels if max_pixels is None else max_pixels,
+            )
         # Bicubic resize via PIL (same pattern as the video path).
         frame = _resize_video_frames(image[None, ...], resized_h, resized_w)[0]
 
@@ -226,8 +260,11 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
         ]
         all_patches = []
         all_thw = []
+        image_kwargs = {
+            name: kwargs[name] for name in _IMAGE_PROCESSOR_KWARGS if name in kwargs
+        }
         for v in imgs:
-            patches, thw = self._process_one(v)
+            patches, thw = self._process_one(v, **image_kwargs)
             all_patches.append(patches)
             all_thw.append(thw)
         return {
@@ -544,9 +581,10 @@ class Qwen3VLProcessor(ProcessorMixin):
     ) -> BatchFeature:
         image_inputs = {}
         videos_inputs = {}
+        image_kwargs = _pop_image_processor_kwargs(kwargs)
 
         if images is not None:
-            image_inputs = self.image_processor(images=images)
+            image_inputs = self.image_processor(images=images, **image_kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
         else:
             image_grid_thw = None

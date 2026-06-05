@@ -32,6 +32,7 @@ class Model(nn.Module):
 
         if pixel_values is None:
             self.language_model._position_ids = None
+            self.language_model._rope_deltas = None
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids)
             )

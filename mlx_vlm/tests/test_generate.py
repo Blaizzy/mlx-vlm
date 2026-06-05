@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import BatchKVCache, KVCache
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -17,13 +18,18 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    PromptProcessingBatch,
+    SpeculativeGenerationBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
-    normalize_resize_shape,
 )
+from mlx_vlm.generate import ar as ar_module
+from mlx_vlm.generate import dispatch as dispatch_module
+from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
+image_module = __import__("mlx_vlm.generate.image", fromlist=[""])
 
 # ============================================================================
 # Fixtures and Mock Classes
@@ -349,6 +355,55 @@ class TestGenerationBatch:
         empty.extend(self._mrope_batch([0, 1], [[5], [7]]))
         assert empty._rope_deltas.tolist() == [[5], [7]]
 
+    def test_extend_materializes_pending_decode_before_cache_merge(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def extend(self, other):
+                calls.append(("extend-cache",))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        a = self._mrope_batch([0], [[0]])
+        b = self._mrope_batch([1], [[5]])
+        a.prompt_cache = [RecordingCache()]
+        b.prompt_cache = [RecordingCache()]
+
+        a.extend(b)
+
+        assert calls == [("eval", (0,)), ("eval", (1,)), ("extend-cache",)]
+
+    def test_filter_materializes_pending_decode_before_cache_filter(self, monkeypatch):
+        calls = []
+
+        class RecordingCache:
+            @property
+            def state(self):
+                return ()
+
+            def filter(self, keep):
+                calls.append(("filter-cache", keep.tolist()))
+
+        def record_eval(batch):
+            calls.append(("eval", tuple(batch.uids)))
+
+        monkeypatch.setattr(GenerationBatch, "_eval_pending_state", record_eval)
+
+        batch = self._mrope_batch([0, 1], [[0], [5]])
+        batch.prompt_cache = [RecordingCache()]
+        batch._next_tokens = mx.array([10, 20], dtype=mx.int32)
+
+        batch.filter([0])
+
+        assert calls == [("eval", (0, 1)), ("filter-cache", [0])]
+
     @staticmethod
     def _capture(value, B):
         from mlx_vlm.generate import PromptProcessingBatch
@@ -369,8 +424,15 @@ class TestGenerationBatch:
         ]
         # Falcon OCR singleton: (1, 1) broadcasts to (B, 1).
         assert self._capture(mx.array([[5]], dtype=mx.int32), 4).tolist() == [[5]] * 4
-        with pytest.raises(RuntimeError, match="does not match"):
-            self._capture(mx.array([[5], [7]], dtype=mx.int32), 3)
+        assert self._capture(mx.array([[5], [7]], dtype=mx.int32), 3).tolist() == [
+            [5],
+            [7],
+            [7],
+        ]
+        assert self._capture(mx.array([[5], [7], [9]], dtype=mx.int32), 2).tolist() == [
+            [5],
+            [7],
+        ]
 
 
 # ============================================================================
@@ -520,7 +582,7 @@ class TestBatchGenerator:
             prompt_kwargs=[{"inputs_embeds": inputs_embeds}],
         )
         ticks = iter([10.0, 10.2])
-        monkeypatch.setattr(generate_module.time, "perf_counter", lambda: next(ticks))
+        monkeypatch.setattr(ar_module.time, "perf_counter", lambda: next(ticks))
 
         prompt_responses, generation_responses = gen.next()
 
@@ -530,6 +592,29 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_tokens == len(prompt)
         assert prompt_responses[0].prompt_tps == pytest.approx(15.0)
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
+        assert prompt_responses[0].cached_tokens == 0
+
+    def test_prompt_progress_reports_apc_cached_tokens(self):
+        batch = PromptProcessingBatch(
+            model=SimpleNamespace(),
+            uids=[1, 2],
+            input_ids=[[4, 5], [6, 7, 8]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+            warm_cache=[],
+            apc_meta=[
+                {"full_input_ids": [1, 2, 3, 4, 5], "prefix_len": 3},
+                None,
+            ],
+        )
+        batch.record_prompt_time(0.5)
+
+        progress = batch.prompt_progress()
+
+        assert [p.prompt_tokens for p in progress] == [5, 3]
+        assert [p.cached_tokens for p in progress] == [3, 0]
 
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
@@ -575,6 +660,198 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_generation_batch_thinking_budget_criteria_can_force_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def apply_forced_token(self, next_y):
+                if self.forced_token_id is None:
+                    return next_y
+                forced = mx.array([self.forced_token_id], dtype=mx.int32)
+                self.forced_token_id = None
+                return forced
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        first = batch.next()
+        assert [r.token for r in first] == [5]
+
+        second = batch.next()
+        assert [r.token for r in second] == [3]
+
+    def test_generation_batch_uses_greedy_hidden_argmax_without_logprobs(self):
+        class FastArgmaxModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                del cache
+                self.calls.append(kwargs)
+                assert kwargs["return_hidden"] is True
+                assert kwargs["skip_logits"] is True
+                hidden = mx.ones((input_ids.shape[0], input_ids.shape[1], 3))
+                return SimpleNamespace(hidden_states=[hidden])
+
+            def speculative_argmax_from_hidden(self, hidden):
+                return mx.full((hidden.shape[0], hidden.shape[1]), 7, dtype=mx.int32)
+
+        model = FastArgmaxModel()
+        batch = GenerationBatch(
+            model=model,
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2, 2],
+            greedy_sampling=True,
+        )
+        batch.compute_logprobs = False
+
+        first = batch.next()
+        assert [r.token for r in first] == [5, 6]
+        assert batch._next_tokens.tolist() == [7, 7]
+        assert model.calls == [{"return_hidden": True, "skip_logits": True}]
+
+    def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
+        def fake_rounds(*args, **kwargs):
+            del args, kwargs
+            yield [1, 10], {"round_pos": 0, "round_len": 2}
+            yield [2, 11], {"round_pos": 1, "round_len": 2}
+            yield [3, 12], {"round_pos": 0, "round_len": 1}
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        batch = SpeculativeGenerationBatch(
+            model=SimpleNamespace(),
+            draft_model=SimpleNamespace(),
+            draft_kind="mtp",
+            uids=[100, 200],
+            first_tokens=mx.array([0, 9], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[10, 10],
+            hidden=mx.zeros((2, 1, 1)),
+            shared_kv_states=None,
+            prompt_tokens=mx.array([[0], [9]], dtype=mx.int32),
+        )
+
+        first = batch.next()
+        assert [(r.uid, r.token) for r in first] == [(100, 0), (200, 9)]
+
+        second = batch.next()
+        assert [(r.uid, r.token) for r in second] == [
+            (100, 1),
+            (200, 10),
+            (100, 2),
+            (200, 11),
+        ]
+
+    def test_generation_batch_extend_keeps_processor_context_aligned(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        seen_contexts = []
+
+        def force_token_2(tokens, logits):
+            seen_contexts.append(tokens.tolist())
+            token_scores = mx.array([-1e9, -1e9, 0.0, -1e9])
+            return mx.broadcast_to(token_scores, logits.shape)
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        plain = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2, 2],
+            logits_processors=[None, None],
+        )
+        structured = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[2],
+            inputs=mx.array([7], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[[force_token_2]],
+        )
+
+        plain.extend(structured)
+        assert plain.token_context == [[], [], [30]]
+
+        first = plain.next()
+        assert [r.token for r in first] == [5, 6, 7]
+        assert seen_contexts == [[30, 7]]
+
+    def test_generation_batch_extend_promotes_singleton_kv_cache(self):
+        def make_kv_cache(value):
+            c = KVCache()
+            keys = mx.full((1, 2, 3, 4), value, dtype=mx.float32)
+            values = mx.full((1, 2, 3, 4), value + 1, dtype=mx.float32)
+            c.update_and_fetch(keys, values)
+            return c
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        first = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(1.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+        second = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(3.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        first.extend(second)
+
+        assert isinstance(first.prompt_cache[0], BatchKVCache)
+        assert first.prompt_cache[0].left_padding.tolist() == [0, 0]
+        assert first.prompt_cache[0].keys.shape[0] == 2
+        assert first._next_tokens.tolist() == [5, 6]
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
@@ -609,7 +886,7 @@ class TestBatchGenerator:
 class TestBatchGenerate:
     """Tests for the batch_generate function."""
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     def test_text_only_batch(self, mock_generate_batch, mock_model, mock_processor):
         """Test batch generation without images."""
         from mlx_vlm.generate import batch_generate
@@ -684,12 +961,12 @@ class TestBatchGenerate:
 
         with (
             patch.object(
-                generate_module,
+                ar_module,
                 "apply_chat_template",
                 side_effect=lambda processor, config, prompt, num_images=0: prompt,
             ),
             patch.object(
-                generate_module,
+                ar_module,
                 "prepare_inputs",
                 return_value={
                     "input_ids": input_ids,
@@ -699,17 +976,17 @@ class TestBatchGenerate:
             patch.object(
                 mock_model, "get_input_embeddings", return_value=embedding_output
             ),
-            patch.object(generate_module.BatchGenerator, "insert", new=fake_insert),
+            patch.object(ar_module.BatchGenerator, "insert", new=fake_insert),
         ):
             with pytest.raises(_StopInsert):
-                generate_module._generate_batch(
+                ar_module._generate_batch(
                     mock_model,
                     mock_processor,
                     prompts=["alpha", "beta", "gamma"],
                     max_tokens=5,
                 )
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_same_shape(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -748,7 +1025,7 @@ class TestBatchGenerate:
         # Same shape images should be processed in one batch
         assert mock_generate_batch.call_count == 1
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_different_shapes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -800,7 +1077,7 @@ class TestBatchGenerate:
         # All 3 responses should be present
         assert len(response.texts) == 3
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -831,7 +1108,7 @@ class TestBatchGenerate:
         assert response.image_sizes is not None
         assert response.image_sizes[0] == (512, 384)
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_disable_track_image_sizes(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -861,7 +1138,7 @@ class TestBatchGenerate:
 
         assert response.image_sizes is None
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     def test_per_sample_max_tokens(
         self, mock_generate_batch, mock_model, mock_processor
     ):
@@ -887,7 +1164,7 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         assert len(response.texts) == 2
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_single_image_string(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -914,7 +1191,7 @@ class TestBatchGenerate:
         assert isinstance(response, BatchResponse)
         mock_process_image.assert_called_once()
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_verbose_output(
         self,
@@ -955,7 +1232,7 @@ class TestBatchGenerate:
         captured = capsys.readouterr()
         assert "[batch_generate]" in captured.out
 
-    @patch.object(generate_module, "_generate_batch")
+    @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_disable_grouping(
         self, mock_process_image, mock_generate_batch, mock_model, mock_processor
@@ -1165,6 +1442,55 @@ class TestThinkingBudgetCriteria:
         assert criteria.thinking_token_count == 0
         assert criteria.budget_exceeded is False
 
+    def _make_criteria(self, enable_thinking=True):
+        return ThinkingBudgetCriteria(
+            tokenizer=FakeTokenizer(),
+            thinking_budget=5,
+            thinking_end_token="</think>",
+            thinking_start_token="<think>",
+            enable_thinking=enable_thinking,
+        )
+
+    def test_apply_forced_token_safe_before_first_call(self):
+        """Regression: apply_forced_token must be safe before __call__ ever runs.
+
+        forced_token_id has to be initialised in __init__; otherwise the first
+        apply_forced_token (e.g. on the very first decode step) raises
+        AttributeError. This crashed real generations on Gemma-style models
+        whose first generated token is the thinking delimiter.
+        """
+        criteria = self._make_criteria()
+        y = mx.array([7])
+        # No __call__ yet: must be a no-op that returns the input unchanged.
+        assert criteria.apply_forced_token(y).tolist() == [7]
+
+    def test_apply_forced_token_safe_after_start_delimiter(self):
+        """Regression: the start-token early return in __call__ does not set
+        forced_token_id, so apply_forced_token must remain safe afterwards."""
+        criteria = self._make_criteria()
+        # First generated token is the start delimiter -> early return, no force.
+        assert criteria(99) is None
+        assert criteria.apply_forced_token(mx.array([7])).tolist() == [7]
+
+    def test_apply_forced_token_safe_after_end_delimiter(self):
+        """Regression: the end-token early return in __call__ does not set
+        forced_token_id, so apply_forced_token must remain safe afterwards."""
+        criteria = self._make_criteria()
+        # End delimiter resets thinking state and returns None without forcing.
+        assert criteria(100) is None
+        assert criteria.apply_forced_token(mx.array([8])).tolist() == [8]
+
+    def test_apply_forced_token_emits_forced_token_when_budget_exceeded(self):
+        """End-to-end: once the budget is exceeded, the token returned by
+        __call__ is the same one apply_forced_token injects into the stream."""
+        criteria = self._make_criteria()
+        # Burn the budget (5 tokens), then trip it on the 6th.
+        for i in range(5):
+            assert criteria(50 + i) is None
+        forced = criteria(60)  # \n forced
+        assert forced == 10
+        assert criteria.apply_forced_token(mx.array([0])).tolist() == [10]
+
 
 class TestSamplerArgs:
     """Tests for sampler argument forwarding."""
@@ -1203,6 +1529,11 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
             repetition_penalty=1.15,
+            repetition_context_size=512,
+            presence_penalty=0.2,
+            presence_context_size=256,
+            frequency_penalty=0.3,
+            frequency_context_size=128,
             logit_bias={3: -0.75},
         )
 
@@ -1214,7 +1545,103 @@ class TestSamplerArgs:
             min_p=0.05,
             top_k=32,
         )
-        mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+        mock_make_logits_processors.assert_called_once_with(
+            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
+        )
+
+
+@pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
+def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
+    pbar = MagicMock()
+
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+    model.no_chunked_prefill = False
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(ar_module, "tqdm") as mock_tqdm,
+    ):
+        mock_tqdm.return_value.__enter__.return_value = pbar
+
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+            prefill_step_size=2,
+            verbose=verbose,
+        )
+
+        next(gen)
+
+    mock_tqdm.assert_called_once()
+    assert mock_tqdm.call_args.kwargs["disable"] is disabled
+    assert pbar.update.call_count > 0
+
+
+def test_stream_generate_forwards_verbose_to_generate_step():
+    captured = {}
+
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return False
+
+    class FakeDetokenizer:
+        def reset(self):
+            self.segments = []
+
+        def add_token(self, token, skip_special_token_ids=None):
+            self.segments.append(str(token))
+
+        @property
+        def last_segment(self):
+            return self.segments.pop(0) if self.segments else ""
+
+        def finalize(self):
+            pass
+
+    def fake_generate_step(*args, **kwargs):
+        captured["verbose"] = kwargs.get("verbose")
+        yield 7, mx.zeros((4,))
+
+    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
+    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+                verbose=True,
+            )
+        )
+
+    assert captured["verbose"] is True
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -1232,12 +1659,14 @@ def test_normalize_resize_shape_rejects_invalid_values(value):
 
 
 def test_generate_cli_smoke(capsys):
-    import importlib
-
-    generate_module = importlib.import_module("mlx_vlm.generate")
-
     args = Namespace(
         model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
         adapter_path=None,
         image=["image.png"],
         audio=None,
@@ -1248,6 +1677,12 @@ def test_generate_cli_smoke(capsys):
         system=None,
         max_tokens=12,
         temperature=0.7,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
         chat=False,
         verbose=False,
         eos_tokens=None,
@@ -1274,18 +1709,18 @@ def test_generate_cli_smoke(capsys):
     processor = SimpleNamespace()
 
     with (
-        patch.object(generate_module, "parse_arguments", return_value=args),
-        patch.object(generate_module, "load", return_value=(model, processor)),
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
         patch.object(
-            generate_module, "apply_chat_template", return_value="prompt"
+            dispatch_module, "apply_chat_template", return_value="prompt"
         ) as mock_apply_chat_template,
         patch.object(
-            generate_module,
+            dispatch_module,
             "generate",
             return_value=SimpleNamespace(text="done"),
         ) as mock_generate,
     ):
-        generate_module.main()
+        dispatch_module.main()
 
     assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["enable_thinking"] is False
@@ -1295,6 +1730,67 @@ def test_generate_cli_smoke(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
+def test_generate_image_cli_routes_before_vlm_load():
+    args = Namespace(
+        model="bonsai-ternary",
+        output_modality="image",
+        task="generate",
+        output="out.png",
+        size="512x512",
+        steps=4,
+        seed=7,
+        guidance=1.0,
+    )
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "run_image_generation_cli") as mock_run_image,
+        patch.object(dispatch_module, "load") as mock_load,
+    ):
+        dispatch_module.main()
+
+    mock_run_image.assert_called_once_with(args)
+    mock_load.assert_not_called()
+
+
+def test_generate_image_cli_edit_task_loads_edit_model_and_saves_output(tmp_path):
+    output_path = tmp_path / "edited.png"
+    args = Namespace(
+        model="black-forest-labs/FLUX.2-klein-9b-kv",
+        task="edit",
+        image=["reference.png"],
+        prompt=["add", "sunglasses"],
+        output=str(output_path),
+        size="256x512",
+        steps=2,
+        seed=7,
+        guidance=1.0,
+    )
+    result = SimpleNamespace(
+        path=output_path,
+        seed=7,
+        width=256,
+        height=512,
+        steps=2,
+        variant="flux2-klein-9b-kv",
+    )
+    model = SimpleNamespace()
+
+    with (
+        patch.object(image_module, "load_image_model", return_value=model),
+        patch.object(image_module, "generate_image", return_value=result) as mock_edit,
+    ):
+        image_module.run_image_generation_cli(args)
+
+    edit_request = mock_edit.call_args.args[1]
+    assert edit_request.prompt == "add sunglasses"
+    assert edit_request.image_paths == ("reference.png",)
+    assert edit_request.width == 256
+    assert edit_request.height == 512
+    assert mock_edit.call_args.kwargs["task"] == "edit"
+    assert mock_edit.call_args.kwargs["output_path"] == output_path
+
+
 def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate"])
 
@@ -1302,6 +1798,9 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
 
     assert args.thinking_start_token == "<think>"
     assert args.thinking_end_token == "</think>"
+    assert args.output_modality == "text"
+    assert args.task == "generate"
+    assert args.size is None
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
@@ -1388,6 +1887,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "_apc_tenant": "tenant",
             },
             [],
+            None,
         )
         for i, length in enumerate(lengths)
     ]
@@ -1445,6 +1945,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 123,
             },
             [],
+            None,
         ),
         (
             2,
@@ -1457,6 +1958,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 456,
             },
             [],
+            None,
         ),
     ]
     picks = [
@@ -1472,7 +1974,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     with (
         patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
         patch.object(
-            generate_module._apc,
+            ar_module._apc,
             "make_warm_batch_kv_cache_multi",
             return_value=([], 4),
         ),
@@ -1505,7 +2007,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, []))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)
