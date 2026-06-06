@@ -341,6 +341,104 @@ def hash_image_payload(
     return int.from_bytes(digest[:8], "little", signed=True)
 
 
+def multimodal_token_ids_from_config(config: Any) -> set[int]:
+    """Return token IDs that represent media placeholders in a prompt."""
+    ids: set[int] = set()
+    for attr in (
+        "image_token_id",
+        "image_token_index",
+        "video_token_id",
+        "video_token_index",
+    ):
+        token_id = getattr(config, attr, None)
+        if token_id is not None:
+            ids.add(int(token_id))
+    return ids
+
+
+def media_token_spans(
+    token_ids: Sequence[int],
+    media_token_ids: Iterable[int],
+) -> Tuple[Tuple[int, int], ...]:
+    """Return contiguous media-token spans as half-open ``(start, end)`` ranges."""
+    media_ids = {int(token_id) for token_id in media_token_ids}
+    if not media_ids:
+        return ()
+
+    spans: list[tuple[int, int]] = []
+    start: Optional[int] = None
+    for idx, token_id in enumerate(token_ids):
+        if int(token_id) in media_ids:
+            if start is None:
+                start = idx
+        elif start is not None:
+            spans.append((start, idx))
+            start = None
+    if start is not None:
+        spans.append((start, len(token_ids)))
+    return tuple(spans)
+
+
+def media_safe_prefix_min(
+    token_ids: Sequence[int],
+    media_token_ids: Iterable[int],
+) -> int:
+    """Minimum prefix length that leaves a text-only suffix.
+
+    APC restore paths consume full prompt-level image/video feature tensors. Until
+    media-feature slicing is model-aware, restored prefixes must include every
+    media placeholder token so the suffix can be embedded as text-only.
+    """
+    spans = media_token_spans(token_ids, media_token_ids)
+    if not spans:
+        return 0
+    return max(end for _start, end in spans)
+
+
+def prefix_leaves_text_only_suffix(
+    token_ids: Sequence[int],
+    prefix_len: int,
+    media_token_ids: Iterable[int],
+) -> bool:
+    return int(prefix_len) >= media_safe_prefix_min(token_ids, media_token_ids)
+
+
+def prefix_contains_media_tokens(
+    token_ids: Sequence[int],
+    prefix_len: int,
+    media_token_ids: Iterable[int],
+) -> bool:
+    """Return whether the prefix itself contains media placeholder tokens."""
+    media_ids = {int(token_id) for token_id in media_token_ids}
+    if not media_ids or prefix_len <= 0:
+        return False
+    prefix_end = min(int(prefix_len), len(token_ids))
+    return any(int(token_id) in media_ids for token_id in token_ids[:prefix_end])
+
+
+def adjust_prefix_to_text_suffix_boundary(
+    token_ids: Sequence[int],
+    desired_prefix_len: int,
+    media_token_ids: Iterable[int],
+    *,
+    max_prefix_tokens: Optional[int] = None,
+) -> int:
+    """Move an APC prefix forward until its suffix contains no media tokens.
+
+    Returns ``0`` when no useful safe prefix exists within ``max_prefix_tokens``.
+    """
+    max_len = (
+        len(token_ids) - 1 if max_prefix_tokens is None else int(max_prefix_tokens)
+    )
+    if max_len <= 0:
+        return 0
+    desired = max(1, int(desired_prefix_len))
+    prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
+    if prefix_len > max_len:
+        return 0
+    return prefix_len
+
+
 @dataclass
 class APCBlock:
     """One fixed-size KV block. Holds per-layer K/V slabs once committed."""
