@@ -52,7 +52,7 @@ MAX_FILE_SIZE_GB = 5
 
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
-SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
+SAFETENSORS_DTYPE_FALLBACKS = {"F8_E4M3": "U8", "F8_E8M0": "U8"}
 
 
 def _e4m3_decode_table() -> mx.array:
@@ -261,6 +261,148 @@ def _transform_compressed_tensors_weights(
         return _transform_compressed_tensors_int4_weights(weights, quantization_config)
 
     return weights, None
+
+
+_MODEL_OPT_MXFP8_QUANTIZATION = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+_MODEL_OPT_NVFP4_QUANTIZATION = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+
+
+def _modelopt_targets(quantization_config: Dict[str, Any], bits: int) -> set[str]:
+    targets: set[str] = set()
+    for group in (quantization_config.get("config_groups") or {}).values():
+        weights_cfg = group.get("weights") or {}
+        if (
+            weights_cfg.get("type") == "float"
+            and weights_cfg.get("num_bits") == bits
+        ):
+            targets.update(group.get("targets") or [])
+    return targets
+
+
+def _modelopt_target_key(prefix: str) -> str:
+    if prefix.startswith("language_model."):
+        return prefix[len("language_model.") :]
+    return prefix
+
+
+def _modelopt_quantization_key(prefix: str) -> str:
+    if prefix.startswith("language_model."):
+        return prefix
+    if prefix.startswith(("backbone.", "lm_head.")):
+        return f"language_model.{prefix}"
+    return prefix
+
+
+def _transform_modelopt_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Optional[Dict[str, Any]],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Normalize ModelOpt tensors to MLX quantized tensor names.
+
+    ModelOpt stores NVFP4 weights as:
+
+    - ``<p>.weight`` packed uint8 E2M1 values, two values per byte
+    - ``<p>.weight_scale`` FP8 E4M3 block scales, one per 16 input values
+    - ``<p>.weight_scale_2`` FP32 per-tensor global scale
+
+    Nemotron H installs custom routed-expert modules that apply the global scale
+    after the quantized matmul. Keeping the scale separate avoids decoding every
+    block-scale tensor to float32 during load, which is prohibitively expensive
+    for 550B-class checkpoints.
+
+    ModelOpt static FP8 linears store:
+
+    - ``<p>.weight`` raw E4M3 bytes
+    - ``<p>.weight_scale`` FP32 per-tensor scale
+
+    Those are dequantized once during load and immediately requantized to MLX's
+    native ``mxfp8`` format so generation uses ``QuantizedLinear`` instead of
+    decoding FP8 weights inside every forward pass.
+    """
+    if quantization_config is None:
+        return weights, None
+    if quantization_config.get("quant_method") != "modelopt":
+        return weights, None
+
+    new_weights = {}
+    transformed_nvfp4 = False
+    transformed_fp8_prefixes: set[str] = set()
+    fp8_targets = _modelopt_targets(quantization_config, 8)
+
+    for key in [k for k in weights.keys() if k.endswith(".weight")]:
+        if key not in weights:
+            continue
+
+        prefix = key[: -len(".weight")]
+        scale_key = f"{prefix}.weight_scale"
+        global_scale_key = f"{prefix}.weight_scale_2"
+
+        if scale_key in weights and global_scale_key in weights:
+            value = weights.pop(key)
+            new_weights[key] = value.view(mx.uint32)
+            new_weights[f"{prefix}.scales"] = weights.pop(scale_key)
+            new_weights[f"{prefix}.global_scale"] = weights.pop(global_scale_key)
+            weights.pop(f"{prefix}.input_scale", None)
+            transformed_nvfp4 = True
+            continue
+
+        target_key = _modelopt_target_key(prefix)
+        is_fp8_target = target_key in fp8_targets or (
+            not fp8_targets
+            and scale_key in weights
+            and global_scale_key not in weights
+            and weights[key].dtype == mx.uint8
+        )
+        if not is_fp8_target or scale_key not in weights:
+            continue
+        if weights[key].shape[-1] % _MODEL_OPT_MXFP8_QUANTIZATION["group_size"] != 0:
+            raise ValueError(
+                "ModelOpt FP8 weights require input dimensions divisible by "
+                f"{_MODEL_OPT_MXFP8_QUANTIZATION['group_size']}: {key} has shape "
+                f"{weights[key].shape}"
+            )
+
+        value = weights.pop(key)
+        scale = weights.pop(scale_key).astype(mx.bfloat16)
+        weights.pop(f"{prefix}.input_scale", None)
+        dense = mx.from_fp8(value.astype(mx.uint8), dtype=mx.bfloat16) * scale
+        qweight, scales, *_ = mx.quantize(
+            dense,
+            group_size=_MODEL_OPT_MXFP8_QUANTIZATION["group_size"],
+            bits=_MODEL_OPT_MXFP8_QUANTIZATION["bits"],
+            mode=_MODEL_OPT_MXFP8_QUANTIZATION["mode"],
+        )
+        mx.eval(qweight, scales)
+        new_weights[key] = qweight
+        new_weights[f"{prefix}.scales"] = scales
+        transformed_fp8_prefixes.add(prefix)
+        del dense, value, scale
+
+    if not transformed_nvfp4 and not transformed_fp8_prefixes:
+        return weights, None
+
+    for key in list(weights.keys()):
+        value = weights.pop(key)
+        if key.endswith((".weight_scale_2", ".input_scale")):
+            continue
+        if (
+            key.endswith(".weight_scale")
+            and f"{key[: -len('.weight_scale')]}.weight_scale_2" in weights
+        ):
+            continue
+        new_weights[key] = value
+
+    mlx_quantization = dict(quantization_config)
+    mlx_quantization.update(
+        _MODEL_OPT_NVFP4_QUANTIZATION
+        if transformed_nvfp4
+        else _MODEL_OPT_MXFP8_QUANTIZATION
+    )
+    for prefix in transformed_fp8_prefixes:
+        mlx_quantization[_modelopt_quantization_key(prefix)] = dict(
+            _MODEL_OPT_MXFP8_QUANTIZATION
+        )
+    return new_weights, mlx_quantization
 
 
 def quantize_activations(model: nn.Module) -> nn.Module:
@@ -519,6 +661,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights, transformed_quantization = _transform_compressed_tensors_weights(
         weights, quantization_config
     )
+    if transformed_quantization is None:
+        weights, transformed_quantization = _transform_modelopt_weights(
+            weights, quantization_config
+        )
     if transformed_quantization is not None:
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
@@ -567,6 +713,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
+            elif quant_method == "modelopt" and any(
+                key.endswith(".scales") for key in weights
+            ):
+                quantization = config.get(
+                    "quantization",
+                    {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+                )
             elif quant_method in ("awq", "gptq", "bitnet"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -588,7 +741,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
         quantized_model = (
-            model.language_model._model
+            getattr(model.language_model, "_model", model)
             if getattr(model, "_is_text_model", False)
             else model
         )
