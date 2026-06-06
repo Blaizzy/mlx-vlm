@@ -461,63 +461,6 @@ def _has_quantized_weights(path: str, weights: Optional[Dict[str, mx.array]]) ->
     return weights is not None and f"{path}.scales" in weights
 
 
-def _quantization_matches_weight_shapes(
-    module: nn.Module,
-    weight: mx.array,
-    scales: mx.array,
-    quantization: Dict[str, Any],
-) -> bool:
-    if not hasattr(module, "weight") or module.weight.ndim < 2:
-        return False
-
-    bits = quantization.get("bits")
-    group_size = quantization.get("group_size")
-    if bits is None or group_size is None:
-        return False
-
-    *prefix_shape, input_dims = module.weight.shape
-    if input_dims % group_size != 0:
-        return False
-
-    return (
-        tuple(weight.shape) == (*prefix_shape, input_dims * bits // 32)
-        and tuple(scales.shape) == (*prefix_shape, input_dims // group_size)
-    )
-
-
-def _infer_quantization_from_weights(
-    path: str,
-    module: nn.Module,
-    weights: Optional[Dict[str, mx.array]],
-    quantization: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
-    if weights is None:
-        return None
-
-    weight = weights.get(f"{path}.weight")
-    scales = weights.get(f"{path}.scales")
-    if weight is None or scales is None:
-        return None
-
-    default = {
-        "group_size": quantization.get("group_size"),
-        "bits": quantization.get("bits"),
-        "mode": quantization.get("mode", "affine"),
-    }
-    candidates = [
-        default,
-        {"group_size": 32, "bits": 8, "mode": "mxfp8"},
-        {"group_size": 16, "bits": 4, "mode": "nvfp4"},
-        {"group_size": 32, "bits": 4, "mode": "mxfp4"},
-    ]
-
-    for candidate in candidates:
-        if _quantization_matches_weight_shapes(module, weight, scales, candidate):
-            return candidate
-
-    return None
-
-
 def get_class_predicate(skip_vision=False, weights=None, quantization_config=None):
     def predicate(p, m):
         if (
@@ -533,9 +476,7 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
         if hasattr(m, "weight") and m.weight.size % 64 != 0:
             return False
         if weights is not None:
-            return _infer_quantization_from_weights(
-                p, m, weights, quantization_config or {}
-            ) or f"{p}.scales" in weights
+            return f"{p}.scales" in weights
         return True
 
     return predicate
@@ -822,10 +763,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Skip layers not divisible by 64
             if hasattr(m, "weight") and m.weight.size % 64 != 0:
                 return False
-            if inferred := _infer_quantization_from_weights(
-                p, m, weights, config["quantization"]
-            ):
-                return inferred
             # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
