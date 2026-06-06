@@ -1,10 +1,15 @@
 import math
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from mlx_vlm.models.nemotron_h.config import ModelConfig
 from mlx_vlm.models.nemotron_h.nemotron_h import Model
-from mlx_vlm.utils import _transform_modelopt_weights, get_model_and_args
+from mlx_vlm.utils import (
+    _infer_quantization_from_weights,
+    _transform_modelopt_weights,
+    get_model_and_args,
+)
 
 
 def tiny_config(**kwargs):
@@ -176,6 +181,24 @@ def test_modelopt_mixed_transform_uses_mxfp8_overrides():
     assert transformed[f"{nvfp4_prefix}.weight"].dtype == mx.uint32
     assert transformed[f"{nvfp4_prefix}.scales"].dtype == mx.uint8
     assert f"{nvfp4_prefix}.global_scale" in transformed
+
+
+def test_quantization_inference_detects_saved_mxfp8_weights():
+    path = "language_model.backbone.layers.0.mixer.in_proj"
+    module = nn.Linear(8192, 35072, bias=False)
+    weights = {
+        f"{path}.weight": mx.zeros((35072, 2048), dtype=mx.uint32),
+        f"{path}.scales": mx.zeros((35072, 256), dtype=mx.uint8),
+    }
+
+    inferred = _infer_quantization_from_weights(
+        path,
+        module,
+        weights,
+        {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+    )
+
+    assert inferred == {"group_size": 32, "bits": 8, "mode": "mxfp8"}
 
 
 def test_nemotron_h_sanitize_stacks_expert_weights_and_scales():
