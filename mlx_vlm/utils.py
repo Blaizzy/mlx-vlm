@@ -293,6 +293,29 @@ def _modelopt_quantization_key(prefix: str) -> str:
     return prefix
 
 
+def _modelopt_mlx_quantization_config(
+    quantization_config: Dict[str, Any],
+    weights: Optional[Dict[str, mx.array]] = None,
+) -> Dict[str, Any]:
+    nvfp4_targets = _modelopt_targets(quantization_config, 4)
+    fp8_targets = _modelopt_targets(quantization_config, 8)
+
+    mlx_quantization = dict(quantization_config)
+    mlx_quantization.update(
+        _MODEL_OPT_NVFP4_QUANTIZATION
+        if nvfp4_targets
+        else _MODEL_OPT_MXFP8_QUANTIZATION
+    )
+
+    for target in fp8_targets:
+        key = _modelopt_quantization_key(target)
+        if weights is not None and f"{key}.scales" not in weights:
+            continue
+        mlx_quantization[key] = dict(_MODEL_OPT_MXFP8_QUANTIZATION)
+
+    return mlx_quantization
+
+
 def _transform_modelopt_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
@@ -392,7 +415,7 @@ def _transform_modelopt_weights(
             continue
         new_weights[key] = value
 
-    mlx_quantization = dict(quantization_config)
+    mlx_quantization = _modelopt_mlx_quantization_config(quantization_config)
     mlx_quantization.update(
         _MODEL_OPT_NVFP4_QUANTIZATION
         if transformed_nvfp4
@@ -574,6 +597,33 @@ def get_model_path(
     return model_path
 
 
+def _get_weight_files(model_path: Path) -> List[str]:
+    index_path = model_path / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path, encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+
+        weight_files = [
+            str(model_path / filename)
+            for filename in sorted(set(weight_map.values()))
+            if not filename.endswith("consolidated.safetensors")
+        ]
+        missing = [wf for wf in weight_files if not Path(wf).exists()]
+        if missing:
+            raise FileNotFoundError(
+                "The safetensors index references missing weight files: "
+                + ", ".join(missing)
+            )
+        if weight_files:
+            return weight_files
+
+    return [
+        wf
+        for wf in sorted(glob.glob(str(model_path / "*.safetensors")))
+        if not wf.endswith("consolidated.safetensors")
+    ]
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -598,12 +648,9 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    # Find .safetensors files, preferring the index when present so stale shards
+    # left in a reused conversion directory are not loaded.
+    weight_files = _get_weight_files(model_path)
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
@@ -716,9 +763,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "modelopt" and any(
                 key.endswith(".scales") for key in weights
             ):
-                quantization = config.get(
-                    "quantization",
-                    {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+                quantization = _modelopt_mlx_quantization_config(
+                    quantization_config, weights
                 )
             elif quant_method in ("awq", "gptq", "bitnet"):
                 logging.warning(

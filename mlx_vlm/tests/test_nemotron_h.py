@@ -4,7 +4,11 @@ import mlx.core as mx
 
 from mlx_vlm.models.nemotron_h.config import ModelConfig
 from mlx_vlm.models.nemotron_h.nemotron_h import Model
-from mlx_vlm.utils import _transform_modelopt_weights, get_model_and_args
+from mlx_vlm.utils import (
+    _modelopt_mlx_quantization_config,
+    _transform_modelopt_weights,
+    get_model_and_args,
+)
 
 
 def tiny_config(**kwargs):
@@ -176,6 +180,47 @@ def test_modelopt_mixed_transform_uses_mxfp8_overrides():
     assert transformed[f"{nvfp4_prefix}.weight"].dtype == mx.uint32
     assert transformed[f"{nvfp4_prefix}.scales"].dtype == mx.uint8
     assert f"{nvfp4_prefix}.global_scale" in transformed
+
+
+def test_modelopt_converted_config_uses_fp8_targets():
+    fp8_prefix = "backbone.layers.0.mixer.in_proj"
+    nvfp4_prefix = "backbone.layers.1.mixer.experts.0.up_proj"
+    weights = {
+        f"language_model.{fp8_prefix}.weight": mx.zeros((2, 8), dtype=mx.uint32),
+        f"language_model.{fp8_prefix}.scales": mx.zeros((2, 1), dtype=mx.uint8),
+    }
+
+    quantization = _modelopt_mlx_quantization_config(
+        {
+            "quant_method": "modelopt",
+            "config_groups": {
+                "group_0": {
+                    "weights": {"dynamic": False, "num_bits": 8, "type": "float"},
+                    "targets": [fp8_prefix],
+                },
+                "group_1": {
+                    "weights": {
+                        "dynamic": False,
+                        "group_size": 16,
+                        "num_bits": 4,
+                        "type": "float",
+                    },
+                    "targets": [nvfp4_prefix],
+                },
+            },
+        },
+        weights,
+    )
+
+    assert quantization["group_size"] == 16
+    assert quantization["bits"] == 4
+    assert quantization["mode"] == "nvfp4"
+    assert quantization[f"language_model.{fp8_prefix}"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }
+    assert f"language_model.{nvfp4_prefix}" not in quantization
 
 
 def test_nemotron_h_sanitize_stacks_expert_weights_and_scales():
