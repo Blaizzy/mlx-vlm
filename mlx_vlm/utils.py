@@ -787,7 +787,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
         quantized_model = (
-            getattr(model.language_model, "_model", model)
+            model.language_model._model
             if getattr(model, "_is_text_model", False)
             else model
         )

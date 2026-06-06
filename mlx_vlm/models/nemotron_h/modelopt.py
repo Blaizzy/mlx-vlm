@@ -2,6 +2,34 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+class ModelOptMXFP8Linear(nn.Linear):
+    """Static ModelOpt FP8 linear that quantizes to MLX-native MXFP8."""
+
+    def to_quantized(
+        self,
+        group_size: int = None,
+        bits: int = None,
+        mode: str = "affine",
+        quantize_input: bool = False,
+    ):
+        del group_size, bits, mode
+        return super().to_quantized(
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+            quantize_input=quantize_input,
+        )
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear):
+        output_dims, input_dims = linear.weight.shape
+        layer = cls(input_dims, output_dims, bias="bias" in linear)
+        layer.weight = linear.weight
+        if "bias" in linear:
+            layer.bias = linear.bias
+        return layer
+
+
 class ModelOptNVFP4SwitchLinear(nn.Module):
     """Routed expert linear for ModelOpt NVFP4 W4A16 weights."""
 
@@ -81,6 +109,31 @@ def _uses_modelopt_nvfp4(quantization_config):
         ):
             return True
     return False
+
+
+def _replace_with_mxfp8_linear(module, name):
+    linear = getattr(module, name, None)
+    if isinstance(linear, nn.Linear) and not isinstance(linear, ModelOptMXFP8Linear):
+        setattr(module, name, ModelOptMXFP8Linear.from_linear(linear))
+
+
+def install_modelopt_mxfp8_linears(root, quantization_config):
+    if not _uses_modelopt_nvfp4(quantization_config):
+        return
+
+    layers = getattr(root.language_model.backbone, "layers", [])
+    for layer in layers:
+        mixer = getattr(layer, "mixer", None)
+        if mixer is None:
+            continue
+        if getattr(layer, "block_type", None) == "M":
+            _replace_with_mxfp8_linear(mixer, "in_proj")
+            _replace_with_mxfp8_linear(mixer, "out_proj")
+        elif getattr(layer, "block_type", None) == "E":
+            shared_experts = getattr(mixer, "shared_experts", None)
+            if shared_experts is not None:
+                _replace_with_mxfp8_linear(shared_experts, "up_proj")
+                _replace_with_mxfp8_linear(shared_experts, "down_proj")
 
 
 def install_modelopt_nvfp4_switch_linears(root, quantization_config):

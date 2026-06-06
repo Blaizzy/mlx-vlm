@@ -1,8 +1,11 @@
 import math
 
 import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from mlx_vlm.models.nemotron_h.config import ModelConfig
+from mlx_vlm.models.nemotron_h.modelopt import ModelOptMXFP8Linear
 from mlx_vlm.models.nemotron_h.nemotron_h import Model
 from mlx_vlm.utils import (
     _modelopt_mlx_quantization_config,
@@ -68,6 +71,43 @@ def test_nemotron_h_config_normalizes_ultra_fields():
     assert config.num_hidden_layers == 3
     assert args.hybrid_override_pattern == ["M", "E", "*"]
     assert args.time_step_limit == (0.0, math.inf)
+
+
+def test_nemotron_h_language_model_exposes_text_model_contract():
+    model = Model(tiny_config())
+    quantization_root = model.language_model._model
+
+    assert quantization_root.language_model is model.language_model
+    assert "language_model.backbone.embeddings" in {
+        path
+        for path, _ in tree_flatten(
+            quantization_root.leaf_modules(), is_leaf=nn.Module.is_module
+        )
+    }
+
+
+def test_modelopt_static_fp8_linears_quantize_as_mxfp8():
+    model = Model(
+        tiny_config(
+            layers_block_type=["mamba"],
+            num_hidden_layers=1,
+            quantization_config={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+    )
+    mixer = model.language_model.backbone.layers[0].mixer
+
+    assert isinstance(mixer.in_proj, ModelOptMXFP8Linear)
+    assert isinstance(mixer.out_proj, ModelOptMXFP8Linear)
+
+    quantized = ModelOptMXFP8Linear(32, 64, bias=False).to_quantized(
+        group_size=16,
+        bits=4,
+        mode="nvfp4",
+    )
+
+    assert quantized.group_size == 32
+    assert quantized.bits == 8
+    assert quantized.mode == "mxfp8"
 
 
 def test_modelopt_nvfp4_transform_remaps_to_mlx_scales():

@@ -11,6 +11,12 @@ from ..base import LanguageModelOutput
 from .config import ModelConfig
 
 
+class _LanguageModelRoot(nn.Module):
+    def __init__(self, language_model: "LanguageModel"):
+        super().__init__()
+        self.language_model = language_model
+
+
 class LanguageModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -23,6 +29,10 @@ class LanguageModel(nn.Module):
     @property
     def layers(self):
         return self.backbone.layers
+
+    @property
+    def _model(self):
+        return _LanguageModelRoot(self)
 
     def make_cache(self):
         caches = []
@@ -97,4 +107,3 @@ class LanguageModel(nn.Module):
             return "e_score_correction_bias" not in key and "A_log" not in key
 
         return predicate
-

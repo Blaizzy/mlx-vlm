@@ -6,7 +6,10 @@ import mlx.nn as nn
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
 from .language import LanguageModel
-from .modelopt import install_modelopt_nvfp4_switch_linears
+from .modelopt import (
+    install_modelopt_mxfp8_linears,
+    install_modelopt_nvfp4_switch_linears,
+)
 
 
 class Model(nn.Module):
@@ -17,6 +20,7 @@ class Model(nn.Module):
         self.config = config
         self.model_type = config.model_type
         self.language_model = LanguageModel(config)
+        install_modelopt_mxfp8_linears(self, config.quantization_config)
         install_modelopt_nvfp4_switch_linears(self, config.quantization_config)
 
     @property
