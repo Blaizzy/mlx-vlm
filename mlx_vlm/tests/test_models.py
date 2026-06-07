@@ -1823,6 +1823,28 @@ class TestModels(unittest.TestCase):
                 )
                 self.assertEqual(explicit.eos_token_id, 248046)
 
+    def test_phi3_v_model_config_uses_chat_control_eos_token_ids(self):
+        from mlx_vlm.models import phi3_v
+
+        config = phi3_v.ModelConfig.from_dict(
+            {
+                "model_type": "phi3_v",
+                "vocab_size": 32064,
+                "eos_token_id": 2,
+            }
+        )
+        self.assertEqual(config.eos_token_id, [2, 32000, 32007])
+
+        explicit = phi3_v.ModelConfig(
+            model_type="phi3_v",
+            vocab_size=32064,
+            eos_token_id=[2, 32007, 32000],
+        )
+        self.assertEqual(explicit.eos_token_id, [2, 32007, 32000])
+
+        tiny = phi3_v.ModelConfig(model_type="phi3_v", vocab_size=1000)
+        self.assertIsNone(tiny.eos_token_id)
+
     def test_qwen3_vl_moe(self):
         from mlx_vlm.models import qwen3_vl_moe
 
