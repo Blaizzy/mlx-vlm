@@ -560,6 +560,61 @@ def test_apply_chat_template_uses_generic_text_model_fallback():
     assert result == "templated"
 
 
+def test_apply_chat_template_defaults_thinking_disabled_when_supported():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+    )
+
+    assert processor.kwargs["enable_thinking"] is False
+    assert result.endswith("<think>\n\n</think>\n\n")
+
+
+def test_apply_chat_template_preserves_explicit_thinking_enabled():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert processor.kwargs["enable_thinking"] is True
+    assert result.endswith("<think>\n")
+
+
 class TestModelSpecificPromptContracts:
     """Guard model-specific multimodal message formats from regressions."""
 
