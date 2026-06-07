@@ -2965,10 +2965,43 @@ class APCManager:
                         and len(stored_tokens) == disk_prefix_len
                         and token_tuple[:disk_prefix_len] == stored_tokens
                     ):
+                        # Promote the disk-restored entry to the in-memory LRU
+                        # so subsequent identical requests get the fast clone
+                        # path instead of paying disk-restore latency again.
+                        # We clone before storing because the caller's copy will
+                        # be mutated in-place by generate_step as it appends
+                        # generated tokens; the stored copy must stay pristine.
                         # Disk reads and warm-cache construction intentionally
                         # happen outside the manager lock. If clear()/reset_stats()
                         # races here, the restored tensors are still valid; only
                         # the hit counter lands in the new stats window.
+                        if self._exact_cache_max > 0:
+                            storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
+                            if storage_copy is not None:
+                                promote_key = _sequence_hash(
+                                    stored_tokens, extra_hash, self.block_size
+                                )
+                                with self.lock:
+                                    self.stats.exact_hits += 1
+                                    self.stats.disk_hits += 1
+                                    self.stats.hits += 1
+                                    self.stats.matched_tokens += disk_prefix_len
+                                    if promote_key not in self._exact_cache:
+                                        self._exact_cache[promote_key] = (
+                                            APCExactCacheEntry(
+                                                token_ids=stored_tokens,
+                                                extra_hash=int(extra_hash),
+                                                prompt_cache=storage_copy,
+                                                last_used=time.time(),
+                                            )
+                                        )
+                                        self._exact_cache.move_to_end(promote_key)
+                                        while (
+                                            len(self._exact_cache)
+                                            > self._exact_cache_max
+                                        ):
+                                            self._exact_cache.popitem(last=False)
+                                return prompt_cache, disk_prefix_len
                         with self.lock:
                             self.stats.exact_hits += 1
                             self.stats.disk_hits += 1
