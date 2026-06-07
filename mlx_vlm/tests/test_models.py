@@ -2318,9 +2318,10 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsNone(model.multi_modal_projector.layer_norm)
+        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
+        self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
         parameters = model.multi_modal_projector.parameters()
-        self.assertNotIn("layer_norm", parameters)
+        self.assertIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
@@ -2344,6 +2345,11 @@ class TestModels(unittest.TestCase):
         )
         projector = Lfm2VlMultiModalProjector(config)
 
+        class FailingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layer_norm should be skipped")
+
+        projector.layer_norm = FailingLayerNorm()
         output = projector(mx.zeros((1, 1, 1, 2)))
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
