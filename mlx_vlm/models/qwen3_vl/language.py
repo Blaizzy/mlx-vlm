@@ -484,8 +484,6 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds: Optional[mx.array] = None,
         **kwargs,
     ):
-        n_to_process = kwargs.get("n_to_process", None)
-
         position_ids = kwargs.pop("position_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
@@ -506,8 +504,11 @@ class LanguageModel(nn.Module):
             if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
                 cache_offset_array = c0.offset
 
-        if n_to_process is not None and visual_pos_masks is not None:
-            # Align the full-prompt visual mask with the current prefill window.
+        if (
+            visual_pos_masks is not None
+            and visual_pos_masks.shape[-1] != inputs.shape[-1]
+        ):
+            # Align the full-prompt visual mask with the current model window.
             if cache_offset_array is None:
                 start = (
                     int(cache_offset.item())
