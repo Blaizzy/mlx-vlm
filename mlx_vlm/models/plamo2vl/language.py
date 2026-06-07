@@ -95,8 +95,9 @@ class LanguageModel(nn.Module):
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
+        **kwargs,
     ):
-        del mask
+        del mask, kwargs
         hidden_states = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
         logits = self.lm_head(hidden_states)[..., : self.vocab_size]
         return LanguageModelOutput(logits=logits)

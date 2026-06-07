@@ -3576,6 +3576,27 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(output.inputs_embeds.shape, (1, 4, 8))
 
+    def test_plamo2vl_language_model_accepts_extra_generation_kwargs(self):
+        from mlx_vlm.models import plamo2vl
+
+        config = plamo2vl.TextConfig(
+            hidden_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            hidden_size_per_head=4,
+            intermediate_size=16,
+            vocab_size=32,
+            mamba_num_heads=2,
+            full_attention_idx=[0],
+        )
+        model = plamo2vl.LanguageModel(config)
+        model.model = lambda inputs, cache=None, inputs_embeds=None: mx.zeros((1, 2, 8))
+
+        output = model(mx.array([[1, 2]]), fps=2.0)
+
+        self.assertEqual(output.logits.shape, (1, 2, 32))
+
     def test_moondream3(self):
         from mlx_vlm.models import moondream3
 

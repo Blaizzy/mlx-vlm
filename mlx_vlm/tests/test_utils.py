@@ -16,6 +16,7 @@ from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
     _load_safetensors,
+    get_model_path,
     get_model_and_args,
     load,
     load_image,
@@ -167,6 +168,19 @@ def test_update_module_configs():
 
     assert updated.text_config == "text_config"
     assert updated.vision_config == "vision_config"
+
+
+def test_get_model_path_downloads_jsonl_tokenizers(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", fake_snapshot_download)
+
+    assert get_model_path("org/model") == tmp_path
+    assert "*.jsonl" in captured["allow_patterns"]
 
 
 def test_quantize_module():

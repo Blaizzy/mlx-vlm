@@ -181,6 +181,7 @@ def get_model_path(
                 revision=revision,
                 allow_patterns=[
                     "*.json",
+                    "*.jsonl",
                     "*.safetensors",
                     "*.py",
                     "*.model",
