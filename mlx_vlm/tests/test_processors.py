@@ -276,6 +276,35 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
         self.assertTrue(np.all(data["video_position_ids"][0, 2:] == -1))
 
+    def test_video_processor_tolerates_extra_hf_config_keys(self):
+        # Regression: extra HF config keys must be ignored, not rejected.
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        # The edited base class, and the unified subclass that delegates to it.
+        for cls in (Gemma4VideoProcessor, Gemma4UnifiedVideoProcessor):
+            processor = cls(
+                patch_size=16,
+                pooling_kernel_size=3,
+                max_soft_tokens=70,
+                num_frames=32,
+                do_rescale=True,
+                rescale_factor=1 / 255,
+                do_normalize=True,
+                image_mean=[0.0, 0.0, 0.0],
+                image_std=[1.0, 1.0, 1.0],
+                # extra HF keys the processor must ignore
+                do_convert_rgb=True,
+                do_sample_frames=True,
+                resample=3,
+                return_metadata=False,
+            )
+
+            self.assertEqual(processor.max_soft_tokens, 70)
+            self.assertEqual(processor.num_frames, 32)
+
     def test_audio_feature_extractor_chunks_waveforms(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedAudioFeatureExtractor,
