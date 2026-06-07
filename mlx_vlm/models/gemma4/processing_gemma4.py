@@ -236,7 +236,7 @@ class Gemma4VideoProcessor:
         default_fps: float = 2.0,
         **kwargs,
     ):
-        # Ignore extra HF processor-config keys this processor doesn't consume.
+        # Ignore extra HF processor's config keys this processor doesn't consume.
         if max_soft_tokens not in _SUPPORTED_SOFT_TOKENS:
             raise ValueError(
                 f"`max_soft_tokens` must be one of {_SUPPORTED_SOFT_TOKENS}, "
