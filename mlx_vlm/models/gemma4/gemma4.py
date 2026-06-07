@@ -224,6 +224,8 @@ class Model(nn.Module):
                 continue
             if self.audio_tower is None and ("audio_tower" in k or "embed_audio" in k):
                 continue
+            if k.startswith("vision_embedder"):
+                continue  # gemma4_unified encoder-free variant; not in standard gemma4 arch
 
             if k.startswith("model."):
                 new_key = k[len("model.") :]
