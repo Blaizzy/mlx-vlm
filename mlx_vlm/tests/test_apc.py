@@ -896,3 +896,276 @@ def test_adjust_prefix_returns_zero_when_no_text_suffix_remains():
         )
         == 0
     )
+
+
+def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
+    """After a disk restore, the entry is written to _exact_cache so the next
+    identical request is served from memory (disk_hits stays unchanged)."""
+    from mlx_lm.models.cache import KVCache
+
+    token_ids = list(range(40))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+
+    # Write to disk only (memory cache disabled).
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    disk = DiskBlockStore(tmp_path, namespace="promotion")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=3)
+    disk._q.join()
+    manager.close()
+
+    # Restart with an in-memory cache (4 slots) so promotion has somewhere to land.
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "4")
+    disk = DiskBlockStore(tmp_path, namespace="promotion")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+
+    # First lookup: cold start, disk hit.
+    warm1, matched1 = manager.lookup_exact_cache(token_ids + [999], extra_hash=3)
+    assert matched1 == len(token_ids)
+    assert warm1 is not None
+    snap1 = manager.stats_snapshot()
+    assert snap1["disk_hits"] == 1
+    assert snap1["exact_hits"] == 1
+
+    # Second lookup: must be served from memory; disk_hits must not increase.
+    warm2, matched2 = manager.lookup_exact_cache(token_ids + [999], extra_hash=3)
+    assert matched2 == len(token_ids)
+    assert warm2 is not None
+    snap2 = manager.stats_snapshot()
+    assert snap2["disk_hits"] == 1, "second hit should come from memory, not disk"
+    assert snap2["exact_hits"] == 2
+
+    # The two returned caches must be independent objects (cloned, not the same).
+    assert warm1 is not warm2
+
+    manager.close()
+
+
+def test_exact_disk_hit_promotion_skipped_when_memory_disabled(tmp_path, monkeypatch):
+    """When _exact_cache_max == 0 the disk hit still works; no promotion attempted."""
+    from mlx_lm.models.cache import KVCache
+
+    token_ids = list(range(20))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    disk = DiskBlockStore(tmp_path, namespace="nopromo")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=5)
+    disk._q.join()
+    manager.close()
+
+    # Restart also with memory disabled.
+    disk = DiskBlockStore(tmp_path, namespace="nopromo")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=5)
+    assert matched == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+
+    # Second lookup should hit disk again (memory still disabled).
+    warm2, matched2 = manager.lookup_exact_cache(token_ids + [999], extra_hash=5)
+    assert matched2 == len(token_ids)
+    assert warm2 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 2
+
+    manager.close()
+
+
+def test_exact_disk_hit_promotion_lru_eviction(tmp_path, monkeypatch):
+    """When _exact_cache_max=1 and a second distinct prefix is promoted, the
+    first promoted entry is evicted from memory and subsequent requests for it
+    go back to disk."""
+    from mlx_lm.models.cache import KVCache
+
+    def _make_kv(val, n):
+        kv = KVCache()
+        kv.keys = mx.full((1, 1, n, 2), float(val))
+        kv.values = mx.full((1, 1, n, 2), float(val) + 1)
+        kv.offset = n
+        return kv
+
+    token_ids_a = list(range(20))
+    token_ids_b = list(range(100, 120))
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    disk = DiskBlockStore(tmp_path, namespace="lru-evict")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids_a, [_make_kv(1, 20)], extra_hash=0)
+    assert manager.store_exact_cache(token_ids_b, [_make_kv(2, 20)], extra_hash=0)
+    disk._q.join()
+    manager.close()
+
+    # Restart with memory capacity = 1.
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "1")
+    disk = DiskBlockStore(tmp_path, namespace="lru-evict")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+
+    # Disk hit A -> promoted to memory (sole slot).
+    warm_a, _ = manager.lookup_exact_cache(token_ids_a + [999], extra_hash=0)
+    assert warm_a is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+
+    # Memory hit A -> disk_hits unchanged.
+    warm_a2, _ = manager.lookup_exact_cache(token_ids_a + [999], extra_hash=0)
+    assert warm_a2 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+
+    # Disk hit B -> promoted, evicts A from the single memory slot.
+    warm_b, _ = manager.lookup_exact_cache(token_ids_b + [999], extra_hash=0)
+    assert warm_b is not None
+    assert manager.stats_snapshot()["disk_hits"] == 2
+
+    # A is now evicted; its next lookup must hit disk again.
+    warm_a3, _ = manager.lookup_exact_cache(token_ids_a + [999], extra_hash=0)
+    assert warm_a3 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 3
+
+    manager.close()
+
+
+def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
+    """Memory entries take priority over the disk store.  When the same prefix
+    exists in both _exact_cache and on disk, the memory clone is returned and
+    disk_hits stays at zero.  This also verifies that the promotion guard
+    (skip insert if key already present) is implicitly exercised: because
+    store_exact_cache writes to both memory and disk, any subsequent lookup
+    hits memory first and never triggers a disk read."""
+    from mlx_lm.models.cache import KVCache
+
+    token_ids = list(range(30))
+
+    def _make_kv(val):
+        kv = KVCache()
+        kv.keys = mx.ones((1, 1, len(token_ids), 2)) * val
+        kv.values = mx.ones((1, 1, len(token_ids), 2)) * (val + 1)
+        kv.offset = len(token_ids)
+        mx.eval(kv.keys, kv.values)
+        return kv
+
+    # Seed disk-only with value 7.
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    disk = DiskBlockStore(tmp_path, namespace="priority")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [_make_kv(7)], extra_hash=0)
+    disk._q.join()
+    manager.close()
+
+    # Restart with memory enabled; store an in-memory entry with value 99.
+    # store_exact_cache also writes to disk, but the memory lookup runs first.
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "4")
+    disk = DiskBlockStore(tmp_path, namespace="priority")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    kv_mem = _make_kv(99)
+    manager.store_exact_cache(token_ids, [kv_mem], extra_hash=0)
+    assert manager.stats_snapshot()["exact_stores"] == 1
+
+    # Lookup must come from memory (no disk hit).
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
+    assert matched == len(token_ids)
+    assert warm is not None
+    snap = manager.stats_snapshot()
+    assert snap["disk_hits"] == 0
+    assert snap["exact_hits"] == 1
+    # Value should be 99 (memory), not 7 (disk).
+    _assert_allclose(warm[0].keys[..., : len(token_ids), :], kv_mem.keys)
+
+    manager.close()
+
+
+def test_exact_disk_hit_promotion_clone_is_independent_of_returned_cache(
+    tmp_path, monkeypatch
+):
+    """The clone stored in _exact_cache must be a separate object from the
+    cache returned to the caller.  Simulating token-generation mutations on the
+    returned cache (advancing offset) must not corrupt the stored entry."""
+    from mlx_lm.models.cache import KVCache
+
+    token_ids = list(range(25))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2))
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 2
+    kv.offset = len(token_ids)
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    disk = DiskBlockStore(tmp_path, namespace="clone-independence")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=0)
+    disk._q.join()
+    manager.close()
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "4")
+    disk = DiskBlockStore(tmp_path, namespace="clone-independence")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+
+    # First lookup: disk hit + promotion.
+    warm1, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
+    assert matched == len(token_ids)
+    assert warm1 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+
+    # Simulate generate_step mutating the returned cache in-place.
+    original_offset = warm1[0].offset
+    warm1[0].offset += 10  # as if 10 tokens were generated
+
+    # Second lookup: must come from memory, with the original offset intact.
+    warm2, _ = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
+    assert warm2 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1  # served from memory
+    assert (
+        warm2[0].offset == original_offset
+    ), "stored clone offset was corrupted by mutation of the returned cache"
+
+    manager.close()
+
+
+def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch):
+    """Promotion must use the correct key when extra_hash != 0, so the
+    promoted entry is found on subsequent lookups with the same extra_hash and
+    not accidentally served for a different extra_hash."""
+    from mlx_lm.models.cache import KVCache
+
+    token_ids = list(range(30))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 2)) * 5
+    kv.values = mx.ones((1, 1, len(token_ids), 2)) * 6
+    kv.offset = len(token_ids)
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+    disk = DiskBlockStore(tmp_path, namespace="extra-hash")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=42)
+    disk._q.join()
+    manager.close()
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "4")
+    disk = DiskBlockStore(tmp_path, namespace="extra-hash")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+
+    # Disk hit with the correct extra_hash -> promoted.
+    warm1, matched1 = manager.lookup_exact_cache(token_ids + [999], extra_hash=42)
+    assert matched1 == len(token_ids)
+    assert warm1 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+
+    # Second lookup with same extra_hash -> memory hit, no new disk hit.
+    warm2, matched2 = manager.lookup_exact_cache(token_ids + [999], extra_hash=42)
+    assert matched2 == len(token_ids)
+    assert warm2 is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+
+    # Lookup with a different extra_hash -> must miss (different namespace).
+    warm_wrong, matched_wrong = manager.lookup_exact_cache(
+        token_ids + [999], extra_hash=99
+    )
+    assert matched_wrong == 0
+    assert warm_wrong is None
+
+    manager.close()
