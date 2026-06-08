@@ -28,8 +28,8 @@ from ..generate import (
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _make_cache,
     _chunked_prefill_enabled,
+    _make_cache,
     _merge_prefill_prompt_kwargs,
 )
 from ..sample_utils import top_p_sampling
