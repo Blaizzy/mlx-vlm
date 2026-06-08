@@ -1937,6 +1937,100 @@ class TestModels(unittest.TestCase):
             model.language_model, config.text_config.hidden_size
         )
 
+    def test_qwen3_vl_deepstack_mask_aligned_on_decode(self):
+        from mlx_vlm.models import qwen3_vl, qwen3_vl_moe
+
+        cases = [
+            (
+                qwen3_vl,
+                qwen3_vl.TextConfig(
+                    model_type="qwen3_vl_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+            (
+                qwen3_vl_moe,
+                qwen3_vl_moe.TextConfig(
+                    model_type="qwen3_vl_moe_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    decoder_sparse_step=1,
+                    mlp_only_layers=[],
+                    num_experts_per_tok=1,
+                    num_experts=1,
+                    moe_intermediate_size=8,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+        ]
+
+        class Recorder(nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.visual_pos_masks = None
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                return mx.zeros(
+                    (inputs.shape[0], inputs.shape[1], self.hidden_size),
+                    dtype=mx.float32,
+                )
+
+        for model_module, text_config in cases:
+            with self.subTest(model_type=text_config.model_type):
+                language_model = model_module.LanguageModel(text_config)
+                recorder = Recorder(text_config.hidden_size)
+                language_model.model = recorder
+                full_visual_mask = mx.array(
+                    [[False, True, True, False, True, False, False]]
+                )
+
+                language_model(
+                    mx.array([[9]]),
+                    inputs_embeds=mx.zeros((1, 1, text_config.hidden_size)),
+                    cache=[SimpleNamespace(offset=5)],
+                    position_ids=mx.zeros((3, 1, 1), dtype=mx.int64),
+                    visual_pos_masks=full_visual_mask,
+                    deepstack_visual_embeds=[
+                        mx.zeros(
+                            (
+                                int(full_visual_mask.sum().item()),
+                                text_config.hidden_size,
+                            )
+                        )
+                    ],
+                )
+
+                self.assertEqual(recorder.visual_pos_masks.shape, (1, 1))
+                self.assertEqual(recorder.visual_pos_masks.tolist(), [[False]])
+
     def _run_deepstack_multi_image_assertions(self, deepstack_fn):
         """Shared assertions for qwen3_vl / qwen3_vl_moe `_deepstack_process`.
 
