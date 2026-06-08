@@ -11,6 +11,7 @@ import mlx.core as mx
 from mlx_vlm.mla_fp8 import (
     DEFAULT_GROUP_SIZE,
     _mla_fp8_decode_metal,
+    _mla_fp8_decode_metal_mma,
     _mla_fp8_decode_reference,
     _mla_fp8_decode_sdpa,
     dequantize_latent_fp8,
@@ -50,12 +51,11 @@ def memory_table(group=DEFAULT_GROUP_SIZE):
     print("\n### Total KV cache @ 128K context (batch 1)\n")
     print("| model | absorbed bf16 latent | absorbed FP8 (this PR) | saved |")
     print("|---|--:|--:|--:|")
-    C = 128 * 1024
+    C = 128 * 1024 / 1e9  # tokens at 128K context, scaled to GB
     for name, layers, H, lora, nope, rope, v in CONFIGS:
         _, bf16, fp8 = _bytes_per_token(layers, H, lora, nope, rope, v, group)
-        gb = lambda b: b * C / 1e9
         print(
-            f"| {name} | {gb(bf16):.2f} GB | {gb(fp8):.2f} GB | {gb(bf16-fp8):.2f} GB |"
+            f"| {name} | {bf16 * C:.2f} GB | {fp8 * C:.2f} GB | {(bf16 - fp8) * C:.2f} GB |"
         )
 
 
@@ -73,7 +73,6 @@ def _time(fn, iters=50, warmup=5):
 def _bf16_absorbed_decode(q, pe, latent_bf16, scale):
     """Realistic bf16 absorbed decode baseline (what an unquantised latent cache would do)."""
     B, H, D = q.shape
-    T = latent_bf16.shape[1]
     k = latent_bf16[:, None]  # (B,1,T,D) shared across heads
     mask = pe[:, :, None, :].astype(
         latent_bf16.dtype
@@ -93,9 +92,9 @@ def latency_table(B=1, H=128, D=512, group=DEFAULT_GROUP_SIZE):
     )
     print(
         "| context | bf16 absorbed SDPA (2× mem) | FP8 — mlx (default) | "
-        "FP8 — kernel | FP8 — sdpa | mlx vs bf16 |"
+        "FP8 — kernel (scalar) | FP8 — kernel_mma (MMA) | FP8 — sdpa | best FP8 vs bf16 |"
     )
-    print("|--:|--:|--:|--:|--:|--:|")
+    print("|--:|--:|--:|--:|--:|--:|--:|")
     scale = 1.0 / (192**0.5)
     mx.random.seed(0)
     for T in [1024, 4096, 16384, 65536]:
@@ -107,16 +106,22 @@ def latency_table(B=1, H=128, D=512, group=DEFAULT_GROUP_SIZE):
         t_mlx = _time(
             lambda: _mla_fp8_decode_reference(q, pe, codes, scales, scale, group)
         )
-        t_ker = _time(lambda: _mla_fp8_decode_metal(q, pe, codes, scales, scale, group))
+        t_scalar = _time(
+            lambda: _mla_fp8_decode_metal(q, pe, codes, scales, scale, group)
+        )
+        t_mma = _time(
+            lambda: _mla_fp8_decode_metal_mma(q, pe, codes, scales, scale, group)
+        )
         t_sdpa = _time(lambda: _mla_fp8_decode_sdpa(q, pe, codes, scales, scale, group))
+        best = min(t_mlx, t_scalar, t_mma, t_sdpa)
         print(
-            f"| {T//1024}K | {t_bf16:.3f} ms | {t_mlx:.3f} ms | {t_ker:.3f} ms | "
-            f"{t_sdpa:.3f} ms | {t_bf16/t_mlx:.2f}× |"
+            f"| {T//1024}K | {t_bf16:.3f} ms | {t_mlx:.3f} ms | {t_scalar:.3f} ms | "
+            f"{t_mma:.3f} ms | {t_sdpa:.3f} ms | {t_bf16/best:.2f}× |"
         )
 
 
 def accuracy_table(B=1, H=32, D=512, group=DEFAULT_GROUP_SIZE):
-    print(f"\n### Accuracy — FP8 kernel vs fp32 reference (B={B}, H={H}, D={D})\n")
+    print(f"\n### Accuracy — FP8 MMA kernel vs fp32 reference (B={B}, H={H}, D={D})\n")
     print("| latent dist | context | cosine | RMS rel-err | max rel-err |")
     print("|---|--:|--:|--:|--:|")
     scale = 1.0 / (192**0.5)
@@ -134,7 +139,7 @@ def accuracy_table(B=1, H=32, D=512, group=DEFAULT_GROUP_SIZE):
             codes, scales = quantize_latent_fp8(latent, group)
             q = mx.random.normal((B, H, D)).astype(mx.float32)
             pe = mx.random.normal((B, H, T)).astype(mx.float32)
-            ker = _mla_fp8_decode_metal(q, pe, codes, scales, scale, group).astype(
+            ker = _mla_fp8_decode_metal_mma(q, pe, codes, scales, scale, group).astype(
                 mx.float32
             )
             ref = _mla_fp8_decode_reference(q, pe, codes, scales, scale, group).astype(
@@ -169,5 +174,9 @@ if __name__ == "__main__":
     print(f"\nMLX {mx.__version__}, Metal available: {mx.metal.is_available()}")
     memory_table()
     if mx.metal.is_available():
-        latency_table()
+        # Sweep batch size: B=1 single-token decode is overhead-bound (FP8 = memory win, not
+        # speed). Batched serving (B>1) feeds the matrix units — the regime where FP8 + MMA
+        # could turn its bandwidth saving into a decode speedup. This sweep is the deciding data.
+        for B in (1, 4, 8):
+            latency_table(B=B)
     accuracy_table()

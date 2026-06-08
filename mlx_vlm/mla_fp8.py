@@ -214,7 +214,27 @@ class Fp8MLAKVCache:
 #: Tuned so long contexts spawn many threadgroups (occupancy) with small partial buffers.
 DECODE_TILE = 512
 
+#: Head-block size for the MMA kernel: 8 query heads share one simdgroup and one streamed
+#: C tile (MQA -> the latent is read once per tile and reused across the head-block). 8 is
+#: the simdgroup-matrix tile edge, so QK^T / PV map straight onto 8x8 matrix ops.
+MMA_HEAD_BLOCK = 8
+
+#: Context tokens per split-K tile for the MMA kernel (one tile per resident simdgroup).
+MMA_TILE = 64
+
+#: Simdgroups co-resident per threadgroup. They share the 16 KB staged query (read once)
+#: and each drives a different split-K tile, so one simdgroup's FP8 dequant overlaps
+#: another's matrix ops -- the structural win over a single-simdgroup decode. Bounded by the
+#: 32 KB threadgroup budget: 16 KB query + MMA_WARPS x (score + streamed-C + temps).
+MMA_WARPS = 3
+
+#: D-chunk width for streaming the FP8 latent in the MMA kernel. Each chunk dequantises an
+#: 8-token x MMA_CHUNK_W slice into threadgroup memory once and feeds (MMA_CHUNK_W/8) matrix
+#: ops, amortising the dequant barrier; MMA_CHUNK_W/8 also bounds the PV register pressure.
+MMA_CHUNK_W = 64
+
 _PARTIAL_KERNEL = None
+_PARTIAL_KERNEL_MMA = None
 _COMBINE_KERNEL = None
 
 
@@ -314,6 +334,238 @@ def _partial_kernel():
     return _PARTIAL_KERNEL
 
 
+def _partial_kernel_mma():
+    """MMA-tiled split-K flash decode on the 8x8 simdgroup matrix units.
+
+    Eight query heads form a head-block and share one simdgroup. Because the MLA latent is
+    MQA (shared across heads), those eight heads read the same streamed C tile, so each FP8
+    sub-tile is dequantised once and reused across the head-block. Both matmuls map onto the
+    matrix units:
+
+      * QK^T:  S(8h x 8t) += Q(8h x 8d) @ C(8t x 8d)^T   -- C loaded transposed
+      * PV:    O(8h x 8d) += P(8h x 8t) @ C(8t x 8d)
+
+    ``MMA_WARPS`` simdgroups are co-resident per threadgroup. They share the staged float
+    query (loaded once) and each drives a different split-K tile, so one simdgroup's FP8
+    dequant overlaps another's matrix ops -- this is what keeps the matrix units fed in this
+    latency-bound single-token decode.
+
+    The FP8 dequant (inline e4m3 decode * group scale) is fused into the matmul feed: the
+    latent is streamed straight from device memory as 1 byte/elem and dequantised into a
+    small ``8 x ChunkW`` threadgroup scratch just before each ``simdgroup_load`` -- no T x D
+    bf16/fp32 latent is ever materialised, so device traffic for the dominant latent is
+    ~half the bf16 cost.
+
+    Output is the same split-K partial layout as :func:`_partial_kernel` (running max + the
+    tile's unnormalised exp-sum + the weighted latent sum), so :func:`_combine_kernel` merges
+    both kernels' partials identically.
+    """
+    global _PARTIAL_KERNEL_MMA
+    if _PARTIAL_KERNEL_MMA is not None:
+        return _PARTIAL_KERNEL_MMA
+    # Inline OCP-e4m3 -> float (S.EEEE.MMM, bias 7, no inf/NaN in this runtime). Bit-exact
+    # with the LUT but with no dependent memory gather, so the dequant pipelines on-SIMD.
+    header = """
+        inline float e4m3f(uchar bcode) {
+            uint e = (bcode >> 3) & 0xFu;
+            uint m = bcode & 0x7u;
+            float sign = (bcode & 0x80u) ? -1.0f : 1.0f;
+            float val = (e == 0u)
+                ? ((float)m * 0.001953125f)                       // 2^-6 / 8 (subnormal)
+                : (1.0f + (float)m * 0.125f) * exp2((float)((int)e - 7));
+            return sign * val;
+        }
+    """
+    source = """
+        uint lane = thread_position_in_threadgroup.x;   // 0..31 within the simdgroup
+        uint warp = thread_position_in_threadgroup.z;   // 0..NW-1 (one tile each)
+        uint hblk = threadgroup_position_in_grid.y;     // (batch * n_head_blocks) + head_block
+        uint tgz  = threadgroup_position_in_grid.z;     // tile-group index
+        int H        = meta[1];
+        int ctx      = meta[2];
+        int ng       = meta[3];
+        int n_tiles  = meta[5];
+        int nhb      = meta[6];                  // head-blocks per batch = ceil(H / 8)
+        int b   = (int)hblk / nhb;
+        int hb  = (int)hblk % nhb;
+        int h0  = hb * 8;                         // first head of this block
+        float sc = scale[0];
+        int tile = (int)tgz * NW + (int)warp;     // this simdgroup's split-K tile
+
+        const int CWB = ChunkW / 8;               // d-blocks per streamed C chunk
+        const int NCH = Dim / ChunkW;             // number of D chunks
+
+        // Q (8 heads x Dim) staged once as float and shared by all NW simdgroups -> matrix
+        // loads work for bf16/fp16 queries and Q is read once per threadgroup. Per-simdgroup
+        // scratch streams C in 8t x ChunkW chunks, dequantised inline from FP8 just-in-time.
+        threadgroup float q_sh[8 * Dim];
+        threadgroup float cchunk[NW][8 * ChunkW];   // 8 tokens x ChunkW dequantised latent
+        threadgroup float c8[NW][64];               // 8x8 store temp (scores / output tiles)
+        threadgroup float p_sh[NW][64];             // 8h x 8t probability tile (PV phase)
+        threadgroup float s_sh[NW][8 * TileTok];    // scores, then probabilities (8h x TileT)
+
+        for (int i = (int)(warp * 32 + lane); i < 8 * Dim; i += NW * 32) {
+            int hh = i / Dim;
+            int dd = i % Dim;
+            int hidx = h0 + hh;
+            q_sh[i] = (hidx < H) ? (float)q[((b * H) + hidx) * Dim + dd] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tile >= n_tiles) return;              // tail simdgroup with no tile
+
+        threadgroup float* cc = cchunk[warp];
+        threadgroup float* my8 = c8[warp];
+        threadgroup float* myp = p_sh[warp];
+        threadgroup float* ss = s_sh[warp];
+
+        int t0 = tile * TileTok;
+        int t1 = min(t0 + TileTok, ctx);
+        int nvalid = t1 - t0;
+        int ntb = (nvalid + 7) / 8;               // token-blocks in this tile
+
+        // ---- Phase 1: scores S(8h x TileT) = sc * (Q @ C^T) + pe ----
+        for (int tb = 0; tb < ntb; ++tb) {
+            int tt0 = t0 + tb * 8;
+            simdgroup_float8x8 Sacc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int ch = 0; ch < NCH; ++ch) {
+                int dch = ch * ChunkW;
+                // Dequant an 8 x ChunkW chunk (inline e4m3 * group scale); one simdgroup
+                // barrier amortised over the CWB matmuls below.
+                for (int i = (int)lane; i < 8 * ChunkW; i += 32) {
+                    int tr = i / ChunkW;
+                    int d  = dch + (i % ChunkW);
+                    int t  = tt0 + tr;
+                    float val = 0.0f;
+                    if (t < ctx) {
+                        int lbase = (b * ctx + t) * Dim + d;
+                        int sbase = (b * ctx + t) * ng + (d / GroupSize);
+                        val = e4m3f(latent_codes[lbase]) * latent_scales[sbase];
+                    }
+                    cc[i] = val;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < CWB; ++j) {
+                    simdgroup_float8x8 Qm, Cm;
+                    simdgroup_load(Qm, q_sh + (dch + j * 8), Dim);            // 8h x 8d
+                    simdgroup_load(Cm, cc + j * 8, ChunkW, ulong2(0, 0), true); // ->8d x 8t
+                    simdgroup_multiply_accumulate(Sacc, Qm, Cm, Sacc);
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            simdgroup_store(Sacc, my8, 8);                                   // 8h x 8t
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (int e = (int)lane; e < 64; e += 32) {
+                int hh = e / 8;
+                int tr = e % 8;
+                int tcol = tb * 8 + tr;
+                if (tcol < nvalid) {
+                    int hidx = h0 + hh;
+                    float s = sc * my8[e];
+                    if (hidx < H) s += (float)pe[((b * H) + hidx) * ctx + (t0 + tcol)];
+                    ss[hh * TileTok + tcol] = s;
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // ---- Online softmax over this tile's tokens, per head (8 lanes own 8 heads) ----
+        if ((int)lane < 8) {
+            int hh = (int)lane;
+            float m = -1e30f;
+            for (int u = 0; u < nvalid; ++u) m = fmax(m, ss[hh * TileTok + u]);
+            float l = 0.0f;
+            for (int u = 0; u < nvalid; ++u) {
+                float p = fast::exp(ss[hh * TileTok + u] - m);
+                ss[hh * TileTok + u] = p;     // overwrite scores with probabilities
+                l += p;
+            }
+            int hidx = h0 + hh;
+            if (hidx < H) {
+                int pidx = ((b * H) + hidx) * n_tiles + tile;
+                partial_m[pidx] = m;
+                partial_l[pidx] = l;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // ---- Phase 3: O(8h x D) = P(8h x T) @ C(T x D), one D chunk at a time. Each chunk
+        // keeps CWB output accumulators in registers (bounded), streams C once per token-
+        // block, and stores its 8h x ChunkW slice of the partial output. ----
+        for (int ch = 0; ch < NCH; ++ch) {
+            int dch = ch * ChunkW;
+            simdgroup_float8x8 Oacc[CWB];
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < CWB; ++j)
+                Oacc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+            for (int tb = 0; tb < ntb; ++tb) {
+                int tt0 = t0 + tb * 8;
+                for (int i = (int)lane; i < 8 * ChunkW; i += 32) {
+                    int tr = i / ChunkW;
+                    int d  = dch + (i % ChunkW);
+                    int t  = tt0 + tr;
+                    float val = 0.0f;
+                    if (t < ctx) {
+                        int lbase = (b * ctx + t) * Dim + d;
+                        int sbase = (b * ctx + t) * ng + (d / GroupSize);
+                        val = e4m3f(latent_codes[lbase]) * latent_scales[sbase];
+                    }
+                    cc[i] = val;
+                }
+                for (int e = (int)lane; e < 64; e += 32) {
+                    int hh = e / 8;
+                    int tr = e % 8;
+                    int tcol = tb * 8 + tr;
+                    myp[e] = (tcol < nvalid) ? ss[hh * TileTok + tcol] : 0.0f;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_float8x8 Pm;
+                simdgroup_load(Pm, myp, 8);                                 // 8h x 8t
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < CWB; ++j) {
+                    simdgroup_float8x8 Cm;
+                    simdgroup_load(Cm, cc + j * 8, ChunkW);                 // 8t x 8d
+                    simdgroup_multiply_accumulate(Oacc[j], Pm, Cm, Oacc[j]);
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < CWB; ++j) {
+                int d0 = dch + j * 8;
+                simdgroup_store(Oacc[j], my8, 8);                          // 8h x 8d
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (int e = (int)lane; e < 64; e += 32) {
+                    int hh = e / 8;
+                    int dc = e % 8;
+                    int hidx = h0 + hh;
+                    if (hidx < H) {
+                        int pidx = ((b * H) + hidx) * n_tiles + tile;
+                        partial_acc[pidx * Dim + d0 + dc] = my8[e];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+    """
+    _PARTIAL_KERNEL_MMA = mx.fast.metal_kernel(
+        name="mla_fp8_decode_partial_mma",
+        input_names=[
+            "q",
+            "pe",
+            "latent_codes",
+            "latent_scales",
+            "meta",
+            "scale",
+        ],
+        output_names=["partial_m", "partial_l", "partial_acc"],
+        source=source,
+        header=header,
+    )
+    return _PARTIAL_KERNEL_MMA
+
+
 def _combine_kernel():
     """Merge the per-tile flash partials for each (batch*head) into the final output."""
     global _COMBINE_KERNEL
@@ -405,6 +657,75 @@ def _mla_fp8_decode_metal(
         inputs=[partial_m, partial_l, partial_acc, mx.array([n_tiles], dtype=mx.int32)],
         template=[("T_out", q.dtype), ("Dim", D), ("DimsPerLane", D // _SIMD)],
         grid=(_SIMD, BH, 1),
+        threadgroup=(_SIMD, 1, 1),
+        output_shapes=[(B, H, D)],
+        output_dtypes=[q.dtype],
+    )[0]
+    return out
+
+
+def _mla_fp8_decode_metal_mma(
+    q: mx.array,
+    pe: mx.array,
+    latent_codes: mx.array,
+    latent_scales: mx.array,
+    scale: float,
+    group_size: int,
+    tile: int = MMA_TILE,
+) -> mx.array:
+    """MMA-tiled FP8-fused split-K flash decode (the ``kernel`` path).
+
+    Maps the absorbed-MLA decode onto the 8x8 simdgroup matrix units, streaming the FP8
+    latent in ``MMA_CHUNK_W``-wide chunks and dequantising them inline just before each
+    matmul (see :func:`_partial_kernel_mma`). Requires ``D % 32 == 0`` -- the shared
+    :func:`_combine_kernel` lane-stripes the partial output in groups of 32, so a tail of
+    ``D % 32`` dims would be dropped. Every MLA ``kv_lora_rank`` (512, ...) satisfies this;
+    :func:`mla_fp8_decode` falls back to ``mlx`` otherwise.
+    """
+    B, H, D = q.shape
+    if D % _SIMD != 0:
+        raise ValueError(
+            f"kv_lora_rank ({D}) must be divisible by {_SIMD} for the MMA 'kernel' decode "
+            f"path; use method='mlx' or method='sdpa'."
+        )
+    T = latent_codes.shape[1]
+    ng = D // group_size
+    # Largest <= MMA_CHUNK_W d-chunk width that is a multiple of 8 and evenly divides D
+    # (D % 32 == 0 guarantees at least 32 works). Keeps streamed-C tiles aligned to D.
+    chunk_w = max(w for w in range(8, min(MMA_CHUNK_W, D) + 1, 8) if D % w == 0)
+    nhb = (H + MMA_HEAD_BLOCK - 1) // MMA_HEAD_BLOCK
+    n_tiles = max(1, (T + tile - 1) // tile)
+    nw = MMA_WARPS
+    n_tilegroups = (n_tiles + nw - 1) // nw  # threadgroups along the split-K axis
+    pe = pe.astype(mx.float32)
+    scale_arr = mx.array([scale], dtype=mx.float32)
+
+    partial_m, partial_l, partial_acc = _partial_kernel_mma()(
+        inputs=[
+            q,
+            pe,
+            latent_codes,
+            latent_scales,
+            mx.array([B, H, T, ng, tile, n_tiles, nhb], dtype=mx.int32),
+            scale_arr,
+        ],
+        template=[
+            ("Dim", D),
+            ("GroupSize", group_size),
+            ("TileTok", tile),
+            ("ChunkW", chunk_w),
+            ("NW", nw),
+        ],
+        grid=(_SIMD, B * nhb, n_tilegroups * nw),
+        threadgroup=(_SIMD, 1, nw),
+        output_shapes=[(B * H, n_tiles), (B * H, n_tiles), (B * H, n_tiles, D)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+
+    out = _combine_kernel()(
+        inputs=[partial_m, partial_l, partial_acc, mx.array([n_tiles], dtype=mx.int32)],
+        template=[("T_out", q.dtype), ("Dim", D), ("DimsPerLane", D // _SIMD)],
+        grid=(_SIMD, B * H, 1),
         threadgroup=(_SIMD, 1, 1),
         output_shapes=[(B, H, D)],
         output_dtypes=[q.dtype],
@@ -512,13 +833,23 @@ def _mla_fp8_decode_mlx(
 # Backwards-compatible alias: the MLX path doubles as the numerical reference.
 _mla_fp8_decode_reference = _mla_fp8_decode_mlx
 
-#: Decode strategies:
-#:  * ``mlx``    — fused einsum (default; fastest on MLX 0.31.2; runs on any backend).
-#:  * ``kernel`` — all-in-one scalar Metal kernel; no bf16 materialisation, lowest extra
-#:                 memory, but compute-bound and slower than ``mlx`` (kept for that niche
-#:                 and as the explicit "absorbed MLA Metal kernel"; an MMA version is TODO).
-#:  * ``sdpa``   — fused dequant Metal kernel + MLX SDPA; materialises a bf16 latent.
-DECODE_METHODS = ("mlx", "kernel", "sdpa")
+#: Decode strategies (``mlx`` is the default and the fastest correct path on MLX 0.31.2):
+#:  * ``mlx``        — fused einsum (default). MLX fuses the lazy FP8 dequant into the matmul,
+#:                     so no bf16 latent is materialised and the GEMMs use the matrix units.
+#:  * ``sdpa``       — fused dequant Metal kernel + MLX SDPA; materialises a bf16 latent.
+#:  * ``kernel``     — scalar all-in-one flash Metal kernel; no bf16 materialisation, lowest
+#:                     extra memory, but compute-bound (per-lane scalar dot). Needs ``D % 32 == 0``.
+#:  * ``kernel_mma`` — MMA-tiled FP8-fused flash kernel (8x8 simdgroup matrix units). Numerically
+#:                     correct (cosine ~1.0) but a *measured perf regression* vs ``mlx``/``kernel``
+#:                     for B=1 single-token decode: that shape is overhead/latency-bound (not FLOP-
+#:                     or bandwidth-bound), so the matrix units stay starved and a JIT
+#:                     ``metal_kernel`` cannot out-pipeline MLX's compiled SDPA. Kept as a reference
+#:                     implementation and for batched-decode evaluation — not for default use.
+#:
+#: NOTE: FP8-MLA is a *memory* win (~43% smaller latent; reaches contexts the expanded cache OOMs
+#: on), not a single-token decode *speed* win — at B=1 bandwidth is not the limiter, so FP8 only
+#: adds dequant cost. See ``tests/bench_mla_fp8.py``.
+DECODE_METHODS = ("mlx", "kernel", "kernel_mma", "sdpa")
 MLA_FP8_DECODE_ENV = "MLX_VLM_MLA_FP8_DECODE"
 
 
@@ -551,12 +882,24 @@ def mla_fp8_decode(
     """
     if method is None:
         method = "mlx"
-    if method in ("kernel", "sdpa") and not _metal_available():
+    if method in ("kernel", "kernel_mma", "sdpa") and not _metal_available():
         method = "mlx"
     if method == "kernel":
-        return _mla_fp8_decode_metal(
-            q, pe, latent_codes, latent_scales, scale, group_size
-        )
+        # Scalar Metal kernel. The split-K combine needs D % 32 == 0 (every MLA kv_lora_rank
+        # satisfies this); fall back rather than raise on an exotic dim.
+        if q.shape[-1] % _SIMD == 0:
+            return _mla_fp8_decode_metal(
+                q, pe, latent_codes, latent_scales, scale, group_size
+            )
+        method = "mlx"
+    if method == "kernel_mma":
+        # MMA reference path (non-default; slower than ``mlx`` at B=1 — see DECODE_METHODS).
+        # Same D % 32 == 0 requirement; fall back rather than miscompute.
+        if q.shape[-1] % _SIMD == 0:
+            return _mla_fp8_decode_metal_mma(
+                q, pe, latent_codes, latent_scales, scale, group_size
+            )
+        method = "mlx"
     if method == "sdpa":
         return _mla_fp8_decode_sdpa(
             q, pe, latent_codes, latent_scales, scale, group_size
