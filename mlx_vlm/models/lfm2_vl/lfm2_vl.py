@@ -16,9 +16,7 @@ class Lfm2VlMultiModalProjector(nn.Module):
         super().__init__()
         in_channels = config.vision_config.hidden_size * (config.downsample_factor**2)
         self.projector_use_layernorm = config.projector_use_layernorm
-        self.layer_norm = (
-            nn.LayerNorm(in_channels) if self.projector_use_layernorm else None
-        )
+        self.layer_norm = nn.LayerNorm(in_channels)
         self.linear_1 = nn.Linear(
             in_channels,
             config.projector_hidden_size,

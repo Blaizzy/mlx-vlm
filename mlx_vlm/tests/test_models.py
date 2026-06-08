@@ -2412,9 +2412,10 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsNone(model.multi_modal_projector.layer_norm)
+        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
+        self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
         parameters = model.multi_modal_projector.parameters()
-        self.assertNotIn("layer_norm", parameters)
+        self.assertIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
@@ -2438,6 +2439,11 @@ class TestModels(unittest.TestCase):
         )
         projector = Lfm2VlMultiModalProjector(config)
 
+        class FailingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layer_norm should be skipped")
+
+        projector.layer_norm = FailingLayerNorm()
         output = projector(mx.zeros((1, 1, 1, 2)))
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
@@ -5772,6 +5778,54 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "lfm2_vl")
+
+    def test_lfm2_vl_disabled_projector_layernorm_weights_load(self):
+        from mlx_vlm.models import lfm2_vl
+
+        model = lfm2_vl.Model(
+            lfm2_vl.ModelConfig(
+                text_config=lfm2_vl.TextConfig(
+                    model_type="lfm2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    layer_types=["full_attention"],
+                    block_dim=16,
+                    block_ff_dim=32,
+                    conv_dim=16,
+                    conv_dim_out=16,
+                ),
+                vision_config=lfm2_vl.VisionConfig(
+                    model_type="lfm2_vl",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    image_size=28,
+                    patch_size=14,
+                ),
+                model_type="lfm2-vl",
+                projector_hidden_size=16,
+                projector_use_layernorm=False,
+            )
+        )
+
+        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
+        self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
+
+        model.multi_modal_projector.load_weights(
+            [
+                ("layer_norm.weight", mx.ones((64,))),
+                ("layer_norm.bias", mx.zeros((64,))),
+                ("linear_1.weight", mx.ones((16, 64))),
+                ("linear_1.bias", mx.zeros((16,))),
+                ("linear_2.weight", mx.ones((16, 16))),
+                ("linear_2.bias", mx.zeros((16,))),
+            ]
+        )
 
     def test_molmo2_input_embeddings(self):
         from mlx_vlm.models import molmo2
