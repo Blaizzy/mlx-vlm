@@ -66,3 +66,40 @@ def test_verbose_flag_semantics():
     assert parser.parse_args([]).verbose is True
     assert parser.parse_args(["--verbose"]).verbose is True
     assert parser.parse_args(["--no-verbose"]).verbose is False
+
+
+def _find_function_def(module: ast.Module, name: str) -> ast.FunctionDef:
+    for node in ast.walk(module):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} must be defined")
+
+
+def _is_args_system(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "system"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "args"
+    )
+
+
+def test_generate_one_shot_applies_system_prompt():
+    main = _find_function_def(_load_module("mlx_vlm/generate/dispatch.py"), "main")
+
+    def _assigns_prompt(block: ast.If) -> bool:
+        return any(
+            isinstance(stmt, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "prompt"
+                for target in stmt.targets
+            )
+            for stmt in ast.walk(block)
+        )
+
+    assert any(
+        isinstance(node, ast.If)
+        and _is_args_system(node.test)
+        and _assigns_prompt(node)
+        for node in ast.walk(main)
+    ), "one-shot generate must prepend args.system to the prompt"

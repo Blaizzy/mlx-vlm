@@ -1453,6 +1453,11 @@ def main():
 
     prompt = args.prompt
 
+    if args.system:
+        prompt = [{"role": "system", "content": args.system}] + (
+            prompt if isinstance(prompt, list) else [prompt]
+        )
+
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
