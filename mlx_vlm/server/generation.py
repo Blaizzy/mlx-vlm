@@ -29,6 +29,7 @@ from ..generate import (
     DEFAULT_TOP_P,
     BatchGenerator,
     _make_cache,
+    _chunked_prefill_enabled,
     _merge_prefill_prompt_kwargs,
 )
 from ..sample_utils import top_p_sampling
@@ -104,6 +105,93 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def _sequence_aligned_prefill_keys(
+    prompt_kwargs: dict, *, batch_size: int, sequence_length: int
+) -> List[str]:
+    return [
+        k
+        for k, v in (prompt_kwargs or {}).items()
+        if isinstance(v, mx.array)
+        and v.ndim >= 2
+        and v.shape[0] == batch_size
+        and v.shape[1] == sequence_length
+    ]
+
+
+def _slice_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
+    if not keys:
+        return prompt_kwargs
+    out = dict(prompt_kwargs)
+    for key in keys:
+        if key in out:
+            out[key] = out[key][:, :n, ...]
+    return out
+
+
+def _drop_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
+    if not keys:
+        return prompt_kwargs
+    out = dict(prompt_kwargs)
+    for key in keys:
+        if key in out:
+            out[key] = out[key][:, n:, ...]
+    return out
+
+
+def _run_chunked_speculative_prefill(
+    lm,
+    input_ids: mx.array,
+    inputs_embeds: mx.array,
+    prompt_cache,
+    prompt_kwargs: dict,
+    speculative_kwargs: dict,
+    *,
+    prefill_step_size: Optional[int],
+    generation_stream,
+) -> Tuple[object, mx.array]:
+    """Prefill target cache in chunks, capturing speculative state only at end."""
+    remaining_input_ids = input_ids
+    remaining_embeds = inputs_embeds
+    remaining_kwargs = dict(prompt_kwargs or {})
+    sequence_keys = _sequence_aligned_prefill_keys(
+        remaining_kwargs,
+        batch_size=input_ids.shape[0],
+        sequence_length=inputs_embeds.shape[1],
+    )
+
+    if (
+        prefill_step_size is not None
+        and prefill_step_size > 0
+        and remaining_embeds.shape[1] > prefill_step_size
+    ):
+        while remaining_embeds.shape[1] > 1:
+            n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
+            chunk_kwargs = _slice_prefill_kwargs(
+                remaining_kwargs, sequence_keys, n_to_process
+            )
+            with mx.stream(generation_stream):
+                lm(
+                    remaining_input_ids[:, :n_to_process],
+                    cache=prompt_cache,
+                    inputs_embeds=remaining_embeds[:, :n_to_process],
+                    n_to_process=n_to_process,
+                    **chunk_kwargs,
+                )
+            mx.eval([c.state for c in prompt_cache])
+            remaining_input_ids = remaining_input_ids[:, n_to_process:]
+            remaining_embeds = remaining_embeds[:, n_to_process:]
+            remaining_kwargs = _drop_prefill_kwargs(
+                remaining_kwargs, sequence_keys, n_to_process
+            )
+            mx.clear_cache()
+
+    final_kwargs = {**remaining_kwargs, **speculative_kwargs}
+    final_kwargs["inputs_embeds"] = remaining_embeds
+    with mx.stream(generation_stream):
+        out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
+    return out, remaining_input_ids
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -1293,12 +1381,30 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
-                lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
-                lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
+                prefill_step_size = get_prefill_step_size()
+                policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
+                if not _chunked_prefill_enabled(
+                    self.model,
+                    input_ids=input_mx,
+                    inputs_embeds=inputs_embeds_mx,
+                    prompt_cache=prompt_cache,
+                    draft_model=drafter,
+                    draft_kind=draft_kind,
+                    prefill_kwargs=policy_kwargs,
+                ):
+                    prefill_step_size = None
 
                 prompt_started = time.perf_counter()
-                with mx.stream(generation_stream):
-                    out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
+                out, input_mx = _run_chunked_speculative_prefill(
+                    lm,
+                    input_mx,
+                    inputs_embeds_mx,
+                    prompt_cache,
+                    prompt_kwargs,
+                    prefill_kwargs,
+                    prefill_step_size=prefill_step_size,
+                    generation_stream=generation_stream,
+                )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B
