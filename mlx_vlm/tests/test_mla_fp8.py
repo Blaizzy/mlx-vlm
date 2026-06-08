@@ -13,6 +13,7 @@ import pytest
 from mlx_vlm.mla_fp8 import (
     Fp8MLAKVCache,
     _mla_fp8_decode_metal,
+    _mla_fp8_decode_metal_mma,
     _mla_fp8_decode_reference,
     dequantize_latent_fp8,
     fp8_lut,
@@ -95,16 +96,21 @@ def test_quant_requires_divisible_group():
 
 @requires_metal
 def test_kernel_rejects_non_simd_lora():
-    # kv_lora_rank not divisible by 32 -> the 'kernel' path must raise (not miscompute).
+    # kv_lora_rank not divisible by 32 is unsupported by both Metal kernels (the split-K
+    # combine lane-stripes the output in groups of 32). The low-level scalar kernel raises;
+    # the public 'kernel'/'kernel_mma' dispatch falls back to the mlx path instead.
     D, G = 48, 48  # 48 % 32 != 0
     codes, scales = quantize_latent_fp8(mx.random.normal((1, 4, D)), G)
     q = mx.random.normal((1, 2, D)).astype(mx.float32)
     pe = mx.random.normal((1, 2, 4)).astype(mx.float32)
     with pytest.raises(ValueError):
-        mla_fp8_decode(q, pe, codes, scales, SCALE, G, method="kernel")
-    # the mlx path handles any dim fine
-    out = mla_fp8_decode(q, pe, codes, scales, SCALE, G, method="mlx")
-    assert out.shape == (1, 2, D)
+        _mla_fp8_decode_metal(q, pe, codes, scales, SCALE, G)
+    # public dispatch: D % 32 != 0 transparently falls back to mlx, matching its output.
+    ref = _mla_fp8_decode_reference(q, pe, codes, scales, SCALE, G)
+    for method in ("kernel", "kernel_mma", "mlx"):
+        out = mla_fp8_decode(q, pe, codes, scales, SCALE, G, method=method)
+        assert out.shape == (1, 2, D)
+        assert _max_rel_err(out, ref) == 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -232,6 +238,49 @@ def test_metal_decode_matches_reference_fp32(group_size, B, H, T):
 
 
 @requires_metal
+@pytest.mark.parametrize("group_size", [64, 128])
+@pytest.mark.parametrize(
+    "B,H,T",
+    [
+        (1, 1, 1),  # single head -> single (padded) head-block
+        (2, 8, 37),  # exactly one head-block, multi-batch
+        (1, 16, 256),  # two full head-blocks, one split-K tile boundary
+        (3, 4, 129),  # tail head-block (H=4 < 8) across batches
+        (1, 12, 300),  # H=12 -> a full block + a 4-head tail block, multi-tile split-K
+        (1, 20, 700),  # H not divisible by 8 with several split-K tiles
+        (1, 128, 600),  # production head count, multi-tile
+    ],
+)
+def test_mma_kernel_matches_reference_fp32(group_size, B, H, T):
+    # The MMA 'kernel' path: validates QK^T/PV on the matrix units and the H%8 tail block.
+    mx.random.seed(B * 1000 + H * 10 + T + group_size)
+    lat = mx.random.normal((B, T, KV_LORA)).astype(mx.float32)
+    codes, scales = quantize_latent_fp8(lat, group_size)
+    q = mx.random.normal((B, H, KV_LORA)).astype(mx.float32)
+    pe = mx.random.normal((B, H, T)).astype(mx.float32)
+    ker = _mla_fp8_decode_metal_mma(q, pe, codes, scales, SCALE, group_size)
+    ref = _mla_fp8_decode_reference(q, pe, codes, scales, SCALE, group_size)
+    assert ker.shape == (B, H, KV_LORA)
+    assert _max_rel_err(ker, ref) < 2e-3
+    assert _cosine(ker, ref) > 0.9999
+
+
+@requires_metal
+def test_mma_kernel_bf16_dtype():
+    # MMA kernel preserves the query dtype on output (bf16 in, bf16 out).
+    mx.random.seed(91)
+    B, H, T = 2, 24, 200
+    lat = mx.random.normal((B, T, KV_LORA)).astype(mx.bfloat16)
+    codes, scales = quantize_latent_fp8(lat, 128)
+    q = mx.random.normal((B, H, KV_LORA)).astype(mx.bfloat16)
+    pe = mx.random.normal((B, H, T)).astype(mx.float32)
+    ker = _mla_fp8_decode_metal_mma(q, pe, codes, scales, SCALE, 128)
+    ref = _mla_fp8_decode_reference(q, pe, codes, scales, SCALE, 128)
+    assert ker.dtype == mx.bfloat16
+    assert _cosine(ker, ref) > 0.999
+
+
+@requires_metal
 def test_metal_decode_bf16():
     mx.random.seed(9)
     B, H, T = 2, 8, 64
@@ -290,7 +339,7 @@ def _full_recompute(cache, group_size, qa1, qpe1, scale):
     return mx.einsum("bht,btd->bhd", p, c)
 
 
-@pytest.mark.parametrize("method", ["mlx", "kernel", "sdpa"])
+@pytest.mark.parametrize("method", ["mlx", "kernel", "kernel_mma", "sdpa"])
 def test_attention_decode_matches_full_recompute(method):
     if method != "mlx" and not mx.metal.is_available():
         pytest.skip("Metal unavailable")
