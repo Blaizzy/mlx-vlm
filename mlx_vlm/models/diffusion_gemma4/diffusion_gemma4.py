@@ -113,6 +113,10 @@ class Model(nn.Module):
         for key, value in weights.items():
             if "rotary_emb" in key or key == "lm_head.weight":
                 continue
+            if key.startswith("model.encoder.embed_vision.") or key.startswith(
+                "model.encoder.vision_tower."
+            ):
+                continue
 
             # Encoder text weights are tied to decoder weights; the checkpoint
             # only carries separate encoder layer scalars.

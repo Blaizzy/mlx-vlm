@@ -1,9 +1,9 @@
 # DiffusionGemma4
 
 DiffusionGemma4 is a block-diffusion language model port for
-`gg-hf-st/test-checkpoint-26B`. Unlike autoregressive decoders, it generates a
-canvas of noisy token ids and repeatedly denoises that canvas before appending
-the accepted tokens to the prefix.
+`gg-hf-st/test-checkpoint-26B`. It generates a canvas of noisy token ids and
+repeatedly denoises that canvas before appending the accepted tokens to the
+prefix.
 
 ## Model
 
@@ -79,7 +79,8 @@ Useful diffusion options:
 - `--diffusion-unmasking-interval`: show every Nth denoising step.
 - `--diffusion-unmasking-width`: preview width. The default `0` means
   untrimmed.
-- `--diffusion-sampler auto-regressive-euler`: checkpoint-style canvas update.
+- `--diffusion-sampler entropy-bound`: checkpoint-style entropy-bound canvas
+  update.
 - `--diffusion-sampler confidence-threshold`: commit high-confidence canvas
   positions early.
 - `--diffusion-threshold`: probability threshold for the confidence sampler.

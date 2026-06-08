@@ -335,7 +335,7 @@ class DecoderModel(nn.Module):
             probs = mx.softmax(self_conditioning_logits, axis=-1, precise=True)
             soft_embeddings = (probs @ self.embed_tokens.weight).astype(
                 inputs_embeds.dtype
-            )
+            ) * self.embed_scale
         return self.self_conditioning(inputs_embeds, soft_embeddings)
 
     def _make_decoder_masks(self, h, caches, decoder_attention_mask=None):

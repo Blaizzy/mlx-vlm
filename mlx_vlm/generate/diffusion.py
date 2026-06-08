@@ -37,15 +37,22 @@ def _clip_display_width(text: str, max_width: int) -> str:
 
     out = []
     width = 0
+    clipped = False
     for char in text:
         if unicodedata.combining(char):
             char_width = 0
         else:
             char_width = 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
         if width + char_width > max_width:
+            clipped = True
             break
         out.append(char)
         width += char_width
+
+    if clipped and max_width >= 3:
+        while out and _display_width("".join(out)) > max_width - 3:
+            out.pop()
+        out.append("...")
 
     return "".join(out)
 
@@ -168,7 +175,7 @@ def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
         kwargs["diffusion_full_canvas"] = True
     if args.diffusion_min_canvas_length is not None:
         kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
-    if args.diffusion_sampler != "auto-regressive-euler":
+    if args.diffusion_sampler != "entropy-bound":
         kwargs["diffusion_sampler"] = args.diffusion_sampler
         kwargs["diffusion_threshold"] = (
             0.9 if args.threshold is None else args.threshold
@@ -265,52 +272,7 @@ def _diffusion_linear_temperature(
         return None
     t_min = float(schedule_config.get("t_min", 0.4))
     t_max = float(schedule_config.get("t_max", 0.8))
-    return t_min + ((t_max - t_min) * ((cur_step - 1) / max_denoising_steps))
-
-
-def _diffusion_accept_canvas(
-    current_canvas: mx.array,
-    denoiser_canvas: mx.array,
-    cur_step: int,
-    canvas_length: int,
-    ar_mask_noise_proportion: float,
-) -> Tuple[mx.array, mx.array]:
-    acceptance_probability = 1.0 / cur_step
-    acceptance_mask = (
-        mx.random.uniform(shape=current_canvas.shape) < acceptance_probability
-    )
-
-    if ar_mask_noise_proportion > 0.0:
-        canvas_proportion = mx.linspace(
-            0.0,
-            1.0 - ar_mask_noise_proportion,
-            canvas_length,
-        )
-        ar_mask = canvas_proportion < acceptance_probability
-        acceptance_mask = acceptance_mask | ar_mask[None, :]
-
-    return mx.where(acceptance_mask, denoiser_canvas, current_canvas), acceptance_mask
-
-
-def _diffusion_renoise_canvas(
-    accepted_canvas: mx.array,
-    cur_step: int,
-    max_denoising_steps: int,
-    renoise_ratio_modifier: float,
-    vocab_size: int,
-    dtype,
-) -> mx.array:
-    renoise_probability = renoise_ratio_modifier * (
-        (cur_step - 1) / max_denoising_steps
-    )
-    renoise_mask = mx.random.uniform(shape=accepted_canvas.shape) < renoise_probability
-    random_canvas = _diffusion_initialize_canvas(
-        accepted_canvas.shape[0],
-        accepted_canvas.shape[1],
-        vocab_size,
-        dtype,
-    )
-    return mx.where(renoise_mask, random_canvas, accepted_canvas)
+    return t_min + ((t_max - t_min) * (cur_step / max_denoising_steps))
 
 
 def _diffusion_sample_canvas(
@@ -318,8 +280,6 @@ def _diffusion_sample_canvas(
     dtype,
     temperature: float,
 ) -> mx.array:
-    if temperature == 0:
-        return mx.argmax(processed_logits, axis=-1).astype(dtype)
     return mx.random.categorical(processed_logits.astype(mx.float32)).astype(dtype)
 
 
@@ -334,6 +294,13 @@ def _diffusion_token_probability(
         axis=-1,
     ).squeeze(-1)
     return mx.exp(token_logits - mx.logsumexp(logits, axis=-1))
+
+
+def _diffusion_token_entropy(processed_logits: mx.array) -> mx.array:
+    logits = processed_logits.astype(mx.float32)
+    log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    probs = mx.exp(log_probs)
+    return -mx.sum(probs * log_probs, axis=-1)
 
 
 def _diffusion_confidence_transfer_mask(
@@ -355,6 +322,26 @@ def _diffusion_confidence_transfer_mask(
     positions = mx.arange(confidence.shape[-1])[None, :]
     forced = (positions == best_index[:, None]) & needs_force[:, None]
     return transfer_mask | forced
+
+
+def _diffusion_entropy_transfer_mask(
+    entropy: mx.array,
+    entropy_bound: float,
+) -> mx.array:
+    sorted_indices = mx.argsort(entropy, axis=-1)
+    sorted_entropy = mx.take_along_axis(entropy, sorted_indices, axis=-1)
+    cumulative_entropy = mx.cumsum(sorted_entropy, axis=-1)
+    cumulative_maximum_entropy = mx.cummax(sorted_entropy, axis=-1)
+    sorted_selection_mask = (
+        cumulative_entropy - cumulative_maximum_entropy
+    ) <= entropy_bound
+    selection_mask = mx.zeros_like(sorted_selection_mask)
+    return mx.put_along_axis(
+        selection_mask,
+        sorted_indices,
+        sorted_selection_mask,
+        axis=-1,
+    )
 
 
 def _diffusion_static_cache_length(
@@ -394,11 +381,7 @@ def _diffusion_stable_and_confident(
     if not stable:
         return False
 
-    log_probs = processed_logits - mx.logsumexp(
-        processed_logits, axis=-1, keepdims=True
-    )
-    probs = mx.exp(log_probs)
-    token_entropy = -probs * log_probs
+    token_entropy = _diffusion_token_entropy(processed_logits)
     confident = bool((mx.mean(token_entropy) < confidence_threshold).item())
     return stable and confident
 
@@ -481,7 +464,7 @@ def stream_diffusion_generate(
     diffusion_full_canvas: bool = False,
     diffusion_min_canvas_length: Optional[int] = None,
     diffusion_static_cache: bool = False,
-    diffusion_sampler: str = "auto-regressive-euler",
+    diffusion_sampler: str = "entropy-bound",
     diffusion_threshold: float = 0.9,
     diffusion_compile: bool = False,
     diffusion_show_unmasking: bool = False,
@@ -517,7 +500,7 @@ def stream_diffusion_generate(
         raise ValueError("diffusion_unmasking_interval must be a positive integer.")
     if diffusion_unmasking_width < 0:
         raise ValueError("diffusion_unmasking_width must be non-negative.")
-    if diffusion_sampler not in ("auto-regressive-euler", "confidence-threshold"):
+    if diffusion_sampler not in ("entropy-bound", "confidence-threshold"):
         raise ValueError(f"Unsupported diffusion sampler: {diffusion_sampler!r}.")
     if not 0.0 <= diffusion_threshold <= 1.0:
         raise ValueError("diffusion_threshold must be between 0 and 1.")
@@ -525,24 +508,33 @@ def stream_diffusion_generate(
     sampler_config = _diffusion_config_dict(
         generation_config.get("sampler_config", None)
     )
-    sampler_name = sampler_config.get("_cls_name", "AutoRegressiveEulerSamplerConfig")
-    if sampler_name != "AutoRegressiveEulerSamplerConfig":
+    sampler_name = sampler_config.get("_cls_name", "EntropyBoundSamplerConfig")
+    entropy_bound = float(sampler_config.get("entropy_bound", 0.1))
+    if sampler_name != "EntropyBoundSamplerConfig":
         raise NotImplementedError(
             f"Diffusion sampler {sampler_name!r} is not supported yet."
         )
-    renoise_ratio_modifier = float(sampler_config.get("renoise_ratio_modifier", 0.8))
-    ar_mask_noise_proportion = float(
-        sampler_config.get("ar_mask_noise_proportion", 0.0)
-    )
     temperature_config = generation_config.get("linear_temperature_schedule_config")
     temperature_config = _diffusion_config_dict(temperature_config)
     if not temperature_config:
-        temperature_config = {"t_min": 0.4, "t_max": 0.8}
+        if "t_min" in generation_config or "t_max" in generation_config:
+            temperature_config = {
+                "t_min": generation_config.get("t_min", 0.4),
+                "t_max": generation_config.get("t_max", 0.8),
+            }
+        else:
+            temperature_config = {"t_min": 0.4, "t_max": 0.8}
 
     diffusion_stopping_config = generation_config.get("diffusion_stopping_config")
     diffusion_stopping_config = _diffusion_config_dict(diffusion_stopping_config)
     if not diffusion_stopping_config:
-        diffusion_stopping_config = None
+        diffusion_stopping_config = {
+            key: generation_config[key]
+            for key in ("confidence_threshold", "stability_threshold")
+            if key in generation_config
+        }
+        if not diffusion_stopping_config:
+            diffusion_stopping_config = None
 
     if attention_mask is None:
         attention_mask = mx.ones((batch_size, prompt_length), dtype=mx.bool_)
@@ -659,6 +651,7 @@ def stream_diffusion_generate(
             draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
             draft_canvas = current_canvas
             accepted_canvas = current_canvas
+            argmax_canvas = current_canvas
             self_conditioning_logits = None
             mask_mapping = model.model.decoder._make_decoder_masks(
                 current_canvas[..., None],
@@ -738,13 +731,39 @@ def stream_diffusion_generate(
                 denoiser_canvas = _diffusion_sample_canvas(
                     processed_logits, input_ids.dtype, temperature
                 )
+                argmax_canvas = mx.argmax(processed_logits, axis=-1).astype(
+                    input_ids.dtype
+                )
 
-                if diffusion_sampler == "confidence-threshold":
+                if diffusion_sampler == "entropy-bound":
+                    token_entropy = _diffusion_token_entropy(processed_logits)
+                    acceptance_mask = _diffusion_entropy_transfer_mask(
+                        token_entropy,
+                        entropy_bound,
+                    )
+                    accepted_canvas = mx.where(
+                        acceptance_mask,
+                        denoiser_canvas,
+                        current_canvas,
+                    )
+                    current_canvas = mx.where(
+                        acceptance_mask,
+                        accepted_canvas,
+                        _diffusion_initialize_canvas(
+                            batch_size,
+                            canvas_length,
+                            vocab_size,
+                            input_ids.dtype,
+                        ),
+                    )
+                    draft_reveal_mask = acceptance_mask
+                    draft_canvas = argmax_canvas
+                else:
+                    unrevealed_mask = ~draft_reveal_mask
                     confidence = _diffusion_token_probability(
                         processed_logits,
                         denoiser_canvas,
                     )
-                    unrevealed_mask = ~draft_reveal_mask
                     acceptance_mask = _diffusion_confidence_transfer_mask(
                         confidence,
                         unrevealed_mask,
@@ -766,25 +785,10 @@ def stream_diffusion_generate(
                             input_ids.dtype,
                         ),
                     )
-                else:
-                    accepted_canvas, acceptance_mask = _diffusion_accept_canvas(
-                        current_canvas,
-                        denoiser_canvas,
-                        cur_step,
-                        canvas_length,
-                        ar_mask_noise_proportion,
+                    draft_reveal_mask = draft_reveal_mask | acceptance_mask
+                    draft_canvas = mx.where(
+                        acceptance_mask, accepted_canvas, draft_canvas
                     )
-                    current_canvas = _diffusion_renoise_canvas(
-                        accepted_canvas,
-                        cur_step,
-                        max_denoising_steps,
-                        renoise_ratio_modifier,
-                        vocab_size,
-                        input_ids.dtype,
-                    )
-
-                draft_reveal_mask = draft_reveal_mask | acceptance_mask
-                draft_canvas = mx.where(acceptance_mask, accepted_canvas, draft_canvas)
 
                 displayed_step = max_denoising_steps - cur_step + 1
                 should_show_unmasking = diffusion_show_unmasking and (
@@ -817,16 +821,18 @@ def stream_diffusion_generate(
                     break
 
                 if _diffusion_stable_and_confident(
-                    accepted_canvas,
+                    argmax_canvas,
                     processed_logits,
                     diffusion_history,
                     diffusion_stopping_config,
                 ):
                     break
 
-                self_conditioning_logits = processed_logits
+                self_conditioning_logits = processed_logits.astype(
+                    model.model.decoder.embed_tokens.weight.dtype
+                )
 
-            current_canvas = accepted_canvas
+            current_canvas = argmax_canvas
             diffusion_canvas_tokens += canvas_length
             diffusion_denoising_steps += denoising_steps_this_canvas
             diffusion_work_tokens += canvas_length * denoising_steps_this_canvas
@@ -888,7 +894,7 @@ def stream_diffusion_generate_from_kwargs(
     diffusion_full_canvas = kwargs.pop("diffusion_full_canvas", False)
     diffusion_min_canvas_length = kwargs.pop("diffusion_min_canvas_length", None)
     diffusion_static_cache = kwargs.pop("diffusion_static_cache", False)
-    diffusion_sampler = kwargs.pop("diffusion_sampler", "auto-regressive-euler")
+    diffusion_sampler = kwargs.pop("diffusion_sampler", "entropy-bound")
     diffusion_threshold = kwargs.pop("diffusion_threshold", 0.9)
     diffusion_compile = kwargs.pop("diffusion_compile", False)
     diffusion_show_unmasking = kwargs.pop("diffusion_show_unmasking", False)

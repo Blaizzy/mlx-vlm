@@ -88,4 +88,7 @@ __all__ = ["DiffusionGemma4Processor"]
 
 from ..base import install_auto_processor_patch
 
-install_auto_processor_patch("diffusion_gemma4", DiffusionGemma4Processor)
+install_auto_processor_patch(
+    ["diffusion_gemma4", "diffusion_gemma"],
+    DiffusionGemma4Processor,
+)

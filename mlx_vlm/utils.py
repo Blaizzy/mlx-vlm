@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "diffusion_gemma": "diffusion_gemma4",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -406,6 +407,22 @@ def _is_text_only_config(config: dict) -> bool:
         _has_config(config, key)
         for key in ("vision_config", "audio_config", "dflash_config")
     )
+
+
+def _normalize_model_type_aliases(config: dict) -> dict:
+    model_type = str(config.get("model_type", "")).lower()
+    remapped = MODEL_REMAPPING.get(model_type)
+    if remapped is not None:
+        config["model_type"] = remapped
+
+    if model_type == "diffusion_gemma":
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            text_model_type = str(text_config.get("model_type", "")).lower()
+            if text_model_type == "diffusion_gemma_text":
+                text_config["model_type"] = "diffusion_gemma4_text"
+
+    return config
 
 
 def get_model_path(
@@ -863,6 +880,7 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     try:
         with open(model_path / "config.json", encoding="utf-8") as f:
             config = json.load(f)
+        config = _normalize_model_type_aliases(config)
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():

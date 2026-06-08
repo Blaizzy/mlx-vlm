@@ -246,8 +246,8 @@ def parse_arguments():
     )
     parser.add_argument(
         "--diffusion-sampler",
-        choices=["auto-regressive-euler", "confidence-threshold"],
-        default="auto-regressive-euler",
+        choices=["entropy-bound", "confidence-threshold"],
+        default="entropy-bound",
         help="Canvas update sampler for diffusion generation.",
     )
     parser.add_argument(
@@ -1394,7 +1394,7 @@ def main():
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
-        "diffusion_sampler": "auto-regressive-euler",
+        "diffusion_sampler": "entropy-bound",
         "threshold": None,
         "min_threshold": None,
         "block_length": None,
