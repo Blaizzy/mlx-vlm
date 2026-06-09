@@ -272,6 +272,16 @@ class Model(nn.Module):
             sanitized[new_key] = v
         return sanitized
 
+    def load_weights(self, weights, strict=True):
+        # `LanguageModel.sanitize` (added in #1301) drops the unused k/v projections that
+        # some checkpoints materialize on the KV-shared layers. But `load_model` only runs
+        # `sanitize` for non-mlx-format checkpoints, so mlx-format checkpoints that still
+        # carry those weights (e.g. mlx-community/gemma-4-e4b-it-4bit) fail to load. Apply
+        # the same filter here — `load_weights` always runs — reusing the existing helper.
+        is_unused = self.language_model._is_unused_shared_kv_weight
+        weights = [(k, v) for (k, v) in weights if not is_unused(k)]
+        super().load_weights(weights, strict=strict)
+
     @property
     def quant_predicate(self):
         return self.language_model.quant_predicate

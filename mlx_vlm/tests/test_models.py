@@ -3230,6 +3230,17 @@ class TestModels(unittest.TestCase):
             "language_model.model.layers.3.self_attn.v_proj.weight", weights
         )
 
+        # load_weights must drop the same unused shared-layer k/v: load_model() skips
+        # sanitize for mlx-format checkpoints, so load_weights is the path that has to
+        # tolerate quants which still materialize k/v on the KV-shared layers.
+        from mlx.utils import tree_flatten
+
+        loadable = dict(tree_flatten(shared_model.parameters()))
+        loadable["language_model.model.layers.2.self_attn.k_proj.weight"] = mx.zeros(
+            (8, 16)
+        )
+        shared_model.load_weights(list(loadable.items()))
+
     def test_gemma4_unified(self):
         import tempfile
         from pathlib import Path
