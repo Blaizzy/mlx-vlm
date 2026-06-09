@@ -110,11 +110,20 @@ def _build_gen_args(
         "enable_thinking",
         get_server_enable_thinking(),
     )
+    default_temperature = _model_config_field_or_default(
+        processor, "temperature", DEFAULT_TEMPERATURE
+    )
+    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
+    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
+    if _model_config_field_or_default(processor, "do_sample", None) is False:
+        default_temperature = 0.0
     args = GenerationArguments(
         max_tokens=max_tokens,
-        temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
-        top_p=getattr(request, "top_p", DEFAULT_TOP_P),
-        top_k=getattr(request, "top_k", 0),
+        temperature=_request_field_or_default(
+            request, "temperature", default_temperature
+        ),
+        top_p=_request_field_or_default(request, "top_p", default_top_p),
+        top_k=_request_field_or_default(request, "top_k", default_top_k),
         min_p=getattr(request, "min_p", 0.0),
         seed=getattr(request, "seed", None),
         logprobs=bool(getattr(request, "logprobs", False)),
@@ -154,6 +163,13 @@ def _request_field_or_default(request, field_name: str, default):
         return default
     value = getattr(request, field_name, default)
     return default if value is None else value
+
+
+def _model_config_field_or_default(processor, field_name: str, default):
+    config = runtime.model_cache.get("config")
+    if config is None and processor is not None:
+        config = getattr(processor, "config", None)
+    return getattr(config, field_name, default)
 
 
 def _read_tenant_id(http_request) -> Optional[str]:
