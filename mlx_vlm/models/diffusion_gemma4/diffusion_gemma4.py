@@ -37,6 +37,7 @@ class _LanguageModelView:
             cache=cache,
             canvas_ids=kwargs.get("canvas_ids"),
             self_conditioning_logits=kwargs.get("self_conditioning_logits"),
+            self_conditioning_embeddings=kwargs.get("self_conditioning_embeddings"),
             decoder_attention_mask=kwargs.get("decoder_attention_mask"),
         )
         logits = self._parent.model.decoder.embed_tokens.as_linear(hidden_states)
@@ -74,6 +75,7 @@ class Model(nn.Module):
         past_key_values=None,
         canvas_ids: mx.array = None,
         self_conditioning_logits: mx.array = None,
+        self_conditioning_embeddings: mx.array = None,
         decoder_attention_mask: mx.array = None,
         **kwargs,
     ):
@@ -86,6 +88,7 @@ class Model(nn.Module):
             cache=cache,
             canvas_ids=canvas_ids,
             self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_embeddings=self_conditioning_embeddings,
             decoder_attention_mask=decoder_attention_mask,
         )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
@@ -129,25 +132,18 @@ class Model(nn.Module):
                 sanitized[
                     key.replace(
                         ".experts.down_proj",
-                        ".experts.switch_glu.down_proj.weight",
+                        ".experts.down_proj.weight",
                     )
                 ] = value
                 continue
 
             if key.endswith(".experts.gate_up_proj"):
-                gate, up = mx.split(value, 2, axis=-2)
                 sanitized[
                     key.replace(
                         ".experts.gate_up_proj",
-                        ".experts.switch_glu.gate_proj.weight",
+                        ".experts.gate_up_proj.weight",
                     )
-                ] = gate
-                sanitized[
-                    key.replace(
-                        ".experts.gate_up_proj",
-                        ".experts.switch_glu.up_proj.weight",
-                    )
-                ] = up
+                ] = value
                 continue
 
             sanitized[key] = value

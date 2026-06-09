@@ -52,6 +52,7 @@ DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
+DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_MASKED_DIFFUSION_THRESHOLD = 0.7
 DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD = 0.5
 DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS = 16
@@ -109,7 +110,10 @@ def parse_arguments():
         "--seed",
         type=int,
         default=None,
-        help="Seed for image generation/editing. Defaults to a random 32-bit seed.",
+        help=(
+            "PRNG seed for reproducible sampling and diffusion canvas init. "
+            "Image generation/editing defaults to a random 32-bit seed."
+        ),
     )
     parser.add_argument(
         "--guidance",
@@ -189,7 +193,13 @@ def parse_arguments():
         "--max-denoising-steps",
         type=int,
         default=None,
-        help="Maximum denoising steps for diffusion generation.",
+        help=(
+            "Maximum denoising steps for diffusion generation. "
+            "Default: the checkpoint's generation config (typically "
+            f"{DEFAULT_DIFFUSION_MAX_DENOISING_STEPS}). Adaptive stopping "
+            "usually converges canvases earlier; set lower to hard-cap "
+            "throughput."
+        ),
     )
     parser.add_argument(
         "--block-length",
@@ -242,6 +252,16 @@ def parse_arguments():
         help=(
             "Minimum active canvas length for diffusion partial blocks. "
             f"Default: {DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH}."
+        ),
+    )
+    parser.add_argument(
+        "--diffusion-max-canvas-length",
+        type=int,
+        default=None,
+        help=(
+            "Maximum active canvas length for diffusion generation. Default: the "
+            "checkpoint canvas length; set lower to trade quality for "
+            "throughput."
         ),
     )
     parser.add_argument(
@@ -1390,10 +1410,14 @@ def main():
         run_image_generation_cli(args)
         return
 
+    if getattr(args, "seed", None) is not None:
+        mx.random.seed(args.seed)
+
     diffusion_arg_defaults = {
         "max_denoising_steps": None,
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
+        "diffusion_max_canvas_length": None,
         "diffusion_sampler": "entropy-bound",
         "threshold": None,
         "min_threshold": None,

@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
 from ..base import (
     LanguageModelOutput,
@@ -89,18 +90,40 @@ class Router(nn.Module):
 class Experts(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        from mlx_lm.models.switch_layers import SwitchGLU
 
-        self.switch_glu = SwitchGLU(
+        self.hidden_dims = config.moe_intermediate_size
+        self.gate_up_proj = SwitchLinear(
             input_dims=config.hidden_size,
-            hidden_dims=config.moe_intermediate_size,
+            output_dims=2 * config.moe_intermediate_size,
             num_experts=config.num_experts,
-            activation=GeGLU(),
+            bias=False,
+        )
+        self.down_proj = SwitchLinear(
+            input_dims=config.moe_intermediate_size,
+            output_dims=config.hidden_size,
+            num_experts=config.num_experts,
             bias=False,
         )
 
     def __call__(self, x, top_k_indices, top_k_weights):
-        y = self.switch_glu(x, top_k_indices)
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = top_k_indices.size >= 64
+        indices = top_k_indices
+        inv_order = None
+        if do_sort:
+            x, indices, inv_order = _gather_sort(x, top_k_indices)
+        if self.training:
+            indices = mx.stop_gradient(indices)
+
+        gate_up = self.gate_up_proj(x, indices, sorted_indices=do_sort)
+        gate = gate_up[..., : self.hidden_dims]
+        up = gate_up[..., self.hidden_dims :]
+        y = self.down_proj(geglu(gate, up), indices, sorted_indices=do_sort)
+
+        if do_sort:
+            y = _scatter_unsort(y, inv_order, top_k_indices.shape)
+
+        y = y.squeeze(-2)
         return (y * top_k_weights[..., None]).sum(axis=-2)
 
 
@@ -260,8 +283,9 @@ class DecoderLayer(nn.Module):
         h1 = self.mlp(h1)
         h1 = self.post_feedforward_layernorm_1(h1)
 
-        h2 = self.pre_feedforward_layernorm_2(residual.reshape(-1, residual.shape[-1]))
-        top_k_indices, top_k_weights = self.router(h2)
+        flat = residual.reshape(-1, residual.shape[-1])
+        top_k_indices, top_k_weights = self.router(flat)
+        h2 = self.pre_feedforward_layernorm_2(flat)
         h2 = self.experts(h2, top_k_indices, top_k_weights)
         h2 = h2.reshape(residual.shape)
         h2 = self.post_feedforward_layernorm_2(h2)
@@ -327,9 +351,24 @@ class DecoderModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_conditioning = SelfConditioning(config)
 
-    def _embed_canvas(self, canvas_ids, self_conditioning_logits=None):
+    def _embed_canvas(
+        self,
+        canvas_ids,
+        self_conditioning_logits=None,
+        self_conditioning_embeddings=None,
+    ):
         inputs_embeds = self.embed_tokens(canvas_ids) * self.embed_scale
-        if self_conditioning_logits is None:
+        if (
+            self_conditioning_logits is not None
+            and self_conditioning_embeddings is not None
+        ):
+            raise ValueError(
+                "Only one of self_conditioning_logits or "
+                "self_conditioning_embeddings can be set."
+            )
+        if self_conditioning_embeddings is not None:
+            soft_embeddings = self_conditioning_embeddings.astype(inputs_embeds.dtype)
+        elif self_conditioning_logits is None:
             soft_embeddings = mx.zeros_like(inputs_embeds)
         else:
             probs = mx.softmax(self_conditioning_logits, axis=-1, precise=True)
@@ -422,9 +461,14 @@ class DecoderModel(nn.Module):
         canvas_ids: mx.array,
         cache=None,
         self_conditioning_logits: Optional[mx.array] = None,
+        self_conditioning_embeddings: Optional[mx.array] = None,
         decoder_attention_mask: Optional[mx.array] = None,
     ):
-        h = self._embed_canvas(canvas_ids, self_conditioning_logits)
+        h = self._embed_canvas(
+            canvas_ids,
+            self_conditioning_logits,
+            self_conditioning_embeddings,
+        )
         cache = cache or [None] * len(self.layers)
         masks = self._make_decoder_masks(h, cache, decoder_attention_mask)
         offset = _cache_offset(cache[0]) if cache else 0
@@ -543,6 +587,7 @@ class DiffusionGemma4Backbone(nn.Module):
         cache=None,
         canvas_ids: Optional[mx.array] = None,
         self_conditioning_logits: Optional[mx.array] = None,
+        self_conditioning_embeddings: Optional[mx.array] = None,
         decoder_attention_mask: Optional[mx.array] = None,
     ):
         if input_ids is not None:
@@ -564,6 +609,7 @@ class DiffusionGemma4Backbone(nn.Module):
             canvas_ids,
             cache=cache,
             self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_embeddings=self_conditioning_embeddings,
             decoder_attention_mask=decoder_attention_mask,
         )
         return hidden_states, cache
@@ -591,6 +637,7 @@ class LanguageModel(nn.Module):
         cache=None,
         canvas_ids: Optional[mx.array] = None,
         self_conditioning_logits: Optional[mx.array] = None,
+        self_conditioning_embeddings: Optional[mx.array] = None,
         decoder_attention_mask: Optional[mx.array] = None,
         **kwargs,
     ):
@@ -600,10 +647,11 @@ class LanguageModel(nn.Module):
             cache=cache,
             canvas_ids=canvas_ids,
             self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_embeddings=self_conditioning_embeddings,
             decoder_attention_mask=decoder_attention_mask,
         )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
-        logits = logit_softcap(self.final_logit_softcapping, logits)
+        logits = logit_softcap(self.final_logit_softcapping, logits.astype(mx.float32))
         return LanguageModelOutput(logits=logits, hidden_states=[hidden_states])
 
     @property

@@ -68,10 +68,17 @@ uv run mlx_vlm.generate \
 
 Useful diffusion options:
 
-- `--max-denoising-steps`: maximum denoising iterations per canvas. The
-  checkpoint default is 48.
+- `--max-denoising-steps`: maximum denoising iterations per canvas. Defaults
+  to the checkpoint's generation config (48 for the RC checkpoints). The
+  stable-and-confident stopping criteria usually converges canvases in far
+  fewer steps, so this cap is cheap; set it lower to hard-cap throughput.
+- `--seed`: seed the PRNG before generation. Diffusion canvases start from
+  random noise, so temperature-0 runs are only reproducible with a fixed seed.
 - `--diffusion-min-canvas-length`: minimum active canvas for partial blocks.
   Smaller values reduce work for short completions.
+- `--diffusion-max-canvas-length`: maximum active canvas length. Defaults to
+  the checkpoint canvas length; set it lower to trade quality for throughput
+  on long generations.
 - `--diffusion-full-canvas`: always denoise the checkpoint canvas length, even
   for a partial final block.
 - `--diffusion-show-unmasking`: redraw the current canvas in place during

@@ -147,6 +147,48 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertLess(float(max_diff.item()), 1e-6)
 
+    def test_precomputed_self_conditioning_embeddings_match_logits_path(self):
+        from mlx_vlm.generate.diffusion import (
+            _diffusion_entropy_and_soft_embeddings,
+            _diffusion_token_entropy,
+        )
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
+        canvas_ids = mx.array([[6, 7, 8]], dtype=mx.int32)
+        self_conditioning_logits = mx.linspace(
+            -0.5,
+            0.5,
+            config.text_config.vocab_size * canvas_ids.shape[-1],
+        ).reshape(1, canvas_ids.shape[-1], -1)
+
+        entropy, self_conditioning_embeddings = (
+            _diffusion_entropy_and_soft_embeddings(
+                self_conditioning_logits,
+                model.model.decoder.embed_tokens.weight,
+                model.model.decoder.embed_scale,
+            )
+        )
+        expected_entropy = _diffusion_token_entropy(self_conditioning_logits)
+        logits_output = model(
+            input_ids=input_ids,
+            canvas_ids=canvas_ids,
+            self_conditioning_logits=self_conditioning_logits,
+        ).logits
+        embeddings_output = model(
+            input_ids=input_ids,
+            canvas_ids=canvas_ids,
+            self_conditioning_embeddings=self_conditioning_embeddings,
+        ).logits
+        max_diff = mx.max(mx.abs(logits_output - embeddings_output))
+        entropy_diff = mx.max(mx.abs(entropy - expected_entropy))
+        mx.eval(max_diff, entropy_diff)
+
+        self.assertLess(float(max_diff.item()), 1e-5)
+        self.assertLess(float(entropy_diff.item()), 1e-5)
+
     def test_transformers_58_logits_and_denoising_step_parity_if_available(self):
         try:
             import numpy as np
@@ -307,7 +349,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(hf_argmax.detach().cpu().numpy().tolist(), mlx_argmax.tolist())
         self.assertEqual(hf_current.detach().cpu().numpy().tolist(), mlx_argmax.tolist())
 
-    def test_sanitize_splits_experts_and_keeps_encoder_scalars(self):
+    def test_sanitize_maps_fused_experts_and_keeps_encoder_scalars(self):
         from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
 
         config = ModelConfig.from_dict(tiny_config_dict())
@@ -332,22 +374,16 @@ class TestDiffusionGemma4(unittest.TestCase):
         sanitized = model.sanitize(weights)
 
         self.assertIn(
-            "model.decoder.layers.0.experts.switch_glu.gate_proj.weight",
+            "model.decoder.layers.0.experts.gate_up_proj.weight",
             sanitized,
         )
         self.assertIn(
-            "model.decoder.layers.0.experts.switch_glu.up_proj.weight",
-            sanitized,
-        )
-        self.assertIn(
-            "model.decoder.layers.0.experts.switch_glu.down_proj.weight",
+            "model.decoder.layers.0.experts.down_proj.weight",
             sanitized,
         )
         self.assertEqual(
-            sanitized[
-                "model.decoder.layers.0.experts.switch_glu.gate_proj.weight"
-            ].shape,
-            (4, 8, 16),
+            sanitized["model.decoder.layers.0.experts.gate_up_proj.weight"].shape,
+            (4, 16, 16),
         )
         self.assertIn("model.encoder.language_model.layers.0.layer_scalar", sanitized)
         self.assertNotIn(
@@ -503,6 +539,80 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 4)
         self.assertEqual(responses[-1].diffusion_work_tokens, 12)
 
+    def test_stream_generate_uses_checkpoint_denoising_steps(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["generation_config"]["max_denoising_steps"] = 48
+        config = ModelConfig.from_dict(config_dict)
+        model = Model(config)
+        processor = FakeProcessor()
+
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].diffusion_denoising_steps, 48)
+        self.assertEqual(responses[-1].diffusion_work_tokens, 144)
+
+    def test_stream_generate_respects_explicit_denoising_steps_override(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["generation_config"]["max_denoising_steps"] = 48
+        config = ModelConfig.from_dict(config_dict)
+        model = Model(config)
+        processor = FakeProcessor()
+
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+                max_denoising_steps=48,
+            )
+        )
+
+        self.assertEqual(responses[-1].diffusion_denoising_steps, 48)
+        self.assertEqual(responses[-1].diffusion_work_tokens, 144)
+
+    def test_stream_generate_respects_diffusion_max_canvas_length(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=4,
+                max_denoising_steps=1,
+                diffusion_max_canvas_length=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].generation_tokens, 4)
+        self.assertEqual(responses[-1].diffusion_canvas_tokens, 4)
+        self.assertEqual(responses[-1].diffusion_work_tokens, 4)
+
     def test_stream_generate_can_emit_unmasking_drafts(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
@@ -534,14 +644,26 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(drafts[-1].diffusion_total_steps, 2)
         self.assertEqual(finals[-1].generation_tokens, 2)
 
-    def test_diffusion_zero_temperature_still_samples_canvas(self):
+    def test_diffusion_zero_temperature_uses_argmax_canvas(self):
         from mlx_vlm.generate.diffusion import _diffusion_sample_canvas
 
         logits = mx.array([[[0.0, 2.0, 1.0], [3.0, 1.0, 2.0]]])
 
-        with patch("mlx_vlm.generate.mx.random.categorical") as categorical:
-            categorical.return_value = mx.array([[2, 1]])
+        with patch("mlx_vlm.generate.diffusion.mx.random.categorical") as categorical:
             sampled = _diffusion_sample_canvas(logits, mx.int32, temperature=0.0)
+            mx.eval(sampled)
+
+        categorical.assert_not_called()
+        self.assertEqual(sampled.tolist(), [[1, 0]])
+
+    def test_diffusion_positive_temperature_samples_canvas(self):
+        from mlx_vlm.generate.diffusion import _diffusion_sample_canvas
+
+        logits = mx.array([[[0.0, 2.0, 1.0], [3.0, 1.0, 2.0]]])
+
+        with patch("mlx_vlm.generate.diffusion.mx.random.categorical") as categorical:
+            categorical.return_value = mx.array([[2, 1]])
+            sampled = _diffusion_sample_canvas(logits, mx.int32, temperature=0.7)
             mx.eval(sampled)
 
         categorical.assert_called_once()
@@ -635,8 +757,14 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         buffer = io.StringIO()
         with (
-            patch("mlx_vlm.generate.stream_generate", return_value=iter(chunks)),
-            patch("mlx_vlm.generate._supports_in_place_output", return_value=True),
+            patch(
+                "mlx_vlm.generate.dispatch.stream_generate",
+                return_value=iter(chunks),
+            ),
+            patch(
+                "mlx_vlm.generate.diffusion._supports_in_place_output",
+                return_value=True,
+            ),
             contextlib.redirect_stdout(buffer),
         ):
             result = generate(
