@@ -21,8 +21,11 @@ prefix.
 | **Dense MLP** | 2112 intermediate size |
 | **Vocabulary** | 262,144 |
 
-This implementation is text-only. Vision, audio, and video inputs are rejected
-for now.
+This implementation supports text and image inputs. Image prompts run through
+the Gemma 4 vision tower, and the encoder applies bidirectional attention
+within each image-token block (matching the checkpoint's
+`use_bidirectional_attention: "vision"` setting). Multiple images per prompt
+are supported. Audio and video inputs are rejected for now.
 
 ## CLI Usage
 
@@ -33,6 +36,19 @@ uv run mlx_vlm.generate \
   --model gg-hf-st/test-checkpoint-26B \
   --prompt "Explain why the sky is blue." \
   --max-tokens 120 \
+  --temperature 0.0 \
+  --trust-remote-code \
+  --skip-special-tokens
+```
+
+Describe an image:
+
+```bash
+uv run mlx_vlm.generate \
+  --model gg-hf-st/test-checkpoint-26B \
+  --prompt "Describe this image in one short paragraph." \
+  --image /path/to/image.png \
+  --max-tokens 128 \
   --temperature 0.0 \
   --trust-remote-code \
   --skip-special-tokens

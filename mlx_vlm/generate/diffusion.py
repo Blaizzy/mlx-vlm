@@ -503,9 +503,8 @@ def stream_diffusion_generate(
     diffusion_show_unmasking: bool = False,
     diffusion_unmasking_interval: int = 1,
     diffusion_unmasking_width: int = DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+    mm_token_type_ids: Optional[mx.array] = None,
 ) -> Generator[GenerationResult, None, None]:
-    if pixel_values is not None:
-        raise ValueError("Diffusion model vision inputs are not supported yet.")
     if input_ids.shape[0] != 1:
         raise ValueError(
             "Diffusion model streaming generation only supports batch size 1."
@@ -667,6 +666,8 @@ def stream_diffusion_generate(
                 unprocessed_input_ids,
                 attention_mask=encoder_attention_mask,
                 cache=kv_cache,
+                pixel_values=pixel_values if is_prefill else None,
+                mm_token_type_ids=mm_token_type_ids if is_prefill else None,
             )
 
             if is_prefill:
@@ -978,6 +979,7 @@ def stream_diffusion_generate_from_kwargs(
     diffusion_unmasking_width = kwargs.pop(
         "diffusion_unmasking_width", DEFAULT_DIFFUSION_UNMASKING_WIDTH
     )
+    mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     with wired_limit(model, [generation_stream]):
         yield from stream_diffusion_generate(
             model,
@@ -1000,5 +1002,6 @@ def stream_diffusion_generate_from_kwargs(
             diffusion_show_unmasking=diffusion_show_unmasking,
             diffusion_unmasking_interval=diffusion_unmasking_interval,
             diffusion_unmasking_width=diffusion_unmasking_width,
+            mm_token_type_ids=mm_token_type_ids,
         )
         mx.clear_cache()

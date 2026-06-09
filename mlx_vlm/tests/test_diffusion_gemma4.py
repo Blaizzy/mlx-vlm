@@ -801,5 +801,145 @@ class TestDiffusionGemma4(unittest.TestCase):
             from_pretrained.assert_called_once()
 
 
+def tiny_vision_config_dict():
+    config = tiny_config_dict()
+    config["image_token_id"] = 60
+    config["text_config"]["use_bidirectional_attention"] = "vision"
+    config["vision_config"] = {
+        "model_type": "gemma4_vision",
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 4,
+        "patch_size": 2,
+        "pooling_kernel_size": 2,
+        "default_output_length": 1,
+        "position_embedding_size": 8,
+    }
+    return config
+
+
+class TestDiffusionGemma4Vision(unittest.TestCase):
+    def test_image_features_scattered_into_embeddings(self):
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_vision_config_dict())
+        model = Model(config)
+
+        image_token_id = config.image_token_id
+        input_ids = mx.array([[2, image_token_id, 3]])
+        pixel_values = mx.random.uniform(shape=(1, 3, 4, 4))
+
+        text_only = model.get_input_embeddings(input_ids=input_ids).inputs_embeds
+        with_image = model.get_input_embeddings(
+            input_ids=input_ids, pixel_values=pixel_values
+        ).inputs_embeds
+
+        self.assertEqual(with_image.shape, text_only.shape)
+        # Text positions are untouched; image positions carry vision features.
+        self.assertTrue(bool(mx.allclose(with_image[0, 0], text_only[0, 0]).item()))
+        self.assertTrue(bool(mx.allclose(with_image[0, 2], text_only[0, 2]).item()))
+        self.assertFalse(bool(mx.allclose(with_image[0, 1], text_only[0, 1]).item()))
+
+        expected = model.model.encoder.get_image_features(pixel_values).astype(
+            with_image.dtype
+        )
+        self.assertTrue(
+            bool(mx.allclose(with_image[0, 1], expected[0, 0], atol=1e-5).item())
+        )
+
+    def test_vision_block_bidirectional_encoder_mask(self):
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_vision_config_dict())
+        model = Model(config)
+        encoder = model.model.encoder
+
+        # text, image, image, text
+        mm_token_type_ids = mx.array([[0, 1, 1, 0]])
+        h = mx.zeros((1, 4, config.text_config.hidden_size))
+        cache = encoder.make_cache()
+        masks = encoder._make_encoder_masks(
+            h, cache, None, mm_token_type_ids=mm_token_type_ids
+        )
+
+        for mask in masks:
+            self.assertEqual(mask.shape, (1, 1, 4, 4))
+            # Image tokens attend bidirectionally within the block.
+            self.assertTrue(bool(mask[0, 0, 1, 2].item()))
+            # Text tokens stay causal.
+            self.assertFalse(bool(mask[0, 0, 0, 1].item()))
+            self.assertFalse(bool(mask[0, 0, 0, 3].item()))
+            # Later text token sees the whole prefix causally.
+            self.assertTrue(bool(mask[0, 0, 3, 0].item()))
+
+        # Without vision tokens the fast path is preserved.
+        text_masks = encoder._make_encoder_masks(
+            h, cache, None, mm_token_type_ids=mx.zeros((1, 4), dtype=mx.int32)
+        )
+        for mask in text_masks:
+            self.assertFalse(isinstance(mask, mx.array) and mask.shape == (1, 1, 4, 4))
+
+    def test_stream_generate_with_image_inputs(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_vision_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        image_token_id = config.image_token_id
+        input_ids = mx.array([[2, image_token_id, 3]])
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=input_ids,
+                pixel_values=mx.random.uniform(shape=(1, 3, 4, 4)),
+                mm_token_type_ids=mx.array([[0, 1, 0]]),
+                max_tokens=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].generation_tokens, 2)
+        self.assertGreater(responses[-1].diffusion_work_tokens, 0)
+
+    def test_sanitize_handles_vision_weights(self):
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        vision_model = Model(ModelConfig.from_dict(tiny_vision_config_dict()))
+        weights = {
+            "model.encoder.vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight": mx.zeros(
+                (1,)
+            ),
+            "model.encoder.vision_tower.encoder.layers.0.mlp.gate_proj.input_max": mx.zeros(
+                (1,)
+            ),
+            "model.encoder.embed_vision.embedding_projection.weight": mx.zeros((1,)),
+        }
+        sanitized = vision_model.sanitize(dict(weights))
+        self.assertIn(
+            "model.encoder.vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight",
+            sanitized,
+        )
+        self.assertIn(
+            "model.encoder.embed_vision.embedding_projection.weight", sanitized
+        )
+        # Clipping calibration tensors are dropped when clipped linears are off.
+        self.assertNotIn(
+            "model.encoder.vision_tower.encoder.layers.0.mlp.gate_proj.input_max",
+            sanitized,
+        )
+
+        text_model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        sanitized = text_model.sanitize(dict(weights))
+        self.assertEqual(sanitized, {})
+
+
 if __name__ == "__main__":
     unittest.main()

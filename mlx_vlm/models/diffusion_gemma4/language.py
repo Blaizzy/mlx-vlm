@@ -14,8 +14,10 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import StaticPrefixKVCache
+from ..gemma4.gemma4 import MultimodalEmbedder, masked_scatter
 from ..gemma4.language import RMSNormNoScale, logit_softcap
 from ..gemma4.rope_utils import initialize_rope
+from ..gemma4.vision import VisionModel
 from .config import ModelConfig, TextConfig
 
 
@@ -491,6 +493,16 @@ class EncoderModel(nn.Module):
         self.text_config = config.text_config
         self.language_model = EncoderLanguageModel(decoder)
         self._decoder = weakref.proxy(decoder)
+        if config.vision_config is not None:
+            self.vision_tower = VisionModel(config.vision_config)
+            self.embed_vision = MultimodalEmbedder(
+                embedding_dim=config.vision_config.hidden_size,
+                text_hidden_size=config.text_config.hidden_size,
+                eps=config.vision_config.rms_norm_eps,
+            )
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
 
     @property
     def decoder(self):
@@ -507,18 +519,77 @@ class EncoderModel(nn.Module):
                 caches.append(RotatingKVCache(max_size=self.text_config.sliding_window))
         return caches
 
-    def _embed_inputs(self, input_ids):
-        input_ids = mx.where(
-            input_ids == self.config.image_token_id,
+    def get_image_features(self, pixel_values):
+        if self.vision_tower is None or self.embed_vision is None:
+            raise ValueError(
+                "This checkpoint does not include a vision tower; "
+                "image inputs are not supported."
+            )
+        return self.embed_vision(self.vision_tower(pixel_values))
+
+    def _embed_inputs(self, input_ids, pixel_values=None):
+        image_mask = input_ids == self.config.image_token_id
+        llm_input_ids = mx.where(
+            image_mask,
             self.text_config.pad_token_id,
             input_ids,
         )
-        return self.decoder.embed_tokens(input_ids) * self.decoder.embed_scale
+        inputs_embeds = (
+            self.decoder.embed_tokens(llm_input_ids) * self.decoder.embed_scale
+        )
+        if pixel_values is not None:
+            features = self.get_image_features(pixel_values).astype(
+                inputs_embeds.dtype
+            )
+            mask_expanded = mx.broadcast_to(
+                mx.expand_dims(image_mask, -1), inputs_embeds.shape
+            )
+            inputs_embeds = masked_scatter(inputs_embeds, mask_expanded, features)
+        return inputs_embeds
 
-    def _make_encoder_masks(self, h, cache, attention_mask=None):
+    def _vision_block_overlay(self, mm_token_type_ids, seq_len):
+        """Bidirectional attention overlay for image-token blocks.
+
+        Mirrors the reference encoder behavior when
+        ``use_bidirectional_attention == "vision"``: tokens within the same
+        contiguous image block attend to each other bidirectionally, on top of
+        the usual causal (and sliding-window) mask.
+        """
+        if (
+            getattr(self.text_config, "use_bidirectional_attention", None) != "vision"
+            or mm_token_type_ids is None
+            or seq_len <= 1
+            or mm_token_type_ids.shape[-1] != seq_len
+        ):
+            return None
+        is_vision = (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+        if not bool(mx.any(is_vision).item()):
+            return None
+        prev = mx.concatenate(
+            [mx.zeros_like(is_vision[:, :1]), is_vision[:, :-1]], axis=1
+        )
+        starts = is_vision & ~prev
+        group_ids = mx.cumsum(starts.astype(mx.int32), axis=1) - 1
+        block_ids = mx.where(is_vision, group_ids, mx.zeros_like(group_ids) - 1)
+        q_blocks = mx.expand_dims(block_ids, -1)
+        k_blocks = mx.expand_dims(block_ids, -2)
+        return (q_blocks != -1) & (q_blocks == k_blocks)
+
+    def _make_encoder_masks(
+        self, h, cache, attention_mask=None, mm_token_type_ids=None
+    ):
         if isinstance(attention_mask, dict):
             return attention_mask
-        if attention_mask is None:
+
+        B, N, _ = h.shape
+        key_len = N + (_cache_offset(cache[0]) if cache else 0)
+        overlay = self._vision_block_overlay(mm_token_type_ids, N)
+        if overlay is not None and key_len != N:
+            # Image blocks only appear in the prompt prefill, where the cache
+            # is empty; ignore the overlay for continuation encoder passes.
+            overlay = None
+
+        if attention_mask is None and overlay is None:
             return [
                 create_attention_mask(
                     h,
@@ -532,11 +603,12 @@ class EncoderModel(nn.Module):
                 for layer, c in zip(self.decoder.layers, cache)
             ]
 
-        B, N, _ = h.shape
-        key_len = N + (_cache_offset(cache[0]) if cache else 0)
-        key_mask = attention_mask.astype(mx.bool_)
-        if key_mask.shape[-1] != key_len:
-            key_mask = key_mask[..., -key_len:]
+        if attention_mask is None:
+            key_mask = mx.ones((B, key_len), dtype=mx.bool_)
+        else:
+            key_mask = attention_mask.astype(mx.bool_)
+            if key_mask.shape[-1] != key_len:
+                key_mask = key_mask[..., -key_len:]
         positions = mx.arange(key_len)
         q_positions = mx.arange(key_len - N, key_len)[:, None]
         base = q_positions >= positions[None, :]
@@ -547,7 +619,10 @@ class EncoderModel(nn.Module):
                 m = m & (
                     q_positions < positions[None, :] + self.text_config.sliding_window
                 )
-            m = m[None, None, :, :] & key_mask[:, None, None, :]
+            m = m[None, None, :, :]
+            if overlay is not None:
+                m = m | overlay[:, None, :, :]
+            m = m & key_mask[:, None, None, :]
             masks.append(mx.broadcast_to(m, (B, 1, N, key_len)))
         return masks
 
@@ -556,11 +631,15 @@ class EncoderModel(nn.Module):
         input_ids: mx.array,
         attention_mask: Optional[mx.array] = None,
         cache=None,
+        pixel_values: Optional[mx.array] = None,
+        mm_token_type_ids: Optional[mx.array] = None,
     ):
-        h = self._embed_inputs(input_ids)
+        h = self._embed_inputs(input_ids, pixel_values=pixel_values)
         if cache is None:
             cache = self.make_cache()
-        masks = self._make_encoder_masks(h, cache, attention_mask)
+        masks = self._make_encoder_masks(
+            h, cache, attention_mask, mm_token_type_ids=mm_token_type_ids
+        )
 
         for i, (layer, c, mask) in enumerate(zip(self.decoder.layers, cache, masks)):
             h = layer(
@@ -589,10 +668,16 @@ class DiffusionGemma4Backbone(nn.Module):
         self_conditioning_logits: Optional[mx.array] = None,
         self_conditioning_embeddings: Optional[mx.array] = None,
         decoder_attention_mask: Optional[mx.array] = None,
+        pixel_values: Optional[mx.array] = None,
+        mm_token_type_ids: Optional[mx.array] = None,
     ):
         if input_ids is not None:
             _, cache = self.encoder(
-                input_ids, attention_mask=attention_mask, cache=cache
+                input_ids,
+                attention_mask=attention_mask,
+                cache=cache,
+                pixel_values=pixel_values,
+                mm_token_type_ids=mm_token_type_ids,
             )
         elif cache is None:
             raise ValueError("Either input_ids or cache must be provided.")

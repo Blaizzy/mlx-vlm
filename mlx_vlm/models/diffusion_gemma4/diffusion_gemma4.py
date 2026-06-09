@@ -103,15 +103,21 @@ class Model(nn.Module):
         return self.model.encoder.make_cache(max_size=max_size)
 
     def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
-        if pixel_values is not None:
-            raise ValueError("DiffusionGemma4 vision inputs are not supported yet.")
         if input_ids is None:
             raise ValueError("input_ids are required for DiffusionGemma4 embeddings.")
         return InputEmbeddingsFeatures(
-            inputs_embeds=self.model.encoder._embed_inputs(input_ids)
+            inputs_embeds=self.model.encoder._embed_inputs(
+                input_ids, pixel_values=pixel_values
+            )
         )
 
     def sanitize(self, weights):
+        has_vision_tower = self.model.encoder.vision_tower is not None
+        use_clipped = (
+            getattr(self.config.vision_config, "use_clipped_linears", False)
+            if self.config.vision_config is not None
+            else False
+        )
         sanitized = {}
         for key, value in weights.items():
             if "rotary_emb" in key or key == "lm_head.weight":
@@ -119,6 +125,15 @@ class Model(nn.Module):
             if key.startswith("model.encoder.embed_vision.") or key.startswith(
                 "model.encoder.vision_tower."
             ):
+                if not has_vision_tower:
+                    continue
+                # Clipping calibration tensors are only used by clipped linears.
+                if not use_clipped and any(
+                    s in key
+                    for s in ("input_max", "input_min", "output_max", "output_min")
+                ):
+                    continue
+                sanitized[key] = value
                 continue
 
             # Encoder text weights are tied to decoder weights; the checkpoint

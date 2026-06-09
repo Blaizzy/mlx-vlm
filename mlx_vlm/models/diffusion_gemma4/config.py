@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
+from ..gemma4.config import VisionConfig
 from ..qwen3_vl.config import _config_kwargs, _maybe_deserialize_config
 
 
@@ -56,28 +57,6 @@ class TextConfig(BaseModelConfig):
                     "rope_theta": 1000000.0,
                 },
             }
-
-
-@dataclass
-class VisionConfig(BaseModelConfig):
-    model_type: str = "diffusion_gemma4_vision"
-    hidden_size: int = 768
-    intermediate_size: int = 3072
-    num_hidden_layers: int = 16
-    num_attention_heads: int = 12
-    num_key_value_heads: int = 12
-    head_dim: int = 64
-    hidden_activation: str = "gelu_pytorch_tanh"
-    rms_norm_eps: float = 1e-6
-    max_position_embeddings: int = 131072
-    attention_bias: bool = False
-    attention_dropout: float = 0.0
-    rope_parameters: Optional[Dict[str, Any]] = None
-    pooling_kernel_size: int = 3
-    patch_size: int = 16
-    position_embedding_size: int = 10240
-    use_clipped_linears: bool = False
-    standardize: bool = False
 
 
 @dataclass
