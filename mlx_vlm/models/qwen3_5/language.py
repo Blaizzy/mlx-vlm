@@ -1929,6 +1929,28 @@ class LanguageModel(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_model is None:
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
+            )
+        if draft_kind in ("dflash", "eagle3"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return draft_kind is None
+
     def rollback_speculative_cache(
         self,
         caches: List[Any],

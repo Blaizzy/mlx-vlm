@@ -2053,6 +2053,115 @@ class TestModels(unittest.TestCase):
                 self.assertEqual(recorder.visual_pos_masks.shape, (1, 1))
                 self.assertEqual(recorder.visual_pos_masks.tolist(), [[False]])
 
+    def test_qwen3_vl_deepstack_embeds_aligned_on_chunked_prefill(self):
+        """Chunked prefill must realign deepstack embeds per window; otherwise later
+        chunks reuse the first chunk's embeds (offset resets to 0). #856 / #1323."""
+        from types import SimpleNamespace
+
+        from mlx_vlm.models import qwen3_vl, qwen3_vl_moe
+
+        cases = [
+            (
+                qwen3_vl,
+                qwen3_vl.TextConfig(
+                    model_type="qwen3_vl_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+            (
+                qwen3_vl_moe,
+                qwen3_vl_moe.TextConfig(
+                    model_type="qwen3_vl_moe_text",
+                    hidden_size=8,
+                    num_hidden_layers=1,
+                    intermediate_size=16,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    rms_norm_eps=1e-5,
+                    head_dim=4,
+                    vocab_size=32,
+                    decoder_sparse_step=1,
+                    mlp_only_layers=[],
+                    num_experts_per_tok=1,
+                    num_experts=1,
+                    moe_intermediate_size=8,
+                    rope_theta=1000,
+                    max_position_embeddings=1000,
+                    tie_word_embeddings=False,
+                    rope_scaling={"rope_type": "mrope", "mrope_section": [2, 1, 1]},
+                ),
+            ),
+        ]
+
+        class Recorder(nn.Module):
+            def __init__(self, hidden_size):
+                super().__init__()
+                self.hidden_size = hidden_size
+                self.visual_pos_masks = None
+                self.deepstack_visual_embeds = None
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                self.deepstack_visual_embeds = deepstack_visual_embeds
+                return mx.zeros(
+                    (inputs.shape[0], inputs.shape[1], self.hidden_size),
+                    dtype=mx.float32,
+                )
+
+        H = 8
+        # 10 positions, vision tokens at {1,2,4,5,7}; marker embed row i == i+1.
+        full_mask = mx.array(
+            [[False, True, True, False, True, True, False, True, False, False]]
+        )
+        embeds = mx.concatenate(
+            [mx.full((1, H), float(i + 1)) for i in range(5)], axis=0
+        )
+
+        for model_module, text_config in cases:
+            with self.subTest(model_type=text_config.model_type):
+                language_model = model_module.LanguageModel(text_config)
+                language_model.model = Recorder(H)
+
+                # Second chunk: window [4:7); 2 vision tokens precede it -> embeds[2:4].
+                start, window = 4, 3
+                language_model(
+                    mx.zeros((1, window), dtype=mx.int64),
+                    inputs_embeds=mx.zeros((1, window, H)),
+                    cache=[SimpleNamespace(offset=start)],
+                    position_ids=mx.zeros((3, 1, window), dtype=mx.int64),
+                    visual_pos_masks=full_mask,
+                    deepstack_visual_embeds=[embeds],
+                )
+
+                recorder = language_model.model
+                self.assertEqual(recorder.visual_pos_masks.shape, (1, window))
+                self.assertEqual(
+                    recorder.visual_pos_masks.tolist(), [[True, True, False]]
+                )
+                self.assertEqual(recorder.deepstack_visual_embeds[0].shape, (2, H))
+                self.assertEqual(
+                    recorder.deepstack_visual_embeds[0].tolist(),
+                    embeds[2:4].tolist(),
+                )
+
     def _run_deepstack_multi_image_assertions(self, deepstack_fn):
         """Shared assertions for qwen3_vl / qwen3_vl_moe `_deepstack_process`.
 
