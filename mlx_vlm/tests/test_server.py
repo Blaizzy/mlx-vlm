@@ -4087,6 +4087,47 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
+    def test_build_gen_args_uses_model_generation_config_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 1.0
+        assert args.top_p == 0.95
+        assert args.top_k == 64
+
+    def test_build_gen_args_request_sampling_overrides_model_generation_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 0.0
+        assert args.top_p == 1.0
+        assert args.top_k == 0
+
     def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
         req = server.ChatRequest(
             model="demo",
