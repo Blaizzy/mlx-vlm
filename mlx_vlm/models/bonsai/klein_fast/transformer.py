@@ -3,7 +3,6 @@ from __future__ import annotations
 import mlx.core as mx
 from mlx import nn
 
-from mlx_vlm.models.bonsai.constants import ModelConfig
 from mlx_vlm.models.bonsai.klein_fast.blocks import DEFAULT_QUANT_GROUP_SIZE
 from mlx_vlm.models.bonsai.klein_fast.megakernel import (
     Flux2KleinMegakernel,
@@ -12,8 +11,11 @@ from mlx_vlm.models.bonsai.klein_fast.megakernel import (
     PrecisionName,
     eval_megakernel_constants,
 )
-from mlx_vlm.models.bonsai.pos_embed import Flux2PosEmbed
-from mlx_vlm.models.bonsai.time_embed import Flux2TimestepGuidanceEmbeddings
+from mlx_vlm.models.flux2.constants import ModelConfig
+from mlx_vlm.models.flux2.transformer.pos_embed import Flux2PosEmbed
+from mlx_vlm.models.flux2.transformer.timestep_guidance_embeddings import (
+    Flux2TimestepGuidanceEmbeddings,
+)
 
 
 class Flux2KleinFastTransformer(nn.Module):

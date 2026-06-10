@@ -20,16 +20,16 @@ from mlx_vlm.models.bonsai.klein_fast.blocks import (
     DEFAULT_QUANT_GROUP_SIZE,
     _require_native_quantized_matmul,
 )
-from mlx_vlm.models.bonsai.latent import prepare_packed_latents
-from mlx_vlm.models.bonsai.prompt import encode_prompt
-from mlx_vlm.models.bonsai.scheduler import FlowMatchEulerDiscreteScheduler
-from mlx_vlm.models.bonsai.tiling import TilingConfig
-from mlx_vlm.models.bonsai.tokenizer import BonsaiTokenizer
 from mlx_vlm.models.bonsai.weights import (
     load_text_encoder_4bit,
     load_transformer,
     load_vae,
 )
+from mlx_vlm.models.flux2.latent import prepare_packed_latents
+from mlx_vlm.models.flux2.prompt import encode_prompt
+from mlx_vlm.models.flux2.scheduler import FlowMatchEulerDiscreteScheduler
+from mlx_vlm.models.flux2.tiling import TilingConfig
+from mlx_vlm.models.flux2.tokenizer import Flux2Tokenizer
 
 TiledVAE = Literal["auto", "on", "off"]
 
@@ -38,7 +38,7 @@ TiledVAE = Literal["auto", "on", "off"]
 class BonsaiRuntimeConfig:
     evict_text_encoder: bool = True
     evict_transformer: bool = False
-    bucketed_seq_len: bool = True
+    bucketed_seq_len: bool = False
     tiled_vae: TiledVAE = "auto"
     max_sequence_length: int = 512
 
@@ -54,7 +54,7 @@ class BonsaiImage:
         self.variant = get_variant(variant)
         self.model_path = validate_model_layout(model_path)
         self.runtime_config = runtime_config or BonsaiRuntimeConfig()
-        self.tokenizer = BonsaiTokenizer(self.model_path)
+        self.tokenizer = Flux2Tokenizer(self.model_path)
         self.text_encoder = load_text_encoder_4bit(self.model_path)
         self.transformer = None
         self.vae = None
@@ -72,7 +72,7 @@ class BonsaiImage:
         token: str | None = None,
         evict_text_encoder: bool = True,
         evict_transformer: bool = False,
-        bucketed_seq_len: bool = True,
+        bucketed_seq_len: bool = False,
         tiled_vae: TiledVAE = "auto",
         max_sequence_length: int = 512,
     ) -> "BonsaiImage":

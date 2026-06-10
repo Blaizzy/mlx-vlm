@@ -173,6 +173,66 @@ class TestApplyChatTemplateIntegration:
                 }
             ]
 
+    def test_gemma4_unified_formats_image_and_audio_messages(self):
+        """Gemma 4 Unified should use typed multimodal content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the inputs.",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {
+                        "type": "text",
+                        "text": "Describe the inputs.",
+                        "content": "Describe the inputs.",
+                    },
+                    {"type": "audio"},
+                ],
+            }
+        ]
+
+    def test_gemma4_unified_formats_video_messages(self):
+        """Gemma 4 Unified should use typed video content for HF templates."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {
+                        "type": "text",
+                        "text": "Describe the video.",
+                        "content": "Describe the video.",
+                    },
+                ],
+            }
+        ]
+
     def test_text_only_formats_regular_chat_message(self):
         """Text-only models should use regular role/content messages with no image tokens."""
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -185,6 +245,20 @@ class TestApplyChatTemplateIntegration:
         )
 
         assert result == [{"role": "user", "content": "Make a program to find pi"}]
+
+    def test_step3p7_formats_image_patch_token(self):
+        """Step-3.7 prompts should include the placeholder its processor expands."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "step3p7"},
+            "What do you see?",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
 
     def test_tool_call_arguments_json_string_is_normalized(self):
         """OpenAI-style JSON-string tool call arguments should become dicts."""
@@ -519,3 +593,101 @@ def test_apply_chat_template_uses_generic_text_model_fallback():
     )
 
     assert result == "templated"
+
+
+def test_apply_chat_template_defaults_thinking_disabled_when_supported():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+    )
+
+    assert processor.kwargs["enable_thinking"] is False
+    assert result.endswith("<think>\n\n</think>\n\n")
+
+
+def test_apply_chat_template_preserves_explicit_thinking_enabled():
+    class ThinkingProcessor:
+        chat_template = "{{ messages }}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            self.kwargs = kwargs
+            if kwargs.get("enable_thinking") is False:
+                return "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            return "<|im_start|>assistant\n<think>\n"
+
+    processor = ThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert processor.kwargs["enable_thinking"] is True
+    assert result.endswith("<think>\n")
+
+
+class TestModelSpecificPromptContracts:
+    """Guard model-specific multimodal message formats from regressions."""
+
+    def test_ernie4_5_vl_uses_image_url_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "ernie4_5_moe_vl"},
+            "Describe this image.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == [
+            "image_url",
+            "text",
+        ]
+        assert result[0]["content"][1]["text"] == "Describe this image."
+
+    def test_paddleocr_vl_uses_image_before_text(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "paddleocr_vl"},
+            "OCR:",
+            return_messages=True,
+            num_images=2,
+        )
+
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert [item["type"] for item in result[0]["content"]] == [
+            "image",
+            "image",
+            "text",
+        ]
+        assert result[0]["content"][-1]["text"] == "OCR:"

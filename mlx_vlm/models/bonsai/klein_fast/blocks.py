@@ -595,22 +595,26 @@ def _fuse_quantized_linears(
     linears: list[QuantizedLinearKernel],
 ) -> QuantizedLinearKernel:
     return QuantizedLinearKernel(
-        packed_weight=mx.concatenate([l.packed_weight for l in linears], axis=0),
-        scales=mx.concatenate([l.scales for l in linears], axis=0),
-        biases=mx.concatenate([l.biases for l in linears], axis=0),
+        packed_weight=mx.concatenate(
+            [linear.packed_weight for linear in linears], axis=0
+        ),
+        scales=mx.concatenate([linear.scales for linear in linears], axis=0),
+        biases=mx.concatenate([linear.biases for linear in linears], axis=0),
         bits=linears[0].bits,
         group_size=linears[0].group_size,
     )
 
 
 def _fuse_dense_linears(linears: list[DenseLinearKernel]) -> DenseLinearKernel:
-    return DenseLinearKernel(mx.concatenate([l.weight for l in linears], axis=0))
+    return DenseLinearKernel(
+        mx.concatenate([linear.weight for linear in linears], axis=0)
+    )
 
 
 def _fuse_linears(linears: list[LinearKernel]) -> LinearKernel:
-    if all(isinstance(l, QuantizedLinearKernel) for l in linears):
+    if all(isinstance(linear, QuantizedLinearKernel) for linear in linears):
         return _fuse_quantized_linears(linears)
-    if all(isinstance(l, DenseLinearKernel) for l in linears):
+    if all(isinstance(linear, DenseLinearKernel) for linear in linears):
         return _fuse_dense_linears(linears)
     raise TypeError("Cannot fuse mixed linear kernel types")
 

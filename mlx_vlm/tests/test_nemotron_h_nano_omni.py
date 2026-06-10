@@ -140,6 +140,50 @@ def test_model_merges_sound_features_into_input_embeddings():
     )
 
 
+def test_audio_path_handles_nvfp4_uint8_lm_head_scales():
+    """Regression: nvfp4-quantized models pack lm_head.scales as uint8.
+
+    Before the fix, ``_extract_sound_features`` would cast the audio
+    ``input_features`` to ``scales.dtype`` and then crash inside the
+    subsampling Conv2d with::
+
+        ValueError: [conv] Invalid input array with type uint8.
+
+    The fix falls back to ``mx.bfloat16`` when ``scales.dtype`` is an
+    integer packing type (uint8 for nvfp4, uint32 for some other packed
+    modes). This test simulates that quant layout by attaching a uint8
+    ``scales`` attribute to a plain ``lm_head`` and verifying the audio
+    path completes without dtype error.
+    """
+    model = Model(
+        ModelConfig(
+            text_config=tiny_text_config(),
+            vision_config=tiny_vision_config(),
+            sound_config=tiny_sound_config(),
+            projector_hidden_size=32,
+            vit_hidden_size=16,
+            img_context_token_id=98,
+            sound_context_token_id=99,
+        )
+    )
+    model.eval()
+
+    # Simulate an nvfp4-quantized lm_head: presence of .scales with uint8 dtype.
+    model.language_model.lm_head.scales = mx.zeros((1,), dtype=mx.uint8)
+
+    input_ids = mx.array([[1, 99, 99, 99, 2]])
+    input_features = mx.random.normal((1, 17, 16))
+    feature_attention_mask = mx.ones((1, 17), dtype=mx.int32)
+
+    # Pre-fix: this raised ValueError from mx.conv2d.
+    output = model.get_input_embeddings(
+        input_ids,
+        input_features=input_features,
+        feature_attention_mask=feature_attention_mask,
+    )
+    assert np.isfinite(np.array(output.inputs_embeds)).all()
+
+
 def test_model_rejects_sound_token_feature_count_mismatch():
     model = Model(
         ModelConfig(

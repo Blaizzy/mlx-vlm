@@ -7,15 +7,15 @@ import mlx.nn as nn
 from huggingface_hub import hf_hub_download
 from mlx.utils import tree_unflatten
 
-from mlx_vlm.models.bonsai.constants import ModelConfig
 from mlx_vlm.models.bonsai.klein_fast import (
     Flux2KleinFastTransformer,
     Flux2KleinMegakernelSpec,
     find_packed_artifact_dir,
     load_klein_fast_packed_weights_from_disk,
 )
-from mlx_vlm.models.bonsai.qwen.text_encoder import Qwen3TextEncoder
-from mlx_vlm.models.bonsai.vae import BonsaiVAE
+from mlx_vlm.models.flux2.constants import ModelConfig
+from mlx_vlm.models.flux2.qwen.text_encoder import Qwen3TextEncoder
+from mlx_vlm.models.flux2.vae import Flux2VAE
 
 SMALL_DECODER_REPO = "black-forest-labs/FLUX.2-small-decoder"
 SMALL_DECODER_FILE = "diffusion_pytorch_model.safetensors"
@@ -86,8 +86,8 @@ def load_transformer(
     return transformer
 
 
-def load_vae() -> BonsaiVAE:
-    vae = BonsaiVAE()
+def load_vae() -> Flux2VAE:
+    vae = Flux2VAE()
     path = hf_hub_download(repo_id=SMALL_DECODER_REPO, filename=SMALL_DECODER_FILE)
     raw = mx.load(path)
     mapped: dict = {}

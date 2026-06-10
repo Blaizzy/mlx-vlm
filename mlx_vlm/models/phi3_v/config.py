@@ -3,6 +3,8 @@ from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 
+PHI3_V_CHAT_EOS_TOKEN_IDS = [2, 32000, 32007]
+
 
 @dataclass
 class ModelConfig(BaseModelConfig):
@@ -28,7 +30,22 @@ class ModelConfig(BaseModelConfig):
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
-    eos_token_id: Optional[List[int]] = None
+    eos_token_id: Optional[Union[int, List[int]]] = None
+
+    def __post_init__(self):
+        if isinstance(self.eos_token_id, int):
+            eos_token_ids = [self.eos_token_id]
+        elif self.eos_token_id is None:
+            eos_token_ids = []
+        else:
+            eos_token_ids = list(self.eos_token_id)
+
+        if self.vocab_size > max(PHI3_V_CHAT_EOS_TOKEN_IDS):
+            for token_id in PHI3_V_CHAT_EOS_TOKEN_IDS:
+                if token_id not in eos_token_ids:
+                    eos_token_ids.append(token_id)
+
+        self.eos_token_id = eos_token_ids or self.eos_token_id
 
 
 @dataclass

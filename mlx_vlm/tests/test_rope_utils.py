@@ -1,5 +1,7 @@
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
@@ -36,6 +38,32 @@ def _disable_metal_fast_path(fn):
 def _position_ids(batch=2, seq_len=4):
     base = mx.arange(batch * seq_len, dtype=mx.int32).reshape(batch, seq_len)
     return mx.stack([base, base + 3, base + 7])
+
+
+def test_mrope_rotary_embedding_evals_private_helper_arrays_on_init(monkeypatch):
+    eval_args = []
+    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rotary_emb = MRoPERotaryEmbedding(
+                dim=8,
+                mrope_section=[2, 1, 1],
+                style="interleaved",
+            )
+
+    host = Host()
+
+    assert isinstance(host.rotary_emb, nn.Module)
+    assert tree_flatten(host.parameters()) == []
+    assert tree_flatten(host.trainable_parameters()) == []
+    eager_arrays = host.rotary_emb.eager_eval_arrays()
+    assert eager_arrays[0] is host.rotary_emb.inv_freq
+    assert eager_arrays[1] is host.rotary_emb.position_selector
+    assert len(eval_args) == 1
+    assert eval_args[0][0] is eager_arrays[0]
+    assert eval_args[0][1] is eager_arrays[1]
 
 
 @pytest.mark.parametrize(

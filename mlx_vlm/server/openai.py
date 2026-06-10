@@ -19,8 +19,10 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from ..generate import generate, stream_generate
+from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
+from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
-from ..generate.image import generate_image, is_image_generation_model, parse_size
+from ..generate.image import generate_image, parse_size
 from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
@@ -31,6 +33,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -56,6 +59,9 @@ from .schemas import (
     ChatStreamChunk,
     ContentPartOutputText,
     GenerationTimings,
+    ImageEditRequest,
+    ImageEditResponse,
+    ImageEditResponseData,
     ImageGenerationRequest,
     ImageGenerationResponse,
     ImageGenerationResponseData,
@@ -93,6 +99,14 @@ _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".
 def _looks_like_audio_reference(value: str) -> bool:
     return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
         _AUDIO_REFERENCE_SUFFIXES
+    )
+
+
+def _adapter_path_or_inherit(request):
+    return (
+        request.adapter_path
+        if "adapter_path" in request.model_fields_set
+        else _INHERIT_ADAPTER
     )
 
 
@@ -218,6 +232,12 @@ def register_routes(app, deps):
         response_model=ImageGenerationResponse,
         include_in_schema=False,
     )(images_generations_endpoint)
+    app.post("/images/edits", response_model=ImageEditResponse)(images_edits_endpoint)
+    app.post(
+        "/v1/images/edits",
+        response_model=ImageEditResponse,
+        include_in_schema=False,
+    )(images_edits_endpoint)
 
 
 # OpenAI compatile endpoints
@@ -233,6 +253,24 @@ def _resolve_image_size(image_request: ImageGenerationRequest) -> Tuple[int, int
         return image_request.width, image_request.height
     try:
         return parse_size(image_request.size or "512x512")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+def _resolve_optional_image_size(
+    image_request: ImageEditRequest,
+) -> Tuple[int | None, int | None]:
+    if image_request.width is not None or image_request.height is not None:
+        if image_request.width is None or image_request.height is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Both width and height are required when either is set.",
+            )
+        return image_request.width, image_request.height
+    if image_request.size is None:
+        return None, None
+    try:
+        return parse_size(image_request.size)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
@@ -264,18 +302,35 @@ def _image_output_path(
     return None
 
 
+def _image_edit_paths(image_request: ImageEditRequest) -> tuple[str, ...]:
+    if isinstance(image_request.image, str):
+        return (image_request.image,)
+    return tuple(image_request.image)
+
+
+def _image_edit_output_path(
+    image_request: ImageEditRequest,
+    *,
+    index: int,
+    count: int,
+    seed: int,
+) -> Path | None:
+    if image_request.output_path:
+        return _indexed_output_path(
+            Path(image_request.output_path).expanduser(), index, count
+        )
+    if image_request.output_dir:
+        directory = Path(image_request.output_dir).expanduser()
+        return directory / f"edit-{seed}.png"
+    if image_request.response_format == "path":
+        return Path("outputs") / f"edit-{seed}.png"
+    return None
+
+
 async def images_generations_endpoint(request: Request):
     request_start = time.perf_counter()
     body = await request.json()
     image_request = ImageGenerationRequest(**body)
-    if not is_image_generation_model(image_request.model):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Model {image_request.model!r} is not a supported image "
-                "generation model."
-            ),
-        )
     if not image_request.prompt:
         raise HTTPException(status_code=400, detail="Missing prompt.")
 
@@ -293,7 +348,9 @@ async def images_generations_endpoint(request: Request):
         stream=False,
     )
     try:
-        model, _, _ = get_cached_model(image_request.model)
+        model, _, _ = get_cached_model(
+            image_request.model, model_kind="image_generation"
+        )
         generation_lock = runtime.model_cache.get("generation_lock")
 
         def _generate_all():
@@ -318,6 +375,13 @@ async def images_generations_endpoint(request: Request):
                         count=image_request.n,
                         seed=seed,
                     )
+                    extra = {}
+                    if image_request.auto_json_caption is not None:
+                        extra["auto_json_caption"] = image_request.auto_json_caption
+                    if image_request.prompt_expansion_model is not None:
+                        extra["prompt_expansion_model"] = (
+                            image_request.prompt_expansion_model
+                        )
                     core_request = CoreImageGenerationRequest(
                         prompt=image_request.prompt,
                         seed=seed,
@@ -326,6 +390,7 @@ async def images_generations_endpoint(request: Request):
                         height=height,
                         guidance=image_request.guidance,
                         output_format=image_request.output_format,
+                        extra=extra,
                     )
                     result = generate_image(
                         model,
@@ -343,6 +408,7 @@ async def images_generations_endpoint(request: Request):
                 height=result.height,
                 seed=result.seed,
                 path=str(result.path) if result.path is not None else None,
+                revised_prompt=result.metadata.get("revised_prompt"),
             )
             if image_request.response_format == "b64_json":
                 item.b64_json = result.to_b64_json()
@@ -393,11 +459,138 @@ async def images_generations_endpoint(request: Request):
         raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
 
 
+async def images_edits_endpoint(request: Request):
+    request_start = time.perf_counter()
+    body = await request.json()
+    image_request = ImageEditRequest(**body)
+    if not image_request.prompt:
+        raise HTTPException(status_code=400, detail="Missing prompt.")
+
+    width, height = _resolve_optional_image_size(image_request)
+    image_paths = _image_edit_paths(image_request)
+    created = int(time.time())
+    base_seed = (
+        int(image_request.seed)
+        if image_request.seed is not None
+        else random.randrange(2**32)
+    )
+
+    runtime.metrics.begin_request(
+        endpoint="/v1/images/edits",
+        model=image_request.model,
+        stream=False,
+    )
+    try:
+        model, _, _ = get_cached_model(image_request.model, model_kind="image_edit")
+        generation_lock = runtime.model_cache.get("generation_lock")
+
+        def _generate_all():
+            results = []
+            lock = generation_lock
+            if lock is None:
+
+                class _NullLock:
+                    def __enter__(self):
+                        return None
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                lock = _NullLock()
+            with lock:
+                for index in range(image_request.n):
+                    seed = base_seed + index
+                    output_path = _image_edit_output_path(
+                        image_request,
+                        index=index,
+                        count=image_request.n,
+                        seed=seed,
+                    )
+                    core_request = CoreImageEditRequest(
+                        prompt=image_request.prompt,
+                        image_paths=image_paths,
+                        seed=seed,
+                        steps=image_request.steps,
+                        width=width,
+                        height=height,
+                        guidance=image_request.guidance,
+                        output_format=image_request.output_format,
+                    )
+                    result = edit_image(
+                        model,
+                        core_request,
+                        output_path=output_path,
+                    )
+                    results.append(result)
+            return results
+
+        results = _generate_all()
+        data = []
+        for result in results:
+            item = ImageEditResponseData(
+                width=result.width,
+                height=result.height,
+                seed=result.seed,
+                path=str(result.path) if result.path is not None else None,
+            )
+            if image_request.response_format == "b64_json":
+                item.b64_json = result.to_b64_json()
+            data.append(item)
+
+        elapsed = time.perf_counter() - request_start
+        prompt_tokens = results[0].prompt_tokens if results else 0
+        peak_memory = max((r.peak_memory for r in results), default=0.0)
+        envelope = _build_metrics_envelope(
+            endpoint="/v1/images/edits",
+            model=image_request.model,
+            stream=False,
+            backend="image_edit",
+            prompt_tokens=prompt_tokens or 0,
+            completion_tokens=0,
+            generated_tokens=0,
+            request_elapsed_s=elapsed,
+            request_started_s=request_start,
+            peak_memory_gb=peak_memory or None,
+            finish_reason="stop",
+            image_count=len(data),
+        )
+        runtime.metrics.record_success(envelope)
+        response_width = results[0].width if results else width or 0
+        response_height = results[0].height if results else height or 0
+        return ImageEditResponse(
+            created=created,
+            data=data,
+            output_format=image_request.output_format,
+            size=f"{response_width}x{response_height}",
+        )
+    except HTTPException:
+        runtime.metrics.record_failure(
+            endpoint="/v1/images/edits",
+            model=image_request.model,
+            stream=False,
+            error="http_exception",
+        )
+        raise
+    except Exception as e:
+        runtime.metrics.record_failure(
+            endpoint="/v1/images/edits",
+            model=image_request.model,
+            stream=False,
+            error=str(e),
+        )
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=500, detail=f"Image edit failed: {e}")
+
+
 async def responses_input_tokens_endpoint(request: Request):
     body = await request.json()
     openai_request = OpenAIRequest(**body)
     try:
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
         del model
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
@@ -549,7 +742,9 @@ async def responses_endpoint(request: Request):
 
     try:
         # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(openai_request.model)
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
 
         kwargs = {}
 
@@ -768,6 +963,8 @@ async def responses_endpoint(request: Request):
                             tool_module,
                             chat_tools,
                             tool_registry,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
                         )
                     )
                     tool_output_items = [
@@ -983,6 +1180,8 @@ async def responses_endpoint(request: Request):
                         tool_module,
                         chat_tools,
                         tool_registry,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1248,9 +1447,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split
-                        in_thinking = False
-                        accumulated = ""
+                        thinking_state = ThinkingStreamState(
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -1268,35 +1469,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if token is None:
                                 break
                             output_tokens += 1
-                            accumulated += token.text
                             full_output += token.text
                             metrics.record_chunk(token)
 
                             # Detect thinking boundaries
-                            delta_reasoning = None
-                            delta_content = None
-
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
-                            ):
-                                in_thinking = True
-                                accumulated = ""
-                                # Don't emit opening tag tokens
-                            elif in_thinking and (
-                                "<channel|>" in accumulated or "</think>" in accumulated
-                            ):
-                                in_thinking = False
-                                accumulated = ""
-                                # Don't emit closing tag tokens
-                            elif in_thinking:
-                                delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
-                            ):
-                                pass  # Partial tag, don't emit yet
-                            else:
-                                delta_content = token.text
+                            thinking_delta = thinking_state.feed(token.text)
+                            delta_reasoning = thinking_delta.reasoning
+                            delta_content = thinking_delta.content
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -1320,8 +1499,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             # Skip empty deltas (e.g. suppressed tool-call tokens)
                             has_payload = (
-                                delta_content is not None
-                                or delta_reasoning is not None
+                                bool(delta_content)
+                                or bool(delta_reasoning)
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
@@ -1405,6 +1584,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
+                        thinking_state = ThinkingStreamState(
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
@@ -1417,11 +1601,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            if chunk.text:
+                            thinking_delta = thinking_state.feed(chunk.text)
+                            if thinking_delta.content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
-                                            role="assistant", content=chunk.text
+                                            role="assistant",
+                                            content=thinking_delta.content,
+                                            reasoning=thinking_delta.reasoning,
                                         )
                                     )
                                 ]
@@ -1454,7 +1641,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
-                        0, output_tokens - _count_thinking_tag_tokens(metrics_text)
+                        0,
+                        output_tokens
+                        - _count_thinking_tag_tokens(
+                            metrics_text,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/chat/completions",
@@ -1623,11 +1816,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
 
-                reasoning, content = _split_thinking(full_text)
+                reasoning, content = _split_thinking(
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
-                    full_text
+                    full_text,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
                 )
 
                 usage_stats = UsageStats.from_metrics(
@@ -1645,7 +1844,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     if tc["calls"]:
                         parsed_tool_calls = tc["calls"]
                         # Clean thinking tags and control tokens from remaining text
-                        _, clean_remaining = _split_thinking(tc["remaining_text"] or "")
+                        _, clean_remaining = _split_thinking(
+                            tc["remaining_text"] or "",
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
                         if clean_remaining:
                             # Strip model control tokens
                             clean_remaining = re.sub(

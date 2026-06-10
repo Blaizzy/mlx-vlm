@@ -1,7 +1,42 @@
+from functools import partial
 from typing import Optional
 
 import mlx.core as mx
-from mlx_lm.models.gated_delta import compute_g, gated_delta_update  # noqa: F401
+import mlx.nn as nn
+from mlx_lm.models.gated_delta import gated_delta_kernel, gated_delta_ops
+
+
+@partial(mx.compile, shapeless=True)
+def compute_g(A_log, a, dt_bias):
+    return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
+
+
+@partial(mx.compile, shapeless=True)
+def _compute_g_beta(A_log, a, b, dt_bias):
+    return compute_g(A_log, a, dt_bias), mx.sigmoid(b)
+
+
+def gated_delta_update(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    use_kernel: bool = True,
+):
+    g, beta = _compute_g_beta(A_log, a, b, dt_bias)
+    if state is None:
+        B, _, _Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+    return gated_delta_kernel(q, k, v, g, beta, state, mask)
 
 
 def _make_gated_delta_with_states_kernel(has_mask: bool = False):
@@ -153,8 +188,7 @@ def gated_delta_update_with_states(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ):
-    beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
+    g, beta = _compute_g_beta(A_log, a, b, dt_bias)
     if state is None:
         B, _, _Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
@@ -276,6 +310,69 @@ _gated_delta_state_kernel = _make_gated_delta_state_kernel(False)
 _gated_delta_state_kernel_masked = _make_gated_delta_state_kernel(True)
 
 
+def _make_gated_delta_accept_states_kernel():
+    if not mx.metal.is_available():
+        return None
+
+    return mx.fast.metal_kernel(
+        name="qwen3_5_gated_delta_accept_states",
+        input_names=[
+            "intermediate_states",
+            "conv_input",
+            "live_state",
+            "live_conv",
+            "accepted",
+        ],
+        output_names=["state_out", "conv_out"],
+        source=r"""
+            uint idx = thread_position_in_grid.x;
+
+            if (idx < StateTotal) {
+                uint dk = idx % Dk;
+                uint t0 = idx / Dk;
+                uint dv = t0 % Dv;
+                t0 /= Dv;
+                uint hv = t0 % Hv;
+                uint row = t0 / Hv;
+
+                int step = int(accepted[row]);
+                bool use_intermediate = step >= 0 && step < T;
+                StT value;
+                if (use_intermediate) {
+                    value = intermediate_states[
+                        ((((row * T + uint(step)) * Hv + hv) * Dv + dv) * Dk + dk)
+                    ];
+                } else {
+                    value = live_state[((row * Hv + hv) * Dv + dv) * Dk + dk];
+                }
+                state_out[idx] = static_cast<StT>(value);
+            }
+
+            if (idx < ConvTotal) {
+                uint c = idx % C;
+                uint t0 = idx / C;
+                uint win = t0 % ConvW;
+                uint row = t0 / ConvW;
+
+                int step = int(accepted[row]);
+                bool use_intermediate = step >= 0 && step < T;
+                ConvT value;
+                if (use_intermediate) {
+                    value = conv_input[
+                        (row * ConvInputT + uint(step) + 1 + win) * C + c
+                    ];
+                } else {
+                    value = live_conv[(row * ConvW + win) * C + c];
+                }
+                conv_out[idx] = static_cast<ConvT>(value);
+            }
+        """,
+    )
+
+
+_gated_delta_accept_states_kernel = _make_gated_delta_accept_states_kernel()
+
+
 def _gated_delta_state_ops(
     k: mx.array,
     v: mx.array,
@@ -305,6 +402,85 @@ def _gated_delta_state_ops(
     return state
 
 
+def _gated_delta_accept_states_ops(
+    intermediate_states: mx.array,
+    conv_input: mx.array,
+    live_state: mx.array,
+    live_conv: mx.array,
+    accepted: mx.array,
+    kernel_size: int,
+):
+    steps = [int(step) for step in accepted.tolist()]
+    state_rows = []
+    conv_rows = []
+    state_steps = intermediate_states.shape[1]
+    for row, step in enumerate(steps):
+        if 0 <= step < state_steps:
+            state_rows.append(intermediate_states[row, step])
+            conv_rows.append(conv_input[row : row + 1, step + 1 : step + kernel_size])
+        else:
+            state_rows.append(live_state[row])
+            conv_rows.append(live_conv[row : row + 1])
+    return mx.stack(state_rows, axis=0), mx.concatenate(conv_rows, axis=0)
+
+
+def gated_delta_accept_states(
+    intermediate_states: mx.array,
+    conv_input: mx.array,
+    live_state: mx.array,
+    live_conv: mx.array,
+    accepted: mx.array,
+    kernel_size: int,
+    use_kernel: bool = True,
+):
+    if accepted.dtype != mx.int32:
+        accepted = accepted.astype(mx.int32)
+
+    if (
+        not use_kernel
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or _gated_delta_accept_states_kernel is None
+    ):
+        return _gated_delta_accept_states_ops(
+            intermediate_states,
+            conv_input,
+            live_state,
+            live_conv,
+            accepted,
+            kernel_size,
+        )
+
+    rows, state_steps, Hv, Dv, Dk = intermediate_states.shape
+    conv_input_t = conv_input.shape[1]
+    conv_dim = conv_input.shape[-1]
+    conv_window = int(kernel_size) - 1
+    state_total = rows * Hv * Dv * Dk
+    conv_total = rows * conv_window * conv_dim
+    total = max(state_total, conv_total)
+
+    return _gated_delta_accept_states_kernel(
+        inputs=[intermediate_states, conv_input, live_state, live_conv, accepted],
+        template=[
+            ("StT", intermediate_states.dtype),
+            ("ConvT", conv_input.dtype),
+            ("T", state_steps),
+            ("Hv", Hv),
+            ("Dv", Dv),
+            ("Dk", Dk),
+            ("C", conv_dim),
+            ("ConvW", conv_window),
+            ("ConvInputT", conv_input_t),
+            ("StateTotal", state_total),
+            ("ConvTotal", conv_total),
+        ],
+        grid=(total, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[live_state.shape, live_conv.shape],
+        output_dtypes=[intermediate_states.dtype, conv_input.dtype],
+    )
+
+
 def gated_delta_state_update(
     k: mx.array,
     v: mx.array,
@@ -317,8 +493,7 @@ def gated_delta_state_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
 ) -> mx.array:
-    beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
+    g, beta = _compute_g_beta(A_log, a, b, dt_bias)
     if state is None:
         B, _, _Hk, Dk = k.shape
         Hv, Dv = v.shape[-2:]

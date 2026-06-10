@@ -1,5 +1,7 @@
 import base64
 import json
+import os
+import sys
 import time
 from pathlib import Path
 from queue import Queue
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import mlx_vlm.server as server
+import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
@@ -29,6 +32,35 @@ def client():
         yield test_client
 
 
+def _gemma_thinking_channel_chunks():
+    return [
+        server.StreamingToken(text="", token=100, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=45518, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=107, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=101, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=236832, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text="<|channel>thought\n<channel|>7",
+            token=808,
+            logprobs=0.0,
+            finish_reason=None,
+        ),
+        server.StreamingToken(
+            text=" *", token=236743, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="", token=236828, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text=" 8", token=578, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text=" =", token=236743, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="", token=236810, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(text="", token=236825, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text=" 56", token=106, logprobs=0.0, finish_reason="stop"
+        ),
+    ]
+
+
 @pytest.mark.parametrize("value", [224, "22", [1.0], [1.5], [True], [1, 2, 3]])
 def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     response = client.post(
@@ -41,6 +73,21 @@ def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     )
 
     assert response.status_code == 422
+
+
+def test_chat_completions_endpoint_requires_model(client):
+    response = client.post(
+        "/chat/completions",
+        json={"messages": [{"role": "user", "content": "Hello"}]},
+    )
+
+    assert response.status_code == 422
+    detail = response.json().get("detail", [])
+    assert any(err.get("loc") == ["body", "model"] for err in detail)
+
+
+def test_chat_request_schema_requires_model():
+    assert "model" in server.ChatRequest.model_json_schema()["required"]
 
 
 def test_chat_request_schema_allows_one_or_two_resize_shape_values():
@@ -59,6 +106,101 @@ def test_speculative_server_dispatches_mtp_batch_loop():
         speculative_utils.get_speculative_rounds_batch("mtp")
         is speculative_utils._mtp_rounds_batch
     )
+
+
+def test_speculative_server_samples_first_bonus_like_decode_step():
+    seen = {}
+    logits = mx.array(
+        [
+            [[1.0, 2.0, 3.0]],
+            [[4.0, 1.0, 0.0]],
+        ],
+        dtype=mx.float32,
+    )
+
+    def sampler(logprobs):
+        seen["shape"] = logprobs.shape
+        seen["values"] = logprobs
+        return mx.argmax(logprobs, axis=-1)
+
+    tokens = server_generation._sample_last_token(logits, sampler)
+    expected_logprobs = logits[:, -1, :] - mx.logsumexp(
+        logits[:, -1, :], axis=-1, keepdims=True
+    )
+    mx.eval(tokens, seen["values"], expected_logprobs)
+
+    assert seen["shape"] == (2, 3)
+    assert tokens.tolist() == [2, 0]
+    assert bool(mx.allclose(seen["values"], expected_logprobs).item())
+
+
+def test_speculative_server_samples_first_bonus_with_positioned_sampler():
+    seen = {}
+    logits = mx.array(
+        [
+            [[1.0, 2.0, 3.0]],
+            [[4.0, 1.0, 0.0]],
+        ],
+        dtype=mx.float32,
+    )
+
+    class Sampler:
+        def __call__(self, logprobs):
+            raise AssertionError("positioned sampler was not used")
+
+        def sample_target(self, logprobs, *, row_ids, positions):
+            seen["shape"] = logprobs.shape
+            seen["row_ids"] = list(row_ids)
+            seen["positions"] = list(positions)
+            return mx.argmax(logprobs, axis=-1)
+
+    tokens = server_generation._sample_last_token(
+        logits,
+        Sampler(),
+        row_ids=[0, 0],
+        positions=[0, 0],
+    )
+    mx.eval(tokens)
+
+    assert seen == {
+        "shape": (2, 3),
+        "row_ids": [0, 0],
+        "positions": [0, 0],
+    }
+    assert tokens.tolist() == [2, 0]
+
+
+def test_positioned_target_sampler_is_batch_grouping_invariant():
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=42
+    )
+    logits = mx.array(
+        [
+            [0.0, 1.0, 2.0, 3.0],
+            [3.0, 2.0, 1.0, 0.0],
+        ],
+        dtype=mx.float32,
+    )
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    batched = sampler.sample_target(
+        logprobs,
+        row_ids=[0, 0],
+        positions=[5, 5],
+    )
+    single_0 = sampler.sample_target(
+        logprobs[0:1],
+        row_ids=[0],
+        positions=[5],
+    )
+    single_1 = sampler.sample_target(
+        logprobs[1:2],
+        row_ids=[0],
+        positions=[5],
+    )
+    mx.eval(batched, single_0, single_1)
+
+    assert batched.tolist() == [single_0.item(), single_1.item()]
 
 
 def test_speculative_server_dispatches_eagle3_batch_loop():
@@ -174,6 +316,38 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
 
     monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "bad")
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
+
+
+def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
+    class FakeResponseGenerator:
+        def __init__(self, model_path, adapter_path=None, **kwargs):
+            self.model_path = model_path
+            self.adapter_path = adapter_path
+            self.model = SimpleNamespace()
+            self.processor = SimpleNamespace()
+            self.config = SimpleNamespace(model_type="qwen2_vl")
+
+        def wait_until_ready(self):
+            return self.model, self.processor, self.config
+
+        def stop_and_join(self):
+            pass
+
+    monkeypatch.setattr(server._app_module, "ResponseGenerator", FakeResponseGenerator)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+
+    server.get_cached_model("demo-model", "adapter-a")
+    server.get_cached_model("demo-model")
+
+    assert server.runtime.model_cache["cache_key"] == (
+        "demo-model",
+        "adapter-a",
+        "auto",
+    )
+    assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
 def _unstarted_response_generator():
@@ -518,6 +692,70 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
     assert "missing/weights" not in ids
 
 
+def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+    )
+    monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == [
+        {
+            "id": "/models/local-qwen",
+            "object": "model",
+            "created": response.json()["data"][0]["created"],
+        }
+    ]
+
+
+def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
+    def repo(repo_id, file_names):
+        return SimpleNamespace(
+            repo_id=repo_id,
+            repo_type="model",
+            last_modified=123.0,
+            refs={
+                "main": SimpleNamespace(
+                    files=[
+                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
+                        for file_name in file_names
+                    ]
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        lambda: SimpleNamespace(
+            repos=[
+                repo(
+                    "local/sharded-model",
+                    [
+                        "config.json",
+                        "model.safetensors.index.json",
+                        "tokenizer_config.json",
+                    ],
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setitem(server.runtime.model_cache, "model_path", "local/sharded-model")
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert [model["id"] for model in response.json()["data"]].count(
+        "local/sharded-model"
+    ) == 1
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
@@ -540,12 +778,16 @@ def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
 
 def test_images_generations_returns_b64_json(client, monkeypatch):
     calls = []
+    cache_calls = []
 
-    monkeypatch.setattr(server_openai, "is_image_generation_model", lambda model: True)
+    def fake_get_cached_model(model, **kwargs):
+        cache_calls.append((model, kwargs))
+        return SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")
+
     monkeypatch.setattr(
         server,
         "get_cached_model",
-        lambda model: (SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")),
+        fake_get_cached_model,
     )
 
     def fake_generate_image(model, request, **kwargs):
@@ -573,14 +815,64 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert [item["seed"] for item in payload["data"]] == [10, 11]
     assert all(item["b64_json"] for item in payload["data"])
     assert [call.seed for call in calls] == [10, 11]
+    assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
 
 
-def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
-    monkeypatch.setattr(server_openai, "is_image_generation_model", lambda model: True)
+def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
+    calls = []
+
     monkeypatch.setattr(
         server,
         "get_cached_model",
-        lambda model: (SimpleNamespace(), None, SimpleNamespace(model_type="bonsai")),
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="ideogram4"),
+        ),
+    )
+
+    def fake_generate_image(model, request, **kwargs):
+        calls.append(request)
+        result = _fake_image_result(seed=request.seed)
+        result.metadata["revised_prompt"] = '{"compositional_deconstruction":{}}'
+        return result
+
+    monkeypatch.setattr(server_openai, "generate_image", fake_generate_image)
+
+    response = client.post(
+        "/v1/images/generations",
+        json={
+            "model": "ideogram-ai/ideogram-4-fp8",
+            "prompt": "A red cube.",
+            "seed": 10,
+            "size": "256x256",
+            "steps": 1,
+            "auto_json_caption": True,
+            "prompt_expansion_model": "tiny-text-model",
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls[0].extra == {
+        "auto_json_caption": True,
+        "prompt_expansion_model": "tiny-text-model",
+    }
+    assert (
+        response.json()["data"][0]["revised_prompt"]
+        == '{"compositional_deconstruction":{}}'
+    )
+
+
+def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="bonsai"),
+        ),
     )
 
     def fake_generate_image(model, request, **kwargs):
@@ -606,6 +898,87 @@ def test_images_generations_writes_paths(client, monkeypatch, tmp_path):
     payload = response.json()
     paths = [Path(item["path"]) for item in payload["data"]]
     assert [path.name for path in paths] == ["image-20.png", "image-21.png"]
+    assert all(path.exists() for path in paths)
+    assert all(item["b64_json"] is None for item in payload["data"])
+
+
+def test_images_edits_returns_b64_json(client, monkeypatch):
+    calls = []
+    cache_calls = []
+
+    def fake_get_cached_model(model, **kwargs):
+        cache_calls.append((model, kwargs))
+        return SimpleNamespace(), None, SimpleNamespace(model_type="flux2")
+
+    monkeypatch.setattr(server, "get_cached_model", fake_get_cached_model)
+
+    def fake_edit_image(model, request, **kwargs):
+        calls.append((request, kwargs))
+        return _fake_image_result(seed=request.seed)
+
+    monkeypatch.setattr(server_openai, "edit_image", fake_edit_image)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "black-forest-labs/FLUX.2-klein-9b-kv",
+            "prompt": "add sunglasses",
+            "image": ["reference.png"],
+            "n": 2,
+            "seed": 30,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "b64_json",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["size"] == "16x16"
+    assert [item["seed"] for item in payload["data"]] == [30, 31]
+    assert all(item["b64_json"] for item in payload["data"])
+    assert [call[0].seed for call in calls] == [30, 31]
+    assert calls[0][0].image_paths == ("reference.png",)
+    assert cache_calls == [
+        ("black-forest-labs/FLUX.2-klein-9b-kv", {"model_kind": "image_edit"})
+    ]
+
+
+def test_images_edits_writes_paths(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(model_type="flux2"),
+        ),
+    )
+
+    def fake_edit_image(model, request, **kwargs):
+        return _fake_image_result(seed=request.seed, output_path=kwargs["output_path"])
+
+    monkeypatch.setattr(server_openai, "edit_image", fake_edit_image)
+
+    response = client.post(
+        "/v1/images/edits",
+        json={
+            "model": "black-forest-labs/FLUX.2-klein-9b-kv",
+            "prompt": "add sunglasses",
+            "image": "reference.png",
+            "n": 2,
+            "seed": 40,
+            "size": "256x256",
+            "steps": 1,
+            "response_format": "path",
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    paths = [Path(item["path"]) for item in payload["data"]]
+    assert [path.name for path in paths] == ["edit-40.png", "edit-41.png"]
     assert all(path.exists() for path in paths)
     assert all(item["b64_json"] is None for item in payload["data"])
 
@@ -852,6 +1225,67 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
     assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
+
+
+@pytest.mark.parametrize(
+    ("include_adapter", "adapter_path", "expected_adapter"),
+    [
+        (False, None, server._INHERIT_ADAPTER),
+        (True, "adapter-a", "adapter-a"),
+        (True, None, None),
+    ],
+)
+def test_responses_endpoint_forwards_adapter_path_or_inherits(
+    client, monkeypatch, include_adapter, adapter_path, expected_adapter
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=1,
+        generation_tokens=1,
+        total_tokens=2,
+    )
+    get_cached_model = MagicMock(return_value=(model, processor, config))
+    payload = {"model": "demo", "input": "Hello"}
+    if include_adapter:
+        payload["adapter_path"] = adapter_path
+
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server, "get_cached_model", get_cached_model)
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+    monkeypatch.setattr(server, "generate", MagicMock(return_value=result))
+
+    response = client.post("/responses", json=payload)
+
+    assert response.status_code == 200
+    assert get_cached_model.call_args.args == ("demo", expected_adapter)
+
+
+def test_responses_input_tokens_endpoint_forwards_adapter_path(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    get_cached_model = MagicMock(return_value=(model, processor, config))
+    response_generator = SimpleNamespace(
+        _cpu_preprocess=MagicMock(
+            return_value={"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
+        )
+    )
+
+    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
+    monkeypatch.setattr(server, "get_cached_model", get_cached_model)
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(
+        "/responses/input_tokens",
+        json={"model": "demo", "input": "Hello", "adapter_path": "adapter-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 3}
+    assert get_cached_model.call_args.args == ("demo", "adapter-a")
 
 
 def test_responses_previous_response_id_replays_stored_items(client):
@@ -1257,6 +1691,121 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     assert captured["args"].min_p == 0.08
     assert captured["args"].repetition_penalty == 1.15
     assert captured["args"].logit_bias == {12: -1.5}
+
+
+def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                _gemma_thinking_channel_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "What's 7*8?"}],
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+    assert "<|channel>" not in response.text
+    assert "<channel|>" not in response.text
+
+
+def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
+    assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
 
 
 @pytest.mark.parametrize(
@@ -1697,6 +2246,49 @@ def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
 
 
+def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
+    client, monkeypatch
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=4, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "system": "Use short answers.",
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    {
+                        "role": "system",
+                        "content": [{"type": "text", "text": "Be precise."}],
+                    },
+                    {"role": "user", "content": "Introduce the project."},
+                ],
+                "max_tokens": 12,
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {"role": "system", "content": "Use short answers.\nBe precise."},
+        {"role": "user", "content": "Hello"},
+        {"role": "user", "content": "Introduce the project."},
+    ]
+
+
 def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
@@ -2018,6 +2610,115 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
     assert '"cache_read_input_tokens": 2' in body
     assert '"input_tokens": 1' in body
     assert "event: message_stop" in body
+
+
+def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                _gemma_thinking_channel_chunks()
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "What's 7*8?"}],
+                "max_tokens": 16,
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = [
+        event["delta"] for event in events if event.get("type") == "content_block_delta"
+    ]
+
+    assert "".join(delta.get("text") or "" for delta in deltas) == "7 * 8 = 56"
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == ""
+    assert "<|channel>" not in response.text
+    assert "<channel|>" not in response.text
+
+
+def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+
+    class FakeResponseGenerator:
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                [
+                    server.StreamingToken(
+                        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 16,
+                "stream": True,
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    events = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    deltas = [
+        event["delta"] for event in events if event.get("type") == "content_block_delta"
+    ]
+
+    assert "".join(delta.get("thinking") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
+    assert "".join(delta.get("text") or "" for delta in deltas) == "Custom answer."
 
 
 def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
@@ -2783,6 +3484,330 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
+    def test_run_routes_mtp_through_batch_generator(self, monkeypatch):
+        batch_state = {}
+        draft_model = object()
+
+        class FakeDetokenizer:
+            def __init__(self):
+                self.last_segment = ""
+
+            def reset(self):
+                self.last_segment = ""
+
+            def add_token(self, token):
+                self.last_segment = str(token)
+
+            def finalize(self):
+                pass
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, **kwargs):
+                del args
+                batch_state["kwargs"] = kwargs
+                self._next_uid = 1
+                self._active = {}
+                self.next_active_sizes = []
+                batch_state["instance"] = self
+
+            def insert(self, *args, **kwargs):
+                del args, kwargs
+                uid = self._next_uid
+                self._next_uid += 1
+                self._active[uid] = True
+                return (uid,)
+
+            def remove(self, uid):
+                return self._active.pop(uid, None) is not None
+
+            @property
+            def unprocessed_prompts(self):
+                return []
+
+            @property
+            def has_pending_prompts(self):
+                return False
+
+            def next(self, **kwargs):
+                del kwargs
+                self.next_active_sizes.append(len(self._active))
+                responses = [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=uid + 100,
+                        token_logprob=0.0,
+                        finish_reason="length",
+                    )
+                    for uid in sorted(self._active)
+                ]
+                self._active.clear()
+                return [], responses
+
+        monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(
+            server_generation,
+            "_get_draft_block_size_from_env",
+            lambda: 6,
+        )
+        monkeypatch.setattr(
+            server_generation,
+            "make_streaming_detokenizer",
+            lambda _: FakeDetokenizer(),
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.model_path = "demo"
+        gen.adapter_path = None
+        gen.model = None
+        gen.processor = None
+        gen.config = None
+        gen.stop_tokens = set()
+        gen.vision_cache = None
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.kv_bits = None
+        gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+        gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+        gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+        gen.top_logprobs_k = 0
+        gen.apc_manager = None
+        gen.tokenizer = SimpleNamespace()
+        gen.requests = Queue()
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+        gen._cancelled = set()
+        gen._cancel_lock = Lock()
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = draft_model
+            gen.draft_kind = "mtp"
+            gen.tokenizer = SimpleNamespace()
+
+        gen._initialize_model = fake_initialize_model
+        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
+        gen._gpu_embed = lambda raw_inputs, images=None: (
+            mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
+            {},
+        )
+
+        request_queues = []
+        for request_id in range(2):
+            rqueue = Queue()
+            request_queues.append(rqueue)
+            gen.requests.put(
+                (
+                    rqueue,
+                    {"request_id": request_id},
+                    1,
+                    server.GenerationArguments(max_tokens=1, temperature=0),
+                    None,
+                )
+            )
+
+        worker = Thread(target=gen._run, daemon=True)
+        worker.start()
+
+        try:
+            for rqueue in request_queues:
+                ctx = rqueue.get(timeout=1)
+                assert isinstance(ctx, server.GenerationContext)
+                item = rqueue.get(timeout=1)
+                assert item.finish_reason == "length"
+                assert rqueue.get(timeout=1) is None
+        finally:
+            gen._stop = True
+            gen.requests.put(None)
+            worker.join(timeout=2)
+
+        kwargs = batch_state["kwargs"]
+        assert kwargs["draft_model"] is draft_model
+        assert kwargs["draft_kind"] == "mtp"
+        assert kwargs["draft_block_size"] == 6
+        assert kwargs["greedy_sampling"] is True
+        assert kwargs["compute_logprobs"] is False
+        assert batch_state["instance"].next_active_sizes == [2]
+
+    def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
+        calls = []
+        draft_model = object()
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = draft_model
+            gen.draft_kind = "mtp"
+            gen.tokenizer = SimpleNamespace()
+
+        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
+            del idle_timeout
+            calls.append((active, coalesce_s))
+            return [], True
+
+        gen._initialize_model = fake_initialize_model
+        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
+        gen._collect_pending_requests = fake_collect_pending_requests
+
+        gen._run()
+
+        assert calls == [(False, 0.037)]
+
+    def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
+        created = []
+        next_uid = [1]
+
+        class FakeDetokenizer:
+            def __init__(self):
+                self.last_segment = ""
+
+            def reset(self):
+                self.last_segment = ""
+
+            def add_token(self, token):
+                self.last_segment = str(token)
+
+            def finalize(self):
+                pass
+
+        class FakeBatchGenerator:
+            def __init__(self, *args, **kwargs):
+                del args
+                self.sampler = kwargs.get("sampler")
+                self.closed = False
+                self._active = {}
+                created.append(self)
+
+            def insert(self, *args, **kwargs):
+                del args, kwargs
+                uid = next_uid[0]
+                next_uid[0] += 1
+                self._active[uid] = True
+                return (uid,)
+
+            @property
+            def has_work(self):
+                return bool(self._active)
+
+            @property
+            def unprocessed_prompts(self):
+                return []
+
+            @property
+            def has_pending_prompts(self):
+                return False
+
+            def next(self, **kwargs):
+                del kwargs
+                responses = [
+                    SimpleNamespace(
+                        uid=uid,
+                        token=uid,
+                        token_logprob=0.0,
+                        finish_reason="length",
+                    )
+                    for uid in list(self._active)
+                ]
+                self._active.clear()
+                return [], responses
+
+            def remove(self, uid):
+                return self._active.pop(uid, None) is not None
+
+            def close(self):
+                self.closed = True
+
+        monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+        monkeypatch.setattr(
+            server_generation,
+            "make_streaming_detokenizer",
+            lambda _: FakeDetokenizer(),
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.model_path = "demo"
+        gen.adapter_path = None
+        gen.model = None
+        gen.processor = None
+        gen.config = None
+        gen.stop_tokens = set()
+        gen.vision_cache = None
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.kv_bits = None
+        gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+        gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+        gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+        gen.top_logprobs_k = 0
+        gen.apc_manager = None
+        gen.tokenizer = SimpleNamespace()
+        gen.requests = Queue()
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+        gen._cancelled = set()
+        gen._cancel_lock = Lock()
+        gen._make_sampler = lambda args: f"sampler-{args.temperature}"
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = None
+            gen.draft_kind = None
+            gen.tokenizer = SimpleNamespace()
+
+        gen._initialize_model = fake_initialize_model
+        gen._gpu_embed = lambda raw_inputs, images=None: (
+            mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
+            {},
+        )
+
+        worker = Thread(target=gen._run, daemon=True)
+        worker.start()
+
+        def run_request(request_id, temperature):
+            rqueue = Queue()
+            gen.requests.put(
+                (
+                    rqueue,
+                    {"request_id": request_id},
+                    1,
+                    server.GenerationArguments(max_tokens=1, temperature=temperature),
+                    None,
+                )
+            )
+            ctx = rqueue.get(timeout=1)
+            assert isinstance(ctx, server.GenerationContext)
+            item = rqueue.get(timeout=1)
+            assert item.finish_reason == "length"
+            assert rqueue.get(timeout=1) is None
+
+        try:
+            run_request(1, 0.0)
+            run_request(2, 0.6)
+        finally:
+            gen._stop = True
+            gen.requests.put(None)
+            worker.join(timeout=2)
+
+        assert [bg.sampler for bg in created] == ["sampler-0.0", "sampler-0.6"]
+        assert created[0].closed is True
+
     def test_step_attaches_prompt_metrics_from_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
@@ -2947,6 +3972,70 @@ class TestResponseGenerator:
         assert calls == [({5: -0.5}, 1.2, 512, 0.2, 256, 0.3, 128)]
         assert processors == ["repetition-processor", custom_processor]
 
+    def test_server_generation_delays_structured_processors_for_thinking_prompt(
+        self, monkeypatch
+    ):
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        repetition_processor = lambda tokens, logits: logits
+        structured_processor = lambda tokens, logits: logits
+
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [repetition_processor],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 10, 3]], dtype=mx.int32),
+        )
+
+        assert processors[0] is repetition_processor
+        assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
+        assert processors[1].processor is structured_processor
+
+    def test_server_generation_keeps_structured_processors_active_without_open_thinking(
+        self, monkeypatch
+    ):
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        structured_processor = lambda tokens, logits: logits
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 10, 3, 20]], dtype=mx.int32),
+        )
+
+        assert processors == [structured_processor]
+
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
             max_output_tokens=128,
@@ -3000,6 +4089,47 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_uses_model_generation_config_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 1.0
+        assert args.top_p == 0.95
+        assert args.top_k == 64
+
+    def test_build_gen_args_request_sampling_overrides_model_generation_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 0.0
+        assert args.top_p == 1.0
+        assert args.top_k == 0
 
     def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
         req = server.ChatRequest(
@@ -3087,6 +4217,26 @@ class TestResponseGenerator:
 
         assert server._build_gen_args(req).enable_thinking is False
 
+    def test_build_gen_args_uses_server_thinking_token_defaults_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
+        monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
+        monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert "thinking_budget" not in req.model_fields_set
+        assert "thinking_start_token" not in req.model_fields_set
+        assert "thinking_end_token" not in req.model_fields_set
+        args = server._build_gen_args(req)
+
+        assert args.thinking_budget == 256
+        assert args.thinking_start_token == "<analysis>"
+        assert args.thinking_end_token == "</analysis>"
+
     def test_build_gen_args_request_thinking_overrides_server_default(
         self, monkeypatch
     ):
@@ -3107,6 +4257,77 @@ class TestResponseGenerator:
         )
 
         assert server._build_gen_args(req).enable_thinking is True
+
+    def test_build_gen_args_request_thinking_tokens_override_server_defaults(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
+        monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
+        monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            thinking_budget=32,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.thinking_budget == 32
+        assert args.thinking_start_token == "<think>"
+        assert args.thinking_end_token == "</think>"
+
+    def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        for env_var in (
+            "MLX_VLM_ENABLE_THINKING",
+            "MLX_VLM_PRELOAD_MODEL",
+            "MLX_VLM_PRELOAD_ADAPTER",
+            "MLX_VLM_VISION_CACHE_SIZE",
+            "MLX_VLM_MAX_TOKENS",
+            "MLX_VLM_THINKING_BUDGET",
+            "MLX_VLM_THINKING_START_TOKEN",
+            "MLX_VLM_THINKING_END_TOKEN",
+            "PREFILL_STEP_SIZE",
+            "KV_GROUP_SIZE",
+            "KV_QUANT_SCHEME",
+            "QUANTIZED_KV_START",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mlx_vlm.server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8080",
+                "--model",
+                "demo",
+                "--enable-thinking",
+                "--thinking-budget",
+                "128",
+                "--thinking-start-token",
+                "<|START_THINKING|>",
+                "--thinking-eos-token",
+                "<|END_THINKING|>",
+            ],
+        )
+        run_calls = []
+        monkeypatch.setattr(
+            server_cli.uvicorn,
+            "run",
+            lambda *args, **kwargs: run_calls.append((args, kwargs)),
+        )
+
+        server_cli.main()
+
+        assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
+        assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
+        assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
+        assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
+        assert run_calls[0][1]["host"] == "127.0.0.1"
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
@@ -3206,6 +4427,24 @@ class TestResponseGenerator:
 
         assert schema["required"] == ["animal"]
 
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_chat_response_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
+            text=None,
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_extract_responses_text_format_json_object_aliases(self, format_type):
+        req = SimpleNamespace(
+            response_format=None,
+            text={"format": {"type": format_type}},
+        )
+
+        assert server._extract_response_format_schema(req) == {"type": "object"}
+
     def test_build_structured_logits_processors_uses_tokenizer(self):
         req = SimpleNamespace(
             response_format={
@@ -3215,6 +4454,24 @@ class TestResponseGenerator:
                     "schema": {"type": "object"},
                 },
             },
+            text=None,
+        )
+        proc = SimpleNamespace(tokenizer=object())
+
+        with patch.object(
+            server, "build_json_schema_logits_processor", return_value="processor"
+        ) as mock_build:
+            processors = server._build_structured_logits_processors(req, proc)
+
+        assert processors == ["processor"]
+        assert mock_build.call_args.args[1] == {"type": "object"}
+
+    @pytest.mark.parametrize("format_type", ["json_object", "object"])
+    def test_build_structured_logits_processors_for_json_object_aliases(
+        self, format_type
+    ):
+        req = SimpleNamespace(
+            response_format={"type": format_type},
             text=None,
         )
         proc = SimpleNamespace(tokenizer=object())
@@ -3260,6 +4517,90 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(text)
         assert reasoning == "Only thinking."
         assert content == ""
+
+    def test_custom_thinking_markers(self):
+        text = "<analysis>Custom reasoning.</analysis>Custom answer."
+        reasoning, content = server._split_thinking(text, "<analysis>", "</analysis>")
+        assert reasoning == "Custom reasoning."
+        assert content == "Custom answer."
+
+    def test_cohere_thinking_markers_strip_text_markers(self):
+        text = (
+            "<|START_THINKING|>Custom reasoning.<|END_THINKING|>"
+            "<|START_TEXT|>Custom answer.<|END_TEXT|>"
+        )
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Custom reasoning."
+        assert content == "Custom answer."
+
+
+class TestThinkingStreamState:
+    """Tests for streaming thinking tag parsing."""
+
+    @pytest.mark.parametrize("enable_thinking", [False, True])
+    def test_gemma_channel_markers_and_content_in_same_delta(self, enable_thinking):
+        state = server.ThinkingStreamState(enable_thinking=enable_thinking)
+        reasoning = []
+        content = []
+
+        for token in _gemma_thinking_channel_chunks():
+            delta = state.feed(token.text)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == ""
+        assert "".join(content) == "7 * 8 = 56"
+
+    def test_think_close_can_emit_reasoning_tail_and_content(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+
+        first = state.feed("thinking")
+        second = state.feed(" tail</think>\n\nAnswer")
+
+        assert first.reasoning == "thinking"
+        assert first.content is None
+        assert first.thinking_closed is False
+        assert second.reasoning == " tail"
+        assert second.content == "Answer"
+        assert second.thinking_closed is True
+
+    def test_custom_markers_split_same_delta_content(self):
+        state = server.ThinkingStreamState(
+            enable_thinking=False,
+            thinking_start_token="<analysis>",
+            thinking_end_token="</analysis>",
+        )
+
+        first = state.feed("<ana")
+        second = state.feed("lysis>Custom reasoning.</analysis>Custom answer.")
+
+        assert first.reasoning is None
+        assert first.content is None
+        assert second.reasoning == "Custom reasoning."
+        assert second.content == "Custom answer."
+        assert second.thinking_closed is True
+
+    def test_cohere_text_markers_are_suppressed_across_chunks(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+        reasoning = []
+        content = []
+
+        for chunk in [
+            "Custom reasoning.",
+            "<|END_THINKING|><|START_",
+            "TEXT|>Custom answer.<|END_",
+            "TEXT|>",
+        ]:
+            delta = state.feed(chunk)
+            if delta.reasoning:
+                reasoning.append(delta.reasoning)
+            if delta.content:
+                content.append(delta.content)
+
+        assert "".join(reasoning) == "Custom reasoning."
+        assert "".join(content) == "Custom answer."
 
 
 class TestChatMessageSchema:
@@ -3355,6 +4696,30 @@ class TestProcessToolCalls:
         result = server.process_tool_calls("Just text.", module, [])
         assert result["calls"] == []
         assert result["remaining_text"] == "Just text."
+
+    def test_parser_can_return_multiple_tool_calls(self):
+        module = SimpleNamespace(
+            tool_call_start="<tc>",
+            tool_call_end="</tc>",
+            parse_tool_call=lambda call, tools: [
+                {"name": "grep", "arguments": {"pattern": "foo"}},
+                {"name": "read", "arguments": {"path": "file.py"}},
+            ],
+        )
+
+        result = server.process_tool_calls("Before <tc>[]</tc> after", module, [])
+
+        assert result["remaining_text"] == "Before   after"
+        assert [call["function"]["name"] for call in result["calls"]] == [
+            "grep",
+            "read",
+        ]
+        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
+            "pattern": "foo"
+        }
+        assert json.loads(result["calls"][1]["function"]["arguments"]) == {
+            "path": "file.py"
+        }
 
 
 class TestCountThinkingTagTokens:

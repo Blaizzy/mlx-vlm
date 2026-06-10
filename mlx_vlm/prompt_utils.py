@@ -1,3 +1,4 @@
+import inspect
 import json
 from enum import Enum
 from functools import partial
@@ -15,6 +16,7 @@ class MessageFormat(Enum):
     LIST_WITH_IMAGE_TYPE_TEXT_IMAGE_LAST = "list_with_image_type_text_image_last"
     IMAGE_TOKEN = "image_token"
     IMAGE_TOKEN_PIPE = "image_token_pipe"
+    IMAGE_PATCH_TOKEN = "image_patch_token"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
     IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
@@ -59,9 +61,11 @@ MODEL_CONFIG = {
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
+    "locateanything": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "gemma4_unified": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
@@ -72,6 +76,7 @@ MODEL_CONFIG = {
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -93,7 +98,9 @@ MODEL_CONFIG = {
     "plamo2vl": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
     "laguna": MessageFormat.TEXT_ONLY,
+    "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.TEXT_ONLY,
+    "hrm_text": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -260,6 +267,7 @@ class MessageFormatter:
             "qwen3_5_moe",
             "qwen3_omni_moe",
             "gemma4",
+            "gemma4_unified",
             "minicpmv4_6",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, role, **kwargs)
@@ -287,6 +295,9 @@ class MessageFormatter:
             ),
             MessageFormat.IMAGE_TOKEN_PIPE: partial(
                 self._format_with_token, token="<|image|>"
+            ),
+            MessageFormat.IMAGE_PATCH_TOKEN: partial(
+                self._format_with_token, token="<im_patch>"
             ),
             MessageFormat.START_IMAGE_TOKEN: partial(
                 self._format_with_token, token="<start_of_image>", image_first=False
@@ -342,6 +353,9 @@ class MessageFormatter:
             )
             image_tokens = [image_builder()] * num_images
             content = image_tokens + content if image_first else content + image_tokens
+
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content = content + [MessageBuilder.audio_message()] * num_audios
 
         return {"role": role, "content": content}
 
@@ -654,6 +668,17 @@ def get_chat_template(
 
     chat_template_override = kwargs.get("chat_template", None)
 
+    def _supports_template_kw(template_processor: Any, name: str) -> bool:
+        try:
+            signature = inspect.signature(template_processor.apply_chat_template)
+        except (TypeError, ValueError):
+            return False
+
+        return name in signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
     try:
         template_processor = None
         if (
@@ -686,12 +711,18 @@ def get_chat_template(
         if template_processor is None:
             return _messages_to_plain_prompt()
 
+        template_kwargs = dict(kwargs)
+        if "enable_thinking" not in template_kwargs and _supports_template_kw(
+            template_processor, "enable_thinking"
+        ):
+            template_kwargs["enable_thinking"] = False
+
         try:
             return template_processor.apply_chat_template(
                 messages,
                 tokenize=tokenize,
                 add_generation_prompt=add_generation_prompt,
-                **kwargs,
+                **template_kwargs,
             )
         except ValueError as e:
             if chat_template_override is None and _missing_template_error(e):

@@ -37,22 +37,15 @@ def _clip_display_width(text: str, max_width: int) -> str:
 
     out = []
     width = 0
-    clipped = False
     for char in text:
         if unicodedata.combining(char):
             char_width = 0
         else:
             char_width = 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
         if width + char_width > max_width:
-            clipped = True
             break
         out.append(char)
         width += char_width
-
-    if clipped and max_width >= 3:
-        while out and _display_width("".join(out)) > max_width - 3:
-            out.pop()
-        out.append("...")
 
     return "".join(out)
 
@@ -175,17 +168,11 @@ def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
         kwargs["diffusion_full_canvas"] = True
     if args.diffusion_min_canvas_length is not None:
         kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
-    if args.diffusion_static_cache:
-        kwargs["diffusion_static_cache"] = True
     if args.diffusion_sampler != "auto-regressive-euler":
         kwargs["diffusion_sampler"] = args.diffusion_sampler
-        kwargs["diffusion_threshold"] = args.diffusion_threshold
-    if args.diffusion_compile:
-        kwargs["diffusion_compile"] = True
-    if args.diffusion_show_unmasking:
-        kwargs["diffusion_show_unmasking"] = True
-        kwargs["diffusion_unmasking_interval"] = args.diffusion_unmasking_interval
-        kwargs["diffusion_unmasking_width"] = args.diffusion_unmasking_width
+        kwargs["diffusion_threshold"] = (
+            0.9 if args.threshold is None else args.threshold
+        )
     return kwargs
 
 
@@ -476,8 +463,6 @@ def _decode_diffusion_masked_draft(
     flush_tokens()
     text = " ".join(piece for piece in pieces if piece)
     text = text.replace("\r", "\\r").replace("\n", "\\n")
-    if max_chars and max_chars > 0 and len(text) > max_chars:
-        return text[: max_chars - 1] + "..."
     return text
 
 

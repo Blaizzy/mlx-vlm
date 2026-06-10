@@ -87,6 +87,389 @@ def _mock_ip(**extra):
     )()
 
 
+class TestGemma4UnifiedProcessor(unittest.TestCase):
+    class _Tokenizer:
+        model_input_names = ["input_ids", "attention_mask"]
+        bos_token = "<bos>"
+        eos_token = "<eos>"
+        pad_token = "<pad>"
+        pad_token_id = 0
+        image_token = "<|image|>"
+        image_token_id = 100
+        boi_token = "<boi>"
+        eoi_token = "<eoi>"
+        audio_token = "<|audio|>"
+        audio_token_id = 101
+        boa_token = "<boa>"
+        eoa_token = "<eoa>"
+        video_token = "<|video|>"
+        video_token_id = 102
+        chat_template = "mock"
+
+        def __init__(self):
+            self.last_text = None
+
+        @property
+        def init_kwargs(self):
+            return {}
+
+        def convert_tokens_to_ids(self, token):
+            if isinstance(token, list):
+                return [self.convert_tokens_to_ids(t) for t in token]
+            return {
+                self.image_token: self.image_token_id,
+                self.audio_token: self.audio_token_id,
+                self.video_token: self.video_token_id,
+            }.get(token, 0)
+
+        def add_special_tokens(self, tokens):
+            return None
+
+        def apply_chat_template(
+            self,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **kwargs,
+        ):
+            parts = ["<bos>"]
+            for message in messages:
+                content = message["content"]
+                if not isinstance(content, list):
+                    parts.append(str(content))
+                    continue
+                for item in content:
+                    if item["type"] == "image":
+                        parts.append(self.image_token)
+                    elif item["type"] == "audio":
+                        parts.append(self.audio_token)
+                    elif item["type"] == "video":
+                        parts.append(self.video_token)
+                    else:
+                        parts.append(item.get("text", item.get("content", "")))
+            if add_generation_prompt:
+                parts.append("<assistant>")
+            rendered = "".join(parts)
+            return self(rendered) if tokenize else rendered
+
+        def __call__(self, text, **kwargs):
+            self.last_text = text
+            texts = [text] if isinstance(text, str) else text
+            special_tokens = {
+                self.image_token: self.image_token_id,
+                self.audio_token: self.audio_token_id,
+                self.video_token: self.video_token_id,
+            }
+            input_ids = []
+            attention_mask = []
+            for item in texts:
+                ids = []
+                i = 0
+                while i < len(item):
+                    matched = False
+                    for token, token_id in special_tokens.items():
+                        if token and item.startswith(token, i):
+                            ids.append(token_id)
+                            i += len(token)
+                            matched = True
+                            break
+                    if not matched:
+                        ids.append((ord(item[i]) % 50) + 1)
+                        i += 1
+                input_ids.append(ids)
+                attention_mask.append([1] * len(ids))
+            return {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+            }
+
+    def _make_gemma4_unified_processor(
+        self, image_processor=None, video_processor=None
+    ):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+            Gemma4UnifiedProcessor,
+        )
+
+        tokenizer = self._Tokenizer()
+        if image_processor is None:
+            image_processor = Gemma4UnifiedImageProcessor(
+                patch_size=2,
+                pooling_kernel_size=2,
+                max_soft_tokens=4,
+                do_resize=False,
+                do_rescale=False,
+            )
+        processor = Gemma4UnifiedProcessor.__new__(Gemma4UnifiedProcessor)
+        processor.tokenizer = tokenizer
+        processor.image_processor = image_processor
+        processor.feature_extractor = None
+        processor.video_processor = video_processor
+        processor.image_seq_length = 4
+        processor.audio_seq_length = 750
+        processor.audio_ms_per_token = 40
+        processor.image_token_id = tokenizer.image_token_id
+        processor.boi_token = tokenizer.boi_token
+        processor.eoi_token = tokenizer.eoi_token
+        processor.image_token = tokenizer.image_token
+        processor.audio_token_id = tokenizer.audio_token_id
+        processor.audio_token = tokenizer.audio_token
+        processor.boa_token = tokenizer.boa_token
+        processor.eoa_token = tokenizer.eoa_token
+        processor.video_token = tokenizer.video_token
+        processor.video_token_id = tokenizer.video_token_id
+        processor.full_image_sequence = (
+            tokenizer.boi_token + tokenizer.image_token * 4 + tokenizer.eoi_token
+        )
+        processor.full_audio_sequence = (
+            tokenizer.boa_token + tokenizer.audio_token * 750 + tokenizer.eoa_token
+        )
+        return processor, tokenizer
+
+    def test_image_processor_outputs_merged_patches_and_positions(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+        )
+
+        processor = Gemma4UnifiedImageProcessor(
+            patch_size=2,
+            pooling_kernel_size=2,
+            max_soft_tokens=4,
+            do_resize=False,
+            do_rescale=False,
+        )
+        image = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8))
+
+        data, num_soft_tokens = processor(image)
+
+        self.assertEqual(data["pixel_values"].shape, (1, 4, 48))
+        self.assertEqual(data["image_position_ids"].shape, (1, 4, 2))
+        self.assertEqual(num_soft_tokens, [4])
+        self.assertEqual(
+            data["image_position_ids"][0].tolist(),
+            [[0, 0], [1, 0], [0, 1], [1, 1]],
+        )
+
+    def test_video_processor_outputs_merged_patches_and_positions(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        processor = Gemma4UnifiedVideoProcessor(
+            patch_size=2,
+            pooling_kernel_size=2,
+            max_soft_tokens=70,
+            do_resize=False,
+            do_rescale=False,
+        )
+        video = np.zeros((2, 3, 4, 8), dtype=np.uint8)
+
+        data = processor([video], fps=[1.0])
+
+        self.assertEqual(data["pixel_values_videos"].shape, (2, 70, 48))
+        self.assertEqual(data["video_position_ids"].shape, (2, 70, 2))
+        self.assertEqual(data["num_frames_per_video"], [2])
+        self.assertEqual(data["num_soft_tokens_per_frame"], [2])
+        self.assertEqual(
+            data["video_position_ids"][0, :4].tolist(),
+            [[0, 0], [1, 0], [-1, -1], [-1, -1]],
+        )
+        self.assertTrue(np.all(data["video_position_ids"][0, 2:] == -1))
+
+    def test_video_processor_tolerates_extra_hf_config_keys(self):
+        # Regression: extra HF config keys must be ignored, not rejected.
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        # The edited base class, and the unified subclass that delegates to it.
+        for cls in (Gemma4VideoProcessor, Gemma4UnifiedVideoProcessor):
+            processor = cls(
+                patch_size=16,
+                pooling_kernel_size=3,
+                max_soft_tokens=70,
+                num_frames=32,
+                do_rescale=True,
+                rescale_factor=1 / 255,
+                do_normalize=True,
+                image_mean=[0.0, 0.0, 0.0],
+                image_std=[1.0, 1.0, 1.0],
+                # extra HF keys the processor must ignore
+                do_convert_rgb=True,
+                do_sample_frames=True,
+                resample=3,
+                return_metadata=False,
+            )
+
+            self.assertEqual(processor.max_soft_tokens, 70)
+            self.assertEqual(processor.num_frames, 32)
+
+    def test_audio_feature_extractor_chunks_waveforms(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedAudioFeatureExtractor,
+        )
+
+        extractor = Gemma4UnifiedAudioFeatureExtractor(
+            audio_samples_per_token=4,
+            feature_size=4,
+        )
+
+        result = extractor(
+            [
+                np.arange(6, dtype=np.float32),
+                np.arange(9, dtype=np.float32),
+            ]
+        )
+
+        self.assertEqual(result["input_features"].shape, (2, 3, 4))
+        self.assertEqual(
+            result["input_features_mask"].tolist(),
+            [[True, True, False], [True, True, True]],
+        )
+
+    def test_apply_chat_template_returns_multimodal_mlx_inputs(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+        )
+
+        processor, tokenizer = self._make_gemma4_unified_processor(
+            image_processor=Gemma4UnifiedImageProcessor(
+                patch_size=2,
+                pooling_kernel_size=2,
+                max_soft_tokens=4,
+                do_resize=False,
+                do_rescale=False,
+            ),
+        )
+        image = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8))
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": "Describe this image in detail."},
+                ],
+            }
+        ]
+
+        result = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            return_tensors="mlx",
+            enable_thinking=False,
+        )
+
+        self.assertIsInstance(result["input_ids"], mx.array)
+        self.assertIsInstance(result["pixel_values"], mx.array)
+        self.assertIn("mm_token_type_ids", result)
+        self.assertEqual(int(mx.sum(result["mm_token_type_ids"] == 1).item()), 4)
+        self.assertEqual(result["pixel_values"].shape, (1, 4, 48))
+        self.assertEqual(result["image_position_ids"].shape, (1, 4, 2))
+        self.assertIn(
+            "<boi><|image|><|image|><|image|><|image|><eoi>", tokenizer.last_text[0]
+        )
+
+    def test_call_returns_patchified_video_inputs(self):
+        import mlx.core as mx
+
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        processor, tokenizer = self._make_gemma4_unified_processor(
+            video_processor=Gemma4UnifiedVideoProcessor(
+                patch_size=2,
+                pooling_kernel_size=2,
+                max_soft_tokens=70,
+                do_resize=False,
+                do_rescale=False,
+            ),
+        )
+        video = np.zeros((2, 3, 4, 8), dtype=np.uint8)
+
+        result = processor(
+            text=[tokenizer.video_token + "describe"],
+            videos=[video],
+            fps=[1.0],
+        )
+
+        self.assertIsInstance(result["pixel_values_videos"], mx.array)
+        self.assertEqual(result["pixel_values_videos"].shape, (2, 70, 48))
+        self.assertEqual(result["video_position_ids"].shape, (2, 70, 2))
+        self.assertEqual(int(mx.sum(result["mm_token_type_ids"] == 2).item()), 4)
+        self.assertIn("<boi><|video|><|video|><eoi>", tokenizer.last_text[0])
+
+    def test_apply_chat_template_renders_media_placeholder_without_tokenizing(self):
+        processor, _ = self._make_gemma4_unified_processor()
+        rendered = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": "https://example.com/rabbit.jpg"},
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                }
+            ],
+            tokenize=False,
+            enable_thinking=False,
+        )
+
+        self.assertIn("<|image|>", rendered)
+
+    def test_apply_chat_template_renders_video_placeholder_without_tokenizing(self):
+        processor, _ = self._make_gemma4_unified_processor()
+        rendered = processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": "clip.mp4"},
+                        {"type": "text", "text": "Describe this video."},
+                    ],
+                }
+            ],
+            tokenize=False,
+            enable_thinking=False,
+        )
+
+        self.assertIn("<|video|>", rendered)
+
+    def test_call_returns_hf_compatible_mm_token_type_ids(self):
+        processor, tokenizer = self._make_gemma4_unified_processor()
+
+        result = processor(
+            text=[
+                tokenizer.image_token
+                + tokenizer.video_token
+                + tokenizer.audio_token
+                + "describe"
+            ]
+        )
+
+        self.assertEqual(result["mm_token_type_ids"].tolist()[0][:3], [1, 2, 3])
+
+    def test_prepare_inputs_respects_mm_token_type_ids_override(self):
+        from mlx_vlm.utils import prepare_inputs
+
+        processor, tokenizer = self._make_gemma4_unified_processor()
+        image = Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8))
+
+        result = prepare_inputs(
+            processor,
+            images=[image],
+            prompts=tokenizer.image_token + "describe",
+            return_mm_token_type_ids=False,
+        )
+
+        self.assertNotIn("mm_token_type_ids", result)
+
+
 # ── Base class with shared test_with_image / test_text_only ───────────────────
 
 
@@ -1168,6 +1551,47 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
         self.assertEqual(processor.image_end_token, "[IMG_END]")
 
 
+class TestStep3VLProcessor(unittest.TestCase):
+    def test_from_pretrained_uses_fixed_tokenizer(self):
+        from mlx_vlm.models.step3p7.processing_step3p7 import Step3VLProcessor
+        from mlx_vlm.tokenizer_utils import BPEStreamingDetokenizer
+
+        tokenizer = _mock_tokenizer(
+            chat_template="template",
+            vocab={"Got": 0, "Ġit": 1},
+            backend_tokenizer=SimpleNamespace(decoder="bad"),
+        )
+
+        def _fake_init(self, tokenizer=None, chat_template=None, **kwargs):
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+
+        with (
+            patch(
+                "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+            ) as from_pretrained,
+            patch.object(Step3VLProcessor, "__init__", _fake_init),
+        ):
+            processor = Step3VLProcessor.from_pretrained(
+                "step-model", trust_remote_code=True
+            )
+
+        from_pretrained.assert_called_once_with(
+            "step-model",
+            trust_remote_code=True,
+            fix_mistral_regex=True,
+        )
+        self.assertIs(processor.tokenizer, tokenizer)
+        self.assertIs(processor.detokenizer_class, BPEStreamingDetokenizer)
+        self.assertIn("ByteLevel", repr(tokenizer.backend_tokenizer.decoder))
+
+        processor.detokenizer = object()
+        processor.detokenizer.add_token(0)
+        processor.detokenizer.add_token(1)
+        processor.detokenizer.finalize()
+        self.assertEqual(processor.detokenizer.text, "Got it")
+
+
 class TestMultiModalityProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.multi_modality.processing_multi_modality import (
@@ -1305,6 +1729,90 @@ class TestErnie4_5VLProcessor(_ProcessorTestBase, unittest.TestCase):
         )
 
 
+class TestPaddleOCRVLProcessor(unittest.TestCase):
+    """Regression tests for PaddleOCR-VL processor loading."""
+
+    def test_from_pretrained_loads_preprocessor_geometry(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.paddleocr_vl.processing_paddleocr_vl import (
+            PaddleOCRVLProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            chat_template=None,
+            **kwargs,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.chat_template = chat_template
+            self.image_token = (
+                "<|IMAGE_PLACEHOLDER|>"
+                if not hasattr(tokenizer, "image_token")
+                else tokenizer.image_token
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            (path / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "min_pixels": 64,
+                        "max_pixels": 4096,
+                        "patch_size": 16,
+                        "temporal_patch_size": 2,
+                        "merge_size": 4,
+                        "image_mean": [0.1, 0.2, 0.3],
+                        "image_std": [0.9, 0.8, 0.7],
+                        "do_convert_rgb": False,
+                    }
+                )
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(image_token="<paddle-image>"),
+                ),
+                patch.object(PaddleOCRVLProcessor, "__init__", _fake_init),
+            ):
+                processor = PaddleOCRVLProcessor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.image_token, "<paddle-image>")
+        self.assertEqual(processor.image_processor.min_pixels, 64)
+        self.assertEqual(processor.image_processor.max_pixels, 4096)
+        self.assertEqual(processor.image_processor.patch_size, 16)
+        self.assertEqual(processor.image_processor.temporal_patch_size, 2)
+        self.assertEqual(processor.image_processor.merge_size, 4)
+        self.assertEqual(processor.image_processor.image_mean, [0.1, 0.2, 0.3])
+        self.assertEqual(processor.image_processor.image_std, [0.9, 0.8, 0.7])
+        self.assertFalse(processor.image_processor.do_convert_rgb)
+
+    def test_load_image_processor_returns_none(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.utils import load_image_processor
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "paddleocr_vl"})
+            )
+            image_processor = load_image_processor(path)
+
+        self.assertIsNone(image_processor)
+
+
 class TestToMlxHelper(unittest.TestCase):
     def test_converts_lists_and_numpy(self):
         import mlx.core as mx
@@ -1335,6 +1843,28 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(23, 43, 2), 264)
         self.assertEqual(_num_image_tokens_from_patch_grid(1, 1, 2), 1)
         self.assertEqual(_num_image_tokens_from_patch_grid(7, 9, 4), 6)
+
+    def test_numpy_image_processor_outputs_packed_patches(self):
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
+            Lfm2VlNumpyImageProcessor,
+            _num_image_tokens_from_patch_grid,
+        )
+
+        processor = Lfm2VlNumpyImageProcessor(
+            encoder_patch_size=16,
+            downsample_factor=2,
+            min_image_tokens=64,
+            max_image_tokens=256,
+            max_num_patches=1024,
+        )
+
+        result = processor(_make_image(), return_tensors="np")
+
+        self.assertEqual(result["pixel_values"].shape, (1, 1024, 768))
+        self.assertEqual(result["pixel_attention_mask"].shape, (1, 1024))
+        self.assertEqual(result["spatial_shapes"].tolist(), [[16, 16]])
+        self.assertEqual(int(result["pixel_attention_mask"].sum()), 256)
+        self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
 
     def test_scalar_image_rows_and_cols_are_supported(self):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import _patched_call
@@ -1390,19 +1920,22 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            (Path(tmpdir) / "preprocessor_config.json").write_text(
+            (Path(tmpdir) / "processor_config.json").write_text(
                 json.dumps(
                     {
-                        "image_processor_type": "Lfm2VlImageProcessorFast",
-                        "do_resize": False,
-                        "do_image_splitting": True,
-                        "do_normalize": True,
-                        "do_rescale": True,
-                        "image_mean": [0.5, 0.5, 0.5],
-                        "image_std": [0.5, 0.5, 0.5],
-                        "max_num_patches": 1024,
-                        "patch_size": 16,
-                        "return_row_col_info": True,
+                        "image_processor": {
+                            "image_processor_type": "Lfm2VlImageProcessorFast",
+                            "do_resize": False,
+                            "do_image_splitting": True,
+                            "do_normalize": True,
+                            "do_rescale": True,
+                            "image_mean": [0.5, 0.5, 0.5],
+                            "image_std": [0.5, 0.5, 0.5],
+                            "max_num_patches": 1024,
+                            "patch_size": 16,
+                            "return_row_col_info": True,
+                        },
+                        "processor_class": "Lfm2VlProcessor",
                     }
                 )
             )
@@ -1654,6 +2187,16 @@ class TestErnie4_5VLPatch(unittest.TestCase):
         )
 
 
+class TestPaddleOCRVLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "paddleocr_vl",
+            "mlx_vlm.models.paddleocr_vl",
+            "PaddleOCRVLProcessor",
+        )
+
+
 class TestQwen3_5Patch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
@@ -1882,6 +2425,99 @@ class TestPatchChainsForUnknownModelType(unittest.TestCase):
             )
             with self.assertRaises(Exception):
                 AutoProcessor.from_pretrained(tmpdir)
+
+
+class TestLocateAnythingProcessor(unittest.TestCase):
+    def test_save_pretrained_round_trips_custom_config(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from transformers import PreTrainedTokenizerBase
+
+        from mlx_vlm.models.locateanything.image_processing_locateanything import (
+            LocateAnythingImageProcessor,
+        )
+        from mlx_vlm.models.locateanything.processing_locateanything import (
+            LocateAnythingProcessor,
+        )
+
+        class DummyTokenizer(PreTrainedTokenizerBase):
+            model_input_names = ["input_ids", "attention_mask"]
+            vocab_files_names = {}
+
+            def __init__(self, chat_template=None):
+                super().__init__(chat_template=chat_template)
+                self.eos_token = "<eos>"
+                self.pad_token = "<pad>"
+
+            def save_pretrained(self, save_directory, **kwargs):
+                path = Path(save_directory) / "tokenizer_config.json"
+                path.write_text(
+                    json.dumps({"tokenizer_class": "DummyTokenizer"}),
+                    encoding="utf-8",
+                )
+                return (str(path),)
+
+            def batch_decode(self, *args, **kwargs):
+                return []
+
+            def decode(self, *args, **kwargs):
+                return ""
+
+            def convert_tokens_to_ids(self, token):
+                return 1
+
+            def __call__(self, *args, **kwargs):
+                return {"input_ids": [[1]], "attention_mask": [[1]]}
+
+        chat_template = "{{ messages }}"
+        processor = LocateAnythingProcessor(
+            image_processor=LocateAnythingImageProcessor(
+                patch_size=28,
+                merge_kernel_size=[2, 4],
+                in_token_limit=1234,
+            ),
+            tokenizer=DummyTokenizer(chat_template=chat_template),
+            chat_template=chat_template,
+        )
+
+        with TemporaryDirectory() as tmp:
+            saved_files = processor.save_pretrained(tmp)
+
+            processor_config = json.loads(
+                (Path(tmp) / "processor_config.json").read_text(encoding="utf-8")
+            )
+            preprocessor_config = json.loads(
+                (Path(tmp) / "preprocessor_config.json").read_text(encoding="utf-8")
+            )
+            chat_template_config = json.loads(
+                (Path(tmp) / "chat_template.json").read_text(encoding="utf-8")
+            )
+
+            self.assertIn(str(Path(tmp) / "processor_config.json"), saved_files)
+            self.assertEqual(
+                processor_config["processor_class"],
+                "LocateAnythingProcessor",
+            )
+            self.assertEqual(processor_config["chat_template"], chat_template)
+            self.assertEqual(preprocessor_config["patch_size"], 28)
+            self.assertEqual(preprocessor_config["merge_kernel_size"], [2, 4])
+            self.assertEqual(preprocessor_config["in_token_limit"], 1234)
+            self.assertEqual(chat_template_config["chat_template"], chat_template)
+
+            with patch(
+                "mlx_vlm.models.locateanything.processing_locateanything."
+                "AutoTokenizer.from_pretrained",
+                return_value=DummyTokenizer(),
+            ):
+                reloaded = LocateAnythingProcessor.from_pretrained(tmp)
+
+            self.assertEqual(reloaded.image_processor.patch_size, 28)
+            self.assertEqual(reloaded.image_processor.merge_kernel_size, [2, 4])
+            self.assertEqual(reloaded.image_processor.in_token_limit, 1234)
+            self.assertEqual(reloaded.chat_template, chat_template)
+            self.assertEqual(reloaded.tokenizer.chat_template, chat_template)
 
 
 if __name__ == "__main__":
