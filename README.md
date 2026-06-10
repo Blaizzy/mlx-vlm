@@ -337,12 +337,14 @@ Configure `pi`, Hermes, and opencode to use the local MLX-VLM server and the
 supported models currently available in your Hugging Face cache:
 
 ```sh
-mlx_vlm.configure_clients --base-url http://127.0.0.1:8080/v1
+mlx_vlm.setup --base-url http://127.0.0.1:8080/v1
 ```
 
 The command updates `~/.pi/agent/models.json`, `~/.hermes/config.yaml`, and
 `~/.config/opencode/opencode.json`, creating `.bak-*` backups first. Use
-`--dry-run` to preview the detected model count and target files.
+`--client pi`, `--client hermes`, or `--client opencode` to configure one
+client; `--client all` is the default. Use `--dry-run` to preview the detected
+model count and target files.
 
 #### Server Options
 

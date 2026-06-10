@@ -13,6 +13,7 @@ if __name__ == "__main__":
         "chat_ui": "chat_ui",
         "server": "server",
         "video_generate": "video_generate",
+        "setup": "setup",
         "configure_clients": "configure_clients",
         "configure-clients": "configure_clients",
     }

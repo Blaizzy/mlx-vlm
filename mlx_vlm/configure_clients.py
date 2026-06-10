@@ -441,7 +441,7 @@ def configure_clients(args: argparse.Namespace) -> list[tuple[str, Path]]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Configure pi, Hermes, and opencode to use the local MLX-VLM "
+            "Set up pi, Hermes, and opencode to use the local MLX-VLM "
             "OpenAI-compatible server and cached HF models."
         )
     )
@@ -469,10 +469,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Display name for the local provider (default: {DEFAULT_PROVIDER_NAME}).",
     )
     parser.add_argument(
-        "--clients",
+        "--client",
+        dest="clients",
         type=_parse_clients,
         default=CLIENTS,
-        help="Comma-separated clients to configure: pi,hermes,opencode,all.",
+        help=(
+            "Client(s) to configure: pi, hermes, opencode, or all. "
+            "Comma-separated values are accepted. Default: all."
+        ),
+    )
+    parser.add_argument(
+        "--clients",
+        dest="clients",
+        type=_parse_clients,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--default-model",
