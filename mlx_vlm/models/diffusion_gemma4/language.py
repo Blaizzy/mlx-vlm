@@ -15,7 +15,7 @@ from ..base import (
 )
 from ..cache import StaticPrefixKVCache
 from ..gemma4.gemma4 import MultimodalEmbedder, masked_scatter
-from ..gemma4.language import RMSNormNoScale, logit_softcap
+from ..gemma4.language import RMSNormNoScale
 from ..gemma4.rope_utils import initialize_rope
 from ..gemma4.vision import VisionModel
 from .config import ModelConfig, TextConfig
@@ -24,6 +24,15 @@ from .config import ModelConfig, TextConfig
 @partial(mx.compile, shapeless=True)
 def geglu(gate, x):
     return nn.gelu_approx(gate) * x
+
+
+def make_compiled_softcap(softcap: float):
+    """Fused fp32 upcast + tanh softcap (one pass over the vocab logits)."""
+
+    def _softcap(x):
+        return mx.tanh(x.astype(mx.float32) / softcap) * softcap
+
+    return mx.compile(_softcap, shapeless=True)
 
 
 class GeGLU(nn.Module):
@@ -723,6 +732,7 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = DiffusionGemma4Backbone(self.config)
         self.final_logit_softcapping = args.final_logit_softcapping
+        self._softcap = make_compiled_softcap(float(args.final_logit_softcapping))
 
     @property
     def layers(self):
@@ -752,7 +762,7 @@ class LanguageModel(nn.Module):
             decoder_attention_mask=decoder_attention_mask,
         )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
-        logits = logit_softcap(self.final_logit_softcapping, logits.astype(mx.float32))
+        logits = self._softcap(logits)
         return LanguageModelOutput(logits=logits, hidden_states=[hidden_states])
 
     @property

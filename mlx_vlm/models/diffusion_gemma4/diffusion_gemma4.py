@@ -2,9 +2,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
-from ..gemma4.language import logit_softcap
 from .config import ModelConfig
-from .language import DiffusionGemma4Backbone
+from .language import DiffusionGemma4Backbone, make_compiled_softcap
 from .visualizer import make_unmasking_visualizer
 
 
@@ -42,7 +41,7 @@ class _LanguageModelView:
             decoder_attention_mask=kwargs.get("decoder_attention_mask"),
         )
         logits = self._parent.model.decoder.embed_tokens.as_linear(hidden_states)
-        logits = logit_softcap(self._parent.final_logit_softcapping, logits)
+        logits = self._parent._softcap(logits)
         return LanguageModelOutput(logits=logits, hidden_states=[hidden_states])
 
     @property
@@ -67,6 +66,7 @@ class Model(nn.Module):
         self.model = DiffusionGemma4Backbone(config)
         self.language_model = _LanguageModelView(self)
         self.final_logit_softcapping = config.text_config.final_logit_softcapping
+        self._softcap = make_compiled_softcap(float(self.final_logit_softcapping))
 
     def __call__(
         self,
@@ -93,7 +93,7 @@ class Model(nn.Module):
             decoder_attention_mask=decoder_attention_mask,
         )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
-        logits = logit_softcap(self.final_logit_softcapping, logits)
+        logits = self._softcap(logits)
         return LanguageModelOutput(logits=logits, hidden_states=[hidden_states])
 
     @property

@@ -167,7 +167,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         entropy, self_conditioning_embeddings = (
             _diffusion_entropy_and_soft_embeddings(
                 self_conditioning_logits,
-                model.model.decoder.embed_tokens,
+                model.model.decoder.embed_tokens.weight,
                 model.model.decoder.embed_scale,
             )
         )
