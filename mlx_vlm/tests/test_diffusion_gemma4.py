@@ -100,6 +100,28 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(loaded["model_type"], "diffusion_gemma4")
         self.assertEqual(loaded["generation_config"], generation_config)
 
+        # Masked-diffusion configs (mask_token_id trait) attach it too.
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "config.json").write_text(
+                json.dumps({"model_type": "llada2_moe", "mask_token_id": 156895})
+            )
+            Path(tmpdir, "generation_config.json").write_text(
+                json.dumps(generation_config)
+            )
+            loaded = load_config(Path(tmpdir))
+        self.assertEqual(loaded["generation_config"], generation_config)
+
+        # AR models keep generation_config.json out of the model config.
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "config.json").write_text(
+                json.dumps({"model_type": "gemma4"})
+            )
+            Path(tmpdir, "generation_config.json").write_text(
+                json.dumps(generation_config)
+            )
+            loaded = load_config(Path(tmpdir))
+        self.assertNotIn("generation_config", loaded)
+
     def test_forward_shape(self):
         from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
 

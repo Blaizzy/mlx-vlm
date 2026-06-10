@@ -408,6 +408,16 @@ def _is_text_only_config(config: dict) -> bool:
     )
 
 
+def _is_diffusion_config_dict(config: dict) -> bool:
+    """Mirror the diffusion-family traits used for generation routing:
+    block-diffusion configs declare a canvas_length, masked-diffusion
+    configs declare a mask_token_id."""
+    return (
+        config.get("canvas_length") is not None
+        or config.get("mask_token_id") is not None
+    )
+
+
 def get_model_path(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -873,7 +883,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
             except json.JSONDecodeError:
                 pass
 
-            if generation_config and config.get("model_type") == "diffusion_gemma4":
+            # Diffusion models store their generation algorithm
+            # parameterization (sampler config, schedules, stopping criteria,
+            # eos ids) in generation_config.json; attach it so the generation
+            # engine can apply the checkpoint's reference defaults.
+            if generation_config and _is_diffusion_config_dict(config):
                 config["generation_config"] = generation_config
 
             for key in GENERATION_CONFIG_DEFAULT_KEYS:
