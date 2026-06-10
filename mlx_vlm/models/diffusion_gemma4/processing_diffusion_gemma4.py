@@ -42,6 +42,17 @@ class DiffusionGemma4Processor(Gemma4Processor):
             )
         return super().__call__(images=images, text=text, **kwargs)
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import warnings
+
+        # The gemma4 processor builds an audio feature extractor whose mel
+        # filter construction warns for this checkpoint's settings; audio is
+        # rejected by this processor, so the warning is pure noise.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*mel filter.*")
+            return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+
 
 __all__ = ["DiffusionGemma4Processor"]
 

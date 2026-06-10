@@ -306,12 +306,15 @@ class EncoderLayerScalar(nn.Module):
 class EncoderLanguageModel(nn.Module):
     def __init__(self, decoder: "DecoderModel"):
         super().__init__()
-        self._decoder = weakref.proxy(decoder)
+        # A weakref.ref stays out of the module tree (a proxy would be walked
+        # like a real submodule and double-count the decoder weights, e.g. in
+        # the wired-limit model size estimate).
+        self._decoder_ref = weakref.ref(decoder)
         self.layers = [EncoderLayerScalar() for _ in decoder.layers]
 
     @property
     def decoder(self):
-        return self._decoder
+        return self._decoder_ref()
 
     @property
     def embed_tokens(self):
@@ -492,7 +495,8 @@ class EncoderModel(nn.Module):
         self.config = config
         self.text_config = config.text_config
         self.language_model = EncoderLanguageModel(decoder)
-        self._decoder = weakref.proxy(decoder)
+        # weakref.ref, not proxy: see EncoderLanguageModel.
+        self._decoder_ref = weakref.ref(decoder)
         if config.vision_config is not None:
             self.vision_tower = VisionModel(config.vision_config)
             self.embed_vision = MultimodalEmbedder(
@@ -506,7 +510,7 @@ class EncoderModel(nn.Module):
 
     @property
     def decoder(self):
-        return self._decoder
+        return self._decoder_ref()
 
     def make_cache(self, max_size: Optional[int] = None):
         caches = []
