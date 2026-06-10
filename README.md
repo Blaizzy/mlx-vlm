@@ -69,6 +69,7 @@ This repo includes an agent skills bundle under `skills/` for common MLX-VLM sup
 |-------|-------------|
 | `cli-inference` | Run and debug inference from the command line with reproducible `uv run mlx_vlm.generate` commands. |
 | `server-inference` | Run and debug local server inference through health checks, model listing, chat completions, and the Responses API. |
+| `hf-cache-models` | List MLX-VLM-supported models available in the local Hugging Face cache directory. |
 | `reproducible-github-issues` | Turn CLI or server failures into concise GitHub issues with environment details, minimal repros, logs, and inputs. |
 
 Install from a local checkout:

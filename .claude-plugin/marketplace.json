@@ -1,7 +1,7 @@
 {
   "name": "mlx-vlm",
   "metadata": {
-    "description": "Agent skills for MLX-VLM CLI inference, server inference, and reproducible GitHub issues.",
+    "description": "Agent skills for MLX-VLM CLI inference, server inference, HF cache model listing, and reproducible GitHub issues.",
     "version": "0.1.0"
   },
   "owner": {
@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "mlx-vlm-skills",
-      "description": "Skills for MLX-VLM CLI inference, server inference, and reproducible GitHub issues.",
+      "description": "Skills for MLX-VLM CLI inference, server inference, HF cache model listing, and reproducible GitHub issues.",
       "version": "0.1.0",
       "source": "./skills"
     }
