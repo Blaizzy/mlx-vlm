@@ -77,12 +77,10 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(model_type, "diffusion_gemma4")
         self.assertEqual(arch.Model.__name__, "Model")
 
-    def test_load_config_normalizes_diffusion_gemma_alias(self):
+    def test_load_config_attaches_diffusion_generation_config(self):
         from mlx_vlm.utils import load_config
 
         config = tiny_config_dict()
-        config["model_type"] = "diffusion_gemma"
-        config["text_config"]["model_type"] = "diffusion_gemma_text"
         generation_config = {
             "max_denoising_steps": 48,
             "sampler_config": {
@@ -100,7 +98,6 @@ class TestDiffusionGemma4(unittest.TestCase):
             loaded = load_config(Path(tmpdir))
 
         self.assertEqual(loaded["model_type"], "diffusion_gemma4")
-        self.assertEqual(loaded["text_config"]["model_type"], "diffusion_gemma4_text")
         self.assertEqual(loaded["generation_config"], generation_config)
 
     def test_forward_shape(self):
@@ -784,21 +781,20 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         from mlx_vlm.models.diffusion_gemma4 import DiffusionGemma4Processor
 
-        for model_type in ("diffusion_gemma4", "diffusion_gemma"):
-            sentinel = object()
-            with TemporaryDirectory() as tmpdir:
-                Path(tmpdir, "config.json").write_text(
-                    json.dumps({"model_type": model_type})
-                )
-                with patch.object(
-                    DiffusionGemma4Processor,
-                    "from_pretrained",
-                    return_value=sentinel,
-                ) as from_pretrained:
-                    processor = AutoProcessor.from_pretrained(tmpdir)
+        sentinel = object()
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "config.json").write_text(
+                json.dumps({"model_type": "diffusion_gemma4"})
+            )
+            with patch.object(
+                DiffusionGemma4Processor,
+                "from_pretrained",
+                return_value=sentinel,
+            ) as from_pretrained:
+                processor = AutoProcessor.from_pretrained(tmpdir)
 
-            self.assertIs(processor, sentinel)
-            from_pretrained.assert_called_once()
+        self.assertIs(processor, sentinel)
+        from_pretrained.assert_called_once()
 
 
 class TestDiffusionVisualization(unittest.TestCase):
