@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import io
 import json
 import unittest
@@ -657,11 +658,12 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(finals[-1].generation_tokens, 2)
 
     def test_diffusion_zero_temperature_uses_argmax_canvas(self):
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
         from mlx_vlm.generate.diffusion import _diffusion_sample_canvas
 
         logits = mx.array([[[0.0, 2.0, 1.0], [3.0, 1.0, 2.0]]])
 
-        with patch("mlx_vlm.generate.diffusion.mx.random.categorical") as categorical:
+        with patch.object(diffusion_module.mx.random, "categorical") as categorical:
             sampled = _diffusion_sample_canvas(logits, mx.int32, temperature=0.0)
             mx.eval(sampled)
 
@@ -669,11 +671,12 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(sampled.tolist(), [[1, 0]])
 
     def test_diffusion_positive_temperature_samples_canvas(self):
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
         from mlx_vlm.generate.diffusion import _diffusion_sample_canvas
 
         logits = mx.array([[[0.0, 2.0, 1.0], [3.0, 1.0, 2.0]]])
 
-        with patch("mlx_vlm.generate.diffusion.mx.random.categorical") as categorical:
+        with patch.object(diffusion_module.mx.random, "categorical") as categorical:
             categorical.return_value = mx.array([[2, 1]])
             sampled = _diffusion_sample_canvas(logits, mx.int32, temperature=0.7)
             mx.eval(sampled)
@@ -744,6 +747,8 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertTrue(_format_diffusion_live_text(long_text, 20).endswith("..."))
 
     def test_generate_redraw_mode_prints_full_final_text(self):
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+        dispatch_module = importlib.import_module("mlx_vlm.generate.dispatch")
         from mlx_vlm.generate import GenerationResult, generate
 
         class Config:
@@ -769,13 +774,9 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         buffer = io.StringIO()
         with (
-            patch(
-                "mlx_vlm.generate.dispatch.stream_generate",
-                return_value=iter(chunks),
-            ),
-            patch(
-                "mlx_vlm.generate.diffusion._supports_in_place_output",
-                return_value=True,
+            patch.object(dispatch_module, "stream_generate", return_value=iter(chunks)),
+            patch.object(
+                diffusion_module, "_supports_in_place_output", return_value=True
             ),
             contextlib.redirect_stdout(buffer),
         ):

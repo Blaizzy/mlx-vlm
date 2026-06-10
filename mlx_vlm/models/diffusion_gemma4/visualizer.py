@@ -16,7 +16,12 @@ in-place redrawer — are shared with the other diffusion models and live in
 import sys
 from typing import Any, Dict, Optional
 
-from ..diffusion_visualizer import _CanvasRedrawer
+from ..diffusion_visualizer import (
+    _CanvasRedrawer,
+    _display_width,
+    _take_display_width,
+    _wrap_text,
+)
 
 
 class DiffusionGemma4Visualizer:
@@ -131,6 +136,10 @@ def install_output_handler_patch() -> None:
 
 
 __all__ = [
+    "_CanvasRedrawer",
+    "_display_width",
+    "_take_display_width",
+    "_wrap_text",
     "DiffusionGemma4Visualizer",
     "install_output_handler_patch",
     "make_unmasking_visualizer",
