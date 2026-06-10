@@ -228,6 +228,22 @@ class Attention(nn.Module):
             state = _cache_state(cache)
             if state is not None:
                 encoder_keys, encoder_values = state
+                if self.is_sliding:
+                    # The canvas only attends to the last `sliding_window - 1`
+                    # encoder positions (the mask already zeroes the rest), so
+                    # drop the out-of-window keys/values before SDPA instead of
+                    # computing scores for thousands of masked positions. This
+                    # keeps the sliding layers O(window) rather than O(context).
+                    window = max(self.config.sliding_window - 1, 0)
+                    encoder_len = encoder_keys.shape[2]
+                    # Only safe when there are no trailing-invalid cache slots
+                    # (i.e. the dynamic cache, where offset == encoder_len);
+                    # the static-cache window starts before the trailing empties.
+                    if window and encoder_len > window and offset >= encoder_len:
+                        encoder_keys = encoder_keys[:, :, -window:, :]
+                        encoder_values = encoder_values[:, :, -window:, :]
+                        if mask is not None and not isinstance(mask, str):
+                            mask = mask[..., -(window + L) :]
                 keys = mx.concatenate([encoder_keys, keys], axis=2)
                 values = mx.concatenate([encoder_values, values], axis=2)
             attn_cache = None
