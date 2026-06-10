@@ -8,137 +8,20 @@ alternate screen buffer and restores it when generation finishes.
 
 Like the nemotron and llada masked-diffusion visualizers, all rendering lives
 with the model; the shared generation engine only forwards draft frames here.
+The rendering primitives — display-width-exact wrapping and the flash-free
+in-place redrawer — are shared with the other diffusion models and live in
+``mlx_vlm.models.diffusion_visualizer``.
 """
 
-import shutil
 import sys
-import time
-import unicodedata
 from typing import Any, Dict, Optional
 
-
-def _display_width(text: str) -> int:
-    width = 0
-    for char in text:
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-    return width
-
-
-def _take_display_width(text: str, width: int) -> str:
-    taken = ""
-    taken_width = 0
-    for char in text:
-        char_width = _display_width(char)
-        if taken_width + char_width > width:
-            break
-        taken += char
-        taken_width += char_width
-    return taken or text[:1]
-
-
-def _wrap_text(text: str, width: int) -> str:
-    """Word-wrap ``text`` so every line fits in ``width`` display columns.
-
-    Wrapping must be display-width exact: the redrawer counts one terminal row
-    per line, so a line that overflows would desynchronize the cursor-up
-    redraws and corrupt the animation.
-    """
-    wrapped_lines = []
-    for raw_line in text.split("\n"):
-        line = ""
-        line_width = 0
-        for word in raw_line.split(" "):
-            word_width = _display_width(word)
-            separator = 1 if line else 0
-            if line_width + separator + word_width <= width:
-                line += (" " if separator else "") + word
-                line_width += separator + word_width
-                continue
-            if line:
-                wrapped_lines.append(line)
-            while word_width > width:
-                head = _take_display_width(word, width)
-                wrapped_lines.append(head)
-                word = word[len(head) :]
-                word_width = _display_width(word)
-            line = word
-            line_width = word_width
-        wrapped_lines.append(line)
-    return "\n".join(wrapped_lines)
-
-
-class _CanvasRedrawer:
-    """In-place canvas redrawer with alternate-screen support.
-
-    Overwrites the previous frame line by line in a single buffered write, so
-    frames update without a clear-then-reprint flash. When the canvas grows
-    taller than the terminal, switches to the alternate screen buffer (hiding
-    the cursor) and shows the tail of the canvas; ``finish()`` restores the
-    screen.
-    """
-
-    def __init__(self, min_interval: float = 0.05):
-        self.rows = 0
-        self.alternate_screen = False
-        self.min_interval = min_interval
-        self._last_draw = 0.0
-        self._last_canvas = None
-
-    def _frame_start(self) -> str:
-        if self.alternate_screen:
-            return "\033[H"
-        if self.rows <= 0:
-            return "\r"
-        return "\r" + "\033[1A" * (self.rows - 1)
-
-    def clear(self) -> None:
-        if self.rows <= 0 and not self.alternate_screen:
-            return
-        print(self._frame_start() + "\033[0J", end="", flush=True)
-        self.rows = 0
-
-    def draw(self, text: str, *, wrap_width: Optional[int] = None) -> None:
-        now = time.perf_counter()
-        if now - self._last_draw < self.min_interval:
-            return
-        terminal_size = shutil.get_terminal_size((120, 20))
-        width = max(20, terminal_size.columns - 1)
-        if wrap_width is not None and wrap_width > 0:
-            width = min(width, wrap_width)
-        canvas = _wrap_text(text, width)
-        if canvas == self._last_canvas:
-            return
-
-        lines = canvas.split("\n")
-        max_rows = max(1, terminal_size.lines - 2)
-        controls = []
-        if len(lines) >= max_rows and not self.alternate_screen:
-            controls.append("\033[?1049h\033[?25l\033[H\033[2J")
-            self.alternate_screen = True
-            self.rows = 0
-        if self.alternate_screen and len(lines) > max_rows:
-            lines = lines[-max_rows:]
-
-        # Overwrite each previous row in place (erase line, write new
-        # content), then erase whatever remains below the new frame. Emitting
-        # the whole frame as one write avoids flicker.
-        controls.append(self._frame_start())
-        frame = "\n".join(f"\033[2K{line}" for line in lines) + "\033[0J"
-        print("".join(controls) + frame, end="", flush=True)
-        self.rows = len(lines)
-        self._last_draw = now
-        self._last_canvas = canvas
-
-    def finish(self) -> None:
-        if self.alternate_screen:
-            print("\033[?25h\033[?1049l", end="", flush=True)
-            self.alternate_screen = False
-            self.rows = 0
-        else:
-            self.clear()
-        self._last_canvas = None
+from ..diffusion_visualizer import (
+    _CanvasRedrawer,
+    _display_width,
+    _take_display_width,
+    _wrap_text,
+)
 
 
 class DiffusionGemma4Visualizer:
