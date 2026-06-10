@@ -23,6 +23,7 @@ import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.model_catalog import CacheNotFound
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -698,7 +699,7 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     monkeypatch.setattr(
         server,
         "scan_cache_dir",
-        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
     )
     monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
 

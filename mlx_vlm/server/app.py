@@ -13,7 +13,6 @@ import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
-from huggingface_hub.errors import CacheNotFound
 
 from .. import apc as _apc
 from ..generate import (
@@ -23,6 +22,7 @@ from ..generate import (
 )
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..model_catalog import local_model_infos
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -619,33 +619,10 @@ def models_endpoint():
     Return list of locally downloaded MLX models.
     """
 
-    required_files = {"config.json", "tokenizer_config.json"}
-
-    def probably_mlx_lm(repo):
-        if repo.repo_type != "model":
-            return False
-        if "main" not in repo.refs:
-            return False
-        file_names = {f.file_path.name for f in repo.refs["main"].files}
-        has_weights = "model.safetensors.index.json" in file_names or any(
-            file_name.endswith(".safetensors") for file_name in file_names
-        )
-        return required_files.issubset(file_names) and has_weights
-
-    # Scan the cache directory for downloaded mlx models when it exists.
-    try:
-        hf_cache_info = _server_package_attr("scan_cache_dir", scan_cache_dir)()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
-    except CacheNotFound:
-        downloaded_models = []
-
     # Create a list of available models
-    models = [
-        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
-        for repo in downloaded_models
-    ]
+    models = local_model_infos(
+        _server_package_attr("scan_cache_dir", scan_cache_dir),
+    )
     loaded_model = runtime.model_cache.get("model_path")
     if loaded_model and all(model["id"] != loaded_model for model in models):
         models.append(
