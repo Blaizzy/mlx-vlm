@@ -22,6 +22,7 @@ from ..generate import (
 )
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..model_catalog import CacheNotFound as _CacheNotFound
 from ..model_catalog import local_model_infos
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
@@ -54,6 +55,9 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 logger = logging.getLogger("mlx_vlm.server")
+
+# Kept as a module attribute for tests and downstream code that patch server.app.
+CacheNotFound = _CacheNotFound
 
 
 def _server_runtime_snapshot() -> dict:
