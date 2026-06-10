@@ -53,12 +53,6 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
-DEFAULT_MASKED_DIFFUSION_THRESHOLD = 0.7
-DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD = 0.5
-DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS = 16
-DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER = 1
-DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS = 2
-DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD = DEFAULT_MASKED_DIFFUSION_THRESHOLD
 
 
 def parse_arguments():
@@ -276,7 +270,8 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling, 0.7 for masked text."
+            "Default: 0.9 for confidence-threshold sampling; masked-diffusion "
+            "models use their checkpoint reference defaults."
         ),
     )
     parser.add_argument(
@@ -632,13 +627,13 @@ from .diffusion import (
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
+    is_masked_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
 
 
 def is_masked_diffusion_text_model(model: nn.Module) -> bool:
-    config = getattr(model, "config", None)
-    return getattr(config, "mask_token_id", None) is not None
+    return is_masked_diffusion_model(model)
 
 
 def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
@@ -802,30 +797,26 @@ def stream_generate(
             max_denoising_steps = kwargs.get(
                 "steps", getattr(config, "default_diffusion_steps", 32)
             )
-        num_to_transfer = kwargs.get(
-            "num_to_transfer", DEFAULT_MASKED_DIFFUSION_NUM_TO_TRANSFER
-        )
         config = getattr(model, "config", None)
-        if getattr(config, "default_generation_mode", None) == "ar":
-            threshold = kwargs.get(
-                "threshold", getattr(config, "default_diffusion_threshold", None)
-            )
-            min_threshold = kwargs.get("min_threshold")
-        else:
-            threshold = kwargs.get("threshold", DEFAULT_MASKED_DIFFUSION_THRESHOLD)
-            min_threshold = kwargs.get(
-                "min_threshold", DEFAULT_MASKED_DIFFUSION_MIN_THRESHOLD
-            )
-        editing_threshold = kwargs.get(
-            "editing_threshold", DEFAULT_MASKED_DIFFUSION_EDITING_THRESHOLD
-        )
-        max_transfer_per_step = kwargs.get("max_transfer_per_step")
-        max_post_steps = kwargs.get(
-            "max_post_steps", DEFAULT_MASKED_DIFFUSION_MAX_POST_STEPS
-        )
-        stability_steps = kwargs.get(
-            "stability_steps", DEFAULT_MASKED_DIFFUSION_STABILITY_STEPS
-        )
+        # Sampler knobs resolve as: explicit kwarg > config default_diffusion_*
+        # attribute > the model generate()'s own reference defaults (omitted
+        # here). Forcing shared defaults broke checkpoints whose reference
+        # generation differs (e.g. LLaDA2.0 corrupts with editing enabled).
+        tuned_kwargs = {}
+        for key, config_attr in (
+            ("threshold", "default_diffusion_threshold"),
+            ("min_threshold", "default_diffusion_min_threshold"),
+            ("editing_threshold", "default_diffusion_editing_threshold"),
+            ("num_to_transfer", "default_diffusion_num_to_transfer"),
+            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
+            ("max_post_steps", "default_diffusion_max_post_steps"),
+            ("stability_steps", "default_diffusion_stability_steps"),
+        ):
+            value = kwargs.get(key)
+            if value is None:
+                value = getattr(config, config_attr, None)
+            if value is not None:
+                tuned_kwargs[key] = value
 
         generation_stats = {}
         handled_generation_kwargs = {
@@ -859,17 +850,11 @@ def stream_generate(
             top_p=None if top_p is None or top_p >= 1.0 else top_p,
             top_k=None if top_k is None or top_k <= 0 else top_k,
             eos_early_stop=True,
-            threshold=threshold,
-            min_threshold=min_threshold,
-            editing_threshold=editing_threshold,
-            max_post_steps=max_post_steps,
-            num_to_transfer=num_to_transfer,
-            max_transfer_per_step=max_transfer_per_step,
-            stability_steps=stability_steps,
             visualize=verbose,
             tokenizer=tokenizer,
             skip_special_tokens=skip_special_tokens,
             stats=generation_stats,
+            **tuned_kwargs,
             **model_generate_kwargs,
         )
         mx.eval(generated)

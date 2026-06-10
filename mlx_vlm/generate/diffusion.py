@@ -20,9 +20,6 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
-_DIFFUSION_MODEL_TYPE = "diffusion_gemma4"
-
-
 def _display_width(text: str) -> int:
     width = 0
     for char in text:
@@ -158,11 +155,39 @@ class _DiffusionRedrawer:
 
 
 def _is_diffusion_config(config: Any) -> bool:
-    return getattr(config, "model_type", None) == _DIFFUSION_MODEL_TYPE
+    # Block-diffusion models declare the canvas length the denoising loop
+    # operates on; that trait is what the shared engine drives, so detection
+    # is not tied to a hardcoded model type.
+    return getattr(config, "canvas_length", None) is not None
 
 
 def is_diffusion_model(model: nn.Module) -> bool:
+    """True for block-diffusion canvas models driven by the shared engine."""
     return _is_diffusion_config(getattr(model, "config", None))
+
+
+def is_masked_diffusion_model(model: nn.Module) -> bool:
+    """True for masked-diffusion text models that own their generate loop."""
+    config = getattr(model, "config", None)
+    return getattr(config, "mask_token_id", None) is not None
+
+
+def diffusion_generation_family(model: nn.Module) -> Optional[str]:
+    """Classify how a model generates, for request routing.
+
+    Returns ``"block"`` for canvas-denoising models the shared engine drives,
+    ``"masked"`` for masked-diffusion text models that run their own
+    ``generate()`` loop (unless the checkpoint defaults to autoregressive
+    generation, like nemotron), and ``None`` for ordinary autoregressive
+    models.
+    """
+    if is_diffusion_model(model):
+        return "block"
+    if is_masked_diffusion_model(model):
+        config = getattr(model, "config", None)
+        if getattr(config, "default_generation_mode", None) != "ar":
+            return "masked"
+    return None
 
 
 def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:

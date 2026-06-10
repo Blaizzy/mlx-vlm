@@ -1,6 +1,6 @@
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -355,7 +355,7 @@ class LanguageModel(nn.Module):
         minimal_topk: int = 1,
         threshold: float = 0.95,
         min_threshold: Optional[float] = None,
-        editing_threshold: float = 0.9,
+        editing_threshold: Optional[float] = None,
         max_post_steps: int = 16,
         eos_id: Optional[int] = None,
         mask_id: Optional[int] = None,
@@ -366,6 +366,7 @@ class LanguageModel(nn.Module):
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
         stats: Optional[Dict[str, float]] = None,
+        on_block: Optional[Callable[[List[int]], bool]] = None,
         **kwargs,
     ) -> mx.array:
         generation_mode = kwargs.pop("generation_mode", None)
@@ -401,6 +402,12 @@ class LanguageModel(nn.Module):
         if min_threshold is None:
             min_threshold = threshold
         min_threshold = min(threshold, max(0.0, float(min_threshold)))
+        # The reference LLaDA2 generation never rewrites committed tokens;
+        # editing is an opt-in extension (it corrupts e.g. LLaDA2.0-mini).
+        editing_enabled = editing_threshold is not None
+        editing_threshold = (
+            float(editing_threshold) if editing_enabled else float("inf")
+        )
         visualizer = DiffusionUnmaskingVisualizer(
             active=visualize and sys.stdout.isatty(),
             mask_id=mask_id,
@@ -468,6 +475,10 @@ class LanguageModel(nn.Module):
                 active_block_mask = old_block == mask_id
                 has_active = bool(active_block_mask.any().item())
                 if not has_active:
+                    if not editing_enabled:
+                        # Reference behavior: the block is done once every
+                        # position is unmasked.
+                        break
                     post_steps += 1
                 if post_steps > max_post_steps:
                     break
@@ -546,6 +557,21 @@ class LanguageModel(nn.Module):
             mx.eval(
                 self.model(x[:, block_start:current_window_end], cache=prefix_cache)
             )
+            if on_block is not None:
+                # Report the generated tokens so far (clipped at the first
+                # EOS, like the final return); a False return stops early.
+                block_end = min(current_window_end, prompt_length + gen_length)
+                so_far = x[0, prompt_length:block_end].tolist()
+                eos_cut = next(
+                    (
+                        index + 1
+                        for index, token_id in enumerate(so_far)
+                        if token_id in eos_token_ids
+                    ),
+                    None,
+                )
+                if not on_block(so_far[:eos_cut] if eos_cut is not None else so_far):
+                    break
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
                 if not bool((generated == mask_id).any().item()):
