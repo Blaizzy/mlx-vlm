@@ -70,6 +70,16 @@ def apply_generation_config_defaults(model_config, config: dict):
     return model_config
 
 
+def _merge_generation_config(config: dict, generation_config: dict) -> None:
+    if not isinstance(generation_config, dict) or not generation_config:
+        return
+
+    config["generation_config"] = generation_config
+    for key in GENERATION_CONFIG_DEFAULT_KEYS:
+        if key in generation_config:
+            config[key] = generation_config[key]
+
+
 def _e4m3_decode_table() -> mx.array:
     """Return a 256-entry ``float32`` LUT mapping every E4M3FN byte to its value.
 
@@ -866,16 +876,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
-            generation_config = {}
             try:
-                with open(generation_config_file, "r") as f:
-                    generation_config = json.load(f)
+                with open(generation_config_file, encoding="utf-8") as f:
+                    _merge_generation_config(config, json.load(f))
             except json.JSONDecodeError:
                 pass
-
-            for key in GENERATION_CONFIG_DEFAULT_KEYS:
-                if key in generation_config:
-                    config[key] = generation_config[key]
 
         return config
 
