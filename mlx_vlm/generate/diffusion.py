@@ -425,6 +425,64 @@ def _diffusion_static_cache_length(
     return prompt_length + cached_canvas_tokens
 
 
+def _diffusion_has_visual_token_types(mm_token_type_ids: Optional[mx.array]) -> bool:
+    if mm_token_type_ids is None:
+        return False
+    return bool(mx.any((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
+
+
+def _diffusion_should_chunk_prefill(
+    *,
+    prefill_step_size: Optional[int],
+    prompt_length: int,
+    has_padding: bool,
+    use_static_cache: bool,
+    pixel_values: Optional[mx.array],
+    mm_token_type_ids: Optional[mx.array],
+) -> bool:
+    if prefill_step_size is None or prompt_length <= prefill_step_size:
+        return False
+    if has_padding or use_static_cache or pixel_values is not None:
+        return False
+    # Visual spans can use bidirectional attention inside the whole block. Keep
+    # those prompts on the existing single prefill until chunking can split on
+    # visual-block boundaries without changing attention semantics.
+    return not _diffusion_has_visual_token_types(mm_token_type_ids)
+
+
+def _diffusion_prefill_cache(
+    model: nn.Module,
+    input_ids: mx.array,
+    *,
+    attention_mask: Optional[mx.array],
+    kv_cache,
+    pixel_values: Optional[mx.array],
+    mm_token_type_ids: Optional[mx.array],
+    prefill_step_size: Optional[int],
+    chunk_prefill: bool,
+):
+    if not chunk_prefill:
+        _, kv_cache = model.model.encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            cache=kv_cache,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        return kv_cache
+
+    for start in range(0, input_ids.shape[1], prefill_step_size):
+        end = min(start + prefill_step_size, input_ids.shape[1])
+        _, kv_cache = model.model.encoder(
+            input_ids[:, start:end],
+            attention_mask=None,
+            cache=kv_cache,
+        )
+        mx.eval([c.state for c in kv_cache])
+        mx.clear_cache()
+    return kv_cache
+
+
 def _diffusion_stable_and_confident(
     accepted_canvas: mx.array,
     processed_logits: mx.array,
@@ -542,6 +600,7 @@ def stream_diffusion_generate(
     diffusion_unmasking_interval: int = 1,
     diffusion_unmasking_width: int = DEFAULT_DIFFUSION_UNMASKING_WIDTH,
     mm_token_type_ids: Optional[mx.array] = None,
+    prefill_step_size: Optional[int] = None,
 ) -> Generator[GenerationResult, None, None]:
     if input_ids.shape[0] != 1:
         raise ValueError(
@@ -591,6 +650,10 @@ def stream_diffusion_generate(
         raise ValueError(f"Unsupported diffusion sampler: {diffusion_sampler!r}.")
     if not 0.0 <= diffusion_threshold <= 1.0:
         raise ValueError("diffusion_threshold must be between 0 and 1.")
+    if prefill_step_size is not None:
+        prefill_step_size = int(prefill_step_size)
+        if prefill_step_size <= 0:
+            raise ValueError("prefill_step_size must be a positive integer.")
 
     sampler_config = _diffusion_config_dict(
         generation_config.get("sampler_config", None)
@@ -647,6 +710,14 @@ def stream_diffusion_generate(
         cached_sequence_length = prompt_length
         kv_cache = model.make_cache()
     detokenizer = make_streaming_detokenizer(processor)
+    chunk_prefill = _diffusion_should_chunk_prefill(
+        prefill_step_size=prefill_step_size,
+        prompt_length=prompt_length,
+        has_padding=has_padding,
+        use_static_cache=use_static_cache,
+        pixel_values=pixel_values,
+        mm_token_type_ids=mm_token_type_ids,
+    )
 
     generated_tokens = 0
     diffusion_canvas_tokens = 0
@@ -707,14 +778,23 @@ def stream_diffusion_generate(
         while generated_tokens < max_new_tokens:
             canvas_index += 1
             unprocessed_input_ids = input_ids if is_prefill else current_canvas
-            encoder_attention_mask = attention_mask if is_prefill else None
-            _, kv_cache = model.model.encoder(
-                unprocessed_input_ids,
-                attention_mask=encoder_attention_mask,
-                cache=kv_cache,
-                pixel_values=pixel_values if is_prefill else None,
-                mm_token_type_ids=mm_token_type_ids if is_prefill else None,
-            )
+            if is_prefill:
+                kv_cache = _diffusion_prefill_cache(
+                    model,
+                    unprocessed_input_ids,
+                    attention_mask=attention_mask if has_padding else None,
+                    kv_cache=kv_cache,
+                    pixel_values=pixel_values,
+                    mm_token_type_ids=mm_token_type_ids,
+                    prefill_step_size=prefill_step_size,
+                    chunk_prefill=chunk_prefill,
+                )
+            else:
+                _, kv_cache = model.model.encoder(
+                    unprocessed_input_ids,
+                    attention_mask=None,
+                    cache=kv_cache,
+                )
 
             if is_prefill:
                 mx.eval([c.state for c in kv_cache])
@@ -1039,6 +1119,7 @@ def stream_diffusion_generate_from_kwargs(
         "diffusion_unmasking_width", DEFAULT_DIFFUSION_UNMASKING_WIDTH
     )
     mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+    prefill_step_size = kwargs.pop("prefill_step_size", None)
     with wired_limit(model, [generation_stream]):
         yield from stream_diffusion_generate(
             model,
@@ -1062,5 +1143,6 @@ def stream_diffusion_generate_from_kwargs(
             diffusion_unmasking_interval=diffusion_unmasking_interval,
             diffusion_unmasking_width=diffusion_unmasking_width,
             mm_token_type_ids=mm_token_type_ids,
+            prefill_step_size=prefill_step_size,
         )
         mx.clear_cache()
