@@ -18,7 +18,6 @@ python -m mlx_vlm setup --help
 
 - `mlx_vlm.convert` – convert Hugging Face models to MLX format.
 - `mlx_vlm.setup` – configure `pi`, Hermes, and opencode for the local server and cached HF models.
-- `mlx_vlm.configure_clients` – compatibility alias for `mlx_vlm.setup`.
 - `mlx_vlm.generate` – run inference on images.
 - `mlx_vlm.video_generate` – generate from a video file.
 - `mlx_vlm.smolvlm_video_generate` – lightweight video generation.
