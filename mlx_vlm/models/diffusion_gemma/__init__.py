@@ -1,7 +1,7 @@
 from .config import ModelConfig, TextConfig, VisionConfig
-from .diffusion_gemma4 import Model
+from .diffusion_gemma import Model
 from .language import LanguageModel
-from .processing_diffusion_gemma4 import DiffusionGemma4Processor
+from .processing_diffusion_gemma import DiffusionGemma4Processor
 
 __all__ = [
     "DiffusionGemma4Processor",

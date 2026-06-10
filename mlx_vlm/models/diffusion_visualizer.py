@@ -4,7 +4,7 @@ Single source of truth for the terminal rendering shared by the diffusion
 models: display-width-exact word wrapping, a flash-free in-place canvas
 redrawer with redraw throttling and alternate-screen escalation, and a
 token-canvas visualizer used by the nemotron_labs_diffusion and llada2_moe
-models. The diffusion_gemma4 package builds its text-stream visualizer on
+models. The diffusion_gemma package builds its text-stream visualizer on
 the same ``_CanvasRedrawer``.
 
 Rendering lives with the models; the shared generation engine in

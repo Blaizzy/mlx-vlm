@@ -604,8 +604,8 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
 
     def test_diffusion_generation_family_block(self):
         from mlx_vlm.generate.diffusion import diffusion_generation_family
-        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
-        from mlx_vlm.tests.test_diffusion_gemma4 import tiny_config_dict
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+        from mlx_vlm.tests.test_diffusion_gemma import tiny_config_dict
 
         model = Model(ModelConfig.from_dict(tiny_config_dict()))
         self.assertEqual(diffusion_generation_family(model), "block")

@@ -1,7 +1,7 @@
 # DiffusionGemma4
 
 DiffusionGemma4 is a block-diffusion language model port for
-`gg-hf-st/test-checkpoint-26B`. It generates a canvas of noisy token ids and
+`google/diffusiongemma-26B-A4B-it`. It generates a canvas of noisy token ids and
 repeatedly denoises that canvas before appending the accepted tokens to the
 prefix.
 
@@ -9,8 +9,8 @@ prefix.
 
 | | |
 |---|---|
-| **Model ID** | `gg-hf-st/test-checkpoint-26B` |
-| **Model type** | `diffusion_gemma4` |
+| **Model ID** | `google/diffusiongemma-26B-A4B-it` |
+| **Model type** | `diffusion_gemma` |
 | **Architecture** | `DiffusionGemma4ModelForBlockDiffusion` |
 | **Generation** | Block diffusion with a 256-token canvas |
 | **Language layers** | 30 |
@@ -21,11 +21,11 @@ prefix.
 | **Dense MLP** | 2112 intermediate size |
 | **Vocabulary** | 262,144 |
 
-This implementation supports text and image inputs. Image prompts run through
-the Gemma 4 vision tower, and the encoder applies bidirectional attention
-within each image-token block (matching the checkpoint's
-`use_bidirectional_attention: "vision"` setting). Multiple images per prompt
-are supported. Audio and video inputs are rejected for now.
+This implementation supports text, image, and video inputs. Image prompts and
+sampled video frames run through the Gemma 4 vision tower, and the encoder
+applies bidirectional attention within each vision-token block (matching the
+checkpoint's `use_bidirectional_attention: "vision"` setting). Multiple images
+or videos per prompt are supported. Audio inputs are rejected for now.
 
 ## CLI Usage
 
@@ -33,7 +33,7 @@ Basic generation:
 
 ```bash
 uv run mlx_vlm.generate \
-  --model gg-hf-st/test-checkpoint-26B \
+  --model google/diffusiongemma-26B-A4B-it \
   --prompt "Explain why the sky is blue." \
   --max-tokens 120 \
   --temperature 0.0 \
@@ -45,7 +45,7 @@ Describe an image:
 
 ```bash
 uv run mlx_vlm.generate \
-  --model gg-hf-st/test-checkpoint-26B \
+  --model google/diffusiongemma-26B-A4B-it \
   --prompt "Describe this image in one short paragraph." \
   --image /path/to/image.png \
   --max-tokens 128 \
@@ -68,7 +68,7 @@ and medium generations, but lower thresholds can hurt quality:
 
 ```bash
 uv run mlx_vlm.generate \
-  --model gg-hf-st/test-checkpoint-26B \
+  --model google/diffusiongemma-26B-A4B-it \
   --prompt "Write a practical explanation of diffusion language model performance." \
   --max-tokens 96 \
   --diffusion-sampler confidence-threshold \
@@ -146,7 +146,7 @@ Argmax outputs matched in these checks.
 
 ## Current Limitations
 
-- Text-only generation is supported.
+- Text, image, and video generation are supported.
 - Batch generation is not supported for this diffusion path.
 - The confidence-threshold sampler is an optimization heuristic. It is useful
   for some short and medium outputs, but conservative settings or the default

@@ -569,8 +569,15 @@ class EncoderModel(nn.Module):
 
     def _embed_inputs(self, input_ids, pixel_values=None):
         image_mask = input_ids == self.config.image_token_id
+        video_token_id = getattr(self.config, "video_token_id", None)
+        video_mask = (
+            input_ids == video_token_id
+            if video_token_id is not None
+            else mx.zeros_like(image_mask)
+        )
+        vision_mask = image_mask | video_mask
         llm_input_ids = mx.where(
-            image_mask,
+            vision_mask,
             self.text_config.pad_token_id,
             input_ids,
         )
@@ -580,7 +587,7 @@ class EncoderModel(nn.Module):
         if pixel_values is not None:
             features = self.get_image_features(pixel_values).astype(inputs_embeds.dtype)
             mask_expanded = mx.broadcast_to(
-                mx.expand_dims(image_mask, -1), inputs_embeds.shape
+                mx.expand_dims(vision_mask, -1), inputs_embeds.shape
             )
             inputs_embeds = masked_scatter(inputs_embeds, mask_expanded, features)
         return inputs_embeds
@@ -672,7 +679,10 @@ class EncoderModel(nn.Module):
         pixel_values: Optional[mx.array] = None,
         mm_token_type_ids: Optional[mx.array] = None,
     ):
-        h = self._embed_inputs(input_ids, pixel_values=pixel_values)
+        h = self._embed_inputs(
+            input_ids,
+            pixel_values=pixel_values,
+        )
         if cache is None:
             cache = self.make_cache()
         masks = self._make_encoder_masks(

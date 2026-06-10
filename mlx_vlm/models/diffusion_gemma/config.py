@@ -8,7 +8,7 @@ from ..qwen3_vl.config import _config_kwargs, _maybe_deserialize_config
 
 @dataclass
 class TextConfig(BaseModelConfig):
-    model_type: str = "diffusion_gemma4_text"
+    model_type: str = "diffusion_gemma_text"
     vocab_size: int = 262144
     hidden_size: int = 2816
     intermediate_size: int = 2112
@@ -63,10 +63,11 @@ class TextConfig(BaseModelConfig):
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig = field(default_factory=TextConfig)
     vision_config: Optional[VisionConfig] = None
-    model_type: str = "diffusion_gemma4"
+    model_type: str = "diffusion_gemma"
     boi_token_id: Optional[int] = 255999
     eoi_token_id: Optional[int] = 258882
     image_token_id: Optional[int] = 258880
+    video_token_id: Optional[int] = None
     initializer_range: float = 0.02
     canvas_length: int = 256
     eos_token_id: Optional[Union[int, List[int]]] = None

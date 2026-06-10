@@ -78,6 +78,8 @@ class Model(nn.Module):
         self_conditioning_logits: mx.array = None,
         self_conditioning_embeddings: mx.array = None,
         decoder_attention_mask: mx.array = None,
+        pixel_values: mx.array = None,
+        mm_token_type_ids: mx.array = None,
         **kwargs,
     ):
         if cache is None:
@@ -91,6 +93,8 @@ class Model(nn.Module):
             self_conditioning_logits=self_conditioning_logits,
             self_conditioning_embeddings=self_conditioning_embeddings,
             decoder_attention_mask=decoder_attention_mask,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         logits = self._softcap(logits)
@@ -111,7 +115,8 @@ class Model(nn.Module):
             raise ValueError("input_ids are required for DiffusionGemma4 embeddings.")
         return InputEmbeddingsFeatures(
             inputs_embeds=self.model.encoder._embed_inputs(
-                input_ids, pixel_values=pixel_values
+                input_ids,
+                pixel_values=pixel_values,
             )
         )
 
