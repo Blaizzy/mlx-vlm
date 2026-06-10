@@ -12,7 +12,6 @@ from typing import Iterable
 
 from .model_catalog import local_model_infos
 
-
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_API_KEY = "not-needed"
 DEFAULT_CONTEXT_WINDOW = 131_072
@@ -27,9 +26,10 @@ def _expand_path(path: str | Path) -> Path:
 
 
 def _default_pi_config() -> Path:
-    return _expand_path(
-        os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent")
-    ) / "models.json"
+    return (
+        _expand_path(os.environ.get("PI_CODING_AGENT_DIR", "~/.pi/agent"))
+        / "models.json"
+    )
 
 
 def _default_hermes_config() -> Path:
@@ -318,9 +318,7 @@ def opencode_config(
             "baseURL": base_url,
             "apiKey": api_key,
         },
-        "models": {
-            model_id: {"name": _model_name(model_id)} for model_id in model_ids
-        },
+        "models": {model_id: {"name": _model_name(model_id)} for model_id in model_ids},
     }
     data["provider"] = providers
     return data
@@ -363,9 +361,7 @@ def _parse_client(value: str) -> tuple[str, ...]:
 
 
 def _parse_clients(value: str) -> tuple[str, ...]:
-    requested = tuple(
-        item.strip().lower() for item in value.split(",") if item.strip()
-    )
+    requested = tuple(item.strip().lower() for item in value.split(",") if item.strip())
     unknown = sorted(set(requested) - set(CLIENTS))
     if not requested or unknown:
         raise _client_error(unknown or None)

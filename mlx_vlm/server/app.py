@@ -13,7 +13,6 @@ import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
-from huggingface_hub.errors import CacheNotFound
 
 from .. import apc as _apc
 from ..generate import (
@@ -23,11 +22,11 @@ from ..generate import (
 )
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..model_catalog import local_model_infos
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
-from ..model_catalog import local_model_infos
 from .anthropic import register_routes as register_anthropic_routes
 from .generation import (
     GenerationArguments,

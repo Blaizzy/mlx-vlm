@@ -5,7 +5,6 @@ from typing import Callable, Iterable
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound
 
-
 REQUIRED_MODEL_FILES = {"config.json", "tokenizer_config.json"}
 
 
