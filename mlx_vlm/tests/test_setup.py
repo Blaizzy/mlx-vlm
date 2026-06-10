@@ -2,7 +2,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mlx_vlm.configure_clients import (
+from mlx_vlm.model_catalog import local_model_infos
+from mlx_vlm.setup import (
     CLIENTS,
     build_parser,
     opencode_config,
@@ -10,7 +11,6 @@ from mlx_vlm.configure_clients import (
     pi_config,
     resolve_default_model,
 )
-from mlx_vlm.model_catalog import local_model_infos
 
 
 def _repo(repo_id, file_names, *, repo_type="model", refs=None):

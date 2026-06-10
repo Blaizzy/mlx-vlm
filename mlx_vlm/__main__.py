@@ -14,8 +14,6 @@ if __name__ == "__main__":
         "server": "server",
         "video_generate": "video_generate",
         "setup": "setup",
-        "configure_clients": "configure_clients",
-        "configure-clients": "configure_clients",
     }
 
     if len(sys.argv) < 2:
