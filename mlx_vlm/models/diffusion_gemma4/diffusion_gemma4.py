@@ -5,6 +5,7 @@ from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from ..gemma4.language import logit_softcap
 from .config import ModelConfig
 from .language import DiffusionGemma4Backbone
+from .visualizer import make_unmasking_visualizer
 
 
 class _LanguageModelView:
@@ -101,6 +102,9 @@ class Model(nn.Module):
 
     def make_cache(self, max_size=None):
         return self.model.encoder.make_cache(max_size=max_size)
+
+    # Model-owned live unmasking view, like the nemotron/llada visualizers.
+    make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
 
     def get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
         if input_ids is None:

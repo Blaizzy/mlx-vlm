@@ -54,18 +54,14 @@ uv run mlx_vlm.generate \
   --skip-special-tokens
 ```
 
-Show the diffusion canvas as masked tokens are replaced in place:
-
-```bash
-uv run mlx_vlm.generate \
-  --model gg-hf-st/test-checkpoint-26B \
-  --prompt "Explain why the sky is blue in three concise sentences. Then elaborate on it." \
-  --max-tokens 500 \
-  --diffusion-show-unmasking \
-  --temperature 0.0 \
-  --trust-remote-code \
-  --skip-special-tokens
-```
+When run in a terminal, generation shows a live canvas view: the full
+sequence generated so far — finalized text plus the in-flight canvas with
+`[Mask]` placeholders — wrapped to the terminal width and redrawn in place on
+every denoising step. When the canvas grows taller than the terminal, the
+view switches to the alternate screen buffer and restores it when generation
+finishes. The view adds no measurable throughput cost; it is skipped
+automatically for piped output, and can be disabled programmatically by
+passing `diffusion_show_unmasking=False` to `generate`/`stream_generate`.
 
 Use the confidence-threshold sampler. This can reduce denoising work on short
 and medium generations, but lower thresholds can hurt quality:
@@ -76,7 +72,7 @@ uv run mlx_vlm.generate \
   --prompt "Write a practical explanation of diffusion language model performance." \
   --max-tokens 96 \
   --diffusion-sampler confidence-threshold \
-  --diffusion-threshold 0.8 \
+  --threshold 0.8 \
   --temperature 0.0 \
   --trust-remote-code \
   --skip-special-tokens
@@ -97,20 +93,11 @@ Useful diffusion options:
   on long generations.
 - `--diffusion-full-canvas`: always denoise the checkpoint canvas length, even
   for a partial final block.
-- `--diffusion-show-unmasking`: redraw the current canvas in place during
-  denoising. Unrevealed tokens are shown as `[Mask]`.
-- `--diffusion-unmasking-interval`: show every Nth denoising step.
-- `--diffusion-unmasking-width`: preview width. The default `0` means
-  untrimmed.
 - `--diffusion-sampler entropy-bound`: checkpoint-style entropy-bound canvas
   update.
 - `--diffusion-sampler confidence-threshold`: commit high-confidence canvas
   positions early.
-- `--diffusion-threshold`: probability threshold for the confidence sampler.
-- `--diffusion-static-cache`: use a fixed-capacity prefix KV cache for
-  multi-canvas generation.
-- `--diffusion-compile`: experimental compiled decoder path. It is kept behind
-  a flag because it has been slower in local profiling.
+- `--threshold`: probability threshold for the confidence sampler.
 
 ## Output Stats
 

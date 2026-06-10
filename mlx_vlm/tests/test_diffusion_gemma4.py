@@ -801,6 +801,175 @@ class TestDiffusionGemma4(unittest.TestCase):
             from_pretrained.assert_called_once()
 
 
+class TestDiffusionVisualization(unittest.TestCase):
+    def test_wrap_text_wraps_on_spaces(self):
+        from mlx_vlm.models.diffusion_gemma4.visualizer import _wrap_text
+
+        wrapped = _wrap_text("alpha beta gamma delta", 11)
+        self.assertEqual(wrapped, "alpha beta\ngamma delta")
+        # Newlines in the input are preserved.
+        wrapped = _wrap_text("alpha\nbeta gamma", 20)
+        self.assertEqual(wrapped, "alpha\nbeta gamma")
+        # A single overlong word is hard-split.
+        self.assertEqual(_wrap_text("abcdef", 3), "abc\ndef")
+
+    def test_redrawer_overwrites_frames_in_place(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from mlx_vlm.models.diffusion_gemma4.visualizer import _CanvasRedrawer
+
+        class Terminal:
+            columns = 40
+            lines = 24
+
+        redrawer = _CanvasRedrawer(min_interval=0.0)
+        buffer = io.StringIO()
+        with patch("shutil.get_terminal_size", return_value=Terminal()):
+            with contextlib.redirect_stdout(buffer):
+                redrawer.draw("one two three\nfour")
+                first = buffer.getvalue()
+                redrawer.draw("one two three\nfour five")
+                second = buffer.getvalue()[len(first) :]
+                redrawer.finish()
+
+        # Frames overwrite line by line; no full-screen clears in normal mode.
+        self.assertNotIn("\033[2J", first + second)
+        self.assertIn("\033[2K", first)
+        # The second frame moves the cursor up over the previous 2-row frame.
+        self.assertIn("\033[1A", second)
+        self.assertEqual(redrawer.rows, 0)
+
+    def test_redrawer_escalates_to_alternate_screen(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+
+        from mlx_vlm.models.diffusion_gemma4.visualizer import _CanvasRedrawer
+
+        class Terminal:
+            columns = 40
+            lines = 6
+
+        redrawer = _CanvasRedrawer(min_interval=0.0)
+        buffer = io.StringIO()
+        with patch("shutil.get_terminal_size", return_value=Terminal()):
+            with contextlib.redirect_stdout(buffer):
+                redrawer.draw("word " * 60)
+                redrawer.finish()
+        out = buffer.getvalue()
+
+        self.assertIn("\033[?1049h", out)
+        self.assertIn("\033[?25l", out)
+        self.assertIn("\033[?1049l", out)
+        self.assertIn("\033[?25h", out)
+        self.assertFalse(redrawer.alternate_screen)
+
+    def test_make_visualizer_defaults_for_verbose_terminals(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models.diffusion_gemma4.visualizer import (
+            make_unmasking_visualizer,
+        )
+
+        with patch("sys.stdout.isatty", return_value=True):
+            kwargs = {}
+            visualizer = make_unmasking_visualizer(kwargs, verbose=True)
+            self.assertTrue(kwargs.get("diffusion_show_unmasking"))
+            self.assertIsNotNone(visualizer)
+
+            # Explicit opt-out is respected.
+            kwargs = {"diffusion_show_unmasking": False}
+            self.assertIsNone(make_unmasking_visualizer(kwargs, verbose=True))
+            self.assertFalse(kwargs["diffusion_show_unmasking"])
+
+            # Quiet runs stay off.
+            kwargs = {}
+            self.assertIsNone(make_unmasking_visualizer(kwargs, verbose=False))
+            self.assertNotIn("diffusion_show_unmasking", kwargs)
+
+        # Piped output stays off.
+        with patch("sys.stdout.isatty", return_value=False):
+            kwargs = {}
+            self.assertIsNone(make_unmasking_visualizer(kwargs, verbose=True))
+            self.assertNotIn("diffusion_show_unmasking", kwargs)
+
+    def test_visualizer_composes_full_canvas(self):
+        from mlx_vlm.models.diffusion_gemma4.visualizer import (
+            DiffusionGemma4Visualizer,
+        )
+
+        visualizer = DiffusionGemma4Visualizer()
+        drawn = []
+
+        class FakeRedrawer:
+            def draw(self, text, wrap_width=None):
+                drawn.append(text)
+
+            def finish(self):
+                drawn.append("<finish>")
+
+        visualizer.redrawer = FakeRedrawer()
+
+        class FakeDraft:
+            draft_text = "[Mask] world"
+
+        visualizer.handle_text("Hello.")
+        visualizer.handle_draft(FakeDraft())
+        self.assertEqual(drawn[-1], "Hello.[Mask] world")
+
+        visualizer.handle_text(" Bye.")
+        self.assertEqual(drawn[-1], "Hello. Bye.")
+
+        visualizer.finish("Hello. Bye.")
+        self.assertIn("<finish>", drawn)
+
+    def test_output_handler_delegates_to_model_visualizer(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.generate.diffusion import DiffusionOutputHandler
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        # Importing the model package installs the handler patch.
+        self.assertTrue(getattr(DiffusionOutputHandler, "_model_visualizer_patched"))
+
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+
+        with patch("sys.stdout.isatty", return_value=True):
+            kwargs = {}
+            handler = DiffusionOutputHandler(model, kwargs, verbose=True)
+
+        self.assertIsNotNone(handler._model_visualizer)
+        self.assertTrue(kwargs.get("diffusion_show_unmasking"))
+        self.assertIsNone(handler.redrawer)
+
+        events = []
+
+        class FakeVisualizer:
+            def handle_draft(self, response):
+                events.append(("draft", response.draft_text))
+
+            def handle_text(self, text):
+                events.append(("text", text))
+                return True
+
+            def finish(self, text):
+                events.append(("finish", text))
+
+        handler._model_visualizer = FakeVisualizer()
+
+        class FakeDraft:
+            draft_text = "[Mask]"
+
+        handler.handle_draft(FakeDraft())
+        self.assertTrue(handler.handle_text("hi"))
+        handler.finish("hi")
+        self.assertEqual(
+            events, [("draft", "[Mask]"), ("text", "hi"), ("finish", "hi")]
+        )
+
+
 def tiny_vision_config_dict():
     config = tiny_config_dict()
     config["image_token_id"] = 60
