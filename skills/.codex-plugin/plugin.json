@@ -1,7 +1,7 @@
 {
   "name": "mlx-vlm-skills",
   "version": "0.1.0",
-  "description": "Skills for running, serving, optimizing, and extending MLX-VLM models on Apple silicon.",
+  "description": "Skills for MLX-VLM CLI inference, server inference, and reproducible GitHub issues.",
   "author": {
     "name": "MLX-VLM contributors"
   },
@@ -14,9 +14,9 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "MLX-VLM skills",
-    "shortDescription": "Run, serve, optimize, and extend MLX-VLM models",
-    "longDescription": "Skills for working effectively with MLX-VLM on Apple silicon, covering multimodal inference workflows, model-family integration, server behavior, batching, caching, quantization, and speculative decoding.",
-    "defaultPrompt": "Use the MLX-VLM skills to help run, serve, optimize, or extend models in this repository.",
+    "shortDescription": "Run CLI/server inference and write reproducible issues",
+    "longDescription": "Skills for MLX-VLM's practical support workflows: command-line inference, local server/API inference, and creating reproducible GitHub issues from failures or bug reports.",
+    "defaultPrompt": "Use the MLX-VLM skills to help run CLI inference, debug server inference, or create a reproducible GitHub issue.",
     "developerName": "MLX-VLM contributors",
     "category": "Coding",
     "capabilities": [

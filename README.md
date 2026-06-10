@@ -63,13 +63,13 @@ pip install -U mlx-vlm
 
 ## Agent Skills
 
-This repo includes an agent skills bundle under `skills/` for common MLX-VLM workflows.
+This repo includes an agent skills bundle under `skills/` for common MLX-VLM support workflows.
 
 | Skill | Description |
 |-------|-------------|
-| `working-with-mlx-vlm` | Run inference, start the local server, call the OpenAI-compatible API, use the chat UI, and debug basic local execution. |
-| `model-integration` | Add or debug model families, model-type routing, processor behavior, weight loading, and key sanitization. |
-| `serving-and-performance` | Work on server throughput, latency, memory, continuous batching, caching, KV cache quantization, and speculative decoding. |
+| `cli-inference` | Run and debug inference from the command line with reproducible `uv run mlx_vlm.generate` commands. |
+| `server-inference` | Run and debug local server inference through health checks, model listing, chat completions, and the Responses API. |
+| `reproducible-github-issues` | Turn CLI or server failures into concise GitHub issues with environment details, minimal repros, logs, and inputs. |
 
 Install from a local checkout:
 
