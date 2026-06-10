@@ -33,10 +33,7 @@ from ..generate import (
     _merge_prefill_prompt_kwargs,
 )
 from ..generate.common import generation_stream, wired_limit
-from ..generate.diffusion import (
-    diffusion_generation_family,
-    stream_diffusion_generate,
-)
+from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
@@ -1470,9 +1467,7 @@ class ResponseGenerator:
 
         def flush(tokens, finish_reason=None):
             nonlocal emitted_text, emitted_tokens
-            text = (
-                tokenizer.decode(tokens, skip_special_tokens=True) if tokens else ""
-            )
+            text = tokenizer.decode(tokens, skip_special_tokens=True) if tokens else ""
             if text.startswith(emitted_text):
                 delta = text[len(emitted_text) :]
             elif not emitted_text:
@@ -1532,11 +1527,7 @@ class ResponseGenerator:
                 block_length=getattr(config, "default_block_length", None) or 32,
                 steps=getattr(config, "default_diffusion_steps", None) or 32,
                 gen_length=args.max_tokens,
-                top_p=(
-                    None
-                    if args.top_p is None or args.top_p >= 1.0
-                    else args.top_p
-                ),
+                top_p=(None if args.top_p is None or args.top_p >= 1.0 else args.top_p),
                 eos_early_stop=True,
                 visualize=False,
                 tokenizer=tokenizer,
@@ -1549,9 +1540,7 @@ class ResponseGenerator:
 
         tokens = generated[0].tolist()
         finish_reason = (
-            "stop"
-            if tokens and tokenizer.stopping_criteria(tokens[-1])
-            else "length"
+            "stop" if tokens and tokenizer.stopping_criteria(tokens[-1]) else "length"
         )
         flush(tokens, finish_reason=finish_reason)
 

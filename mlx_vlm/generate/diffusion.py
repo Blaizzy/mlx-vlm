@@ -20,6 +20,8 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
+
+
 def _display_width(text: str) -> int:
     width = 0
     for char in text:
@@ -353,9 +355,7 @@ def _diffusion_entropy_and_soft_embeddings(
     embedding_weight: mx.array,
     embed_scale: float,
 ) -> Tuple[mx.array, mx.array]:
-    probs, entropy = _diffusion_entropy_probs_chain(
-        processed_logits.astype(mx.float32)
-    )
+    probs, entropy = _diffusion_entropy_probs_chain(processed_logits.astype(mx.float32))
     soft_embeddings = (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
         embedding_weight.dtype
     ) * embed_scale

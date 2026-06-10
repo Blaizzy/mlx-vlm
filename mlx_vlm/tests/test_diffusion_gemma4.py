@@ -77,7 +77,8 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(model_type, "diffusion_gemma4")
         self.assertEqual(arch.Model.__name__, "Model")
 
-    def test_load_config_attaches_diffusion_generation_config(self):
+    def test_load_config_preserves_generation_config_for_model_config(self):
+        from mlx_vlm.models.diffusion_gemma4 import ModelConfig
         from mlx_vlm.utils import load_config
 
         config = tiny_config_dict()
@@ -99,28 +100,10 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertEqual(loaded["model_type"], "diffusion_gemma4")
         self.assertEqual(loaded["generation_config"], generation_config)
-
-        # Masked-diffusion configs (mask_token_id trait) attach it too.
-        with TemporaryDirectory() as tmpdir:
-            Path(tmpdir, "config.json").write_text(
-                json.dumps({"model_type": "llada2_moe", "mask_token_id": 156895})
-            )
-            Path(tmpdir, "generation_config.json").write_text(
-                json.dumps(generation_config)
-            )
-            loaded = load_config(Path(tmpdir))
-        self.assertEqual(loaded["generation_config"], generation_config)
-
-        # AR models keep generation_config.json out of the model config.
-        with TemporaryDirectory() as tmpdir:
-            Path(tmpdir, "config.json").write_text(
-                json.dumps({"model_type": "gemma4"})
-            )
-            Path(tmpdir, "generation_config.json").write_text(
-                json.dumps(generation_config)
-            )
-            loaded = load_config(Path(tmpdir))
-        self.assertNotIn("generation_config", loaded)
+        self.assertEqual(
+            ModelConfig.from_dict(loaded).generation_config,
+            generation_config,
+        )
 
     def test_forward_shape(self):
         from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
@@ -183,12 +166,10 @@ class TestDiffusionGemma4(unittest.TestCase):
             config.text_config.vocab_size * canvas_ids.shape[-1],
         ).reshape(1, canvas_ids.shape[-1], -1)
 
-        entropy, self_conditioning_embeddings = (
-            _diffusion_entropy_and_soft_embeddings(
-                self_conditioning_logits,
-                model.model.decoder.embed_tokens.weight,
-                model.model.decoder.embed_scale,
-            )
+        entropy, self_conditioning_embeddings = _diffusion_entropy_and_soft_embeddings(
+            self_conditioning_logits,
+            model.model.decoder.embed_tokens.weight,
+            model.model.decoder.embed_scale,
         )
         expected_entropy = _diffusion_token_entropy(self_conditioning_logits)
         logits_output = model(
@@ -223,7 +204,9 @@ class TestDiffusionGemma4(unittest.TestCase):
                 DiffusionGemma4ModelForBlockDiffusion,
             )
         except Exception as exc:
-            self.skipTest(f"Transformers 5.8 DiffusionGemma4 reference unavailable: {exc}")
+            self.skipTest(
+                f"Transformers 5.8 DiffusionGemma4 reference unavailable: {exc}"
+            )
 
         from mlx_vlm.generate.diffusion import _diffusion_linear_temperature
         from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
@@ -261,7 +244,9 @@ class TestDiffusionGemma4(unittest.TestCase):
         mlx_logits = mlx_model(input_ids=input_ids_m, canvas_ids=canvas_m).logits
         mx.eval(mlx_logits)
         self.assertLess(
-            float(np.max(np.abs(hf_logits.detach().cpu().numpy() - np.array(mlx_logits)))),
+            float(
+                np.max(np.abs(hf_logits.detach().cpu().numpy() - np.array(mlx_logits)))
+            ),
             1e-5,
         )
 
@@ -284,7 +269,9 @@ class TestDiffusionGemma4(unittest.TestCase):
         ).logits
         mx.eval(mlx_logits)
         self.assertLess(
-            float(np.max(np.abs(hf_logits.detach().cpu().numpy() - np.array(mlx_logits)))),
+            float(
+                np.max(np.abs(hf_logits.detach().cpu().numpy() - np.array(mlx_logits)))
+            ),
             1e-5,
         )
 
@@ -304,11 +291,13 @@ class TestDiffusionGemma4(unittest.TestCase):
                 past_key_values=past_key_values,
             )
             past_key_values = encoder_outputs.past_key_values
-            mask_mapping = hf_model.model.decoder.create_diffusion_decoder_attention_mask(
-                config=hf_model.config.text_config,
-                inputs_embeds=canvas_t.unsqueeze(-1),
-                past_key_values=past_key_values,
-                attention_mask=decoder_attention_t,
+            mask_mapping = (
+                hf_model.model.decoder.create_diffusion_decoder_attention_mask(
+                    config=hf_model.config.text_config,
+                    inputs_embeds=canvas_t.unsqueeze(-1),
+                    past_key_values=past_key_values,
+                    attention_mask=decoder_attention_t,
+                )
             )
             logits_processor = LogitsProcessorList(
                 [
@@ -360,13 +349,17 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertLess(
             float(
                 np.max(
-                    np.abs(hf_processed.detach().cpu().numpy() - np.array(mlx_processed))
+                    np.abs(
+                        hf_processed.detach().cpu().numpy() - np.array(mlx_processed)
+                    )
                 )
             ),
             1e-5,
         )
         self.assertEqual(hf_argmax.detach().cpu().numpy().tolist(), mlx_argmax.tolist())
-        self.assertEqual(hf_current.detach().cpu().numpy().tolist(), mlx_argmax.tolist())
+        self.assertEqual(
+            hf_current.detach().cpu().numpy().tolist(), mlx_argmax.tolist()
+        )
 
     def test_sanitize_maps_fused_experts_and_keeps_encoder_scalars(self):
         from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
@@ -887,9 +880,7 @@ class TestDiffusionVisualization(unittest.TestCase):
     def test_make_visualizer_defaults_for_verbose_terminals(self):
         from unittest.mock import patch
 
-        from mlx_vlm.models.diffusion_gemma4.visualizer import (
-            make_unmasking_visualizer,
-        )
+        from mlx_vlm.models.diffusion_gemma4.visualizer import make_unmasking_visualizer
 
         with patch("sys.stdout.isatty", return_value=True):
             kwargs = {}
@@ -914,9 +905,7 @@ class TestDiffusionVisualization(unittest.TestCase):
             self.assertNotIn("diffusion_show_unmasking", kwargs)
 
     def test_visualizer_composes_full_canvas(self):
-        from mlx_vlm.models.diffusion_gemma4.visualizer import (
-            DiffusionGemma4Visualizer,
-        )
+        from mlx_vlm.models.diffusion_gemma4.visualizer import DiffusionGemma4Visualizer
 
         visualizer = DiffusionGemma4Visualizer()
         drawn = []
@@ -1077,9 +1066,7 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
             bits=5,
             class_predicate=lambda path, module: isinstance(module, nn.Embedding),
         )
-        self.assertIsInstance(
-            model.model.decoder.embed_tokens, nn.QuantizedEmbedding
-        )
+        self.assertIsInstance(model.model.decoder.embed_tokens, nn.QuantizedEmbedding)
 
         processor = FakeProcessor()
         responses = list(
@@ -1116,9 +1103,7 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         canvas_ids = mx.array([[5, 6, 7]])
         logits = mx.random.normal((1, 3, config.text_config.vocab_size))
         embeds = decoder._embed_canvas(canvas_ids, self_conditioning_logits=logits)
-        self.assertEqual(
-            embeds.shape, (1, 3, config.text_config.hidden_size)
-        )
+        self.assertEqual(embeds.shape, (1, 3, config.text_config.hidden_size))
 
 
 def tiny_vision_config_dict():

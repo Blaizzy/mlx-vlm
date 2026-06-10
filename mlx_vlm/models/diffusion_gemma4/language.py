@@ -1,10 +1,9 @@
-from functools import partial
 import weakref
+from functools import partial
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
@@ -579,9 +578,7 @@ class EncoderModel(nn.Module):
             self.decoder.embed_tokens(llm_input_ids) * self.decoder.embed_scale
         )
         if pixel_values is not None:
-            features = self.get_image_features(pixel_values).astype(
-                inputs_embeds.dtype
-            )
+            features = self.get_image_features(pixel_values).astype(inputs_embeds.dtype)
             mask_expanded = mx.broadcast_to(
                 mx.expand_dims(image_mask, -1), inputs_embeds.shape
             )

@@ -16,12 +16,7 @@ in-place redrawer — are shared with the other diffusion models and live in
 import sys
 from typing import Any, Dict, Optional
 
-from ..diffusion_visualizer import (
-    _CanvasRedrawer,
-    _display_width,
-    _take_display_width,
-    _wrap_text,
-)
+from ..diffusion_visualizer import _CanvasRedrawer
 
 
 class DiffusionGemma4Visualizer:
