@@ -1,4 +1,3 @@
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -15,6 +14,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..diffusion_visualizer import DiffusionUnmaskingVisualizer
 from .config import ModelConfig
 
 _HAS_METAL = mx.metal.is_available()
@@ -128,19 +128,6 @@ def _first_token_index(tokens: mx.array, token_ids: set[int]) -> Optional[int]:
         (index for index, token_id in enumerate(values) if token_id in token_ids),
         None,
     )
-
-
-def _wrap_text(text: str, width: int) -> str:
-    lines = []
-    while len(text) > width:
-        split_at = text.rfind(" ", 0, width + 1)
-        if split_at <= 0:
-            split_at = width
-        lines.append(text[:split_at].rstrip())
-        text = text[split_at:].lstrip()
-    if text:
-        lines.append(text)
-    return "\n".join(lines)
 
 
 def _make_bidirectional_mask(
@@ -1257,107 +1244,13 @@ class LanguageModel(nn.Module):
             if stats is not None:
                 stats[key] = stats.get(key, 0.0) + float(value)
 
-        visualizer_state = {
-            "active": visualize and sys.stdout.isatty(),
-            "alternate_screen": False,
-            "rows": 0,
-            "last_draw": 0.0,
-            "min_interval": 0.1,
-            "token_ids": None,
-            "pieces": None,
-            "canvas": "",
-        }
-
-        def clear_visualizer() -> None:
-            if not visualizer_state["active"]:
-                return
-            if visualizer_state["alternate_screen"]:
-                print("\033[H\033[2J", end="", flush=True)
-                visualizer_state["rows"] = 0
-                return
-            if visualizer_state["rows"] == 0:
-                return
-            controls = ["\r\033[2K"]
-            for _ in range(visualizer_state["rows"] - 1):
-                controls.append("\033[1A\r\033[2K")
-            print("".join(controls), end="", flush=True)
-            visualizer_state["rows"] = 0
-
-        def finish_visualizer() -> None:
-            if not visualizer_state["active"]:
-                return
-            if visualizer_state["alternate_screen"]:
-                print("\033[H\033[2J\033[?25h\033[?1049l", end="", flush=True)
-                visualizer_state["alternate_screen"] = False
-                visualizer_state["rows"] = 0
-            else:
-                clear_visualizer()
-
-        def decode_token(token_id: int) -> str:
-            if tokenizer is None:
-                return str(token_id)
-            piece = tokenizer.decode(
-                [token_id], skip_special_tokens=skip_special_tokens
-            )
-            return piece.replace("\n", "\\n") or " "
-
-        def visualize_tokens(tokens: mx.array, force: bool = False) -> None:
-            if not visualizer_state["active"]:
-                return
-            now = time.perf_counter()
-            if (
-                not force
-                and now - visualizer_state["last_draw"]
-                < visualizer_state["min_interval"]
-            ):
-                return
-            token_ids = tokens[0].tolist()
-            pieces = visualizer_state["pieces"]
-            previous_token_ids = visualizer_state["token_ids"]
-            if (
-                pieces is None
-                or previous_token_ids is None
-                or len(previous_token_ids) != len(token_ids)
-            ):
-                pieces = ["[MASK]"] * len(token_ids)
-                previous_token_ids = [mask_id] * len(token_ids)
-
-            found_eos = False
-            for i, token_id in enumerate(token_ids):
-                previous_token_id = previous_token_ids[i]
-                if found_eos:
-                    if previous_token_id != mask_id:
-                        pieces[i] = "[MASK]"
-                    continue
-                if token_id == mask_id:
-                    if previous_token_id != mask_id:
-                        pieces[i] = "[MASK]"
-                elif token_id in eos_token_ids:
-                    if previous_token_id != token_id:
-                        pieces[i] = decode_token(token_id) or "<eos>"
-                    found_eos = True
-                elif previous_token_id != token_id:
-                    pieces[i] = decode_token(token_id)
-
-            visualizer_state["pieces"] = pieces
-            visualizer_state["token_ids"] = token_ids
-            terminal_size = shutil.get_terminal_size((120, 20))
-            terminal_width = max(20, terminal_size.columns - 1)
-            canvas = _wrap_text("".join(pieces), terminal_width)
-            if not force and canvas == visualizer_state["canvas"]:
-                return
-            rows = max(1, canvas.count("\n") + 1)
-            if (
-                rows >= max(1, terminal_size.lines - 2)
-                and not visualizer_state["alternate_screen"]
-            ):
-                print("\033[?1049h\033[?25l\033[H\033[2J", end="", flush=True)
-                visualizer_state["alternate_screen"] = True
-            clear_visualizer()
-            print(canvas, end="", flush=True)
-            visualizer_state["rows"] = rows
-            visualizer_state["last_draw"] = now
-            visualizer_state["canvas"] = canvas
+        visualizer = DiffusionUnmaskingVisualizer(
+            active=visualize and sys.stdout.isatty(),
+            mask_id=mask_id,
+            eos_token_ids=eos_token_ids,
+            tokenizer=tokenizer,
+            skip_special_tokens=skip_special_tokens,
+        )
 
         generated_blocks = []
         prompt_tic = time.perf_counter()
@@ -1393,13 +1286,13 @@ class LanguageModel(nn.Module):
             block_positions = mx.arange(current_block_length)
             block = mx.full((1, current_block_length), mask_id, dtype=inputs.dtype)
             block[:, 0] = next_token[:, 0]
-            if visualizer_state["active"]:
+            if visualizer.active:
                 preview = (
                     mx.concatenate(generated_blocks + [block], axis=1)
                     if generated_blocks
                     else block
                 )
-                visualize_tokens(preview, force=True)
+                visualizer.visualize(preview, force=True)
 
             denoise_steps = max(1, min(steps, current_block_length))
             denoise_range = range(denoise_steps) if current_block_length > 1 else ()
@@ -1583,13 +1476,13 @@ class LanguageModel(nn.Module):
                     accepted_count = min(transfer_count, masked_count)
                 block = mx.where(transfer_mask, sampled_block, block)
                 add_stat("diffusion_accepted_tokens", accepted_count)
-                if visualizer_state["active"] and bool(transfer_mask.any().item()):
+                if visualizer.active and bool(transfer_mask.any().item()):
                     preview = (
                         mx.concatenate(generated_blocks + [block], axis=1)
                         if generated_blocks
                         else block
                     )
-                    visualize_tokens(preview)
+                    visualizer.visualize(preview)
                 if force_completion:
                     break
                 if end_length is not None:
@@ -1641,9 +1534,9 @@ class LanguageModel(nn.Module):
                 stats["diffusion_tokens_per_denoise_forward"] = (
                     stats.get("diffusion_accepted_tokens", 0.0) / denoise_nfe
                 )
-        if visualizer_state["active"]:
+        if visualizer.active:
             generated_ids = generated[0].tolist()
-            finish_visualizer()
+            visualizer.finish()
             if tokenizer is not None:
                 final_text = tokenizer.decode(
                     generated_ids[:end], skip_special_tokens=skip_special_tokens

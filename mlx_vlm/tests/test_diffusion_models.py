@@ -111,13 +111,18 @@ class TestDiffusionModels(unittest.TestCase):
             )
         )
 
-        self.assertEqual(generate_kwargs["threshold"], 0.7)
-        self.assertEqual(generate_kwargs["min_threshold"], 0.7)
-        self.assertEqual(generate_kwargs["editing_threshold"], 0.5)
-        self.assertEqual(generate_kwargs["max_post_steps"], 16)
-        self.assertEqual(generate_kwargs["num_to_transfer"], 1)
-        self.assertIsNone(generate_kwargs["max_transfer_per_step"])
-        self.assertEqual(generate_kwargs["stability_steps"], 2)
+        # Without explicit overrides the model generate()'s own reference
+        # defaults apply; the dispatcher must not force shared tuned values.
+        for key in (
+            "threshold",
+            "min_threshold",
+            "editing_threshold",
+            "max_post_steps",
+            "num_to_transfer",
+            "max_transfer_per_step",
+            "stability_steps",
+        ):
+            self.assertNotIn(key, generate_kwargs)
         self.assertEqual(generate_kwargs["block_length"], 32)
         self.assertEqual(generate_kwargs["steps"], 32)
         self.assertEqual(result.text, "decoded")
@@ -167,10 +172,8 @@ class TestDiffusionModels(unittest.TestCase):
             )
         )
 
-        self.assertEqual(generate_kwargs["threshold"], 0.7)
-        self.assertEqual(generate_kwargs["min_threshold"], 0.7)
-        self.assertEqual(generate_kwargs["editing_threshold"], 0.5)
-        self.assertEqual(generate_kwargs["max_post_steps"], 16)
+        self.assertNotIn("threshold", generate_kwargs)
+        self.assertNotIn("editing_threshold", generate_kwargs)
         self.assertEqual(generate_kwargs["num_to_transfer"], 2)
 
         model = llada2_moe.Model(config)
@@ -516,3 +519,97 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertGreaterEqual(len(results), 1)
         self.assertEqual(results[-1].generation_tokens, 2)
         self.assertEqual(results[-1].finish_reason, "stop")
+
+
+class TestMaskedDiffusionServerLane(unittest.TestCase):
+    def _tiny_llada(self):
+        from mlx_vlm.models import llada2_moe
+
+        config = llada2_moe.ModelConfig(
+            model_type="llada2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rotary_dim=8,
+            num_experts=None,
+            max_position_embeddings=128,
+            pad_token_id=3,
+            eos_token_id=3,
+            mask_token_id=127,
+        )
+        return llada2_moe.Model(config)
+
+    def test_generate_invokes_on_block_per_block(self):
+        mx.random.seed(0)
+        model = self._tiny_llada()
+        blocks = []
+
+        def on_block(tokens):
+            blocks.append(list(tokens))
+            return True
+
+        generated = model.language_model.generate(
+            mx.array([[4, 5]], dtype=mx.int32),
+            gen_length=8,
+            block_length=4,
+            steps=4,
+            eos_early_stop=False,
+            on_block=on_block,
+        )
+
+        self.assertGreaterEqual(len(blocks), 2)
+        # Each callback reports the cumulative generated tokens so far.
+        self.assertLess(len(blocks[0]), len(blocks[-1]))
+        self.assertEqual(blocks[-1][: len(blocks[0])][:0], [])
+        self.assertLessEqual(len(blocks[-1]), 8)
+        self.assertEqual(generated.shape[0], 1)
+
+    def test_generate_on_block_false_stops_early(self):
+        mx.random.seed(0)
+        model = self._tiny_llada()
+        calls = []
+
+        def on_block(tokens):
+            calls.append(len(tokens))
+            return False
+
+        model.language_model.generate(
+            mx.array([[4, 5]], dtype=mx.int32),
+            gen_length=8,
+            block_length=4,
+            steps=4,
+            eos_early_stop=False,
+            on_block=on_block,
+        )
+
+        self.assertEqual(len(calls), 1)
+
+    def test_diffusion_generation_family_routing(self):
+        from mlx_vlm.generate.diffusion import diffusion_generation_family
+
+        model = self._tiny_llada()
+        self.assertEqual(diffusion_generation_family(model), "masked")
+
+        # Mask-token models that default to AR stay on the batch generator.
+        model.config.default_generation_mode = "ar"
+        self.assertIsNone(diffusion_generation_family(model))
+        model.config.default_generation_mode = None
+
+        model.config.mask_token_id = None
+        self.assertIsNone(diffusion_generation_family(model))
+
+    def test_diffusion_generation_family_block(self):
+        from mlx_vlm.generate.diffusion import diffusion_generation_family
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+        from mlx_vlm.tests.test_diffusion_gemma import tiny_config_dict
+
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        self.assertEqual(diffusion_generation_family(model), "block")
+
+
+if __name__ == "__main__":
+    unittest.main()

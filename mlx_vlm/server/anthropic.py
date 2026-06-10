@@ -654,7 +654,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         if token_count is not None:
                             output_tokens = int(token_count)
                         else:
-                            output_tokens += 1
+                            output_tokens += getattr(token, "token_count", 1)
                         delta = token.text
                         full_output += delta
                         metrics.record_chunk(token)

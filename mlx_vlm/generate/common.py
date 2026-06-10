@@ -128,6 +128,7 @@ class GenerationResult:
     diffusion_step: int = 0
     diffusion_total_steps: int = 0
     diffusion_canvas_index: int = 0
+    diffusion_block_complete: bool = False
 
 
 class PromptCacheState:

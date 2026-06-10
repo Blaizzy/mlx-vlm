@@ -902,7 +902,7 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
-                            output_tokens += 1
+                            output_tokens += getattr(token, "token_count", 1)
                             delta = token.text
                             full_text += delta
                             in_tool_call, delta = suppress_tool_call_content(
@@ -1468,7 +1468,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
-                            output_tokens += 1
+                            output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             metrics.record_chunk(token)
 
@@ -1771,7 +1771,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         pt = ctx.prompt_tokens
                         for token in token_iter:
                             text += token.text
-                            gt += 1
+                            gt += getattr(token, "token_count", 1)
                             metrics.record_chunk(token)
                             if request.logprobs and token.finish_reason != "stop":
                                 logprobs.append(

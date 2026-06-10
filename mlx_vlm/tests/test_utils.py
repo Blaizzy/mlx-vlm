@@ -118,26 +118,26 @@ class MockProcessor:
 
 
 def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+    generation_config = {
+        "eos_token_id": [2, 3],
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_new_tokens": 4096,
+    }
     (tmp_path / "config.json").write_text(
         json.dumps({"model_type": "demo", "eos_token_id": 1}),
         encoding="utf-8",
     )
     (tmp_path / "generation_config.json").write_text(
-        json.dumps(
-            {
-                "eos_token_id": [2, 3],
-                "do_sample": True,
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "top_k": 64,
-                "max_new_tokens": 4096,
-            }
-        ),
+        json.dumps(generation_config),
         encoding="utf-8",
     )
 
     config = load_config(tmp_path)
 
+    assert config["generation_config"] == generation_config
     assert config["eos_token_id"] == [2, 3]
     assert config["do_sample"] is True
     assert config["temperature"] == 1.0
