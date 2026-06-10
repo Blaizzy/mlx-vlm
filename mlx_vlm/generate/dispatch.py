@@ -632,7 +632,6 @@ from .diffusion import (
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
-    print_diffusion_stats,
     stream_diffusion_generate_from_kwargs,
 )
 
@@ -1380,7 +1379,6 @@ def generate(
             f"Generation: {last_response.generation_tokens} tokens, "
             f"{last_response.generation_tps:.3f} tokens-per-sec"
         )
-        print_diffusion_stats(last_response)
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
     return GenerationResult(

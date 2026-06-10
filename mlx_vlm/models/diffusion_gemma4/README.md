@@ -101,24 +101,20 @@ Useful diffusion options:
 
 ## Output Stats
 
-Verbose CLI output includes standard prompt and generation throughput plus
-diffusion-specific counters:
+Verbose CLI output reports the standard prompt and generation throughput,
+like other diffusion models in mlx-vlm:
 
 ```text
 Prompt: 29 tokens, 142.641 tokens-per-sec
 Generation: 120 tokens, 24.488 tokens-per-sec
-Diffusion canvas: 120 tokens, 24.488 tokens-per-sec
-Diffusion work: 1680 token-steps, 342.831 token-steps-per-sec
 Peak memory: 50.883 GB
 ```
 
-- **Generation**: final emitted tokens per second.
-- **Diffusion canvas**: total canvas positions denoised per second. This can be
-  higher than final generation throughput when the model denoises a larger
-  canvas than the number of emitted tokens.
-- **Diffusion work**: `canvas_length * denoising_steps`, reported as
-  token-steps per second. This is the best number for comparing denoising-loop
-  efficiency.
+Note that generation throughput counts the final emitted tokens; a short
+reply still denoises a full canvas, so short generations report lower
+tokens-per-second than long ones. The diffusion counters (canvas tokens,
+denoising steps, token-steps) remain available programmatically on the
+streamed `GenerationResult` objects.
 
 ## Architecture Notes
 

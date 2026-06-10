@@ -243,20 +243,6 @@ def _diffusion_config_dict(config: Any) -> Dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
-def print_diffusion_stats(response: GenerationResult) -> None:
-    if response.diffusion_canvas_tokens <= 0:
-        return
-    print(
-        f"Diffusion canvas: {response.diffusion_canvas_tokens} tokens, "
-        f"{response.diffusion_canvas_tps:.3f} tokens-per-sec"
-    )
-    print(
-        f"Diffusion work: {response.diffusion_work_tokens} "
-        "token-steps, "
-        f"{response.diffusion_work_tps:.3f} token-steps-per-sec"
-    )
-
-
 def _diffusion_initialize_canvas(
     batch_size: int,
     canvas_length: int,
