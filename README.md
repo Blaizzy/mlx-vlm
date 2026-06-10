@@ -343,8 +343,8 @@ mlx_vlm.setup --base-url http://127.0.0.1:8080/v1
 The command updates `~/.pi/agent/models.json`, `~/.hermes/config.yaml`, and
 `~/.config/opencode/opencode.json`, creating `.bak-*` backups first. Use
 `--client pi`, `--client hermes`, or `--client opencode` to configure one
-client; `--client all` is the default. Use `--dry-run` to preview the detected
-model count and target files.
+client. Omit `--client` to configure all clients. Use `--dry-run` to preview
+the detected model count and target files.
 
 #### Server Options
 

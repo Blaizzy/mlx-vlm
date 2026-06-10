@@ -176,19 +176,22 @@ def test_resolve_default_model_rejects_missing_explicit_default(tmp_path):
         resolve_default_model(["org/model-a"], "missing/model", config)
 
 
-def test_setup_parser_uses_client_flag_with_all_default():
+def test_setup_parser_uses_client_flag_with_implicit_all_default():
     parser = build_parser()
 
     assert parser.parse_args([]).clients == CLIENTS
     assert parser.parse_args(["--client", "pi"]).clients == ("pi",)
-    assert parser.parse_args(["--client", "all"]).clients == CLIENTS
-    assert parser.parse_args(["--client", "pi,opencode"]).clients == (
-        "pi",
-        "opencode",
-    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--client", "all"])
 
 
 def test_setup_parser_keeps_clients_alias():
     parser = build_parser()
 
     assert parser.parse_args(["--clients", "hermes"]).clients == ("hermes",)
+    assert parser.parse_args(["--clients", "pi,opencode"]).clients == (
+        "pi",
+        "opencode",
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--clients", "all"])

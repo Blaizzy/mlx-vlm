@@ -346,18 +346,30 @@ def resolve_default_model(
     return model_ids[0]
 
 
+def _client_error(unknown: Iterable[str] | None = None) -> argparse.ArgumentTypeError:
+    valid = ", ".join(CLIENTS)
+    if unknown:
+        return argparse.ArgumentTypeError(
+            f"unknown client(s): {', '.join(sorted(unknown))}. Expected one of: {valid}"
+        )
+    return argparse.ArgumentTypeError(f"expected one of: {valid}")
+
+
+def _parse_client(value: str) -> tuple[str, ...]:
+    client = value.strip().lower()
+    if client not in CLIENTS:
+        raise _client_error([client] if client else None)
+    return (client,)
+
+
 def _parse_clients(value: str) -> tuple[str, ...]:
     requested = tuple(
         item.strip().lower() for item in value.split(",") if item.strip()
     )
-    if not requested or "all" in requested:
-        return CLIENTS
     unknown = sorted(set(requested) - set(CLIENTS))
-    if unknown:
-        raise argparse.ArgumentTypeError(
-            f"unknown client(s): {', '.join(unknown)}"
-        )
-    return requested
+    if not requested or unknown:
+        raise _client_error(unknown or None)
+    return tuple(dict.fromkeys(requested))
 
 
 def configure_clients(args: argparse.Namespace) -> list[tuple[str, Path]]:
@@ -471,11 +483,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--client",
         dest="clients",
-        type=_parse_clients,
+        metavar="CLIENT",
+        type=_parse_client,
         default=CLIENTS,
         help=(
-            "Client(s) to configure: pi, hermes, opencode, or all. "
-            "Comma-separated values are accepted. Default: all."
+            "Client to configure: pi, hermes, or opencode. "
+            "Omit to configure all clients."
         ),
     )
     parser.add_argument(
