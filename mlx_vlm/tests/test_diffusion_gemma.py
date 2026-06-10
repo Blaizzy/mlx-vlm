@@ -568,6 +568,48 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertIsNone(masks["full_attention"])
         self.assertIsNone(masks["sliding_attention"])
 
+    def test_decoder_masks_skip_no_padding_long_sliding_context(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        cache = model.make_cache()
+        _, cache = model.model.encoder(
+            mx.arange(12, dtype=mx.int32)[None, :], cache=cache
+        )
+
+        masks = model.model.decoder._make_decoder_masks(
+            mx.zeros((1, 3, 1)),
+            cache,
+            decoder_attention_mask=None,
+        )
+
+        self.assertIsNone(masks["full_attention"])
+        self.assertIsNone(masks["sliding_attention"])
+
+    def test_decoder_masks_keep_padding_masks(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        cache = model.make_cache()
+        input_ids = mx.array([[2, 3, 0, 0]], dtype=mx.int32)
+        attention_mask = mx.array([[1, 1, 0, 0]], dtype=mx.bool_)
+        _, cache = model.model.encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+        )
+
+        masks = model.model.decoder._make_decoder_masks(
+            mx.zeros((1, 3, 1)),
+            cache,
+            decoder_attention_mask=mx.array([[1, 1, 0, 0, 1, 1, 1]], dtype=mx.bool_),
+        )
+
+        self.assertEqual(masks["full_attention"].shape, (1, 1, 3, 7))
+        self.assertEqual(masks["sliding_attention"].shape, (1, 1, 3, 7))
+
     def test_static_prefix_cache_exposes_full_decoder_state(self):
         from mlx_vlm.models.cache import StaticPrefixKVCache
 
@@ -632,6 +674,32 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
 
+    def test_one_step_generation_does_not_prepare_soft_embedding_weight(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        with patch(
+            "mlx_vlm.generate.diffusion._diffusion_soft_embedding_weight"
+        ) as soft_embedding_weight:
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=2,
+                    max_denoising_steps=1,
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 2)
+        soft_embedding_weight.assert_not_called()
+
     def test_entropy_bound_sampler_runs_configured_steps(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -660,6 +728,28 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].generation_tokens, 2)
         self.assertEqual(responses[-1].diffusion_denoising_steps, 4)
         self.assertEqual(responses[-1].diffusion_work_tokens, 12)
+
+    def test_stability_check_reuses_precomputed_entropy(self):
+        from mlx_vlm.generate.diffusion import _diffusion_stable_and_confident
+
+        canvas = mx.array([[4, 5]], dtype=mx.int32)
+        logits = mx.zeros((1, 2, 8))
+        entropy = mx.zeros((1, 2))
+
+        with patch("mlx_vlm.generate.diffusion._diffusion_token_entropy") as entropy_fn:
+            stable = _diffusion_stable_and_confident(
+                canvas,
+                logits,
+                [canvas],
+                {
+                    "stability_threshold": 1,
+                    "confidence_threshold": 0.1,
+                },
+                entropy,
+            )
+
+        self.assertTrue(stable)
+        entropy_fn.assert_not_called()
 
     def test_stream_generate_uses_checkpoint_denoising_steps(self):
         from mlx_vlm.generate import stream_generate

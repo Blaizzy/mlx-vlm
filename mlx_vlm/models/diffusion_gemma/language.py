@@ -464,18 +464,10 @@ class DecoderModel(nn.Module):
                 continue
 
             if decoder_attention_mask is None:
-                window_prefix = max(self.config.sliding_window - 1, 0)
-                if encoder_len == valid_encoder_len and encoder_len <= window_prefix:
-                    masks[layer_type] = None
-                    continue
-                start = max(0, valid_encoder_len - window_prefix)
-                positions = mx.arange(encoder_len)
-                encoder_mask = (positions >= start) & (positions < valid_encoder_len)
-                canvas_mask = mx.ones((canvas_length,), dtype=mx.bool_)
-                row = mx.concatenate([encoder_mask, canvas_mask], axis=0)
-                masks[layer_type] = mx.broadcast_to(
-                    row[None, None, None, :], (B, 1, canvas_length, key_len)
-                )
+                # No padding/static-cache holes: the attention layer trims
+                # sliding decoder keys to the live window before SDPA, so a
+                # large broadcast mask over the full prompt would be wasted.
+                masks[layer_type] = None
             else:
                 full = decoder_attention_mask.astype(mx.bool_)
                 if full.shape[-1] != key_len:

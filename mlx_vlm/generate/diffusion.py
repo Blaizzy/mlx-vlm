@@ -356,10 +356,20 @@ def _diffusion_entropy_and_soft_embeddings(
     embed_scale: float,
 ) -> Tuple[mx.array, mx.array]:
     probs, entropy = _diffusion_entropy_probs_chain(processed_logits.astype(mx.float32))
-    soft_embeddings = (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
+    soft_embeddings = _diffusion_soft_embeddings_from_probs(
+        probs, embedding_weight, embed_scale
+    )
+    return entropy, soft_embeddings
+
+
+def _diffusion_soft_embeddings_from_probs(
+    probs: mx.array,
+    embedding_weight: mx.array,
+    embed_scale: float,
+) -> mx.array:
+    return (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
         embedding_weight.dtype
     ) * embed_scale
-    return entropy, soft_embeddings
 
 
 def _diffusion_soft_embeddings(
@@ -430,6 +440,7 @@ def _diffusion_stable_and_confident(
     processed_logits: mx.array,
     history: List[mx.array],
     stopping_config: Optional[Dict[str, Any]],
+    token_entropy: Optional[mx.array] = None,
 ) -> bool:
     if stopping_config is None:
         return False
@@ -451,7 +462,8 @@ def _diffusion_stable_and_confident(
     if not stable:
         return False
 
-    token_entropy = _diffusion_token_entropy(processed_logits)
+    if token_entropy is None:
+        token_entropy = _diffusion_token_entropy(processed_logits)
     confident = bool((mx.mean(token_entropy) < confidence_threshold).item())
     return stable and confident
 
@@ -699,10 +711,9 @@ def stream_diffusion_generate(
 
     with mx.stream(generation_stream):
         # Float view of the embedding table for self-conditioning soft
-        # embeddings; dequantized once per call for quantized checkpoints.
-        soft_embedding_weight = _diffusion_soft_embedding_weight(
-            model.model.decoder.embed_tokens
-        )
+        # embeddings. Keep it lazy so one-step/early-stop runs do not
+        # dequantize or materialize the table at all.
+        soft_embedding_weight = None
         canvas_index = 0
         while generated_tokens < max_new_tokens:
             canvas_index += 1
@@ -785,6 +796,9 @@ def stream_diffusion_generate(
 
             for cur_step in reversed(range(1, max_denoising_steps + 1)):
                 denoising_steps_this_canvas += 1
+                token_entropy = None
+                token_probs = None
+                next_self_conditioning_embeddings = None
                 try:
                     if self_conditioning_embeddings is None:
                         processed_logits = decoder_logits_without_sc(current_canvas)
@@ -843,16 +857,11 @@ def stream_diffusion_generate(
 
                 if diffusion_sampler == "entropy-bound":
                     if cur_step > 1:
-                        token_entropy, next_self_conditioning_embeddings = (
-                            _diffusion_entropy_and_soft_embeddings(
-                                processed_logits,
-                                soft_embedding_weight,
-                                model.model.decoder.embed_scale,
-                            )
+                        token_probs, token_entropy = _diffusion_entropy_probs_chain(
+                            processed_logits.astype(mx.float32)
                         )
                     else:
                         token_entropy = _diffusion_token_entropy(processed_logits)
-                        next_self_conditioning_embeddings = None
                     acceptance_mask = _diffusion_entropy_transfer_mask(
                         token_entropy,
                         entropy_bound,
@@ -875,7 +884,6 @@ def stream_diffusion_generate(
                     draft_reveal_mask = acceptance_mask
                     draft_canvas = argmax_canvas
                 else:
-                    next_self_conditioning_embeddings = None
                     unrevealed_mask = ~draft_reveal_mask
                     confidence = _diffusion_token_probability(
                         processed_logits,
@@ -942,16 +950,32 @@ def stream_diffusion_generate(
                     processed_logits,
                     diffusion_history,
                     diffusion_stopping_config,
+                    token_entropy,
                 ):
                     break
 
                 if cur_step > 1:
                     if next_self_conditioning_embeddings is None:
-                        next_self_conditioning_embeddings = _diffusion_soft_embeddings(
-                            processed_logits,
-                            soft_embedding_weight,
-                            model.model.decoder.embed_scale,
-                        )
+                        if soft_embedding_weight is None:
+                            soft_embedding_weight = _diffusion_soft_embedding_weight(
+                                model.model.decoder.embed_tokens
+                            )
+                        if token_probs is not None:
+                            next_self_conditioning_embeddings = (
+                                _diffusion_soft_embeddings_from_probs(
+                                    token_probs,
+                                    soft_embedding_weight,
+                                    model.model.decoder.embed_scale,
+                                )
+                            )
+                        else:
+                            next_self_conditioning_embeddings = (
+                                _diffusion_soft_embeddings(
+                                    processed_logits,
+                                    soft_embedding_weight,
+                                    model.model.decoder.embed_scale,
+                                )
+                            )
                     self_conditioning_embeddings = next_self_conditioning_embeddings
 
             current_canvas = argmax_canvas
