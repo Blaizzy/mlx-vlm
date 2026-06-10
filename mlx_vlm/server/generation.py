@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -32,6 +32,8 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
+from ..generate.common import generation_stream, wired_limit
+from ..generate.diffusion import is_diffusion_model, stream_diffusion_generate
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
@@ -728,7 +730,11 @@ class GenerationMetrics:
 
 @dataclass
 class StreamingToken:
-    """A single token response during streaming generation."""
+    """A single token response during streaming generation.
+
+    Diffusion models stream block-by-block: one StreamingToken per denoised
+    block, with ``token_count`` carrying the number of tokens in the block.
+    """
 
     text: str
     token: int
@@ -738,6 +744,44 @@ class StreamingToken:
     prompt_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
+    token_count: int = 1
+
+
+def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
+    """Group diffusion engine results into block-by-block streaming tokens.
+
+    The diffusion engine emits a canvas's tokens right after that canvas
+    finishes denoising, followed by a block-boundary marker. Each completed
+    block becomes one StreamingToken; the final token carries the finish
+    reason (plus any text flushed by detokenizer finalization).
+    """
+    block_text: List[str] = []
+    last_token = 0
+    emitted_tokens = 0
+    for result in results:
+        if result.is_draft:
+            continue
+        if result.text:
+            block_text.append(result.text)
+        if result.token is not None:
+            last_token = int(result.token)
+        if not result.diffusion_block_complete and not result.finish_reason:
+            continue
+        if result.finish_reason or block_text:
+            token_count = max(result.generation_tokens - emitted_tokens, 0)
+            emitted_tokens = result.generation_tokens
+            yield StreamingToken(
+                text="".join(block_text),
+                token=last_token,
+                logprobs=None,
+                finish_reason=result.finish_reason,
+                peak_memory=result.peak_memory,
+                prompt_tps=result.prompt_tps,
+                token_count=token_count,
+            )
+            block_text = []
+        if result.finish_reason:
+            return
 
 
 class _TokenIterator:
@@ -1165,6 +1209,10 @@ class ResponseGenerator:
 
         self._ready.set()
 
+        if is_diffusion_model(self.model):
+            self._run_diffusion()
+            return
+
         if self.draft_model is not None and self.draft_kind != "mtp":
             self._run_speculative()
             return
@@ -1303,6 +1351,86 @@ class ResponseGenerator:
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
+
+    def _run_diffusion(self):
+        """GPU thread loop for block-diffusion models.
+
+        The diffusion engine generates one request at a time (batch size 1).
+        Output streams back block-by-block: one queue item per denoised
+        canvas, plus a final item carrying the finish reason. Non-streaming
+        endpoints aggregate the same items into a single response.
+        """
+        uid_counter = 0
+        cancelled: set = set()
+        while not self._stop:
+            try:
+                new_items, should_stop = self._collect_pending_requests(active=False)
+                if should_stop:
+                    break
+                cancelled |= self._drain_cancellations()
+                for rqueue, raw_inputs, prompt_tokens, args, _images in new_items:
+                    uid_counter += 1
+                    uid = uid_counter
+                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    try:
+                        self._generate_diffusion(
+                            uid, rqueue, raw_inputs, args, cancelled
+                        )
+                        rqueue.put(None)
+                    except Exception as e:
+                        logger.exception("Error in diffusion generation")
+                        try:
+                            rqueue.put(e)
+                            rqueue.put(None)
+                        except Exception:
+                            pass
+                    mx.clear_cache()
+            except Exception:
+                logger.exception("Error in diffusion generation thread")
+                mx.clear_cache()
+                gc.collect()
+
+    def _generate_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+        if args.logits_processors is not None:
+            raise ValueError(
+                "Structured response_format is not supported with diffusion models."
+            )
+        if args.seed is not None:
+            mx.random.seed(args.seed)
+
+        input_ids = raw_inputs.get("input_ids")
+        if input_ids is not None and input_ids.ndim == 1:
+            input_ids = input_ids[None]
+        tokenizer = self.tokenizer
+        if hasattr(tokenizer, "stopping_criteria"):
+            tokenizer.stopping_criteria.reset(self.config.eos_token_id)
+
+        results = stream_diffusion_generate(
+            self.model,
+            self.processor,
+            tokenizer,
+            input_ids,
+            raw_inputs.get("pixel_values"),
+            raw_inputs.get("attention_mask"),
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            skip_special_token_ids=set(
+                getattr(tokenizer, "all_special_ids", None) or []
+            ),
+            mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
+        )
+        try:
+            with wired_limit(self.model, [generation_stream]):
+                for chunk in _diffusion_block_chunks(results):
+                    rqueue.put(chunk)
+                    if chunk.finish_reason:
+                        break
+                    cancelled |= self._drain_cancellations()
+                    if uid in cancelled:
+                        cancelled.discard(uid)
+                        break
+        finally:
+            results.close()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.

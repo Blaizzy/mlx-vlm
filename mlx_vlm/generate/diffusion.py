@@ -634,6 +634,7 @@ def stream_diffusion_generate(
     is_prefill = True
     current_canvas = None
     stopped = False
+    stop_reason = "length"
 
     def make_result(
         text: str,
@@ -643,6 +644,7 @@ def stream_diffusion_generate(
         diffusion_step: int = 0,
         diffusion_total_steps: int = 0,
         diffusion_canvas_index: int = 0,
+        diffusion_block_complete: bool = False,
         finish_reason: Optional[str] = None,
     ) -> GenerationResult:
         generation_time = max(time.perf_counter() - generation_tic, 1e-9)
@@ -667,6 +669,7 @@ def stream_diffusion_generate(
             diffusion_step=diffusion_step,
             diffusion_total_steps=diffusion_total_steps,
             diffusion_canvas_index=diffusion_canvas_index,
+            diffusion_block_complete=diffusion_block_complete,
         )
 
     with mx.stream(generation_stream):
@@ -938,16 +941,29 @@ def stream_diffusion_generate(
 
                 if tokenizer.stopping_criteria(last_token):
                     stopped = True
+                    stop_reason = "stop"
                     break
 
                 detokenizer.add_token(
                     last_token, skip_special_token_ids=skip_special_token_ids
                 )
-                yield make_result(detokenizer.last_segment)
+                yield make_result(
+                    detokenizer.last_segment,
+                    diffusion_canvas_index=canvas_index,
+                )
 
                 if generated_tokens >= max_new_tokens:
                     stopped = True
+                    stop_reason = "length"
                     break
+
+            # Mark the end of this denoised block so consumers (e.g. the
+            # server) can stream block-by-block.
+            yield make_result(
+                "",
+                diffusion_canvas_index=canvas_index,
+                diffusion_block_complete=True,
+            )
 
             if stopped:
                 break
@@ -970,7 +986,7 @@ def stream_diffusion_generate(
     if prompt_time == 0.0:
         prompt_time = time.perf_counter() - tic
     detokenizer.finalize()
-    finish_reason = "stop" if stopped else "length"
+    finish_reason = stop_reason if stopped else "length"
     yield make_result(detokenizer.last_segment, finish_reason=finish_reason)
 
 

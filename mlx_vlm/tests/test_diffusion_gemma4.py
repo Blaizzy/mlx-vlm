@@ -970,6 +970,74 @@ class TestDiffusionVisualization(unittest.TestCase):
         )
 
 
+class TestDiffusionBlockStreaming(unittest.TestCase):
+    def test_stream_generate_emits_block_boundaries(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma4 import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        # canvas_length=3 with max_tokens=5 -> two canvases, two boundaries.
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=5,
+            )
+        )
+
+        boundaries = [r for r in responses if r.diffusion_block_complete]
+        self.assertEqual(len(boundaries), 2)
+        self.assertTrue(all(r.text == "" for r in boundaries))
+        self.assertEqual([r.diffusion_canvas_index for r in boundaries], [1, 2])
+        # Token results carry their canvas index; the final result carries
+        # the finish reason.
+        token_results = [r for r in responses if r.text and not r.finish_reason]
+        self.assertTrue(all(r.diffusion_canvas_index > 0 for r in token_results))
+        self.assertEqual(responses[-1].finish_reason, "length")
+
+    def test_diffusion_block_chunks_groups_by_block(self):
+        from mlx_vlm.generate.common import GenerationResult
+        from mlx_vlm.server.generation import _diffusion_block_chunks
+
+        results = [
+            GenerationResult(text="Hello", token=5, diffusion_canvas_index=1),
+            GenerationResult(text=" world", token=6, diffusion_canvas_index=1),
+            GenerationResult(diffusion_block_complete=True, diffusion_canvas_index=1),
+            GenerationResult(text="!", token=7, diffusion_canvas_index=2),
+            GenerationResult(diffusion_block_complete=True, diffusion_canvas_index=2),
+            GenerationResult(text="", finish_reason="stop", token=7),
+        ]
+
+        chunks = list(_diffusion_block_chunks(iter(results)))
+        self.assertEqual(
+            [(c.text, c.finish_reason) for c in chunks],
+            [("Hello world", None), ("!", None), ("", "stop")],
+        )
+
+    def test_diffusion_block_chunks_skips_drafts_and_empty_blocks(self):
+        from mlx_vlm.generate.common import GenerationResult
+        from mlx_vlm.server.generation import _diffusion_block_chunks
+
+        results = [
+            GenerationResult(is_draft=True, draft_text="[Mask]"),
+            GenerationResult(diffusion_block_complete=True, diffusion_canvas_index=1),
+            GenerationResult(text="Hi", token=4, diffusion_canvas_index=2),
+            GenerationResult(text=".", finish_reason="stop", token=5),
+        ]
+
+        chunks = list(_diffusion_block_chunks(iter(results)))
+        self.assertEqual(
+            [(c.text, c.finish_reason) for c in chunks],
+            [("Hi.", "stop")],
+        )
+
+
 class TestDiffusionGemma4Quantized(unittest.TestCase):
     def test_stream_generate_with_quantized_embeddings(self):
         import mlx.nn as nn
