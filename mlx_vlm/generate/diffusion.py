@@ -311,28 +311,50 @@ def _diffusion_token_entropy(processed_logits: mx.array) -> mx.array:
     return -mx.sum(probs * log_probs, axis=-1)
 
 
+def _diffusion_probs_to_soft_embeddings(
+    probs: mx.array,
+    embed_tokens: nn.Module,
+    embed_scale: float,
+) -> mx.array:
+    if isinstance(embed_tokens, nn.QuantizedEmbedding):
+        # The packed quantized weight cannot be used in a regular matmul;
+        # probs @ W is a quantized matmul without the as_linear transpose.
+        dtype = embed_tokens.scales.dtype
+        soft_embeddings = mx.quantized_matmul(
+            probs.astype(dtype),
+            embed_tokens.weight,
+            embed_tokens.scales,
+            embed_tokens.biases,
+            transpose=False,
+            group_size=embed_tokens.group_size,
+            bits=embed_tokens.bits,
+        )
+        return soft_embeddings.astype(dtype) * embed_scale
+    weight = embed_tokens.weight
+    return (probs.astype(weight.dtype) @ weight).astype(weight.dtype) * embed_scale
+
+
 def _diffusion_entropy_and_soft_embeddings(
     processed_logits: mx.array,
-    embedding_weight: mx.array,
+    embed_tokens: nn.Module,
     embed_scale: float,
 ) -> Tuple[mx.array, mx.array]:
     logits = processed_logits.astype(mx.float32)
     log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     probs = mx.exp(log_probs)
     entropy = -mx.sum(probs * log_probs, axis=-1)
-    soft_embeddings = (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
-        embedding_weight.dtype
-    ) * embed_scale
-    return entropy, soft_embeddings
+    return entropy, _diffusion_probs_to_soft_embeddings(
+        probs, embed_tokens, embed_scale
+    )
 
 
 def _diffusion_soft_embeddings(
     processed_logits: mx.array,
-    embedding_weight: mx.array,
+    embed_tokens: nn.Module,
     embed_scale: float,
 ) -> mx.array:
     probs = mx.softmax(processed_logits, axis=-1, precise=True)
-    return (probs @ embedding_weight).astype(embedding_weight.dtype) * embed_scale
+    return _diffusion_probs_to_soft_embeddings(probs, embed_tokens, embed_scale)
 
 
 def _diffusion_confidence_transfer_mask(
@@ -800,7 +822,7 @@ def stream_diffusion_generate(
                         token_entropy, next_self_conditioning_embeddings = (
                             _diffusion_entropy_and_soft_embeddings(
                                 processed_logits,
-                                model.model.decoder.embed_tokens.weight,
+                                model.model.decoder.embed_tokens,
                                 model.model.decoder.embed_scale,
                             )
                         )
@@ -903,7 +925,7 @@ def stream_diffusion_generate(
                     if next_self_conditioning_embeddings is None:
                         next_self_conditioning_embeddings = _diffusion_soft_embeddings(
                             processed_logits,
-                            model.model.decoder.embed_tokens.weight,
+                            model.model.decoder.embed_tokens,
                             model.model.decoder.embed_scale,
                         )
                     self_conditioning_embeddings = next_self_conditioning_embeddings

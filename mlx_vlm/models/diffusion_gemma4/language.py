@@ -377,9 +377,21 @@ class DecoderModel(nn.Module):
             soft_embeddings = mx.zeros_like(inputs_embeds)
         else:
             probs = mx.softmax(self_conditioning_logits, axis=-1, precise=True)
-            soft_embeddings = (probs @ self.embed_tokens.weight).astype(
-                inputs_embeds.dtype
-            ) * self.embed_scale
+            if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
+                soft_embeddings = mx.quantized_matmul(
+                    probs.astype(inputs_embeds.dtype),
+                    self.embed_tokens.weight,
+                    self.embed_tokens.scales,
+                    self.embed_tokens.biases,
+                    transpose=False,
+                    group_size=self.embed_tokens.group_size,
+                    bits=self.embed_tokens.bits,
+                )
+            else:
+                soft_embeddings = probs @ self.embed_tokens.weight
+            soft_embeddings = (
+                soft_embeddings.astype(inputs_embeds.dtype) * self.embed_scale
+            )
         return self.self_conditioning(inputs_embeds, soft_embeddings)
 
     def _make_decoder_masks(self, h, caches, decoder_attention_mask=None):
