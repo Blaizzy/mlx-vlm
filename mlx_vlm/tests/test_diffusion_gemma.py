@@ -70,6 +70,23 @@ class FakeProcessor:
         self.detokenizer = NaiveStreamingDetokenizer(self.tokenizer)
 
 
+class RecordingEncoder:
+    def __init__(self, inner):
+        self.inner = inner
+        self.input_lengths = []
+        self.attention_masks = []
+        self.mm_token_type_ids = []
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def __call__(self, input_ids, *args, **kwargs):
+        self.input_lengths.append(input_ids.shape[1])
+        self.attention_masks.append(kwargs.get("attention_mask"))
+        self.mm_token_type_ids.append(kwargs.get("mm_token_type_ids"))
+        return self.inner(input_ids, *args, **kwargs)
+
+
 class TinyDiffusionGemma4Tokenizer:
     image_token = "<image>"
     image_token_id = 60
@@ -548,6 +565,112 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_canvas_tokens, 3)
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
+
+    def test_stream_generate_chunks_diffusion_prefill(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+        processor = FakeProcessor()
+
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
+                max_tokens=1,
+                max_denoising_steps=1,
+                prefill_step_size=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].generation_tokens, 1)
+        self.assertEqual(recorder.input_lengths, [2, 2, 1])
+        self.assertEqual(recorder.attention_masks, [None, None, None])
+
+    def test_chunked_diffusion_prefill_matches_unchunked_tokens(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        def generated_tokens(prefill_step_size):
+            mx.random.seed(42)
+            model = Model(ModelConfig.from_dict(tiny_config_dict()))
+            responses = list(
+                stream_generate(
+                    model,
+                    FakeProcessor(),
+                    "",
+                    input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
+                    max_tokens=3,
+                    max_denoising_steps=1,
+                    prefill_step_size=prefill_step_size,
+                )
+            )
+            return [r.token for r in responses if r.token is not None]
+
+        self.assertEqual(generated_tokens(None), generated_tokens(2))
+
+    def test_stream_generate_keeps_padded_diffusion_prefill_unchunked(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+        processor = FakeProcessor()
+
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3, 4, 5, 0]], dtype=mx.int32),
+                mask=mx.array([[1, 1, 1, 1, 0]], dtype=mx.bool_),
+                max_tokens=1,
+                max_denoising_steps=1,
+                prefill_step_size=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].generation_tokens, 1)
+        self.assertEqual(recorder.input_lengths, [5])
+        self.assertIsNotNone(recorder.attention_masks[0])
+
+    def test_stream_generate_keeps_visual_diffusion_prefill_unchunked(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+        processor = FakeProcessor()
+        mm_token_type_ids = mx.array([[0, 1, 1, 0, 0]], dtype=mx.int32)
+
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
+                mm_token_type_ids=mm_token_type_ids,
+                max_tokens=1,
+                max_denoising_steps=1,
+                prefill_step_size=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].generation_tokens, 1)
+        self.assertEqual(recorder.input_lengths, [5])
+        self.assertIs(recorder.mm_token_type_ids[0], mm_token_type_ids)
 
     def test_decoder_masks_skip_no_padding_short_context(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
