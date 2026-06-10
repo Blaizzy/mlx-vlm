@@ -1,0 +1,14 @@
+{
+  "name": "mlx-vlm-skills",
+  "description": "Skills for running, serving, optimizing, and extending MLX-VLM models on Apple silicon.",
+  "version": "0.1.0",
+  "author": {
+    "name": "MLX-VLM contributors"
+  },
+  "keywords": [
+    "mlx",
+    "mlx-vlm",
+    "vision-language-models",
+    "apple-silicon"
+  ]
+}

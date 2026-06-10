@@ -5,6 +5,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
 
 ## Table of Contents
 - [Installation](#installation)
+- [Agent Skills](#agent-skills)
 - [Usage](#usage)
   - [Command Line Interface (CLI)](#command-line-interface-cli)
     - [Thinking Budget](#thinking-budget)
@@ -58,6 +59,31 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 
 ```sh
 pip install -U mlx-vlm
+```
+
+## Agent Skills
+
+This repo includes an agent skills bundle under `skills/` for common MLX-VLM workflows.
+
+| Skill | Description |
+|-------|-------------|
+| `working-with-mlx-vlm` | Run inference, start the local server, call the OpenAI-compatible API, use the chat UI, and debug basic local execution. |
+| `model-integration` | Add or debug model families, model-type routing, processor behavior, weight loading, and key sanitization. |
+| `serving-and-performance` | Work on server throughput, latency, memory, continuous batching, caching, KV cache quantization, and speculative decoding. |
+
+Install from a local checkout:
+
+```sh
+# Claude Code
+/plugin marketplace add /path/to/mlx-vlm
+/plugin install mlx-vlm-skills@mlx-vlm
+
+# Codex CLI
+codex plugin marketplace add /path/to/mlx-vlm
+codex plugin add mlx-vlm-skills@mlx-vlm
+
+# Gemini CLI
+gemini extensions install /path/to/mlx-vlm/skills
 ```
 
 ## Usage

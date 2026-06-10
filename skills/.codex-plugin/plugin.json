@@ -1,0 +1,27 @@
+{
+  "name": "mlx-vlm-skills",
+  "version": "0.1.0",
+  "description": "Skills for running, serving, optimizing, and extending MLX-VLM models on Apple silicon.",
+  "author": {
+    "name": "MLX-VLM contributors"
+  },
+  "keywords": [
+    "mlx",
+    "mlx-vlm",
+    "vision-language-models",
+    "apple-silicon"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "MLX-VLM skills",
+    "shortDescription": "Run, serve, optimize, and extend MLX-VLM models",
+    "longDescription": "Skills for working effectively with MLX-VLM on Apple silicon, covering multimodal inference workflows, model-family integration, server behavior, batching, caching, quantization, and speculative decoding.",
+    "defaultPrompt": "Use the MLX-VLM skills to help run, serve, optimize, or extend models in this repository.",
+    "developerName": "MLX-VLM contributors",
+    "category": "Coding",
+    "capabilities": [
+      "Read",
+      "Write"
+    ]
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "mlx-vlm",
+  "metadata": {
+    "description": "Agent skills for running, serving, optimizing, and extending MLX-VLM models on Apple silicon.",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "MLX-VLM contributors"
+  },
+  "plugins": [
+    {
+      "name": "mlx-vlm-skills",
+      "description": "Skills for running, serving, optimizing, and extending MLX-VLM models on Apple silicon.",
+      "version": "0.1.0",
+      "source": "./skills"
+    }
+  ]
+}
