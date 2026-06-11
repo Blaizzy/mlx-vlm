@@ -260,9 +260,13 @@ def parse_arguments():
     )
     parser.add_argument(
         "--diffusion-sampler",
-        choices=["entropy-bound", "confidence-threshold"],
-        default="entropy-bound",
-        help="Canvas update sampler for diffusion generation.",
+        choices=["auto", "entropy-bound", "confidence-threshold"],
+        default="auto",
+        help=(
+            "Canvas update sampler for diffusion generation. Auto keeps "
+            "entropy-bound for full-precision models and uses faster "
+            "confidence-threshold sampling for quantized block-diffusion models."
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -270,8 +274,9 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling; masked-diffusion "
-            "models use their checkpoint reference defaults."
+            "Default: 0.9 for explicit confidence-threshold sampling and 0.8 "
+            "for auto-selected quantized block-diffusion sampling; "
+            "masked-diffusion models use their checkpoint reference defaults."
         ),
     )
     parser.add_argument(
@@ -1364,6 +1369,14 @@ def generate(
             f"Generation: {last_response.generation_tokens} tokens, "
             f"{last_response.generation_tps:.3f} tokens-per-sec"
         )
+        if last_response.diffusion_work_tokens:
+            print(
+                "Diffusion: "
+                f"{last_response.diffusion_canvas_tokens} canvas tokens, "
+                f"{last_response.diffusion_denoising_steps} denoising steps, "
+                f"{last_response.diffusion_work_tokens} work tokens, "
+                f"{last_response.diffusion_work_tps:.3f} work-tokens-per-sec"
+            )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
     return GenerationResult(
@@ -1401,7 +1414,7 @@ def main():
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
         "diffusion_max_canvas_length": None,
-        "diffusion_sampler": "entropy-bound",
+        "diffusion_sampler": "auto",
         "threshold": None,
         "min_threshold": None,
         "block_length": None,

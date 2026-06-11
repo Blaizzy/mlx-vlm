@@ -56,6 +56,7 @@ def tiny_config_dict():
 
 class FakeTokenizer:
     all_special_ids = []
+    eos_token_ids = [999999]
 
     def __init__(self):
         self.stopping_criteria = StoppingCriteria([999999], self)
@@ -566,6 +567,30 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
 
+    def test_generate_verbose_prints_diffusion_work_stats(self):
+        from mlx_vlm.generate import generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            generate(
+                model,
+                FakeProcessor(),
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+                max_denoising_steps=1,
+                verbose=True,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Diffusion:", output)
+        self.assertIn("work tokens", output)
+        self.assertIn("work-tokens-per-sec", output)
+
     def test_stream_generate_chunks_diffusion_prefill(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -808,6 +833,7 @@ class TestDiffusionGemma4(unittest.TestCase):
                 "",
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
+                diffusion_sampler="entropy-bound",
             )
         )
 
@@ -1382,6 +1408,48 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
 
 
 class TestDiffusionGemma4Quantized(unittest.TestCase):
+    def test_auto_sampler_uses_confidence_threshold_for_quantized_weights(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.generate.diffusion import (
+            DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
+            DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD,
+            _resolve_diffusion_sampler,
+        )
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config_dict = tiny_config_dict()
+        config_dict["text_config"]["hidden_size"] = 32
+        model = Model(ModelConfig.from_dict(config_dict))
+
+        self.assertEqual(
+            _resolve_diffusion_sampler(model, "auto", None),
+            ("entropy-bound", DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD),
+        )
+
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=5,
+            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
+        )
+
+        self.assertEqual(
+            _resolve_diffusion_sampler(model, "auto", None),
+            (
+                "confidence-threshold",
+                DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD,
+            ),
+        )
+        self.assertEqual(
+            _resolve_diffusion_sampler(model, "entropy-bound", None),
+            ("entropy-bound", DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD),
+        )
+        self.assertEqual(
+            _resolve_diffusion_sampler(model, "confidence-threshold", 0.7),
+            ("confidence-threshold", 0.7),
+        )
+
     def test_stream_generate_with_quantized_embeddings(self):
         import mlx.nn as nn
 

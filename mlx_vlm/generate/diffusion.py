@@ -29,6 +29,8 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
+DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
+DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD = 0.8
 
 
 def _diffusion_display_limit(requested_width: Optional[int] = None) -> Optional[int]:
@@ -180,11 +182,10 @@ def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
         kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
     if getattr(args, "diffusion_max_canvas_length", None) is not None:
         kwargs["diffusion_max_canvas_length"] = args.diffusion_max_canvas_length
-    if args.diffusion_sampler != "entropy-bound":
+    if args.diffusion_sampler != "auto":
         kwargs["diffusion_sampler"] = args.diffusion_sampler
-        kwargs["diffusion_threshold"] = (
-            0.9 if args.threshold is None else args.threshold
-        )
+    if args.threshold is not None:
+        kwargs["diffusion_threshold"] = args.threshold
     return kwargs
 
 
@@ -297,6 +298,49 @@ def _diffusion_token_entropy(processed_logits: mx.array) -> mx.array:
     log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     probs = mx.exp(log_probs)
     return -mx.sum(probs * log_probs, axis=-1)
+
+
+def _diffusion_has_quantized_weights(model: nn.Module) -> bool:
+    for _, module in model.named_modules():
+        if isinstance(module, (nn.QuantizedEmbedding, nn.QuantizedLinear)):
+            return True
+        if module.__class__.__name__ == "QuantizedSwitchLinear":
+            return True
+    return False
+
+
+def _resolve_diffusion_sampler(
+    model: nn.Module,
+    diffusion_sampler: str,
+    diffusion_threshold: Optional[float],
+) -> Tuple[str, float]:
+    if diffusion_sampler == "auto":
+        if _diffusion_has_quantized_weights(model):
+            return (
+                "confidence-threshold",
+                (
+                    DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD
+                    if diffusion_threshold is None
+                    else diffusion_threshold
+                ),
+            )
+        return (
+            "entropy-bound",
+            (
+                DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD
+                if diffusion_threshold is None
+                else diffusion_threshold
+            ),
+        )
+
+    return (
+        diffusion_sampler,
+        (
+            DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD
+            if diffusion_threshold is None
+            else diffusion_threshold
+        ),
+    )
 
 
 def _diffusion_soft_embedding_weight(embed_tokens: nn.Module) -> mx.array:
@@ -543,8 +587,8 @@ def stream_diffusion_generate(
     diffusion_min_canvas_length: Optional[int] = None,
     diffusion_max_canvas_length: Optional[int] = None,
     diffusion_static_cache: bool = False,
-    diffusion_sampler: str = "entropy-bound",
-    diffusion_threshold: float = 0.9,
+    diffusion_sampler: str = "auto",
+    diffusion_threshold: Optional[float] = None,
     diffusion_compile: bool = False,
     diffusion_show_unmasking: bool = False,
     diffusion_unmasking_interval: int = 1,
@@ -596,8 +640,13 @@ def stream_diffusion_generate(
         raise ValueError("diffusion_unmasking_interval must be a positive integer.")
     if diffusion_unmasking_width < 0:
         raise ValueError("diffusion_unmasking_width must be non-negative.")
-    if diffusion_sampler not in ("entropy-bound", "confidence-threshold"):
+    if diffusion_sampler not in ("auto", "entropy-bound", "confidence-threshold"):
         raise ValueError(f"Unsupported diffusion sampler: {diffusion_sampler!r}.")
+    diffusion_sampler, diffusion_threshold = _resolve_diffusion_sampler(
+        model,
+        diffusion_sampler,
+        diffusion_threshold,
+    )
     if not 0.0 <= diffusion_threshold <= 1.0:
         raise ValueError("diffusion_threshold must be between 0 and 1.")
     if prefill_step_size is not None:
@@ -1069,8 +1118,8 @@ def stream_diffusion_generate_from_kwargs(
     diffusion_min_canvas_length = kwargs.pop("diffusion_min_canvas_length", None)
     diffusion_max_canvas_length = kwargs.pop("diffusion_max_canvas_length", None)
     diffusion_static_cache = kwargs.pop("diffusion_static_cache", False)
-    diffusion_sampler = kwargs.pop("diffusion_sampler", "entropy-bound")
-    diffusion_threshold = kwargs.pop("diffusion_threshold", 0.9)
+    diffusion_sampler = kwargs.pop("diffusion_sampler", "auto")
+    diffusion_threshold = kwargs.pop("diffusion_threshold", None)
     diffusion_compile = kwargs.pop("diffusion_compile", False)
     diffusion_show_unmasking = kwargs.pop("diffusion_show_unmasking", False)
     diffusion_unmasking_interval = kwargs.pop("diffusion_unmasking_interval", 1)
