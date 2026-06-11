@@ -41,6 +41,16 @@ from .anthropic import (
     anthropic_count_tokens_endpoint,
     anthropic_messages_endpoint,
 )
+from .audio import (
+    AudioInferenceHandle,
+    AudioRequestQueue,
+    AudioResultChunk,
+    AudioSpeechRequest,
+    AudioTranscriptionRequest,
+    audio_speech_endpoint,
+    audio_transcriptions_endpoint,
+    audio_translations_endpoint,
+)
 from .generation import (
     DEFAULT_ENABLE_THINKING,
     DEFAULT_SPECULATIVE_BATCH_COALESCE_MS,
@@ -107,7 +117,7 @@ from .responses_state import (
     response_store_order,
     suppress_tool_call_content,
 )
-from .runtime import runtime
+from .runtime import ModelCacheRegistry, runtime
 from .schemas import (
     AnthropicMessageParam,
     AnthropicMessageResponse,
