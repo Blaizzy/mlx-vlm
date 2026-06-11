@@ -751,6 +751,27 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertTrue(stable)
         entropy_fn.assert_not_called()
 
+    def test_stability_threshold_one_accepts_current_confident_canvas(self):
+        from mlx_vlm.generate.diffusion import _diffusion_stable_and_confident
+
+        canvas = mx.array([[4, 5]], dtype=mx.int32)
+        logits = mx.zeros((1, 2, 8))
+        history = []
+
+        stable = _diffusion_stable_and_confident(
+            canvas,
+            logits,
+            history,
+            {
+                "stability_threshold": 1,
+                "confidence_threshold": 0.1,
+            },
+            token_entropy=mx.zeros((1, 2)),
+        )
+
+        self.assertTrue(stable)
+        self.assertEqual(len(history), 1)
+
     def test_stream_generate_uses_checkpoint_denoising_steps(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig

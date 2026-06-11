@@ -448,17 +448,13 @@ def _diffusion_stable_and_confident(
     stability_threshold = int(stopping_config.get("stability_threshold", 1))
     confidence_threshold = float(stopping_config.get("confidence_threshold", 0.005))
 
-    if len(history) == stability_threshold:
-        stable = all(
-            bool(mx.all(accepted_canvas == canvas).item()) for canvas in history
-        )
-    else:
-        stable = False
-
     history.append(accepted_canvas)
     if len(history) > stability_threshold:
         history.pop(0)
 
+    stable = len(history) >= stability_threshold and all(
+        bool(mx.all(accepted_canvas == canvas).item()) for canvas in history
+    )
     if not stable:
         return False
 
