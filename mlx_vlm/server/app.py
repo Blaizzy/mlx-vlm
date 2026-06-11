@@ -118,6 +118,7 @@ def _build_gen_args(
     )
     default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
     default_top_k = _model_config_field_or_default(processor, "top_k", 0)
+    default_min_p = _model_config_field_or_default(processor, "min_p", 0.0)
     if _model_config_field_or_default(processor, "do_sample", None) is False:
         default_temperature = 0.0
     args = GenerationArguments(
@@ -127,7 +128,7 @@ def _build_gen_args(
         ),
         top_p=_request_field_or_default(request, "top_p", default_top_p),
         top_k=_request_field_or_default(request, "top_k", default_top_k),
-        min_p=getattr(request, "min_p", 0.0),
+        min_p=_request_field_or_default(request, "min_p", default_min_p),
         seed=getattr(request, "seed", None),
         logprobs=bool(getattr(request, "logprobs", False)),
         repetition_penalty=getattr(request, "repetition_penalty", None),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import math
 import os
 import sys
 import time
@@ -45,6 +46,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
+DEFAULT_SEED = 0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
@@ -125,14 +127,47 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 
 
 class _PositionedTargetSampler:
-    """Sampler with stateless target draws keyed by generated-token position."""
+    """Sampler with stateless target draws keyed by generated-token position.
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
+    Optional top-k truncation and min-p filtering mirror
+    ``mlx_lm.sample_utils.apply_top_k`` / ``apply_min_p``: excluded tokens are
+    masked to -inf on every row's normalized logprobs (vectorized across the
+    batch) before the temperature/top-p draw.
+    """
+
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        seed: Optional[int],
+        top_k: int = DEFAULT_TOP_K,
+        min_p: float = DEFAULT_MIN_P,
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
-        self.seed = int(seed)
+        self.top_k = int(top_k or 0)
+        # An out-of-domain min_p would mask every token (even the argmax);
+        # clamp instead of erroring mid-batch on the GPU thread.
+        self.min_p = min(max(float(min_p or 0.0), 0.0), 1.0)
+        self.seed = DEFAULT_SEED if seed is None else int(seed)
+
+    def _filter_logprobs(self, logprobs: mx.array) -> mx.array:
+        """Mask tokens excluded by top-k/min-p with -inf, per row."""
+        neg_inf = mx.array(-float("inf"), logprobs.dtype)
+        if 0 < self.top_k < logprobs.shape[-1]:
+            mask_idx = mx.argpartition(-logprobs, kth=self.top_k - 1, axis=-1)[
+                ..., self.top_k :
+            ]
+            logprobs = mx.put_along_axis(logprobs, mask_idx, neg_inf, axis=-1)
+        if self.min_p > 0:
+            top_logprobs = mx.max(logprobs, axis=-1, keepdims=True)
+            scaled_min_p = top_logprobs + math.log(self.min_p)
+            logprobs = mx.where(logprobs < scaled_min_p, neg_inf, logprobs)
+        return logprobs
 
     def __call__(self, logprobs: mx.array) -> mx.array:
+        logprobs = self._filter_logprobs(logprobs)
         if self.top_p > 0 and self.top_p < 1.0:
             return top_p_sampling(logprobs, self.top_p, self.temperature)
         return mx.random.categorical(logprobs * (1 / self.temperature))
@@ -146,6 +181,7 @@ class _PositionedTargetSampler:
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
+        logprobs = self._filter_logprobs(logprobs)
         keys = _position_keys(self.seed, row_ids, positions)
         if self.top_p > 0 and self.top_p < 1.0:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
@@ -173,6 +209,36 @@ class _PositionedTargetSampler:
 def _generate_module_override(name: str, fallback):
     generate_module = sys.modules.get("mlx_vlm.generate")
     return getattr(generate_module, name, fallback) if generate_module else fallback
+
+
+def _default_sampler(
+    *,
+    temperature: float,
+    top_p: float,
+    min_p: float,
+    top_k: int,
+    seed: Optional[int],
+) -> Callable[[mx.array], mx.array]:
+    """Build the default sampler for generate_step.
+
+    Seeded calls get the positioned sampler (stateless, reproducible draws,
+    now covering top-k/min-p as well); unseeded calls keep mlx_lm's
+    make_sampler so their global-RNG behavior is unchanged.
+    """
+    if seed is not None and temperature > 0:
+        return _PositionedTargetSampler(
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+            top_k=top_k,
+            min_p=min_p,
+        )
+    return _generate_module_override("make_sampler", make_sampler)(
+        temp=temperature,
+        top_p=top_p,
+        min_p=min_p,
+        top_k=top_k,
+    )
 
 
 def normalize_resize_shape(values):
@@ -290,24 +356,13 @@ def generate_step(
 
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
-        if (
-            seed is not None
-            and temperature > 0
-            and min_p == DEFAULT_MIN_P
-            and top_k == DEFAULT_TOP_K
-        ):
-            sampler = _PositionedTargetSampler(
-                temperature=temperature,
-                top_p=top_p,
-                seed=seed,
-            )
-        else:
-            sampler = _generate_module_override("make_sampler", make_sampler)(
-                temp=temperature,
-                top_p=top_p,
-                min_p=min_p,
-                top_k=top_k,
-            )
+        sampler = _default_sampler(
+            temperature=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+            seed=seed,
+        )
 
     processors = _generate_module_override(
         "make_logits_processors", make_logits_processors
