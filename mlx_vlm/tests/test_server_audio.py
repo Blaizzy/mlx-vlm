@@ -1,3 +1,4 @@
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +13,7 @@ import mlx_vlm.server.audio as server_audio
 
 
 @pytest.fixture
-def client():
+def client(reset_audio_runtime):
     with TestClient(server.app) as test_client:
         yield test_client
 
@@ -21,6 +22,8 @@ def client():
 def reset_audio_runtime(monkeypatch):
     if server.runtime.audio_queue is not None:
         server.runtime.audio_queue.stop_and_join()
+    os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
+    os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     monkeypatch.setattr(server.runtime, "audio_queue", None)
     monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
     monkeypatch.setattr(server.runtime, "response_generator", None)

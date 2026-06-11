@@ -4336,13 +4336,26 @@ class TestResponseGenerator:
             lambda *args, **kwargs: run_calls.append((args, kwargs)),
         )
 
-        server_cli.main()
+        try:
+            server_cli.main()
 
-        assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
-        assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
-        assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
-        assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
-        assert run_calls[0][1]["host"] == "127.0.0.1"
+            assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
+            assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
+            assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
+            assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
+            assert run_calls[0][1]["host"] == "127.0.0.1"
+        finally:
+            for env_var in (
+                "MLX_VLM_ENABLE_THINKING",
+                "MLX_VLM_PRELOAD_MODEL",
+                "MLX_VLM_PRELOAD_ADAPTER",
+                "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_MAX_TOKENS",
+                "MLX_VLM_THINKING_BUDGET",
+                "MLX_VLM_THINKING_START_TOKEN",
+                "MLX_VLM_THINKING_END_TOKEN",
+            ):
+                os.environ.pop(env_var, None)
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
