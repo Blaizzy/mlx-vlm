@@ -59,6 +59,7 @@ GENERATION_CONFIG_DEFAULT_KEYS = (
     "temperature",
     "top_p",
     "top_k",
+    "min_p",
     "do_sample",
 )
 
