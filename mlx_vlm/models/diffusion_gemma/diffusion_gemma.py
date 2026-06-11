@@ -107,6 +107,19 @@ class Model(nn.Module):
     def make_cache(self, max_size=None):
         return self.model.encoder.make_cache(max_size=max_size)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache, draft_model, draft_kind
+        return self.model.encoder.chunked_prefill_policy(prefill_kwargs=prefill_kwargs)
+
     # Model-owned live unmasking view, like the nemotron/llada visualizers.
     make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
 

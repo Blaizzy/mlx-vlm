@@ -20,6 +20,48 @@ DEFAULT_QUANTIZED_KV_START = 5000
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def _policy_enabled(policy) -> bool:
+    return bool(getattr(policy, "enabled", policy))
+
+
+def _chunked_prefill_enabled(
+    model,
+    *,
+    input_ids=None,
+    inputs_embeds=None,
+    prompt_cache=None,
+    draft_model=None,
+    draft_kind=None,
+    prefill_kwargs=None,
+) -> bool:
+    prefill_kwargs = prefill_kwargs or {}
+    candidates = [model]
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None and language_model is not model:
+        candidates.append(language_model)
+
+    for candidate in candidates:
+        policy = getattr(candidate, "chunked_prefill_policy", None)
+        if callable(policy):
+            return _policy_enabled(
+                policy(
+                    input_ids=input_ids,
+                    inputs_embeds=inputs_embeds,
+                    prompt_cache=prompt_cache,
+                    draft_model=draft_model,
+                    draft_kind=draft_kind,
+                    prefill_kwargs=prefill_kwargs,
+                )
+            )
+
+    if any(getattr(candidate, "no_chunked_prefill", False) for candidate in candidates):
+        return False
+
+    # Hidden-state speculative prefill is model-contract dependent. Keep unknown
+    # target models conservative unless they expose a chunked_prefill_policy.
+    return draft_model is None
+
+
 def maybe_quantize_kv_cache(
     prompt_cache,
     quantized_kv_start,

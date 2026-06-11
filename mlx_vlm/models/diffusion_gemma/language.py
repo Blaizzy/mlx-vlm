@@ -559,6 +559,39 @@ class EncoderModel(nn.Module):
                 caches.append(RotatingKVCache(max_size=self.text_config.sliding_window))
         return caches
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache, draft_model, draft_kind
+        prefill_kwargs = prefill_kwargs or {}
+        if bool(prefill_kwargs.get("has_padding", False)):
+            return False
+        attention_mask = prefill_kwargs.get("attention_mask", None)
+        if attention_mask is not None and not bool(mx.all(attention_mask).item()):
+            return False
+        if bool(prefill_kwargs.get("use_static_cache", False)):
+            return False
+        if prefill_kwargs.get("pixel_values", None) is not None:
+            return False
+
+        token_types = prefill_kwargs.get("mm_token_type_ids", None)
+        if token_types is not None:
+            # Visual spans can use bidirectional attention inside the whole
+            # block. Keep those prompts on the single prefill path until
+            # chunking can split on visual-block boundaries.
+            has_visual = bool(mx.any((token_types == 1) | (token_types == 2)).item())
+            if has_visual:
+                return False
+
+        return True
+
     def get_image_features(self, pixel_values):
         if self.vision_tower is None or self.embed_vision is None:
             raise ValueError(
@@ -763,6 +796,19 @@ class LanguageModel(nn.Module):
 
     def make_cache(self, max_size: Optional[int] = None):
         return self.model.encoder.make_cache(max_size=max_size)
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache, draft_model, draft_kind
+        return self.model.encoder.chunked_prefill_policy(prefill_kwargs=prefill_kwargs)
 
     def __call__(
         self,

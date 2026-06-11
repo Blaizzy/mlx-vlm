@@ -593,6 +593,37 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(recorder.input_lengths, [2, 2, 1])
         self.assertEqual(recorder.attention_masks, [None, None, None])
 
+    def test_stream_generate_honors_diffusion_chunked_prefill_policy(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        recorder = RecordingEncoder(model.model.encoder)
+        model.model.encoder = recorder
+        processor = FakeProcessor()
+
+        with patch.object(
+            model, "chunked_prefill_policy", return_value=False
+        ) as policy:
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
+                    max_tokens=1,
+                    max_denoising_steps=1,
+                    prefill_step_size=2,
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 1)
+        self.assertEqual(recorder.input_lengths, [5])
+        policy.assert_called_once()
+        self.assertFalse(policy.call_args.kwargs["prefill_kwargs"]["has_padding"])
+
     def test_chunked_diffusion_prefill_matches_unchunked_tokens(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
