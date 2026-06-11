@@ -818,6 +818,21 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
 
 
+def test_image_generation_lock_uses_image_cache_kind(monkeypatch):
+    text_lock = object()
+    image_lock = object()
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"generation_lock": text_lock})
+    registry.set("image_generation", {"generation_lock": image_lock})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    assert server_openai._runtime_cache_get("generation_lock") is text_lock
+    assert (
+        server_openai._runtime_cache_get("generation_lock", kind="image_generation")
+        is image_lock
+    )
+
+
 def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
     calls = []
 
