@@ -640,6 +640,43 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertEqual(generated_tokens(None), generated_tokens(2))
 
+    def test_full_precision_generation_keeps_soft_embedding_helpers(self):
+        from mlx_vlm.generate import diffusion as diffusion_module
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        self.assertFalse(model.prefers_logits_self_conditioning)
+
+        with (
+            patch(
+                "mlx_vlm.generate.diffusion._diffusion_soft_embedding_weight",
+                wraps=diffusion_module._diffusion_soft_embedding_weight,
+            ) as weight,
+            patch(
+                "mlx_vlm.generate.diffusion._diffusion_entropy_and_soft_embeddings",
+                wraps=diffusion_module._diffusion_entropy_and_soft_embeddings,
+            ) as entropy_embeddings,
+        ):
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=2,
+                    max_denoising_steps=2,
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 2)
+        weight.assert_called_once()
+        entropy_embeddings.assert_called()
+
     def test_stream_generate_keeps_padded_diffusion_prefill_unchunked(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -1429,8 +1466,8 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         mx.random.seed(0)
         config_dict = tiny_config_dict()
         config_dict["text_config"]["hidden_size"] = 32
-        # Several denoising steps so the self-conditioning soft-embedding
-        # path (probs @ embedding table) runs against the quantized table.
+        # Several denoising steps so quantized self-conditioning reuses logits
+        # and avoids materializing a dequantized embedding table.
         config_dict["generation_config"]["max_denoising_steps"] = 3
         config = ModelConfig.from_dict(config_dict)
         model = Model(config)
@@ -1441,20 +1478,35 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
             class_predicate=lambda path, module: isinstance(module, nn.Embedding),
         )
         self.assertIsInstance(model.model.decoder.embed_tokens, nn.QuantizedEmbedding)
+        self.assertTrue(model.prefers_logits_self_conditioning)
 
         processor = FakeProcessor()
-        responses = list(
-            stream_generate(
-                model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
+        with (
+            patch(
+                "mlx_vlm.generate.diffusion._diffusion_soft_embedding_weight"
+            ) as weight,
+            patch(
+                "mlx_vlm.generate.diffusion._diffusion_soft_embeddings"
+            ) as embeddings,
+            patch(
+                "mlx_vlm.generate.diffusion._diffusion_entropy_and_soft_embeddings"
+            ) as entropy_embeddings,
+        ):
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=2,
+                )
             )
-        )
 
         self.assertEqual(responses[-1].generation_tokens, 2)
         self.assertGreater(responses[-1].diffusion_work_tokens, 0)
+        weight.assert_not_called()
+        embeddings.assert_not_called()
+        entropy_embeddings.assert_not_called()
 
     def test_embed_canvas_quantized_self_conditioning_logits(self):
         import mlx.nn as nn

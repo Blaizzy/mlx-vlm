@@ -111,6 +111,31 @@ class Model(nn.Module):
     def make_cache(self, max_size=None):
         return self.model.encoder.make_cache(max_size=max_size)
 
+    @property
+    def prefers_logits_self_conditioning(self) -> bool:
+        return self.model.decoder.prefers_logits_self_conditioning
+
+    def _diffusion_decoder_logits(
+        self,
+        canvas_ids: mx.array,
+        cache=None,
+        self_conditioning: mx.array = None,
+        decoder_attention_mask: mx.array = None,
+    ):
+        kwargs = (
+            {"self_conditioning_logits": self_conditioning}
+            if self.prefers_logits_self_conditioning
+            else {"self_conditioning_embeddings": self_conditioning}
+        )
+        hidden_states = self.model.decoder(
+            canvas_ids,
+            cache=cache,
+            decoder_attention_mask=decoder_attention_mask,
+            **kwargs,
+        )
+        logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
+        return self._softcap(logits)
+
     # Model-owned live unmasking view, like the nemotron/llada visualizers.
     make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
 
