@@ -3,11 +3,7 @@ import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
-from .language import (
-    DiffusionGemma4Backbone,
-    diffusion_gemma_quant_predicate,
-    make_compiled_softcap,
-)
+from .language import DiffusionGemma4Backbone, make_compiled_softcap
 from .visualizer import make_unmasking_visualizer
 
 
@@ -50,7 +46,20 @@ class _LanguageModelView:
 
     @property
     def quant_predicate(self):
-        return diffusion_gemma_quant_predicate
+        def predicate(path, m):
+            if not hasattr(m, "to_quantized"):
+                return False
+            if (
+                path.endswith(
+                    ("embed_tokens", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+                )
+                or ".self_attn." in path
+                or "router" in path
+            ):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
 
 class Model(nn.Module):
