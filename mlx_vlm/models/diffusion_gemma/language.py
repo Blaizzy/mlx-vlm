@@ -34,6 +34,27 @@ def make_compiled_softcap(softcap: float):
     return mx.compile(_softcap, shapeless=True)
 
 
+_EIGHT_BIT_QUANTIZATION = {"group_size": 64, "bits": 8}
+_EIGHT_BIT_QUANTIZED_SUFFIXES = (
+    "embed_tokens",
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
+
+
+def diffusion_gemma_quant_predicate(path, m):
+    if not hasattr(m, "to_quantized"):
+        return False
+    if (
+        path.endswith(_EIGHT_BIT_QUANTIZED_SUFFIXES)
+        or ".self_attn." in path
+        or "router" in path
+    ):
+        return dict(_EIGHT_BIT_QUANTIZATION)
+    return True
+
+
 class GeGLU(nn.Module):
     def __call__(self, x, gate):
         return geglu(gate, x)
@@ -837,15 +858,4 @@ class LanguageModel(nn.Module):
 
     @property
     def quant_predicate(self):
-        def predicate(path, m):
-            if not hasattr(m, "to_quantized"):
-                return False
-            if path.endswith("embed_tokens") or ".self_attn." in path:
-                return {"group_size": 64, "bits": 8}
-            if "router" in path or path.endswith(
-                ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
-            ):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
+        return diffusion_gemma_quant_predicate
