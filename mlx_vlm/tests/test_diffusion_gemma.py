@@ -1338,6 +1338,46 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
 
 
 class TestDiffusionGemma4Quantized(unittest.TestCase):
+    def test_quant_predicate_uses_8bit_for_embeddings_and_attention(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        predicate = model.quant_predicate
+        decoder = model.model.decoder
+
+        self.assertEqual(
+            predicate("model.decoder.embed_tokens", decoder.embed_tokens),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertEqual(
+            predicate(
+                "model.decoder.layers.0.self_attn.q_proj",
+                decoder.layers[0].self_attn.q_proj,
+            ),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertEqual(
+            predicate(
+                "model.decoder.layers.0.router.proj",
+                decoder.layers[0].router.proj,
+            ),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertEqual(
+            predicate(
+                "model.decoder.layers.0.mlp.gate_proj",
+                decoder.layers[0].mlp.gate_proj,
+            ),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(
+            predicate(
+                "model.decoder.layers.0.experts.gate_up_proj",
+                decoder.layers[0].experts.gate_up_proj,
+            ),
+            True,
+        )
+
     def test_auto_sampler_uses_confidence_threshold_for_quantized_weights(self):
         import mlx.nn as nn
 
