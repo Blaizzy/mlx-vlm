@@ -32,6 +32,15 @@ DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
 DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD = 0.8
 
+BLOCK_DIFFUSION_METHODS = (
+    "diffusion_decoder_logits",
+    "diffusion_decoder_masks",
+    "diffusion_prefill_cache",
+    "diffusion_prepare_self_conditioning",
+    "diffusion_self_conditioning",
+    "diffusion_update_cache",
+)
+
 
 def _diffusion_display_limit(requested_width: Optional[int] = None) -> Optional[int]:
     terminal_width = shutil.get_terminal_size((120, 20)).columns
@@ -142,7 +151,9 @@ def _is_diffusion_config(config: Any) -> bool:
 
 def is_diffusion_model(model: nn.Module) -> bool:
     """True for block-diffusion canvas models driven by the shared engine."""
-    return _is_diffusion_config(getattr(model, "config", None))
+    return _is_diffusion_config(getattr(model, "config", None)) and all(
+        callable(getattr(model, method, None)) for method in BLOCK_DIFFUSION_METHODS
+    )
 
 
 def is_masked_diffusion_model(model: nn.Module) -> bool:
@@ -343,91 +354,12 @@ def _resolve_diffusion_sampler(
     )
 
 
-def _diffusion_soft_embedding_weight(embed_tokens: nn.Module) -> mx.array:
-    """Return a float weight matrix usable as ``probs @ weight``.
-
-    For quantized embeddings, the packed weight cannot feed a regular matmul
-    and ``mx.quantized_matmul(..., transpose=False)`` is several times slower
-    at this shape, so the table is dequantized once per generation call.
-    """
-    if isinstance(embed_tokens, nn.QuantizedEmbedding):
-        return mx.dequantize(
-            embed_tokens.weight,
-            embed_tokens.scales,
-            embed_tokens.biases,
-            group_size=embed_tokens.group_size,
-            bits=embed_tokens.bits,
-            mode=getattr(embed_tokens, "mode", "affine"),
-        )
-    return embed_tokens.weight
-
-
 @mx.compile
 def _diffusion_entropy_probs_chain(logits: mx.array) -> Tuple[mx.array, mx.array]:
     log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     probs = mx.exp(log_probs)
     entropy = -mx.sum(probs * log_probs, axis=-1)
     return probs, entropy
-
-
-def _diffusion_entropy_and_soft_embeddings(
-    processed_logits: mx.array,
-    embedding_weight: mx.array,
-    embed_scale: float,
-) -> Tuple[mx.array, mx.array]:
-    probs, entropy = _diffusion_entropy_probs_chain(processed_logits.astype(mx.float32))
-    soft_embeddings = (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
-        embedding_weight.dtype
-    ) * embed_scale
-    return entropy, soft_embeddings
-
-
-def _diffusion_soft_embeddings(
-    processed_logits: mx.array,
-    embedding_weight: mx.array,
-    embed_scale: float,
-) -> mx.array:
-    probs = mx.softmax(processed_logits, axis=-1, precise=True)
-    return (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
-        embedding_weight.dtype
-    ) * embed_scale
-
-
-def _diffusion_self_conditioning_weight(model: nn.Module) -> Optional[mx.array]:
-    if model.prefers_logits_self_conditioning:
-        return None
-    return _diffusion_soft_embedding_weight(model.model.decoder.embed_tokens)
-
-
-def _diffusion_make_self_conditioning(
-    model: nn.Module,
-    processed_logits: mx.array,
-    embedding_weight: Optional[mx.array],
-) -> mx.array:
-    if model.prefers_logits_self_conditioning:
-        return processed_logits
-    return _diffusion_soft_embeddings(
-        processed_logits,
-        embedding_weight,
-        model.model.decoder.embed_scale,
-    )
-
-
-def _diffusion_entropy_and_self_conditioning(
-    model: nn.Module,
-    processed_logits: mx.array,
-    embedding_weight: Optional[mx.array],
-) -> Tuple[mx.array, mx.array]:
-    if model.prefers_logits_self_conditioning:
-        _, token_entropy = _diffusion_entropy_probs_chain(
-            processed_logits.astype(mx.float32)
-        )
-        return token_entropy, processed_logits
-    return _diffusion_entropy_and_soft_embeddings(
-        processed_logits,
-        embedding_weight,
-        model.model.decoder.embed_scale,
-    )
 
 
 def _diffusion_confidence_transfer_mask(
@@ -482,39 +414,6 @@ def _diffusion_static_cache_length(
     return prompt_length + cached_canvas_tokens
 
 
-def _diffusion_prefill_cache(
-    model: nn.Module,
-    input_ids: mx.array,
-    *,
-    attention_mask: Optional[mx.array],
-    kv_cache,
-    pixel_values: Optional[mx.array],
-    mm_token_type_ids: Optional[mx.array],
-    prefill_step_size: Optional[int],
-    chunk_prefill: bool,
-):
-    if not chunk_prefill:
-        _, kv_cache = model.model.encoder(
-            input_ids,
-            attention_mask=attention_mask,
-            cache=kv_cache,
-            pixel_values=pixel_values,
-            mm_token_type_ids=mm_token_type_ids,
-        )
-        return kv_cache
-
-    for start in range(0, input_ids.shape[1], prefill_step_size):
-        end = min(start + prefill_step_size, input_ids.shape[1])
-        _, kv_cache = model.model.encoder(
-            input_ids[:, start:end],
-            attention_mask=None,
-            cache=kv_cache,
-        )
-        mx.eval([c.state for c in kv_cache])
-        mx.clear_cache()
-    return kv_cache
-
-
 def _diffusion_stable_and_confident(
     accepted_canvas: mx.array,
     processed_logits: mx.array,
@@ -554,7 +453,7 @@ def _make_diffusion_decoder_logits_fns(
     compile_graph: bool,
 ):
     def without_self_conditioning(current_canvas):
-        return model._diffusion_decoder_logits(
+        return model.diffusion_decoder_logits(
             current_canvas,
             cache=kv_cache,
             self_conditioning=None,
@@ -562,7 +461,7 @@ def _make_diffusion_decoder_logits_fns(
         )
 
     def with_self_conditioning(current_canvas, self_conditioning):
-        return model._diffusion_decoder_logits(
+        return model.diffusion_decoder_logits(
             current_canvas,
             cache=kv_cache,
             self_conditioning=self_conditioning,
@@ -814,26 +713,24 @@ def stream_diffusion_generate(
         )
 
     with mx.stream(generation_stream):
-        soft_embedding_weight = _diffusion_self_conditioning_weight(model)
+        self_conditioning_context = model.diffusion_prepare_self_conditioning()
         canvas_index = 0
         while generated_tokens < max_new_tokens:
             canvas_index += 1
             unprocessed_input_ids = input_ids if is_prefill else current_canvas
             if is_prefill:
-                kv_cache = _diffusion_prefill_cache(
-                    model,
+                kv_cache = model.diffusion_prefill_cache(
                     unprocessed_input_ids,
                     attention_mask=attention_mask if has_padding else None,
-                    kv_cache=kv_cache,
+                    cache=kv_cache,
                     pixel_values=pixel_values,
                     mm_token_type_ids=mm_token_type_ids,
                     prefill_step_size=prefill_step_size,
                     chunk_prefill=chunk_prefill,
                 )
             else:
-                _, kv_cache = model.model.encoder(
+                kv_cache = model.diffusion_update_cache(
                     unprocessed_input_ids,
-                    attention_mask=None,
                     cache=kv_cache,
                 )
 
@@ -871,8 +768,8 @@ def stream_diffusion_generate(
             accepted_canvas = current_canvas
             argmax_canvas = current_canvas
             self_conditioning = None
-            mask_mapping = model.model.decoder._make_decoder_masks(
-                current_canvas[..., None],
+            mask_mapping = model.diffusion_decoder_masks(
+                current_canvas,
                 kv_cache,
                 current_decoder_attention_mask,
             )
@@ -964,12 +861,13 @@ def stream_diffusion_generate(
 
                 if diffusion_sampler == "entropy-bound":
                     if cur_step > 1:
-                        token_entropy, next_self_conditioning = (
-                            _diffusion_entropy_and_self_conditioning(
-                                model,
-                                processed_logits,
-                                soft_embedding_weight,
-                            )
+                        token_probs, token_entropy = _diffusion_entropy_probs_chain(
+                            processed_logits.astype(mx.float32)
+                        )
+                        next_self_conditioning = model.diffusion_self_conditioning(
+                            processed_logits,
+                            self_conditioning_context,
+                            token_probs=token_probs,
                         )
                     else:
                         token_entropy = _diffusion_token_entropy(processed_logits)
@@ -1068,10 +966,9 @@ def stream_diffusion_generate(
 
                 if cur_step > 1:
                     if next_self_conditioning is None:
-                        next_self_conditioning = _diffusion_make_self_conditioning(
-                            model,
+                        next_self_conditioning = model.diffusion_self_conditioning(
                             processed_logits,
-                            soft_embedding_weight,
+                            self_conditioning_context,
                         )
                     self_conditioning = next_self_conditioning
 

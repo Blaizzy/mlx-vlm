@@ -128,7 +128,59 @@ class Model(nn.Module):
     def prefers_logits_self_conditioning(self) -> bool:
         return self.model.decoder.prefers_logits_self_conditioning
 
-    def _diffusion_decoder_logits(
+    def diffusion_prepare_self_conditioning(self):
+        return self.model.decoder.diffusion_prepare_self_conditioning()
+
+    def diffusion_self_conditioning(
+        self,
+        processed_logits: mx.array,
+        embedding_weight: mx.array = None,
+        *,
+        token_probs: mx.array = None,
+    ):
+        return self.model.decoder.diffusion_self_conditioning(
+            processed_logits,
+            embedding_weight,
+            token_probs=token_probs,
+        )
+
+    def diffusion_prefill_cache(
+        self,
+        input_ids: mx.array,
+        *,
+        attention_mask: mx.array = None,
+        cache=None,
+        pixel_values: mx.array = None,
+        mm_token_type_ids: mx.array = None,
+        prefill_step_size: int = None,
+        chunk_prefill: bool = False,
+    ):
+        return self.model.diffusion_prefill_cache(
+            input_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
+            prefill_step_size=prefill_step_size,
+            chunk_prefill=chunk_prefill,
+        )
+
+    def diffusion_update_cache(self, input_ids: mx.array, *, cache):
+        return self.model.diffusion_update_cache(input_ids, cache=cache)
+
+    def diffusion_decoder_masks(
+        self,
+        canvas_ids: mx.array,
+        cache,
+        decoder_attention_mask: mx.array = None,
+    ):
+        return self.model.diffusion_decoder_masks(
+            canvas_ids,
+            cache,
+            decoder_attention_mask,
+        )
+
+    def diffusion_decoder_logits(
         self,
         canvas_ids: mx.array,
         cache=None,
@@ -148,6 +200,8 @@ class Model(nn.Module):
         )
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return self._softcap(logits)
+
+    _diffusion_decoder_logits = diffusion_decoder_logits
 
     # Model-owned live unmasking view, like the nemotron/llada visualizers.
     make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
