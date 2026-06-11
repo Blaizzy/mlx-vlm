@@ -1708,6 +1708,12 @@ def prepare_inputs(
                 padding=True,
                 return_attention_mask=True,
             )
+            # Hand the decoded arrays downstream (mirrors the generic branch
+            # below): process_inputs_with_fallback re-runs the HF processor,
+            # whose Whisper feature extractor does np.asarray(raw_speech) and
+            # crashes on path strings ("could not convert string to float")
+            # or BytesIO from the server's base64 decode.
+            audio = audio_arrays
 
             audio_feature_lengths = np.sum(
                 audio_inputs["attention_mask"], axis=-1, dtype=np.int32
