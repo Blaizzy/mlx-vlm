@@ -279,7 +279,7 @@ class TestDiffusionGemma4(unittest.TestCase):
 
     def test_precomputed_self_conditioning_embeddings_match_logits_path(self):
         from mlx_vlm.generate.diffusion import (
-            _diffusion_entropy_and_soft_embeddings,
+            _diffusion_entropy_probs_chain,
             _diffusion_token_entropy,
         )
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -294,10 +294,13 @@ class TestDiffusionGemma4(unittest.TestCase):
             config.text_config.vocab_size * canvas_ids.shape[-1],
         ).reshape(1, canvas_ids.shape[-1], -1)
 
-        entropy, self_conditioning_embeddings = _diffusion_entropy_and_soft_embeddings(
+        token_probs, entropy = _diffusion_entropy_probs_chain(
+            self_conditioning_logits.astype(mx.float32)
+        )
+        self_conditioning_embeddings = model.diffusion_self_conditioning(
             self_conditioning_logits,
-            model.model.decoder.embed_tokens.weight,
-            model.model.decoder.embed_scale,
+            model.diffusion_prepare_self_conditioning(),
+            token_probs=token_probs,
         )
         expected_entropy = _diffusion_token_entropy(self_conditioning_logits)
         logits_output = model(
@@ -640,8 +643,7 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertEqual(generated_tokens(None), generated_tokens(2))
 
-    def test_full_precision_generation_keeps_soft_embedding_helpers(self):
-        from mlx_vlm.generate import diffusion as diffusion_module
+    def test_full_precision_generation_uses_model_self_conditioning(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -653,14 +655,16 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertFalse(model.prefers_logits_self_conditioning)
 
         with (
-            patch(
-                "mlx_vlm.generate.diffusion._diffusion_soft_embedding_weight",
-                wraps=diffusion_module._diffusion_soft_embedding_weight,
-            ) as weight,
-            patch(
-                "mlx_vlm.generate.diffusion._diffusion_entropy_and_soft_embeddings",
-                wraps=diffusion_module._diffusion_entropy_and_soft_embeddings,
-            ) as entropy_embeddings,
+            patch.object(
+                model,
+                "diffusion_prepare_self_conditioning",
+                wraps=model.diffusion_prepare_self_conditioning,
+            ) as prepare,
+            patch.object(
+                model,
+                "diffusion_self_conditioning",
+                wraps=model.diffusion_self_conditioning,
+            ) as self_conditioning,
         ):
             responses = list(
                 stream_generate(
@@ -674,8 +678,8 @@ class TestDiffusionGemma4(unittest.TestCase):
             )
 
         self.assertEqual(responses[-1].generation_tokens, 2)
-        weight.assert_called_once()
-        entropy_embeddings.assert_called()
+        prepare.assert_called_once()
+        self_conditioning.assert_called()
 
     def test_stream_generate_keeps_padded_diffusion_prefill_unchunked(self):
         from mlx_vlm.generate import stream_generate
@@ -1482,15 +1486,16 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
 
         processor = FakeProcessor()
         with (
-            patch(
-                "mlx_vlm.generate.diffusion._diffusion_soft_embedding_weight"
-            ) as weight,
-            patch(
-                "mlx_vlm.generate.diffusion._diffusion_soft_embeddings"
-            ) as embeddings,
-            patch(
-                "mlx_vlm.generate.diffusion._diffusion_entropy_and_soft_embeddings"
-            ) as entropy_embeddings,
+            patch.object(
+                model,
+                "diffusion_prepare_self_conditioning",
+                wraps=model.diffusion_prepare_self_conditioning,
+            ) as prepare,
+            patch.object(
+                model,
+                "diffusion_self_conditioning",
+                wraps=model.diffusion_self_conditioning,
+            ) as self_conditioning,
         ):
             responses = list(
                 stream_generate(
@@ -1504,9 +1509,8 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
 
         self.assertEqual(responses[-1].generation_tokens, 2)
         self.assertGreater(responses[-1].diffusion_work_tokens, 0)
-        weight.assert_not_called()
-        embeddings.assert_not_called()
-        entropy_embeddings.assert_not_called()
+        prepare.assert_called_once()
+        self_conditioning.assert_called()
 
     def test_embed_canvas_quantized_self_conditioning_logits(self):
         import mlx.nn as nn
