@@ -15,6 +15,7 @@ from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _get_weight_files,
     _load_safetensors,
     apply_generation_config_defaults,
     get_model_and_args,
@@ -225,6 +226,18 @@ def test_update_module_configs():
 
     assert updated.text_config == "text_config"
     assert updated.vision_config == "vision_config"
+
+
+def test_get_weight_files_prefers_safetensors_index(tmp_path):
+    current = tmp_path / "model-00001-of-00002.safetensors"
+    stale = tmp_path / "model-00001-of-00001.safetensors"
+    current.write_bytes(b"")
+    stale.write_bytes(b"")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.weight": current.name}})
+    )
+
+    assert _get_weight_files(tmp_path) == [str(current)]
 
 
 def test_quantize_module():
