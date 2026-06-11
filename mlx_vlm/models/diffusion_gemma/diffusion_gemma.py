@@ -49,6 +49,8 @@ class _LanguageModelView:
         def predicate(path, m):
             if not hasattr(m, "to_quantized"):
                 return False
+            if path.endswith("embed_tokens") or ".self_attn." in path:
+                return {"group_size": 64, "bits": 8}
             if "router" in path or path.endswith(
                 ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
             ):
