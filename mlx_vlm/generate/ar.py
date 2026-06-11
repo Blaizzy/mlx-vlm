@@ -33,6 +33,7 @@ from .common import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_QUANTIZED_KV_START,
+    chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
     wired_limit,
@@ -50,48 +51,6 @@ DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
-
-
-def _policy_enabled(policy) -> bool:
-    return bool(getattr(policy, "enabled", policy))
-
-
-def _chunked_prefill_enabled(
-    model,
-    *,
-    input_ids=None,
-    inputs_embeds=None,
-    prompt_cache=None,
-    draft_model=None,
-    draft_kind=None,
-    prefill_kwargs=None,
-) -> bool:
-    prefill_kwargs = prefill_kwargs or {}
-    candidates = [model]
-    language_model = getattr(model, "language_model", None)
-    if language_model is not None and language_model is not model:
-        candidates.append(language_model)
-
-    for candidate in candidates:
-        policy = getattr(candidate, "chunked_prefill_policy", None)
-        if callable(policy):
-            return _policy_enabled(
-                policy(
-                    input_ids=input_ids,
-                    inputs_embeds=inputs_embeds,
-                    prompt_cache=prompt_cache,
-                    draft_model=draft_model,
-                    draft_kind=draft_kind,
-                    prefill_kwargs=prefill_kwargs,
-                )
-            )
-
-    if any(getattr(candidate, "no_chunked_prefill", False) for candidate in candidates):
-        return False
-
-    # Hidden-state speculative prefill is model-contract dependent. Keep unknown
-    # target models conservative unless they expose a chunked_prefill_policy.
-    return draft_model is None
 
 
 def _get_batch_cache_eval_interval() -> int:
@@ -426,7 +385,7 @@ def generate_step(
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
-        if prefill_step_size is not None and not _chunked_prefill_enabled(
+        if prefill_step_size is not None and not chunked_prefill_enabled(
             model,
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1646,7 +1605,7 @@ class PromptProcessingBatch:
                 policy_kwargs.update(
                     speculative_prefill_kwargs(draft_kind, draft_model)
                 )
-            if not _chunked_prefill_enabled(
+            if not chunked_prefill_enabled(
                 self.model,
                 input_ids=self._input_ids,
                 inputs_embeds=self._inputs_embeds,
@@ -3097,7 +3056,7 @@ def _generate_batch(
         draft_kind = kwargs.get("draft_kind")
         if draft_model is not None and draft_kind is not None:
             policy_kwargs.update(speculative_prefill_kwargs(draft_kind, draft_model))
-        if not _chunked_prefill_enabled(
+        if not chunked_prefill_enabled(
             model,
             input_ids=input_ids,
             inputs_embeds=embedding_output.inputs_embeds,

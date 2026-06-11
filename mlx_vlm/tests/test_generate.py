@@ -24,6 +24,7 @@ from mlx_vlm.generate import (
     _prime_cached_prefix_rope_state,
 )
 from mlx_vlm.generate import ar as ar_module
+from mlx_vlm.generate import common as common_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -1646,8 +1647,8 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
 def test_chunked_prefill_policy_defaults_conservative_for_speculation():
     model = SimpleNamespace(no_chunked_prefill=False)
 
-    assert ar_module._chunked_prefill_enabled(model)
-    assert not ar_module._chunked_prefill_enabled(
+    assert common_module.chunked_prefill_enabled(model)
+    assert not common_module.chunked_prefill_enabled(
         model,
         draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
         draft_kind="mtp",

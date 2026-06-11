@@ -28,11 +28,10 @@ from ..generate import (
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _chunked_prefill_enabled,
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
-from ..generate.common import generation_stream, wired_limit
+from ..generate.common import chunked_prefill_enabled, generation_stream, wired_limit
 from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
@@ -1636,7 +1635,7 @@ class ResponseGenerator:
 
                 prefill_step_size = get_prefill_step_size()
                 policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
-                if not _chunked_prefill_enabled(
+                if not chunked_prefill_enabled(
                     self.model,
                     input_ids=input_mx,
                     inputs_embeds=inputs_embeds_mx,

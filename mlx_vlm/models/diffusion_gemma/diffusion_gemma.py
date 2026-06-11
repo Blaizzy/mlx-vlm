@@ -107,6 +107,52 @@ class Model(nn.Module):
     def make_cache(self, max_size=None):
         return self.model.encoder.make_cache(max_size=max_size)
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache, draft_model, draft_kind
+        prefill_kwargs = prefill_kwargs or {}
+        if getattr(self, "no_chunked_prefill", False):
+            return False
+        if prefill_kwargs.get("attention_mask", None) is not None:
+            return False
+        if prefill_kwargs.get("pixel_values", None) is not None:
+            return False
+
+        token_types = prefill_kwargs.get("mm_token_type_ids", None)
+        if token_types is None:
+            token_types = prefill_kwargs.get("token_type_ids", None)
+        if token_types is not None:
+            visual = (token_types == 1) | (token_types == 2)
+            if bool(mx.any(visual).item()):
+                return False
+
+        return True
+
+    def encode_diffusion_tokens(
+        self,
+        input_ids: mx.array,
+        *,
+        attention_mask: mx.array = None,
+        cache=None,
+        pixel_values: mx.array = None,
+        mm_token_type_ids: mx.array = None,
+    ):
+        return self.model.encoder(
+            input_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+
     # Model-owned live unmasking view, like the nemotron/llada visualizers.
     make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
 

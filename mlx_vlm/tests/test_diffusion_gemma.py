@@ -247,6 +247,113 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(out.logits.shape, (1, 3, 64))
         self.assertEqual(len(model.make_cache()), 2)
 
+    def test_diffusion_prefill_encoder_matches_regular_forward(self):
+        from mlx_vlm.generate.diffusion import _diffusion_prefill_encoder
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        input_ids = mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32)
+        canvas_ids = mx.array([[7, 8, 9]], dtype=mx.int32)
+
+        regular_cache = model.make_cache()
+        _, regular_cache = model.encode_diffusion_tokens(
+            input_ids,
+            cache=regular_cache,
+        )
+        chunked_cache = model.make_cache()
+        chunked_cache, was_chunked = _diffusion_prefill_encoder(
+            model,
+            input_ids,
+            None,
+            chunked_cache,
+            pixel_values=None,
+            mm_token_type_ids=None,
+            prefill_step_size=2,
+            use_static_cache=False,
+        )
+
+        regular_hidden = model.model.decoder(canvas_ids, cache=regular_cache)
+        chunked_hidden = model.model.decoder(canvas_ids, cache=chunked_cache)
+        regular_logits = model._softcap(
+            model.model.decoder.embed_tokens.as_linear(regular_hidden)
+        )
+        chunked_logits = model._softcap(
+            model.model.decoder.embed_tokens.as_linear(chunked_hidden)
+        )
+        mx.eval(regular_logits, chunked_logits)
+
+        self.assertTrue(was_chunked)
+        self.assertTrue(
+            bool(mx.allclose(regular_logits, chunked_logits, atol=1e-5).item())
+        )
+
+    def test_diffusion_prefill_encoder_evals_once_per_prompt_chunk(self):
+        from mlx_vlm.generate import diffusion as diffusion_module
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        input_ids = mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32)
+
+        with patch.object(diffusion_module.mx, "eval", wraps=mx.eval) as eval_mock:
+            _, was_chunked = diffusion_module._diffusion_prefill_encoder(
+                model,
+                input_ids,
+                None,
+                model.make_cache(),
+                pixel_values=None,
+                mm_token_type_ids=None,
+                prefill_step_size=2,
+                use_static_cache=False,
+            )
+
+        self.assertTrue(was_chunked)
+        self.assertEqual(eval_mock.call_count, 3)
+
+    def test_diffusion_prefill_encoder_skips_chunking_with_padding(self):
+        from mlx_vlm.generate.diffusion import _diffusion_prefill_encoder
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        input_ids = mx.array([[2, 3, 4, 5, 0]], dtype=mx.int32)
+
+        _, was_chunked = _diffusion_prefill_encoder(
+            model,
+            input_ids,
+            mx.array([[1, 1, 1, 1, 0]], dtype=mx.bool_),
+            model.make_cache(),
+            pixel_values=None,
+            mm_token_type_ids=None,
+            prefill_step_size=2,
+            use_static_cache=False,
+        )
+
+        self.assertFalse(was_chunked)
+
+    def test_diffusion_gemma_chunked_prefill_policy_skips_visual_tokens(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+
+        self.assertFalse(
+            model.chunked_prefill_policy(
+                prefill_kwargs={
+                    "mm_token_type_ids": mx.array([[0, 1, 1, 0]], dtype=mx.int32),
+                }
+            )
+        )
+        self.assertTrue(
+            model.chunked_prefill_policy(
+                prefill_kwargs={
+                    "mm_token_type_ids": mx.array([[0, 0, 0, 0]], dtype=mx.int32),
+                }
+            )
+        )
+
     def test_self_conditioning_soft_embeddings_use_embedding_scale(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -671,6 +778,45 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].generation_tokens, 1)
         self.assertEqual(recorder.input_lengths, [5])
         self.assertIs(recorder.mm_token_type_ids[0], mm_token_type_ids)
+
+    def test_stream_generate_routes_prefill_step_size_to_diffusion_encoder(self):
+        from mlx_vlm.generate import diffusion as diffusion_module
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+        original_prefill = diffusion_module._diffusion_prefill_encoder
+        seen_step_sizes = []
+
+        def wrapped_prefill(*args, **kwargs):
+            seen_step_sizes.append(kwargs.get("prefill_step_size"))
+            return original_prefill(*args, **kwargs)
+
+        with patch.object(
+            diffusion_module,
+            "_diffusion_prefill_encoder",
+            side_effect=wrapped_prefill,
+        ):
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3, 4, 5, 6]], dtype=mx.int32),
+                    max_tokens=2,
+                    max_denoising_steps=1,
+                    prefill_step_size=2,
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 2)
+        self.assertEqual(
+            seen_step_sizes,
+            [2],
+        )
 
     def test_decoder_masks_skip_no_padding_short_context(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
