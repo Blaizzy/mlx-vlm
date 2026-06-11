@@ -380,6 +380,10 @@ class DecoderModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_conditioning = SelfConditioning(config)
 
+    @property
+    def prefers_logits_self_conditioning(self) -> bool:
+        return isinstance(self.embed_tokens, nn.QuantizedEmbedding)
+
     def _embed_canvas(
         self,
         canvas_ids,
@@ -764,6 +768,31 @@ class LanguageModel(nn.Module):
     def make_cache(self, max_size: Optional[int] = None):
         return self.model.encoder.make_cache(max_size=max_size)
 
+    @property
+    def prefers_logits_self_conditioning(self) -> bool:
+        return self.model.decoder.prefers_logits_self_conditioning
+
+    def _diffusion_decoder_logits(
+        self,
+        canvas_ids: mx.array,
+        cache=None,
+        self_conditioning: Optional[mx.array] = None,
+        decoder_attention_mask: Optional[mx.array] = None,
+    ):
+        kwargs = (
+            {"self_conditioning_logits": self_conditioning}
+            if self.prefers_logits_self_conditioning
+            else {"self_conditioning_embeddings": self_conditioning}
+        )
+        hidden_states = self.model.decoder(
+            canvas_ids,
+            cache=cache,
+            decoder_attention_mask=decoder_attention_mask,
+            **kwargs,
+        )
+        logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
+        return self._softcap(logits)
+
     def __call__(
         self,
         input_ids: Optional[mx.array] = None,
@@ -793,8 +822,12 @@ class LanguageModel(nn.Module):
         def predicate(path, m):
             if not hasattr(m, "to_quantized"):
                 return False
-            if "router" in path or path.endswith(
-                ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+            if (
+                path.endswith(
+                    ("embed_tokens", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+                )
+                or ".self_attn." in path
+                or "router" in path
             ):
                 return {"group_size": 64, "bits": 8}
             return True
