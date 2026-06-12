@@ -1663,6 +1663,72 @@ class TestModels(unittest.TestCase):
             model.language_model, config.text_config.hidden_size
         )
 
+    def test_qwen3_vl_none_cache_offset(self):
+        # Host cache implementations may leave offset unset (None) before the
+        # first prefill; the language model must treat that as an empty cache
+        # instead of raising "unsupported operand type(s) for +=".
+        from mlx_vlm.models import qwen3_vl
+
+        class NoneOffsetCache:
+            def __init__(self):
+                self.offset = None
+                self.keys = None
+                self.values = None
+
+            def update_and_fetch(self, keys, values):
+                if self.keys is None:
+                    self.keys, self.values = keys, values
+                else:
+                    self.keys = mx.concatenate([self.keys, keys], axis=2)
+                    self.values = mx.concatenate([self.values, values], axis=2)
+                self.offset = self.keys.shape[2]
+                return self.keys, self.values
+
+        text_config = qwen3_vl.TextConfig(
+            model_type="qwen3_vl_text",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=10_000,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            rope_scaling={"rope_type": "mrope", "mrope_section": [8, 6, 6]},
+        )
+        vision_config = qwen3_vl.VisionConfig(
+            model_type="qwen3_vl",
+            depth=4,
+            hidden_size=128,
+            intermediate_size=256,
+            out_hidden_size=128,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=144,
+            deepstack_visual_indexes=[],
+        )
+        config = qwen3_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_vl",
+            image_token_id=151655,
+            video_token_id=151656,
+            vocab_size=10_000,
+        )
+        model = qwen3_vl.Model(config)
+
+        cache = [NoneOffsetCache() for _ in range(text_config.num_hidden_layers)]
+        inputs = mx.array([[0, 1, 2]])
+        logits = model.language_model(inputs, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 3, text_config.vocab_size))
+
     def test_qwen3_5_model_config(self):
         from mlx_vlm.models import qwen3_5, qwen3_5_moe
 
