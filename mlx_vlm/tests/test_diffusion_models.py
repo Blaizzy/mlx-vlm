@@ -588,6 +588,40 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_unmasking_visualizer_preserves_decoded_newlines(self):
+        from mlx_vlm.models.diffusion_visualizer import DiffusionUnmaskingVisualizer
+
+        class NewlineTokenizer:
+            def decode(self, tokens, skip_special_tokens=False):
+                token = int(tokens[0])
+                if token == 5:
+                    return "\n"
+                return str(token)
+
+        visualizer = DiffusionUnmaskingVisualizer(
+            active=True,
+            mask_id=127,
+            eos_token_ids=[],
+            tokenizer=NewlineTokenizer(),
+            min_interval=0.0,
+        )
+        drawn = []
+
+        class FakeRedrawer:
+            def throttled(self):
+                return False
+
+            def draw(self, text, force=False):
+                drawn.append(text)
+
+            def finish(self):
+                pass
+
+        visualizer.redrawer = FakeRedrawer()
+        visualizer.visualize(mx.array([[4, 5, 6]], dtype=mx.int32), force=True)
+
+        self.assertEqual(drawn[-1], "4\n6")
+
     def test_diffusion_generation_family_routing(self):
         from mlx_vlm.generate.diffusion import diffusion_generation_family
 
