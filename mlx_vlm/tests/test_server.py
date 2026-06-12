@@ -2194,6 +2194,53 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
+def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": "Hello",
+                        "reasoning": "Prior thought",
+                    },
+                    {"role": "user", "content": "Continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2][1] == {
+        "role": "assistant",
+        "content": "Hello",
+        "reasoning": "Prior thought",
+    }
+
+
 def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
