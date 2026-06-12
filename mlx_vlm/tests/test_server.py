@@ -818,6 +818,21 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
 
 
+def test_image_generation_lock_uses_image_cache_kind(monkeypatch):
+    text_lock = object()
+    image_lock = object()
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"generation_lock": text_lock})
+    registry.set("image_generation", {"generation_lock": image_lock})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    assert server_openai._runtime_cache_get("generation_lock") is text_lock
+    assert (
+        server_openai._runtime_cache_get("generation_lock", kind="image_generation")
+        is image_lock
+    )
+
+
 def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
     calls = []
 
@@ -4321,13 +4336,26 @@ class TestResponseGenerator:
             lambda *args, **kwargs: run_calls.append((args, kwargs)),
         )
 
-        server_cli.main()
+        try:
+            server_cli.main()
 
-        assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
-        assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
-        assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
-        assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
-        assert run_calls[0][1]["host"] == "127.0.0.1"
+            assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
+            assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
+            assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
+            assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
+            assert run_calls[0][1]["host"] == "127.0.0.1"
+        finally:
+            for env_var in (
+                "MLX_VLM_ENABLE_THINKING",
+                "MLX_VLM_PRELOAD_MODEL",
+                "MLX_VLM_PRELOAD_ADAPTER",
+                "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_MAX_TOKENS",
+                "MLX_VLM_THINKING_BUDGET",
+                "MLX_VLM_THINKING_START_TOKEN",
+                "MLX_VLM_THINKING_END_TOKEN",
+            ):
+                os.environ.pop(env_var, None)
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:

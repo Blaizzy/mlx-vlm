@@ -10,6 +10,7 @@ mlx-lm>=0.31.3
 mlx-audio>=0.4.3
 opencv-python>=4.12.0.88
 fastapi>=0.95.1
+python-multipart>=0.0.9
 starlette>=1.0.1
 uvicorn
 numpy
