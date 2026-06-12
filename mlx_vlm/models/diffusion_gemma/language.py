@@ -410,6 +410,7 @@ class DecoderModel(nn.Module):
                     transpose=False,
                     group_size=self.embed_tokens.group_size,
                     bits=self.embed_tokens.bits,
+                    mode=getattr(self.embed_tokens, "mode", "affine"),
                 )
             else:
                 soft_embeddings = probs @ self.embed_tokens.weight
