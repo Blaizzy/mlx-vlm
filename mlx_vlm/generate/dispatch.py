@@ -1369,14 +1369,6 @@ def generate(
             f"Generation: {last_response.generation_tokens} tokens, "
             f"{last_response.generation_tps:.3f} tokens-per-sec"
         )
-        if last_response.diffusion_work_tokens:
-            print(
-                "Diffusion: "
-                f"{last_response.diffusion_canvas_tokens} canvas tokens, "
-                f"{last_response.diffusion_denoising_steps} denoising steps, "
-                f"{last_response.diffusion_work_tokens} work tokens, "
-                f"{last_response.diffusion_work_tps:.3f} work-tokens-per-sec"
-            )
         print(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
     return GenerationResult(
