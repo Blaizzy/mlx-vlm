@@ -1,6 +1,6 @@
 # FP8 KV cache for MLA models
 
-`mlx_vlm.mla_fp8` adds a vLLM/SGLang-style **FP8 KV cache for MLA-attention models**
+`mlx_vlm.models.deepseek_vl_v2.mla_fp8` adds a vLLM/SGLang-style **FP8 KV cache for MLA-attention models**
 (DeepSeek-V2/V3, GLM-4-MoE, Kimi, …), served through an **absorbed-MLA** decode path. It is
 **opt-in and off by default** — the standard path is untouched unless you set an env flag.
 
@@ -50,7 +50,7 @@ export MLX_VLM_MLA_FP8_DECODE=mlx   # mlx (default) | kernel | sdpa
 
 Wired into `deepseek_vl_v2` (DeepSeek-VL2 small/base). With the flag off, behaviour is
 byte-identical to before. Other MLA models can adopt it by routing their MLA attention through
-`mlx_vlm.mla_fp8.mla_fp8_attention` and returning `Fp8MLAKVCache` from `make_cache`.
+`mlx_vlm.models.deepseek_vl_v2.mla_fp8.mla_fp8_attention` and returning `Fp8MLAKVCache` from `make_cache`.
 
 ## Performance (M-series, MLX 0.31.2, B=1, H=128, kv_lora_rank=512)
 

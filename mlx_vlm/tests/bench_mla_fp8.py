@@ -8,7 +8,7 @@ import time
 
 import mlx.core as mx
 
-from mlx_vlm.mla_fp8 import (
+from mlx_vlm.models.deepseek_vl_v2.mla_fp8 import (
     DEFAULT_GROUP_SIZE,
     _mla_fp8_decode_metal,
     _mla_fp8_decode_metal_mma,

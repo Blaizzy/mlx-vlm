@@ -6,11 +6,11 @@ import mlx.nn as nn
 import numpy as np
 from transformers import AutoProcessor
 
-from ...mla_fp8 import Fp8MLAKVCache, mla_fp8_enabled, mla_fp8_group_size
 from ..base import InputEmbeddingsFeatures
 from ..cache import KVCache
 from .config import ModelConfig, ProjectorConfig
 from .language import LanguageModel
+from .mla_fp8 import Fp8MLAKVCache, mla_fp8_enabled, mla_fp8_group_size
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 from .vision import VisionModel
 
