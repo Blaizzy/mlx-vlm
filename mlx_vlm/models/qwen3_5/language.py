@@ -2447,7 +2447,12 @@ class LanguageModel(nn.Module):
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
 
-        if mask is None and c0 is not None and cache_offset == 0:
+        if (
+            mask is None
+            and c0 is not None
+            and cache_offsets is None
+            and cache_offset == 0
+        ):
             left_padding = getattr(c0, "left_padding", None)
             if (
                 isinstance(left_padding, mx.array)
@@ -2469,7 +2474,7 @@ class LanguageModel(nn.Module):
                 (
                     cache is not None
                     and cache[self.model.fa_idx] is not None
-                    and (cache_offset == 0)
+                    and (cache_offsets is None and cache_offset == 0)
                 )
                 or self._rope_deltas is None
                 or cache is None
