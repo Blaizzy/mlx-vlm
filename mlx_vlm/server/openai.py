@@ -96,6 +96,14 @@ _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
 _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
 
 
+def _runtime_cache_get(key, default=None, *, kind=None):
+    cache = runtime.model_cache
+    try:
+        return cache.get(key, default, kind=kind)
+    except TypeError:
+        return cache.get(key, default)
+
+
 def _looks_like_audio_reference(value: str) -> bool:
     return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
         _AUDIO_REFERENCE_SUFFIXES
@@ -351,7 +359,7 @@ async def images_generations_endpoint(request: Request):
         model, _, _ = get_cached_model(
             image_request.model, model_kind="image_generation"
         )
-        generation_lock = runtime.model_cache.get("generation_lock")
+        generation_lock = _runtime_cache_get("generation_lock", kind="image_generation")
 
         def _generate_all():
             results = []
@@ -482,7 +490,7 @@ async def images_edits_endpoint(request: Request):
     )
     try:
         model, _, _ = get_cached_model(image_request.model, model_kind="image_edit")
-        generation_lock = runtime.model_cache.get("generation_lock")
+        generation_lock = _runtime_cache_get("generation_lock", kind="image_edit")
 
         def _generate_all():
             results = []

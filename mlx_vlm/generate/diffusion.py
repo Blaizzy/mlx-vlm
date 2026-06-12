@@ -12,7 +12,12 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from ..tokenizer_utils import make_streaming_detokenizer
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import (
+    GenerationResult,
+    _chunked_prefill_enabled,
+    generation_stream,
+    wired_limit,
+)
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -426,31 +431,6 @@ def _diffusion_static_cache_length(
     return prompt_length + cached_canvas_tokens
 
 
-def _diffusion_has_visual_token_types(mm_token_type_ids: Optional[mx.array]) -> bool:
-    if mm_token_type_ids is None:
-        return False
-    return bool(mx.any((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
-
-
-def _diffusion_should_chunk_prefill(
-    *,
-    prefill_step_size: Optional[int],
-    prompt_length: int,
-    has_padding: bool,
-    use_static_cache: bool,
-    pixel_values: Optional[mx.array],
-    mm_token_type_ids: Optional[mx.array],
-) -> bool:
-    if prefill_step_size is None or prompt_length <= prefill_step_size:
-        return False
-    if has_padding or use_static_cache or pixel_values is not None:
-        return False
-    # Visual spans can use bidirectional attention inside the whole block. Keep
-    # those prompts on the existing single prefill until chunking can split on
-    # visual-block boundaries without changing attention semantics.
-    return not _diffusion_has_visual_token_types(mm_token_type_ids)
-
-
 def _diffusion_prefill_cache(
     model: nn.Module,
     input_ids: mx.array,
@@ -711,13 +691,22 @@ def stream_diffusion_generate(
         cached_sequence_length = prompt_length
         kv_cache = model.make_cache()
     detokenizer = make_streaming_detokenizer(processor)
-    chunk_prefill = _diffusion_should_chunk_prefill(
-        prefill_step_size=prefill_step_size,
-        prompt_length=prompt_length,
-        has_padding=has_padding,
-        use_static_cache=use_static_cache,
-        pixel_values=pixel_values,
-        mm_token_type_ids=mm_token_type_ids,
+    prefill_policy_kwargs = {
+        "attention_mask": attention_mask,
+        "has_padding": has_padding,
+        "use_static_cache": use_static_cache,
+        "pixel_values": pixel_values,
+        "mm_token_type_ids": mm_token_type_ids,
+    }
+    chunk_prefill = (
+        prefill_step_size is not None
+        and prompt_length > prefill_step_size
+        and _chunked_prefill_enabled(
+            model,
+            input_ids=input_ids,
+            prompt_cache=kv_cache,
+            prefill_kwargs=prefill_policy_kwargs,
+        )
     )
 
     generated_tokens = 0
