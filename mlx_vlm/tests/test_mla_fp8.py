@@ -10,7 +10,7 @@ import math
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.mla_fp8 import (
+from mlx_vlm.models.deepseek_vl_v2.mla_fp8 import (
     Fp8MLAKVCache,
     _mla_fp8_decode_metal,
     _mla_fp8_decode_metal_mma,
@@ -297,7 +297,7 @@ def test_metal_decode_bf16():
 @requires_metal
 @pytest.mark.parametrize("group_size", [64, 128])
 def test_fused_dequant_kernel_matches_mlx(group_size):
-    from mlx_vlm.mla_fp8 import dequantize_latent_fp8_metal
+    from mlx_vlm.models.deepseek_vl_v2.mla_fp8 import dequantize_latent_fp8_metal
 
     mx.random.seed(5)
     lat = mx.random.normal((2, 70, KV_LORA)).astype(mx.float32)

@@ -5,13 +5,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
-from ...mla_fp8 import Fp8MLAKVCache, mla_fp8_attention, mla_fp8_decode_method
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from .config import TextConfig
+from .mla_fp8 import Fp8MLAKVCache, mla_fp8_attention, mla_fp8_decode_method
 
 
 def yarn_find_correction_dim(
