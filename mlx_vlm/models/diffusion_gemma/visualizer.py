@@ -18,10 +18,10 @@ from typing import Any, Dict, Optional
 
 from ..diffusion_visualizer import (
     _CanvasRedrawer,
-    _display_width,
-    _escape_carriage_returns,
     _take_display_width,
     _wrap_text,
+    display_width,
+    escape_carriage_returns,
 )
 
 
@@ -38,7 +38,7 @@ class DiffusionGemma4Visualizer:
         if not canvas:
             return
         self.redrawer.draw(
-            _escape_carriage_returns(canvas),
+            escape_carriage_returns(canvas),
             wrap_width=self.wrap_width if self.wrap_width else None,
         )
 
@@ -138,11 +138,11 @@ def install_output_handler_patch() -> None:
 
 __all__ = [
     "_CanvasRedrawer",
-    "_display_width",
-    "_escape_carriage_returns",
     "_take_display_width",
     "_wrap_text",
     "DiffusionGemma4Visualizer",
+    "display_width",
+    "escape_carriage_returns",
     "install_output_handler_patch",
     "make_unmasking_visualizer",
 ]

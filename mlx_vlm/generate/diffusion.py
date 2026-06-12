@@ -11,9 +11,9 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from ..models.diffusion_visualizer import (
-    _clip_display_width,
-    _display_width,
-    _escape_carriage_returns,
+    clip_display_width,
+    display_width,
+    escape_carriage_returns,
 )
 from ..tokenizer_utils import make_streaming_detokenizer
 from .common import (
@@ -54,11 +54,11 @@ def _format_diffusion_draft_line(
     response: GenerationResult,
     requested_width: Optional[int] = None,
 ) -> str:
-    text = _escape_carriage_returns(response.draft_text)
+    text = escape_carriage_returns(response.draft_text)
     width = _diffusion_display_limit(requested_width)
     if width is None:
         return text
-    return _clip_display_width(text, width)
+    return clip_display_width(text, width)
 
 
 def _print_diffusion_draft(
@@ -76,12 +76,12 @@ def _format_diffusion_live_text(
     preserve_newlines: bool = True,
 ) -> str:
     width = _diffusion_display_limit(requested_width)
-    text = _escape_carriage_returns(text)
+    text = escape_carriage_returns(text)
     if not preserve_newlines:
         text = text.replace("\n", "\\n")
     if width is None:
         return text
-    return _clip_display_width(text, width)
+    return clip_display_width(text, width)
 
 
 def _print_diffusion_live_text(
@@ -106,7 +106,7 @@ def _terminal_rows_for_text(text: str, columns: Optional[int] = None) -> int:
     columns = max(1, columns)
     rows = 0
     for line in text.split("\n"):
-        width = _display_width(line)
+        width = display_width(line)
         rows += max(1, (width + columns - 1) // columns)
     return rows
 
@@ -523,7 +523,7 @@ def _decode_diffusion_masked_draft(
 
     flush_tokens()
     text = " ".join(piece for piece in pieces if piece)
-    return _escape_carriage_returns(text)
+    return escape_carriage_returns(text)
 
 
 def stream_diffusion_generate(

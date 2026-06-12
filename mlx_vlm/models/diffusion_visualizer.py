@@ -19,7 +19,7 @@ import unicodedata
 from typing import Any, Optional
 
 
-def _display_width(text: str) -> int:
+def display_width(text: str) -> int:
     width = 0
     for char in text:
         if unicodedata.combining(char):
@@ -28,17 +28,17 @@ def _display_width(text: str) -> int:
     return width
 
 
-def _escape_carriage_returns(text: str) -> str:
+def escape_carriage_returns(text: str) -> str:
     return text.replace("\r", "\\r")
 
 
-def _clip_display_width(text: str, max_width: int) -> str:
+def clip_display_width(text: str, max_width: int) -> str:
     if max_width <= 0:
         return ""
 
     if "\n" in text:
         return "\n".join(
-            _clip_display_width(line, max_width) for line in text.split("\n")
+            clip_display_width(line, max_width) for line in text.split("\n")
         )
 
     out = []
@@ -56,7 +56,7 @@ def _clip_display_width(text: str, max_width: int) -> str:
         width += char_width
 
     if clipped and max_width >= 3:
-        while out and _display_width("".join(out)) > max_width - 3:
+        while out and display_width("".join(out)) > max_width - 3:
             out.pop()
         out.append("...")
 
@@ -67,7 +67,7 @@ def _take_display_width(text: str, width: int) -> str:
     taken = ""
     taken_width = 0
     for char in text:
-        char_width = _display_width(char)
+        char_width = display_width(char)
         if taken_width + char_width > width:
             break
         taken += char
@@ -87,13 +87,13 @@ def _wrap_text(text: str, width: int) -> str:
         line = ""
         line_width = 0
         for word in re.findall(r" *[^ ]+| +", raw_line):
-            word_width = _display_width(word)
+            word_width = display_width(word)
             if line and line_width + word_width > width:
                 wrapped_lines.append(line.rstrip(" "))
                 line = ""
                 line_width = 0
                 word = word.lstrip(" ")
-                word_width = _display_width(word)
+                word_width = display_width(word)
                 if not word:
                     continue
 
@@ -108,7 +108,7 @@ def _wrap_text(text: str, width: int) -> str:
                 head = _take_display_width(word, width)
                 wrapped_lines.append(head)
                 word = word[len(head) :]
-                word_width = _display_width(word)
+                word_width = display_width(word)
             line = word
             line_width = word_width
         wrapped_lines.append(line)
@@ -232,7 +232,7 @@ class DiffusionUnmaskingVisualizer:
         piece = self.tokenizer.decode(
             [token_id], skip_special_tokens=self.skip_special_tokens
         )
-        return _escape_carriage_returns(piece) or " "
+        return escape_carriage_returns(piece) or " "
 
     def visualize(self, tokens: Any, force: bool = False) -> None:
         if not self.active:
