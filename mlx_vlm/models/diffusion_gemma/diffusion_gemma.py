@@ -201,8 +201,6 @@ class Model(nn.Module):
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return self._softcap(logits)
 
-    _diffusion_decoder_logits = diffusion_decoder_logits
-
     # Model-owned live unmasking view, like the nemotron/llada visualizers.
     make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
 

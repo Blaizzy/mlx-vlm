@@ -975,8 +975,6 @@ class LanguageModel(nn.Module):
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return self._softcap(logits)
 
-    _diffusion_decoder_logits = diffusion_decoder_logits
-
     def __call__(
         self,
         input_ids: Optional[mx.array] = None,

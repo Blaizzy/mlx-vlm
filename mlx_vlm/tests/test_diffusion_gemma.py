@@ -570,7 +570,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
 
-    def test_generate_verbose_prints_diffusion_work_stats(self):
+    def test_generate_verbose_omits_diffusion_work_stats(self):
         from mlx_vlm.generate import generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -590,9 +590,12 @@ class TestDiffusionGemma4(unittest.TestCase):
             )
 
         output = stdout.getvalue()
-        self.assertIn("Diffusion:", output)
-        self.assertIn("work tokens", output)
-        self.assertIn("work-tokens-per-sec", output)
+        self.assertIn("Prompt:", output)
+        self.assertIn("Generation:", output)
+        self.assertIn("Peak memory:", output)
+        self.assertNotIn("Diffusion:", output)
+        self.assertNotIn("work tokens", output)
+        self.assertNotIn("work-tokens-per-sec", output)
 
     def test_stream_generate_chunks_diffusion_prefill(self):
         from mlx_vlm.generate import stream_generate
