@@ -343,6 +343,7 @@ def _diffusion_soft_embedding_weight(embed_tokens: nn.Module) -> mx.array:
             embed_tokens.biases,
             group_size=embed_tokens.group_size,
             bits=embed_tokens.bits,
+            mode=getattr(embed_tokens, "mode", "affine"),
         )
     return embed_tokens.weight
 

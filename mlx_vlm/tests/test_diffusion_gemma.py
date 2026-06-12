@@ -1379,6 +1379,41 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         self.assertEqual(responses[-1].generation_tokens, 2)
         self.assertGreater(responses[-1].diffusion_work_tokens, 0)
 
+    def test_stream_generate_with_mxfp4_quantized_embeddings(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["text_config"]["hidden_size"] = 32
+        config_dict["generation_config"]["max_denoising_steps"] = 3
+        config = ModelConfig.from_dict(config_dict)
+        model = Model(config)
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
+        )
+        self.assertEqual(model.model.decoder.embed_tokens.mode, "mxfp4")
+
+        processor = FakeProcessor()
+        responses = list(
+            stream_generate(
+                model,
+                processor,
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+            )
+        )
+
+        self.assertEqual(responses[-1].generation_tokens, 2)
+        self.assertGreater(responses[-1].diffusion_work_tokens, 0)
+
     def test_embed_canvas_quantized_self_conditioning_logits(self):
         import mlx.nn as nn
 
@@ -1397,6 +1432,31 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         )
 
         decoder = model.model.decoder
+        canvas_ids = mx.array([[5, 6, 7]])
+        logits = mx.random.normal((1, 3, config.text_config.vocab_size))
+        embeds = decoder._embed_canvas(canvas_ids, self_conditioning_logits=logits)
+        self.assertEqual(embeds.shape, (1, 3, config.text_config.hidden_size))
+
+    def test_embed_canvas_mxfp4_quantized_self_conditioning_logits(self):
+        import mlx.nn as nn
+
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config_dict = tiny_config_dict()
+        config_dict["text_config"]["hidden_size"] = 32
+        config = ModelConfig.from_dict(config_dict)
+        model = Model(config)
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            mode="mxfp4",
+            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
+        )
+
+        decoder = model.model.decoder
+        self.assertEqual(decoder.embed_tokens.mode, "mxfp4")
         canvas_ids = mx.array([[5, 6, 7]])
         logits = mx.random.normal((1, 3, config.text_config.vocab_size))
         embeds = decoder._embed_canvas(canvas_ids, self_conditioning_logits=logits)
