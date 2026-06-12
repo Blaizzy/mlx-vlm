@@ -69,6 +69,31 @@ class TestGemma4ToolParser(unittest.TestCase):
             [{"newText": "orange", "oldText": "apple"}],
         )
 
+    # ── colon-namespaced names (MCP server:tool, agent toolsets) ──────────
+
+    def test_colon_namespaced_name(self):
+        text = _wrap(f"call:server:tool{{location:{_str('Zurich')}}}")
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "server:tool")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"location": "Zurich"})
+
+    def test_colon_namespaced_name_with_multiple_args(self):
+        text = _wrap(
+            f"call:google-workspace:google-workspace{{action:{_str('list_events')},calendar_id:{_str('primary')}}}"
+        )
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "google-workspace:google-workspace")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"action": "list_events", "calendar_id": "primary"})
+
+    def test_dotted_name(self):
+        text = _wrap(f"call:math.add{{a:1,b:2}}")
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "math.add")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"a": 1, "b": 2})
+
     # ── arguments type ────────────────────────────────────────────────────
 
     def test_arguments_is_json_string(self):
