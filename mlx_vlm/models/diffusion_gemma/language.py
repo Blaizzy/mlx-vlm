@@ -387,14 +387,6 @@ class DecoderModel(nn.Module):
     def diffusion_prepare_self_conditioning(self) -> Optional[mx.array]:
         if self.prefers_logits_self_conditioning:
             return None
-        if isinstance(self.embed_tokens, nn.QuantizedEmbedding):
-            return mx.dequantize(
-                self.embed_tokens.weight,
-                self.embed_tokens.scales,
-                self.embed_tokens.biases,
-                group_size=self.embed_tokens.group_size,
-                bits=self.embed_tokens.bits,
-            )
         return self.embed_tokens.weight
 
     def diffusion_self_conditioning(
