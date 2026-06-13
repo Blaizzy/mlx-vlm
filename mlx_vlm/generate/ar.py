@@ -880,7 +880,13 @@ class GenerationBatch:
         if not (force or (self.logits_processors and any(self.logits_processors))):
             if not self.logits_processors:
                 self.token_context = []
-            return
+                return
+            if not self.token_context:
+                return
+            # token_context was populated while a processor was active and is
+            # still carried after that sequence left the batch. Fall through to
+            # keep it aligned with uids so filter() can reindex it safely even
+            # though no processor is currently active.
         if len(self.token_context) < len(self.uids):
             missing = len(self.uids) - len(self.token_context)
             self.token_context.extend([[] for _ in range(missing)])
