@@ -29,6 +29,16 @@ QUANT_RECIPES = [
     "mixed_4_8",
 ]
 
+_RUNTIME_PROCESSOR_ATTRS = (
+    "_mlx_vlm_m3_resize_patch",
+    "max_long_side_pixel",
+    "min_short_side_pixel",
+    "max_total_pixels",
+    "valid_kwargs",
+    "preprocess",
+    "get_number_of_image_patches",
+)
+
 
 def _quantization_params(
     q_group_size: Optional[int], q_bits: Optional[int], q_mode: str
@@ -69,6 +79,30 @@ def _preserve_existing_deepseek_v4_quantization(
     quantization.update(_quantization_params(q_group_size, q_bits, q_mode))
     config["quantization"] = quantization
     config["quantization_config"] = quantization
+
+
+def _save_processor_pretrained(processor, mlx_path):
+    restored_attrs = []
+    sentinel = object()
+    for attr in ("image_processor", "video_processor"):
+        component = getattr(processor, attr, None)
+        if component is None or not getattr(
+            component, "_mlx_vlm_m3_resize_patch", False
+        ):
+            continue
+        component_dict = getattr(component, "__dict__", None)
+        if component_dict is None:
+            continue
+        for name in _RUNTIME_PROCESSOR_ATTRS:
+            value = component_dict.pop(name, sentinel)
+            if value is not sentinel:
+                restored_attrs.append((component_dict, name, value))
+
+    try:
+        return processor.save_pretrained(mlx_path)
+    finally:
+        for component_dict, name, value in reversed(restored_attrs):
+            component_dict[name] = value
 
 
 def mixed_quant_predicate_builder(
@@ -242,7 +276,7 @@ def convert(
                 shutil.rmtree(dest)
             shutil.copytree(item, dest)
 
-    processor.save_pretrained(mlx_path)
+    _save_processor_pretrained(processor, mlx_path)
 
     save_config(config, config_path=mlx_path / "config.json")
 

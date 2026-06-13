@@ -1,6 +1,7 @@
 import argparse
 import codecs
 import contextlib
+import inspect
 import json
 import logging
 import time
@@ -16,7 +17,7 @@ from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
 from ..models import cache
-from ..prompt_utils import apply_chat_template
+from ..prompt_utils import apply_chat_template, thinking_template_kwargs
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
@@ -163,6 +164,12 @@ def parse_arguments():
         nargs="+",
         default=None,
         help="Resize shape for the image.",
+    )
+    parser.add_argument(
+        "--max-long-side-pixel",
+        type=_parse_positive_int,
+        default=None,
+        help="Maximum long-side pixels for MiniMax M3 image/video preprocessing.",
     )
     parser.add_argument(
         "--prompt",
@@ -390,6 +397,15 @@ def parse_arguments():
         help="Trust remote code when loading the model.",
     )
     parser.add_argument(
+        "--lazy-load",
+        action="store_true",
+        help=(
+            "Skip eager parameter materialization during model load. This can "
+            "reduce startup memory for very large checkpoints, but the first "
+            "generation step will still need to materialize the weights it uses."
+        ),
+    )
+    parser.add_argument(
         "--quantize-activations",
         "-qa",
         action="store_true",
@@ -422,7 +438,10 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help=(
+            "Speculative drafter path or HF id "
+            "(e.g. z-lab/Qwen3.5-4B-DFlash, Inferact/MiniMax-M3-EAGLE3)."
+        ),
     )
     parser.add_argument(
         "--draft-kind",
@@ -431,7 +450,7 @@ def parse_arguments():
         choices=["dflash", "eagle3", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
         "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "'mtp' (native/assistant Multi-Token Prediction). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -444,6 +463,13 @@ def parse_arguments():
         "--enable-thinking",
         action="store_true",
         help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        type=str,
+        default=None,
+        choices=["enabled", "disabled", "adaptive"],
+        help="Model chat template thinking mode, when supported.",
     )
     parser.add_argument(
         "--thinking-budget",
@@ -480,6 +506,27 @@ def normalize_resize_shape(
     ):
         raise ValueError("resize_shape must contain 1 or 2 integers")
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
+
+
+def normalize_max_long_side_pixel(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("max_long_side_pixel must be a positive integer")
+    return value
+
+
+def _parse_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "max_long_side_pixel must be a positive integer"
+        ) from exc
+    try:
+        return normalize_max_long_side_pixel(parsed)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 # A stream on the default device just for generation
@@ -621,6 +668,119 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+def _cache_offset_value(c) -> Optional[int]:
+    offset = getattr(c, "offset", None)
+    if offset is None:
+        return None
+    try:
+        return int(offset.item() if hasattr(offset, "item") else offset)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trim_prompt_cache_entry_to(c, prefix_len: int):
+    if hasattr(c, "caches"):
+        for sub_cache in c.caches:
+            _trim_prompt_cache_entry_to(sub_cache, prefix_len)
+        return
+    if isinstance(c, tuple):
+        for sub_cache in c:
+            _trim_prompt_cache_entry_to(sub_cache, prefix_len)
+        return
+
+    offset = _cache_offset_value(c)
+    if offset is None or offset <= prefix_len:
+        return
+
+    trim = getattr(c, "trim", None)
+    if callable(trim):
+        trim(offset - prefix_len)
+        return
+
+    keys = getattr(c, "keys", None)
+    values = getattr(c, "values", None)
+    if keys is not None and values is not None:
+        c.keys = keys[..., :prefix_len, :]
+        c.values = values[..., :prefix_len, :]
+        if hasattr(c, "offset"):
+            c.offset = prefix_len
+
+
+def _config_token_id(config, name: str):
+    return getattr(config, f"{name}_token_id", None) or getattr(
+        config, f"{name}_token_index", None
+    )
+
+
+def _drop_unused_multimodal_inputs(model, new_ids: list, pixel_values, kwargs: dict):
+    config = getattr(model, "config", None)
+    image_token_id = _config_token_id(config, "image")
+    video_token_id = _config_token_id(config, "video")
+    has_image = image_token_id is not None and image_token_id in new_ids
+    has_video = video_token_id is not None and video_token_id in new_ids
+
+    if not has_image:
+        kwargs.pop("cached_image_features", None)
+        if not has_video or "pixel_values_videos" in kwargs:
+            pixel_values = None
+
+    if video_token_id is not None and not has_video:
+        kwargs.pop("pixel_values_videos", None)
+        kwargs.pop("video_grid_thw", None)
+        kwargs.pop("cached_video_features", None)
+
+    return pixel_values
+
+
+def _encode_image_for_vision_cache(model, pixel_values, kwargs: dict):
+    encode_image = getattr(model, "encode_image", None)
+    if not callable(encode_image):
+        return None
+
+    encode_kwargs = {}
+    try:
+        parameters = inspect.signature(encode_image).parameters
+    except (TypeError, ValueError):
+        return encode_image(pixel_values)
+
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
+    for name in ("image_grid_thw", "image_position_ids"):
+        if name in kwargs and (accepts_kwargs or name in parameters):
+            encode_kwargs[name] = kwargs[name]
+
+    return encode_image(pixel_values, **encode_kwargs)
+
+
+def _encode_video_for_vision_cache(model, pixel_values, kwargs: dict):
+    encode_video = getattr(model, "encode_video", None)
+    if not callable(encode_video):
+        return None
+
+    encode_kwargs = {}
+    try:
+        parameters = inspect.signature(encode_video).parameters
+    except (TypeError, ValueError):
+        return encode_video(pixel_values)
+
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
+    if "video_grid_thw" in kwargs and (
+        accepts_kwargs or "video_grid_thw" in parameters
+    ):
+        encode_kwargs["video_grid_thw"] = kwargs["video_grid_thw"]
+
+    return encode_video(pixel_values, **encode_kwargs)
+
+
+def _video_cache_key(video):
+    if isinstance(video, list):
+        return ["video", *video]
+    return f"video:{video}"
+
+
 from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -732,6 +892,11 @@ def stream_generate(
         "thinking_start_token", DEFAULT_THINKING_START_TOKEN
     )
     enable_thinking = kwargs.pop("enable_thinking", False)
+    if model.config.model_type in {"minimax_m3", "minimax_m3_vl"}:
+        if thinking_start_token == DEFAULT_THINKING_START_TOKEN:
+            thinking_start_token = "<mm:think>"
+        if thinking_end_token == DEFAULT_THINKING_END_TOKEN:
+            thinking_end_token = "</mm:think>"
 
     # Skip special tokens
     skip_special_tokens = kwargs.pop("skip_special_tokens", False)
@@ -748,6 +913,9 @@ def stream_generate(
     )
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    max_long_side_pixel = normalize_max_long_side_pixel(
+        kwargs.pop("max_long_side_pixel", None)
+    )
     image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
@@ -762,6 +930,9 @@ def stream_generate(
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
     else:
+        processor_kwargs = {}
+        if max_long_side_pixel is not None:
+            processor_kwargs["max_long_side_pixel"] = max_long_side_pixel
         inputs = prepare_inputs(
             processor,
             images=image,
@@ -771,6 +942,7 @@ def stream_generate(
             image_token_index=image_token_index,
             resize_shape=resize_shape,
             add_special_tokens=add_special_tokens,
+            **processor_kwargs,
             **kwargs,
         )
         input_ids = inputs.get("input_ids", None)
@@ -892,11 +1064,32 @@ def stream_generate(
         cached = vision_cache.get(image)
         if cached is not None:
             kwargs["cached_image_features"] = cached
-        elif hasattr(model, "encode_image"):
-            features = model.encode_image(pixel_values)
-            mx.eval(features)
-            vision_cache.put(image, features)
-            kwargs["cached_image_features"] = features
+        else:
+            features = _encode_image_for_vision_cache(model, pixel_values, kwargs)
+            if features is not None:
+                mx.eval(features)
+                vision_cache.put(image, features)
+                kwargs["cached_image_features"] = features
+
+    if (
+        vision_cache is not None
+        and video is not None
+        and kwargs.get("pixel_values_videos", None) is not None
+    ):
+        cache_key = _video_cache_key(video)
+        cached = vision_cache.get(cache_key)
+        if cached is not None:
+            kwargs["cached_video_features"] = cached
+        else:
+            features = _encode_video_for_vision_cache(
+                model,
+                kwargs["pixel_values_videos"],
+                kwargs,
+            )
+            if features is not None:
+                mx.eval(features)
+                vision_cache.put(cache_key, features)
+                kwargs["cached_video_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn
     reused_prefix_len = 0
@@ -946,7 +1139,13 @@ def stream_generate(
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
-        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
+        video_hash = _apc.hash_video_payload(
+            pixel_values=kwargs.get("pixel_values_videos"),
+            video_grid_thw=kwargs.get("video_grid_thw"),
+            video_ref=video,
+        )
+        payload_hash = _apc.hash_multimodal_payload(image_hash, video_hash)
+        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, payload_hash)
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
@@ -957,19 +1156,15 @@ def stream_generate(
                 reused_prefix_len = prefix_len
                 # Trim to only new tokens
                 input_ids = input_ids[:, prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
+                new_ids = input_ids.flatten().tolist()
+                pixel_values = _drop_unused_multimodal_inputs(
+                    model, new_ids, pixel_values, kwargs
+                )
                 # Reuse the saved KV cache (trimmed to prefix length)
                 kv_cache = prompt_cache_state.cache
                 # Trim cache to prefix_len in case it includes generated tokens
                 for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
+                    _trim_prompt_cache_entry_to(c, prefix_len)
                 kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
@@ -990,8 +1185,10 @@ def stream_generate(
             ):
                 reused_prefix_len = exact_prefix_len
                 input_ids = input_ids[:, exact_prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
+                new_ids = input_ids.flatten().tolist()
+                pixel_values = _drop_unused_multimodal_inputs(
+                    model, new_ids, pixel_values, kwargs
+                )
                 kwargs["prompt_cache"] = exact_prompt_cache
         else:
             matched_blocks, prefix_len = apc_manager.lookup_prefix(
@@ -1035,8 +1232,10 @@ def stream_generate(
                 ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     reused_prefix_len = disk_prefix_len
                     input_ids = input_ids[:, disk_prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                    new_ids = input_ids.flatten().tolist()
+                    pixel_values = _drop_unused_multimodal_inputs(
+                        model, new_ids, pixel_values, kwargs
+                    )
                     kwargs["prompt_cache"] = disk_prompt_cache
             elif (
                 exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
@@ -1048,8 +1247,10 @@ def stream_generate(
                 ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
                     reused_prefix_len = exact_prefix_len
                     input_ids = input_ids[:, exact_prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                    new_ids = input_ids.flatten().tolist()
+                    pixel_values = _drop_unused_multimodal_inputs(
+                        model, new_ids, pixel_values, kwargs
+                    )
                     kwargs["prompt_cache"] = exact_prompt_cache
             elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
                 if _apc_suffix_is_text_only(
@@ -1058,8 +1259,10 @@ def stream_generate(
                     apc_blocks_in_use = matched_blocks
                     reused_prefix_len = prefix_len
                     input_ids = input_ids[:, prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
+                    new_ids = input_ids.flatten().tolist()
+                    pixel_values = _drop_unused_multimodal_inputs(
+                        model, new_ids, pixel_values, kwargs
+                    )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
                         min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
@@ -1426,6 +1629,7 @@ def main():
     model, processor = load(
         args.model,
         args.adapter_path,
+        lazy=args.lazy_load,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
         quantize_activations=args.quantize_activations,
@@ -1468,7 +1672,12 @@ def main():
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
-    chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    thinking_mode = getattr(args, "thinking_mode", None)
+    chat_template_kwargs = thinking_template_kwargs(
+        config,
+        enable_thinking=args.enable_thinking,
+        thinking_mode=thinking_mode,
+    )
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
@@ -1507,11 +1716,22 @@ def main():
 
     # Add thinking kwargs
     kwargs["enable_thinking"] = args.enable_thinking
+    if thinking_mode == "enabled":
+        kwargs["enable_thinking"] = True
+    elif thinking_mode == "disabled":
+        kwargs["enable_thinking"] = False
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
-        kwargs["thinking_end_token"] = args.thinking_end_token
+        thinking_start_token = args.thinking_start_token
+        thinking_end_token = args.thinking_end_token
+        if config.model_type in {"minimax_m3", "minimax_m3_vl"}:
+            if thinking_start_token == DEFAULT_THINKING_START_TOKEN:
+                thinking_start_token = "<mm:think>"
+            if thinking_end_token == DEFAULT_THINKING_END_TOKEN:
+                thinking_end_token = "</mm:think>"
+        kwargs["thinking_end_token"] = thinking_end_token
         if args.thinking_start_token is not None:
-            kwargs["thinking_start_token"] = args.thinking_start_token
+            kwargs["thinking_start_token"] = thinking_start_token
 
     if args.chat:
         from ..vision_cache import VisionFeatureCache
@@ -1547,6 +1767,8 @@ def main():
             }
             if args.resize_shape is not None:
                 stream_kwargs["resize_shape"] = args.resize_shape
+            if args.max_long_side_pixel is not None:
+                stream_kwargs["max_long_side_pixel"] = args.max_long_side_pixel
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
             if is_masked_text_diffusion:
@@ -1617,6 +1839,8 @@ def main():
         }
         if args.resize_shape is not None:
             gen_kwargs["resize_shape"] = args.resize_shape
+        if args.max_long_side_pixel is not None:
+            gen_kwargs["max_long_side_pixel"] = args.max_long_side_pixel
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
         if is_masked_diffusion_text_model(model):

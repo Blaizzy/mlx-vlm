@@ -34,6 +34,7 @@ from ..generate import (
 )
 from ..generate.common import generation_stream, wired_limit
 from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
+from ..prompt_utils import is_minimax_m3_model_type
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
@@ -530,6 +531,7 @@ def _build_metrics_envelope(
     finish_reason: Optional[str] = None,
     image_count: int = 0,
     audio_count: int = 0,
+    video_count: int = 0,
     structured_output: bool = False,
     thinking_enabled: bool = False,
     tool_parser: Optional[str] = None,
@@ -575,6 +577,7 @@ def _build_metrics_envelope(
         "finish_reason": finish_reason,
         "image_count": int(image_count),
         "audio_count": int(audio_count),
+        "video_count": int(video_count),
         "structured_output": bool(structured_output),
         "thinking_enabled": bool(thinking_enabled),
         "tool_parser": tool_parser,
@@ -596,8 +599,16 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
+        lazy_load = os.environ.get("MLX_VLM_LAZY_LOAD", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
         model, processor = load(
-            model_path, adapter_path, trust_remote_code=trust_remote_code
+            model_path,
+            adapter_path,
+            lazy=lazy_load,
+            trust_remote_code=trust_remote_code,
         )
         config = model.config
         print("Model and processor loaded successfully.")
@@ -632,9 +643,13 @@ class GenerationArguments:
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
+    enable_thinking_explicit: bool = False
+    thinking_mode: Optional[str] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
+    resize_shape: Optional[tuple] = None
+    max_long_side_pixel: Optional[int] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
@@ -673,15 +688,39 @@ class GenerationArguments:
             kw["thinking_start_token"] = self.thinking_start_token
         if self.thinking_end_token is not None:
             kw["thinking_end_token"] = self.thinking_end_token
+        if self.resize_shape is not None:
+            kw["resize_shape"] = self.resize_shape
+        if self.max_long_side_pixel is not None:
+            kw["max_long_side_pixel"] = self.max_long_side_pixel
         if self.logits_processors is not None:
             kw["logits_processors"] = self.logits_processors
         if self.tenant_id is not None:
             kw["apc_tenant"] = self.tenant_id
         return kw
 
-    def to_template_kwargs(self) -> dict:
+    def to_processor_kwargs(self) -> dict:
+        """Convert request-level media preprocessing options to kwargs."""
+        kw = {}
+        if self.max_long_side_pixel is not None:
+            kw["max_long_side_pixel"] = self.max_long_side_pixel
+        return kw
+
+    def to_template_kwargs(self, config=None) -> dict:
         """Convert to kwargs for apply_chat_template()."""
-        kw = {"enable_thinking": self.enable_thinking}
+        kw = {}
+        include_enable_thinking = True
+        if (
+            config is not None
+            and is_minimax_m3_model_type(config)
+            and not self.enable_thinking
+            and not self.enable_thinking_explicit
+            and self.thinking_mode is None
+        ):
+            include_enable_thinking = False
+        if include_enable_thinking:
+            kw["enable_thinking"] = self.enable_thinking
+        if self.thinking_mode is not None:
+            kw["thinking_mode"] = self.thinking_mode
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
@@ -976,6 +1015,7 @@ class ResponseGenerator:
         prompt: str,
         images: Optional[List] = None,
         audio: Optional[List] = None,
+        videos: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
@@ -990,13 +1030,13 @@ class ResponseGenerator:
             )
         rqueue: Queue = Queue()
 
-        # CPU preprocessing (tokenize, load images) on caller thread.
+        # CPU preprocessing (tokenize, load media) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._cpu_preprocess(prompt, images, audio, videos, args=args)
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images, videos))
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -1007,8 +1047,11 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
-    def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
-        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+    def _cpu_preprocess(
+        self, prompt, images=None, audio=None, videos=None, args=None
+    ) -> dict:
+        """CPU-only: tokenize text, load/resize media. Thread-safe."""
+        args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
             if self.model.config.model_type
@@ -1016,13 +1059,17 @@ class ResponseGenerator:
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
+        processor_kwargs = args.to_processor_kwargs()
         return prepare_inputs(
             self.processor,
             images=images,
             audio=audio,
+            videos=videos,
             prompts=prompt,
             image_token_index=image_token_index,
+            resize_shape=args.resize_shape,
             add_special_tokens=add_special_tokens,
+            **processor_kwargs,
         )
 
     # -- internals --
@@ -1061,8 +1108,7 @@ class ResponseGenerator:
 
     def _thinking_token_ids(self, args: GenerationArguments) -> Tuple[int, int]:
         tokenizer = self.tokenizer
-        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
-        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token, thinking_end_token = self._thinking_markers(args)
         thinking_start_token_id = tokenizer.encode(
             thinking_start_token, add_special_tokens=False
         )[-1]
@@ -1070,6 +1116,20 @@ class ResponseGenerator:
             thinking_end_token, add_special_tokens=False
         )[-1]
         return thinking_start_token_id, thinking_end_token_id
+
+    def _thinking_markers(self, args: GenerationArguments) -> Tuple[str, str]:
+        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
+        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        model_config = getattr(getattr(self, "model", None), "config", None)
+        if getattr(model_config, "model_type", None) in {
+            "minimax_m3",
+            "minimax_m3_vl",
+        }:
+            if thinking_start_token == DEFAULT_THINKING_START_TOKEN:
+                thinking_start_token = "<mm:think>"
+            if thinking_end_token == DEFAULT_THINKING_END_TOKEN:
+                thinking_end_token = "</mm:think>"
+        return thinking_start_token, thinking_end_token
 
     def _prompt_has_open_thinking(
         self, args: GenerationArguments, input_ids: mx.array
@@ -1093,8 +1153,7 @@ class ResponseGenerator:
         args: GenerationArguments,
         processors: List[Callable[[mx.array, mx.array], mx.array]],
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
-        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
-        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token, thinking_end_token = self._thinking_markers(args)
         return [
             ThinkingAwareLogitsProcessor(
                 processor=processor,
@@ -1112,8 +1171,7 @@ class ResponseGenerator:
         if args.thinking_budget is None:
             return None
         tokenizer = self.tokenizer
-        thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
-        thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
+        thinking_start_token, thinking_end_token = self._thinking_markers(args)
         enable_thinking = self._prompt_has_open_thinking(args, input_ids)
         return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
@@ -1123,7 +1181,9 @@ class ResponseGenerator:
             enable_thinking=enable_thinking,
         )
 
-    def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
+    def _gpu_embed(
+        self, raw_inputs: dict, images=None, videos=None
+    ) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
         input_ids = raw_inputs.get("input_ids")
         pixel_values = raw_inputs.get("pixel_values")
@@ -1150,12 +1210,21 @@ class ResponseGenerator:
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
         gen_kwargs = {**data_kwargs, **embed.to_dict()}
-        if images is not None:
-            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
-        elif pixel_values is not None:
+        if pixel_values is not None:
             gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(
                 pixel_values=pixel_values
             )
+        elif images is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
+        video_pixels = data_kwargs.get("pixel_values_videos")
+        video_grid_thw = data_kwargs.get("video_grid_thw")
+        if video_pixels is not None:
+            gen_kwargs["_apc_video_hash"] = _apc.hash_video_payload(
+                pixel_values=video_pixels,
+                video_grid_thw=video_grid_thw,
+            )
+        elif videos is not None:
+            gen_kwargs["_apc_video_hash"] = _apc.hash_video_payload(video_ref=videos)
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -1264,7 +1333,14 @@ class ResponseGenerator:
                         batch_gen.close()
                         batch_gen = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                for (
+                    rqueue,
+                    raw_inputs,
+                    prompt_tokens,
+                    args,
+                    images,
+                    videos,
+                ) in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -1287,7 +1363,7 @@ class ResponseGenerator:
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images, videos)
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
                     # Per-tenant APC salt: keep this out of the model forward
                     # by namespacing under "_apc_tenant"; BatchGenerator strips
@@ -1376,7 +1452,14 @@ class ResponseGenerator:
                 if should_stop:
                     break
                 cancelled |= self._drain_cancellations()
-                for rqueue, raw_inputs, prompt_tokens, args, _images in new_items:
+                for (
+                    rqueue,
+                    raw_inputs,
+                    prompt_tokens,
+                    args,
+                    _images,
+                    _videos,
+                ) in new_items:
                     uid_counter += 1
                     uid = uid_counter
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -1595,8 +1678,8 @@ class ResponseGenerator:
                 if hasattr(lm, "_rope_deltas"):
                     lm._rope_deltas = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                for rqueue, raw_inputs, prompt_tokens, args, images, videos in pending:
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images, videos)
                     uid = id(rqueue)
                     uids.append(uid)
                     rqueues[uid] = rqueue
@@ -1732,7 +1815,7 @@ class ResponseGenerator:
                     stop_check=stop_check,
                     greedy_sampling=all(
                         pending_args.temperature == 0
-                        for _, _, _, pending_args, _ in pending
+                        for _, _, _, pending_args, _, _ in pending
                     ),
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
@@ -1870,6 +1953,7 @@ class ResponseGenerator:
         prompt: str,
         images: Optional[List] = None,
         audio: Optional[List] = None,
+        videos: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
     ):
         """Validate request size before opening a streaming response."""
@@ -1877,7 +1961,7 @@ class ResponseGenerator:
             return
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._cpu_preprocess(prompt, images, audio, videos, args=args)
         _check_configured_context_budget(
             _count_prompt_tokens(raw_inputs), args.max_tokens
         )

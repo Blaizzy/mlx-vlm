@@ -21,11 +21,7 @@ from .generation import (
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .responses_state import (
-    ThinkingStreamState,
-    process_tool_calls,
-    suppress_tool_call_content,
-)
+from .responses_state import process_tool_calls, suppress_tool_call_content
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
 
@@ -38,6 +34,7 @@ _read_tenant_id = None
 _preflight_stream_context_budget = None
 _as_plain_dict = None
 _split_thinking = None
+_split_stream_thinking_delta = None
 _count_thinking_tag_tokens = None
 
 
@@ -45,7 +42,7 @@ def register_routes(app, deps):
     global _INHERIT_ADAPTER
     global get_cached_model, _build_gen_args, _read_tenant_id
     global _preflight_stream_context_budget, _as_plain_dict
-    global _split_thinking, _count_thinking_tag_tokens
+    global _split_thinking, _split_stream_thinking_delta, _count_thinking_tag_tokens
     global generate, stream_generate, apply_chat_template
     global _infer_tool_parser_from_processor, load_tool_module
 
@@ -61,6 +58,7 @@ def register_routes(app, deps):
     _preflight_stream_context_budget = deps.preflight_stream_context_budget
     _as_plain_dict = deps.as_plain_dict
     _split_thinking = deps.split_thinking
+    _split_stream_thinking_delta = deps.split_stream_thinking_delta
     _count_thinking_tag_tokens = deps.count_thinking_tag_tokens
 
     app.post("/messages")(anthropic_messages_endpoint)
@@ -437,7 +435,10 @@ def _anthropic_content_from_generation(
     thinking_end_token: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     reasoning, content = _split_thinking(
-        full_text, thinking_start_token, thinking_end_token
+        full_text,
+        thinking_start_token,
+        thinking_end_token,
+        assume_in_thinking=include_thinking,
     )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
@@ -485,7 +486,7 @@ async def anthropic_messages_endpoint(http_request: Request):
         except Exception as e:
             return _anthropic_error_response(400, str(e))
 
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(config)
         if tool_choice is not None:
             template_kwargs["tool_choice"] = tool_choice
 
@@ -537,11 +538,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                 open_block_type = None
                 full_output = ""
                 text_output = ""
-                thinking_state = ThinkingStreamState(
-                    gen_args.enable_thinking,
-                    gen_args.thinking_start_token,
-                    gen_args.thinking_end_token,
-                )
+                in_thinking = bool(gen_args.enable_thinking)
+                accumulated = ""
+                at_response_start = True
                 in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
                 message_started = False
@@ -611,7 +610,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             formatted_prompt,
                             images if images else None,
                             None,
-                            gen_args,
+                            args=gen_args,
                         )
                         prompt_tokens = ctx.prompt_tokens
 
@@ -657,15 +656,28 @@ async def anthropic_messages_endpoint(http_request: Request):
                             output_tokens += getattr(token, "token_count", 1)
                         delta = token.text
                         full_output += delta
+                        accumulated += delta
                         metrics.record_chunk(token)
                         if prompt_tokens == 0:
                             prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
                         for event in start_message_event():
                             yield event
 
-                        thinking_delta = thinking_state.feed(delta)
-                        delta_reasoning = thinking_delta.reasoning
-                        delta_content = thinking_delta.content
+                        was_in_thinking = in_thinking
+                        (
+                            in_thinking,
+                            accumulated,
+                            at_response_start,
+                            delta_reasoning,
+                            delta_content,
+                        ) = _split_stream_thinking_delta(
+                            accumulated,
+                            delta,
+                            in_thinking,
+                            at_response_start=at_response_start,
+                            thinking_start_token=gen_args.thinking_start_token,
+                            thinking_end_token=gen_args.thinking_end_token,
+                        )
 
                         in_tool_call, delta_content = suppress_tool_call_content(
                             full_output, in_tool_call, tc_start, delta_content
@@ -684,22 +696,22 @@ async def anthropic_messages_endpoint(http_request: Request):
                                     },
                                 },
                             )
-                        if (
-                            thinking_delta.thinking_closed
-                            and open_block_type == "thinking"
-                        ):
-                            yield _sse_event(
-                                "content_block_delta",
-                                {
-                                    "type": "content_block_delta",
-                                    "index": block_index,
-                                    "delta": {
-                                        "type": "signature_delta",
-                                        "signature": "",
+
+                        if was_in_thinking and not in_thinking:
+                            if open_block_type == "thinking":
+                                yield _sse_event(
+                                    "content_block_delta",
+                                    {
+                                        "type": "content_block_delta",
+                                        "index": block_index,
+                                        "delta": {
+                                            "type": "signature_delta",
+                                            "signature": "",
+                                        },
                                     },
-                                },
-                            )
+                                )
                             yield close_open_block()
+
                         if delta_content:
                             text_output += delta_content
                             yield open_block("text")
@@ -800,6 +812,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                             full_output,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            assume_in_thinking=bool(gen_args.enable_thinking),
                         ),
                     )
                     envelope = _build_metrics_envelope(
@@ -975,6 +988,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     full_text,
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
+                    assume_in_thinking=bool(gen_args.enable_thinking),
                 ),
             )
             envelope = _build_metrics_envelope(
@@ -1049,7 +1063,7 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
         gen_args = _build_gen_args(
             request, processor, tenant_id=_read_tenant_id(http_request)
         )
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(config)
         if tool_choice is not None:
             template_kwargs["tool_choice"] = tool_choice
         formatted_prompt = apply_chat_template(
@@ -1066,6 +1080,8 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 formatted_prompt,
                 images if images else None,
                 None,
+                None,
+                gen_args,
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
@@ -1074,6 +1090,8 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
                 images=images if images else None,
                 prompts=formatted_prompt,
                 image_token_index=image_token_index,
+                resize_shape=gen_args.resize_shape,
+                **gen_args.to_processor_kwargs(),
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
     except Exception as e:

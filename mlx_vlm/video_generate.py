@@ -17,7 +17,7 @@ import requests
 from PIL import Image
 
 from .generate import generate
-from .utils import load, load_image, process_inputs_with_fallback
+from .utils import load, load_image, prepare_inputs, process_inputs_with_fallback
 
 # This is a beta version of the video generation script.
 # It is not fully tested and may not work as expected.
@@ -425,6 +425,36 @@ def is_video_file(video_path: List[str]) -> bool:
     return True
 
 
+def _video_inputs_to_generation_args(inputs: dict, model_type: str):
+    input_ids = mx.array(inputs["input_ids"])
+    mask = mx.array(inputs["attention_mask"])
+    kwargs = {}
+
+    if model_type == "minimax_m3_vl":
+        pixel_values = inputs.get("pixel_values", None)
+        skip_keys = {"input_ids", "pixel_values", "attention_mask"}
+    else:
+        pixel_values = inputs.get(
+            "pixel_values_videos", inputs.get("pixel_values", None)
+        )
+        skip_keys = {
+            "input_ids",
+            "pixel_values",
+            "pixel_values_videos",
+            "attention_mask",
+        }
+
+    if pixel_values is not None and not isinstance(pixel_values, mx.array):
+        pixel_values = mx.array(pixel_values)
+
+    for key, value in inputs.items():
+        if key in skip_keys or isinstance(value, (str, list)):
+            continue
+        kwargs[key] = value if isinstance(value, mx.array) else mx.array(value)
+
+    return input_ids, pixel_values, mask, kwargs
+
+
 def main():
     parser = argparse.ArgumentParser(description="Video Description CLI")
     parser.add_argument(
@@ -492,7 +522,8 @@ def main():
     if is_video_model(model):
 
         # Check if video is image or video
-        if is_video_file(args.video):
+        video_file_input = is_video_file(args.video)
+        if video_file_input:
             messages = [
                 {
                     "role": "user",
@@ -527,31 +558,38 @@ def main():
         text = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        image_inputs, video_inputs, fps = process_vision_info(messages, True)
+        model_type = getattr(model.config, "model_type", None)
+        if model_type == "minimax_m3_vl":
+            inputs = prepare_inputs(
+                processor,
+                images=None if video_file_input else args.video,
+                videos=args.video[0] if video_file_input else None,
+                prompts=text,
+                fps=args.fps,
+                padding=True,
+            )
+        else:
+            image_inputs, video_inputs, fps = process_vision_info(messages, True)
 
-        if args.max_frames is not None:
-            video_inputs = video_inputs[: args.max_frames]
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
+            if args.max_frames is not None:
+                video_inputs = video_inputs[: args.max_frames]
+            inputs = processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
 
-        input_ids = mx.array(inputs["input_ids"])
-        pixel_values = inputs.get(
-            "pixel_values_videos", inputs.get("pixel_values", None)
+        input_ids, pixel_values, mask, input_kwargs = _video_inputs_to_generation_args(
+            inputs, model_type
         )
-        if pixel_values is None:
+        kwargs.update(input_kwargs)
+        has_video_values = (
+            model_type == "minimax_m3_vl" and "pixel_values_videos" in kwargs
+        )
+        if pixel_values is None and not has_video_values:
             raise ValueError("Please provide a valid video or image input.")
-        pixel_values = mx.array(pixel_values)
-
-        mask = mx.array(inputs["attention_mask"])
-        if inputs.get("video_grid_thw", None) is not None:
-            kwargs["video_grid_thw"] = mx.array(inputs["video_grid_thw"])
-        if inputs.get("image_grid_thw", None) is not None:
-            kwargs["image_grid_thw"] = mx.array(inputs["image_grid_thw"])
 
     else:
         if is_video_file(args.video):

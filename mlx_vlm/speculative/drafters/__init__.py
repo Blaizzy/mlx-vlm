@@ -31,6 +31,36 @@ def _hidden_size(config: Any) -> Any:
     return _cfg_get(_cfg_get(config, "text_config", config), "hidden_size")
 
 
+def _target_num_layers(target_model: Any) -> Optional[int]:
+    target = getattr(target_model, "language_model", target_model)
+    model = getattr(target, "model", None)
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        return len(layers)
+    config = getattr(target, "config", None)
+    text_config = _cfg_get(config, "text_config", config)
+    value = _cfg_get(text_config, "num_hidden_layers")
+    return int(value) if value is not None else None
+
+
+def _set_eagle3_default_aux_layers(target_model: Any, draft_cfg: Any) -> None:
+    if _cfg_get(draft_cfg, "target_layer_ids_explicit", False):
+        return
+
+    num_layers = _target_num_layers(target_model)
+    if not num_layers:
+        return
+
+    target_layer_ids = [2, num_layers // 2, max(num_layers - 3, 0)]
+    capture_layer_ids = [max(int(i) - 1, 0) for i in target_layer_ids]
+    try:
+        draft_cfg.target_layer_ids = target_layer_ids
+        draft_cfg.capture_layer_ids = capture_layer_ids
+        draft_cfg.num_aux_hidden_states = len(target_layer_ids)
+    except AttributeError:
+        pass
+
+
 def validate_drafter_compatibility(
     target_model: Any,
     draft_model: Any,
@@ -54,6 +84,10 @@ def validate_drafter_compatibility(
             f"Drafter model_type={model_type!r} requires draft_kind={expected_kind!r}. "
             f"Got draft_kind={draft_kind!r}."
         )
+
+    if draft_kind == "eagle3":
+        _set_eagle3_default_aux_layers(target_model, draft_cfg)
+        return
 
     if draft_kind != "mtp":
         return
@@ -85,7 +119,10 @@ def _peek_drafter_model_type(model_path) -> Optional[str]:
     try:
         with open(model_path / "config.json") as f:
             config = json.load(f)
-            return config.get("model_type") or config.get("speculators_model_type")
+            architectures = config.get("architectures") or []
+            if any("eagle3" in str(arch).lower() for arch in architectures):
+                return "eagle3"
+            return config.get("speculators_model_type") or config.get("model_type")
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
 
