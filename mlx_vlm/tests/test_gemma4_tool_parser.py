@@ -69,6 +69,24 @@ class TestGemma4ToolParser(unittest.TestCase):
             [{"newText": "orange", "oldText": "apple"}],
         )
 
+    # ── namespaced names ─────────────────────────────────────────────────
+
+    def test_colon_namespaced_name(self):
+        text = _wrap(
+            f"call:google-workspace:google-workspace{{action:{_str('list_events')}}}"
+        )
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "google-workspace:google-workspace")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"action": "list_events"})
+
+    def test_dotted_colon_namespaced_name(self):
+        text = _wrap(f"call:mcp.server:calendar.search{{query:{_str('today')}}}")
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "mcp.server:calendar.search")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"query": "today"})
+
     # ── arguments type ────────────────────────────────────────────────────
 
     def test_arguments_is_json_string(self):
