@@ -928,32 +928,6 @@ def test_qwen3_5_rope_index_handles_fully_padded_vision_rows():
     assert rope_deltas.tolist() == [[0], [0]]
 
 
-def test_qwen3_5_batch_forward_preserves_offsets_for_fully_padded_rows():
-    text_config = _tiny_qwen3_5_text_config()
-    text_config.num_hidden_layers = 2
-    text_config.full_attention_interval = 2
-    model = qwen_language.Qwen3_5Model(text_config)
-    arrays_cache = ArraysCache(size=2)
-    arrays_cache.left_padding = mx.array([5, 0], dtype=mx.int32)
-    batch_cache = [arrays_cache, BatchKVCache([5, 0])]
-
-    first_chunk = mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32)
-    first_out = model(first_chunk, cache=batch_cache)
-    mx.eval(first_out, batch_cache[1].offset, batch_cache[1].left_padding)
-
-    assert first_out.shape == (2, 3, text_config.hidden_size)
-    assert batch_cache[1].offset.tolist() == [-2, 3]
-    assert batch_cache[1].left_padding.tolist() == [5, 0]
-
-    second_chunk = mx.array([[0, 0, 4], [4, 5, 6]], dtype=mx.int32)
-    second_out = model(second_chunk, cache=batch_cache)
-    mx.eval(second_out, batch_cache[1].offset, batch_cache[1].left_padding)
-
-    assert second_out.shape == (2, 3, text_config.hidden_size)
-    assert batch_cache[1].offset.tolist() == [1, 6]
-    assert batch_cache[1].left_padding.tolist() == [5, 0]
-
-
 def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
     text_config = _tiny_qwen3_5_text_config()
     text_config.num_hidden_layers = 2
@@ -980,6 +954,26 @@ def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
 
     assert bool(mx.array_equal(singleton_decode, batch_decode).item())
     assert isinstance(batch_cache[1], BatchKVCache)
+
+    padded_arrays = ArraysCache(size=2)
+    padded_arrays.left_padding = mx.array([5, 0], dtype=mx.int32)
+    padded_cache = [padded_arrays, BatchKVCache([5, 0])]
+
+    first_chunk = mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32)
+    first_out = model(first_chunk, cache=padded_cache)
+    mx.eval(first_out, padded_cache[1].offset, padded_cache[1].left_padding)
+
+    assert first_out.shape == (2, 3, text_config.hidden_size)
+    assert padded_cache[1].offset.tolist() == [-2, 3]
+    assert padded_cache[1].left_padding.tolist() == [5, 0]
+
+    second_chunk = mx.array([[0, 0, 4], [4, 5, 6]], dtype=mx.int32)
+    second_out = model(second_chunk, cache=padded_cache)
+    mx.eval(second_out, padded_cache[1].offset, padded_cache[1].left_padding)
+
+    assert second_out.shape == (2, 3, text_config.hidden_size)
+    assert padded_cache[1].offset.tolist() == [1, 6]
+    assert padded_cache[1].left_padding.tolist() == [5, 0]
 
 
 def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
