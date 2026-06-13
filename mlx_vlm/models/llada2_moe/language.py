@@ -424,7 +424,6 @@ class LanguageModel(nn.Module):
         x = mx.concatenate([inputs, x[:, prompt_length:]], axis=1)
         prefill_blocks = prompt_length // block_length
         display_end = prompt_length + gen_length
-        visualizer.visualize(x[:, prompt_length:display_end], force=True)
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
         prefix_cache = [StaticPrefixKVCache(total_length) for _ in self.layers]
@@ -465,6 +464,17 @@ class LanguageModel(nn.Module):
             prompt_mask = block_start + block_positions < prompt_length
             block_cache = [StaticPrefixKVCache.from_prefix(c) for c in prefix_cache]
             eos_block_index = None
+            block_display_end = min(current_window_end, display_end)
+
+            def visualize_current_block(force: bool = False) -> None:
+                if not visualizer.active or block_display_end <= prompt_length:
+                    return
+                visualizer.visualize(
+                    x[:, prompt_length:block_display_end],
+                    force=force,
+                )
+
+            visualize_current_block(force=True)
 
             post_steps = 0
             stable_steps = 0
@@ -538,7 +548,7 @@ class LanguageModel(nn.Module):
                 cur_x = mx.concatenate([cur_x[:, :-block_length], new_block], axis=1)
                 if visualizer.active and bool(final_mask.any().item()):
                     x = mx.concatenate([cur_x, x[:, current_window_end:]], axis=1)
-                    visualizer.visualize(x[:, prompt_length:display_end])
+                    visualize_current_block()
 
                 has_edit = bool(edit_mask.any().item())
                 if eos_early_stop and eos_block_index is None and not has_active:
