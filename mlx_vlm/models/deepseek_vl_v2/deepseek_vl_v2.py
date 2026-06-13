@@ -7,8 +7,10 @@ import numpy as np
 from transformers import AutoProcessor
 
 from ..base import InputEmbeddingsFeatures
+from ..cache import KVCache
 from .config import ModelConfig, ProjectorConfig
 from .language import LanguageModel
+from .mla_fp8 import Fp8MLAKVCache, mla_fp8_enabled, mla_fp8_group_size
 from .processing_deepsek_vl_v2 import DeepseekVLV2Processor
 from .vision import VisionModel
 
@@ -383,6 +385,16 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.language_model.model.layers
+
+    def make_cache(self):
+        # Opt-in: FP8 latent KV cache for the MLA attention path (off by default).
+        if (
+            mla_fp8_enabled()
+            and self.config.text_config.attn_type == "DeepseekV2Attention"
+        ):
+            gs = mla_fp8_group_size()
+            return [Fp8MLAKVCache(group_size=gs) for _ in self.layers]
+        return [KVCache() for _ in self.layers]
 
     def __call__(
         self,
