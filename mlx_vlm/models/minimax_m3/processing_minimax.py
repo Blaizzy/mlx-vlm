@@ -1,3 +1,5 @@
+# Vendored from the MiniMax-M3 processor (transformers `minimax_m3_vl`, not yet in a released
+# transformers version). Registered with the Auto* factories in processing.py.
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 """
