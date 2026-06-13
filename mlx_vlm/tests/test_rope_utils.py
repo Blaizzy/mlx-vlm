@@ -4,6 +4,7 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
+from mlx_vlm.models.gemma4.rope_utils import ProportionalRoPE
 from mlx_vlm.models.rope_utils import (
     MRoPERotaryEmbedding,
     apply_mrope_frequency_layout,
@@ -64,6 +65,29 @@ def test_mrope_rotary_embedding_evals_private_helper_arrays_on_init(monkeypatch)
     assert len(eval_args) == 1
     assert eval_args[0][0] is eager_arrays[0]
     assert eval_args[0][1] is eager_arrays[1]
+
+
+def test_proportional_rope_evals_private_helper_arrays_on_init(monkeypatch):
+    eval_args = []
+    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rope = ProportionalRoPE(
+                dims=8,
+                scaling_config={"partial_rotary_factor": 0.25},
+            )
+
+    host = Host()
+
+    assert isinstance(host.rope, nn.Module)
+    assert tree_flatten(host.parameters()) == []
+    assert tree_flatten(host.trainable_parameters()) == []
+    eager_arrays = host.rope.eager_eval_arrays()
+    assert eager_arrays[0] is host.rope.freqs
+    assert len(eval_args) == 1
+    assert eval_args[0][0] is eager_arrays[0]
 
 
 @pytest.mark.parametrize(
