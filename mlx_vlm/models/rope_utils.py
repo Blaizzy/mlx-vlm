@@ -1,3 +1,4 @@
+import math
 from functools import lru_cache
 from typing import Optional, Sequence
 
@@ -397,6 +398,41 @@ def compute_inv_freq(dim: int, base: float):
     return 1.0 / (base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim))
 
 
+def apply_cope_clip(
+    inv_freq,
+    original_max_position_embeddings: Optional[int] = None,
+    clip_n: Optional[int] = None,
+):
+    """Soft-clip out-of-distribution low frequencies (CoPE, arXiv:2602.05258).
+
+    Frequency components whose rotation period exceeds the pre-training
+    context window never complete a full rotation during training and go
+    out-of-distribution when extrapolating past it. CoPE attenuates them
+    with a raised-cosine (Hann) taper: the boundary component is left
+    untouched and the lowest-frequency component is frozen (inv_freq=0),
+    avoiding the spectral leakage of a hard cutoff.
+
+    When ``clip_n`` is not given it is derived from
+    ``original_max_position_embeddings``: every component with period
+    ``2*pi/inv_freq`` greater than the window is clipped.
+    """
+    n = inv_freq.shape[0]
+    if clip_n is None:
+        if original_max_position_embeddings is None:
+            raise ValueError(
+                "CoPE requires either clip_n or "
+                "original_max_position_embeddings to size the clip."
+            )
+        periods = 2 * math.pi / inv_freq
+        clip_n = int((periods > original_max_position_embeddings).sum())
+    clip_n = min(int(clip_n), n)
+    if clip_n == 0:
+        return inv_freq
+    theta = mx.linspace(0, math.pi, num=clip_n)
+    mask = 0.5 * (1.0 + mx.cos(theta))
+    return mx.concatenate([inv_freq[: n - clip_n], inv_freq[n - clip_n :] * mask])
+
+
 @mx.compile
 def _apply_selected_mrope_frequency_layout(freqs, position_selector):
     indices = mx.broadcast_to(
@@ -535,6 +571,15 @@ class MRoPERotaryEmbedding(nn.Module):
         self.base = base
         self.style = style
         self._inv_freq = compute_inv_freq(dim, base)
+        rope_params = rope_parameters or rope_scaling or {}
+        if (rope_params.get("rope_type") or rope_params.get("type")) == "cope":
+            self._inv_freq = apply_cope_clip(
+                self._inv_freq,
+                rope_params.get(
+                    "original_max_position_embeddings", max_position_embeddings
+                ),
+                rope_params.get("clip_n"),
+            )
         self.attention_scaling = attention_scaling
         self.cast_output = cast_output
         self._mrope_section = list(
