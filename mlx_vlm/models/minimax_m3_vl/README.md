@@ -110,7 +110,9 @@ mlx_vlm.generate \
   selected `sparse_topk_blocks * sparse_block_size` tokens are at most half of
   the cache by default. Tune or diagnose with
   `MLX_VLM_MINIMAX_M3_SPARSE_DECODE_MAX_DENSITY`,
-  `MLX_VLM_MINIMAX_M3_DISABLE_SPARSE_DECODE`, and
+  `MLX_VLM_MINIMAX_M3_DISABLE_COMPILED_SPARSE_PREFILL`,
+  `MLX_VLM_MINIMAX_M3_DISABLE_SPARSE_DECODE`,
+  `MLX_VLM_MINIMAX_M3_DISABLE_DECODE_INDEX_FASTPATH`, and
   `MLX_VLM_MINIMAX_M3_FORCE_MSA`.
 - Decode fuses compatible quantized projection groups such as q/k/v and MiniMax
   index q/k to reduce per-token launch overhead. Set
