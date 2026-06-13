@@ -923,14 +923,18 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    kwargs.setdefault("trust_remote_code", True)
     try:
         processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     except Exception:
-        # transformers may not forward trust_remote_code to sub image-processor; the
-        # text path only needs the tokenizer + chat template, so fall back to that.
-        from transformers import AutoTokenizer
-        processor = AutoTokenizer.from_pretrained(model_path, **kwargs)
+        # Some VL models ship custom processor code not yet merged into transformers;
+        # retry allowing it, then fall back to the tokenizer (text path) if it still
+        # will not build. Normal models take the first path unchanged.
+        tr = {**kwargs, "trust_remote_code": True}
+        try:
+            processor = AutoProcessor.from_pretrained(model_path, **tr)
+        except Exception:
+            from transformers import AutoTokenizer
+            processor = AutoTokenizer.from_pretrained(model_path, **tr)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
