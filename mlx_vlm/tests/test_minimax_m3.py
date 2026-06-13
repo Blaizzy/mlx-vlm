@@ -2077,6 +2077,30 @@ def test_minimax_m3_batch_index_cache_filter_extend_extract():
     assert cache_a.state[1].shape == (2, 1, 4, 4)
 
 
+def test_minimax_m3_kv_cache_merge_returns_batch_cache():
+    caches = []
+    for offset in (1, 2):
+        cache = MiniMaxM3KVCache()
+        cache.update_and_fetch(
+            mx.ones((1, 1, 3, 4), dtype=mx.float32) * offset,
+            mx.ones((1, 1, 3, 5), dtype=mx.float32) * offset,
+        )
+        cache.update_index_and_fetch(
+            mx.ones((1, 2, 3, 4), dtype=mx.float32) * offset
+        )
+        caches.append(cache)
+
+    merged = MiniMaxM3KVCache.merge(caches)
+    extracted = merged.extract(1)
+
+    assert isinstance(merged, MiniMaxM3BatchKVCache)
+    assert merged.kv_cache.keys.shape == (2, 1, 3, 4)
+    assert merged.kv_cache.values.shape == (2, 1, 3, 5)
+    assert merged.index_keys.shape == (2, 2, 3, 4)
+    assert extracted.kv_cache.state[0].tolist() == caches[1].kv_cache.state[0].tolist()
+    assert extracted.index_keys.tolist() == caches[1].state[1].tolist()
+
+
 def test_minimax_m3_batch_cache_merge_preserves_index_cache_rows():
     warm = MiniMaxM3KVCache()
     warm.update_and_fetch(

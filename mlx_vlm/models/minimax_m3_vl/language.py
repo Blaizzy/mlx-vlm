@@ -389,6 +389,10 @@ class MiniMaxM3KVCache:
         self.index_offset = max(0, self.index_offset - trimmed)
         return trimmed
 
+    @classmethod
+    def merge(cls, caches, prefix_lens=None):
+        return MiniMaxM3BatchKVCache.merge(caches, prefix_lens=prefix_lens)
+
     @property
     def state(self):
         kv_state = None if self.kv_cache.empty() else self.kv_cache.state
