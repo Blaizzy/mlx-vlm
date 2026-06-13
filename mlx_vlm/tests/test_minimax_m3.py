@@ -24,6 +24,11 @@ from mlx_vlm.models.minimax_m3_vl.language import (
     _swiglu_oai,
 )
 from mlx_vlm.models.minimax_m3_vl.minimax_m3_vl import Model
+from mlx_vlm.models.minimax_m3_vl.processing_minimax_m3_vl import (
+    MiniMaxM3VLImageProcessor,
+    MiniMaxM3VLProcessor,
+    MiniMaxM3VLVideoProcessor,
+)
 from mlx_vlm.models.minimax_m3_vl.vision import (
     MiniMaxVisionTransformer,
     _apply_vision_rope,
@@ -1352,6 +1357,136 @@ def test_minimax_m3_prepare_inputs_accepts_explicit_video_metadata():
     assert processor.kwargs["do_resize"] is True
     assert processor.kwargs["fps"] == 1.5
     assert processor.kwargs["video_metadata"] == [metadata]
+
+
+class _MiniMaxFakeTokenizer:
+    model_input_names = ["input_ids", "attention_mask"]
+    pad_token = "<pad>"
+    eos_token = "</s>"
+    pad_token_id = 0
+
+    vocab = {
+        MiniMaxM3VLProcessor.IMAGE_TOKEN: 11,
+        MiniMaxM3VLProcessor.VIDEO_TOKEN: 12,
+        MiniMaxM3VLProcessor.VISION_START_TOKEN: 13,
+        MiniMaxM3VLProcessor.VISION_END_TOKEN: 14,
+    }
+
+    def __init__(self):
+        self.seen_text = None
+
+    def convert_tokens_to_ids(self, token):
+        return self.vocab[token]
+
+    def __call__(
+        self,
+        text,
+        padding=True,
+        add_special_tokens=False,
+        return_tensors=None,
+        **kwargs,
+    ):
+        del add_special_tokens, return_tensors, kwargs
+        self.seen_text = list(text)
+        encoded = [self._encode(prompt) for prompt in text]
+        max_len = max(len(ids) for ids in encoded)
+        if padding:
+            encoded = [ids + [self.pad_token_id] * (max_len - len(ids)) for ids in encoded]
+        attention_mask = [
+            [0 if token == self.pad_token_id else 1 for token in ids]
+            for ids in encoded
+        ]
+        return {"input_ids": encoded, "attention_mask": attention_mask}
+
+    def _encode(self, text):
+        specials = sorted(self.vocab, key=len, reverse=True)
+        ids = []
+        index = 0
+        while index < len(text):
+            for special in specials:
+                if text.startswith(special, index):
+                    ids.append(self.vocab[special])
+                    index += len(special)
+                    break
+            else:
+                ids.append(9)
+                index += 1
+        return ids
+
+
+def _tiny_minimax_processor():
+    return MiniMaxM3VLProcessor(
+        image_processor=MiniMaxM3VLImageProcessor(
+            patch_size=2,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=16,
+            max_pixels=16,
+            do_resize=False,
+        ),
+        video_processor=MiniMaxM3VLVideoProcessor(
+            patch_size=2,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=16,
+            max_pixels=16,
+            do_resize=False,
+        ),
+        tokenizer=_MiniMaxFakeTokenizer(),
+    )
+
+
+def test_minimax_m3_processor_expands_image_tokens_and_patchifies():
+    processor = _tiny_minimax_processor()
+    image = np.arange(3 * 4 * 4, dtype=np.uint8).reshape(3, 4, 4)
+
+    outputs = processor(
+        text=f"{MiniMaxM3VLProcessor.IMAGE_TOKEN}Describe.",
+        images=[image],
+        return_tensors=None,
+        return_mm_token_type_ids=True,
+    )
+
+    expected_text = (
+        MiniMaxM3VLProcessor.VISION_START_TOKEN
+        + MiniMaxM3VLProcessor.IMAGE_TOKEN
+        + MiniMaxM3VLProcessor.VISION_END_TOKEN
+        + "Describe."
+    )
+    assert processor.tokenizer.seen_text == [expected_text]
+    assert outputs["pixel_values"].shape == (4, 24)
+    assert outputs["image_grid_thw"].tolist() == [[1, 2, 2]]
+    assert outputs["input_ids"][0].count(processor.image_token_id) == 1
+    image_pos = outputs["input_ids"][0].index(processor.image_token_id)
+    assert outputs["mm_token_type_ids"][0][image_pos] == 1
+
+
+def test_minimax_m3_processor_expands_video_tokens_with_timestamps():
+    processor = _tiny_minimax_processor()
+    video = np.arange(3 * 3 * 4 * 4, dtype=np.uint8).reshape(3, 3, 4, 4)
+    metadata = {"fps": 2.0, "frames_indices": [0, 1, 2]}
+
+    outputs = processor(
+        text=f"{MiniMaxM3VLProcessor.VIDEO_TOKEN}Describe.",
+        videos=[video],
+        video_metadata=[metadata],
+        return_tensors=None,
+        return_mm_token_type_ids=True,
+    )
+
+    frame_chunk = (
+        MiniMaxM3VLProcessor.VISION_START_TOKEN
+        + MiniMaxM3VLProcessor.VIDEO_TOKEN
+        + MiniMaxM3VLProcessor.VISION_END_TOKEN
+    )
+    expected_text = f"]<]0.0 seconds[>[{frame_chunk}]<]1.0 seconds[>[{frame_chunk}Describe."
+    assert processor.tokenizer.seen_text == [expected_text]
+    assert outputs["pixel_values_videos"].shape == (8, 24)
+    assert outputs["video_grid_thw"].tolist() == [[2, 2, 2]]
+    assert outputs["input_ids"][0].count(processor.video_token_id) == 2
+    for index, token_id in enumerate(outputs["input_ids"][0]):
+        if token_id == processor.video_token_id:
+            assert outputs["mm_token_type_ids"][0][index] == 2
 
 
 def _legacy_smart_resize(
