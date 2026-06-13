@@ -95,12 +95,19 @@ class Attention(nn.Module):
         kv_seq_len = keys.shape[-2]
 
         if position_ids is None:
-            kv_seq_len += cache.offset + 1
-            position_ids = mx.arange(cache.offset, cache.offset + L)
+            # Cache implementations may leave offset unset before the
+            # first prefill; treat that as an empty cache.
+            offset = cache.offset if cache.offset is not None else 0
+            kv_seq_len += offset + 1
+            position_ids = mx.arange(offset, offset + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
         else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
+            kv_seq_len += (
+                cache.offset + 1
+                if cache is not None and cache.offset is not None
+                else 0
+            )
 
         if position_embeddings is None:
             queries, keys = self.rotary_emb.apply_rotary(
@@ -541,6 +548,8 @@ class LanguageModel(nn.Module):
         if cache and cache[0] is not None:
             c0 = cache[0]
             cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if cache_offset is None:
+                cache_offset = 0
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0

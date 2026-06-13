@@ -97,12 +97,18 @@ class Attention(nn.Module):
         # left padding — slicing on it then under-sizes the mask.
         if cache is not None:
             cache_size = cache._idx if hasattr(cache, "_idx") else cache.offset
+            if cache_size is None:
+                # Cache implementations may leave offset unset before the
+                # first prefill; treat that as an empty cache.
+                cache_size = 0
         else:
             cache_size = 0
 
         if position_ids is None:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
             offset_for_pos = cache.offset if cache is not None else 0
+            if offset_for_pos is None:
+                offset_for_pos = 0
+            kv_seq_len += offset_for_pos + 1 if cache is not None else 0
             position_ids = mx.arange(offset_for_pos, offset_for_pos + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
             position_ids = mx.tile(position_ids, (3, 1, 1))
@@ -501,6 +507,8 @@ class LanguageModel(nn.Module):
         if cache and cache[0] is not None:
             c0 = cache[0]
             cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if cache_offset is None:
+                cache_offset = 0
             if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
                 cache_offset_array = c0.offset
 
