@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "minimax_m3_vl": "minimax_m3",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -922,7 +923,14 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    kwargs.setdefault("trust_remote_code", True)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    except Exception:
+        # transformers may not forward trust_remote_code to sub image-processor; the
+        # text path only needs the tokenizer + chat template, so fall back to that.
+        from transformers import AutoTokenizer
+        processor = AutoTokenizer.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
