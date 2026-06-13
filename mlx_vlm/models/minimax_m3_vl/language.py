@@ -7,7 +7,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx_lm.models.cache import BatchKVCache, dynamic_roll
 from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU
+from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
 
 from ..base import (
     LanguageModelOutput,
@@ -135,6 +135,42 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
+def _switch_gather_sort(x: mx.array, indices: mx.array):
+    *_, num_selected = indices.shape
+    indices = indices.flatten()
+    order = mx.argsort(indices)
+    inv_order = mx.argsort(order)
+    return x.flatten(0, -3)[order // num_selected], indices[order], inv_order
+
+
+def _switch_scatter_unsort(x: mx.array, inv_order: mx.array, shape=None):
+    x = x[inv_order]
+    if shape is not None:
+        x = mx.unflatten(x, 0, shape)
+    return x
+
+
+@mx.compile
+def _minimax_moe_select(
+    gates: mx.array,
+    correction_bias: mx.array,
+    k: int,
+    routed_scaling_factor: float,
+    scoring_func: str,
+):
+    gates = gates.astype(mx.float32)
+    if scoring_func == "sigmoid":
+        scores = mx.sigmoid(gates)
+    else:
+        scores = mx.softmax(gates, axis=-1, precise=True)
+
+    biased_scores = scores + correction_bias
+    inds = mx.argpartition(-biased_scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
+    weights = mx.take_along_axis(scores, inds, axis=-1)
+    weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
+    return inds, weights * routed_scaling_factor
+
+
 @mx.compile
 def _build_sparse_causal_mask_compiled(
     idx_queries: mx.array,
@@ -259,11 +295,8 @@ class MiniMaxRMSNorm(nn.Module):
         self.gemma = gemma
 
     def __call__(self, x):
-        output = x * mx.rsqrt(
-            mx.mean(mx.square(x.astype(mx.float32)), axis=-1, keepdims=True) + self.eps
-        )
         weight = self.weight + 1 if self.gemma else self.weight
-        return (output * weight).astype(x.dtype)
+        return mx.fast.rms_norm(x, weight.astype(mx.float32), self.eps).astype(x.dtype)
 
 
 class MiniMaxM3KVCache:
@@ -623,6 +656,47 @@ class MiniMaxMLP(nn.Module):
         else:
             up, gate = fused
         return self.down_proj(self.act_fn(up, gate))
+
+
+class MiniMaxPackedSwitchGLU(nn.Module):
+    def __init__(
+        self,
+        input_dims: int,
+        hidden_dims: int,
+        num_experts: int,
+        activation: MiniMaxSwiGLUOAI,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.gate_up_proj = SwitchLinear(
+            input_dims, 2 * hidden_dims, num_experts, bias=bias
+        )
+        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
+        self.activation = activation
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _switch_gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+
+        gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+        gate, up = mx.split(gate_up, 2, axis=-1)
+        x = self.down_proj(
+            self.activation(up, gate),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _switch_scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
 
 
 class MiniMaxAttention(nn.Module):
@@ -1241,18 +1315,32 @@ class MiniMaxSparseMoeBlock(nn.Module):
         self.num_experts_per_tok = args.num_experts_per_tok
         self.routed_scaling_factor = args.routed_scaling_factor
         self.scoring_func = args.scoring_func
+        self.shared_expert_index = args.num_local_experts
+        self.pack_shared_expert = (
+            args.n_shared_experts == 1
+            and args.shared_intermediate_size == args.intermediate_size
+        )
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.intermediate_size,
-            args.num_local_experts,
-            activation=MiniMaxSwiGLUOAI(
-                args.swiglu_alpha,
-                args.swiglu_limit,
-                args.swiglu_beta,
-            ),
+        activation = MiniMaxSwiGLUOAI(
+            args.swiglu_alpha,
+            args.swiglu_limit,
+            args.swiglu_beta,
         )
+        if self.pack_shared_expert:
+            self.switch_mlp = MiniMaxPackedSwitchGLU(
+                args.hidden_size,
+                args.intermediate_size,
+                args.num_local_experts + 1,
+                activation=activation,
+            )
+        else:
+            self.switch_mlp = SwitchGLU(
+                args.hidden_size,
+                args.intermediate_size,
+                args.num_local_experts,
+                activation=activation,
+            )
         self.shared_experts = (
             MiniMaxMLP(
                 args.hidden_size,
@@ -1262,7 +1350,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
                 args.swiglu_beta,
                 bias=False,
             )
-            if args.n_shared_experts
+            if args.n_shared_experts and not self.pack_shared_expert
             else None
         )
         self.e_score_correction_bias = (
@@ -1275,19 +1363,33 @@ class MiniMaxSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x.astype(mx.float32))
-        if self.scoring_func == "sigmoid":
-            scores = mx.sigmoid(gates)
-        else:
-            scores = mx.softmax(gates, axis=-1, precise=True)
-
-        orig_scores = scores
         if self.e_score_correction_bias is not None:
-            scores = scores + self.e_score_correction_bias
-        k = self.num_experts_per_tok
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores = (scores * self.routed_scaling_factor).astype(x.dtype)
+            inds, scores = _minimax_moe_select(
+                gates,
+                self.e_score_correction_bias,
+                self.num_experts_per_tok,
+                self.routed_scaling_factor,
+                self.scoring_func,
+            )
+            scores = scores.astype(x.dtype)
+        else:
+            if self.scoring_func == "sigmoid":
+                scores = mx.sigmoid(gates)
+            else:
+                scores = mx.softmax(gates, axis=-1, precise=True)
+
+            k = self.num_experts_per_tok
+            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            scores = mx.take_along_axis(scores, inds, axis=-1)
+            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+            scores = (scores * self.routed_scaling_factor).astype(x.dtype)
+        if self.pack_shared_expert:
+            shared_inds = mx.full(
+                (*inds.shape[:-1], 1), self.shared_expert_index, dtype=inds.dtype
+            )
+            shared_scores = mx.ones((*scores.shape[:-1], 1), dtype=scores.dtype)
+            inds = mx.concatenate([inds, shared_inds], axis=-1)
+            scores = mx.concatenate([scores, shared_scores], axis=-1)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
@@ -1568,16 +1670,23 @@ class LanguageModel(nn.Module):
 
             if not layer.is_moe_layer:
                 continue
-            shard_inplace(
-                layer.block_sparse_moe.switch_mlp.gate_proj,
-                "all-to-sharded",
-                group=group,
-            )
-            shard_inplace(
-                layer.block_sparse_moe.switch_mlp.up_proj,
-                "all-to-sharded",
-                group=group,
-            )
+            if layer.block_sparse_moe.pack_shared_expert:
+                shard_inplace(
+                    layer.block_sparse_moe.switch_mlp.gate_up_proj,
+                    "all-to-sharded",
+                    group=group,
+                )
+            else:
+                shard_inplace(
+                    layer.block_sparse_moe.switch_mlp.gate_proj,
+                    "all-to-sharded",
+                    group=group,
+                )
+                shard_inplace(
+                    layer.block_sparse_moe.switch_mlp.up_proj,
+                    "all-to-sharded",
+                    group=group,
+                )
             shard_inplace(
                 layer.block_sparse_moe.switch_mlp.down_proj,
                 "sharded-to-all",

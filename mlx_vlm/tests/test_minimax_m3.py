@@ -4,6 +4,7 @@ import sys
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx_lm.models.switch_layers import SwitchGLU
 from PIL import Image
 from transformers import BaseImageProcessor
 
@@ -20,7 +21,10 @@ from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxAttention,
     MiniMaxM3BatchKVCache,
     MiniMaxM3KVCache,
+    MiniMaxMLP,
+    MiniMaxPackedSwitchGLU,
     MiniMaxSparseMoeBlock,
+    MiniMaxSwiGLUOAI,
     _swiglu_oai,
 )
 from mlx_vlm.models.minimax_m3_vl.minimax_m3_vl import Model
@@ -160,7 +164,8 @@ def test_minimax_m3_swiglu_beta_reaches_dense_and_moe_paths():
 
     assert dense_lm.model.layers[0].mlp.act_fn.beta == 0.5
     assert moe_block.switch_mlp.activation.beta == 0.25
-    assert moe_block.shared_experts.act_fn.beta == 0.25
+    assert moe_block.pack_shared_expert is True
+    assert moe_block.shared_experts is None
 
 
 def test_minimax_m3_moe_respects_optional_shared_experts_and_routing_bias():
@@ -176,6 +181,74 @@ def test_minimax_m3_moe_respects_optional_shared_experts_and_routing_bias():
     assert block.shared_experts is None
     assert block.e_score_correction_bias is None
     assert out.shape == (1, 2, config.hidden_size)
+
+
+def test_minimax_m3_packed_switch_glu_matches_routed_plus_shared_mlp():
+    hidden_size = 4
+    intermediate_size = 3
+    num_experts = 2
+    activation = MiniMaxSwiGLUOAI(alpha=1.3, limit=4.0, beta=0.2)
+    split = SwitchGLU(
+        hidden_size,
+        intermediate_size,
+        num_experts,
+        activation=activation,
+    )
+    shared = MiniMaxMLP(
+        hidden_size,
+        intermediate_size,
+        alpha=1.3,
+        limit=4.0,
+        beta=0.2,
+    )
+    packed = MiniMaxPackedSwitchGLU(
+        hidden_size,
+        intermediate_size,
+        num_experts + 1,
+        activation=MiniMaxSwiGLUOAI(alpha=1.3, limit=4.0, beta=0.2),
+    )
+
+    def values(shape, offset):
+        return (mx.arange(math.prod(shape), dtype=mx.float32).reshape(shape) + offset) / 50
+
+    split.gate_proj.weight = values((num_experts, intermediate_size, hidden_size), 1)
+    split.up_proj.weight = values((num_experts, intermediate_size, hidden_size), 17)
+    split.down_proj.weight = values((num_experts, hidden_size, intermediate_size), 31)
+    shared.gate_proj.weight = values((intermediate_size, hidden_size), 47)
+    shared.up_proj.weight = values((intermediate_size, hidden_size), 59)
+    shared.down_proj.weight = values((hidden_size, intermediate_size), 71)
+
+    packed.gate_up_proj.weight = mx.concatenate(
+        [
+            mx.concatenate([split.gate_proj.weight, split.up_proj.weight], axis=1),
+            mx.expand_dims(
+                mx.concatenate(
+                    [shared.gate_proj.weight, shared.up_proj.weight], axis=0
+                ),
+                axis=0,
+            ),
+        ],
+        axis=0,
+    )
+    packed.down_proj.weight = mx.concatenate(
+        [split.down_proj.weight, mx.expand_dims(shared.down_proj.weight, axis=0)],
+        axis=0,
+    )
+
+    x = values((1, 24, hidden_size), 3)
+    inds = mx.array([[[i % 2, (i + 1) % 2] for i in range(24)]], dtype=mx.int32)
+    scores = mx.array([[[0.65, 0.35] for _ in range(24)]], dtype=mx.float32)
+    expected = (split(x, inds) * scores[..., None]).sum(axis=-2) + shared(x)
+
+    shared_inds = mx.full((1, 24, 1), num_experts, dtype=mx.int32)
+    packed_inds = mx.concatenate([inds, shared_inds], axis=-1)
+    packed_scores = mx.concatenate(
+        [scores, mx.ones((1, 24, 1), dtype=mx.float32)], axis=-1
+    )
+    actual = (packed(x, packed_inds) * packed_scores[..., None]).sum(axis=-2)
+    mx.eval(actual, expected)
+
+    np.testing.assert_allclose(np.array(actual), np.array(expected), rtol=1e-5)
 
 
 def test_minimax_m3_default_layer_frequency_matches_m3_shape():
@@ -653,6 +726,75 @@ def test_minimax_m3_text_model_sanitize_maps_causal_lm_checkpoint_keys():
     assert gate_scales.shape == (2, 2, 2)
     assert f"{prefix}.experts.0.w1.weight" not in out
     assert f"{prefix}.experts.0.w1.scales" not in out
+
+
+def test_minimax_m3_text_model_sanitize_packs_hf_shared_expert_layout():
+    from mlx_vlm.models.minimax_m3 import Model as TextOnlyMiniMaxM3Model
+    from mlx_vlm.models.minimax_m3 import ModelConfig as TextOnlyMiniMaxM3Config
+
+    config = TextOnlyMiniMaxM3Config(
+        hidden_size=8,
+        intermediate_size=8,
+        dense_intermediate_size=16,
+        shared_intermediate_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_hidden_layers=1,
+        rotary_dim=4,
+        vocab_size=32,
+        moe_layer_freq=[1],
+        num_local_experts=2,
+        n_shared_experts=1,
+    )
+    model = TextOnlyMiniMaxM3Model(config)
+
+    source_prefix = "model.layers.0.block_sparse_moe"
+    weights = {}
+    for suffix in ("weight", "scales", "biases"):
+        for expert in range(config.num_local_experts):
+            weights[f"{source_prefix}.experts.{expert}.w1.{suffix}"] = mx.full(
+                (2, 3), expert + 1, dtype=mx.float32
+            )
+            weights[f"{source_prefix}.experts.{expert}.w3.{suffix}"] = mx.full(
+                (2, 3), expert + 3, dtype=mx.float32
+            )
+            weights[f"{source_prefix}.experts.{expert}.w2.{suffix}"] = mx.full(
+                (4, 2), expert + 5, dtype=mx.float32
+            )
+        weights[f"{source_prefix}.shared_experts.gate_proj.{suffix}"] = mx.full(
+            (2, 3), 7, dtype=mx.float32
+        )
+        weights[f"{source_prefix}.shared_experts.up_proj.{suffix}"] = mx.full(
+            (2, 3), 8, dtype=mx.float32
+        )
+        weights[f"{source_prefix}.shared_experts.down_proj.{suffix}"] = mx.full(
+            (4, 2), 9, dtype=mx.float32
+        )
+
+    out = model.sanitize(weights)
+    prefix = "language_model.model.layers.0.block_sparse_moe"
+    gate_up = out[f"{prefix}.switch_mlp.gate_up_proj.weight"]
+    down = out[f"{prefix}.switch_mlp.down_proj.weight"]
+    mx.eval(gate_up, down)
+
+    assert gate_up.shape == (3, 4, 3)
+    assert down.shape == (3, 4, 2)
+    assert np.all(np.array(gate_up[0, :2]) == 1)
+    assert np.all(np.array(gate_up[0, 2:]) == 3)
+    assert np.all(np.array(gate_up[1, :2]) == 2)
+    assert np.all(np.array(gate_up[1, 2:]) == 4)
+    assert np.all(np.array(gate_up[2, :2]) == 7)
+    assert np.all(np.array(gate_up[2, 2:]) == 8)
+    assert np.all(np.array(down[0]) == 5)
+    assert np.all(np.array(down[1]) == 6)
+    assert np.all(np.array(down[2]) == 9)
+    assert out[f"{prefix}.switch_mlp.gate_up_proj.scales"].shape == (3, 4, 3)
+    assert out[f"{prefix}.switch_mlp.gate_up_proj.biases"].shape == (3, 4, 3)
+    assert f"{prefix}.experts.0.w1.weight" not in out
+    assert f"{prefix}.experts.0.w2.weight" not in out
+    assert f"{prefix}.experts.0.w3.weight" not in out
+    assert f"{prefix}.shared_experts.gate_proj.weight" not in out
 
 
 def test_minimax_m3_config_preserves_quantization_metadata_with_aliases():

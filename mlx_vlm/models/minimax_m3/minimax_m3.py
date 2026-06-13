@@ -11,7 +11,10 @@ from ..minimax_m3_vl.config import (
     _sanitize_quantization_config,
 )
 from ..minimax_m3_vl.language import LanguageModel
-from ..minimax_m3_vl.minimax_m3_vl import _pack_uint8_weight
+from ..minimax_m3_vl.minimax_m3_vl import (
+    _pack_uint8_weight,
+    _sanitize_moe_weights,
+)
 
 
 @dataclass
@@ -82,6 +85,7 @@ class Model(nn.Module):
             elif key.startswith("model.") or key.startswith("lm_head."):
                 key = f"language_model.{key}"
             sanitized_weights[key] = value
+        weights.clear()
 
         scale_keys = {
             key.replace(".weight_scale_inv", ".weight")
@@ -100,23 +104,7 @@ class Model(nn.Module):
                 )
 
         args = self.language_model.args
-        for layer_idx in range(args.num_hidden_layers):
-            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
-            if f"{prefix}.experts.0.w1.weight" not in sanitized_weights:
-                continue
-
-            mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-            for old_name, new_name in mapping.items():
-                for suffix in ("weight", "scales", "biases"):
-                    expert_keys = [
-                        f"{prefix}.experts.{expert}.{old_name}.{suffix}"
-                        for expert in range(args.num_local_experts)
-                    ]
-                    if any(k not in sanitized_weights for k in expert_keys):
-                        continue
-                    sanitized_weights[f"{prefix}.switch_mlp.{new_name}.{suffix}"] = (
-                        mx.stack([sanitized_weights.pop(k) for k in expert_keys])
-                    )
+        _sanitize_moe_weights(sanitized_weights, args)
         return sanitized_weights
 
     def make_cache(self):

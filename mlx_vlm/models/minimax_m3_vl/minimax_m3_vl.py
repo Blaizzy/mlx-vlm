@@ -34,6 +34,69 @@ def _pack_uint8_weight(weight: mx.array) -> mx.array:
     return mx.sum(weight << shifts, axis=-1)
 
 
+def _sanitize_moe_weights(weights: dict, args):
+    num_experts = args.num_local_experts
+    pack_shared = (
+        args.n_shared_experts == 1
+        and args.shared_intermediate_size == args.intermediate_size
+    )
+
+    def expert_keys(prefix, name, suffix):
+        return [
+            f"{prefix}.experts.{expert}.{name}.{suffix}"
+            for expert in range(num_experts)
+        ]
+
+    def has_all(keys):
+        return all(key in weights for key in keys)
+
+    def pop_stack(keys):
+        return mx.stack([weights.pop(key) for key in keys])
+
+    for layer_idx in range(args.num_hidden_layers):
+        prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
+
+        for suffix in ("weight", "scales", "biases", "bias"):
+            if pack_shared:
+                gate_keys = expert_keys(prefix, "w1", suffix)
+                up_keys = expert_keys(prefix, "w3", suffix)
+                shared_gate_key = f"{prefix}.shared_experts.gate_proj.{suffix}"
+                shared_up_key = f"{prefix}.shared_experts.up_proj.{suffix}"
+                if has_all([*gate_keys, *up_keys, shared_gate_key, shared_up_key]):
+                    gate = pop_stack(gate_keys)
+                    up = pop_stack(up_keys)
+                    shared_gate = weights.pop(shared_gate_key)
+                    shared_up = weights.pop(shared_up_key)
+                    routed_gate_up = mx.concatenate([gate, up], axis=1)
+                    shared_gate_up = mx.expand_dims(
+                        mx.concatenate([shared_gate, shared_up], axis=0), axis=0
+                    )
+                    weights[f"{prefix}.switch_mlp.gate_up_proj.{suffix}"] = (
+                        mx.concatenate([routed_gate_up, shared_gate_up], axis=0)
+                    )
+
+                down_keys = expert_keys(prefix, "w2", suffix)
+                shared_down_key = f"{prefix}.shared_experts.down_proj.{suffix}"
+                if has_all([*down_keys, shared_down_key]):
+                    down = pop_stack(down_keys)
+                    shared_down = mx.expand_dims(weights.pop(shared_down_key), axis=0)
+                    weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
+                        mx.concatenate([down, shared_down], axis=0)
+                    )
+                continue
+
+            for hf_name, mlx_name in (
+                ("w1", "gate_proj"),
+                ("w2", "down_proj"),
+                ("w3", "up_proj"),
+            ):
+                keys = expert_keys(prefix, hf_name, suffix)
+                if has_all(keys):
+                    weights[f"{prefix}.switch_mlp.{mlx_name}.{suffix}"] = pop_stack(
+                        keys
+                    )
+
+
 class MiniMaxProjector(nn.Module):
     def __init__(
         self,
@@ -335,6 +398,7 @@ class Model(nn.Module):
             elif key.startswith("model.patch_merge_mlp."):
                 key = key.replace("model.patch_merge_mlp.", "patch_merge_mlp.", 1)
             sanitized_weights[key] = value
+        weights.clear()
 
         scale_keys = {
             key.replace(".weight_scale_inv", ".weight")
@@ -353,23 +417,7 @@ class Model(nn.Module):
                 )
 
         args = self.language_model.args
-        for layer_idx in range(args.num_hidden_layers):
-            prefix = f"language_model.model.layers.{layer_idx}.block_sparse_moe"
-            if f"{prefix}.experts.0.w1.weight" not in sanitized_weights:
-                continue
-
-            mapping = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-            for old_name, new_name in mapping.items():
-                for suffix in ("weight", "scales", "biases"):
-                    expert_keys = [
-                        f"{prefix}.experts.{expert}.{old_name}.{suffix}"
-                        for expert in range(args.num_local_experts)
-                    ]
-                    if any(k not in sanitized_weights for k in expert_keys):
-                        continue
-                    sanitized_weights[f"{prefix}.switch_mlp.{new_name}.{suffix}"] = (
-                        mx.stack([sanitized_weights.pop(k) for k in expert_keys])
-                    )
+        _sanitize_moe_weights(sanitized_weights, args)
         return sanitized_weights
 
     def make_cache(self):
