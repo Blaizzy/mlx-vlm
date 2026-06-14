@@ -91,7 +91,6 @@ def _build_sparse_causal_mask_compiled(
     sparse_topk_blocks: int,
     sparse_init_blocks: int,
     sparse_local_blocks: int,
-    num_attention_heads: int,
 ):
     B, H_idx, L, _ = idx_queries.shape
     total_len = idx_keys.shape[2]
@@ -699,7 +698,6 @@ class MiniMaxAttention(nn.Module):
                 self.sparse_topk_blocks,
                 self.sparse_init_blocks,
                 self.sparse_local_blocks,
-                self.num_attention_heads,
             )
             if return_block_indices:
                 return sparse_mask, topk_idx, topk_valid
@@ -811,11 +809,7 @@ class MiniMaxAttention(nn.Module):
     ):
         B, H_idx, L, _ = idx_queries.shape
         total_len = idx_keys.shape[2]
-        if (
-            B != 1
-            or L != 1
-            or q_start + 1 != total_len
-        ):
+        if B != 1 or L != 1 or q_start + 1 != total_len:
             return None
 
         block_size = self.sparse_block_size
@@ -1005,12 +999,7 @@ class MiniMaxAttention(nn.Module):
         B, H, L, D = queries.shape
         _, K, total_len, _ = keys.shape
         index_heads = topk_idx.shape[1]
-        if (
-            B != 1
-            or L != 1
-            or index_heads not in (1, K)
-            or H % K != 0
-        ):
+        if B != 1 or L != 1 or index_heads not in (1, K) or H % K != 0:
             return None
 
         selected_len = topk_idx.shape[-1] * self.sparse_block_size
@@ -1390,10 +1379,8 @@ class LanguageModel(nn.Module):
             hidden_sink=hidden_sink,
             position_ids=position_ids,
         )
-        if skip_logits:
-            logits = None
-        else:
-            logits = self.logits_from_hidden(out)
+
+        logits = self.logits_from_hidden(out) if skip_logits is False else None
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
