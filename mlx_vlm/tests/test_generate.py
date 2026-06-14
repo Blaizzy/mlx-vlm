@@ -816,6 +816,121 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
 
+    def test_generation_batch_extend_aligns_token_context_without_active_processor(
+        self,
+    ):
+        # A batch can carry a populated token_context while having no *active*
+        # processor: the state left behind after a guided/json-schema request
+        # (which populates token_context for the whole batch) has finished.
+        # Admitting a plain request must keep token_context aligned with uids;
+        # otherwise filter() later indexes past the end of token_context.
+        # (logits_processors=[None] is a reserved per-sequence slot with no
+        # active processor -- distinct from an empty [] processor list.)
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        leftover = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[8],
+            token_context=[[30]],
+            logits_processors=[None],
+        )
+        plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[8],
+            logits_processors=[None],
+        )
+
+        leftover.extend(plain)
+
+        assert len(leftover.token_context) == len(leftover.uids)
+        assert leftover.token_context == [[30], []]
+
+    def test_generation_batch_filter_after_processorless_extend_does_not_raise(self):
+        # Regression: extend() of a leftover-guided batch with a plain batch used
+        # to leave token_context shorter than uids when neither side had an
+        # active processor, so the next eviction raised "IndexError: list index
+        # out of range" in filter().
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        leftover = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[8],
+            token_context=[[30]],
+            logits_processors=[None],
+        )
+        plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[8],
+            logits_processors=[None],
+        )
+        leftover.extend(plain)
+
+        leftover.filter([1])
+
+        assert leftover.uids == [1]
+        assert len(leftover.token_context) == len(leftover.uids)
+
+    def test_generation_batch_repeated_processorless_extend_stays_aligned(self):
+        # Recurring continuous-batching scenario: a guided request leaves dead
+        # token_context behind, then several plain requests are admitted one
+        # after another. Every extend() must keep token_context aligned with
+        # uids so the eventual eviction does not IndexError in filter().
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+
+        def plain(uid, tok):
+            return GenerationBatch(
+                model=MagicMock(),
+                uids=[uid],
+                inputs=mx.array([tok], dtype=mx.int32),
+                prompt_cache=[],
+                sampler=sampler,
+                stop_criteria=stop_criteria,
+                max_tokens=[8],
+                logits_processors=[None],
+            )
+
+        leftover = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[8],
+            token_context=[[30]],
+            logits_processors=[None],
+        )
+
+        leftover.extend(plain(1, 6))
+        leftover.extend(plain(2, 7))
+        assert len(leftover.token_context) == len(leftover.uids) == 3
+
+        # Evict everything except the last sequence.
+        leftover.filter([2])
+        assert leftover.uids == [2]
+        assert len(leftover.token_context) == len(leftover.uids)
+
     def test_generation_batch_extend_promotes_singleton_kv_cache(self):
         def make_kv_cache(value):
             c = KVCache()
