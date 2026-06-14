@@ -422,6 +422,159 @@ def test_minimax_m3_attention_uses_position_ids_for_rope_offsets(monkeypatch):
     assert [offset.tolist() for offset in offsets] == [[4, 7], [4, 7]]
 
 
+def test_minimax_m3_attention_passes_position_ids_to_sparse_selection(monkeypatch):
+    config = _tiny_minimax_text_config(
+        num_hidden_layers=1,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1],
+            "sparse_index_dim": 4,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 1,
+            "sparse_topk_blocks": 1,
+        },
+    )
+    attention = MiniMaxAttention(config, layer_idx=0)
+    captured = {}
+
+    def fake_build_sparse_mask(
+        self,
+        idx_queries,
+        idx_keys,
+        q_start,
+        mask=None,
+        return_block_indices=False,
+        build_token_mask=True,
+        q_positions=None,
+    ):
+        del self, mask, build_token_mask
+        captured["q_start"] = q_start
+        captured["q_positions"] = q_positions
+        sparse_mask = mx.ones(
+            (idx_queries.shape[0], 1, idx_queries.shape[2], idx_keys.shape[2]),
+            dtype=mx.bool_,
+        )
+        topk_idx = mx.zeros(
+            (idx_queries.shape[0], 1, idx_queries.shape[2], 1), dtype=mx.int32
+        )
+        topk_valid = mx.ones(topk_idx.shape, dtype=mx.bool_)
+        if return_block_indices:
+            return sparse_mask, topk_idx, topk_valid
+        return sparse_mask
+
+    def fake_sdpa(queries, keys, values, cache, scale, mask):
+        del keys, values, cache, scale, mask
+        return mx.zeros_like(queries)
+
+    position_ids = mx.array([[4, 5, 6]], dtype=mx.int32)
+    monkeypatch.setattr(MiniMaxAttention, "_build_sparse_mask", fake_build_sparse_mask)
+    monkeypatch.setattr(minimax_language, "scaled_dot_product_attention", fake_sdpa)
+
+    output = attention(
+        mx.ones((1, 3, config.hidden_size), dtype=mx.float32),
+        position_ids=position_ids,
+    )
+    mx.eval(output)
+
+    assert captured["q_start"] == 0
+    assert captured["q_positions"].tolist() == position_ids.tolist()
+
+
+def test_minimax_m3_get_rope_index_offsets_left_padded_rows():
+    config = _tiny_minimax_text_config(num_hidden_layers=1)
+    language_model = LanguageModel(config)
+    input_ids = mx.array([[0, 0, 5, 6], [7, 8, 9, 10]], dtype=mx.int32)
+    attention_mask = mx.array([[0, 0, 1, 1], [1, 1, 1, 1]], dtype=mx.int32)
+
+    position_ids, rope_deltas = language_model.get_rope_index(
+        input_ids,
+        attention_mask=attention_mask,
+    )
+
+    assert position_ids.tolist() == [[-2, -1, 0, 1], [0, 1, 2, 3]]
+    assert rope_deltas.tolist() == [[0], [0]]
+
+
+def test_minimax_m3_language_model_initial_batch_prefill_uses_rope_index():
+    config = _tiny_minimax_text_config(num_hidden_layers=1)
+    language_model = LanguageModel(config)
+    captured = {}
+
+    class ModelStub:
+        def __call__(self, inputs, **kwargs):
+            captured["mask"] = kwargs["mask"]
+            captured["position_ids"] = kwargs["position_ids"]
+            return mx.zeros(
+                (inputs.shape[0], inputs.shape[1], config.hidden_size),
+                dtype=mx.float32,
+            )
+
+    object.__setattr__(language_model, "model", ModelStub())
+    cache = [MiniMaxM3BatchKVCache([2, 0])]
+    input_ids = mx.array([[0, 0, 5, 6], [7, 8, 9, 10]], dtype=mx.int32)
+
+    language_model(input_ids, cache=cache, skip_logits=True)
+    mx.eval(captured["mask"], captured["position_ids"])
+
+    assert captured["mask"].tolist() == [
+        [False, False, True, True],
+        [True, True, True, True],
+    ]
+    assert captured["position_ids"].tolist() == [[-2, -1, 0, 1], [0, 1, 2, 3]]
+    assert language_model._rope_deltas.tolist() == [[0], [0]]
+
+
+def test_minimax_m3_language_model_decode_uses_batch_cache_offsets():
+    config = _tiny_minimax_text_config(num_hidden_layers=1)
+    language_model = LanguageModel(config)
+    language_model._rope_deltas = mx.zeros((2, 1), dtype=mx.int32)
+    captured = {}
+
+    class ModelStub:
+        def __call__(self, inputs, **kwargs):
+            captured["position_ids"] = kwargs["position_ids"]
+            return mx.zeros(
+                (inputs.shape[0], inputs.shape[1], config.hidden_size),
+                dtype=mx.float32,
+            )
+
+    object.__setattr__(language_model, "model", ModelStub())
+    cache = MiniMaxM3BatchKVCache([2, 0])
+    cache.kv_cache.offset = mx.array([2, 4], dtype=mx.int32)
+    cache.kv_cache._idx = 4
+
+    language_model(
+        mx.array([[11, 12], [13, 14]], dtype=mx.int32),
+        cache=[cache],
+        skip_logits=True,
+    )
+    mx.eval(captured["position_ids"])
+
+    assert captured["position_ids"].tolist() == [[2, 3], [4, 5]]
+
+
+def test_minimax_m3_language_model_recomputes_positions_without_cache():
+    config = _tiny_minimax_text_config(num_hidden_layers=1)
+    language_model = LanguageModel(config)
+    language_model._position_ids = mx.array([[99, 100]], dtype=mx.int32)
+    language_model._rope_deltas = mx.zeros((1, 1), dtype=mx.int32)
+    captured = {}
+
+    class ModelStub:
+        def __call__(self, inputs, **kwargs):
+            captured["position_ids"] = kwargs["position_ids"]
+            return mx.zeros(
+                (inputs.shape[0], inputs.shape[1], config.hidden_size),
+                dtype=mx.float32,
+            )
+
+    object.__setattr__(language_model, "model", ModelStub())
+
+    language_model(mx.array([[3, 4]], dtype=mx.int32), skip_logits=True)
+
+    assert captured["position_ids"] is None
+
+
 def test_minimax_m3_config_uses_top_level_compression_as_vision_fallback():
     config = ModelConfig.from_dict(
         {
@@ -2364,6 +2517,94 @@ def test_minimax_m3_dense_attention_combines_integer_padding_with_causal_mask(
     ]
 
 
+def test_minimax_m3_sparse_selection_uses_explicit_query_positions_per_row():
+    config = TextConfig(
+        hidden_size=4,
+        intermediate_size=4,
+        dense_intermediate_size=4,
+        shared_intermediate_size=4,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=1,
+        num_hidden_layers=1,
+        rotary_dim=1,
+        vocab_size=8,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1],
+            "sparse_index_dim": 1,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 2,
+            "sparse_topk_blocks": 1,
+            "sparse_init_block": 0,
+            "sparse_local_block": 0,
+        },
+    )
+    attention = MiniMaxAttention(config, 0)
+    idx_queries = mx.ones((2, 1, 1, 1), dtype=mx.float32)
+    idx_keys = mx.array(
+        [
+            [[[1.0], [1.0], [100.0], [100.0]]],
+            [[[1.0], [1.0], [100.0], [100.0]]],
+        ],
+        dtype=mx.float32,
+    )
+
+    sparse_mask = attention._build_sparse_mask(
+        idx_queries,
+        idx_keys,
+        q_start=3,
+        q_positions=mx.array([[1], [3]], dtype=mx.int32),
+    )
+
+    assert sparse_mask.tolist() == [
+        [[[True, True, False, False]]],
+        [[[False, False, True, True]]],
+    ]
+
+
+def test_minimax_m3_sparse_decode_indices_use_explicit_query_position():
+    config = TextConfig(
+        hidden_size=4,
+        intermediate_size=4,
+        dense_intermediate_size=4,
+        shared_intermediate_size=4,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=1,
+        num_hidden_layers=1,
+        rotary_dim=1,
+        vocab_size=8,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1],
+            "sparse_index_dim": 1,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 2,
+            "sparse_topk_blocks": 1,
+            "sparse_init_block": 0,
+            "sparse_local_block": 0,
+        },
+    )
+    attention = MiniMaxAttention(config, 0)
+    idx_queries = mx.ones((1, 1, 1, 1), dtype=mx.float32)
+    idx_keys = mx.array(
+        [[[[1.0], [1.0], [100.0], [100.0]]]],
+        dtype=mx.float32,
+    )
+
+    topk_idx, topk_valid = attention._build_sparse_decode_indices(
+        idx_queries,
+        idx_keys,
+        q_start=3,
+        q_positions=mx.array([[1]], dtype=mx.int32),
+    )
+    mx.eval(topk_idx, topk_valid)
+
+    assert topk_idx.tolist() == [[[[0]]]]
+    assert topk_valid.tolist() == [[[[True]]]]
+
+
 def test_minimax_m3_sparse_decode_attention_matches_dense_masked_attention():
     config = TextConfig(
         hidden_size=8,
@@ -2407,6 +2648,60 @@ def test_minimax_m3_sparse_decode_attention_matches_dense_masked_attention():
     )
     compact = attention._sparse_decode_attention(
         queries, keys, values, topk_idx, topk_valid, 5
+    )
+    mx.eval(dense, compact)
+
+    assert compact is not None
+    np.testing.assert_allclose(np.array(compact), np.array(dense), rtol=1e-5)
+
+
+def test_minimax_m3_sparse_decode_attention_uses_explicit_query_position():
+    config = TextConfig(
+        hidden_size=2,
+        intermediate_size=4,
+        dense_intermediate_size=4,
+        shared_intermediate_size=4,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=2,
+        num_hidden_layers=1,
+        rotary_dim=2,
+        vocab_size=8,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1],
+            "sparse_index_dim": 1,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 2,
+            "sparse_topk_blocks": 1,
+            "sparse_init_block": 0,
+            "sparse_local_block": 0,
+        },
+    )
+    attention = MiniMaxAttention(config, 0)
+    queries = mx.array([[[[1.0, 0.0]]]], dtype=mx.float32)
+    keys = mx.array([[[[1.0, 0.0], [10.0, 0.0], [0.0, 1.0], [0.0, 1.0]]]])
+    values = mx.array([[[[1.0, 0.0], [100.0, 0.0], [0.0, 1.0], [0.0, 1.0]]]])
+    topk_idx = mx.array([[[[0]]]], dtype=mx.int32)
+    topk_valid = mx.ones(topk_idx.shape, dtype=mx.bool_)
+    dense_mask = mx.array([[[[True, False, False, False]]]])
+
+    dense = minimax_language.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=attention.scale,
+        mask=dense_mask,
+    )
+    compact = attention._sparse_decode_attention(
+        queries,
+        keys,
+        values,
+        topk_idx,
+        topk_valid,
+        q_start=3,
+        q_positions=mx.array([[0]], dtype=mx.int32),
     )
     mx.eval(dense, compact)
 

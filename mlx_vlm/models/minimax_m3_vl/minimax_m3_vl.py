@@ -245,6 +245,8 @@ class Model(nn.Module):
         cached = kwargs.get("cached_image_features", None)
         cached_video = kwargs.get("cached_video_features", None)
 
+        self.language_model._position_ids = None
+        self.language_model._rope_deltas = None
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         if (
             pixel_values is None

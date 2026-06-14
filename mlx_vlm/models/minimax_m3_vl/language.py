@@ -666,6 +666,36 @@ class MiniMaxAttention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
         )
 
+    @staticmethod
+    def _sparse_query_positions(
+        B: int,
+        L: int,
+        q_start: int,
+        q_positions: Optional[mx.array] = None,
+    ):
+        if q_positions is None:
+            positions = mx.arange(q_start, q_start + L)
+            return mx.broadcast_to(positions[None, :], (B, L))
+
+        positions = q_positions
+        if positions.ndim == 0:
+            positions = positions.reshape(1, 1)
+        elif positions.ndim == 1:
+            if positions.shape[0] == B and L == 1:
+                positions = positions[:, None]
+            else:
+                positions = positions[None, :]
+        elif positions.ndim == 3:
+            positions = positions[0]
+
+        if positions.shape[-1] != L:
+            positions = positions[..., -L:]
+        if positions.shape[0] == 1 and B != 1:
+            positions = mx.broadcast_to(positions, (B, L))
+        elif positions.shape[0] != B:
+            positions = positions.reshape(B, L)
+        return positions
+
     def _build_sparse_mask(
         self,
         idx_queries: mx.array,
@@ -674,11 +704,13 @@ class MiniMaxAttention(nn.Module):
         mask: Optional[mx.array] = None,
         return_block_indices: bool = False,
         build_token_mask: bool = True,
+        q_positions: Optional[mx.array] = None,
     ):
         B, H_idx, L, _ = idx_queries.shape
         total_len = idx_keys.shape[2]
         if (
             build_token_mask
+            and q_positions is None
             and (mask is None or isinstance(mask, str))
             and self.sparse_score_type == "max"
             and (total_len + self.sparse_block_size - 1) // self.sparse_block_size
@@ -712,10 +744,10 @@ class MiniMaxAttention(nn.Module):
         )
         scores = scores * scale
 
-        qpos = mx.arange(q_start, q_start + L)
+        qpos = self._sparse_query_positions(B, L, q_start, q_positions)
         kpos = mx.arange(total_len)
-        causal = kpos[None, :] <= qpos[:, None]
-        scores = mx.where(causal[None, None], scores, neg)
+        causal = kpos[None, None, :] <= qpos[:, :, None]
+        scores = mx.where(causal[:, None], scores, neg)
         valid = self._selection_valid_mask(mask, B, H_idx, L, total_len)
         if valid is not None:
             scores = mx.where(valid, scores, neg)
@@ -734,7 +766,7 @@ class MiniMaxAttention(nn.Module):
 
         blocks = mx.arange(num_blocks)
         cur_block = qpos // block_size
-        causal_block = blocks[None, :] <= cur_block[:, None]
+        causal_block = blocks[None, None, :] <= cur_block[:, :, None]
 
         scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
         if valid is not None:
@@ -743,7 +775,7 @@ class MiniMaxAttention(nn.Module):
                 axis=-1,
             )
         else:
-            valid_blocks = causal_block[None, None]
+            valid_blocks = causal_block[:, None]
 
         if self.sparse_score_type == "lse":
             block_scores = mx.logsumexp(scores, axis=-1)
@@ -755,19 +787,20 @@ class MiniMaxAttention(nn.Module):
             valid_blocks = valid_blocks[:, 0]
         else:
             valid_blocks = mx.any(valid_blocks, axis=1)
+        valid_blocks = valid_blocks & causal_block
 
-        init_blocks = blocks[None, :] < self.sparse_init_blocks
+        init_blocks = blocks[None, None, :] < self.sparse_init_blocks
         if self.sparse_local_blocks > 0:
             local_start = mx.maximum(cur_block - self.sparse_local_blocks + 1, 0)
-            local_blocks = (blocks[None, :] >= local_start[:, None]) & (
-                blocks[None, :] <= cur_block[:, None]
+            local_blocks = (blocks[None, None, :] >= local_start[:, :, None]) & (
+                blocks[None, None, :] <= cur_block[:, :, None]
             )
         else:
-            local_blocks = mx.zeros((L, num_blocks), dtype=mx.bool_)
+            local_blocks = mx.zeros((B, L, num_blocks), dtype=mx.bool_)
 
         selected_scores = mx.where(valid_blocks, block_scores, neg)
-        forced_init_blocks = ((init_blocks & causal_block)[None]) & valid_blocks
-        forced_local_blocks = ((local_blocks & causal_block)[None]) & valid_blocks
+        forced_init_blocks = (init_blocks & causal_block) & valid_blocks
+        forced_local_blocks = (local_blocks & causal_block) & valid_blocks
         selected_scores = mx.where(
             forced_init_blocks,
             mx.array(1e30, dtype=selected_scores.dtype),
@@ -793,7 +826,7 @@ class MiniMaxAttention(nn.Module):
         key_blocks = (kpos // block_size).astype(mx.int32)
         key_blocks = mx.broadcast_to(key_blocks[None, None, :], (B, L, total_len))
         key_selected = mx.take_along_axis(block_selected, key_blocks, axis=-1)
-        key_selected = key_selected & causal[None]
+        key_selected = key_selected & causal
 
         sparse_mask = key_selected[:, None]
         sparse_mask = self._merge_sparse_mask(sparse_mask, mask)
@@ -806,22 +839,32 @@ class MiniMaxAttention(nn.Module):
         idx_queries: mx.array,
         idx_keys: mx.array,
         q_start: int,
+        q_positions: Optional[mx.array] = None,
     ):
         B, H_idx, L, _ = idx_queries.shape
         total_len = idx_keys.shape[2]
-        if B != 1 or L != 1 or q_start + 1 != total_len:
+        if B != 1 or L != 1:
+            return None
+        explicit_positions = q_positions is not None
+        if not explicit_positions and q_start + 1 != total_len:
             return None
 
         block_size = self.sparse_block_size
         num_blocks = (total_len + block_size - 1) // block_size
         pad = num_blocks * block_size - total_len
         neg = mx.array(-float("inf"), dtype=mx.float32)
+        qpos = None
 
         scores = mx.matmul(
             idx_queries.astype(mx.float32),
             idx_keys.astype(mx.float32).swapaxes(-1, -2),
         )
         scores = scores * self.scale
+        if explicit_positions:
+            qpos = self._sparse_query_positions(B, L, q_start, q_positions)
+            kpos = mx.arange(total_len)
+            causal = kpos[None, None, None, :] <= qpos[:, None, :, None]
+            scores = mx.where(causal, scores, neg)
         if pad:
             pad_values = mx.full(
                 (*scores.shape[:-1], pad), -float("inf"), dtype=scores.dtype
@@ -837,20 +880,41 @@ class MiniMaxAttention(nn.Module):
         selected_scores = mx.where(block_scores == block_scores, block_scores, neg)
 
         blocks = mx.arange(num_blocks)
+        if explicit_positions:
+            cur_block = qpos // block_size
+            valid_blocks = blocks[None, None, None, :] <= cur_block[:, None, :, None]
+            selected_scores = mx.where(valid_blocks, selected_scores, neg)
+        else:
+            valid_blocks = None
+
         if self.sparse_init_blocks > 0:
             init_blocks = blocks < self.sparse_init_blocks
+            if valid_blocks is not None:
+                init_blocks = init_blocks[None, None, None, :] & valid_blocks
+            else:
+                init_blocks = init_blocks[None, None, None, :]
             selected_scores = mx.where(
-                init_blocks[None, None, None, :],
+                init_blocks,
                 mx.array(1e30, dtype=selected_scores.dtype),
                 selected_scores,
             )
 
         if self.sparse_local_blocks > 0:
-            cur_block = q_start // block_size
-            local_start = max(cur_block - self.sparse_local_blocks + 1, 0)
-            local_blocks = (blocks >= local_start) & (blocks <= cur_block)
+            if explicit_positions:
+                cur_block = qpos // block_size
+                local_start = mx.maximum(cur_block - self.sparse_local_blocks + 1, 0)
+                local_blocks = (
+                    blocks[None, None, None, :] >= local_start[:, None, :, None]
+                ) & (blocks[None, None, None, :] <= cur_block[:, None, :, None])
+                if valid_blocks is not None:
+                    local_blocks = local_blocks & valid_blocks
+            else:
+                cur_block = q_start // block_size
+                local_start = max(cur_block - self.sparse_local_blocks + 1, 0)
+                local_blocks = (blocks >= local_start) & (blocks <= cur_block)
+                local_blocks = local_blocks[None, None, None, :]
             selected_scores = mx.where(
-                local_blocks[None, None, None, :],
+                local_blocks,
                 mx.array(1e29, dtype=selected_scores.dtype),
                 selected_scores,
             )
@@ -859,7 +923,10 @@ class MiniMaxAttention(nn.Module):
         topk_idx = mx.argpartition(-selected_scores, kth=k_eff - 1, axis=-1)[
             ..., :k_eff
         ]
-        topk_valid = mx.ones(topk_idx.shape, dtype=mx.bool_)
+        if valid_blocks is None:
+            topk_valid = mx.ones(topk_idx.shape, dtype=mx.bool_)
+        else:
+            topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
         return topk_idx, topk_valid
 
     @staticmethod
@@ -995,6 +1062,7 @@ class MiniMaxAttention(nn.Module):
         q_start: int,
         *,
         topk_all_valid: bool = False,
+        q_positions: Optional[mx.array] = None,
     ):
         B, H, L, D = queries.shape
         _, K, total_len, _ = keys.shape
@@ -1012,7 +1080,7 @@ class MiniMaxAttention(nn.Module):
         if index_heads == 1 and K != 1:
             positions = mx.broadcast_to(positions, (B, K, L, selected_len))
 
-        if topk_all_valid and q_start + L == total_len:
+        if topk_all_valid and q_positions is None and q_start + L == total_len:
             valid = positions < total_len
             positions = mx.minimum(
                 positions, mx.array(total_len - 1, dtype=positions.dtype)
@@ -1025,11 +1093,13 @@ class MiniMaxAttention(nn.Module):
             valid = valid.reshape(B, index_heads, L, selected_len)
             if index_heads == 1 and K != 1:
                 valid = mx.broadcast_to(valid, (B, K, L, selected_len))
-            qpos = mx.arange(q_start, q_start + L, dtype=positions.dtype)
+            qpos = self._sparse_query_positions(B, L, q_start, q_positions).astype(
+                positions.dtype
+            )
             valid = (
                 valid
                 & (positions < total_len)
-                & (positions <= qpos[None, None, :, None])
+                & (positions <= qpos[:, None, :, None])
             )
             positions = mx.where(
                 valid, positions, mx.array(total_len, dtype=positions.dtype)
@@ -1071,6 +1141,7 @@ class MiniMaxAttention(nn.Module):
             else:
                 rope_offset = position_ids[0] if position_ids.ndim > 0 else position_ids
         sparse_q_start = 0 if cache is None else getattr(cache, "index_offset", offset)
+        sparse_q_positions = position_ids if position_ids is not None else None
         original_mask = mask
         use_sparse_mask = self.has_sparse_index and (
             cache is None or hasattr(cache, "update_index_and_fetch")
@@ -1116,7 +1187,7 @@ class MiniMaxAttention(nn.Module):
             if cache is not None and hasattr(cache, "update_index_and_fetch"):
                 idx_keys = cache.update_index_and_fetch(idx_keys)
             mask = self._normalize_attention_mask(
-                mask, B, L, keys.shape[2], causal=True
+                mask, B, L, keys.shape[2], causal=sparse_q_positions is None
             )
             if idx_keys.shape[2] > self.sparse_block_size * self.sparse_topk_blocks:
                 compact_candidate = self._can_use_sparse_decode_attention(
@@ -1126,7 +1197,10 @@ class MiniMaxAttention(nn.Module):
                 decode_indices = None
                 if compact_candidate and mask is None:
                     decode_indices = self._build_sparse_decode_indices(
-                        idx_queries, idx_keys, int(sparse_q_start)
+                        idx_queries,
+                        idx_keys,
+                        int(sparse_q_start),
+                        q_positions=sparse_q_positions,
                     )
                 if decode_indices is None:
                     sparse_mask, topk_idx, topk_valid = self._build_sparse_mask(
@@ -1136,6 +1210,7 @@ class MiniMaxAttention(nn.Module):
                         mask,
                         return_block_indices=True,
                         build_token_mask=not compact_candidate,
+                        q_positions=sparse_q_positions,
                     )
                 else:
                     topk_idx, topk_valid = decode_indices
@@ -1147,14 +1222,21 @@ class MiniMaxAttention(nn.Module):
                         topk_idx,
                         topk_valid,
                         int(sparse_q_start),
-                        topk_all_valid=decode_indices is not None,
+                        topk_all_valid=(
+                            decode_indices is not None and sparse_q_positions is None
+                        ),
+                        q_positions=sparse_q_positions,
                     )
                     if output is not None:
                         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
                         return self.o_proj(output)
                     if sparse_mask is None:
                         sparse_mask = self._build_sparse_mask(
-                            idx_queries, idx_keys, int(sparse_q_start), mask
+                            idx_queries,
+                            idx_keys,
+                            int(sparse_q_start),
+                            mask,
+                            q_positions=sparse_q_positions,
                         )
                 mask = sparse_mask
         else:
@@ -1349,8 +1431,86 @@ class LanguageModel(nn.Module):
         self.config = config
         self.model_type = args.model_type
         self.model = MiniMaxM3Model(args)
+        self._position_ids = None
+        self._rope_deltas = None
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def get_rope_index(
+        self,
+        input_ids: mx.array,
+        image_grid_thw: Optional[mx.array] = None,
+        video_grid_thw: Optional[mx.array] = None,
+        attention_mask: Optional[mx.array] = None,
+    ):
+        del image_grid_thw, video_grid_thw
+        batch_size, seq_length = input_ids.shape
+        positions = mx.arange(seq_length, dtype=mx.int32)
+        positions = mx.broadcast_to(positions[None, :], (batch_size, seq_length))
+
+        if attention_mask is not None:
+            seen_token = mx.cumsum(attention_mask.astype(mx.int32), axis=-1) > 0
+            left_padding = seq_length - mx.sum(
+                seen_token.astype(mx.int32), axis=-1
+            )
+            positions = positions - left_padding.astype(positions.dtype)[:, None]
+
+        rope_deltas = mx.zeros((batch_size, 1), dtype=positions.dtype)
+        return positions, rope_deltas
+
+    @staticmethod
+    def _first_cache(cache):
+        if not cache:
+            return None
+        for entry in cache:
+            if entry is not None:
+                return entry
+        return None
+
+    @staticmethod
+    def _position_ids_from_cache_offsets(
+        offsets: mx.array,
+        seq_length: int,
+    ) -> mx.array:
+        offsets = mx.maximum(offsets, 0).astype(mx.int32)
+        positions = mx.arange(seq_length, dtype=mx.int32)
+        return offsets[:, None] + positions[None, :]
+
+    @staticmethod
+    def _scalar_cache_offset(cache_offset) -> int:
+        if isinstance(cache_offset, mx.array):
+            if cache_offset.ndim == 0:
+                return int(cache_offset.item())
+            return 0
+        return int(cache_offset)
+
+    def _slice_cached_position_ids(
+        self,
+        batch_size: int,
+        seq_length: int,
+        cache_offset: int,
+    ):
+        cached = self._position_ids
+        if (
+            cached is not None
+            and cached.ndim == 2
+            and cached.shape[0] == batch_size
+            and cached.shape[-1] >= cache_offset + seq_length
+        ):
+            return cached[:, cache_offset : cache_offset + seq_length]
+        return None
+
+    @staticmethod
+    def _offset_position_ids(cache_offset, batch_size: int, seq_length: int):
+        if isinstance(cache_offset, mx.array):
+            if cache_offset.ndim > 0:
+                return LanguageModel._position_ids_from_cache_offsets(
+                    cache_offset[:batch_size], seq_length
+                )
+            cache_offset = int(cache_offset.item())
+        cache_offset = int(cache_offset)
+        base = mx.arange(cache_offset, cache_offset + seq_length, dtype=mx.int32)
+        return mx.broadcast_to(base[None, :], (batch_size, seq_length))
 
     def __call__(
         self,
@@ -1365,6 +1525,94 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         position_ids = kwargs.pop("position_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        kwargs.pop("visual_pos_masks", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        if (
+            mask is None
+            and attention_mask is not None
+            and attention_mask.shape[-1] == inputs.shape[-1]
+        ):
+            mask = attention_mask
+
+        if (
+            position_ids is None
+            and inputs.shape[0] > 1
+        ):
+            first_cache = self._first_cache(cache)
+            cache_offset = 0
+            cache_offsets = None
+            if first_cache is not None:
+                cache_offset = first_cache._idx if hasattr(first_cache, "_idx") else 0
+                offset = getattr(first_cache, "offset", None)
+                if isinstance(offset, mx.array) and offset.ndim > 0:
+                    cache_offsets = offset
+                elif offset is not None and not hasattr(first_cache, "_idx"):
+                    cache_offset = offset
+
+            scalar_cache_offset = self._scalar_cache_offset(cache_offset)
+            if mask is None and first_cache is not None and scalar_cache_offset == 0:
+                left_padding = getattr(first_cache, "left_padding", None)
+                if (
+                    isinstance(left_padding, mx.array)
+                    and left_padding.ndim > 0
+                    and left_padding.size >= inputs.shape[0]
+                ):
+                    positions = mx.arange(inputs.shape[-1], dtype=mx.int32)[None, :]
+                    mask = positions >= left_padding[: inputs.shape[0], None]
+
+            rope_mask = mask
+            if mask is not None and mask.shape[-1] != inputs.shape[-1]:
+                rope_mask = None
+            if rope_mask is not None and rope_mask.ndim != 2:
+                rope_mask = None
+
+            batch_size, seq_length = inputs.shape
+            needs_rope_index = (
+                cache is None
+                or first_cache is None
+                or self._rope_deltas is None
+                or (cache_offsets is None and scalar_cache_offset == 0)
+            )
+            if needs_rope_index:
+                position_ids = None
+                if first_cache is not None:
+                    position_ids = self._slice_cached_position_ids(
+                        batch_size, seq_length, scalar_cache_offset
+                    )
+                if position_ids is None:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        inputs,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        attention_mask=rope_mask,
+                    )
+                    self._position_ids = position_ids
+                    self._rope_deltas = rope_deltas
+                elif self._rope_deltas is None:
+                    self._rope_deltas = mx.zeros(
+                        (batch_size, 1), dtype=position_ids.dtype
+                    )
+            else:
+                rope_deltas = (
+                    rope_deltas_kw if rope_deltas_kw is not None else self._rope_deltas
+                )
+                if cache_offsets is not None:
+                    delta = mx.maximum(cache_offsets[:batch_size], 0).astype(mx.int32)
+                    if rope_deltas is not None:
+                        delta = delta + rope_deltas[:batch_size].squeeze(-1)
+                    position_ids = self._position_ids_from_cache_offsets(
+                        delta, seq_length
+                    )
+                else:
+                    delta = scalar_cache_offset
+                    if rope_deltas is not None:
+                        delta = delta + int(rope_deltas.reshape(-1)[0].item())
+                    position_ids = self._offset_position_ids(
+                        delta, batch_size, seq_length
+                    )
         hidden_sink = kwargs.pop(
             "hidden_sink",
             [] if capture_layer_ids is not None or return_hidden else None,
