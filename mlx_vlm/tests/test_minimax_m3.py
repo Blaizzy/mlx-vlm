@@ -2782,6 +2782,86 @@ def test_minimax_m3_indexer_block_mask_matches_sparse_mask():
     assert block_mask.tolist() == sparse_mask.tolist()
 
 
+def test_minimax_m3_direct_sparse_prefill_matches_sparse_masked_attention():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return
+
+    config = TextConfig(
+        hidden_size=64,
+        intermediate_size=64,
+        dense_intermediate_size=64,
+        shared_intermediate_size=64,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=32,
+        num_hidden_layers=1,
+        rotary_dim=32,
+        vocab_size=16,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1],
+            "sparse_index_dim": 32,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 2,
+            "sparse_topk_blocks": 2,
+            "sparse_init_block": 0,
+            "sparse_local_block": 0,
+        },
+    )
+    attention = MiniMaxAttention(config, 0)
+    rng = np.random.default_rng(11)
+    queries = mx.array(
+        rng.normal(size=(1, 2, 4, 32)).astype(np.float16),
+        dtype=mx.float16,
+    )
+    keys = mx.array(
+        rng.normal(size=(1, 1, 32, 32)).astype(np.float16),
+        dtype=mx.float16,
+    )
+    values = mx.array(
+        rng.normal(size=(1, 1, 32, 32)).astype(np.float16),
+        dtype=mx.float16,
+    )
+    block_indices = mx.array(
+        [[[0, 1], [0, 1], [1, 2], [2, 3]]],
+        dtype=mx.int32,
+    )
+    q_positions = mx.array([[3, 4, 5, 7]], dtype=mx.int32)
+    mask = attention.indexer.build_block_mask(
+        block_indices,
+        None,
+        keys.shape[2],
+        queries.dtype,
+        q_positions,
+    )
+
+    dense = minimax_language.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=attention.scale,
+        mask=mask,
+    )
+    sparse = attention._sparse_prefill_attention(
+        queries,
+        keys,
+        values,
+        block_indices,
+        "causal",
+        q_positions,
+    )
+    mx.eval(dense, sparse)
+
+    assert sparse is not None
+    np.testing.assert_allclose(
+        np.array(sparse),
+        np.array(dense),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
 def test_minimax_m3_decode_keeps_full_sparse_kv(monkeypatch):
     config = TextConfig(
         hidden_size=4,
