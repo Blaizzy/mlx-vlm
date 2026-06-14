@@ -517,7 +517,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     with safetensors.safe_open(weight_files[0], framework="np") as f:
         is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
-    model_class, _ = get_model_and_args(config=config)
+    model_class, model_type = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -654,6 +654,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    if is_mlx_format and model_type == "gemma4":
+        # Gemma4 MLX checkpoints may contain legacy shared-KV weights that no
+        # longer exist in the final model. Filter after quantization so the
+        # allowed set matches the parameters load_weights expects.
+        model_keys = {k for k, _ in tree_flatten(model.parameters())}
+        weights = {k: v for k, v in weights.items() if k in model_keys}
 
     model.load_weights(list(weights.items()))
 
