@@ -334,6 +334,31 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def test_server_reads_batch_coalesce_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_BATCH_COALESCE_MS", raising=False)
+    assert server.get_batch_coalesce_s() == 0.0
+
+    monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "25")
+    assert server.get_batch_coalesce_s() == pytest.approx(0.025)
+
+    monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "bad")
+    assert server.get_batch_coalesce_s() == 0.0
+
+
+def test_server_reads_prefill_batch_size_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", raising=False)
+    assert server.get_server_prefill_batch_size() == 32
+
+    monkeypatch.setenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", "16")
+    assert server.get_server_prefill_batch_size() == 16
+
+    monkeypatch.setenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", "0")
+    assert server.get_server_prefill_batch_size() == 32
+
+    monkeypatch.setenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", "bad")
+    assert server.get_server_prefill_batch_size() == 32
+
+
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     class FakeResponseGenerator:
         def __init__(self, model_path, adapter_path=None, **kwargs):
@@ -3926,6 +3951,7 @@ class TestResponseGenerator:
             ]
 
     def test_run_routes_mtp_through_batch_generator(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", raising=False)
         batch_state = {}
         draft_model = object()
 
@@ -4072,6 +4098,7 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert kwargs["prefill_batch_size"] == 32
         assert batch_state["instance"].next_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
@@ -4107,6 +4134,38 @@ class TestResponseGenerator:
         gen._run()
 
         assert calls == [(False, 0.037)]
+
+    def test_run_coalesces_idle_batch_generator_from_env(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "25")
+        calls = []
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = None
+            gen.draft_kind = None
+            gen.tokenizer = SimpleNamespace()
+
+        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
+            del idle_timeout
+            calls.append((active, coalesce_s))
+            return [], True
+
+        gen._initialize_model = fake_initialize_model
+        gen._collect_pending_requests = fake_collect_pending_requests
+
+        gen._run()
+
+        assert calls == [(False, 0.025)]
 
     def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
         created = []

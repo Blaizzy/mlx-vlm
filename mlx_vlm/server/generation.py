@@ -50,6 +50,8 @@ from .runtime import runtime
 logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_BATCH_COALESCE_MS = 0.0
+DEFAULT_SERVER_PREFILL_BATCH_SIZE = 32
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
@@ -108,6 +110,29 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def get_batch_coalesce_s():
+    raw = os.environ.get("MLX_VLM_BATCH_COALESCE_MS", str(DEFAULT_BATCH_COALESCE_MS))
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_BATCH_COALESCE_MS / 1000.0
+
+
+def get_server_prefill_batch_size() -> int:
+    raw = os.environ.get(
+        "MLX_VLM_SERVER_PREFILL_BATCH_SIZE", str(DEFAULT_SERVER_PREFILL_BATCH_SIZE)
+    )
+    try:
+        size = int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid MLX_VLM_SERVER_PREFILL_BATCH_SIZE=%r", raw)
+        return DEFAULT_SERVER_PREFILL_BATCH_SIZE
+    if size <= 0:
+        logger.warning("Ignoring non-positive MLX_VLM_SERVER_PREFILL_BATCH_SIZE=%r", raw)
+        return DEFAULT_SERVER_PREFILL_BATCH_SIZE
+    return size
 
 
 def _sequence_aligned_prefill_keys(
@@ -1300,15 +1325,13 @@ class ResponseGenerator:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
                 active_batch = bool(active)
-                coalesce_s = (
-                    get_speculative_batch_coalesce_s()
-                    if (
-                        not active_batch
-                        and self.draft_model is not None
-                        and self.draft_kind == "mtp"
-                    )
-                    else 0.0
-                )
+                coalesce_s = 0.0
+                if not active_batch:
+                    coalesce_s = get_batch_coalesce_s()
+                    if self.draft_model is not None and self.draft_kind == "mtp":
+                        coalesce_s = max(
+                            coalesce_s, get_speculative_batch_coalesce_s()
+                        )
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
                     coalesce_s=coalesce_s,
@@ -1359,6 +1382,7 @@ class ResponseGenerator:
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
+                            prefill_batch_size=get_server_prefill_batch_size(),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
