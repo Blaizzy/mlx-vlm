@@ -2,7 +2,6 @@ import math
 import sys
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.switch_layers import SwitchGLU
 from PIL import Image
@@ -75,71 +74,6 @@ def test_minimax_m3_swiglu_oai_uses_configurable_beta():
     expected = clipped_gate * mx.sigmoid(1.7 * clipped_gate) * (clipped_up + 0.25)
 
     np.testing.assert_allclose(np.array(out), np.array(expected), rtol=1e-6)
-
-
-def _quantized_linear(input_dims, output_dims):
-    linear = nn.Linear(input_dims, output_dims, bias=False)
-    quantized = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=4)
-    quantized.scales = quantized.scales.astype(mx.bfloat16)
-    quantized.biases = quantized.biases.astype(mx.bfloat16)
-    return quantized
-
-
-def test_minimax_m3_fused_quantized_decode_linears_match_separate_outputs():
-    linears = (
-        _quantized_linear(64, 32),
-        _quantized_linear(64, 16),
-        _quantized_linear(64, 24),
-    )
-    x = mx.arange(64, dtype=mx.bfloat16).reshape(1, 1, 64) / 64
-
-    separate = tuple(linear(x) for linear in linears)
-    fused = minimax_language._decode_quantized_linears_fused(linears, x)
-    mx.eval(*separate, *fused)
-
-    assert fused is not None
-    for actual, expected in zip(fused, separate):
-        np.testing.assert_allclose(
-            np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
-            rtol=1e-5,
-        )
-
-
-def test_minimax_m3_sparse_decode_fuses_main_and_index_projections(monkeypatch):
-    config = _tiny_minimax_text_config(
-        num_hidden_layers=1,
-        sparse_attention_config={
-            "use_sparse_attention": True,
-            "sparse_attention_freq": [1],
-            "sparse_index_dim": 4,
-            "sparse_num_index_heads": 1,
-            "sparse_block_size": 2,
-            "sparse_topk_blocks": 1,
-        },
-    )
-    attention = MiniMaxAttention(config, 0)
-    calls = []
-
-    def fake_fused(linears, x):
-        calls.append(len(linears))
-        if len(linears) != 5:
-            return None
-        B, L, _ = x.shape
-        return (
-            mx.zeros((B, L, config.num_attention_heads * config.head_dim)),
-            mx.zeros((B, L, config.num_key_value_heads * config.head_dim)),
-            mx.zeros((B, L, config.num_key_value_heads * config.head_dim)),
-            mx.zeros((B, L, 4)),
-            mx.zeros((B, L, 4)),
-        )
-
-    monkeypatch.setattr(minimax_language, "_decode_quantized_linears_fused", fake_fused)
-
-    out = attention(mx.ones((1, 1, config.hidden_size), dtype=mx.float32))
-    mx.eval(out)
-
-    assert calls == [5]
 
 
 def test_minimax_m3_swiglu_beta_reaches_dense_and_moe_paths():

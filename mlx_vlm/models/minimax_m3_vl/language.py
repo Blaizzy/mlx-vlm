@@ -45,59 +45,6 @@ def _is_empty_kv_state(state) -> bool:
     )
 
 
-def _decode_quantized_linears_fused(linears, x: mx.array):
-    if (
-        x.ndim != 3
-        or x.shape[1] != 1
-        or len(linears) < 2
-        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
-    ):
-        return None
-
-    first = linears[0]
-    if not all(
-        linear.bits == first.bits
-        and linear.group_size == first.group_size
-        and linear.mode == first.mode
-        and linear.biases is not None
-        and linear.scales.dtype == x.dtype
-        and linear.biases.dtype == x.dtype
-        and "bias" not in linear
-        for linear in linears
-    ):
-        return None
-
-    cache_key = tuple(
-        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
-    )
-    cached = getattr(first, "_minimax_m3_fused_decode_linears", None)
-    if cached is None or cached[0] != cache_key:
-        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
-        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
-        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
-        split_indices = []
-        offset = 0
-        for linear in linears[:-1]:
-            offset += linear.weight.shape[0]
-            split_indices.append(offset)
-        mx.eval(weights, scales, biases)
-        cached = (cache_key, weights, scales, biases, split_indices)
-        first._minimax_m3_fused_decode_linears = cached
-
-    _, weights, scales, biases, split_indices = cached
-    output = mx.quantized_matmul(
-        x,
-        weights,
-        scales=scales,
-        biases=biases,
-        transpose=True,
-        group_size=first.group_size,
-        bits=first.bits,
-        mode=first.mode,
-    )
-    return tuple(mx.split(output, split_indices, axis=-1))
-
-
 def _switch_gather_sort(x: mx.array, indices: mx.array):
     *_, num_selected = indices.shape
     indices = indices.flatten()
@@ -616,12 +563,7 @@ class MiniMaxMLP(nn.Module):
         self.act_fn = MiniMaxSwiGLUOAI(alpha, limit, beta)
 
     def __call__(self, x):
-        fused = _decode_quantized_linears_fused((self.up_proj, self.gate_proj), x)
-        if fused is None:
-            up, gate = self.up_proj(x), self.gate_proj(x)
-        else:
-            up, gate = fused
-        return self.down_proj(self.act_fn(up, gate))
+        return self.down_proj(self.act_fn(self.up_proj(x), self.gate_proj(x)))
 
 
 class MiniMaxPackedSwitchGLU(nn.Module):
@@ -1145,32 +1087,9 @@ class MiniMaxAttention(nn.Module):
             cache is None or hasattr(cache, "update_index_and_fetch")
         )
 
-        idx_queries = None
-        idx_keys = None
-        qkv_index = (
-            _decode_quantized_linears_fused(
-                (
-                    self.q_proj,
-                    self.k_proj,
-                    self.v_proj,
-                    self.index_q_proj,
-                    self.index_k_proj,
-                ),
-                x,
-            )
-            if use_sparse_mask
-            else None
-        )
-        if qkv_index is not None:
-            queries, keys, values, idx_queries, idx_keys = qkv_index
-        else:
-            qkv = _decode_quantized_linears_fused(
-                (self.q_proj, self.k_proj, self.v_proj), x
-            )
-            if qkv is None:
-                queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-            else:
-                queries, keys, values = qkv
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
         queries = queries.reshape(B, L, self.num_attention_heads, self.head_dim)
         keys = keys.reshape(B, L, self.num_key_value_heads, self.head_dim)
         values = values.reshape(B, L, self.num_key_value_heads, self.head_dim)
@@ -1180,15 +1099,8 @@ class MiniMaxAttention(nn.Module):
             keys = self.k_norm(keys)
 
         if use_sparse_mask:
-            if idx_queries is None or idx_keys is None:
-                index_qk = _decode_quantized_linears_fused(
-                    (self.index_q_proj, self.index_k_proj), x
-                )
-                if index_qk is None:
-                    idx_queries = self.index_q_proj(x)
-                    idx_keys = self.index_k_proj(x)
-                else:
-                    idx_queries, idx_keys = index_qk
+            idx_queries = self.index_q_proj(x)
+            idx_keys = self.index_k_proj(x)
             idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
             idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
             idx_queries = self.index_q_norm(idx_queries).transpose(0, 2, 1, 3)
