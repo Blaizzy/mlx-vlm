@@ -2908,7 +2908,7 @@ def test_minimax_m3_sparse_selection_prioritizes_init_before_local_blocks():
     assert sparse_mask.tolist() == [[[[True, True, False, False]]]]
 
 
-def test_minimax_m3_sparse_selection_is_per_index_head_and_gqa_group():
+def test_minimax_m3_sparse_selection_is_shared_across_attention_heads():
     config = TextConfig(
         hidden_size=4,
         intermediate_size=4,
@@ -2940,14 +2940,8 @@ def test_minimax_m3_sparse_selection_is_per_index_head_and_gqa_group():
 
     sparse_mask = attention._build_sparse_mask(idx_queries, idx_keys, 3, None)
 
-    assert sparse_mask.tolist() == [
-        [
-            [[True, True, False, False]],
-            [[True, True, False, False]],
-            [[False, False, True, True]],
-            [[False, False, True, True]],
-        ]
-    ]
+    assert sparse_mask.shape == (1, 1, 1, 4)
+    assert sparse_mask.tolist() == [[[[False, False, True, True]]]]
 
 
 def test_minimax_m3_compiled_sparse_selection_matches_generic_causal_path():

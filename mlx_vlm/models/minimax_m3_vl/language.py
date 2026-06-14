@@ -165,7 +165,7 @@ def _minimax_moe_select(
         scores = mx.softmax(gates, axis=-1, precise=True)
 
     biased_scores = scores + correction_bias
-    inds = mx.argpartition(-biased_scores, kth=k - 1, axis=-1)[..., :k].astype(mx.int32)
+    inds = mx.argpartition(-biased_scores, kth=k - 1, axis=-1)[..., :k]
     weights = mx.take_along_axis(scores, inds, axis=-1)
     weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
     return inds, weights * routed_scaling_factor
@@ -213,6 +213,7 @@ def _build_sparse_causal_mask_compiled(
 
     scores = scores.reshape(B, H_idx, L, num_blocks, block_size)
     block_scores = mx.max(scores, axis=-1)
+    block_scores = mx.max(block_scores, axis=1)
     block_scores = mx.where(block_scores == block_scores, block_scores, neg)
 
     init_blocks = blocks[None, :] < sparse_init_blocks
@@ -224,9 +225,10 @@ def _build_sparse_causal_mask_compiled(
     else:
         local_blocks = mx.zeros((L, num_blocks), dtype=mx.bool_)
 
+    valid_blocks = mx.broadcast_to(valid_blocks[:, 0], block_scores.shape)
     selected_scores = mx.where(valid_blocks, block_scores, neg)
-    forced_init_blocks = (init_blocks & causal_block)[None, None] & valid_blocks
-    forced_local_blocks = (local_blocks & causal_block)[None, None] & valid_blocks
+    forced_init_blocks = (init_blocks & causal_block)[None] & valid_blocks
+    forced_local_blocks = (local_blocks & causal_block)[None] & valid_blocks
     selected_scores = mx.where(
         forced_init_blocks,
         mx.array(1e30, dtype=selected_scores.dtype),
@@ -247,15 +249,12 @@ def _build_sparse_causal_mask_compiled(
     block_selected = block_selected & valid_blocks
 
     key_blocks = (kpos // block_size).astype(mx.int32)
-    key_blocks = mx.broadcast_to(
-        key_blocks[None, None, None, :], (B, H_idx, L, total_len)
-    )
+    key_blocks = mx.broadcast_to(key_blocks[None, None, :], (B, L, total_len))
     key_selected = mx.take_along_axis(block_selected, key_blocks, axis=-1)
-    key_selected = key_selected & causal[None, None]
+    key_selected = key_selected & causal[None]
 
-    repeat = num_attention_heads // H_idx
-    sparse_mask = mx.repeat(key_selected, repeat, axis=1)
-    return sparse_mask, topk_idx, topk_valid
+    sparse_mask = key_selected[:, None]
+    return sparse_mask, topk_idx[:, None], topk_valid[:, None]
 
 
 @partial(mx.compile, shapeless=True)
@@ -848,9 +847,12 @@ class MiniMaxAttention(nn.Module):
             block_scores = mx.logsumexp(scores, axis=-1)
         else:
             block_scores = mx.max(scores, axis=-1)
+        block_scores = mx.max(block_scores, axis=1)
         block_scores = mx.where(block_scores == block_scores, block_scores, neg)
-        if valid_blocks.shape[1] == 1 and H_idx != 1:
-            valid_blocks = mx.broadcast_to(valid_blocks, (B, H_idx, L, num_blocks))
+        if valid_blocks.shape[1] == 1:
+            valid_blocks = valid_blocks[:, 0]
+        else:
+            valid_blocks = mx.any(valid_blocks, axis=1)
 
         init_blocks = blocks[None, :] < self.sparse_init_blocks
         if self.sparse_local_blocks > 0:
@@ -862,8 +864,8 @@ class MiniMaxAttention(nn.Module):
             local_blocks = mx.zeros((L, num_blocks), dtype=mx.bool_)
 
         selected_scores = mx.where(valid_blocks, block_scores, neg)
-        forced_init_blocks = ((init_blocks & causal_block)[None, None]) & valid_blocks
-        forced_local_blocks = ((local_blocks & causal_block)[None, None]) & valid_blocks
+        forced_init_blocks = ((init_blocks & causal_block)[None]) & valid_blocks
+        forced_local_blocks = ((local_blocks & causal_block)[None]) & valid_blocks
         selected_scores = mx.where(
             forced_init_blocks,
             mx.array(1e30, dtype=selected_scores.dtype),
@@ -881,29 +883,20 @@ class MiniMaxAttention(nn.Module):
         ]
         topk_valid = mx.take_along_axis(valid_blocks, topk_idx, axis=-1)
         if not build_token_mask:
-            return None, topk_idx, topk_valid
+            return None, topk_idx[:, None], topk_valid[:, None]
 
         block_selected = mx.any(topk_idx[..., None] == blocks, axis=-2)
         block_selected = block_selected & valid_blocks
 
         key_blocks = (kpos // block_size).astype(mx.int32)
-        key_blocks = mx.broadcast_to(
-            key_blocks[None, None, None, :], (B, H_idx, L, total_len)
-        )
+        key_blocks = mx.broadcast_to(key_blocks[None, None, :], (B, L, total_len))
         key_selected = mx.take_along_axis(block_selected, key_blocks, axis=-1)
-        key_selected = key_selected & causal[None, None]
+        key_selected = key_selected & causal[None]
 
-        if self.num_attention_heads % key_selected.shape[1] != 0:
-            raise ValueError(
-                "MiniMax M3 sparse index heads must divide attention heads: "
-                f"{key_selected.shape[1]} index heads, "
-                f"{self.num_attention_heads} attention heads."
-            )
-        repeat = self.num_attention_heads // key_selected.shape[1]
-        sparse_mask = mx.repeat(key_selected, repeat, axis=1)
+        sparse_mask = key_selected[:, None]
         sparse_mask = self._merge_sparse_mask(sparse_mask, mask)
         if return_block_indices:
-            return sparse_mask, topk_idx, topk_valid
+            return sparse_mask, topk_idx[:, None], topk_valid[:, None]
         return sparse_mask
 
     def _build_sparse_decode_indices(
@@ -943,6 +936,7 @@ class MiniMaxAttention(nn.Module):
             block_scores = mx.logsumexp(scores, axis=-1)
         else:
             block_scores = mx.max(scores, axis=-1)
+        block_scores = mx.max(block_scores, axis=1, keepdims=True)
         selected_scores = mx.where(block_scores == block_scores, block_scores, neg)
 
         blocks = mx.arange(num_blocks)
@@ -1108,11 +1102,12 @@ class MiniMaxAttention(nn.Module):
     ):
         B, H, L, D = queries.shape
         _, K, total_len, _ = keys.shape
+        index_heads = topk_idx.shape[1]
         if (
             _disable_msa_sparse_decode()
             or B != 1
             or L != 1
-            or self.index_heads != K
+            or index_heads not in (1, K)
             or H % K != 0
         ):
             return None
@@ -1123,7 +1118,9 @@ class MiniMaxAttention(nn.Module):
 
         block_offsets = self._sparse_block_offsets(topk_idx.dtype)
         positions = topk_idx[..., None] * self.sparse_block_size + block_offsets
-        positions = positions.reshape(B, K, L, selected_len)
+        positions = positions.reshape(B, index_heads, L, selected_len)
+        if index_heads == 1 and K != 1:
+            positions = mx.broadcast_to(positions, (B, K, L, selected_len))
 
         if topk_all_valid and q_start + L == total_len:
             valid = positions < total_len
@@ -1135,7 +1132,9 @@ class MiniMaxAttention(nn.Module):
                 topk_valid[..., None],
                 topk_idx.shape + (self.sparse_block_size,),
             )
-            valid = valid.reshape(B, K, L, selected_len)
+            valid = valid.reshape(B, index_heads, L, selected_len)
+            if index_heads == 1 and K != 1:
+                valid = mx.broadcast_to(valid, (B, K, L, selected_len))
             qpos = mx.arange(q_start, q_start + L, dtype=positions.dtype)
             valid = (
                 valid
