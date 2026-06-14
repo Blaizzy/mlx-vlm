@@ -45,13 +45,17 @@ class Eagle3Config(BaseModelConfig):
     tie_word_embeddings: bool = False
     norm_before_residual: bool = False
     norm_before_fc: bool = False
+    fc_norm: bool = False
+    norm_output: bool = False
     embed_requires_grad: bool = False
     eagle_aux_hidden_state_layer_ids: Optional[List[int]] = None
+    num_aux_hidden_states: Optional[int] = None
     block_size: int = 5
     adaptive_max_block_size: Optional[int] = None
     verify_mode: Optional[str] = None
     target_layer_ids: List[int] = field(default_factory=list)
     capture_layer_ids: List[int] = field(default_factory=list)
+    target_layer_ids_explicit: bool = False
 
     def __post_init__(self):
         if isinstance(self.transformer_layer_config, dict):
@@ -63,6 +67,9 @@ class Eagle3Config(BaseModelConfig):
         if self.target_hidden_size is None:
             self.target_hidden_size = text.hidden_size
 
+        self.target_layer_ids_explicit = bool(
+            self.target_layer_ids or self.eagle_aux_hidden_state_layer_ids
+        )
         if not self.target_layer_ids:
             if self.eagle_aux_hidden_state_layer_ids is not None:
                 self.target_layer_ids = list(self.eagle_aux_hidden_state_layer_ids)
@@ -71,10 +78,14 @@ class Eagle3Config(BaseModelConfig):
                 self.target_layer_ids = [2, n // 2, max(n - 3, 0)]
         if not self.capture_layer_ids:
             self.capture_layer_ids = [max(int(i) - 1, 0) for i in self.target_layer_ids]
+        if self.num_aux_hidden_states is None:
+            self.num_aux_hidden_states = len(self.target_layer_ids) or 3
 
     @classmethod
     def from_dict(cls, params: dict) -> "Eagle3Config":
         flat = dict(params)
+        architectures = flat.get("architectures") or []
+        is_arch_eagle3 = any("eagle3" in str(arch).lower() for arch in architectures)
         spec_cfg = flat.get("speculators_config") or {}
         proposal_methods = spec_cfg.get("proposal_methods") or []
         if proposal_methods:
@@ -82,6 +93,14 @@ class Eagle3Config(BaseModelConfig):
             if speculative_tokens is not None:
                 flat.setdefault("block_size", int(speculative_tokens) + 2)
 
+        if "transformer_layer_config" not in flat:
+            text_sig = inspect.signature(TextConfig).parameters
+            text_config = {k: v for k, v in flat.items() if k in text_sig}
+            if text_config:
+                flat["transformer_layer_config"] = text_config
+
+        if is_arch_eagle3:
+            flat["model_type"] = "eagle3"
         if "model_type" not in flat:
             flat["model_type"] = flat.get("speculators_model_type", "eagle3")
 

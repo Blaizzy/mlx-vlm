@@ -19,6 +19,8 @@ from mlx_vlm.apc import (
     from_env,
     harvest_blocks_from_batch_cache,
     hash_image_payload,
+    hash_multimodal_payload,
+    hash_video_payload,
     make_warm_batch_exact_cache_multi,
     make_warm_batch_kv_cache,
     make_warm_batch_kv_cache_multi,
@@ -65,6 +67,21 @@ def _make_exact_row_cache(prefix_len: int):
     return [arrays, kv]
 
 
+def _make_minimax_m3_cache(prefix_len: int):
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+    cache = MiniMaxM3KVCache()
+    if prefix_len <= 0:
+        return cache
+    keys = mx.full((1, 1, prefix_len, 4), prefix_len + 1, dtype=mx.float32)
+    values = mx.full((1, 1, prefix_len, 5), prefix_len + 2, dtype=mx.float32)
+    index_keys = mx.full((1, 2, prefix_len, 3), prefix_len + 3, dtype=mx.float32)
+    cache.update_and_fetch(keys, values)
+    cache.update_index_and_fetch(index_keys)
+    mx.eval(cache.kv_cache.keys, cache.kv_cache.values, cache.index_keys)
+    return cache
+
+
 def test_hash_chain_and_image_hash_are_deterministic():
     assert _hash_tokens(0, tuple(range(16)), 0) == _hash_tokens(0, tuple(range(16)), 0)
     assert _hash_tokens(0, tuple(range(16)), 0) != _hash_tokens(0, tuple(range(16)), 42)
@@ -75,10 +92,43 @@ def test_hash_chain_and_image_hash_are_deterministic():
     assert hash_image_payload(pixel_values=zeros) != hash_image_payload(
         pixel_values=ones
     )
+    same_bytes_different_shape = mx.arange(12, dtype=mx.float32).reshape(1, 3, 2, 2)
+    reshaped = mx.arange(12, dtype=mx.float32).reshape(1, 1, 3, 4)
+    assert hash_image_payload(
+        pixel_values=same_bytes_different_shape
+    ) != hash_image_payload(pixel_values=reshaped)
     assert hash_image_payload(None, None) == 0
     assert hash_image_payload(image_ref=["a.png", "b.png"]) == hash_image_payload(
         image_ref=["a.png", "b.png"]
     )
+
+
+def test_video_and_multimodal_hashes_isolate_apc_payloads():
+    frames = mx.arange(12, dtype=mx.float32).reshape(1, 3, 2, 2)
+    same_grid = mx.array([[1, 1, 2]], dtype=mx.int32)
+    other_grid = mx.array([[1, 2, 1]], dtype=mx.int32)
+
+    video_hash = hash_video_payload(
+        pixel_values=frames,
+        video_grid_thw=same_grid,
+    )
+
+    assert video_hash == hash_video_payload(
+        pixel_values=frames,
+        video_grid_thw=same_grid,
+    )
+    assert video_hash != hash_video_payload(
+        pixel_values=frames,
+        video_grid_thw=other_grid,
+    )
+    assert hash_video_payload(None, None, None) == 0
+    assert hash_video_payload(video_ref=["a.mp4", "b.mp4"]) == hash_video_payload(
+        video_ref=["a.mp4", "b.mp4"]
+    )
+    assert hash_multimodal_payload(123, 0) == 123
+    assert hash_multimodal_payload(0, video_hash) == video_hash
+    assert hash_multimodal_payload(123, video_hash) != 123
+    assert hash_multimodal_payload(123, video_hash) != video_hash
 
 
 def test_tenant_scoped_hash_is_stable_namespaced_and_process_stable():
@@ -334,6 +384,76 @@ def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
 
     assert batch._apc_meta[0]["checkpoint_done"] is True
     assert batch._apc_manager.stats_snapshot()["exact_stores"] == 1
+
+
+def test_exact_batch_cache_merge_and_extract_supports_minimax_m3_cache():
+    from mlx_vlm.models.minimax_m3_vl.language import (
+        MiniMaxM3BatchKVCache,
+        MiniMaxM3KVCache,
+    )
+
+    warm = [_make_minimax_m3_cache(12)]
+    cold = [_make_minimax_m3_cache(0)]
+
+    batch_cache, max_prefix = make_warm_batch_exact_cache_multi(
+        [warm, cold],
+        [12, 0],
+    )
+
+    assert max_prefix == 12
+    assert batch_cache is not None
+    assert isinstance(batch_cache[0], MiniMaxM3BatchKVCache)
+    assert batch_cache[0].kv_cache.keys.shape == (2, 1, 12, 4)
+    assert batch_cache[0].kv_cache.values.shape == (2, 1, 12, 5)
+    assert batch_cache[0].index_keys.shape == (2, 2, 12, 3)
+    assert batch_cache[0].left_padding.tolist() == [0, 12]
+    assert batch_cache[0].offset.tolist() == [12, 0]
+    _assert_allclose(
+        batch_cache[0].kv_cache.keys[0:1],
+        warm[0].kv_cache.keys[..., :12, :],
+    )
+    _assert_allclose(
+        batch_cache[0].index_keys[0:1],
+        warm[0].index_keys[..., :12, :],
+    )
+    _assert_allclose(
+        batch_cache[0].kv_cache.keys[1:2],
+        mx.zeros_like(warm[0].kv_cache.keys[..., :12, :]),
+    )
+    _assert_allclose(
+        batch_cache[0].index_keys[1:2],
+        mx.zeros_like(warm[0].index_keys[..., :12, :]),
+    )
+
+    extracted = extract_prompt_cache_from_batch(batch_cache, 0)
+    assert extracted is not None
+    assert isinstance(extracted[0], MiniMaxM3KVCache)
+    _assert_allclose(extracted[0].kv_cache.keys, warm[0].kv_cache.keys[..., :12, :])
+    _assert_allclose(extracted[0].kv_cache.values, warm[0].kv_cache.values[..., :12, :])
+    _assert_allclose(extracted[0].index_keys, warm[0].index_keys[..., :12, :])
+    assert extracted[0].offset == 12
+    assert extracted[0].index_offset == 12
+
+
+def test_exact_batch_cache_merge_supports_all_cold_minimax_m3_cache():
+    from mlx_vlm.models.minimax_m3_vl.language import (
+        MiniMaxM3BatchKVCache,
+        MiniMaxM3KVCache,
+    )
+
+    batch_cache, max_prefix = make_warm_batch_exact_cache_multi(
+        [[MiniMaxM3KVCache()], [MiniMaxM3KVCache()]],
+        [0, 0],
+    )
+
+    assert max_prefix == 0
+    assert batch_cache is not None
+    assert isinstance(batch_cache[0], MiniMaxM3BatchKVCache)
+    assert batch_cache[0].empty() is True
+    assert batch_cache[0].offset.tolist() == [0, 0]
+    assert batch_cache[0].left_padding.tolist() == [0, 0]
+    assert batch_cache[0].state[0][0] is None
+    assert batch_cache[0].state[1] is None
 
 
 def test_apc_max_pool_tensors_keeps_disk_persistence(tmp_path, monkeypatch):
@@ -649,6 +769,50 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_cache_disk_restore_preserves_minimax_m3_cache(tmp_path, monkeypatch):
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
+
+    token_ids = list(range(40))
+    cache = _make_minimax_m3_cache(len(token_ids))
+
+    disk = DiskBlockStore(tmp_path, namespace="minimax-m3-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=23)
+    disk._q.join()
+    manager.close()
+
+    disk = DiskBlockStore(tmp_path, namespace="minimax-m3-exact")
+    manager = APCManager(num_blocks=1, block_size=16, disk=disk)
+    warm, matched_tokens = manager.lookup_exact_cache(
+        token_ids + [999],
+        extra_hash=23,
+    )
+
+    assert matched_tokens == len(token_ids)
+    assert warm is not None
+    assert manager.stats_snapshot()["disk_hits"] == 1
+    assert isinstance(warm[0], MiniMaxM3KVCache)
+    assert warm[0].offset == len(token_ids)
+    assert warm[0].index_offset == len(token_ids)
+    assert warm[0].kv_cache.keys.shape[2] >= len(token_ids) + 1
+    assert warm[0].index_keys.shape[2] >= len(token_ids) + 1
+    _assert_allclose(
+        warm[0].kv_cache.keys[..., : len(token_ids), :],
+        cache.kv_cache.keys[..., : len(token_ids), :],
+    )
+    _assert_allclose(
+        warm[0].kv_cache.values[..., : len(token_ids), :],
+        cache.kv_cache.values[..., : len(token_ids), :],
+    )
+    _assert_allclose(
+        warm[0].index_keys[..., : len(token_ids), :],
+        cache.index_keys[..., : len(token_ids), :],
+    )
+    manager.close()
+
+
 def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
     from mlx_lm.models.cache import KVCache, RotatingKVCache
 
@@ -694,6 +858,8 @@ def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
 def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
     from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
     assert model_apc_mode(object()) == "block"
 
     class KVOnly:
@@ -708,6 +874,10 @@ def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
         def make_cache(self):
             return [RotatingKVCache(max_size=8), KVCache()]
 
+    class MiniMaxM3:
+        def make_cache(self):
+            return [KVCache(), MiniMaxM3KVCache()]
+
     class Unsupported:
         def make_cache(self):
             return [object()]
@@ -715,6 +885,7 @@ def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
     assert model_apc_mode(KVOnly()) == "block"
     assert model_apc_mode(Mixed()) == "exact"
     assert model_apc_mode(SlidingMixed()) == "exact"
+    assert model_apc_mode(MiniMaxM3()) == "exact"
     assert model_apc_mode(Unsupported()) is None
 
 

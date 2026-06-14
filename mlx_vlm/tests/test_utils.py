@@ -11,7 +11,10 @@ import mlx.nn as nn
 import pytest
 from mlx_lm.utils import quantize_model
 
-from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.convert import (
+    _preserve_existing_deepseek_v4_quantization,
+    _save_processor_pretrained,
+)
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
@@ -500,6 +503,18 @@ def test_get_model_and_args_routes_text_only_configs():
     assert model_type == "text_only"
 
 
+def test_get_model_and_args_routes_minimax_m3_causal_architecture():
+    model_class, model_type = get_model_and_args(
+        {
+            "model_type": "minimax_m3_vl",
+            "architectures": ["MiniMaxM3SparseForCausalLM"],
+        }
+    )
+
+    assert model_class.__name__ == "mlx_vlm.models.minimax_m3"
+    assert model_type == "minimax_m3"
+
+
 def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
     with pytest.raises(ValueError):
         get_model_and_args(
@@ -534,6 +549,62 @@ def test_load_model_routes_text_models_through_existing_loader():
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
 
     assert getattr(model, "_is_text_model", False) is True
+
+
+def test_load_model_quantizes_native_text_wrapper_without_inner_model():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        quantization = {"group_size": 64, "bits": 4}
+        quantization_config = quantization
+
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeNativeTextModel(nn.Module):
+        _is_text_model = True
+
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights):
+            self.loaded_weights = weights
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig,
+        Model=FakeNativeTextModel,
+    )
+    weights = {
+        "language_model.weight": mx.zeros((64, 8), dtype=mx.uint32),
+        "language_model.scales": mx.zeros((64, 1), dtype=mx.float16),
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "minimax_m3",
+                "quantization": {"group_size": 64, "bits": 4},
+                "quantization_config": {"group_size": 64, "bits": 4},
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "minimax_m3"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert quantize.call_args.args[0] is model
 
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
@@ -689,6 +760,165 @@ def test_load_model_quantizes_projector_with_scales_when_skip_vision():
     assert selected == {"language": True, "projector": True, "vision": False}
 
 
+def test_load_model_infers_missing_mlx_affine_quantization_config():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.linear = nn.Linear(64, 64, bias=False)
+            self.linear_2 = nn.Linear(64, 32, bias=False)
+            self.gate = nn.Linear(64, 8, bias=False)
+            self.unquantized = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights):
+            self.loaded_weights = weights
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+    weights = {
+        "linear.weight": mx.zeros((64, 8), dtype=mx.uint32),
+        "linear.scales": mx.ones((64, 1)),
+        "linear.biases": mx.zeros((64, 1)),
+        "linear_2.weight": mx.zeros((32, 8), dtype=mx.uint32),
+        "linear_2.scales": mx.ones((32, 1)),
+        "linear_2.biases": mx.zeros((32, 1)),
+        "gate.weight": mx.zeros((8, 16), dtype=mx.uint32),
+        "gate.scales": mx.ones((8, 1)),
+        "gate.biases": mx.zeros((8, 1)),
+        "unquantized.weight": mx.zeros((64, 64)),
+    }
+    selected = {}
+
+    def fake_quantize(model, *args, **kwargs):
+        predicate = kwargs["class_predicate"]
+        selected["kwargs"] = kwargs
+        selected["linear"] = predicate("linear", model.linear)
+        selected["linear_2"] = predicate("linear_2", model.linear_2)
+        selected["gate"] = predicate("gate", model.gate)
+        selected["unquantized"] = predicate("unquantized", model.unquantized)
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={"model_type": "fake_vl"},
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "fake_vl"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize", side_effect=fake_quantize) as quantize,
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert selected["kwargs"]["group_size"] == 64
+    assert selected["kwargs"]["bits"] == 4
+    assert selected["kwargs"]["mode"] == "affine"
+    assert selected["linear"] is True
+    assert selected["linear_2"] is True
+    assert selected["gate"] == {"group_size": 64, "bits": 8, "mode": "affine"}
+    assert selected["unquantized"] is False
+
+
+def test_load_model_maps_mxfp8_quantization_config():
+    from mlx_vlm.models.minimax_m3_vl.config import ModelConfig as MiniMaxM3Config
+    from mlx_vlm.models.minimax_m3_vl.config import TextConfig as MiniMaxM3TextConfig
+    from mlx_vlm.models.minimax_m3_vl.config import (
+        VisionConfig as MiniMaxM3VisionConfig,
+    )
+
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeMiniMaxModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(64, 64, bias=False)
+            self.vision_tower = nn.Linear(64, 64, bias=False)
+            self.model = SimpleNamespace(
+                language_model=SimpleNamespace(
+                    model=SimpleNamespace(
+                        layers=[
+                            SimpleNamespace(
+                                block_sparse_moe=SimpleNamespace(
+                                    gate=nn.Linear(64, 64, bias=False)
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+
+        def load_weights(self, weights):
+            self.loaded_weights = weights
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=MiniMaxM3Config,
+        TextConfig=MiniMaxM3TextConfig,
+        VisionConfig=MiniMaxM3VisionConfig,
+        Model=FakeMiniMaxModel,
+    )
+    weights = {
+        "language_model.weight": mx.zeros((64, 64)),
+        "language_model.scales": mx.ones((64, 2)),
+        "vision_tower.weight": mx.zeros((64, 64)),
+        "vision_tower.scales": mx.ones((64, 2)),
+        "language_model.model.layers.0.block_sparse_moe.gate.weight": mx.zeros(
+            (64, 64)
+        ),
+        "language_model.model.layers.0.block_sparse_moe.gate.scales": mx.ones((64, 2)),
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "minimax_m3_vl",
+                "quantization_config": {
+                    "quant_method": "mxfp8",
+                    "ignored_layers": [
+                        "model.layers.0.block_sparse_moe.gate",
+                        "vision_tower",
+                    ],
+                },
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "minimax_m3_vl"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 32
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "mxfp8"
+    class_predicate = quantize.call_args.kwargs["class_predicate"]
+    assert class_predicate("language_model", model.language_model) is True
+    assert class_predicate("vision_tower", model.vision_tower) is False
+    gate = model.model.language_model.model.layers[0].block_sparse_moe.gate
+    assert (
+        class_predicate("language_model.model.layers.0.block_sparse_moe.gate", gate)
+        is False
+    )
+
+
 def test_load_delegates_adapter_loading_to_trainer_entrypoint():
     model = MagicMock()
     adapted_model = MagicMock()
@@ -713,6 +943,137 @@ def test_load_processor_propagates_auto_processor_errors():
     with patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError):
         with pytest.raises(ValueError):
             load_processor(Path("/tmp/model"), eos_token_ids=2)
+
+
+def _write_minimax_m3_local_processor_files(path: Path):
+    (path / "config.json").write_text(
+        json.dumps({"model_type": "minimax_m3_vl"}),
+        encoding="utf-8",
+    )
+    (path / "preprocessor_config.json").write_text(
+        json.dumps(
+            {
+                "auto_map": {
+                    "AutoImageProcessor": "image_processor.MiniMaxM3VLImageProcessor",
+                    "AutoVideoProcessor": "video_processor.MiniMaxM3VLVideoProcessor",
+                    "AutoProcessor": "processing_minimax.MiniMaxVLProcessor",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    for file_name in (
+        "processing_minimax.py",
+        "image_processor.py",
+        "video_processor.py",
+    ):
+        (path / file_name).write_text("", encoding="utf-8")
+
+
+def test_load_processor_trusts_local_minimax_m3_processor_code(tmp_path):
+    _write_minimax_m3_local_processor_files(tmp_path)
+    processor = SimpleNamespace()
+
+    with patch(
+        "mlx_vlm.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ) as from_pretrained:
+        result = load_processor(tmp_path, add_detokenizer=False)
+
+    assert result is processor
+    from_pretrained.assert_called_once_with(tmp_path, trust_remote_code=True)
+
+
+def test_load_processor_respects_explicit_minimax_m3_trust_remote_code(tmp_path):
+    _write_minimax_m3_local_processor_files(tmp_path)
+    processor = SimpleNamespace()
+
+    with patch(
+        "mlx_vlm.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ) as from_pretrained:
+        result = load_processor(
+            tmp_path,
+            add_detokenizer=False,
+            trust_remote_code=False,
+        )
+
+    assert result is processor
+    from_pretrained.assert_called_once_with(tmp_path, trust_remote_code=False)
+
+
+@pytest.mark.parametrize(
+    "first_error",
+    [
+        OSError("invalid processor_config.json"),
+        ValueError("invalid processor_config.json"),
+        TypeError("Object of type function is not JSON serializable"),
+    ],
+)
+def test_load_processor_ignores_invalid_minimax_m3_processor_config(
+    tmp_path, first_error
+):
+    _write_minimax_m3_local_processor_files(tmp_path)
+    (tmp_path / "processor_config.json").write_text("", encoding="utf-8")
+    processor = SimpleNamespace()
+    calls = []
+
+    def fake_from_pretrained(path, **kwargs):
+        path = Path(path)
+        calls.append((path, kwargs))
+        if len(calls) == 1:
+            raise first_error
+        assert path != tmp_path
+        assert not (path / "processor_config.json").exists()
+        assert (path / "preprocessor_config.json").exists()
+        return processor
+
+    with patch(
+        "mlx_vlm.utils.AutoProcessor.from_pretrained",
+        side_effect=fake_from_pretrained,
+    ):
+        result = load_processor(tmp_path, add_detokenizer=False)
+
+    assert result is processor
+    assert calls[0] == (tmp_path, {"trust_remote_code": True})
+    assert calls[1][1] == {"trust_remote_code": True}
+
+
+def test_save_processor_pretrained_strips_minimax_runtime_patch_attrs(tmp_path):
+    class Component:
+        def __init__(self):
+            self._mlx_vlm_m3_resize_patch = True
+            self.max_long_side_pixel = 1024
+            self.min_short_side_pixel = 112
+            self.max_total_pixels = 123
+            self.valid_kwargs = lambda: None
+            self.preprocess = lambda: None
+            self.get_number_of_image_patches = lambda: None
+
+    class Processor:
+        def __init__(self):
+            self.image_processor = Component()
+            self.video_processor = Component()
+            self.saved = False
+
+        def save_pretrained(self, save_dir):
+            for component in (self.image_processor, self.video_processor):
+                assert "_mlx_vlm_m3_resize_patch" not in component.__dict__
+                assert "valid_kwargs" not in component.__dict__
+                assert "preprocess" not in component.__dict__
+                assert "get_number_of_image_patches" not in component.__dict__
+            self.saved = True
+            return [str(Path(save_dir) / "processor_config.json")]
+
+    processor = Processor()
+    saved_files = _save_processor_pretrained(processor, tmp_path)
+
+    assert saved_files == [str(tmp_path / "processor_config.json")]
+    assert processor.saved is True
+    assert processor.image_processor._mlx_vlm_m3_resize_patch is True
+    assert processor.image_processor.max_long_side_pixel == 1024
+    assert callable(processor.image_processor.preprocess)
+    assert callable(processor.video_processor.valid_kwargs)
 
 
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():

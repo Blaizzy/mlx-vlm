@@ -39,6 +39,7 @@ class ThinkingStreamState:
 
     _DEFAULT_OPEN_CLOSE_MARKERS = (
         ("<|channel>thought", "<channel|>"),
+        ("<mm:think>", "</mm:think>"),
         ("<think>", "</think>"),
         ("<|START_THINKING|>", "<|END_THINKING|>"),
     )
@@ -267,6 +268,8 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    *,
+    assume_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
@@ -274,23 +277,32 @@ def _split_thinking(
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
     ):
-        start = text.find(start_marker)
-        end = text.find(end_marker, start if start >= 0 else 0)
-        if start >= 0 and start < end:
-            reasoning = text[start + len(start_marker) : end].strip()
-            content = _strip_content_markers(
-                text[:start] + text[end + len(end_marker) :]
-            ).strip()
-            return reasoning or None, content
+        if start_marker in text or end_marker in text:
+            start = text.find(start_marker)
+            end = text.find(end_marker)
+            if end >= 0 and start == -1:
+                leading_text = text.lstrip()
+                if leading_text.startswith(end_marker):
+                    leading_ws = len(text) - len(leading_text)
+                    content = _strip_content_markers(
+                        text[leading_ws + len(end_marker) :]
+                    ).strip()
+                    return None, content
+                if not assume_in_thinking:
+                    return None, _strip_content_markers(text).strip()
 
-        if end_marker in text:
-            reasoning, content = text.split(end_marker, 1)
-            reasoning = _clean_reasoning(reasoning, start_marker)
-            return reasoning or None, _strip_content_markers(content).strip()
-
-        if start_marker in text:
-            reasoning = _clean_reasoning(text, start_marker)
-            return reasoning or None, ""
+            if end >= 0 and (start < end or start == -1):
+                reasoning_start = 0 if start == -1 else start + len(start_marker)
+                reasoning = _clean_reasoning(text[reasoning_start:end], start_marker)
+                prefix = "" if start == -1 else text[:start]
+                content = _strip_content_markers(
+                    prefix + text[end + len(end_marker) :]
+                ).strip()
+                return reasoning or None, content
+            if start >= 0:
+                reasoning = _clean_reasoning(text[start:], start_marker)
+                content = _strip_content_markers(text[:start]).strip()
+                return reasoning or None, content
 
     return None, _strip_content_markers(text).strip()
 
@@ -303,9 +315,14 @@ def _response_output_items_from_text(
     tool_registry: Dict[str, str],
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    *,
+    assume_in_thinking: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
-        full_text, thinking_start_token, thinking_end_token
+        full_text,
+        thinking_start_token,
+        thinking_end_token,
+        assume_in_thinking=assume_in_thinking,
     )
     if tool_module is not None and chat_tools:
         tc = process_tool_calls(full_text, tool_module, chat_tools)
@@ -317,6 +334,7 @@ def _response_output_items_from_text(
                 tc.get("remaining_text") or "",
                 thinking_start_token,
                 thinking_end_token,
+                assume_in_thinking=assume_in_thinking,
             )
             remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
             return items, remaining, reasoning, "tool_calls"
@@ -380,6 +398,7 @@ def _append_response_item_to_prompt(
     item: Dict[str, Any],
     chat_messages: List[Dict[str, Any]],
     images: List[Any],
+    videos: List[Any],
 ):
     item_type = item.get("type")
     if item_type == "message":
@@ -405,6 +424,22 @@ def _append_response_item_to_prompt(
                         if isinstance(image_url, dict)
                         else image_url
                     )
+                elif part_type in ("input_video", "video"):
+                    video = (
+                        part.get("video")
+                        or part.get("video_url")
+                        or part.get("file_id")
+                    )
+                    if isinstance(video, dict):
+                        video = video.get("url") or video.get("path")
+                    if video:
+                        videos.append(video)
+                elif part_type == "video_url":
+                    video_url = part.get("video_url")
+                    if isinstance(video_url, dict):
+                        video_url = video_url.get("url") or video_url.get("path")
+                    if video_url:
+                        videos.append(video_url)
             content = "\n".join(p for p in text_parts if p)
         chat_messages.append({"role": role, "content": content or ""})
         return
@@ -466,12 +501,13 @@ def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str,
 
 def _response_items_to_chat(
     items: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Any], List[Any]]:
     chat_messages: List[Dict[str, Any]] = []
     images: List[Any] = []
+    videos: List[Any] = []
     for item in items:
-        _append_response_item_to_prompt(item, chat_messages, images)
-    return chat_messages, images
+        _append_response_item_to_prompt(item, chat_messages, images, videos)
+    return chat_messages, images, videos
 
 
 def _store_response(

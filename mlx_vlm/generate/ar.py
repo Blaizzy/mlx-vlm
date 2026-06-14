@@ -546,7 +546,30 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "token_type_ids",
 }
 
-APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash", "_apc_video_hash")
+
+
+def _config_token_id(config, name: str):
+    token_id = getattr(config, f"{name}_token_id", None)
+    if token_id is not None:
+        return token_id
+    return getattr(config, f"{name}_token_index", None)
+
+
+def _visual_token_ids(config) -> tuple:
+    return tuple(
+        token_id
+        for token_id in (
+            _config_token_id(config, "image"),
+            _config_token_id(config, "video"),
+        )
+        if token_id is not None
+    )
+
+
+def _contains_visual_token(config, token_ids: List[int]) -> bool:
+    visual_token_ids = _visual_token_ids(config)
+    return bool(visual_token_ids) and any(t in visual_token_ids for t in token_ids)
 
 
 def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
@@ -708,6 +731,11 @@ def _make_cache(
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
             return cache.BatchKVCache(left_padding)
+        elif hasattr(c, "to_batch") and hasattr(c, "update_index_and_fetch"):
+            # MiniMax M3 sparse attention caches carry a side index-key cache
+            # used for block selection. Generic quantized KV caches do not
+            # preserve that state, so keep the model-specific batch cache.
+            return c.to_batch(left_padding)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -2153,8 +2181,16 @@ class BatchGenerator:
         if img is None:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
+        vid = prompt_kwargs.get("_apc_video_hash")
+        if vid is None:
+            vid = _apc.hash_video_payload(
+                pixel_values=prompt_kwargs.get("pixel_values_videos"),
+                video_grid_thw=prompt_kwargs.get("video_grid_thw"),
+                video_ref=None,
+            )
         tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.tenant_scoped_hash(tenant, img)
+        payload_hash = _apc.hash_multimodal_payload(img, vid)
+        return _apc.tenant_scoped_hash(tenant, payload_hash)
 
     def _apc_media_token_ids(self) -> set[int]:
         return _apc.multimodal_token_ids_from_config(self.model.config)

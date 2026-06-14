@@ -12,6 +12,7 @@ from ..generate import (
     DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
+    normalize_max_long_side_pixel,
     normalize_resize_shape,
 )
 from ..generate.image import (
@@ -221,6 +222,13 @@ class ResponseInputAudioParam(TypedDict, total=False):
     input_audio: Required[InputAudio]
 
 
+class ResponseInputVideoParam(TypedDict, total=False):
+    type: Required[Literal["input_video", "video"]]
+    video: Optional[str]
+    video_url: Optional[Union[str, "ImageUrl"]]
+    file_id: Optional[str]
+
+
 class ImageUrl(TypedDict, total=False):
     url: Required[str]
 
@@ -232,6 +240,11 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+class ResponseVideoUrlParam(TypedDict, total=False):
+    type: Required[Literal["video_url"]]
+    video_url: Required[Union[str, ImageUrl]]
+
+
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
 ResponseInputContentParam: TypeAlias = Union[
@@ -239,6 +252,8 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputImageParam,
     ResponseImageUrlParam,
     ResponseInputAudioParam,
+    ResponseInputVideoParam,
+    ResponseVideoUrlParam,
 ]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
@@ -320,11 +335,25 @@ class OpenAIRequest(FlexibleBaseModel):
             "server default set by --enable-thinking is used."
         ),
     )
+    thinking_mode: Optional[Literal["enabled", "disabled", "adaptive"]] = Field(
+        None, description="Model chat template thinking mode, when supported."
+    )
+    chat_template_kwargs: Optional[dict] = Field(
+        None, description="Extra keyword arguments for the chat template."
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
     )
     thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
+    resize_shape: Optional[ResizeShapeInput] = Field(
+        None,
+        description="Resize shape for the image. Provide one integer for square or two for (height, width).",
+    )
+    max_long_side_pixel: Optional[int] = Field(
+        None,
+        description="Maximum long-side pixels for MiniMax M3 image/video preprocessing.",
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -348,6 +377,16 @@ class OpenAIRequest(FlexibleBaseModel):
     store: Optional[bool] = Field(
         True, description="Whether to store this response for later retrieval."
     )
+
+    @field_validator("resize_shape", mode="before")
+    @classmethod
+    def normalize_resize_shape_field(cls, value):
+        return normalize_resize_shape(value)
+
+    @field_validator("max_long_side_pixel", mode="before")
+    @classmethod
+    def normalize_max_long_side_pixel_field(cls, value):
+        return normalize_max_long_side_pixel(value)
 
 
 class PromptTokensDetails(BaseModel):
@@ -629,6 +668,12 @@ class VLMRequest(FlexibleBaseModel):
             "server default set by --enable-thinking is used."
         ),
     )
+    thinking_mode: Optional[Literal["enabled", "disabled", "adaptive"]] = Field(
+        None, description="Model chat template thinking mode, when supported."
+    )
+    chat_template_kwargs: Optional[dict] = Field(
+        None, description="Extra keyword arguments for the chat template."
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -650,6 +695,10 @@ class VLMRequest(FlexibleBaseModel):
         None,
         description="Resize shape for the image. Provide one integer for square or two for (height, width).",
     )
+    max_long_side_pixel: Optional[int] = Field(
+        None,
+        description="Maximum long-side pixels for MiniMax M3 image/video preprocessing.",
+    )
     response_format: Optional[Any] = Field(
         None, description="OpenAI-compatible response_format for structured outputs."
     )
@@ -658,6 +707,11 @@ class VLMRequest(FlexibleBaseModel):
     @classmethod
     def normalize_resize_shape_field(cls, value):
         return normalize_resize_shape(value)
+
+    @field_validator("max_long_side_pixel", mode="before")
+    @classmethod
+    def normalize_max_long_side_pixel_field(cls, value):
+        return normalize_max_long_side_pixel(value)
 
 
 class GenerationRequest(VLMRequest):
@@ -799,6 +853,8 @@ class AnthropicRequest(FlexibleBaseModel):
     )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = None
+    thinking_mode: Optional[Literal["enabled", "disabled", "adaptive"]] = None
+    chat_template_kwargs: Optional[dict] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None

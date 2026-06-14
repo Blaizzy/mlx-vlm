@@ -33,7 +33,6 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
-    ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -90,6 +89,7 @@ _build_gen_args = None
 _read_tenant_id = None
 _preflight_stream_context_budget = None
 _split_thinking = None
+_split_stream_thinking_delta = None
 _count_thinking_tag_tokens = None
 _make_logprob_content = None
 _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
@@ -102,6 +102,21 @@ def _runtime_cache_get(key, default=None, *, kind=None):
         return cache.get(key, default, kind=kind)
     except TypeError:
         return cache.get(key, default)
+
+
+def _video_ref_from_content_part(item):
+    if not isinstance(item, dict):
+        return None
+    item_type = item.get("type")
+    if item_type in ("input_video", "video"):
+        video = item.get("video") or item.get("video_url") or item.get("file_id")
+    elif item_type == "video_url":
+        video = item.get("video_url")
+    else:
+        return None
+    if isinstance(video, dict):
+        return video.get("url") or video.get("path") or video.get("file_id")
+    return video
 
 
 def _looks_like_audio_reference(value: str) -> bool:
@@ -188,6 +203,7 @@ def register_routes(app, deps):
     global _INHERIT_ADAPTER
     global get_cached_model, _build_gen_args, _read_tenant_id
     global _preflight_stream_context_budget, _split_thinking
+    global _split_stream_thinking_delta
     global _count_thinking_tag_tokens, _make_logprob_content
     global generate, stream_generate, apply_chat_template
     global _infer_tool_parser_from_processor, load_tool_module
@@ -203,6 +219,7 @@ def register_routes(app, deps):
     _read_tenant_id = deps.read_tenant_id
     _preflight_stream_context_budget = deps.preflight_stream_context_budget
     _split_thinking = deps.split_thinking
+    _split_stream_thinking_delta = deps.split_stream_thinking_delta
     _count_thinking_tag_tokens = deps.count_thinking_tag_tokens
     _make_logprob_content = deps.make_logprob_content
 
@@ -605,7 +622,7 @@ async def responses_input_tokens_endpoint(request: Request):
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images, videos = _response_items_to_chat(prompt_items)
         if openai_request.instructions:
             chat_messages.insert(
                 0, {"role": "system", "content": openai_request.instructions}
@@ -614,7 +631,7 @@ async def responses_input_tokens_endpoint(request: Request):
         gen_args = _build_gen_args(
             openai_request, processor, tenant_id=_read_tenant_id(request)
         )
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(config)
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
         formatted_prompt = apply_chat_template(
@@ -622,6 +639,8 @@ async def responses_input_tokens_endpoint(request: Request):
             config,
             chat_messages,
             num_images=len(images),
+            num_videos=len(videos),
+            video=videos if videos else None,
             tools=chat_tools or None,
             **template_kwargs,
         )
@@ -631,14 +650,19 @@ async def responses_input_tokens_endpoint(request: Request):
                 formatted_prompt,
                 images if images else None,
                 None,
+                videos if videos else None,
+                gen_args,
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
             raw_inputs = prepare_inputs(
                 processor,
                 images=images if images else None,
+                videos=videos if videos else None,
                 prompts=formatted_prompt,
                 image_token_index=image_token_index,
+                resize_shape=gen_args.resize_shape,
+                **gen_args.to_processor_kwargs(),
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
     except HTTPException:
@@ -765,7 +789,7 @@ async def responses_endpoint(request: Request):
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
-        chat_messages, images = _response_items_to_chat(prompt_items)
+        chat_messages, images, videos = _response_items_to_chat(prompt_items)
         instructions = openai_request.instructions
         if instructions:
             chat_messages.insert(0, {"role": "system", "content": instructions})
@@ -783,7 +807,7 @@ async def responses_endpoint(request: Request):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-        template_kwargs = gen_args.to_template_kwargs()
+        template_kwargs = gen_args.to_template_kwargs(config)
         if openai_request.tool_choice is not None:
             template_kwargs["tool_choice"] = openai_request.tool_choice
 
@@ -792,14 +816,18 @@ async def responses_endpoint(request: Request):
             config,
             chat_messages,
             num_images=len(images),
+            num_videos=len(videos),
+            video=videos if videos else None,
             tools=chat_tools or None,
             **template_kwargs,
         )
 
         logger.debug(
-            "responses request: model=%s images=%d max_tokens=%s temp=%s stream=%s",
+            "responses request: model=%s images=%d videos=%d "
+            "max_tokens=%s temp=%s stream=%s",
             openai_request.model,
             len(images),
+            len(videos),
             gen_args.max_tokens,
             gen_args.temperature,
             openai_request.stream,
@@ -822,6 +850,7 @@ async def responses_endpoint(request: Request):
                 prompt=formatted_prompt,
                 images=images if images else None,
                 audio=None,
+                videos=videos if videos else None,
                 args=gen_args,
             )
 
@@ -894,6 +923,7 @@ async def responses_endpoint(request: Request):
                             formatted_prompt,
                             images if images else None,
                             None,  # audio
+                            videos if videos else None,
                             gen_args,
                         )
                         usage_stats["input_tokens"] = ctx.prompt_tokens
@@ -936,6 +966,7 @@ async def responses_endpoint(request: Request):
                             processor=processor,
                             prompt=formatted_prompt,
                             image=images,
+                            video=videos if videos else None,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             **gen_args.to_generate_kwargs(),
@@ -973,6 +1004,7 @@ async def responses_endpoint(request: Request):
                             tool_registry,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            assume_in_thinking=bool(gen_args.enable_thinking),
                         )
                     )
                     tool_output_items = [
@@ -1048,6 +1080,7 @@ async def responses_endpoint(request: Request):
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
                         image_count=len(images),
+                        video_count=len(videos),
                         structured_output=bool(gen_args.logits_processors),
                         thinking_enabled=bool(gen_args.enable_thinking),
                     )
@@ -1135,6 +1168,7 @@ async def responses_endpoint(request: Request):
                         ctx_, ti = runtime.response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
+                            videos=videos if videos else None,
                             args=gen_args,
                         )
                         text = ""
@@ -1166,6 +1200,7 @@ async def responses_endpoint(request: Request):
                         processor=processor,
                         prompt=formatted_prompt,
                         image=images,
+                        video=videos if videos else None,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,
@@ -1190,6 +1225,7 @@ async def responses_endpoint(request: Request):
                         tool_registry,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        assume_in_thinking=bool(gen_args.enable_thinking),
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1255,6 +1291,7 @@ async def responses_endpoint(request: Request):
                     peak_memory_gb=metrics.peak_memory or None,
                     finish_reason=finish_reason,
                     image_count=len(images),
+                    video_count=len(videos),
                     structured_output=bool(gen_args.logits_processors),
                     thinking_enabled=bool(gen_args.enable_thinking),
                 )
@@ -1316,20 +1353,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         kwargs = {}
 
-        if request.resize_shape is not None:
-            if len(request.resize_shape) not in [1, 2]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="resize_shape must contain exactly two integers (height, width)",
-                )
-            kwargs["resize_shape"] = (
-                (request.resize_shape[0],) * 2
-                if len(request.resize_shape) == 1
-                else tuple(request.resize_shape)
-            )
-
         images = []
         audio = []
+        videos = []
         processed_messages = []
         for message in request.messages:
             msg = {"role": message.role}
@@ -1348,6 +1374,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             images.append(item["image_url"]["url"])
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
+                        else:
+                            video = _video_ref_from_content_part(item)
+                            if video:
+                                videos.append(video)
                 msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
@@ -1395,16 +1425,19 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            num_videos=len(videos),
+            video=videos if videos else None,
             tools=tools,
-            **gen_args.to_template_kwargs(),
+            **gen_args.to_template_kwargs(config),
         )
 
         logger.debug(
-            "chat/completions request: model=%s images=%d audio=%d "
+            "chat/completions request: model=%s images=%d audio=%d videos=%d "
             "max_tokens=%s temp=%s stream=%s",
             request.model,
             len(images),
             len(audio),
+            len(videos),
             gen_args.max_tokens,
             gen_args.temperature,
             request.stream,
@@ -1423,6 +1456,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 prompt=formatted_prompt,
                 images=images if images else None,
                 audio=audio if audio else None,
+                videos=videos if videos else None,
                 args=gen_args,
             )
 
@@ -1450,16 +1484,16 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             formatted_prompt,
                             images if images else None,
                             audio if audio else None,
+                            videos if videos else None,
                             gen_args,
                         )
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState(
-                            gen_args.enable_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
+                        # Track thinking state for reasoning/content split
+                        in_thinking = bool(gen_args.enable_thinking)
+                        accumulated = ""
+                        at_response_start = True
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -1478,12 +1512,23 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 break
                             output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
+                            accumulated += token.text
                             metrics.record_chunk(token)
 
-                            # Detect thinking boundaries
-                            thinking_delta = thinking_state.feed(token.text)
-                            delta_reasoning = thinking_delta.reasoning
-                            delta_content = thinking_delta.content
+                            (
+                                in_thinking,
+                                accumulated,
+                                at_response_start,
+                                delta_reasoning,
+                                delta_content,
+                            ) = _split_stream_thinking_delta(
+                                accumulated,
+                                token.text,
+                                in_thinking,
+                                at_response_start=at_response_start,
+                                thinking_start_token=gen_args.thinking_start_token,
+                                thinking_end_token=gen_args.thinking_end_token,
+                            )
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -1584,6 +1629,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             prompt=formatted_prompt,
                             image=images,
                             audio=audio,
+                            video=videos if videos else None,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             **gen_args.to_generate_kwargs(),
@@ -1592,16 +1638,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState(
-                            gen_args.enable_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
+                        in_thinking = bool(gen_args.enable_thinking)
+                        accumulated = ""
+                        at_response_start = True
                         for chunk in token_iterator:
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
                             output_text += chunk.text
+                            accumulated += chunk.text
                             stream_prompt_tokens = chunk.prompt_tokens
                             output_tokens = chunk.generation_tokens
                             metrics.record_chunk(chunk)
@@ -1609,14 +1654,28 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            thinking_delta = thinking_state.feed(chunk.text)
-                            if thinking_delta.content or thinking_delta.reasoning:
+                            (
+                                in_thinking,
+                                accumulated,
+                                at_response_start,
+                                delta_reasoning,
+                                delta_content,
+                            ) = _split_stream_thinking_delta(
+                                accumulated,
+                                chunk.text,
+                                in_thinking,
+                                at_response_start=at_response_start,
+                                thinking_start_token=gen_args.thinking_start_token,
+                                thinking_end_token=gen_args.thinking_end_token,
+                            )
+
+                            if delta_content is not None or delta_reasoning is not None:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
-                                            content=thinking_delta.content,
-                                            reasoning=thinking_delta.reasoning,
+                                            content=delta_content,
+                                            reasoning=delta_reasoning,
                                         )
                                     )
                                 ]
@@ -1655,6 +1714,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             metrics_text,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            assume_in_thinking=bool(gen_args.enable_thinking),
                         ),
                     )
                     envelope = _build_metrics_envelope(
@@ -1682,6 +1742,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         finish_reason=finish_reason,
                         image_count=len(images),
                         audio_count=len(audio),
+                        video_count=len(videos),
                         structured_output=bool(gen_args.logits_processors),
                         thinking_enabled=bool(gen_args.enable_thinking),
                         tool_parser=tool_parser_type,
@@ -1774,6 +1835,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             prompt=formatted_prompt,
                             images=images if images else None,
                             audio=audio if audio else None,
+                            videos=videos if videos else None,
                             args=gen_args,
                         )
                         pt = ctx.prompt_tokens
@@ -1809,6 +1871,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
+                        video=videos if videos else None,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,
@@ -1828,6 +1891,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     full_text,
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
+                    assume_in_thinking=bool(gen_args.enable_thinking),
                 )
 
                 # Count raw generated tokens minus thinking tag tokens
@@ -1835,6 +1899,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     full_text,
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
+                    assume_in_thinking=bool(gen_args.enable_thinking),
                 )
 
                 usage_stats = UsageStats.from_metrics(
@@ -1856,6 +1921,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             tc["remaining_text"] or "",
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            assume_in_thinking=bool(gen_args.enable_thinking),
                         )
                         if clean_remaining:
                             # Strip model control tokens
@@ -1951,6 +2017,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     ),
                     image_count=len(images),
                     audio_count=len(audio),
+                    video_count=len(videos),
                     structured_output=bool(gen_args.logits_processors),
                     thinking_enabled=bool(gen_args.enable_thinking),
                     tool_parser=tool_parser_type,
