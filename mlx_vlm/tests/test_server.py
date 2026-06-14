@@ -3518,7 +3518,7 @@ class TestResponseGenerator:
 
         class FakeBatchGenerator:
             def __init__(self, *args, **kwargs):
-                del args
+                batch_state["args"] = args
                 batch_state["kwargs"] = kwargs
                 self._next_uid = 1
                 self._active = {}
@@ -3593,9 +3593,10 @@ class TestResponseGenerator:
         gen._load_error = None
         gen._cancelled = set()
         gen._cancel_lock = Lock()
+        target_lm = object()
 
         def fake_initialize_model():
-            gen.model = SimpleNamespace(language_model=object())
+            gen.model = SimpleNamespace(language_model=target_lm)
             gen.processor = SimpleNamespace()
             gen.config = SimpleNamespace()
             gen.stop_tokens = set()
@@ -3640,12 +3641,22 @@ class TestResponseGenerator:
             worker.join(timeout=2)
 
         kwargs = batch_state["kwargs"]
+        assert batch_state["args"][0] is target_lm
         assert kwargs["draft_model"] is draft_model
         assert kwargs["draft_kind"] == "mtp"
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
         assert batch_state["instance"].next_active_sizes == [2]
+
+    def test_target_language_model_rejects_drafter_as_target(self):
+        draft_model = SimpleNamespace()
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.model = draft_model
+        gen.draft_model = draft_model
+
+        with pytest.raises(RuntimeError, match="server --model path"):
+            gen._target_language_model()
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
