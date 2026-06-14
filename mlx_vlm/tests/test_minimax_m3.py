@@ -106,16 +106,6 @@ def test_minimax_m3_fused_quantized_decode_linears_match_separate_outputs():
         )
 
 
-def test_minimax_m3_decode_projection_fusion_can_be_disabled(monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_DISABLE_DECODE_FUSION", "1")
-    linears = (_quantized_linear(64, 32), _quantized_linear(64, 16))
-    x = mx.ones((1, 1, 64), dtype=mx.bfloat16)
-
-    fused = minimax_language._decode_quantized_linears_fused(linears, x)
-
-    assert fused is None
-
-
 def test_minimax_m3_sparse_decode_fuses_main_and_index_projections(monkeypatch):
     config = _tiny_minimax_text_config(
         num_hidden_layers=1,
@@ -2143,8 +2133,7 @@ def test_minimax_m3_batch_cache_preserves_sparse_index_with_kv_quantization():
     assert index_keys.shape == (1, 1, 2, 4)
 
 
-def test_minimax_m3_batch_forced_msa_forward(monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_FORCE_MSA", "1")
+def test_minimax_m3_batch_sparse_msa_forward():
     config = TextConfig(
         hidden_size=16,
         intermediate_size=8,
@@ -2623,8 +2612,6 @@ def test_minimax_m3_decode_uses_compacted_sparse_kv(monkeypatch):
         return mx.zeros_like(queries)
 
     monkeypatch.setattr(minimax_language, "scaled_dot_product_attention", fake_sdpa)
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_FORCE_MSA", "1")
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_SPARSE_DECODE_MAX_DENSITY", "1.0")
 
     mx.eval(attention(mx.ones((1, 5, 4), dtype=mx.float32), cache=cache))
     mx.eval(attention(mx.ones((1, 1, 4), dtype=mx.float32), cache=cache))
@@ -2632,7 +2619,7 @@ def test_minimax_m3_decode_uses_compacted_sparse_kv(monkeypatch):
     assert key_lengths[-2:] == [5, 2]
 
 
-def test_minimax_m3_sparse_decode_compaction_respects_density_threshold(monkeypatch):
+def test_minimax_m3_sparse_decode_compaction_respects_density_threshold():
     config = TextConfig(
         hidden_size=4,
         intermediate_size=4,
@@ -2659,16 +2646,9 @@ def test_minimax_m3_sparse_decode_compaction_respects_density_threshold(monkeypa
     queries = mx.ones((1, 2, 1, 2), dtype=mx.float32)
     keys = mx.ones((1, 1, 3, 2), dtype=mx.float32)
 
-    monkeypatch.delenv("MLX_VLM_MINIMAX_M3_SPARSE_DECODE_MAX_DENSITY", raising=False)
     assert attention._can_use_sparse_decode_attention(queries, keys, None) is False
 
-    keys = mx.ones((1, 1, 6, 2), dtype=mx.float32)
-    assert attention._can_use_sparse_decode_attention(queries, keys, None) is True
-
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_SPARSE_DECODE_MAX_DENSITY", "0.25")
-    assert attention._can_use_sparse_decode_attention(queries, keys, None) is False
-
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_SPARSE_DECODE_MAX_DENSITY", "0.5")
+    keys = mx.ones((1, 1, 4, 2), dtype=mx.float32)
     assert attention._can_use_sparse_decode_attention(queries, keys, None) is True
 
 
@@ -2735,39 +2715,6 @@ def test_minimax_m3_sparse_decode_index_fastpath_matches_generic_selection():
     for generic_head, fast_head in zip(generic_idx[0], fast_idx[0]):
         assert sorted(generic_head[0]) == sorted(fast_head[0])
     assert fast[1].tolist() == generic[2].tolist()
-
-
-def test_minimax_m3_sparse_decode_index_fastpath_can_be_disabled(monkeypatch):
-    config = TextConfig(
-        hidden_size=4,
-        intermediate_size=4,
-        dense_intermediate_size=4,
-        shared_intermediate_size=4,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=2,
-        num_hidden_layers=1,
-        rotary_dim=2,
-        vocab_size=8,
-        sparse_attention_config={
-            "use_sparse_attention": True,
-            "sparse_attention_freq": [1],
-            "sparse_index_dim": 2,
-            "sparse_num_index_heads": 1,
-            "sparse_block_size": 2,
-            "sparse_topk_blocks": 1,
-        },
-    )
-    attention = MiniMaxAttention(config, 0)
-
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_DISABLE_DECODE_INDEX_FASTPATH", "1")
-    out = attention._build_sparse_decode_indices(
-        mx.ones((1, 1, 1, 2), dtype=mx.float32),
-        mx.ones((1, 1, 4, 2), dtype=mx.float32),
-        q_start=3,
-    )
-
-    assert out is None
 
 
 def test_minimax_m3_sparse_selection_ignores_nan_block_scores():
@@ -3000,65 +2947,6 @@ def test_minimax_m3_compiled_sparse_selection_matches_generic_causal_path():
     compiled_blocks = np.sort(np.array(compiled[1].tolist()), axis=-1)
     generic_blocks = np.sort(np.array(generic[1].tolist()), axis=-1)
     np.testing.assert_array_equal(compiled_blocks, generic_blocks)
-
-
-def test_minimax_m3_compiled_sparse_selection_can_be_disabled(monkeypatch):
-    config = TextConfig(
-        hidden_size=8,
-        intermediate_size=4,
-        dense_intermediate_size=4,
-        shared_intermediate_size=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=2,
-        num_hidden_layers=1,
-        rotary_dim=2,
-        vocab_size=8,
-        sparse_attention_config={
-            "use_sparse_attention": True,
-            "sparse_attention_freq": [1],
-            "sparse_index_dim": 2,
-            "sparse_num_index_heads": 2,
-            "sparse_block_size": 2,
-            "sparse_topk_blocks": 2,
-            "sparse_init_block": 0,
-            "sparse_local_block": 1,
-            "sparse_score_type": "max",
-        },
-    )
-    attention = MiniMaxAttention(config, 0)
-    idx_queries = mx.array(
-        [[[[2.0, 0.0]], [[0.0, 2.0]]]],
-        dtype=mx.float32,
-    )
-    idx_keys = mx.array(
-        [[[[3.0, 0.0], [2.0, 0.0], [0.0, 3.0], [0.0, 2.0], [1.0, 1.0], [2.0, 2.0]]]],
-        dtype=mx.float32,
-    )
-    q_start = 5
-    causal_mask = mx.ones((1, 1, 1, idx_keys.shape[2]), dtype=mx.bool_)
-    expected = attention._build_sparse_mask(
-        idx_queries, idx_keys, q_start, causal_mask, return_block_indices=True
-    )
-
-    def raise_if_called(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("compiled sparse prefill path should be disabled")
-
-    monkeypatch.setenv("MLX_VLM_MINIMAX_M3_DISABLE_COMPILED_SPARSE_PREFILL", "1")
-    monkeypatch.setattr(
-        minimax_language, "_build_sparse_causal_mask_compiled", raise_if_called
-    )
-    actual = attention._build_sparse_mask(
-        idx_queries, idx_keys, q_start, None, return_block_indices=True
-    )
-    mx.eval(*expected, *actual)
-
-    assert actual[0].tolist() == expected[0].tolist()
-    assert actual[2].tolist() == expected[2].tolist()
-    actual_blocks = np.sort(np.array(actual[1].tolist()), axis=-1)
-    expected_blocks = np.sort(np.array(expected[1].tolist()), axis=-1)
-    np.testing.assert_array_equal(actual_blocks, expected_blocks)
 
 
 def test_minimax_m3_compiled_sparse_selection_handles_batched_index_heads():

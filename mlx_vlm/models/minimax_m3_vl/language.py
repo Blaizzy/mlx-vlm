@@ -1,4 +1,3 @@
-import os
 from functools import partial
 from typing import Any, List, Optional
 
@@ -37,41 +36,6 @@ def _is_integer_mask(mask: mx.array) -> bool:
     }
 
 
-def _force_msa_mask() -> bool:
-    value = os.environ.get("MLX_VLM_MINIMAX_M3_FORCE_MSA", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _disable_msa_sparse_decode() -> bool:
-    value = os.environ.get("MLX_VLM_MINIMAX_M3_DISABLE_SPARSE_DECODE", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _disable_msa_decode_index_fastpath() -> bool:
-    value = os.environ.get("MLX_VLM_MINIMAX_M3_DISABLE_DECODE_INDEX_FASTPATH", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _disable_compiled_sparse_prefill() -> bool:
-    value = os.environ.get("MLX_VLM_MINIMAX_M3_DISABLE_COMPILED_SPARSE_PREFILL", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _disable_decode_projection_fusion() -> bool:
-    value = os.environ.get("MLX_VLM_MINIMAX_M3_DISABLE_DECODE_FUSION", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _msa_sparse_decode_max_density() -> float:
-    value = os.environ.get("MLX_VLM_MINIMAX_M3_SPARSE_DECODE_MAX_DENSITY")
-    if value is None:
-        return _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
-    try:
-        return max(0.0, min(float(value), 1.0))
-    except ValueError:
-        return _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
-
-
 def _is_empty_kv_state(state) -> bool:
     return state is None or (
         isinstance(state, (tuple, list))
@@ -83,8 +47,7 @@ def _is_empty_kv_state(state) -> bool:
 
 def _decode_quantized_linears_fused(linears, x: mx.array):
     if (
-        _disable_decode_projection_fusion()
-        or x.ndim != 3
+        x.ndim != 3
         or x.shape[1] != 1
         or len(linears) < 2
         or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
@@ -775,7 +738,6 @@ class MiniMaxAttention(nn.Module):
         total_len = idx_keys.shape[2]
         if (
             build_token_mask
-            and not _disable_compiled_sparse_prefill()
             and (mask is None or isinstance(mask, str))
             and self.sparse_score_type == "max"
             and (total_len + self.sparse_block_size - 1) // self.sparse_block_size
@@ -908,8 +870,7 @@ class MiniMaxAttention(nn.Module):
         B, H_idx, L, _ = idx_queries.shape
         total_len = idx_keys.shape[2]
         if (
-            _disable_msa_decode_index_fastpath()
-            or B != 1
+            B != 1
             or L != 1
             or q_start + 1 != total_len
         ):
@@ -1064,14 +1025,13 @@ class MiniMaxAttention(nn.Module):
         selected_len = min(self.sparse_topk_blocks, num_blocks) * self.sparse_block_size
         sparse_density = selected_len / total_len if total_len else 1.0
         return (
-            not _disable_msa_sparse_decode()
-            and original_mask is None
+            original_mask is None
             and B == 1
             and L == 1
             and self.index_heads == K
             and H % K == 0
             and selected_len < total_len
-            and sparse_density <= _msa_sparse_decode_max_density()
+            and sparse_density <= _MSA_SPARSE_DECODE_DEFAULT_MAX_DENSITY
         )
 
     def _sparse_block_offsets(self, dtype):
@@ -1104,8 +1064,7 @@ class MiniMaxAttention(nn.Module):
         _, K, total_len, _ = keys.shape
         index_heads = topk_idx.shape[1]
         if (
-            _disable_msa_sparse_decode()
-            or B != 1
+            B != 1
             or L != 1
             or index_heads not in (1, K)
             or H % K != 0
@@ -1258,10 +1217,7 @@ class MiniMaxAttention(nn.Module):
             mask = self._normalize_attention_mask(
                 mask, B, L, keys.shape[2], causal=True
             )
-            if (
-                _force_msa_mask()
-                or idx_keys.shape[2] > self.sparse_block_size * self.sparse_topk_blocks
-            ):
+            if idx_keys.shape[2] > self.sparse_block_size * self.sparse_topk_blocks:
                 compact_candidate = self._can_use_sparse_decode_attention(
                     queries, keys, original_mask
                 )
