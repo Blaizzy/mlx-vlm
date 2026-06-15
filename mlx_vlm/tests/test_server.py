@@ -1823,6 +1823,68 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
     assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
 
 
+def test_chat_completions_streaming_continues_prompt_thinking_block(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+    open_marker, close_marker = server.ThinkingStreamState().open_close_markers[-1]
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text=f"Reasoning.{close_marker}Answer.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value=f"prompt{open_marker}"
+        ),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert response.status_code == 200
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == "Reasoning."
+    assert "".join(delta.get("content") or "" for delta in deltas) == "Answer."
+    assert close_marker not in response.text
+
+
 @pytest.mark.parametrize(
     "audio_data_factory",
     [
