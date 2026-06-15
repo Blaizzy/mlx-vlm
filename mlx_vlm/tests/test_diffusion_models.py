@@ -588,6 +588,77 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_llada_unmasking_visualizes_current_block(self):
+        from mlx_vlm.models.llada2_moe import language as llada_language
+
+        mx.random.seed(0)
+        model = self._tiny_llada()
+        calls = []
+        original_visualizer = llada_language.DiffusionUnmaskingVisualizer
+
+        class FakeVisualizer:
+            def __init__(self, **kwargs):
+                self.active = True
+
+            def visualize(self, tokens, force=False):
+                calls.append((tokens.shape[1], force))
+
+            def finish(self):
+                pass
+
+        llada_language.DiffusionUnmaskingVisualizer = FakeVisualizer
+        try:
+            model.language_model.generate(
+                mx.array([[4, 5, 6, 7]], dtype=mx.int32),
+                gen_length=8,
+                block_length=4,
+                steps=1,
+                eos_early_stop=False,
+                visualize=True,
+                mask_id=127,
+                eos_id=999,
+            )
+        finally:
+            llada_language.DiffusionUnmaskingVisualizer = original_visualizer
+
+        force_lengths = [length for length, force in calls if force]
+        self.assertEqual(force_lengths, [4, 8])
+        self.assertEqual(calls[0], (4, True))
+
+    def test_unmasking_visualizer_preserves_decoded_newlines(self):
+        from mlx_vlm.models.diffusion_visualizer import DiffusionUnmaskingVisualizer
+
+        class NewlineTokenizer:
+            def decode(self, tokens, skip_special_tokens=False):
+                token = int(tokens[0])
+                if token == 5:
+                    return "\n"
+                return str(token)
+
+        visualizer = DiffusionUnmaskingVisualizer(
+            active=True,
+            mask_id=127,
+            eos_token_ids=[],
+            tokenizer=NewlineTokenizer(),
+            min_interval=0.0,
+        )
+        drawn = []
+
+        class FakeRedrawer:
+            def throttled(self):
+                return False
+
+            def draw(self, text, force=False):
+                drawn.append(text)
+
+            def finish(self):
+                pass
+
+        visualizer.redrawer = FakeRedrawer()
+        visualizer.visualize(mx.array([[4, 5, 6]], dtype=mx.int32), force=True)
+
+        self.assertEqual(drawn[-1], "4\n6")
+
     def test_diffusion_generation_family_routing(self):
         from mlx_vlm.generate.diffusion import diffusion_generation_family
 

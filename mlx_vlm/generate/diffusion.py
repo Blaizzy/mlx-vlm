@@ -4,13 +4,17 @@ import logging
 import os
 import shutil
 import time
-import unicodedata
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
+from ..models.diffusion_visualizer import (
+    clip_display_width,
+    display_width,
+    escape_carriage_returns,
+)
 from ..tokenizer_utils import make_streaming_detokenizer
 from .common import (
     GenerationResult,
@@ -25,41 +29,6 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
-
-
-def _display_width(text: str) -> int:
-    width = 0
-    for char in text:
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-    return width
-
-
-def _clip_display_width(text: str, max_width: int) -> str:
-    if max_width <= 0:
-        return ""
-
-    out = []
-    width = 0
-    clipped = False
-    for char in text:
-        if unicodedata.combining(char):
-            char_width = 0
-        else:
-            char_width = 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-        if width + char_width > max_width:
-            clipped = True
-            break
-        out.append(char)
-        width += char_width
-
-    if clipped and max_width >= 3:
-        while out and _display_width("".join(out)) > max_width - 3:
-            out.pop()
-        out.append("...")
-
-    return "".join(out)
 
 
 def _diffusion_display_limit(requested_width: Optional[int] = None) -> Optional[int]:
@@ -85,10 +54,11 @@ def _format_diffusion_draft_line(
     response: GenerationResult,
     requested_width: Optional[int] = None,
 ) -> str:
+    text = escape_carriage_returns(response.draft_text)
     width = _diffusion_display_limit(requested_width)
     if width is None:
-        return response.draft_text
-    return _clip_display_width(response.draft_text, width)
+        return text
+    return clip_display_width(text, width)
 
 
 def _print_diffusion_draft(
@@ -103,15 +73,15 @@ def _format_diffusion_live_text(
     text: str,
     requested_width: Optional[int] = None,
     *,
-    preserve_newlines: bool = False,
+    preserve_newlines: bool = True,
 ) -> str:
     width = _diffusion_display_limit(requested_width)
-    text = text.replace("\r", "\\r")
+    text = escape_carriage_returns(text)
     if not preserve_newlines:
         text = text.replace("\n", "\\n")
     if width is None:
         return text
-    return _clip_display_width(text, width)
+    return clip_display_width(text, width)
 
 
 def _print_diffusion_live_text(
@@ -136,7 +106,7 @@ def _terminal_rows_for_text(text: str, columns: Optional[int] = None) -> int:
     columns = max(1, columns)
     rows = 0
     for line in text.split("\n"):
-        width = _display_width(line)
+        width = display_width(line)
         rows += max(1, (width + columns - 1) // columns)
     return rows
 
@@ -554,8 +524,7 @@ def _decode_diffusion_masked_draft(
 
     flush_tokens()
     text = " ".join(piece for piece in pieces if piece)
-    text = text.replace("\r", "\\r").replace("\n", "\\n")
-    return text
+    return escape_carriage_returns(text)
 
 
 def stream_diffusion_generate(

@@ -37,6 +37,19 @@ class ProportionalRoPE(nn.Module):
             self._freqs = factor * (base**exponents)
         else:
             self._freqs = None
+        self.eval_cached_arrays()
+
+    @property
+    def freqs(self):
+        return self._freqs
+
+    def eager_eval_arrays(self):
+        return [] if self._freqs is None else [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset=0):
         if self.rotated_dims <= 0:
