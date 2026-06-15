@@ -302,8 +302,7 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
     }
 
     int qpos = int(q_positions[batch_idx * Q_LEN + query_idx]);
-    const device int* blocks =
-        block_indices + (batch_idx * Q_LEN + query_idx) * TOPK_BLOCKS;
+    int blocks_offset = (batch_idx * Q_LEN + query_idx) * TOPK_BLOCKS;
 
     U max_score = -3.4028234663852886e38f;
     U sum_exp_score = 0;
@@ -312,7 +311,7 @@ _MINIMAX_M3_SPARSE_PREFILL_ONE_PASS_SOURCE = r"""
          selected_idx += BN) {
         int block_slot = selected_idx / BLOCK_SIZE;
         int block_offset = selected_idx - block_slot * BLOCK_SIZE;
-        int block_idx = int(blocks[block_slot]);
+        int block_idx = int(block_indices[blocks_offset + block_slot]);
         int key_pos = block_idx * BLOCK_SIZE + block_offset;
         bool valid = block_idx >= 0 && key_pos < key_length && key_pos <= qpos;
 
