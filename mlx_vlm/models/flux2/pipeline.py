@@ -12,7 +12,6 @@ import numpy as np
 from PIL import Image
 
 from mlx_vlm.models.flux2.config import Flux2Variant, get_variant, validate_dimensions
-from mlx_vlm.models.flux2.constants import ModelConfig
 from mlx_vlm.models.flux2.download import download_model, validate_model_layout
 from mlx_vlm.models.flux2.latent import (
     pack_latents,
@@ -565,7 +564,7 @@ def _load_reference_image(
 def _reference_image_array(image: Image.Image) -> mx.array:
     array = np.asarray(image).astype(np.float32) / 127.5 - 1.0
     array = np.transpose(array, (2, 0, 1))[None, ...]
-    return mx.array(array).astype(ModelConfig.precision)
+    return mx.array(array)
 
 
 def _crop_to_even_spatial(latents: mx.array) -> mx.array:
