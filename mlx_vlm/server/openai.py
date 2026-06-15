@@ -1374,6 +1374,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
                 msg["name"] = message.name
+            if message.reasoning is not None:
+                msg["reasoning"] = message.reasoning
 
             processed_messages.append(msg)
 
