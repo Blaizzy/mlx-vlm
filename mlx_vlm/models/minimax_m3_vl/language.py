@@ -66,7 +66,6 @@ def _minimax_moe_select(
     routed_scaling_factor: float,
     scoring_func: str,
 ):
-    gates = gates.astype(mx.float32)
     if scoring_func == "sigmoid":
         scores = mx.sigmoid(gates)
     else:
@@ -520,7 +519,7 @@ class MiniMaxRMSNorm(nn.Module):
 
     def __call__(self, x):
         weight = self.weight + 1 if self.gemma else self.weight
-        return mx.fast.rms_norm(x, weight.astype(mx.float32), self.eps).astype(x.dtype)
+        return mx.fast.rms_norm(x, weight, self.eps)
 
 
 class MiniMaxM3KVCache:
