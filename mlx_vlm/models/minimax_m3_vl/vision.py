@@ -16,8 +16,11 @@ def _rotate_half(x):
 
 def _apply_vision_rope(x, freqs):
     orig_dtype = x.dtype
-    cos = mx.cos(freqs)
-    sin = mx.sin(freqs)
+    if isinstance(freqs, tuple):
+        cos, sin = freqs
+    else:
+        cos = mx.cos(freqs)
+        sin = mx.sin(freqs)
     cos = cos[None, :, None, :]
     sin = sin[None, :, None, :]
     rot_dim = cos.shape[-1]
@@ -101,14 +104,18 @@ class MiniMaxVisionAttention(nn.Module):
         k = k.transpose(1, 0, 2)[None]
         v = v.transpose(1, 0, 2)[None]
 
-        splits = [
-            mx.split(tensor, cu_seqlens[1:-1].tolist(), axis=2) for tensor in (q, k, v)
-        ]
-        outputs = [
-            ensure_fused_sdpa(q_i, k_i, v_i, self.scale)
-            for q_i, k_i, v_i in zip(*splits)
-        ]
-        output = mx.concatenate(outputs, axis=2)
+        if cu_seqlens.shape[0] <= 2:
+            output = ensure_fused_sdpa(q, k, v, self.scale)
+        else:
+            splits = [
+                mx.split(tensor, cu_seqlens[1:-1].tolist(), axis=2)
+                for tensor in (q, k, v)
+            ]
+            outputs = [
+                ensure_fused_sdpa(q_i, k_i, v_i, self.scale)
+                for q_i, k_i, v_i in zip(*splits)
+            ]
+            output = mx.concatenate(outputs, axis=2)
         output = output[0].transpose(1, 0, 2).reshape(seq_length, -1)
         return self.out_proj(output)
 
@@ -248,6 +255,7 @@ class MiniMaxVisionTransformer(nn.Module):
         )
         hidden_states = self.pre_layrnorm(hidden_states)
         rotary_pos_emb = self._rotary_pos_emb(grid_thw)
+        rotary_pos_emb = (mx.cos(rotary_pos_emb), mx.sin(rotary_pos_emb))
 
         seqlens = [int(t * h * w) for t, h, w in self._segment_grid_thw(grid_thw)]
         cu_seqlens = mx.array([0] + list(accumulate(seqlens)), dtype=mx.int32)
