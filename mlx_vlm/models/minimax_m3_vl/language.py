@@ -43,6 +43,32 @@ def _is_empty_kv_state(state) -> bool:
     )
 
 
+def _can_skip_uniform_batch_decode_mask(cache, seq_length: int) -> bool:
+    if seq_length != 1 or cache is None:
+        return False
+
+    if isinstance(cache, (list, tuple)):
+        return any(
+            _can_skip_uniform_batch_decode_mask(entry, seq_length)
+            for entry in cache
+            if entry is not None
+        )
+
+    nested = getattr(cache, "caches", None)
+    if nested is not None:
+        return _can_skip_uniform_batch_decode_mask(nested, seq_length)
+
+    can_skip_decode_mask = getattr(cache, "can_skip_decode_mask", None)
+    if callable(can_skip_decode_mask):
+        return bool(can_skip_decode_mask(seq_length))
+
+    kv_cache = getattr(cache, "kv_cache", None)
+    if kv_cache is not None and kv_cache is not cache:
+        return _can_skip_uniform_batch_decode_mask(kv_cache, seq_length)
+
+    return False
+
+
 def _switch_gather_sort(x: mx.array, indices: mx.array):
     *_, num_selected = indices.shape
     indices = indices.flatten()
@@ -480,7 +506,6 @@ def _minimax_m3_sparse_prefill_attention(
         output_dtypes=[queries.dtype],
     )[0]
 
-
 @partial(mx.compile, shapeless=True)
 def _swiglu_oai(
     x_linear,
@@ -656,6 +681,16 @@ class MiniMaxM3BatchKVCache:
         self.kv_cache = BatchKVCache(left_padding)
         self.index_keys = None
         self.index_offset = 0
+        self._can_skip_decode_mask = self._all_zero_padding(left_padding)
+
+    @staticmethod
+    def _all_zero_padding(padding) -> bool:
+        if isinstance(padding, mx.array):
+            return False
+        try:
+            return all(int(value) == 0 for value in padding)
+        except TypeError:
+            return False
 
     @property
     def offset(self):
@@ -692,17 +727,38 @@ class MiniMaxM3BatchKVCache:
         return self.index_keys[..., : self.index_offset, :]
 
     def prepare(self, **kwargs):
+        left_padding = kwargs.get("left_padding")
+        right_padding = kwargs.get("right_padding")
+        if (
+            left_padding is not None
+            and not self._all_zero_padding(left_padding)
+        ) or (
+            right_padding is not None
+            and not self._all_zero_padding(right_padding)
+        ):
+            self._can_skip_decode_mask = False
         self.kv_cache.prepare(**kwargs)
 
     def finalize(self):
         right_padding = getattr(self.kv_cache, "_right_padding", None)
+        if right_padding is not None:
+            self._can_skip_decode_mask = False
         self.kv_cache.finalize()
         if right_padding is not None and self.index_keys is not None:
             self.index_keys = dynamic_roll(
                 self.index_keys, right_padding[:, None], axis=2
             )
 
+    def can_skip_decode_mask(self, N: int) -> bool:
+        return (
+            N == 1
+            and self._can_skip_decode_mask
+            and getattr(self.kv_cache, "_right_padding", None) is None
+        )
+
     def make_mask(self, *args, **kwargs):
+        if args and self.can_skip_decode_mask(int(args[0])):
+            return None
         return self.kv_cache.make_mask(*args, **kwargs)
 
     def filter(self, batch_indices):
@@ -717,7 +773,13 @@ class MiniMaxM3BatchKVCache:
     def extend(self, other):
         if not isinstance(other, MiniMaxM3BatchKVCache):
             raise TypeError(f"Cannot extend MiniMaxM3BatchKVCache with {type(other)}")
+        can_skip_decode_mask = (
+            self._can_skip_decode_mask
+            and other._can_skip_decode_mask
+            and self.kv_cache._idx == other.kv_cache._idx
+        )
         self.kv_cache.extend(other.kv_cache)
+        self._can_skip_decode_mask = can_skip_decode_mask
         self._extend_index_keys(other)
 
     def _extend_index_keys(self, other):
@@ -767,6 +829,11 @@ class MiniMaxM3BatchKVCache:
             return out
 
         out.kv_cache = BatchKVCache.merge([cache.kv_cache for cache in caches])
+        lengths = [cache.kv_cache.size() for cache in caches]
+        out._can_skip_decode_mask = (
+            len(set(lengths)) == 1
+            and all(getattr(cache, "_can_skip_decode_mask", True) for cache in caches)
+        )
         index_states = [
             (
                 None
@@ -839,10 +906,12 @@ class MiniMaxM3BatchKVCache:
         if _is_empty_kv_state(kv_state):
             left_padding = [0] if kv_state is None or len(kv_state) < 4 else kv_state[3]
             self.kv_cache = BatchKVCache(left_padding)
+            self._can_skip_decode_mask = self._all_zero_padding(left_padding)
             if kv_state is not None and len(kv_state) >= 3 and kv_state[2] is not None:
                 self.kv_cache.offset = kv_state[2]
         else:
             self.kv_cache.state = kv_state
+            self._can_skip_decode_mask = False
         self.index_keys = index_state
         self.index_offset = 0 if index_state is None else index_state.shape[2]
 
@@ -899,7 +968,7 @@ class MiniMaxPackedSwitchGLU(nn.Module):
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= 6
         idx = indices
         inv_order = None
         if do_sort:
@@ -1263,6 +1332,92 @@ class MiniMaxAttention(nn.Module):
             self.sparse_block_size,
         )
 
+    def _sparse_decode_attention(
+        self,
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        block_indices: mx.array,
+        mask: Optional[mx.array],
+        q_positions: mx.array,
+    ):
+        if (
+            queries.shape[2] != 1
+            or block_indices.shape[1] != 1
+            or q_positions.shape[1] != 1
+            or keys.shape != values.shape
+        ):
+            return None
+
+        B, _, _, _ = queries.shape
+        key_length = keys.shape[2]
+        selected_length = block_indices.shape[-1] * self.sparse_block_size
+        has_explicit_mask = mask is not None and not isinstance(mask, str)
+        # Dense SDPA is still faster before these measured crossover points.
+        min_sparse_length = selected_length * (16 if has_explicit_mask else 64)
+        if selected_length >= key_length or key_length < min_sparse_length:
+            return None
+
+        if not has_explicit_mask:
+            output = _minimax_m3_sparse_prefill_attention(
+                queries,
+                keys,
+                values,
+                block_indices,
+                q_positions,
+                self.scale,
+                self.sparse_block_size,
+            )
+            if output is not None:
+                return output
+
+        block_indices = block_indices.astype(mx.int32)
+        offsets = mx.arange(self.sparse_block_size, dtype=mx.int32)
+        token_indices = block_indices[..., None] * self.sparse_block_size + offsets
+        valid = (
+            (block_indices[..., None] >= 0)
+            & (token_indices < key_length)
+            & (token_indices <= q_positions[..., None, None].astype(mx.int32))
+        )
+
+        token_indices = token_indices.reshape(B, 1, selected_length)
+        valid = valid.reshape(B, 1, selected_length)
+        safe_indices = mx.where(valid, token_indices, mx.zeros_like(token_indices))
+
+        gather_indices = mx.broadcast_to(
+            safe_indices[:, None, 0, :, None],
+            (B, keys.shape[1], selected_length, keys.shape[3]),
+        )
+        compact_keys = mx.take_along_axis(keys, gather_indices, axis=2)
+        compact_values = mx.take_along_axis(values, gather_indices, axis=2)
+
+        compact_mask = valid[:, None]
+        if mask is not None and not isinstance(mask, str):
+            mask = self._normalize_attention_mask(mask, B, 1, key_length)
+            mask_indices = mx.broadcast_to(
+                safe_indices[:, None, :, :],
+                (*mask.shape[:-1], selected_length),
+            )
+            gathered_mask = mx.take_along_axis(mask, mask_indices, axis=-1)
+            if _is_bool_mask(gathered_mask):
+                compact_mask = compact_mask & gathered_mask
+            else:
+                sparse_bias = mx.where(
+                    compact_mask,
+                    mx.array(0.0, dtype=gathered_mask.dtype),
+                    mx.array(-float("inf"), dtype=gathered_mask.dtype),
+                )
+                compact_mask = sparse_bias + gathered_mask
+
+        return scaled_dot_product_attention(
+            queries,
+            compact_keys,
+            compact_values,
+            cache=None,
+            scale=self.scale,
+            mask=compact_mask,
+        )
+
     def __call__(
         self,
         x: mx.array,
@@ -1329,6 +1484,17 @@ class MiniMaxAttention(nn.Module):
             )
             if block_indices is not None:
                 output = self._sparse_prefill_attention(
+                    queries,
+                    keys,
+                    values,
+                    block_indices,
+                    mask,
+                    q_positions,
+                )
+                if output is not None:
+                    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                    return self.o_proj(output)
+                output = self._sparse_decode_attention(
                     queries,
                     keys,
                     values,
@@ -1714,9 +1880,9 @@ class MiniMaxM3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         if mask is None:
-            mask = create_attention_mask(
-                h, cache[0] if cache and cache[0] is not None else cache
-            )
+            first_cache = cache[0] if cache and cache[0] is not None else cache
+            if not _can_skip_uniform_batch_decode_mask(cache, h.shape[1]):
+                mask = create_attention_mask(h, first_cache)
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for idx, (layer, c) in enumerate(zip(self.layers, cache)):
@@ -1843,11 +2009,17 @@ class LanguageModel(nn.Module):
         ):
             mask = attention_mask
 
-        if (
+        first_cache = self._first_cache(cache)
+        can_skip_batch_positions = (
             position_ids is None
             and inputs.shape[0] > 1
-        ):
-            first_cache = self._first_cache(cache)
+            and mask is None
+            and attention_mask is None
+            and first_cache is not None
+            and _can_skip_uniform_batch_decode_mask(cache, inputs.shape[-1])
+        )
+
+        if position_ids is None and inputs.shape[0] > 1 and not can_skip_batch_positions:
             cache_offset = 0
             cache_offsets = None
             if first_cache is not None:
@@ -1949,6 +2121,9 @@ class LanguageModel(nn.Module):
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
         return self.logits_from_hidden(self.model.norm(hidden))
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
 
     def rollback_speculative_cache(
         self,

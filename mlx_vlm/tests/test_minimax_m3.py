@@ -2312,6 +2312,88 @@ def test_minimax_m3_batch_cache_preserves_sparse_index_with_kv_quantization():
     assert index_keys.shape == (1, 1, 2, 4)
 
 
+def test_minimax_m3_uniform_batch_cache_skips_decode_mask():
+    cache = MiniMaxM3BatchKVCache([0, 0])
+    generic_cache = minimax_language.BatchKVCache([0, 0])
+
+    assert cache.make_mask(1) is None
+    assert cache.make_mask(2) is not None
+    assert not minimax_language._can_skip_uniform_batch_decode_mask(generic_cache, 1)
+    assert minimax_language._can_skip_uniform_batch_decode_mask(
+        [generic_cache, cache], 1
+    )
+    assert not minimax_language._can_skip_uniform_batch_decode_mask(generic_cache, 2)
+    assert MiniMaxM3BatchKVCache([1, 0]).make_mask(1) is not None
+    assert not minimax_language._can_skip_uniform_batch_decode_mask(
+        [minimax_language.BatchKVCache([1, 0]), MiniMaxM3BatchKVCache([1, 0])],
+        1,
+    )
+
+
+def test_minimax_m3_uniform_batch_decode_skips_position_ids(monkeypatch):
+    config = _tiny_minimax_text_config(num_hidden_layers=1)
+    lm = LanguageModel(config)
+    cache = [
+        minimax_language.BatchKVCache([0, 0]),
+        MiniMaxM3BatchKVCache([0, 0]),
+    ]
+    captured = {}
+
+    def fake_model_call(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        capture_layer_ids=None,
+        hidden_sink=None,
+        position_ids=None,
+    ):
+        del self, inputs_embeds, cache, capture_layer_ids, hidden_sink
+        captured["mask"] = mask
+        captured["position_ids"] = position_ids
+        return mx.zeros((inputs.shape[0], inputs.shape[1], config.hidden_size))
+
+    monkeypatch.setattr(minimax_language.MiniMaxM3Model, "__call__", fake_model_call)
+
+    lm(mx.ones((2, 1), dtype=mx.int32), cache=cache, skip_logits=True)
+
+    assert captured["mask"] is None
+    assert captured["position_ids"] is None
+
+
+def test_minimax_m3_left_padded_batch_decode_keeps_position_ids(monkeypatch):
+    config = _tiny_minimax_text_config(num_hidden_layers=1)
+    lm = LanguageModel(config)
+    cache = [
+        minimax_language.BatchKVCache([1, 0]),
+        MiniMaxM3BatchKVCache([1, 0]),
+    ]
+    captured = {}
+
+    def fake_model_call(
+        self,
+        inputs,
+        inputs_embeds=None,
+        mask=None,
+        cache=None,
+        capture_layer_ids=None,
+        hidden_sink=None,
+        position_ids=None,
+    ):
+        del self, inputs_embeds, cache, capture_layer_ids, hidden_sink
+        captured["mask"] = mask
+        captured["position_ids"] = position_ids
+        return mx.zeros((inputs.shape[0], inputs.shape[1], config.hidden_size))
+
+    monkeypatch.setattr(minimax_language.MiniMaxM3Model, "__call__", fake_model_call)
+
+    lm(mx.ones((2, 1), dtype=mx.int32), cache=cache, skip_logits=True)
+
+    assert captured["mask"] is not None
+    assert captured["position_ids"] is not None
+
+
 def test_minimax_m3_batch_sparse_msa_forward():
     config = TextConfig(
         hidden_size=16,
@@ -2862,7 +2944,84 @@ def test_minimax_m3_direct_sparse_prefill_matches_sparse_masked_attention():
     )
 
 
-def test_minimax_m3_decode_keeps_full_sparse_kv(monkeypatch):
+def test_minimax_m3_direct_sparse_decode_matches_sparse_masked_attention():
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return
+
+    config = TextConfig(
+        hidden_size=128,
+        intermediate_size=64,
+        dense_intermediate_size=64,
+        shared_intermediate_size=64,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        num_hidden_layers=1,
+        rotary_dim=32,
+        vocab_size=16,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_attention_freq": [1],
+            "sparse_index_dim": 32,
+            "sparse_num_index_heads": 1,
+            "sparse_block_size": 128,
+            "sparse_topk_blocks": 16,
+            "sparse_init_block": 1,
+            "sparse_local_block": 2,
+        },
+    )
+    attention = MiniMaxAttention(config, 0)
+    rng = np.random.default_rng(13)
+    queries = mx.array(
+        rng.normal(size=(1, 4, 1, 32)).astype(np.float16),
+        dtype=mx.float16,
+    )
+    keys = mx.array(
+        rng.normal(size=(1, 1, 131072, 32)).astype(np.float16),
+        dtype=mx.float16,
+    )
+    values = mx.array(
+        rng.normal(size=(1, 1, 131072, 32)).astype(np.float16),
+        dtype=mx.float16,
+    )
+    q_positions = mx.array([[131071]], dtype=mx.int32)
+    block_indices = mx.arange(16, dtype=mx.int32)[None, None, :]
+    mask = attention.indexer.build_block_mask(
+        block_indices,
+        None,
+        keys.shape[2],
+        queries.dtype,
+        q_positions,
+    )
+
+    dense = minimax_language.scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=None,
+        scale=attention.scale,
+        mask=mask,
+    )
+    sparse = attention._sparse_decode_attention(
+        queries,
+        keys,
+        values,
+        block_indices,
+        "causal",
+        q_positions,
+    )
+    mx.eval(dense, sparse)
+
+    assert sparse is not None
+    np.testing.assert_allclose(
+        np.array(sparse),
+        np.array(dense),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_minimax_m3_short_decode_keeps_full_sparse_kv(monkeypatch):
     config = TextConfig(
         hidden_size=4,
         intermediate_size=4,
@@ -2902,7 +3061,7 @@ def test_minimax_m3_decode_keeps_full_sparse_kv(monkeypatch):
     assert key_lengths[-2:] == [5, 6]
 
 
-def test_minimax_m3_batched_decode_keeps_full_sparse_kv(monkeypatch):
+def test_minimax_m3_batched_decode_compacts_sparse_kv(monkeypatch):
     config = TextConfig(
         hidden_size=4,
         intermediate_size=4,
@@ -2938,12 +3097,54 @@ def test_minimax_m3_batched_decode_keeps_full_sparse_kv(monkeypatch):
 
     mx.eval(
         attention(
-            mx.ones((2, 11, 4), dtype=mx.float32),
+            mx.ones((2, 20, 4), dtype=mx.float32),
             cache=cache,
             position_ids=mx.array(
                 [
-                    [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8],
-                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                    [
+                        -2,
+                        -1,
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5,
+                        6,
+                        7,
+                        8,
+                        9,
+                        10,
+                        11,
+                        12,
+                        13,
+                        14,
+                        15,
+                        16,
+                        17,
+                    ],
+                    [
+                        0,
+                        1,
+                        2,
+                        3,
+                        4,
+                        5,
+                        6,
+                        7,
+                        8,
+                        9,
+                        10,
+                        11,
+                        12,
+                        13,
+                        14,
+                        15,
+                        16,
+                        17,
+                        18,
+                        19,
+                    ],
                 ],
                 dtype=mx.int32,
             ),
@@ -2954,11 +3155,11 @@ def test_minimax_m3_batched_decode_keeps_full_sparse_kv(monkeypatch):
             mx.ones((2, 1, 4), dtype=mx.float32),
             mask=cache.make_mask(1),
             cache=cache,
-            position_ids=mx.array([[9], [11]], dtype=mx.int32),
+            position_ids=mx.array([[18], [20]], dtype=mx.int32),
         )
     )
 
-    assert key_lengths[-2:] == [11, 12]
+    assert key_lengths[-2:] == [20, 1]
 
 
 def test_minimax_m3_compiled_sparse_indexer_matches_generic_selection():
