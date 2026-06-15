@@ -58,6 +58,22 @@ class ThinkingStreamState:
         self.thinking_done = False
         self.buffer = ""
 
+    @classmethod
+    def from_prompt(
+        cls,
+        formatted_prompt: str,
+        enable_thinking: bool = False,
+        thinking_start_token: Optional[str] = None,
+        thinking_end_token: Optional[str] = None,
+    ):
+        state = cls(enable_thinking, thinking_start_token, thinking_end_token)
+        # Some prompts end with an open thinking marker, so generation starts
+        # inside reasoning and should stay there until the close marker appears.
+        state.in_thinking = state.in_thinking or formatted_prompt.rstrip().endswith(
+            state.open_markers
+        )
+        return state
+
     def feed(self, text: str) -> ThinkingStreamDelta:
         self.buffer += text or ""
         reasoning = []
