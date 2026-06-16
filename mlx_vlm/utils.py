@@ -549,10 +549,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    if not is_mlx_format:
-        # Sanitize weights
+    # Top-level remap. Skipped for MLX-format checkpoints (keys/layout already
+    # match the parameter tree) unless the model opts in via sanitize_mlx_format
+    # because its checkpoint still needs key remapping. See issue #1367.
+    if not is_mlx_format or getattr(model, "sanitize_mlx_format", False):
         weights = sanitize_weights(model, weights)
 
+    if not is_mlx_format:
         if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
             weights = sanitize_weights(model.thinker, weights)
             weights = sanitize_weights(model.thinker.vision_tower, weights)
