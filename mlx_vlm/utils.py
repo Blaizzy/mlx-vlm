@@ -345,77 +345,6 @@ def _has_quantized_weights(path: str, weights: Optional[Dict[str, mx.array]]) ->
     return weights is not None and f"{path}.scales" in weights
 
 
-def _infer_mlx_affine_quantization_from_weights(
-    model: nn.Module, weights: Dict[str, mx.array]
-) -> Optional[Dict[str, Any]]:
-    per_module_quantization = {}
-    quantization_counts = {}
-    quantization_order = []
-
-    for path, module in model.named_modules():
-        if not hasattr(module, "to_quantized") or not hasattr(module, "weight"):
-            continue
-
-        weight = weights.get(f"{path}.weight")
-        scales = weights.get(f"{path}.scales")
-        biases = weights.get(f"{path}.biases")
-        if weight is None or scales is None or biases is None:
-            continue
-        if weight.dtype != mx.uint32:
-            continue
-        if len(weight.shape) != len(module.weight.shape):
-            continue
-        if weight.shape[:-1] != module.weight.shape[:-1]:
-            continue
-        if scales.shape[:-1] != weight.shape[:-1]:
-            continue
-        if biases.shape != scales.shape:
-            continue
-
-        input_dims = int(module.weight.shape[-1])
-        packed_dims = int(weight.shape[-1])
-        scale_groups = int(scales.shape[-1])
-        if input_dims <= 0 or packed_dims <= 0 or scale_groups <= 0:
-            continue
-        if input_dims % scale_groups != 0:
-            continue
-
-        bit_count = 32 * packed_dims
-        if bit_count % input_dims != 0:
-            continue
-
-        bits = bit_count // input_dims
-        if bits <= 0 or bits > 8:
-            continue
-
-        quantization = {
-            "group_size": input_dims // scale_groups,
-            "bits": bits,
-            "mode": "affine",
-        }
-        per_module_quantization[path] = quantization
-        key = (quantization["group_size"], quantization["bits"], quantization["mode"])
-        if key not in quantization_counts:
-            quantization_order.append(key)
-            quantization_counts[key] = 0
-        quantization_counts[key] += 1
-
-    if not per_module_quantization:
-        return None
-
-    base_key = max(quantization_order, key=lambda key: quantization_counts[key])
-    base_quantization = {
-        "group_size": base_key[0],
-        "bits": base_key[1],
-        "mode": base_key[2],
-    }
-    quantization = dict(base_quantization)
-    for path, module_quantization in per_module_quantization.items():
-        if module_quantization != base_quantization:
-            quantization[path] = module_quantization
-    return quantization
-
-
 def get_class_predicate(skip_vision=False, weights=None, quantization_config=None):
     def predicate(p, m):
         if (
@@ -450,13 +379,7 @@ def get_model_and_args(config: dict):
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
-    architectures = config.get("architectures") or []
-    if any(str(arch) == "MiniMaxM3SparseForCausalLM" for arch in architectures):
-        model_type = "minimax_m3"
-    elif any("eagle3" in str(arch).lower() for arch in architectures):
-        model_type = "eagle3"
-    else:
-        model_type = raw_model_type.lower()
+    model_type = raw_model_type.lower()
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
@@ -602,16 +525,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     config.setdefault("vision_config", {})
     config.setdefault("audio_config", {})
 
-    has_quantization = config.get("quantization") is not None
+    has_quantization = "quantization" in config
 
     # Initialize model config and update it with module configs
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
     model_config = apply_generation_config_defaults(model_config, config)
-    normalized_quantization_config = getattr(model_config, "quantization_config", None)
-    if normalized_quantization_config is not None:
-        config["quantization_config"] = normalized_quantization_config
 
     model = model_class.Model(model_config)
 
@@ -670,8 +590,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            elif quant_method == "mxfp8":
-                quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
             elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
                 from .models.deepseek_v4.language import make_quantization_config
 
@@ -683,19 +601,8 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 )
 
             if quantization is not None:
-                ignored_layers = quantization_config.get("ignored_layers")
-                if ignored_layers:
-                    quantization["ignored_layers"] = ignored_layers
                 config["quantization"] = quantization
                 config["quantization_config"] = quantization
-
-        if config.get("quantization") is None:
-            inferred_quantization = _infer_mlx_affine_quantization_from_weights(
-                model, weights
-            )
-            if inferred_quantization is not None:
-                config["quantization"] = inferred_quantization
-                config["quantization_config"] = inferred_quantization
 
     if has_quantization:
         for quantization_key in ("quantization", "quantization_config"):
@@ -707,20 +614,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-        ignored_layers = config.get("quantization_config", {}).get("ignored_layers", [])
-        ignored_layers = tuple(ignored_layers or ())
-        quantized_model = model
-        if getattr(model, "_is_text_model", False):
-            language_model = getattr(model, "language_model", None)
-            quantized_model = getattr(language_model, "_model", model)
-
-        def is_ignored_quant_layer(p):
-            paths = (p, f"model.{p}", f"language_model.{p}")
-            return any(
-                ignored == path or path.startswith(f"{ignored}.")
-                for ignored in ignored_layers
-                for path in paths
-            )
+        quantized_model = (
+            model.language_model._model
+            if getattr(model, "_is_text_model", False)
+            else model
+        )
 
         def get_class_predicate(p, m):
             # Skip legacy multimodal layers unless the checkpoint has quantized
@@ -730,9 +628,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and skip_vision
                 and not _has_quantized_weights(p, weights)
             ):
-                return False
-            # Honor HF quantization_config.ignored_layers for MXFP8 checkpoints.
-            if is_ignored_quant_layer(p):
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -1556,27 +1451,26 @@ def load_video(
 
     if nframes is not None:
         n = _round(nframes)
-        indices = np.linspace(0, total_frames - 1, n).round().astype(int).tolist()
     else:
         lo = _ceil(min_frames)
         hi = _floor(min(max_frames, total_frames))
         n = total_frames / video_fps * fps
         n = min(max(n, lo), hi, total_frames)
         n = _floor(n)
-        indices = np.linspace(0, total_frames - 1, n).round().astype(int).tolist()
     if not (frame_factor <= n <= total_frames):
         cap.release()
-        raise ValueError(f"nframes must be in [{frame_factor}, {total_frames}], got {n}.")
+        raise ValueError(
+            f"nframes must be in [{frame_factor}, {total_frames}], got {n}."
+        )
 
+    indices = np.linspace(0, total_frames - 1, n).round().astype(int)
     frames = []
-    read_indices = []
     for idx in indices:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ret, frame = cap.read()
         if not ret:
             break
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        read_indices.append(int(idx))
     cap.release()
     if not frames:
         raise ValueError("No frames read from the video.")
@@ -1600,9 +1494,6 @@ def process_inputs(
     # Get the process method from the processor
     process_method = getattr(processor, "process", processor)
     parameters = inspect.signature(process_method).parameters
-    accepts_kwargs = any(
-        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
-    )
 
     # Prepare arguments
     args = {
@@ -1621,9 +1512,6 @@ def process_inputs(
     for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
-    if accepts_kwargs:
-        for key, value in kwargs.items():
-            args.setdefault(key, value)
 
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:
@@ -1839,29 +1727,21 @@ def prepare_inputs(
         if not isinstance(videos, list):
             videos = [videos]
         fps_hint = kwargs.pop("fps", 2.0)
-        fps_values = (
-            fps_hint if isinstance(fps_hint, list) else [fps_hint] * len(videos)
-        )
-        if len(fps_values) != len(videos):
-            raise ValueError(
-                f"Got {len(fps_values)} fps values for {len(videos)} videos."
-            )
-
         loaded, video_fps = [], []
-        for v, fps_value in zip(videos, fps_values):
-            if isinstance(v, (str, bytes, Path)):
-                arr, s_fps = load_video(str(v), fps=fps_value)
-            else:
-                arr, s_fps = v, fps_value
+        for v in videos:
+            arr, s_fps = (
+                load_video(str(v), fps=fps_hint)
+                if isinstance(v, (str, bytes))
+                else (v, fps_hint)
+            )
             loaded.append(arr)
             video_fps.append(s_fps)
         videos = loaded
 
     model_inputs = {}
 
-    if (
-        hasattr(processor, "image_processor")
-        and isinstance(processor.image_processor, BaseImageProcessor)
+    if hasattr(processor, "image_processor") and isinstance(
+        processor.image_processor, BaseImageProcessor
     ):
         if not isinstance(prompts, list):
             prompts = [prompts]
