@@ -64,6 +64,3 @@ class ModelConfig(BaseModelConfig):
                     "full" if (max(i - offset + 1, 0) % freq) == 0 else "shared"
                     for i in range(self.num_hidden_layers)
                 ]
-
-
-ModelArgs = ModelConfig

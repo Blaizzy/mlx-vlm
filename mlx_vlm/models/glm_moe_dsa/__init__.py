@@ -1,4 +1,4 @@
-from .config import ModelArgs, ModelConfig
+from .config import ModelConfig
 from .glm_moe_dsa import Model
 
-__all__ = ["Model", "ModelArgs", "ModelConfig"]
+__all__ = ["Model", "ModelConfig"]
