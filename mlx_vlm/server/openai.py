@@ -1457,8 +1457,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState.from_prompt(
-                            formatted_prompt,
+                        thinking_state = ThinkingStreamState(
                             gen_args.enable_thinking,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
@@ -1595,8 +1594,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState.from_prompt(
-                            formatted_prompt,
+                        thinking_state = ThinkingStreamState(
                             gen_args.enable_thinking,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
