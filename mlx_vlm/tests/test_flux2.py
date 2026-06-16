@@ -4,7 +4,9 @@ import importlib
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
+from PIL import Image
 
 import mlx_vlm.models.flux2.download as download_module
 from mlx_vlm.generate.edit_image import (
@@ -23,7 +25,12 @@ from mlx_vlm.models.flux2.config import (
 )
 from mlx_vlm.models.flux2.download import DOWNLOAD_PATTERNS, validate_model_layout
 from mlx_vlm.models.flux2.model import Flux2ImageEditModel, Flux2ImageGenerationModel
-from mlx_vlm.models.flux2.pipeline import Flux2Image, Flux2ImageEdit, Flux2RuntimeConfig
+from mlx_vlm.models.flux2.pipeline import (
+    Flux2Image,
+    Flux2ImageEdit,
+    Flux2RuntimeConfig,
+    _reference_image_array,
+)
 
 image_module = importlib.import_module("mlx_vlm.generate.image")
 
@@ -277,3 +284,35 @@ def test_flux2_standard_edit_model_reports_non_kv_path() -> None:
 
     assert result.variant == "flux2-klein-9b"
     assert result.metadata["uses_reference_kv_cache"] is False
+
+
+def test_flux2_edit_model_defaults_to_untiled_vae_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def fake_from_pretrained(cls, variant, **kwargs):  # noqa: ARG001
+        calls.append(kwargs)
+        return _fake_edit_pipeline("flux2-klein-9b-kv")
+
+    monkeypatch.setattr(
+        Flux2ImageEdit, "from_pretrained", classmethod(fake_from_pretrained)
+    )
+
+    Flux2ImageEditModel.from_model_id("flux2-klein-9b-kv")
+    Flux2ImageEditModel.from_model_id(
+        "flux2-klein-9b-kv", bucketed_seq_len=True, tiled_vae="auto"
+    )
+
+    assert calls[0]["tiled_vae"] == "off"
+    assert calls[0]["bucketed_seq_len"] is False
+    assert calls[1]["tiled_vae"] == "auto"
+    assert calls[1]["bucketed_seq_len"] is True
+
+
+def test_flux2_reference_image_array_keeps_float32_input() -> None:
+    image = Image.new("RGB", (1, 1), color=(255, 127, 0))
+    array = _reference_image_array(image)
+
+    assert array.dtype == mx.float32
+    assert np.array(array).shape == (1, 3, 1, 1)

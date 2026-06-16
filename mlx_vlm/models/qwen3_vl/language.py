@@ -544,7 +544,11 @@ class LanguageModel(nn.Module):
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
             # Calculate RoPE index once per generation in the pre-fill stage only
             recalc_condition = (
-                (cache is not None and cache[0] is not None and (cache_offset == 0))
+                (
+                    cache is not None
+                    and cache[0] is not None
+                    and (cache_offset_array is None and cache_offset == 0)
+                )
                 or self._rope_deltas is None
                 or cache is None
             )
