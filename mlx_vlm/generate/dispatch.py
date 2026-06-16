@@ -265,86 +265,6 @@ def parse_arguments():
         help="Canvas update sampler for diffusion generation.",
     )
     parser.add_argument(
-        "--diffusion-turbo",
-        action="store_true",
-        help=(
-            "Use the high-throughput turbo engine for block-diffusion models "
-            "(top-K sampler chain, monotone commits, EOS tail cut)."
-        ),
-    )
-    parser.add_argument(
-        "--entropy-bound",
-        type=float,
-        default=None,
-        help=(
-            "Entropy budget per denoising step for the turbo engine. Default: "
-            "the checkpoint sampler config (0.1). Higher commits more tokens "
-            "per step (faster, slightly lower fidelity)."
-        ),
-    )
-    parser.add_argument(
-        "--turbo-no-monotone",
-        action="store_true",
-        help="Turbo engine: disable monotone commits (faithful re-annealing).",
-    )
-    parser.add_argument(
-        "--turbo-steps",
-        type=int,
-        default=None,
-        help=(
-            "Turbo engine: bound denoising to this many forwards per canvas; "
-            "remaining positions are argmax-flushed on the final step."
-        ),
-    )
-    parser.add_argument(
-        "--turbo-accept",
-        choices=["entropy-bound", "confidence"],
-        default=None,
-        help="Turbo engine acceptance rule (default: entropy-bound).",
-    )
-    parser.add_argument(
-        "--turbo-repair",
-        action="store_true",
-        help=(
-            "Turbo engine: run one extra full-canvas forward after the canvas "
-            "drains and re-argmax every position (recovers reference "
-            "final-step semantics; fixes early-frozen glitches)."
-        ),
-    )
-    parser.add_argument(
-        "--turbo-compact",
-        action="store_true",
-        help=(
-            "Turbo engine: forward only live canvas positions each step, "
-            "serving frozen positions from per-layer K/V buffers."
-        ),
-    )
-    parser.add_argument(
-        "--turbo-threshold-relax",
-        type=float,
-        default=None,
-        help=(
-            "Turbo engine: relaxed commit threshold applied after "
-            "--turbo-threshold-relax-after steps (two-stage schedule). Keeps "
-            "canvas structure clean without the error-compounding final flush."
-        ),
-    )
-    parser.add_argument(
-        "--turbo-threshold-relax-after",
-        type=int,
-        default=8,
-        help="Turbo engine: step at which the relaxed threshold takes over.",
-    )
-    parser.add_argument(
-        "--turbo-repeat-guard",
-        type=int,
-        default=16,
-        help=(
-            "Turbo engine: stop generation if a single token repeats this many "
-            "times consecutively (degeneration safety net). 0 disables."
-        ),
-    )
-    parser.add_argument(
         "--threshold",
         type=float,
         default=None,
@@ -1651,7 +1571,6 @@ def main():
             stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
             diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
-            last_chunk = None
             for chunk in stream_generate(
                 model,
                 processor,
@@ -1665,28 +1584,12 @@ def main():
                     diffusion_output.handle_draft(chunk)
                     continue
                 response += chunk.text
-                last_chunk = chunk
                 if not diffusion_output.handle_text(chunk.text):
                     print(chunk.text, end="")
 
             chat.append({"role": "assistant", "content": response})
             diffusion_output.finish(response)
             print()
-            if last_chunk is not None:
-                steps = getattr(last_chunk, "diffusion_denoising_steps", 0)
-                stats = (
-                    f"  [{last_chunk.generation_tokens} tok @ "
-                    f"{last_chunk.generation_tps:.1f} tok/s"
-                    f" | prompt {last_chunk.prompt_tokens} @ "
-                    f"{last_chunk.prompt_tps:.0f} tok/s"
-                )
-                if steps:
-                    stats += f" | {steps} denoise steps"
-                stats += (
-                    f" | {last_chunk.peak_memory:.1f} GB"
-                    f" | {last_chunk.finish_reason or 'length'}]"
-                )
-                print(stats)
 
     else:
         gen_kwargs = {
