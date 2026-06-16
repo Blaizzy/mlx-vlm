@@ -975,7 +975,7 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertEqual(transfer.tolist(), [[False, True, True, True]])
 
-    def test_unmasking_display_has_no_prefix_or_real_newlines(self):
+    def test_unmasking_display_has_no_prefix_and_preserves_newlines(self):
         from mlx_vlm.generate import GenerationResult
         from mlx_vlm.generate.diffusion import (
             _format_diffusion_draft_line,
@@ -984,15 +984,41 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         draft = GenerationResult(
             is_draft=True,
-            draft_text="[Mask] Hello",
+            draft_text="[Mask]\nHello",
             diffusion_canvas_index=1,
             diffusion_step=1,
             diffusion_total_steps=4,
         )
 
-        self.assertEqual(_format_diffusion_draft_line(draft, 80), "[Mask] Hello")
+        self.assertEqual(_format_diffusion_draft_line(draft, 80), "[Mask]\nHello")
         self.assertEqual(
-            _format_diffusion_live_text("hello\nworld", 80), "hello\\nworld"
+            _format_diffusion_live_text("hello\nworld", 80),
+            "hello\nworld",
+        )
+        self.assertEqual(
+            _format_diffusion_live_text(
+                "hello\nworld",
+                80,
+                preserve_newlines=False,
+            ),
+            "hello\\nworld",
+        )
+
+    def test_diffusion_masked_draft_decode_preserves_newlines(self):
+        from mlx_vlm.generate.diffusion import _decode_diffusion_masked_draft
+
+        class NewlineTokenizer:
+            def decode(self, tokens, skip_special_tokens=False):
+                return "hello\nworld"
+
+        self.assertEqual(
+            _decode_diffusion_masked_draft(
+                NewlineTokenizer(),
+                [1],
+                [True],
+                skip_special_token_ids=[],
+            ),
+            "hello\nworld",
         )
 
     def test_unmasking_display_is_untrimmed_by_default(self):
@@ -1121,6 +1147,19 @@ class TestDiffusionVisualization(unittest.TestCase):
         # A single overlong word is hard-split.
         self.assertEqual(_wrap_text("abcdef", 3), "abc\ndef")
 
+    def test_wrap_text_preserves_code_block_indentation(self):
+        from mlx_vlm.models.diffusion_gemma.visualizer import _wrap_text
+
+        code = (
+            "import random\n\n"
+            "def calculate_pi_monte_carlo(iterations):\n"
+            "    inside_circle = 0\n"
+            "    \n"
+            "    for _ in range(iterations):"
+        )
+
+        self.assertEqual(_wrap_text(code, 80), code)
+
     def test_redrawer_overwrites_frames_in_place(self):
         import contextlib
         import io
@@ -1217,16 +1256,16 @@ class TestDiffusionVisualization(unittest.TestCase):
         visualizer.redrawer = FakeRedrawer()
 
         class FakeDraft:
-            draft_text = "[Mask] world"
+            draft_text = "[Mask]\nworld"
 
-        visualizer.handle_text("Hello.")
+        visualizer.handle_text("Hello.\n")
         visualizer.handle_draft(FakeDraft())
-        self.assertEqual(drawn[-1], "Hello.[Mask] world")
+        self.assertEqual(drawn[-1], "Hello.\n[Mask]\nworld")
 
         visualizer.handle_text(" Bye.")
-        self.assertEqual(drawn[-1], "Hello. Bye.")
+        self.assertEqual(drawn[-1], "Hello.\n Bye.")
 
-        visualizer.finish("Hello. Bye.")
+        visualizer.finish("Hello.\n Bye.")
         self.assertIn("<finish>", drawn)
 
     def test_output_handler_delegates_to_model_visualizer(self):
