@@ -30,7 +30,7 @@ from typing import List, Optional
 
 import mlx.core as mx
 
-from ..models.diffusion_gemma.language import _cache_offset, _cache_state
+from .language import _cache_offset, _cache_state
 
 
 def _rope_tables(dims: int, base: float, positions: int):
@@ -113,19 +113,27 @@ class TurboCanvasRunner:
         # canvas K/V buffers per layer
         self.buf_k: List[mx.array] = []
         self.buf_v: List[mx.array] = []
-        dtype = self.decoder.embed_tokens.scales.dtype if hasattr(
-            self.decoder.embed_tokens, "scales"
-        ) else mx.bfloat16
+        dtype = (
+            self.decoder.embed_tokens.scales.dtype
+            if hasattr(self.decoder.embed_tokens, "scales")
+            else mx.bfloat16
+        )
         for layer in self.layers:
             attn = layer.self_attn
             self.buf_k.append(
-                mx.zeros((1, attn.n_kv_heads, canvas_length, attn.head_dim), dtype=dtype)
+                mx.zeros(
+                    (1, attn.n_kv_heads, canvas_length, attn.head_dim), dtype=dtype
+                )
             )
             self.buf_v.append(
-                mx.zeros((1, attn.n_kv_heads, canvas_length, attn.head_dim), dtype=dtype)
+                mx.zeros(
+                    (1, attn.n_kv_heads, canvas_length, attn.head_dim), dtype=dtype
+                )
             )
 
-    def forward(self, tokens_f: mx.array, positions_f: mx.array, sc_f: Optional[mx.array]):
+    def __call__(
+        self, tokens_f: mx.array, positions_f: mx.array, sc_f: Optional[mx.array]
+    ):
         """One decoder pass over the forward set.
 
         tokens_f: [1, F] int32 canvas tokens at the forward positions

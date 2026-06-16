@@ -39,20 +39,23 @@ the encoder pass so the prefix KV cache stays exact for subsequent blocks.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Generator, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from ..tokenizer_utils import make_streaming_detokenizer
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import (
+    GenerationResult,
+    _chunked_prefill_enabled,
+    generation_stream,
+)
 from .diffusion import (
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     _diffusion_config_dict,
     _diffusion_prefill_cache,
-    _diffusion_should_chunk_prefill,
 )
 
 DEFAULT_TURBO_TOPK = 64
@@ -169,9 +172,8 @@ def _run_canvas_compact(
     denoising (when ``show_unmasking``), then a final
     ("done", final_tokens, emit_length, steps, work_tokens).
     """
-    import random as _random
 
-    from .diffusion_turbo_runner import TurboCanvasRunner
+    from ..models.diffusion_gemma.diffusion_turbo_runner import TurboCanvasRunner
 
     decoder = model.model.decoder
     self_conditioner = _TurboSelfConditioner(decoder)
@@ -226,7 +228,7 @@ def _run_canvas_compact(
         runner.set_forward_positions(rel)
         tokens_f = canvas_dev[:, rel]
         sc_f = sc_full[:, rel, :]
-        h_f = runner.forward(tokens_f, prefix_offset + rel, sc_f)
+        h_f = runner(tokens_f, prefix_offset + rel, sc_f)
 
         # logits + sampler math only for active positions (bucketed length)
         pos_in_f = {p: j for j, p in enumerate(fwd)}  # real positions -> h_f row
@@ -242,9 +244,7 @@ def _run_canvas_compact(
         if temperature <= 0:
             sel = mx.argmax(probs, axis=-1)
         else:
-            sel = mx.random.categorical(
-                mx.log(probs + 1e-20) / max(temperature, 1e-5)
-            )
+            sel = mx.random.categorical(mx.log(probs + 1e-20) / max(temperature, 1e-5))
         proposal = (
             mx.take_along_axis(idx, sel[..., None], axis=-1)
             .squeeze(-1)
@@ -273,7 +273,9 @@ def _run_canvas_compact(
         noise = mx.random.randint(0, vocab_size, accept.shape).astype(mx.int32)
         new_active_tokens = mx.where(accept, proposal, noise)
         committed_active = mx.where(
-            accept, proposal, mx.take_along_axis(committed_dev, act_pos[None, :], axis=-1)
+            accept,
+            proposal,
+            mx.take_along_axis(committed_dev, act_pos[None, :], axis=-1),
         )
         canvas_dev = mx.put_along_axis(
             canvas_dev, act_pos[None, :], new_active_tokens, axis=-1
@@ -284,9 +286,7 @@ def _run_canvas_compact(
         sc_active = self_conditioner.soft_embeddings(probs, idx)
         sc_full = mx.put_along_axis(
             sc_full,
-            mx.broadcast_to(
-                act_pos[None, :, None], (1, ab, hidden_size)
-            ),
+            mx.broadcast_to(act_pos[None, :, None], (1, ab, hidden_size)),
             sc_active.astype(sc_full.dtype),
             axis=1,
         )
@@ -321,8 +321,10 @@ def _run_canvas_compact(
                 frozen[p] = True
                 newly_frozen.append(p)
 
-        if show_unmasking and tokenizer is not None and (
-            step % max(1, unmask_interval) == 0 or flush
+        if (
+            show_unmasking
+            and tokenizer is not None
+            and (step % max(1, unmask_interval) == 0 or flush)
         ):
             from .diffusion import _decode_diffusion_masked_draft
 
@@ -366,7 +368,7 @@ def _run_canvas_compact(
         rel = mx.arange(C, dtype=mx.int32)
         runner.set_forward_positions(rel)
         tokens_f = mx.array([committed], dtype=mx.int32)
-        h_f = runner.forward(tokens_f, prefix_offset + rel, sc_full)
+        h_f = runner(tokens_f, prefix_offset + rel, sc_full)
         raw_logits = decoder.embed_tokens.as_linear(h_f)
         vals, idx = _topk_logits(raw_logits, turbo_topk)
         am = (
@@ -470,14 +472,18 @@ def stream_diffusion_turbo_generate(
     max_canvas_length = (
         model_canvas_length
         if diffusion_full_canvas
-        else min(model_canvas_length, int(diffusion_max_canvas_length or model_canvas_length))
+        else min(
+            model_canvas_length, int(diffusion_max_canvas_length or model_canvas_length)
+        )
     )
     min_canvas_length = min(
         max_canvas_length,
         int(diffusion_min_canvas_length or DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH),
     )
 
-    sampler_config = _diffusion_config_dict(generation_config.get("sampler_config", None))
+    sampler_config = _diffusion_config_dict(
+        generation_config.get("sampler_config", None)
+    )
     if entropy_bound is None:
         entropy_bound = float(sampler_config.get("entropy_bound", 0.1))
     t_min = float(generation_config.get("t_min", 0.4))
@@ -490,21 +496,32 @@ def stream_diffusion_turbo_generate(
     sc_module = decoder.self_conditioning
     entropy_bound_arr = mx.array(entropy_bound, dtype=mx.float32)
     softcap_arr = mx.array(
-        float(getattr(model.language_model, "final_logit_softcapping", None)
-              or getattr(text_config, "final_logit_softcapping", 30.0)),
+        float(
+            getattr(model.language_model, "final_logit_softcapping", None)
+            or getattr(text_config, "final_logit_softcapping", 30.0)
+        ),
         dtype=mx.float32,
     )
 
     kv_cache = model.make_cache()
     detokenizer = make_streaming_detokenizer(processor)
     has_padding = attention_mask is not None and not bool(mx.all(attention_mask).item())
-    chunk_prefill = _diffusion_should_chunk_prefill(
-        prefill_step_size=prefill_step_size,
-        prompt_length=prompt_length,
-        has_padding=has_padding,
-        use_static_cache=False,
-        pixel_values=pixel_values,
-        mm_token_type_ids=mm_token_type_ids,
+    prefill_policy_kwargs = {
+        "attention_mask": attention_mask,
+        "has_padding": has_padding,
+        "use_static_cache": False,
+        "pixel_values": pixel_values,
+        "mm_token_type_ids": mm_token_type_ids,
+    }
+    chunk_prefill = (
+        prefill_step_size is not None
+        and prompt_length > prefill_step_size
+        and _chunked_prefill_enabled(
+            model,
+            input_ids=input_ids,
+            prompt_cache=kv_cache,
+            prefill_kwargs=prefill_policy_kwargs,
+        )
     )
 
     generated_tokens = 0
@@ -633,9 +650,7 @@ def stream_diffusion_turbo_generate(
                         stop_reason = "stop"
                         break
                     if repeat_guard:
-                        repeat_run = (
-                            repeat_run + 1 if last_token == prev_emit_id else 1
-                        )
+                        repeat_run = repeat_run + 1 if last_token == prev_emit_id else 1
                         prev_emit_id = last_token
                         if repeat_run >= repeat_guard:
                             stopped = True
@@ -651,9 +666,7 @@ def stream_diffusion_turbo_generate(
                         stopped = True
                         stop_reason = "length"
                         break
-                yield make_result(
-                    "", canvas_index=canvas_index, block_complete=True
-                )
+                yield make_result("", canvas_index=canvas_index, block_complete=True)
                 if stopped:
                     break
                 mx.clear_cache()
@@ -692,7 +705,9 @@ def stream_diffusion_turbo_generate(
                     else 0
                 )
                 for layer, c in zip(decoder.layers, cache_list):
-                    h = layer(h, masks.get(layer.layer_type), c, decoder=True, offset=offset)
+                    h = layer(
+                        h, masks.get(layer.layer_type), c, decoder=True, offset=offset
+                    )
                 h = decoder.norm(h)
 
                 if turbo_monotone and step > 0:
@@ -764,13 +779,9 @@ def stream_diffusion_turbo_generate(
                         accept = accept & (pos_of_active < frontier_limit)
                     if not bool(mx.any(accept).item()):
                         best = mx.argmax(top_p, axis=-1)
-                        accept = (
-                            mx.arange(top_p.shape[-1])[None, :] == best[:, None]
-                        )
+                        accept = mx.arange(top_p.shape[-1])[None, :] == best[:, None]
                 else:
-                    accept = _entropy_transfer_mask(
-                        entropy, entropy_bound_arr, quota_n
-                    )
+                    accept = _entropy_transfer_mask(entropy, entropy_bound_arr, quota_n)
 
                 if turbo_monotone:
                     if active_idx is None:
@@ -780,14 +791,17 @@ def stream_diffusion_turbo_generate(
                         canvas = mx.where(
                             accept,
                             committed,
-                            mx.random.randint(0, vocab_size, (batch_size, canvas_length)),
+                            mx.random.randint(
+                                0, vocab_size, (batch_size, canvas_length)
+                            ),
                         )
                         frozen = frozen | new_frozen
                         argmax_full = top1
                     else:
                         # scatter active results back into full-canvas tensors
                         committed_active = mx.where(
-                            accept, proposal,
+                            accept,
+                            proposal,
                             mx.take_along_axis(committed, active_idx[None, :], axis=-1),
                         )
                         committed = mx.put_along_axis(
@@ -847,9 +861,7 @@ def stream_diffusion_turbo_generate(
                 if turbo_monotone:
                     mx.eval(frozen, committed, entropy)
                     frozen_list = frozen[0].tolist()
-                    active_positions = [
-                        i for i, f in enumerate(frozen_list) if not f
-                    ]
+                    active_positions = [i for i, f in enumerate(frozen_list) if not f]
                     mean_entropy = float(mx.mean(entropy).item())
 
                     if turbo_eos_early_stop and eos_ids:
@@ -895,9 +907,7 @@ def stream_diffusion_turbo_generate(
                 # take the model's argmax everywhere, recovering the reference
                 # sampler's trailing "final canvas = argmax of last forward"
                 # semantics so early-frozen tokens get a revision opportunity.
-                inputs_embeds = (
-                    decoder.embed_tokens(final_canvas) * decoder.embed_scale
-                )
+                inputs_embeds = decoder.embed_tokens(final_canvas) * decoder.embed_scale
                 soft = (
                     sc_embeddings.astype(inputs_embeds.dtype)
                     if sc_embeddings is not None
@@ -965,4 +975,6 @@ def stream_diffusion_turbo_generate(
     if prompt_time == 0.0:
         prompt_time = time.perf_counter() - tic
     detokenizer.finalize()
-    yield make_result(detokenizer.last_segment, finish_reason=stop_reason if stopped else "length")
+    yield make_result(
+        detokenizer.last_segment, finish_reason=stop_reason if stopped else "length"
+    )
