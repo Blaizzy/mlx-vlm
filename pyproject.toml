@@ -42,9 +42,6 @@ exclude = ["mlx_vlm.tests*"]
 version = {attr = "mlx_vlm.version.__version__"}
 dependencies = {file = ["requirements.txt"]}
 
-[tool.uv.sources]
-transformers = { git = "https://github.com/huggingface/transformers.git", rev = "920878b452d139e564da2e5daa364dfec8750238" }
-
 [project.optional-dependencies]
 ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
