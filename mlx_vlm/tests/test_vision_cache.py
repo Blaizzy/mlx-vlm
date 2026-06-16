@@ -155,7 +155,6 @@ class TestCachedImageFeaturesKwarg:
             "minicpmo.minicpmo",
             "jina_vlm.jina_vlm",
             "qwen3_omni_moe.thinker",
-            "minimax_m3_vl.minimax_m3_vl",
         ],
     )
     def test_cached_image_features_in_source(self, model_module):

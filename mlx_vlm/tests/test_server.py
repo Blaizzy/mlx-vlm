@@ -16,12 +16,11 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import mlx_vlm.server as server
-import mlx_vlm.server.anthropic as server_anthropic
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
-from mlx_vlm.apc import hash_image_payload, hash_video_payload
+from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
@@ -91,20 +90,6 @@ def test_chat_request_schema_requires_model():
     assert "model" in server.ChatRequest.model_json_schema()["required"]
 
 
-@pytest.mark.parametrize("value", [0, -1, True, "1008"])
-def test_chat_completions_endpoint_rejects_invalid_max_long_side_pixel(client, value):
-    response = client.post(
-        "/chat/completions",
-        json={
-            "model": "demo",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "max_long_side_pixel": value,
-        },
-    )
-
-    assert response.status_code == 422
-
-
 def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     resize_shape = server.ChatRequest.model_json_schema()["properties"]["resize_shape"]
     lengths = {
@@ -114,7 +99,6 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     }
 
     assert lengths == {(1, 1), (2, 2)}
-    assert "max_long_side_pixel" in server.ChatRequest.model_json_schema()["properties"]
 
 
 def test_speculative_server_dispatches_mtp_batch_loop():
@@ -334,31 +318,6 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
-def test_server_reads_batch_coalesce_env(monkeypatch):
-    monkeypatch.delenv("MLX_VLM_BATCH_COALESCE_MS", raising=False)
-    assert server.get_batch_coalesce_s() == 0.0
-
-    monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "25")
-    assert server.get_batch_coalesce_s() == pytest.approx(0.025)
-
-    monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "bad")
-    assert server.get_batch_coalesce_s() == 0.0
-
-
-def test_server_reads_prefill_batch_size_env(monkeypatch):
-    monkeypatch.delenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", raising=False)
-    assert server.get_server_prefill_batch_size() == 32
-
-    monkeypatch.setenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", "16")
-    assert server.get_server_prefill_batch_size() == 16
-
-    monkeypatch.setenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", "0")
-    assert server.get_server_prefill_batch_size() == 32
-
-    monkeypatch.setenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", "bad")
-    assert server.get_server_prefill_batch_size() == 32
-
-
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     class FakeResponseGenerator:
         def __init__(self, model_path, adapter_path=None, **kwargs):
@@ -389,34 +348,6 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
         "auto",
     )
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
-
-
-def test_load_model_resources_threads_lazy_load_env(monkeypatch):
-    model = SimpleNamespace(config=SimpleNamespace(model_type="demo"))
-    processor = SimpleNamespace()
-    calls = []
-
-    def fake_load(*args, **kwargs):
-        calls.append((args, kwargs))
-        return model, processor
-
-    monkeypatch.setenv("MLX_TRUST_REMOTE_CODE", "true")
-    monkeypatch.setenv("MLX_VLM_LAZY_LOAD", "true")
-    monkeypatch.setattr(server_generation, "load", fake_load)
-
-    loaded_model, loaded_processor, loaded_config = server.load_model_resources(
-        "demo-model", "adapter-a"
-    )
-
-    assert loaded_model is model
-    assert loaded_processor is processor
-    assert loaded_config is model.config
-    assert calls == [
-        (
-            ("demo-model", "adapter-a"),
-            {"lazy": True, "trust_remote_code": True},
-        )
-    ]
 
 
 def _unstarted_response_generator():
@@ -543,7 +474,7 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
         "mlx_vlm.speculative.drafters.load_drafter",
         lambda *_args, **_kwargs: (drafter, "mtp"),
     )
-    gen._gpu_embed = lambda raw_inputs, images=None, videos=None: (
+    gen._gpu_embed = lambda raw_inputs, images=None: (
         mx.array([[raw_inputs["token"]]], dtype=mx.int32),
         {},
     )
@@ -555,7 +486,6 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
             {"token": 1},
             1,
             server.GenerationArguments(max_tokens=1),
-            None,
             None,
         )
     )
@@ -595,7 +525,6 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
             {"input_ids": mx.array([[1]], dtype=mx.int32)},
             1,
             server.GenerationArguments(max_tokens=2),
-            None,
             None,
         )
     ]
@@ -643,14 +572,12 @@ def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
             1,
             server.GenerationArguments(max_tokens=2),
             None,
-            None,
         ),
         (
             good_queue,
             {"input_ids": mx.array([[1]], dtype=mx.int32)},
             1,
             server.GenerationArguments(max_tokens=2),
-            None,
             None,
         ),
     ]
@@ -1118,8 +1045,8 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     specs_iter = iter(request_specs)
 
-    def fake_gpu_embed(raw_inputs, images=None, videos=None):
-        del raw_inputs, images, videos
+    def fake_gpu_embed(raw_inputs, images=None):
+        del raw_inputs, images
         spec = next(specs_iter)
         return spec["input_ids"], spec["gen_kwargs"]
 
@@ -1168,7 +1095,6 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
                 {"input_ids": spec["input_ids"]},
                 int(spec["input_ids"].shape[1]),
                 args,
-                None,
                 None,
             )
         )
@@ -1375,91 +1301,6 @@ def test_responses_input_tokens_endpoint_forwards_adapter_path(client, monkeypat
     assert response.status_code == 200
     assert response.json() == {"input_tokens": 3}
     assert get_cached_model.call_args.args == ("demo", "adapter-a")
-
-
-def test_responses_input_tokens_forwards_media_preprocessing_options(
-    client, monkeypatch
-):
-    captured = {}
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="minimax_m3_vl", image_token_index=7)
-
-    def fake_prepare_inputs(processor_arg, **kwargs):
-        captured["processor"] = processor_arg
-        captured.update(kwargs)
-        return {"input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32)}
-
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    monkeypatch.setattr(
-        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
-    )
-    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
-    monkeypatch.setattr(server_openai, "prepare_inputs", fake_prepare_inputs)
-
-    response = client.post(
-        "/responses/input_tokens",
-        json={
-            "model": "demo",
-            "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "Describe both."},
-                        {"type": "input_image", "image_url": "/tmp/image.png"},
-                        {"type": "input_video", "video": "/tmp/video.mp4"},
-                    ],
-                }
-            ],
-            "resize_shape": [384],
-            "max_long_side_pixel": 1008,
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"input_tokens": 4}
-    assert captured["processor"] is processor
-    assert captured["images"] == ["/tmp/image.png"]
-    assert captured["videos"] == ["/tmp/video.mp4"]
-    assert captured["prompts"] == "prompt"
-    assert captured["image_token_index"] == 7
-    assert captured["resize_shape"] == (384, 384)
-    assert captured["max_long_side_pixel"] == 1008
-
-
-def test_responses_input_tokens_continuous_batching_forwards_generation_args(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="minimax_m3_vl")
-    response_generator = SimpleNamespace(
-        _cpu_preprocess=MagicMock(
-            return_value={"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
-        )
-    )
-
-    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
-    monkeypatch.setattr(
-        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
-    )
-    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
-
-    response = client.post(
-        "/responses/input_tokens",
-        json={
-            "model": "demo",
-            "input": "Hello",
-            "resize_shape": [512],
-            "max_long_side_pixel": 1008,
-        },
-    )
-
-    assert response.status_code == 200
-    args = response_generator._cpu_preprocess.call_args.args[4]
-    assert args.resize_shape == (512, 512)
-    assert args.max_long_side_pixel == 1008
 
 
 def test_responses_previous_response_id_replays_stored_items(client):
@@ -1686,9 +1527,7 @@ def test_v1_stream_endpoints_reject_over_context_before_sse(
     class OverBudgetResponseGenerator:
         generate_called = False
 
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             raise server.PromptTooLongError(
                 "Request needs 9 context tokens "
                 "(5 prompt + 4 max generation), but MAX_KV_SIZE is 8."
@@ -1799,7 +1638,6 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
                 "repetition_penalty": 1.15,
                 "logit_bias": {"12": -1.5},
                 "resize_shape": [512],
-                "max_long_side_pixel": 1008,
             },
         )
 
@@ -1810,7 +1648,6 @@ def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     assert mock_generate.call_args.kwargs["repetition_penalty"] == 1.15
     assert mock_generate.call_args.kwargs["logit_bias"] == {12: -1.5}
     assert mock_generate.call_args.kwargs["resize_shape"] == (512, 512)
-    assert mock_generate.call_args.kwargs["max_long_side_pixel"] == 1008
 
 
 def test_chat_completions_streaming_forwards_explicit_sampling_args(
@@ -1824,12 +1661,10 @@ def test_chat_completions_streaming_forwards_explicit_sampling_args(
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
 
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             captured["prompt"] = prompt
             captured["images"] = images
             captured["audio"] = audio
@@ -1883,12 +1718,10 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
 
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 _gemma_thinking_channel_chunks()
             )
@@ -1937,12 +1770,10 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
 
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=8), iter(
                 [
                     server.StreamingToken(
@@ -2106,85 +1937,6 @@ def test_chat_completions_preserves_input_audio_references(client):
     assert captured["audio"] == [audio_path]
 
 
-def test_chat_completions_forwards_video_references(client):
-    video_path = "/tmp/example.mp4"
-    captured = {}
-
-    def fake_generate(prompt, image=None, audio=None, video=None, **kwargs):
-        captured["video"] = video
-        return GenerationResult(
-            text="video ok",
-            prompt_tokens=8,
-            generation_tokens=4,
-            total_tokens=12,
-            prompt_tps=10.0,
-            generation_tps=5.0,
-            peak_memory=0.1,
-        )
-
-    with (
-        patch.object(
-            server,
-            "get_cached_model",
-            return_value=(
-                SimpleNamespace(),
-                SimpleNamespace(),
-                SimpleNamespace(model_type="minimax_m3_vl"),
-            ),
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt") as template,
-        patch.object(server, "generate", side_effect=fake_generate),
-        patch.object(server.runtime, "response_generator", None),
-    ):
-        response = client.post(
-            "/chat/completions",
-            json={
-                "model": "demo",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Describe the video."},
-                            {
-                                "type": "video_url",
-                                "video_url": {"url": video_path},
-                            },
-                        ],
-                    }
-                ],
-            },
-        )
-
-    assert response.status_code == 200
-    assert captured["video"] == [video_path]
-    assert template.call_args.kwargs["num_videos"] == 1
-    assert template.call_args.kwargs["video"] == [video_path]
-
-
-def test_response_items_to_chat_extracts_videos():
-    chat_messages, images, videos = server._response_items_to_chat(
-        [
-            {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Compare these."},
-                    {"type": "input_image", "image_url": "/tmp/image.png"},
-                    {"type": "input_video", "video": "/tmp/video-a.mp4"},
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": "/tmp/video-b.mp4"},
-                    },
-                ],
-            }
-        ]
-    )
-
-    assert chat_messages == [{"role": "user", "content": "Compare these."}]
-    assert images == ["/tmp/image.png"]
-    assert videos == ["/tmp/video-a.mp4", "/tmp/video-b.mp4"]
-
-
 def test_generation_timings_from_metrics():
     metrics = SimpleNamespace(
         cached_tokens=2,
@@ -2265,12 +2017,10 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
 
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
@@ -2332,12 +2082,10 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
 
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
@@ -2554,94 +2302,6 @@ def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
         {"role": "user", "content": "Hello"},
         {"role": "user", "content": "Introduce the project."},
     ]
-
-
-def test_anthropic_count_tokens_forwards_media_preprocessing_options(
-    client, monkeypatch
-):
-    captured = {}
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="minimax_m3_vl", image_token_index=7)
-
-    def fake_prepare_inputs(processor_arg, **kwargs):
-        captured["processor"] = processor_arg
-        captured.update(kwargs)
-        return {"input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)}
-
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    monkeypatch.setattr(
-        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
-    )
-    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
-    monkeypatch.setattr(server_anthropic, "prepare_inputs", fake_prepare_inputs)
-
-    response = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            "model": "demo",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Describe it."},
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "url",
-                                "url": "https://example.com/image.png",
-                            },
-                        },
-                    ],
-                }
-            ],
-            "resize_shape": [384],
-            "max_long_side_pixel": 1008,
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {"input_tokens": 5}
-    assert captured["processor"] is processor
-    assert captured["images"] == ["https://example.com/image.png"]
-    assert captured["prompts"] == "prompt"
-    assert captured["image_token_index"] == 7
-    assert captured["resize_shape"] == (384, 384)
-    assert captured["max_long_side_pixel"] == 1008
-
-
-def test_anthropic_count_tokens_continuous_batching_forwards_generation_args(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="minimax_m3_vl")
-    response_generator = SimpleNamespace(
-        _cpu_preprocess=MagicMock(
-            return_value={"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
-        )
-    )
-
-    monkeypatch.setattr(server.runtime, "response_generator", response_generator)
-    monkeypatch.setattr(
-        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
-    )
-    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
-
-    response = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            "model": "demo",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "resize_shape": [512],
-            "max_long_side_pixel": 1008,
-        },
-    )
-
-    assert response.status_code == 200
-    args = response_generator._cpu_preprocess.call_args.args[4]
-    assert args.resize_shape == (512, 512)
-    assert args.max_long_side_pixel == 1008
 
 
 def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
@@ -2911,22 +2571,12 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
-    captured = {}
 
     class FakeResponseGenerator:
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
-            captured["generate"] = {
-                "prompt": prompt,
-                "images": images,
-                "audio": audio,
-                "videos": videos,
-                "args": args,
-            }
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -2965,9 +2615,6 @@ def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch)
         )
 
     assert response.status_code == 200
-    assert captured["generate"]["videos"] is None
-    assert isinstance(captured["generate"]["args"], server.GenerationArguments)
-    assert captured["generate"]["args"].max_tokens == 4
     body = response.text
     assert "event: message_start" in body
     assert "event: content_block_start" in body
@@ -2988,12 +2635,10 @@ def test_anthropic_messages_streaming_splits_gemma_thinking_channel_content(
     config = SimpleNamespace(model_type="gemma4")
 
     class FakeResponseGenerator:
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 _gemma_thinking_channel_chunks()
             )
@@ -3039,12 +2684,10 @@ def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monke
     config = SimpleNamespace(model_type="custom")
 
     class FakeResponseGenerator:
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -3093,62 +2736,6 @@ def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monke
     assert "".join(delta.get("text") or "" for delta in deltas) == "Custom answer."
 
 
-def test_anthropic_messages_streaming_splits_minimax_m3_thinking_close(
-    client, monkeypatch
-):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="minimax_m3_vl")
-
-    class FakeResponseGenerator:
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
-            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
-                [
-                    server.StreamingToken(
-                        text="Reasoning.</mm:think>Answer.",
-                        token=1,
-                        logprobs=0.0,
-                        finish_reason="stop",
-                    )
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "max_tokens": 4,
-                "stream": True,
-                "enable_thinking": True,
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.text
-    reasoning_idx = body.index('"thinking": "Reasoning."')
-    signature_idx = body.index('"type": "signature_delta"')
-    thinking_stop_idx = body.index("event: content_block_stop", signature_idx)
-    content_idx = body.index('"text": "Answer."')
-
-    assert reasoning_idx < signature_idx
-    assert signature_idx < thinking_stop_idx
-    assert thinking_stop_idx < content_idx
-
-
 def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -3160,12 +2747,10 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
     )
 
     class FakeResponseGenerator:
-        def validate_context_budget(
-            self, prompt, images=None, audio=None, videos=None, args=None
-        ):
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
             return None
 
-        def generate(self, prompt, images=None, audio=None, videos=None, args=None):
+        def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=3), iter(
                 [
                     server.StreamingToken(
@@ -3328,7 +2913,6 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     assert latest["peak_memory_gb"] == 1.25
     assert latest["image_count"] == 0
     assert latest["audio_count"] == 0
-    assert latest["video_count"] == 0
     assert latest["apc_enabled"] is False
 
     assert len(payload["recent"]) == 1
@@ -3352,48 +2936,14 @@ class TestResponseGenerator:
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.draft_model = None
         gen.wait_until_ready = lambda: None
-        gen._cpu_preprocess = lambda prompt, images, audio, videos, args=None: {
-            "input_ids": [1, 2, 3]
-        }
+        gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
-
-    def test_cpu_preprocess_forwards_media_processor_options(self, monkeypatch):
-        captured = {}
-
-        def fake_prepare_inputs(processor, **kwargs):
-            captured["processor"] = processor
-            captured.update(kwargs)
-            return {"input_ids": mx.array([[1, 2]], dtype=mx.int32)}
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.processor = SimpleNamespace(chat_template="template")
-        gen.model = SimpleNamespace(
-            config=SimpleNamespace(model_type="minimax_m3_vl", image_token_index=7)
-        )
-        monkeypatch.setattr(server_generation, "prepare_inputs", fake_prepare_inputs)
-
-        raw_inputs = gen._cpu_preprocess(
-            "prompt",
-            images=["image.png"],
-            videos=["clip.mp4"],
-            args=server.GenerationArguments(
-                resize_shape=(512, 512), max_long_side_pixel=1008
-            ),
-        )
-
-        assert raw_inputs["input_ids"].shape == (1, 2)
-        assert captured["processor"] is gen.processor
-        assert captured["prompts"] == "prompt"
-        assert captured["images"] == ["image.png"]
-        assert captured["videos"] == ["clip.mp4"]
-        assert captured["resize_shape"] == (512, 512)
-        assert captured["max_long_side_pixel"] == 1008
 
     def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
         gen.draft_model = None
-        gen._cpu_preprocess = lambda prompt, images, audio, videos, args=None: {
+        gen._cpu_preprocess = lambda prompt, images, audio: {
             "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
         }
         gen.requests = Queue()
@@ -3898,7 +3448,7 @@ class TestResponseGenerator:
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None, videos=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -3913,7 +3463,6 @@ class TestResponseGenerator:
                     {"request_id": request_id},
                     1,
                     server.GenerationArguments(max_tokens=2),
-                    None,
                     None,
                 )
             )
@@ -3951,7 +3500,6 @@ class TestResponseGenerator:
             ]
 
     def test_run_routes_mtp_through_batch_generator(self, monkeypatch):
-        monkeypatch.delenv("MLX_VLM_SERVER_PREFILL_BATCH_SIZE", raising=False)
         batch_state = {}
         draft_model = object()
 
@@ -4057,7 +3605,7 @@ class TestResponseGenerator:
 
         gen._initialize_model = fake_initialize_model
         gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
-        gen._gpu_embed = lambda raw_inputs, images=None, videos=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -4072,7 +3620,6 @@ class TestResponseGenerator:
                     {"request_id": request_id},
                     1,
                     server.GenerationArguments(max_tokens=1, temperature=0),
-                    None,
                     None,
                 )
             )
@@ -4098,7 +3645,6 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
-        assert kwargs["prefill_batch_size"] == 32
         assert batch_state["instance"].next_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
@@ -4134,38 +3680,6 @@ class TestResponseGenerator:
         gen._run()
 
         assert calls == [(False, 0.037)]
-
-    def test_run_coalesces_idle_batch_generator_from_env(self, monkeypatch):
-        monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "25")
-        calls = []
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.draft_model = None
-        gen.draft_kind = None
-        gen._stop = False
-        gen._ready = Event()
-        gen._load_error = None
-
-        def fake_initialize_model():
-            gen.model = SimpleNamespace(language_model=object())
-            gen.processor = SimpleNamespace()
-            gen.config = SimpleNamespace()
-            gen.stop_tokens = set()
-            gen.draft_model = None
-            gen.draft_kind = None
-            gen.tokenizer = SimpleNamespace()
-
-        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
-            del idle_timeout
-            calls.append((active, coalesce_s))
-            return [], True
-
-        gen._initialize_model = fake_initialize_model
-        gen._collect_pending_requests = fake_collect_pending_requests
-
-        gen._run()
-
-        assert calls == [(False, 0.025)]
 
     def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
         created = []
@@ -4273,7 +3787,7 @@ class TestResponseGenerator:
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None, videos=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -4289,7 +3803,6 @@ class TestResponseGenerator:
                     {"request_id": request_id},
                     1,
                     server.GenerationArguments(max_tokens=1, temperature=temperature),
-                    None,
                     None,
                 )
             )
@@ -4398,40 +3911,13 @@ class TestResponseGenerator:
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(
             enable_thinking=False,
-            thinking_mode="adaptive",
             thinking_budget=50,
             thinking_end_token="</think>",
         )
         kw = args.to_template_kwargs()
         assert kw["enable_thinking"] is False
-        assert kw["thinking_mode"] == "adaptive"
         assert kw["thinking_budget"] == 50
         assert kw["thinking_end_token"] == "</think>"
-
-    def test_generate_arguments_preserve_minimax_adaptive_template_default(self):
-        args = server.GenerationArguments(enable_thinking=False)
-        kw = args.to_template_kwargs({"model_type": "minimax_m3_vl"})
-
-        assert "enable_thinking" not in kw
-        assert "thinking_mode" not in kw
-
-    def test_generate_arguments_keep_explicit_minimax_disabled_template(self):
-        args = server.GenerationArguments(
-            enable_thinking=False,
-            enable_thinking_explicit=True,
-        )
-        kw = args.to_template_kwargs({"model_type": "minimax_m3_vl"})
-
-        assert kw["enable_thinking"] is False
-
-    def test_response_generator_uses_minimax_m3_text_thinking_markers(self):
-        gen = server_generation.ResponseGenerator.__new__(
-            server_generation.ResponseGenerator
-        )
-        gen.model = SimpleNamespace(config=SimpleNamespace(model_type="minimax_m3"))
-        args = server.GenerationArguments()
-
-        assert gen._thinking_markers(args) == ("<mm:think>", "</mm:think>")
 
     def test_generate_arguments_omits_none_optionals(self):
         args = server.GenerationArguments()
@@ -4583,8 +4069,6 @@ class TestResponseGenerator:
             thinking_budget=None,
             thinking_start_token=None,
             thinking_end_token=None,
-            resize_shape=[384],
-            max_long_side_pixel=1008,
         )
         args = server._build_gen_args(req, tenant_id="tenant-a")
         assert args.max_tokens == 128
@@ -4595,8 +4079,6 @@ class TestResponseGenerator:
         assert args.frequency_penalty == 0.3
         assert args.frequency_context_size == 128
         assert args.logit_bias == {5: -1.0}  # string keys converted to int
-        assert args.to_generate_kwargs()["resize_shape"] == (384, 384)
-        assert args.to_generate_kwargs()["max_long_side_pixel"] == 1008
         assert args.to_generate_kwargs()["apc_tenant"] == "tenant-a"
 
     def test_build_gen_args_from_chat_request(self):
@@ -4618,8 +4100,6 @@ class TestResponseGenerator:
             thinking_budget=None,
             thinking_start_token=None,
             thinking_end_token=None,
-            resize_shape=None,
-            max_long_side_pixel=None,
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
@@ -4742,9 +4222,7 @@ class TestResponseGenerator:
         )
 
         assert "enable_thinking" not in req.model_fields_set
-        args = server._build_gen_args(req)
-        assert args.enable_thinking is True
-        assert args.enable_thinking_explicit is False
+        assert server._build_gen_args(req).enable_thinking is True
 
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
         req = server.ChatRequest(
@@ -4752,9 +4230,7 @@ class TestResponseGenerator:
             messages=[server.ChatMessage(role="user", content="hi")],
         )
 
-        args = server._build_gen_args(req)
-        assert args.enable_thinking is False
-        assert args.enable_thinking_explicit is False
+        assert server._build_gen_args(req).enable_thinking is False
 
     def test_build_gen_args_uses_server_thinking_token_defaults_when_omitted(
         self, monkeypatch
@@ -4786,9 +4262,7 @@ class TestResponseGenerator:
             enable_thinking=False,
         )
 
-        args = server._build_gen_args(req)
-        assert args.enable_thinking is False
-        assert args.enable_thinking_explicit is True
+        assert server._build_gen_args(req).enable_thinking is False
 
         monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
         req = server.ChatRequest(
@@ -4797,9 +4271,7 @@ class TestResponseGenerator:
             enable_thinking=True,
         )
 
-        args = server._build_gen_args(req)
-        assert args.enable_thinking is True
-        assert args.enable_thinking_explicit is True
+        assert server._build_gen_args(req).enable_thinking is True
 
     def test_build_gen_args_request_thinking_tokens_override_server_defaults(
         self, monkeypatch
@@ -4821,25 +4293,11 @@ class TestResponseGenerator:
         assert args.thinking_start_token == "<think>"
         assert args.thinking_end_token == "</think>"
 
-    def test_build_gen_args_uses_chat_template_thinking_mode(self, monkeypatch):
-        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
-        req = server.ChatRequest(
-            model="demo",
-            messages=[server.ChatMessage(role="user", content="hi")],
-            chat_template_kwargs={"thinking_mode": "enabled"},
-        )
-
-        args = server._build_gen_args(req)
-
-        assert args.enable_thinking is True
-        assert args.thinking_mode == "enabled"
-
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
         for env_var in (
             "MLX_VLM_ENABLE_THINKING",
             "MLX_VLM_PRELOAD_MODEL",
             "MLX_VLM_PRELOAD_ADAPTER",
-            "MLX_VLM_LAZY_LOAD",
             "MLX_VLM_VISION_CACHE_SIZE",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
@@ -4862,7 +4320,6 @@ class TestResponseGenerator:
                 "8080",
                 "--model",
                 "demo",
-                "--lazy-load",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -4883,7 +4340,6 @@ class TestResponseGenerator:
             server_cli.main()
 
             assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
-            assert os.environ["MLX_VLM_LAZY_LOAD"] == "1"
             assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
             assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
             assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
@@ -4893,7 +4349,6 @@ class TestResponseGenerator:
                 "MLX_VLM_ENABLE_THINKING",
                 "MLX_VLM_PRELOAD_MODEL",
                 "MLX_VLM_PRELOAD_ADAPTER",
-                "MLX_VLM_LAZY_LOAD",
                 "MLX_VLM_VISION_CACHE_SIZE",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
@@ -4930,7 +4385,7 @@ class TestResponseGenerator:
             pixel_values=pixel_values
         )
 
-    def test_gpu_embed_prefers_image_pixels_for_apc_hash(self):
+    def test_gpu_embed_prefers_image_ref_for_apc_hash(self):
         class Embed:
             def to_dict(self):
                 return {"inputs_embeds": mx.zeros((1, 2, 4))}
@@ -4955,129 +4410,10 @@ class TestResponseGenerator:
             images=images,
         )
 
-        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(
+        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(image_ref=images)
+        assert gen_kwargs["_apc_image_hash"] != hash_image_payload(
             pixel_values=pixel_values
         )
-        assert gen_kwargs["_apc_image_hash"] != hash_image_payload(image_ref=images)
-
-    def test_gpu_embed_falls_back_to_image_ref_for_apc_hash(self):
-        class Embed:
-            def to_dict(self):
-                return {"inputs_embeds": mx.zeros((1, 2, 4))}
-
-        class Model:
-            def get_input_embeddings(
-                self, input_ids, pixel_values, mask=None, **kwargs
-            ):
-                return Embed()
-
-        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
-        images = ["image-a.png"]
-
-        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
-            response_generator,
-            {
-                "input_ids": mx.array([[1, 2]]),
-                "attention_mask": mx.array([[1, 1]]),
-            },
-            images=images,
-        )
-
-        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(image_ref=images)
-
-    def test_gpu_embed_hashes_video_pixels_without_video_ref(self):
-        class Embed:
-            def to_dict(self):
-                return {"inputs_embeds": mx.zeros((1, 2, 4))}
-
-        class Model:
-            def get_input_embeddings(
-                self, input_ids, pixel_values, mask=None, **kwargs
-            ):
-                return Embed()
-
-        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
-        video_pixels = mx.ones((2, 3, 2, 2), dtype=mx.float32)
-        video_grid = mx.array([[1, 1, 2]], dtype=mx.int32)
-
-        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
-            response_generator,
-            {
-                "input_ids": mx.array([[1, 2]]),
-                "attention_mask": mx.array([[1, 1]]),
-                "pixel_values_videos": video_pixels,
-                "video_grid_thw": video_grid,
-            },
-            images=None,
-            videos=None,
-        )
-
-        assert gen_kwargs["_apc_video_hash"] == hash_video_payload(
-            pixel_values=video_pixels,
-            video_grid_thw=video_grid,
-        )
-
-    def test_gpu_embed_prefers_video_pixels_for_apc_hash(self):
-        class Embed:
-            def to_dict(self):
-                return {"inputs_embeds": mx.zeros((1, 2, 4))}
-
-        class Model:
-            def get_input_embeddings(
-                self, input_ids, pixel_values, mask=None, **kwargs
-            ):
-                return Embed()
-
-        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
-        video_pixels = mx.ones((2, 3, 2, 2), dtype=mx.float32)
-        video_grid = mx.array([[1, 1, 2]], dtype=mx.int32)
-        videos = ["clip-a.mp4"]
-
-        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
-            response_generator,
-            {
-                "input_ids": mx.array([[1, 2]]),
-                "attention_mask": mx.array([[1, 1]]),
-                "pixel_values_videos": video_pixels,
-                "video_grid_thw": video_grid,
-            },
-            images=None,
-            videos=videos,
-        )
-
-        assert gen_kwargs["_apc_video_hash"] == hash_video_payload(
-            pixel_values=video_pixels,
-            video_grid_thw=video_grid,
-        )
-        assert gen_kwargs["_apc_video_hash"] != hash_video_payload(
-            video_ref=videos,
-        )
-
-    def test_gpu_embed_falls_back_to_video_ref_for_apc_hash(self):
-        class Embed:
-            def to_dict(self):
-                return {"inputs_embeds": mx.zeros((1, 2, 4))}
-
-        class Model:
-            def get_input_embeddings(
-                self, input_ids, pixel_values, mask=None, **kwargs
-            ):
-                return Embed()
-
-        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
-        videos = ["clip-a.mp4"]
-
-        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
-            response_generator,
-            {
-                "input_ids": mx.array([[1, 2]]),
-                "attention_mask": mx.array([[1, 1]]),
-            },
-            images=None,
-            videos=videos,
-        )
-
-        assert gen_kwargs["_apc_video_hash"] == hash_video_payload(video_ref=videos)
 
     def test_extract_chat_response_format_json_schema(self):
         req = SimpleNamespace(
@@ -5192,197 +4528,10 @@ class TestSplitThinking:
         assert reasoning == "Thinking."
         assert content == "Answer."
 
-    def test_minimax_m3_think_tags(self):
-        text = "<mm:think>Thinking.</mm:think>Answer."
-        reasoning, content = server._split_thinking(text)
-        assert reasoning == "Thinking."
-        assert content == "Answer."
-
     def test_partial_close_tag_only(self):
         text = "Thinking text\n</think>\nAnswer."
-        reasoning, content = server._split_thinking(text, assume_in_thinking=True)
-        assert reasoning == "Thinking text"
-        assert content == "Answer."
-
-    def test_minimax_m3_partial_close_tag_only(self):
-        text = "Thinking text\n</mm:think>\nAnswer."
-        reasoning, content = server._split_thinking(text, assume_in_thinking=True)
-        assert reasoning == "Thinking text"
-        assert content == "Answer."
-
-    def test_minimax_m3_leading_close_tag_is_dropped(self):
-        text = "</mm:think>Answer."
         reasoning, content = server._split_thinking(text)
-        assert reasoning is None
-        assert content == "Answer."
-
-    def test_minimax_m3_non_leading_unmatched_close_tag_is_content(self):
-        text = "XXX</mm:think>YYY"
-        reasoning, content = server._split_thinking(text)
-        assert reasoning is None
-        assert content == "XXX</mm:think>YYY"
-
-    def test_stream_minimax_m3_leading_close_tag_is_dropped_across_chunks(self):
-        in_thinking = False
-        accumulated = ""
-        at_response_start = True
-
-        for delta in ("</mm", ":think>"):
-            accumulated += delta
-            (
-                in_thinking,
-                accumulated,
-                at_response_start,
-                reasoning,
-                content,
-            ) = server._split_stream_thinking_delta(
-                accumulated,
-                delta,
-                in_thinking,
-                at_response_start=at_response_start,
-            )
-            assert reasoning is None
-            assert content is None
-
-        accumulated += "Answer."
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            accumulated,
-            "Answer.",
-            in_thinking,
-            at_response_start=at_response_start,
-        )
-
-        assert in_thinking is False
-        assert at_response_start is False
-        assert reasoning is None
-        assert content == "Answer."
-
-    def test_stream_minimax_m3_leading_close_tag_keeps_same_delta_content(self):
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            "</mm:think>Answer.",
-            "</mm:think>Answer.",
-            False,
-            at_response_start=True,
-        )
-
-        assert in_thinking is False
-        assert accumulated == "Answer."
-        assert at_response_start is False
-        assert reasoning is None
-        assert content == "Answer."
-
-    def test_stream_minimax_m3_non_leading_unmatched_close_tag_is_content(self):
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            "XXX</mm:think>YYY",
-            "XXX</mm:think>YYY",
-            False,
-            at_response_start=True,
-        )
-
-        assert in_thinking is False
-        assert accumulated == "XXX</mm:think>YYY"
-        assert at_response_start is False
-        assert reasoning is None
-        assert content == "XXX</mm:think>YYY"
-
-    def test_stream_minimax_m3_enabled_thinking_closes_with_same_chunk_content(self):
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            "Thinking.</mm:think>Answer.",
-            "Thinking.</mm:think>Answer.",
-            True,
-            at_response_start=True,
-        )
-
-        assert in_thinking is False
-        assert accumulated == "Answer."
-        assert at_response_start is False
-        assert reasoning == "Thinking."
-        assert content == "Answer."
-
-    def test_stream_minimax_m3_enabled_thinking_holds_split_close_tag(self):
-        in_thinking = True
-        accumulated = ""
-        at_response_start = True
-
-        accumulated += "Thinking."
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            accumulated,
-            "Thinking.",
-            in_thinking,
-            at_response_start=at_response_start,
-        )
-        assert in_thinking is True
-        assert accumulated == ""
-        assert at_response_start is False
-        assert reasoning == "Thinking."
-        assert content is None
-
-        accumulated += "</mm"
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            accumulated,
-            "</mm",
-            in_thinking,
-            at_response_start=at_response_start,
-        )
-        assert in_thinking is True
-        assert accumulated == "</mm"
-        assert at_response_start is False
-        assert reasoning is None
-        assert content is None
-
-        accumulated += ":think>Answer."
-        (
-            in_thinking,
-            accumulated,
-            at_response_start,
-            reasoning,
-            content,
-        ) = server._split_stream_thinking_delta(
-            accumulated,
-            ":think>Answer.",
-            in_thinking,
-            at_response_start=at_response_start,
-        )
-        assert in_thinking is False
-        assert accumulated == "Answer."
-        assert at_response_start is False
-        assert reasoning is None
+        assert reasoning == "Thinking text"
         assert content == "Answer."
 
     def test_no_thinking(self):
@@ -5569,18 +4718,6 @@ class TestSuppressToolCallContent:
 class TestProcessToolCalls:
     """Tests for tool call parsing from model output."""
 
-    def test_minimax_m3_tool_parser_inference(self):
-        processor = SimpleNamespace(
-            tokenizer=SimpleNamespace(
-                chat_template=(
-                    "{%- set think_begin_token = '<mm:think>' -%}"
-                    "{%- set toolcall_begin_token = ns_token ~ '<tool_call>' -%}"
-                )
-            )
-        )
-
-        assert server._infer_tool_parser_from_processor(processor) == "minimax_m3"
-
     def test_no_tool_calls(self):
         # Minimal tool module mock
         module = SimpleNamespace(tool_call_start="<tc>", tool_call_end="</tc>")
@@ -5612,378 +4749,6 @@ class TestProcessToolCalls:
             "path": "file.py"
         }
 
-    def test_minimax_m3_xml_tool_calls(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "Plan."
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="lookup">'
-            "]<]minimax[>[<query>weather"
-            "]<]minimax[>[</query>"
-            "]<]minimax[>[<days>3"
-            "]<]minimax[>[</days>"
-            "]<]minimax[>[</invoke>\n"
-            ']<]minimax[>[<invoke name="save">'
-            "]<]minimax[>[<items>"
-            "]<]minimax[>[<item>a"
-            "]<]minimax[>[</item>"
-            "]<]minimax[>[<item>b"
-            "]<]minimax[>[</item>"
-            "]<]minimax[>[</items>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert [c["function"]["name"] for c in result["calls"]] == [
-            "lookup",
-            "save",
-        ]
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "query": "weather",
-            "days": 3,
-        }
-        assert json.loads(result["calls"][1]["function"]["arguments"]) == {
-            "items": ["a", "b"],
-        }
-        assert result["remaining_text"] == "Plan."
-
-    def test_minimax_m3_xml_tool_calls_allow_raw_scalar_text(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="search">'
-            "]<]minimax[>[<query>cats & dogs < 3"
-            "]<]minimax[>[</query>"
-            "]<]minimax[>[<exact>true"
-            "]<]minimax[>[</exact>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert result["calls"][0]["function"]["name"] == "search"
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "query": "cats & dogs < 3",
-            "exact": True,
-        }
-
-    def test_minimax_m3_xml_tool_calls_preserve_duplicate_parameters(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="tag">'
-            "]<]minimax[>[<label>alpha"
-            "]<]minimax[>[</label>"
-            "]<]minimax[>[<label>beta"
-            "]<]minimax[>[</label>"
-            "]<]minimax[>[<metadata>"
-            "]<]minimax[>[<source>mobile"
-            "]<]minimax[>[</source>"
-            "]<]minimax[>[<source>web"
-            "]<]minimax[>[</source>"
-            "]<]minimax[>[</metadata>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert result["calls"][0]["function"]["name"] == "tag"
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "label": ["alpha", "beta"],
-            "metadata": {"source": ["mobile", "web"]},
-        }
-
-    def test_minimax_m3_xml_tool_calls_use_tool_schema_for_arguments(self):
-        module = server.load_tool_module("minimax_m3")
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "create_order",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "zip": {"type": "string"},
-                            "qty": {"type": "integer"},
-                            "urgent": {"type": "boolean"},
-                            "items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "sku": {"type": "string"},
-                                        "qty": {"type": "integer"},
-                                    },
-                                },
-                            },
-                        },
-                    },
-                },
-            }
-        ]
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="create_order">'
-            "]<]minimax[>[<zip>018956"
-            "]<]minimax[>[</zip>"
-            "]<]minimax[>[<qty>2"
-            "]<]minimax[>[</qty>"
-            "]<]minimax[>[<urgent>1"
-            "]<]minimax[>[</urgent>"
-            "]<]minimax[>[<items>"
-            "]<]minimax[>[<item>"
-            "]<]minimax[>[<sku>book-001"
-            "]<]minimax[>[</sku>"
-            "]<]minimax[>[<qty>5"
-            "]<]minimax[>[</qty>"
-            "]<]minimax[>[</item>"
-            "]<]minimax[>[</items>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, tools)
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "zip": "018956",
-            "qty": 2,
-            "urgent": True,
-            "items": [{"sku": "book-001", "qty": 5}],
-        }
-
-    def test_minimax_m3_xml_tool_calls_preserve_mixed_text(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="convert">'
-            "]<]minimax[>[<payload>text before "
-            "]<]minimax[>[<child>value"
-            "]<]minimax[>[</child>"
-            " text after"
-            "]<]minimax[>[</payload>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "payload": {
-                "child": "value",
-                "$text": "text before  text after",
-            }
-        }
-
-    def test_minimax_m3_xml_tool_calls_avoid_mixed_text_field_collision(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="convert">'
-            "]<]minimax[>[<payload>text"
-            "]<]minimax[>[<$text>child text"
-            "]<]minimax[>[</$text>"
-            "]<]minimax[>[<child>value"
-            "]<]minimax[>[</child>"
-            "]<]minimax[>[</payload>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "payload": {
-                "$text": "child text",
-                "$$text": "text",
-                "child": "value",
-            }
-        }
-
-    def test_minimax_m3_xml_tool_calls_allow_unquoted_invoke_name(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            "]<]minimax[>[<invoke name=lookup>"
-            "]<]minimax[>[<query>weather"
-            "]<]minimax[>[</query>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert result["calls"][0]["function"]["name"] == "lookup"
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "query": "weather"
-        }
-
-    def test_minimax_m3_xml_tool_calls_drop_rest_after_top_level_junk(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="lookup">'
-            "]<]minimax[>[<query>weather"
-            "]<]minimax[>[</query>"
-            "I already have enough information."
-            "]<]minimax[>[<days>3"
-            "]<]minimax[>[</days>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "query": "weather"
-        }
-
-    def test_minimax_m3_xml_tool_calls_reject_unexpected_namespace_in_leaf(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            ']<]minimax[>[<invoke name="lookup">'
-            "]<]minimax[>[<query>weather ]<]minimax[>[bad marker"
-            "]<]minimax[>[</query>"
-            "]<]minimax[>[</invoke>"
-        )
-
-        with pytest.raises(ValueError, match="unexpected namespace marker"):
-            module.parse_tool_call(output, [])
-
-    def test_minimax_m3_xml_tool_calls_schema_fallbacks_stay_strings(self):
-        module = server.load_tool_module("minimax_m3")
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "convert",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "whole": {"type": "number"},
-                            "missing_type": {},
-                        },
-                    },
-                },
-            }
-        ]
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="convert">'
-            "]<]minimax[>[<whole>not-a-number"
-            "]<]minimax[>[</whole>"
-            "]<]minimax[>[<missing_type>42"
-            "]<]minimax[>[</missing_type>"
-            "]<]minimax[>[<unknown_param>42"
-            "]<]minimax[>[</unknown_param>"
-            "]<]minimax[>[<nullish>NULL"
-            "]<]minimax[>[</nullish>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, tools)
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "whole": "not-a-number",
-            "missing_type": "42",
-            "unknown_param": "42",
-            "nullish": None,
-        }
-
-    def test_minimax_m3_xml_tool_calls_schema_empty_composites(self):
-        module = server.load_tool_module("minimax_m3")
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "convert",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "payload": {"type": "object"},
-                            "items": {"type": "array"},
-                            "fallback_object": {
-                                "oneOf": [{"type": "mystery"}],
-                            },
-                        },
-                    },
-                },
-            }
-        ]
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="convert">'
-            "]<]minimax[>[<payload>"
-            "]<]minimax[>[</payload>"
-            "]<]minimax[>[<items>"
-            "]<]minimax[>[</items>"
-            ']<]minimax[>[<fallback_object>{"x":1}'
-            "]<]minimax[>[</fallback_object>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, tools)
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "payload": {},
-            "items": [],
-            "fallback_object": {"x": 1},
-        }
-
-    def test_minimax_m3_xml_tool_calls_unknown_tool_uses_schema_fallback(self):
-        module = server.load_tool_module("minimax_m3")
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "known",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            }
-        ]
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="unknown">'
-            "]<]minimax[>[<count>42"
-            "]<]minimax[>[</count>"
-            "]<]minimax[>[<nullish>null"
-            "]<]minimax[>[</nullish>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, tools)
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "count": "42",
-            "nullish": None,
-        }
-
-    def test_minimax_m3_xml_tool_calls_without_tools_keep_legacy_coercion(self):
-        module = server.load_tool_module("minimax_m3")
-        output = (
-            "]<]minimax[>[<tool_call>\n"
-            ']<]minimax[>[<invoke name="convert">'
-            "]<]minimax[>[<count>42"
-            "]<]minimax[>[</count>"
-            "]<]minimax[>[<flag>true"
-            "]<]minimax[>[</flag>"
-            "]<]minimax[>[</invoke>\n"
-            "]<]minimax[>[</tool_call>"
-        )
-
-        result = server.process_tool_calls(output, module, [])
-
-        assert json.loads(result["calls"][0]["function"]["arguments"]) == {
-            "count": 42,
-            "flag": True,
-        }
-
 
 class TestCountThinkingTagTokens:
     """Tests for thinking tag token counting."""
@@ -5996,15 +4761,6 @@ class TestCountThinkingTagTokens:
 
     def test_think_tags(self):
         assert server._count_thinking_tag_tokens("<think>text</think>answer") == 2
-
-    def test_minimax_m3_think_tags(self):
-        assert server._count_thinking_tag_tokens("<mm:think>x</mm:think>y") == 2
-        assert server._count_thinking_tag_tokens("</mm:think>y") == 1
-        assert server._count_thinking_tag_tokens("x</mm:think>y") == 0
-        assert (
-            server._count_thinking_tag_tokens("x</mm:think>y", assume_in_thinking=True)
-            == 1
-        )
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0

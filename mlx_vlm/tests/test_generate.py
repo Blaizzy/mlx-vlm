@@ -25,7 +25,7 @@ from mlx_vlm.generate import (
 )
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
-from mlx_vlm.generate import normalize_max_long_side_pixel, normalize_resize_shape
+from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -1705,385 +1705,6 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
-def test_stream_generate_uses_minimax_m3_text_thinking_markers():
-    captured = {}
-
-    class FakeStoppingCriteria:
-        def __call__(self, token):
-            return False
-
-    class FakeTokenizer:
-        all_special_ids = []
-        stopping_criteria = FakeStoppingCriteria()
-
-        def __init__(self):
-            self.thinking_budget_criteria = None
-
-        def encode(self, text, add_special_tokens=False):
-            del add_special_tokens
-            return {
-                "<mm:think>": [42],
-                "</mm:think>": [43],
-                "\n": [10],
-                "<think>": [99],
-                "</think>": [100],
-            }.get(text, [0])
-
-        def decode(self, token):
-            return str(token)
-
-    class FakeDetokenizer:
-        def reset(self):
-            self.segments = []
-
-        def add_token(self, token, skip_special_token_ids=None):
-            del skip_special_token_ids
-            self.segments.append(str(token))
-
-        @property
-        def last_segment(self):
-            return self.segments.pop(0) if self.segments else ""
-
-        def finalize(self):
-            pass
-
-    def fake_generate_step(*args, **kwargs):
-        del args
-        captured["criteria"] = kwargs.get("thinking_budget_criteria")
-        yield 7, mx.zeros((4,))
-
-    tokenizer = FakeTokenizer()
-    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
-    model = SimpleNamespace(
-        config=SimpleNamespace(model_type="minimax_m3", eos_token_id=[]),
-        language_model=SimpleNamespace(),
-    )
-
-    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
-        list(
-            dispatch_module.stream_generate(
-                model=model,
-                processor=processor,
-                prompt="",
-                input_ids=mx.array([[42]], dtype=mx.int32),
-                pixel_values=None,
-                mask=None,
-                prompt_cache=[],
-                max_tokens=1,
-                enable_thinking=True,
-                thinking_budget=3,
-            )
-        )
-
-    criteria = captured["criteria"]
-    assert criteria is tokenizer.thinking_budget_criteria
-    assert criteria.thinking_start_token_id == 42
-    assert criteria.thinking_end_token_id == 43
-    assert criteria.enable_thinking is True
-
-
-def test_stream_generate_apc_extra_hash_includes_video_payload():
-    captured = {}
-
-    class FakeAPCManager:
-        def lookup_prefix(self, token_ids, extra_hash=0):
-            del token_ids
-            captured["extra_hash"] = extra_hash
-            return [], 0
-
-        def lookup_exact_cache(self, *args, **kwargs):
-            return None, 0
-
-        def lookup_prefix_disk_cache(self, *args, **kwargs):
-            return None, 0
-
-        def release(self, blocks):
-            del blocks
-
-    class FakeStoppingCriteria:
-        def __call__(self, token):
-            return False
-
-    class FakeDetokenizer:
-        def reset(self):
-            self.segments = []
-
-        def add_token(self, token, skip_special_token_ids=None):
-            self.segments.append(str(token))
-
-        @property
-        def last_segment(self):
-            return self.segments.pop(0) if self.segments else ""
-
-        def finalize(self):
-            pass
-
-    def fake_generate_step(*args, **kwargs):
-        yield 7, mx.zeros((4,))
-
-    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
-    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
-    model = SimpleNamespace(
-        config=SimpleNamespace(model_type="test", eos_token_id=[]),
-        language_model=SimpleNamespace(),
-    )
-    video_pixels = mx.ones((2, 3, 2, 2), dtype=mx.float32)
-    video_grid = mx.array([[1, 1, 2]], dtype=mx.int32)
-
-    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
-        list(
-            dispatch_module.stream_generate(
-                model=model,
-                processor=processor,
-                prompt="",
-                video=["clip-a.mp4"],
-                input_ids=mx.array([[1, 2]], dtype=mx.int32),
-                pixel_values=None,
-                mask=None,
-                pixel_values_videos=video_pixels,
-                video_grid_thw=video_grid,
-                prompt_cache=[],
-                max_tokens=1,
-                apc_manager=FakeAPCManager(),
-            )
-        )
-
-    assert captured["extra_hash"] == apc_module.hash_video_payload(
-        pixel_values=video_pixels,
-        video_grid_thw=video_grid,
-        video_ref=["clip-a.mp4"],
-    )
-
-
-def test_vision_cache_encode_image_forwards_supported_grid_metadata():
-    pixel_values = mx.ones((1, 4), dtype=mx.float32)
-    image_grid_thw = mx.array([[1, 1, 1]], dtype=mx.int32)
-    captured = {}
-
-    class Model:
-        def encode_image(self, pixel_values, image_grid_thw=None):
-            captured["pixel_values"] = pixel_values
-            captured["image_grid_thw"] = image_grid_thw
-            return mx.ones((1, 3), dtype=mx.float32)
-
-    features = dispatch_module._encode_image_for_vision_cache(
-        Model(),
-        pixel_values,
-        {"image_grid_thw": image_grid_thw},
-    )
-
-    assert features.shape == (1, 3)
-    assert captured["pixel_values"] is pixel_values
-    assert captured["image_grid_thw"] is image_grid_thw
-
-
-def test_vision_cache_encode_image_keeps_legacy_single_argument_call():
-    pixel_values = mx.ones((1, 4), dtype=mx.float32)
-    captured = {}
-
-    class Model:
-        def encode_image(self, pixel_values):
-            captured["pixel_values"] = pixel_values
-            return mx.ones((1, 3), dtype=mx.float32)
-
-    features = dispatch_module._encode_image_for_vision_cache(
-        Model(),
-        pixel_values,
-        {"image_grid_thw": mx.array([[1, 1, 1]], dtype=mx.int32)},
-    )
-
-    assert features.shape == (1, 3)
-    assert captured["pixel_values"] is pixel_values
-
-
-def test_vision_cache_encode_video_forwards_supported_grid_metadata():
-    pixel_values = mx.ones((2, 4), dtype=mx.float32)
-    video_grid_thw = mx.array([[1, 1, 2]], dtype=mx.int32)
-    captured = {}
-
-    class Model:
-        def encode_video(self, pixel_values, video_grid_thw=None):
-            captured["pixel_values"] = pixel_values
-            captured["video_grid_thw"] = video_grid_thw
-            return mx.ones((2, 3), dtype=mx.float32)
-
-    features = dispatch_module._encode_video_for_vision_cache(
-        Model(),
-        pixel_values,
-        {"video_grid_thw": video_grid_thw},
-    )
-
-    assert features.shape == (2, 3)
-    assert captured["pixel_values"] is pixel_values
-    assert captured["video_grid_thw"] is video_grid_thw
-
-
-def test_vision_cache_encode_video_keeps_legacy_single_argument_call():
-    pixel_values = mx.ones((2, 4), dtype=mx.float32)
-    captured = {}
-
-    class Model:
-        def encode_video(self, pixel_values):
-            captured["pixel_values"] = pixel_values
-            return mx.ones((2, 3), dtype=mx.float32)
-
-    features = dispatch_module._encode_video_for_vision_cache(
-        Model(),
-        pixel_values,
-        {"video_grid_thw": mx.array([[1, 1, 2]], dtype=mx.int32)},
-    )
-
-    assert features.shape == (2, 3)
-    assert captured["pixel_values"] is pixel_values
-
-
-def test_stream_generate_vision_cache_passes_image_grid_to_encoder():
-    captured = {}
-
-    class Cache:
-        def get(self, image):
-            captured["cache_get"] = image
-            return None
-
-        def put(self, image, features):
-            captured["cache_put"] = image
-            captured["features"] = features
-
-    class Model:
-        config = SimpleNamespace(model_type="minimax_m3_vl", eos_token_id=[])
-        language_model = SimpleNamespace()
-
-        def encode_image(self, pixel_values, image_grid_thw=None):
-            captured["pixel_values"] = pixel_values
-            captured["image_grid_thw"] = image_grid_thw
-            return mx.ones((1, 3), dtype=mx.float32)
-
-    class FakeStoppingCriteria:
-        def __call__(self, token):
-            return False
-
-    class FakeDetokenizer:
-        def reset(self):
-            self.segments = []
-
-        def add_token(self, token, skip_special_token_ids=None):
-            self.segments.append(str(token))
-
-        @property
-        def last_segment(self):
-            return self.segments.pop(0) if self.segments else ""
-
-        def finalize(self):
-            pass
-
-    def fake_generate_step(*args, **kwargs):
-        assert kwargs["cached_image_features"].shape == (1, 3)
-        yield 7, mx.zeros((4,))
-
-    image_grid_thw = mx.array([[1, 1, 1]], dtype=mx.int32)
-    pixel_values = mx.ones((1, 4), dtype=mx.float32)
-    processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(stopping_criteria=FakeStoppingCriteria()),
-        detokenizer=FakeDetokenizer(),
-    )
-
-    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
-        list(
-            dispatch_module.stream_generate(
-                model=Model(),
-                processor=processor,
-                prompt="",
-                image=["image.png"],
-                input_ids=mx.array([[1, 2]], dtype=mx.int32),
-                pixel_values=pixel_values,
-                mask=None,
-                image_grid_thw=image_grid_thw,
-                prompt_cache=[],
-                vision_cache=Cache(),
-                max_tokens=1,
-            )
-        )
-
-    assert captured["cache_get"] == ["image.png"]
-    assert captured["cache_put"] == ["image.png"]
-    assert captured["pixel_values"] is pixel_values
-    assert captured["image_grid_thw"] is image_grid_thw
-
-
-def test_stream_generate_vision_cache_passes_video_grid_to_encoder():
-    captured = {}
-
-    class Cache:
-        def get(self, key):
-            captured["cache_get"] = key
-            return None
-
-        def put(self, key, features):
-            captured["cache_put"] = key
-            captured["features"] = features
-
-    class Model:
-        config = SimpleNamespace(model_type="minimax_m3_vl", eos_token_id=[])
-        language_model = SimpleNamespace()
-
-        def encode_video(self, pixel_values, video_grid_thw=None):
-            captured["pixel_values"] = pixel_values
-            captured["video_grid_thw"] = video_grid_thw
-            return mx.ones((2, 3), dtype=mx.float32)
-
-    class FakeStoppingCriteria:
-        def __call__(self, token):
-            return False
-
-    class FakeDetokenizer:
-        def reset(self):
-            self.segments = []
-
-        def add_token(self, token, skip_special_token_ids=None):
-            self.segments.append(str(token))
-
-        @property
-        def last_segment(self):
-            return self.segments.pop(0) if self.segments else ""
-
-        def finalize(self):
-            pass
-
-    def fake_generate_step(*args, **kwargs):
-        assert kwargs["cached_video_features"].shape == (2, 3)
-        yield 7, mx.zeros((4,))
-
-    video_grid_thw = mx.array([[1, 1, 2]], dtype=mx.int32)
-    pixel_values_videos = mx.ones((2, 4), dtype=mx.float32)
-    processor = SimpleNamespace(
-        tokenizer=SimpleNamespace(stopping_criteria=FakeStoppingCriteria()),
-        detokenizer=FakeDetokenizer(),
-    )
-
-    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
-        list(
-            dispatch_module.stream_generate(
-                model=Model(),
-                processor=processor,
-                prompt="",
-                video=["clip.mp4"],
-                input_ids=mx.array([[1, 2]], dtype=mx.int32),
-                pixel_values=None,
-                mask=None,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-                prompt_cache=[],
-                vision_cache=Cache(),
-                max_tokens=1,
-            )
-        )
-
-    assert captured["cache_get"] == ["video", "clip.mp4"]
-    assert captured["cache_put"] == ["video", "clip.mp4"]
-    assert captured["pixel_values"] is pixel_values_videos
-    assert captured["video_grid_thw"] is video_grid_thw
-
-
 def test_normalize_resize_shape_expands_single_value():
     assert normalize_resize_shape([224]) == (224, 224)
 
@@ -2096,18 +1717,6 @@ def test_normalize_resize_shape_accepts_two_values():
 def test_normalize_resize_shape_rejects_invalid_values(value):
     with pytest.raises(ValueError, match="resize_shape must contain 1 or 2 integers"):
         normalize_resize_shape(value)
-
-
-def test_normalize_max_long_side_pixel_accepts_positive_integer():
-    assert normalize_max_long_side_pixel(1008) == 1008
-
-
-@pytest.mark.parametrize("value", [0, -1, 1.0, True, "1008"])
-def test_normalize_max_long_side_pixel_rejects_invalid_values(value):
-    with pytest.raises(
-        ValueError, match="max_long_side_pixel must be a positive integer"
-    ):
-        normalize_max_long_side_pixel(value)
 
 
 def test_generate_cli_smoke(capsys):
@@ -2125,7 +1734,6 @@ def test_generate_cli_smoke(capsys):
         video=None,
         fps=2.0,
         resize_shape=[224],
-        max_long_side_pixel=1008,
         prompt=["Describe this image."],
         system=None,
         max_tokens=12,
@@ -2147,7 +1755,6 @@ def test_generate_cli_smoke(capsys):
         force_download=False,
         revision="main",
         trust_remote_code=False,
-        lazy_load=True,
         quantize_activations=False,
         processor_kwargs={},
         prefill_step_size=128,
@@ -2164,9 +1771,7 @@ def test_generate_cli_smoke(capsys):
 
     with (
         patch.object(dispatch_module, "parse_arguments", return_value=args),
-        patch.object(
-            dispatch_module, "load", return_value=(model, processor)
-        ) as mock_load,
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
         patch.object(
             dispatch_module, "apply_chat_template", return_value="prompt"
         ) as mock_apply_chat_template,
@@ -2179,89 +1784,10 @@ def test_generate_cli_smoke(capsys):
         dispatch_module.main()
 
     assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
-    assert mock_load.call_args.kwargs["lazy"] is True
     assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
-    assert mock_generate.call_args.kwargs["max_long_side_pixel"] == 1008
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
-    assert capsys.readouterr().out.strip() == "done"
-
-
-def test_generate_cli_keeps_minimax_m3_default_thinking_adaptive(capsys):
-    args = Namespace(
-        model="m3",
-        output_modality="text",
-        output=None,
-        size="512x512",
-        steps=4,
-        seed=None,
-        guidance=1.0,
-        adapter_path=None,
-        image=None,
-        audio=None,
-        video=None,
-        fps=2.0,
-        resize_shape=None,
-        max_long_side_pixel=None,
-        prompt=["Write a haiku."],
-        system=None,
-        max_tokens=12,
-        temperature=0.7,
-        repetition_penalty=None,
-        repetition_context_size=20,
-        presence_penalty=None,
-        presence_context_size=20,
-        frequency_penalty=None,
-        frequency_context_size=20,
-        chat=False,
-        verbose=False,
-        eos_tokens=None,
-        max_kv_size=None,
-        kv_bits=None,
-        kv_group_size=64,
-        quantized_kv_start=512,
-        skip_special_tokens=False,
-        force_download=False,
-        revision="main",
-        trust_remote_code=False,
-        lazy_load=False,
-        quantize_activations=False,
-        processor_kwargs={},
-        gen_kwargs={},
-        prefill_step_size=128,
-        enable_thinking=False,
-        thinking_mode=None,
-        thinking_budget=None,
-        thinking_start_token="<think>",
-        thinking_end_token="</think>",
-        draft_model=None,
-        draft_kind="dflash",
-        draft_block_size=None,
-    )
-    model = SimpleNamespace(config=SimpleNamespace(model_type="minimax_m3_vl"))
-    processor = SimpleNamespace()
-
-    with (
-        patch.object(dispatch_module, "parse_arguments", return_value=args),
-        patch.object(
-            dispatch_module, "load", return_value=(model, processor)
-        ) as mock_load,
-        patch.object(
-            dispatch_module, "apply_chat_template", return_value="prompt"
-        ) as mock_apply_chat_template,
-        patch.object(
-            dispatch_module,
-            "generate",
-            return_value=SimpleNamespace(text="done"),
-        ) as mock_generate,
-    ):
-        dispatch_module.main()
-
-    assert "enable_thinking" not in mock_apply_chat_template.call_args.kwargs
-    assert "thinking_mode" not in mock_apply_chat_template.call_args.kwargs
-    assert mock_load.call_args.kwargs["lazy"] is False
-    assert mock_generate.call_args.kwargs["enable_thinking"] is False
     assert capsys.readouterr().out.strip() == "done"
 
 
@@ -2335,27 +1861,7 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.thinking_end_token == "</think>"
     assert args.output_modality == "text"
     assert args.task == "generate"
-    assert args.lazy_load is False
     assert args.size is None
-    assert args.max_long_side_pixel is None
-
-
-def test_parse_arguments_accepts_max_long_side_pixel(monkeypatch):
-    monkeypatch.setattr(
-        sys, "argv", ["mlx_vlm.generate", "--max-long-side-pixel", "1008"]
-    )
-
-    args = generate_module.parse_arguments()
-
-    assert args.max_long_side_pixel == 1008
-
-
-def test_parse_arguments_accepts_lazy_load(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["mlx_vlm.generate", "--lazy-load"])
-
-    args = generate_module.parse_arguments()
-
-    assert args.lazy_load is True
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
@@ -2397,38 +1903,6 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     )
 
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
-
-
-def test_batch_apc_extra_hash_combines_precomputed_image_and_video_hashes():
-    batch_generator = SimpleNamespace(apc_manager=object())
-
-    got = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {
-            "_apc_image_hash": 123,
-            "_apc_video_hash": 456,
-            "_apc_tenant": "tenant-a",
-        },
-    )
-
-    expected_payload = apc_module.hash_multimodal_payload(123, 456)
-    assert got == apc_module.tenant_scoped_hash("tenant-a", expected_payload)
-
-
-def test_batch_apc_extra_hash_uses_video_pixels_when_precomputed_hash_missing():
-    batch_generator = SimpleNamespace(apc_manager=object())
-    video_pixels = mx.ones((2, 3, 2, 2), dtype=mx.float32)
-    video_grid = mx.array([[1, 1, 2]], dtype=mx.int32)
-
-    got = BatchGenerator._apc_extra_hash(
-        batch_generator,
-        {"pixel_values_videos": video_pixels, "video_grid_thw": video_grid},
-    )
-
-    assert got == apc_module.hash_video_payload(
-        pixel_values=video_pixels,
-        video_grid_thw=video_grid,
-    )
 
 
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
@@ -2530,7 +2004,6 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "keep_tensor": mx.ones((1, 1)),
                 "_apc_tenant": "tenant-a",
                 "_apc_image_hash": 123,
-                "_apc_video_hash": 234,
             },
             [],
             None,
@@ -2544,7 +2017,6 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "keep_tensor": mx.zeros((1, 1)),
                 "_apc_tenant": "tenant-b",
                 "_apc_image_hash": 456,
-                "_apc_video_hash": 567,
             },
             [],
             None,
@@ -2574,7 +2046,6 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert batch is not None
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
-    assert "_apc_video_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 
@@ -2601,79 +2072,6 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)
-
-
-def test_apc_pick_rejects_video_tokens_and_releases_blocks():
-    block_size = 4
-    video_token_id = 88
-    token_ids = [video_token_id, 1, 2, 3, 4]
-    manager = apc_module.APCManager(num_blocks=4, block_size=block_size)
-    layer_keys = [mx.ones((1, 1, block_size, 2))]
-    layer_values = [mx.ones((1, 1, block_size, 2)) * 2]
-    stored = manager.store_kv_blocks(
-        token_ids[:block_size],
-        layer_keys,
-        layer_values,
-    )
-    manager.release(stored)
-
-    bg = object.__new__(BatchGenerator)
-    bg.apc_manager = manager
-    bg.model = SimpleNamespace(config=SimpleNamespace(video_token_id=video_token_id))
-    bg._wire_stack = None
-
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
-
-    assert pick is None
-    assert all(block.ref_cnt == 0 for block in stored)
-
-
-def test_apc_pick_allows_video_prefix_in_exact_mode_when_suffix_is_text_only():
-    video_token_id = 88
-    token_ids = [video_token_id, 1, 2, 3, 4]
-    warm_cache = [object()]
-
-    class Manager:
-        def lookup_exact_cache(self, ids, extra_hash=0, min_prefix_tokens=0):
-            assert ids == token_ids
-            assert extra_hash == 0
-            assert min_prefix_tokens == 0
-            return warm_cache, 4
-
-    bg = object.__new__(BatchGenerator)
-    bg.apc_manager = Manager()
-    bg.apc_mode = "exact"
-    bg.model = SimpleNamespace(config=SimpleNamespace(video_token_id=video_token_id))
-    bg._wire_stack = None
-
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
-
-    assert pick is not None
-    assert pick["warm_cache"] is warm_cache
-    assert pick["prefix_len"] == 4
-    assert pick["matched_blocks"] == []
-
-
-def test_apc_pick_rejects_video_suffix_in_exact_mode():
-    video_token_id = 88
-    token_ids = [1, video_token_id, video_token_id, 2, 3]
-
-    class Manager:
-        def lookup_exact_cache(self, ids, extra_hash=0, min_prefix_tokens=0):
-            assert ids == token_ids
-            assert extra_hash == 0
-            assert min_prefix_tokens == 2
-            return [object()], 2
-
-    bg = object.__new__(BatchGenerator)
-    bg.apc_manager = Manager()
-    bg.apc_mode = "exact"
-    bg.model = SimpleNamespace(config=SimpleNamespace(video_token_id=video_token_id))
-    bg._wire_stack = None
-
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
-
-    assert pick is None
 
 
 if __name__ == "__main__":

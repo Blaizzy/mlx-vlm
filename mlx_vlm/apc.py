@@ -97,29 +97,9 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
-def hash_multimodal_payload(image_hash: int = 0, video_hash: int = 0) -> int:
-    """Combine independent media hashes into one APC payload salt."""
-    image_hash = int(image_hash or 0)
-    video_hash = int(video_hash or 0)
-    if image_hash and video_hash:
-        return _stable_int_hash(0x4D4D5F5041594C44, image_hash, video_hash)
-    return image_hash or video_hash
-
-
 def _copy_mlx_array(x: mx.array) -> mx.array:
     """Materialize ``x`` into a fresh MLX-owned contiguous buffer."""
     return mx.contiguous(mx.array(x, dtype=x.dtype))
-
-
-def _minimax_m3_cache_classes() -> Tuple[Optional[type], Optional[type]]:
-    try:
-        from mlx_vlm.models.minimax_m3_vl.language import (
-            MiniMaxM3BatchKVCache,
-            MiniMaxM3KVCache,
-        )
-    except Exception:
-        return None, None
-    return MiniMaxM3KVCache, MiniMaxM3BatchKVCache
 
 
 def _pad_kv_for_capacity(
@@ -145,25 +125,6 @@ def _pad_kv_for_capacity(
     return keys, values
 
 
-def _pad_index_keys_for_capacity(
-    keys: mx.array,
-    *,
-    offset: int,
-    min_capacity_tokens: Optional[int],
-    step: int,
-) -> mx.array:
-    if min_capacity_tokens is None or min_capacity_tokens <= offset:
-        return keys
-    capacity = int(min_capacity_tokens)
-    if step > 0:
-        capacity = ((capacity + step - 1) // step) * step
-    if capacity <= keys.shape[2]:
-        return keys
-    pad_tokens = capacity - keys.shape[2]
-    pad_shape = (*keys.shape[:2], pad_tokens, keys.shape[3])
-    return mx.concatenate([keys, mx.zeros(pad_shape, dtype=keys.dtype)], axis=2)
-
-
 def _clone_cache_entry_for_apc(
     c: Any,
     *,
@@ -172,35 +133,6 @@ def _clone_cache_entry_for_apc(
 ) -> Optional[Any]:
     """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
     from mlx_lm.models import cache as lm_cache
-
-    minimax_m3_cache, _ = _minimax_m3_cache_classes()
-    if minimax_m3_cache is not None and isinstance(c, minimax_m3_cache):
-        out = type(c)()
-        copied_kv = _clone_cache_entry_for_apc(
-            c.kv_cache,
-            min_capacity_tokens=min_capacity_tokens,
-            eval_targets=eval_targets,
-        )
-        if copied_kv is None:
-            return None
-        out.kv_cache = copied_kv
-        index_off = int(getattr(c, "index_offset", 0) or 0)
-        if c.index_keys is None or index_off <= 0:
-            if int(getattr(c.kv_cache, "offset", 0) or 0) > 0:
-                return None
-            return out
-        index_keys = _copy_mlx_array(c.index_keys[..., :index_off, :])
-        step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
-        index_keys = _pad_index_keys_for_capacity(
-            index_keys,
-            offset=index_off,
-            min_capacity_tokens=min_capacity_tokens,
-            step=step,
-        )
-        out.index_keys = index_keys
-        out.index_offset = index_off
-        eval_targets.append(index_keys)
-        return out
 
     if isinstance(c, lm_cache.KVCache):
         out = type(c)()
@@ -340,9 +272,6 @@ def _clone_layer_major_kv_cache_for_apc(
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
     from mlx_lm.models import cache as lm_cache
 
-    minimax_m3_cache, _ = _minimax_m3_cache_classes()
-    if minimax_m3_cache is not None and isinstance(c, minimax_m3_cache):
-        return True
     if isinstance(
         c,
         (
@@ -388,13 +317,9 @@ def hash_image_payload(
     """
     if pixel_values is not None:
         try:
-            h = hashlib.sha256()
             arr = np.asarray(pixel_values).astype(np.float16, copy=False)
-            h.update(int(arr.ndim).to_bytes(1, "little", signed=False))
-            for dim in arr.shape:
-                h.update(int(dim).to_bytes(8, "little", signed=False))
-            h.update(arr.tobytes())
-            return int.from_bytes(h.digest()[:8], "little", signed=True)
+            digest = hashlib.sha256(arr.tobytes()).digest()
+            return int.from_bytes(digest[:8], "little", signed=True)
         except Exception:
             pass
 
@@ -413,53 +338,6 @@ def hash_image_payload(
             hashlib.sha256(image_ref).digest()[:8], "little", signed=True
         )
     digest = hashlib.sha256(repr(image_ref).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "little", signed=True)
-
-
-def hash_video_payload(
-    pixel_values: Optional[mx.array] = None,
-    video_grid_thw: Optional[mx.array] = None,
-    video_ref: Any = None,
-) -> int:
-    """Stable content hash of a video payload.
-
-    Prefers hashing processed frame tensors so sampling, resize, and transform
-    changes invalidate APC entries. Falls back to the source identifier when
-    server paths already converted media into embeddings.
-    """
-    if pixel_values is not None:
-        try:
-            h = hashlib.sha256()
-            arr = np.asarray(pixel_values).astype(np.float16, copy=False)
-            h.update(int(arr.ndim).to_bytes(1, "little", signed=False))
-            for dim in arr.shape:
-                h.update(int(dim).to_bytes(8, "little", signed=False))
-            h.update(arr.tobytes())
-            if video_grid_thw is not None:
-                grid = np.asarray(video_grid_thw).astype(np.int32, copy=False)
-                h.update(int(grid.ndim).to_bytes(1, "little", signed=False))
-                for dim in grid.shape:
-                    h.update(int(dim).to_bytes(8, "little", signed=False))
-                h.update(grid.tobytes())
-            return int.from_bytes(h.digest()[:8], "little", signed=True)
-        except Exception:
-            pass
-
-    if video_ref is None:
-        return 0
-    if isinstance(video_ref, (list, tuple)):
-        h = SEED_PARENT_HASH
-        for it in video_ref:
-            h = _stable_int_hash(h, hash_video_payload(video_ref=it))
-        return h
-    if isinstance(video_ref, str):
-        digest = hashlib.sha256(video_ref.encode("utf-8")).digest()
-        return int.from_bytes(digest[:8], "little", signed=True)
-    if isinstance(video_ref, bytes):
-        return int.from_bytes(
-            hashlib.sha256(video_ref).digest()[:8], "little", signed=True
-        )
-    digest = hashlib.sha256(repr(video_ref).encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "little", signed=True)
 
 
@@ -1443,49 +1321,6 @@ class DiskBlockStore:
         from mlx_lm.models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
-        if kind == "minimax_m3_kv":
-            minimax_m3_cache, _ = _minimax_m3_cache_classes()
-            if minimax_m3_cache is None:
-                return None
-            kv_cache = self._load_exact_cache_entry(
-                path,
-                tensor_entries,
-                metadata,
-                data_start,
-                f"{prefix}_kv",
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            if kv_cache is None:
-                return None
-            try:
-                index_offset = int(metadata.get(f"{prefix}_index_offset", "0"))
-                step = int(metadata.get(f"{prefix}_index_step", "256"))
-            except (TypeError, ValueError):
-                return None
-            c = minimax_m3_cache()
-            c.kv_cache = kv_cache
-            if metadata.get(f"{prefix}_index_empty", "0") == "1":
-                if int(getattr(kv_cache, "offset", 0) or 0) > 0:
-                    return None
-                return c
-            index_entry = tensor_entries.get(f"{prefix}_index_k")
-            if index_entry is None:
-                return None
-            index_keys = _read_safetensors_tensor(path, data_start, index_entry)
-            if index_keys is None:
-                return None
-            index_keys = _pad_index_keys_for_capacity(
-                index_keys,
-                offset=index_offset,
-                min_capacity_tokens=min_capacity_tokens,
-                step=step,
-            )
-            c.index_keys = index_keys
-            c.index_offset = index_offset
-            eval_targets.append(index_keys)
-            return c
-
         if kind == "kv":
             if metadata.get(f"{prefix}_empty", "0") == "1":
                 c = lm_cache.KVCache()
@@ -2643,24 +2478,6 @@ class DiskBlockStore:
     ) -> bool:
         from mlx_lm.models import cache as lm_cache
 
-        minimax_m3_cache, _ = _minimax_m3_cache_classes()
-        if minimax_m3_cache is not None and isinstance(c, minimax_m3_cache):
-            index_off = int(getattr(c, "index_offset", 0) or 0)
-            metadata[f"{prefix}_kind"] = "minimax_m3_kv"
-            metadata[f"{prefix}_index_offset"] = str(index_off)
-            metadata[f"{prefix}_index_step"] = str(
-                int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
-            )
-            if not self._snapshot_exact_cache_entry(
-                c.kv_cache, f"{prefix}_kv", arrays, metadata
-            ):
-                return False
-            if c.index_keys is None or index_off <= 0:
-                metadata[f"{prefix}_index_empty"] = "1"
-                return int(getattr(c.kv_cache, "offset", 0) or 0) <= 0
-            arrays[f"{prefix}_index_k"] = c.index_keys[..., :index_off, :]
-            return True
-
         if isinstance(c, lm_cache.KVCache):
             off = int(getattr(c, "offset", 0) or 0)
             metadata[f"{prefix}_kind"] = "kv"
@@ -3780,17 +3597,6 @@ def _merge_arrays_cache_entries(
     return out
 
 
-def _merge_minimax_m3_cache_entries(
-    entries: Sequence[Any],
-    prefix_lens: Sequence[int],
-) -> Optional[Any]:
-    minimax_m3_cache, minimax_m3_batch_cache = _minimax_m3_cache_classes()
-    if minimax_m3_cache is None or minimax_m3_batch_cache is None:
-        return None
-
-    return minimax_m3_batch_cache.merge(entries, prefix_lens=prefix_lens)
-
-
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
@@ -3800,11 +3606,6 @@ def _merge_exact_cache_entries(
     if not entries:
         return None
     first = entries[0]
-    minimax_m3_cache, _ = _minimax_m3_cache_classes()
-    if minimax_m3_cache is not None and all(
-        isinstance(c, minimax_m3_cache) for c in entries
-    ):
-        return _merge_minimax_m3_cache_entries(entries, prefix_lens)
     if all(isinstance(c, lm_cache.KVCache) for c in entries):
         return lm_cache.BatchKVCache.merge(entries)
     if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):

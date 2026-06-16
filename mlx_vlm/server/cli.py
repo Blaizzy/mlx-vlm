@@ -44,14 +44,6 @@ def main():
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
     parser.add_argument(
-        "--lazy-load",
-        action="store_true",
-        help=(
-            "Skip eager parameter materialization when loading text/VLM models. "
-            "This can reduce startup memory for very large checkpoints."
-        ),
-    )
-    parser.add_argument(
         "--model",
         type=str,
         default=None,
@@ -156,8 +148,7 @@ def main():
         default=None,
         help=(
             "Speculative drafter path or HF id "
-            "(e.g. z-lab/Qwen3.5-4B-DFlash, google/gemma-4-31B-it-assistant, "
-            "Inferact/MiniMax-M3-EAGLE3)."
+            "(e.g. z-lab/Qwen3.5-4B-DFlash, google/gemma-4-31B-it-assistant)."
         ),
     )
     parser.add_argument(
@@ -165,7 +156,7 @@ def main():
         type=str,
         default=None,
         choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (native/assistant MTP). "
+        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -199,7 +190,6 @@ def main():
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
-    os.environ["MLX_VLM_LAZY_LOAD"] = "1" if args.lazy_load else "0"
     if args.model:
         os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
         if args.adapter_path:

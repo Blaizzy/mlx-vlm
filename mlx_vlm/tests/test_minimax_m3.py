@@ -5,11 +5,6 @@ import numpy as np
 from mlx_lm.models.switch_layers import SwitchGLU
 
 import mlx_vlm.models.minimax_m3_vl.language as minimax_language
-from mlx_vlm.generate.ar import _make_cache
-from mlx_vlm.generate.dispatch import (
-    _drop_unused_multimodal_inputs,
-    _trim_prompt_cache_entry_to,
-)
 from mlx_vlm.models.minimax_m3_vl.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.minimax_m3_vl.language import (
     LanguageModel,
@@ -33,8 +28,6 @@ from mlx_vlm.models.minimax_m3_vl.vision import (
     _apply_vision_rope,
 )
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.speculative.eagle3 import _eagle3_verify_target
-from mlx_vlm.video_generate import _video_inputs_to_generation_args
 
 
 def _tiny_minimax_text_config(num_hidden_layers=2, **kwargs):
@@ -1290,85 +1283,6 @@ def test_minimax_m3_omitted_thinking_flag_uses_template_default():
     assert "thinking_mode" not in processor.kwargs
 
 
-def test_minimax_m3_chat_forwards_thinking_mode_to_template_only(monkeypatch):
-    import mlx_vlm.chat as chat_mod
-
-    class Model:
-        config = {"model_type": "minimax_m3_vl"}
-
-    class Processor:
-        pass
-
-    class Chunk:
-        text = "ok"
-
-    captured_template = {}
-    captured_stream = {}
-
-    def fake_apply_chat_template(*args, **kwargs):
-        del args
-        captured_template.update(kwargs)
-        return "prompt"
-
-    def fake_stream_generate(*args, **kwargs):
-        del args
-        captured_stream.update(kwargs)
-        yield Chunk()
-
-    monkeypatch.setattr(chat_mod, "load", lambda model_path: (Model(), Processor()))
-    monkeypatch.setattr(chat_mod.MLXVisionChat, "print_help", lambda self: None)
-    monkeypatch.setattr(chat_mod, "apply_chat_template", fake_apply_chat_template)
-    monkeypatch.setattr(chat_mod, "stream_generate", fake_stream_generate)
-
-    session = chat_mod.MLXVisionChat(
-        model_path="m3",
-        enable_thinking=False,
-        thinking_mode="adaptive",
-    )
-    session.add_to_history("user", "Think when needed.")
-
-    assert session.generate_response() == "ok"
-    assert captured_template["enable_thinking"] is False
-    assert captured_template["thinking_mode"] == "adaptive"
-    assert "thinking_mode" not in captured_stream
-
-
-def test_minimax_m3_chat_keeps_default_thinking_mode_adaptive(monkeypatch):
-    import mlx_vlm.chat as chat_mod
-
-    class Model:
-        config = {"model_type": "minimax_m3_vl"}
-
-    class Processor:
-        pass
-
-    class Chunk:
-        text = "ok"
-
-    captured_template = {}
-
-    def fake_apply_chat_template(*args, **kwargs):
-        del args
-        captured_template.update(kwargs)
-        return "prompt"
-
-    def fake_stream_generate(*args, **kwargs):
-        del args, kwargs
-        yield Chunk()
-
-    monkeypatch.setattr(chat_mod, "load", lambda model_path: (Model(), Processor()))
-    monkeypatch.setattr(chat_mod.MLXVisionChat, "print_help", lambda self: None)
-    monkeypatch.setattr(chat_mod, "apply_chat_template", fake_apply_chat_template)
-    monkeypatch.setattr(chat_mod, "stream_generate", fake_stream_generate)
-
-    session = chat_mod.MLXVisionChat(model_path="m3")
-    session.add_to_history("user", "Use the model default.")
-
-    assert session.generate_response() == "ok"
-    assert "enable_thinking" not in captured_template
-    assert "thinking_mode" not in captured_template
-
-
 def test_minimax_m3_template_decodes_top_level_tool_arguments():
     class Processor:
         chat_template = "template"
@@ -1542,56 +1456,6 @@ def test_minimax_m3_processor_expands_video_tokens_with_timestamps():
             assert outputs["mm_token_type_ids"][0][index] == 2
 
 
-def test_minimax_m3_video_generate_keeps_video_pixels_in_kwargs():
-    inputs = {
-        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
-        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
-        "pixel_values_videos": mx.ones((2, 4), dtype=mx.float32),
-        "video_grid_thw": mx.array([[1, 1, 2]], dtype=mx.int32),
-    }
-
-    input_ids, pixel_values, mask, kwargs = _video_inputs_to_generation_args(
-        inputs, "minimax_m3_vl"
-    )
-
-    assert input_ids.tolist() == [[1, 2, 3]]
-    assert mask.tolist() == [[1, 1, 1]]
-    assert pixel_values is None
-    assert kwargs["pixel_values_videos"].shape == (2, 4)
-    assert kwargs["video_grid_thw"].tolist() == [[1, 1, 2]]
-
-
-def test_video_generate_non_minimax_keeps_legacy_video_pixel_mapping():
-    inputs = {
-        "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
-        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
-        "pixel_values_videos": mx.ones((2, 4), dtype=mx.float32),
-        "video_grid_thw": mx.array([[1, 1, 2]], dtype=mx.int32),
-    }
-
-    _, pixel_values, _, kwargs = _video_inputs_to_generation_args(inputs, "qwen2_5_vl")
-
-    assert pixel_values.shape == (2, 4)
-    assert "pixel_values_videos" not in kwargs
-    assert kwargs["video_grid_thw"].tolist() == [[1, 1, 2]]
-
-
-def test_prompt_cache_trim_keeps_minimax_m3_index_cache_in_sync():
-    cache = MiniMaxM3KVCache()
-    keys = mx.ones((1, 1, 5, 4), dtype=mx.float32)
-    values = mx.ones((1, 1, 5, 4), dtype=mx.float32)
-    index_keys = mx.ones((1, 1, 5, 4), dtype=mx.float32)
-
-    cache.update_and_fetch(keys, values)
-    cache.update_index_and_fetch(index_keys)
-    _trim_prompt_cache_entry_to(cache, 3)
-
-    assert cache.offset == 3
-    assert cache.index_offset == 3
-    assert cache.state[0][0].shape[2] == 3
-    assert cache.state[1].shape[2] == 3
-
-
 def test_minimax_m3_empty_cache_state_roundtrips():
     cache = MiniMaxM3KVCache()
 
@@ -1647,27 +1511,6 @@ def test_minimax_m3_to_batch_preserves_warm_kv_and_index_cache():
     assert extracted.index_keys.tolist() == index_keys.tolist()
 
 
-def test_minimax_m3_eagle3_verifier_captures_hidden_states():
-    lm = LanguageModel(_tiny_minimax_text_config(num_hidden_layers=2))
-    prompt_cache = lm.make_cache()
-    verify_input = mx.array([[1, 2, 3]], dtype=mx.int32)
-
-    def sampler(logits):
-        return mx.argmax(logits, axis=-1).astype(mx.int32)
-
-    hidden, target_tokens, gdn_states = _eagle3_verify_target(
-        lm,
-        verify_input,
-        prompt_cache=prompt_cache,
-        sampler=sampler,
-        target_layer_ids=[0, 1],
-    )
-
-    assert hidden.shape == (1, 3, 16)
-    assert target_tokens.shape == (1, 3)
-    assert gdn_states is None
-
-
 def test_minimax_m3_rollback_speculative_cache_trims_index_cache():
     lm = LanguageModel(_tiny_minimax_text_config(num_hidden_layers=1))
     cache = MiniMaxM3KVCache()
@@ -1705,85 +1548,6 @@ def test_minimax_m3_batch_rollback_zeroes_rejected_index_tails():
     assert cache.kv_cache.keys[1, :, 2:4, :].sum().item() == 0
     assert cache.kv_cache.values[1, :, 2:4, :].sum().item() == 0
     assert cache.index_keys[1, :, 2:4, :].sum().item() == 0
-
-
-def test_multimodal_prefix_trim_drops_unused_minimax_video_kwargs():
-    class ModelStub:
-        config = type(
-            "Config",
-            (),
-            {"image_token_index": 5, "video_token_index": 6},
-        )()
-
-    pixel_values = mx.ones((1, 2), dtype=mx.float32)
-    kwargs = {
-        "cached_image_features": mx.ones((1, 2), dtype=mx.float32),
-        "cached_video_features": mx.ones((3, 2), dtype=mx.float32),
-        "pixel_values_videos": mx.ones((3, 2), dtype=mx.float32),
-        "video_grid_thw": mx.array([[1, 1, 3]], dtype=mx.int32),
-    }
-
-    pixel_values = _drop_unused_multimodal_inputs(
-        ModelStub(), [1, 2, 3], pixel_values, kwargs
-    )
-
-    assert pixel_values is None
-    assert "cached_image_features" not in kwargs
-    assert "cached_video_features" not in kwargs
-    assert "pixel_values_videos" not in kwargs
-    assert "video_grid_thw" not in kwargs
-
-
-def test_multimodal_prefix_trim_keeps_minimax_video_kwargs_for_video_suffix():
-    class ModelStub:
-        config = type(
-            "Config",
-            (),
-            {"image_token_index": 5, "video_token_index": 6},
-        )()
-
-    pixel_values = mx.ones((1, 2), dtype=mx.float32)
-    kwargs = {
-        "cached_image_features": mx.ones((1, 2), dtype=mx.float32),
-        "cached_video_features": mx.ones((3, 2), dtype=mx.float32),
-        "pixel_values_videos": mx.ones((3, 2), dtype=mx.float32),
-        "video_grid_thw": mx.array([[1, 1, 3]], dtype=mx.int32),
-    }
-
-    pixel_values = _drop_unused_multimodal_inputs(
-        ModelStub(), [6, 42], pixel_values, kwargs
-    )
-
-    assert pixel_values is None
-    assert "cached_image_features" not in kwargs
-    assert "cached_video_features" in kwargs
-    assert kwargs["pixel_values_videos"].shape == (3, 2)
-    assert kwargs["video_grid_thw"].tolist() == [[1, 1, 3]]
-
-
-def test_multimodal_prefix_trim_keeps_image_pixels_for_image_suffix():
-    class ModelStub:
-        config = type(
-            "Config",
-            (),
-            {"image_token_index": 5, "video_token_index": 6},
-        )()
-
-    pixel_values = mx.ones((1, 2), dtype=mx.float32)
-    kwargs = {
-        "cached_image_features": mx.ones((1, 2), dtype=mx.float32),
-        "cached_video_features": mx.ones((3, 2), dtype=mx.float32),
-        "pixel_values_videos": mx.ones((3, 2), dtype=mx.float32),
-        "video_grid_thw": mx.array([[1, 1, 3]], dtype=mx.int32),
-    }
-
-    result = _drop_unused_multimodal_inputs(ModelStub(), [5, 42], pixel_values, kwargs)
-
-    assert result is pixel_values
-    assert "cached_image_features" in kwargs
-    assert "cached_video_features" not in kwargs
-    assert "pixel_values_videos" not in kwargs
-    assert "video_grid_thw" not in kwargs
 
 
 def test_minimax_m3_batch_index_cache_filter_extend_extract():
@@ -1858,27 +1622,6 @@ def test_minimax_m3_batch_cache_merge_preserves_index_cache_rows():
     assert merged.offset.tolist() == [3, 0]
     assert merged.index_keys[0].tolist() == warm.index_keys[0, :, :3, :].tolist()
     assert merged.index_keys[1].sum().item() == 0
-
-
-def test_minimax_m3_batch_cache_preserves_sparse_index_with_kv_quantization():
-    config = _tiny_minimax_text_config(num_hidden_layers=1)
-    config.sparse_attention_config = {
-        "use_sparse_attention": True,
-        "sparse_attention_freq": [1],
-        "sparse_index_dim": 4,
-        "sparse_num_index_heads": 1,
-        "sparse_block_size": 2,
-        "sparse_topk_blocks": 1,
-    }
-    lm = LanguageModel(config)
-
-    batch_cache = _make_cache(lm, [0], kv_bits=4, kv_group_size=64)
-    sparse_cache = batch_cache[0]
-
-    assert isinstance(sparse_cache, MiniMaxM3BatchKVCache)
-    assert hasattr(sparse_cache, "update_index_and_fetch")
-    index_keys = sparse_cache.update_index_and_fetch(mx.ones((1, 1, 2, 4)))
-    assert index_keys.shape == (1, 1, 2, 4)
 
 
 def test_minimax_m3_uniform_batch_cache_skips_decode_mask():

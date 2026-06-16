@@ -20,8 +20,6 @@ from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
-    normalize_max_long_side_pixel,
-    normalize_resize_shape,
 )
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
@@ -160,8 +158,6 @@ def _build_gen_args(
         "enable_thinking",
         get_server_enable_thinking(),
     )
-    fields_set = getattr(request, "model_fields_set", None)
-    enable_thinking_explicit = fields_set is None or "enable_thinking" in fields_set
     default_temperature = _model_config_field_or_default(
         processor, "temperature", DEFAULT_TEMPERATURE
     )
@@ -169,18 +165,6 @@ def _build_gen_args(
     default_top_k = _model_config_field_or_default(processor, "top_k", 0)
     if _model_config_field_or_default(processor, "do_sample", None) is False:
         default_temperature = 0.0
-    chat_template_kwargs = getattr(request, "chat_template_kwargs", None)
-    if hasattr(chat_template_kwargs, "model_dump"):
-        chat_template_kwargs = chat_template_kwargs.model_dump(exclude_none=True)
-    if not isinstance(chat_template_kwargs, dict):
-        chat_template_kwargs = {}
-    thinking_mode = getattr(request, "thinking_mode", None)
-    if thinking_mode is None:
-        thinking_mode = chat_template_kwargs.get("thinking_mode")
-    if thinking_mode == "enabled":
-        enable_thinking = True
-    elif thinking_mode == "disabled":
-        enable_thinking = False
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=_request_field_or_default(
@@ -211,8 +195,6 @@ def _build_gen_args(
         ),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
-        enable_thinking_explicit=enable_thinking_explicit,
-        thinking_mode=thinking_mode,
         thinking_budget=_request_field_or_default(
             request, "thinking_budget", get_server_thinking_budget()
         ),
@@ -221,10 +203,6 @@ def _build_gen_args(
         ),
         thinking_end_token=_request_field_or_default(
             request, "thinking_end_token", get_server_thinking_end_token()
-        ),
-        resize_shape=normalize_resize_shape(getattr(request, "resize_shape", None)),
-        max_long_side_pixel=normalize_max_long_side_pixel(
-            getattr(request, "max_long_side_pixel", None)
         ),
         tenant_id=tenant_id,
     )
@@ -266,7 +244,6 @@ async def _preflight_stream_context_budget(
     prompt: str,
     images: Optional[List] = None,
     audio: Optional[List] = None,
-    videos: Optional[List] = None,
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
@@ -278,7 +255,6 @@ async def _preflight_stream_context_budget(
             prompt,
             images,
             audio,
-            videos,
             args,
         )
     except PromptTooLongError as e:
@@ -345,196 +321,35 @@ def _build_structured_logits_processors(request, processor):
     return [logits_processor]
 
 
-def _count_delimited_thinking_tag_tokens(
-    text: str,
-    start_marker: str,
-    end_marker: str,
-    *,
-    assume_in_thinking: bool = False,
-) -> int:
-    has_start = start_marker in text
-    has_end = end_marker in text
-    if not has_start and not has_end:
-        return 0
-
-    count = int(has_start)
-    if has_end and (
-        has_start or assume_in_thinking or text.lstrip().startswith(end_marker)
-    ):
-        count += 1
-    return count
-
-
 def _count_thinking_tag_tokens(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
-    *,
-    assume_in_thinking: bool = False,
 ) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
     count = 0
     if (
         thinking_start_token
         and thinking_end_token
-        and (thinking_start_token in text or thinking_end_token in text)
+        and thinking_start_token in text
+        and thinking_end_token in text
     ):
-        return _count_delimited_thinking_tag_tokens(
-            text,
-            thinking_start_token,
-            thinking_end_token,
-            assume_in_thinking=assume_in_thinking,
-        )
+        return 2
     # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
     if "<|channel>thought" in text and "<channel|>" in text:
         count = 4
-    elif "<think>" in text or "</think>" in text:
-        count = _count_delimited_thinking_tag_tokens(
-            text,
-            "<think>",
-            "</think>",
-            assume_in_thinking=assume_in_thinking,
-        )
-    elif "<mm:think>" in text or "</mm:think>" in text:
-        count = _count_delimited_thinking_tag_tokens(
-            text,
-            "<mm:think>",
-            "</mm:think>",
-            assume_in_thinking=assume_in_thinking,
-        )
+    elif "<think>" in text and "</think>" in text:
+        count = 2  # <think> and </think> are 1 token each typically
     return count
-
-
-def _find_earliest_marker(text: str, markers: Tuple[str, ...]) -> Tuple[int, str]:
-    marker_pos = -1
-    found_marker = ""
-    for marker in markers:
-        pos = text.find(marker)
-        if pos >= 0 and (marker_pos < 0 or pos < marker_pos):
-            marker_pos = pos
-            found_marker = marker
-    return marker_pos, found_marker
-
-
-def _partial_marker_suffix(text: str, markers: Tuple[str, ...]) -> str:
-    suffix = ""
-    for marker in markers:
-        max_len = min(len(marker) - 1, len(text))
-        for length in range(1, max_len + 1):
-            candidate = text[-length:]
-            if marker.startswith(candidate) and len(candidate) > len(suffix):
-                suffix = candidate
-    return suffix
 
 
 def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
-    *,
-    assume_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    return _split_thinking_text(
-        text,
-        thinking_start_token,
-        thinking_end_token,
-        assume_in_thinking=assume_in_thinking,
-    )
-
-
-def _split_stream_thinking_delta(
-    accumulated: str,
-    delta: str,
-    in_thinking: bool,
-    *,
-    at_response_start: bool = False,
-    thinking_start_token: Optional[str] = None,
-    thinking_end_token: Optional[str] = None,
-) -> Tuple[bool, str, bool, Optional[str], Optional[str]]:
-    """Split a streamed token into reasoning/content deltas."""
-    delta_reasoning = None
-    delta_content = None
-    marker_pairs = [
-        ("<|channel>thought", "<channel|>"),
-        ("<think>", "</think>"),
-        ("<mm:think>", "</mm:think>"),
-    ]
-    if thinking_start_token and thinking_end_token:
-        marker_pairs.insert(0, (thinking_start_token, thinking_end_token))
-    start_markers = tuple(dict.fromkeys(start for start, _ in marker_pairs))
-    end_markers = tuple(dict.fromkeys(end for _, end in marker_pairs))
-
-    if at_response_start and not in_thinking:
-        leading_text = accumulated.lstrip()
-        if not leading_text:
-            return in_thinking, accumulated, at_response_start, None, None
-
-        for end_marker in end_markers:
-            if leading_text.startswith(end_marker):
-                accumulated = leading_text[len(end_marker) :]
-                at_response_start = False
-                return (
-                    in_thinking,
-                    accumulated,
-                    at_response_start,
-                    None,
-                    accumulated or None,
-                )
-            if end_marker.startswith(leading_text):
-                return in_thinking, accumulated, at_response_start, None, None
-
-        at_response_start = False
-        delta = accumulated
-
-    if in_thinking:
-        marker_pos, start_marker = _find_earliest_marker(accumulated, start_markers)
-        if marker_pos >= 0:
-            accumulated = accumulated[:marker_pos] + accumulated[
-                marker_pos + len(start_marker) :
-            ].lstrip("\n")
-        marker_pos, end_marker = _find_earliest_marker(accumulated, end_markers)
-        if marker_pos >= 0:
-            reasoning = accumulated[:marker_pos]
-            content = accumulated[marker_pos + len(end_marker) :]
-            return (
-                False,
-                content,
-                False,
-                reasoning or None,
-                content or None,
-            )
-
-        pending_suffix = _partial_marker_suffix(accumulated, end_markers)
-        if pending_suffix:
-            reasoning = accumulated[: -len(pending_suffix)]
-            return (
-                in_thinking,
-                pending_suffix,
-                False,
-                reasoning or None,
-                None,
-            )
-
-        return in_thinking, "", False, accumulated or None, None
-
-    marker_pos, start_marker = _find_earliest_marker(accumulated, start_markers)
-    if not in_thinking and marker_pos >= 0:
-        in_thinking = True
-        prefix = accumulated[:marker_pos]
-        accumulated = accumulated[marker_pos + len(start_marker) :].lstrip("\n")
-        delta_content = prefix or None
-    elif not in_thinking and (
-        "<|channel>" in accumulated
-        or "<think" in accumulated
-        or "<mm:think" in accumulated
-        or _partial_marker_suffix(accumulated, start_markers)
-    ):
-        pass
-    else:
-        delta_content = delta
-
-    return in_thinking, accumulated, at_response_start, delta_reasoning, delta_content
+    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -953,7 +768,6 @@ _protocol_deps = SimpleNamespace(
     preflight_stream_context_budget=_preflight_stream_context_budget,
     as_plain_dict=_as_plain_dict,
     split_thinking=_split_thinking,
-    split_stream_thinking_delta=_split_stream_thinking_delta,
     count_thinking_tag_tokens=_count_thinking_tag_tokens,
     make_logprob_content=_make_logprob_content,
     build_metrics_envelope=_build_metrics_envelope,

@@ -23,7 +23,7 @@ from mlx_vlm.generate import (
     PromptCacheState,
     stream_generate,
 )
-from mlx_vlm.prompt_utils import apply_chat_template, thinking_template_kwargs
+from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_image
 from mlx_vlm.vision_cache import VisionFeatureCache
 
@@ -47,7 +47,6 @@ class MLXVisionChat:
         self.image_paths: List[str] = []
         self.vision_cache = VisionFeatureCache()
         self.prompt_cache_state = PromptCacheState()
-        self.thinking_mode = kwargs.pop("thinking_mode", None)
         self.stream_kwargs = kwargs
 
         with self.console.status("[bold green]Loading model..."):
@@ -94,11 +93,9 @@ class MLXVisionChat:
 
     def generate_response(self) -> str:
         """Generate a response from the model based on the conversation history."""
-        chat_template_kwargs = thinking_template_kwargs(
-            self.model.config,
-            enable_thinking=self.stream_kwargs.get("enable_thinking", False),
-            thinking_mode=self.thinking_mode,
-        )
+        chat_template_kwargs = {
+            "enable_thinking": self.stream_kwargs.get("enable_thinking", False),
+        }
 
         num_images = 1 if self.current_image_path else 0
         image = [self.current_image_path] if self.current_image_path else None
@@ -274,13 +271,6 @@ def main():
         help="Enable thinking mode in the chat template.",
     )
     parser.add_argument(
-        "--thinking-mode",
-        type=str,
-        choices=("enabled", "disabled", "adaptive"),
-        default=None,
-        help="MiniMax M3 thinking mode to pass through the chat template.",
-    )
-    parser.add_argument(
         "--thinking-budget",
         type=int,
         default=None,
@@ -319,12 +309,6 @@ def main():
 
     # Thinking kwargs
     kwargs["enable_thinking"] = args.enable_thinking
-    if args.thinking_mode == "enabled":
-        kwargs["enable_thinking"] = True
-    elif args.thinking_mode == "disabled":
-        kwargs["enable_thinking"] = False
-    if args.thinking_mode is not None:
-        kwargs["thinking_mode"] = args.thinking_mode
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token

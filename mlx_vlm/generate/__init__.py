@@ -16,7 +16,7 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
-from .dispatch import generate, normalize_max_long_side_pixel, stream_generate
+from .dispatch import generate, stream_generate
 from .edit_image import (
     ImageEditModel,
     ImageEditRequest,
@@ -69,7 +69,6 @@ __all__ = [
     "load_image_model",
     "main",
     "maybe_quantize_kv_cache",
-    "normalize_max_long_side_pixel",
     "parse_arguments",
     "stream_generate",
     "wired_limit",

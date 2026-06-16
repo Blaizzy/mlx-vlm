@@ -30,7 +30,6 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
-from mlx_vlm.models.minimax_m3_vl.config import TextConfig as MiniMaxM3TextConfig
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -248,28 +247,6 @@ def _make_drafter_config(model_type: str, hidden_size: int, *, field: str):
     else:
         raise ValueError(f"Unknown hidden-size field: {field}")
     return SimpleNamespace(**kwargs)
-
-
-MINIMAX_M3_EAGLE3_HF_CONFIG = {
-    "architectures": ["LlamaForCausalLMEagle3"],
-    "attention_bias": False,
-    "draft_vocab_size": 200064,
-    "fc_norm": True,
-    "head_dim": 128,
-    "hidden_act": "silu",
-    "hidden_size": 6144,
-    "intermediate_size": 18432,
-    "max_position_embeddings": 524288,
-    "model_type": "llama",
-    "norm_output": True,
-    "num_attention_heads": 64,
-    "num_hidden_layers": 1,
-    "num_key_value_heads": 64,
-    "rms_norm_eps": 1e-6,
-    "rope_theta": 5000000,
-    "tie_word_embeddings": False,
-    "vocab_size": 200064,
-}
 
 
 MTP_DRAFTER_COMPAT_CASES = [
@@ -2288,14 +2265,6 @@ def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "eagle3"
 
 
-def test_kind_none_autodetects_eagle3_architecture_config(tmp_path):
-    path = tmp_path / "drafter"
-    path.mkdir()
-    (path / "config.json").write_text(json.dumps(MINIMAX_M3_EAGLE3_HF_CONFIG))
-    assert resolve_drafter_kind(path, None) == "eagle3"
-    assert resolve_drafter_kind(path, "dflash") == "eagle3"
-
-
 @pytest.mark.parametrize("model_type,hidden_size_field", MTP_DRAFTER_COMPAT_CASES)
 def test_mtp_drafter_compatibility_accepts_matching_target(
     model_type, hidden_size_field
@@ -2385,13 +2354,6 @@ def test_model_loader_uses_gemma4_unified_assistant_drafter():
     assert config.text_config.num_kv_shared_layers == 4
 
 
-def test_model_loader_uses_architecture_for_eagle3_config():
-    arch, model_type = get_model_and_args(MINIMAX_M3_EAGLE3_HF_CONFIG)
-
-    assert model_type == "eagle3"
-    assert arch.Model is Eagle3DraftModel
-
-
 def test_kind_none_falls_back_to_default_for_unknown_model_type(tmp_path):
     path = _make_drafter_dir(tmp_path, "qwen3_dflash")
     assert resolve_drafter_kind(path, None) == DEFAULT_DRAFTER_KIND
@@ -2427,36 +2389,6 @@ def _tiny_qwen3_5_text_config():
             "mrope_section": [1, 0, 0],
             "rope_theta": 10000,
             "partial_rotary_factor": 0.25,
-        },
-    )
-
-
-def _tiny_minimax_m3_text_config():
-    return MiniMaxM3TextConfig(
-        hidden_size=16,
-        intermediate_size=8,
-        dense_intermediate_size=16,
-        shared_intermediate_size=8,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=8,
-        num_hidden_layers=1,
-        rotary_dim=4,
-        vocab_size=32,
-        moe_layer_freq=[1],
-        num_local_experts=2,
-        num_experts_per_tok=1,
-        n_shared_experts=0,
-        sparse_attention_config={
-            "use_sparse_attention": True,
-            "sparse_attention_freq": [1],
-            "sparse_disable_index_value": [1],
-            "sparse_index_dim": 4,
-            "sparse_num_index_heads": 1,
-            "sparse_block_size": 2,
-            "sparse_topk_blocks": 1,
-            "sparse_init_block": 0,
-            "sparse_local_block": 0,
         },
     )
 
@@ -2516,64 +2448,6 @@ def test_eagle3_config_uses_speculators_fields():
     assert cfg.target_layer_ids == [2, 30, 57]
     assert cfg.capture_layer_ids == [1, 29, 56]
     assert cfg.transformer_layer_config.hidden_size == 8
-
-
-def test_eagle3_config_uses_top_level_llama_fields():
-    cfg = Eagle3Config.from_dict(MINIMAX_M3_EAGLE3_HF_CONFIG)
-
-    assert cfg.model_type == "eagle3"
-    assert cfg.draft_vocab_size == 200064
-    assert cfg.fc_norm is True
-    assert cfg.norm_output is True
-    assert cfg.target_hidden_size == 6144
-    assert cfg.target_layer_ids_explicit is False
-    assert cfg.num_aux_hidden_states == 3
-    assert cfg.transformer_layer_config.model_type == "llama"
-    assert cfg.transformer_layer_config.hidden_size == 6144
-    assert cfg.transformer_layer_config.intermediate_size == 18432
-    assert cfg.transformer_layer_config.num_hidden_layers == 1
-    assert cfg.transformer_layer_config.vocab_size == 200064
-
-
-def test_eagle3_compatibility_uses_target_default_aux_layers():
-    target = SimpleNamespace(
-        language_model=SimpleNamespace(
-            config=SimpleNamespace(hidden_size=6144),
-            model=SimpleNamespace(layers=[object()] * 60),
-        )
-    )
-    cfg = Eagle3Config.from_dict(MINIMAX_M3_EAGLE3_HF_CONFIG)
-    drafter = SimpleNamespace(config=cfg)
-
-    validate_drafter_compatibility(target, drafter, "eagle3")
-
-    assert cfg.target_layer_ids == [2, 30, 57]
-    assert cfg.capture_layer_ids == [1, 29, 56]
-    assert cfg.num_aux_hidden_states == 3
-
-
-def test_eagle3_drafter_applies_fc_norm_for_minimax_config():
-    cfg = Eagle3Config(
-        fc_norm=True,
-        norm_output=True,
-        target_hidden_size=4,
-        num_aux_hidden_states=3,
-        target_layer_ids=[2, 4, 6],
-        transformer_layer_config=Eagle3TextConfig(
-            hidden_size=4,
-            intermediate_size=8,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=1,
-            head_dim=2,
-            vocab_size=16,
-        ),
-    )
-    drafter = Eagle3DraftModel(cfg)
-    hidden = mx.ones((1, 1, 12), dtype=mx.float32)
-
-    assert drafter._prepare_target_hidden(hidden).shape == (1, 1, 4)
-    assert len(drafter.fc_norm) == 3
 
 
 def test_eagle3_prefill_uses_mlx_capture_layer_indexes():

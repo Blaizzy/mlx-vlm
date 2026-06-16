@@ -163,18 +163,12 @@ class Eagle3DraftModel(nn.Module):
         text_config = config.transformer_layer_config
         self.hidden_size = text_config.hidden_size
         self.target_hidden_size = int(config.target_hidden_size or self.hidden_size)
-        self.num_aux_hidden_states = int(config.num_aux_hidden_states or 3)
         self.draft_vocab_size = int(config.draft_vocab_size)
         self.target_vocab_size = int(text_config.vocab_size)
         self.uses_draft_vocab = self.draft_vocab_size != self.target_vocab_size
-        self.norm_output = bool(config.norm_output)
 
         self.embed_tokens = nn.Embedding(self.target_vocab_size, self.hidden_size)
-        self.fc = nn.Linear(
-            self.num_aux_hidden_states * self.target_hidden_size,
-            self.hidden_size,
-            bias=False,
-        )
+        self.fc = nn.Linear(3 * self.target_hidden_size, self.hidden_size, bias=False)
         self.layers = [
             Eagle3FirstLayer(text_config, config.norm_before_residual),
             *[
@@ -185,18 +179,10 @@ class Eagle3DraftModel(nn.Module):
         self.norm = nn.RMSNorm(self.hidden_size, eps=text_config.rms_norm_eps)
         if config.norm_before_fc:
             self.input_norm = nn.RMSNorm(
-                self.num_aux_hidden_states * self.target_hidden_size,
-                eps=text_config.rms_norm_eps,
+                3 * self.target_hidden_size, eps=text_config.rms_norm_eps
             )
         else:
             self.input_norm = None
-        if config.fc_norm:
-            self.fc_norm = [
-                nn.RMSNorm(self.target_hidden_size, eps=text_config.rms_norm_eps)
-                for _ in range(self.num_aux_hidden_states)
-            ]
-        else:
-            self.fc_norm = None
 
         if config.tie_word_embeddings and not self.uses_draft_vocab:
             self.lm_head = None
@@ -276,23 +262,10 @@ class Eagle3DraftModel(nn.Module):
             return hidden
         if self.input_norm is not None:
             hidden = self.input_norm(hidden)
-        if self.fc_norm is not None:
-            chunks = [
-                hidden[
-                    ...,
-                    i * self.target_hidden_size : (i + 1) * self.target_hidden_size,
-                ]
-                for i in range(self.num_aux_hidden_states)
-            ]
-            hidden = mx.concatenate(
-                [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
-                axis=-1,
-            )
         return self.fc(hidden)
 
     def _logits(self, hidden: mx.array) -> mx.array:
-        if not self.norm_output:
-            hidden = self.norm(hidden)
+        hidden = self.norm(hidden)
         if self.lm_head is None:
             return self.embed_tokens.as_linear(hidden)
         return self.lm_head(hidden)
@@ -335,8 +308,6 @@ class Eagle3DraftModel(nn.Module):
             if isinstance(self._next_position, int)
             else self._next_position + steps
         )
-        if self.norm_output:
-            h = self.norm(h)
         return h
 
     def _set_seed_from_hidden(self, hidden: mx.array, sampler, token_dtype, greedy):
