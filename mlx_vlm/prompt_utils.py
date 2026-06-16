@@ -26,7 +26,6 @@ class MessageFormat(Enum):
     PROMPT_WITH_IMAGE_TOKEN = "prompt_with_image_token"
     PROMPT_WITH_START_IMAGE_TOKEN = "prompt_with_start_image_token"
     VIDEO_WITH_TEXT = "video_with_text"
-    MINIMAX_M3 = "minimax_m3"
 
 
 # Model configuration mapping
@@ -79,7 +78,6 @@ MODEL_CONFIG = {
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
-    "minimax_m3_vl": MessageFormat.MINIMAX_M3,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -115,44 +113,6 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "mllama",
     "falcon_ocr",
 }
-
-
-MINIMAX_M3_MODEL_TYPES = {"minimax_m3", "minimax_m3_vl"}
-
-
-def _model_type_from_config(config: Union[Dict[str, Any], Any]) -> str:
-    if isinstance(config, dict):
-        return config.get("model_type", "")
-    return getattr(config, "model_type", "")
-
-
-def is_minimax_m3_model_type(config: Union[Dict[str, Any], Any]) -> bool:
-    return _model_type_from_config(config) in MINIMAX_M3_MODEL_TYPES
-
-
-def thinking_template_kwargs(
-    config: Union[Dict[str, Any], Any],
-    *,
-    enable_thinking: bool = False,
-    thinking_mode: Union[str, None] = None,
-) -> Dict[str, Any]:
-    """Build chat-template thinking kwargs without disabling MiniMax adaptive mode.
-
-    MiniMax M3's template defaults to adaptive thinking when ``thinking_mode`` is
-    omitted. The generic CLI/server default is ``enable_thinking=False``; passing
-    that through would force MiniMax into non-thinking mode for ordinary no-flag
-    generation.
-    """
-    kwargs: Dict[str, Any] = {}
-    if (
-        enable_thinking
-        or thinking_mode is not None
-        or not is_minimax_m3_model_type(config)
-    ):
-        kwargs["enable_thinking"] = enable_thinking
-    if thinking_mode is not None:
-        kwargs["thinking_mode"] = thinking_mode
-    return kwargs
 
 
 def extract_text_from_content(content: Any) -> str:
@@ -194,26 +154,6 @@ def extract_text_from_content(content: Any) -> str:
     return str(content) if content else ""
 
 
-def _count_media_parts(content: Any) -> tuple[int, int, int]:
-    if not isinstance(content, list):
-        return 0, 0, 0
-
-    images = 0
-    audio = 0
-    videos = 0
-    for item in content:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type", "")
-        if item_type in ("image", "image_url", "input_image"):
-            images += 1
-        elif item_type in ("audio", "input_audio"):
-            audio += 1
-        elif item_type in ("video", "input_video", "video_url"):
-            videos += 1
-    return images, audio, videos
-
-
 def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     """Return (role, content) for a message-like item (dict or object with .role/.content), else None."""
     if isinstance(item, dict):
@@ -221,15 +161,6 @@ def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
     if hasattr(item, "role") and hasattr(item, "content"):
         return getattr(item, "role", "user"), getattr(item, "content", "")
     return None
-
-
-def _normalize_tool_arguments(arguments: Any) -> Any:
-    if not isinstance(arguments, str):
-        return arguments
-    try:
-        return json.loads(arguments)
-    except (json.JSONDecodeError, TypeError):
-        return {}
 
 
 def _normalize_tool_call_arguments(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -244,14 +175,13 @@ def _normalize_tool_call_arguments(message: Dict[str, Any]) -> Dict[str, Any]:
         tool_call = dict(tool_call) if isinstance(tool_call, dict) else tool_call
         if isinstance(tool_call, dict) and "function" in tool_call:
             function = dict(tool_call["function"])
-            function["arguments"] = _normalize_tool_arguments(
-                function.get("arguments", {})
-            )
+            arguments = function.get("arguments", {})
+            if isinstance(arguments, str):
+                try:
+                    function["arguments"] = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = {}
             tool_call["function"] = function
-        elif isinstance(tool_call, dict) and "arguments" in tool_call:
-            tool_call["arguments"] = _normalize_tool_arguments(
-                tool_call.get("arguments", {})
-            )
         normalized_calls.append(tool_call)
 
     normalized["tool_calls"] = normalized_calls
@@ -387,7 +317,6 @@ class MessageFormatter:
             MessageFormat.PROMPT_WITH_START_IMAGE_TOKEN: lambda *args, **kw: prompt
             + "<start_of_image>" * num_images,
             MessageFormat.VIDEO_WITH_TEXT: self._format_video_message,
-            MessageFormat.MINIMAX_M3: self._format_minimax_m3,
         }
 
         formatter = formatter_map.get(self.format_type)
@@ -539,37 +468,6 @@ class MessageFormatter:
                 content = f"{''.join(prefix_parts)}{content}"
 
         return {"role": role, "content": content}
-
-    def _format_minimax_m3(
-        self,
-        prompt: str,
-        role: str,
-        skip_image_token: bool,
-        skip_audio_token: bool,
-        num_images: int,
-        num_audios: int,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        """Format MiniMax M3 prompts with native image/video placeholder tokens."""
-        content = prompt
-        if role != "user":
-            return {"role": role, "content": content}
-
-        prefix = ""
-        if not skip_image_token and num_images > 0:
-            prefix += "]<]image[>[" * num_images
-
-        videos = kwargs.get("video") or kwargs.get("videos")
-        if videos is not None:
-            if not isinstance(videos, list):
-                videos = [videos]
-            num_videos = len(videos)
-        else:
-            num_videos = int(kwargs.get("num_videos", 0) or 0)
-        if not skip_image_token and num_videos > 0:
-            prefix += "]<]video[>[" * num_videos
-
-        return {"role": role, "content": f"{prefix}{content}"}
 
     def _format_video_message(
         self,
@@ -862,11 +760,6 @@ def apply_chat_template(
     """
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
-    if model_type in MINIMAX_M3_MODEL_TYPES and "thinking_mode" not in kwargs:
-        if kwargs.get("enable_thinking") is True:
-            kwargs["thinking_mode"] = "enabled"
-        elif kwargs.get("enable_thinking") is False:
-            kwargs["thinking_mode"] = "disabled"
 
     # Use standard formatting for text-only models.
     if model_type not in MODEL_CONFIG:
@@ -897,16 +790,6 @@ def apply_chat_template(
     # Build messages from prompts
     messages = []
 
-    def _message_media_args(content: Any) -> tuple[int, int, Dict[str, Any]]:
-        auto_images, auto_audios, auto_videos = _count_media_parts(content)
-        message_kwargs = dict(kwargs)
-        message_num_images = num_images or auto_images
-        message_num_audios = num_audios or auto_audios
-        has_video_refs = message_kwargs.get("video") or message_kwargs.get("videos")
-        if auto_videos and not has_video_refs and "num_videos" not in message_kwargs:
-            message_kwargs["num_videos"] = auto_videos
-        return message_num_images, message_num_audios, message_kwargs
-
     if isinstance(prompt, str):
         # Single string prompt
         messages.append(
@@ -924,19 +807,15 @@ def apply_chat_template(
         if "tool_calls" in prompt or "tool_call_id" in prompt or role == "tool":
             messages.append(_normalize_tool_call_arguments(prompt))
         else:
-            raw_content = prompt["content"]
-            content = extract_text_from_content(raw_content)
-            message_num_images, message_num_audios, message_kwargs = (
-                _message_media_args(raw_content)
-            )
+            content = extract_text_from_content(prompt["content"])
             messages.append(
                 get_message_json(
                     model_type,
                     content,
                     role,
-                    num_images=message_num_images,
-                    num_audios=message_num_audios,
-                    **message_kwargs,
+                    num_images=num_images,
+                    num_audios=num_audios,
+                    **kwargs,
                 )
             )
     elif isinstance(prompt, list):
@@ -974,12 +853,8 @@ def apply_chat_template(
                     messages.append(_normalize_tool_call_arguments(p))
                 else:
                     # Handle multimodal content: extract only text, skip image/audio URLs
-                    raw_content = content
-                    content = extract_text_from_content(raw_content)
+                    content = extract_text_from_content(content)
                     is_target = i == last_user_idx
-                    message_num_images, message_num_audios, message_kwargs = (
-                        _message_media_args(raw_content)
-                    )
                     messages.append(
                         get_message_json(
                             model_type,
@@ -989,9 +864,9 @@ def apply_chat_template(
                             or role in ["system", "assistant"],
                             skip_audio_token=not is_target
                             or role in ["system", "assistant"],
-                            num_images=message_num_images,
-                            num_audios=message_num_audios,
-                            **message_kwargs,
+                            num_images=num_images,
+                            num_audios=num_audios,
+                            **kwargs,
                         )
                     )
 
