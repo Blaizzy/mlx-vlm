@@ -4,15 +4,11 @@ import inspect
 import json
 import logging
 import math
-import shutil
 import struct
-import sys
-import tempfile
-from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -290,14 +286,6 @@ def _transform_compressed_tensors_weights(
         return _transform_compressed_tensors_int4_weights(weights, quantization_config)
 
     return weights, None
-
-
-_MINIMAX_M3_RESIZE_CONTEXT: ContextVar[Optional[int]] = ContextVar(
-    "minimax_m3_resize_context", default=None
-)
-_MINIMAX_M3_MIN_SHORT_SIDE_PIXEL = 112
-_MINIMAX_M3_IMAGE_MAX_TOTAL_PIXELS = 3584 * 3584
-_MINIMAX_M3_VIDEO_MAX_TOTAL_PIXELS = 301_056_000
 
 
 def quantize_activations(model: nn.Module) -> nn.Module:
@@ -1006,332 +994,6 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
         raise FileNotFoundError(f"Config not found at {model_path}") from exc
 
 
-def _maybe_trust_local_minimax_m3_processor(
-    model_path: Union[str, Path], kwargs: Dict[str, Any]
-) -> None:
-    if "trust_remote_code" in kwargs:
-        return
-
-    model_path = Path(model_path)
-    if not model_path.exists() or not model_path.is_dir():
-        return
-
-    config_file = model_path / "config.json"
-    processor_file = model_path / "preprocessor_config.json"
-    if not config_file.exists() or not processor_file.exists():
-        return
-
-    try:
-        config = json.loads(config_file.read_text(encoding="utf-8"))
-        processor_config = json.loads(processor_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-
-    if config.get("model_type") != "minimax_m3_vl":
-        return
-
-    auto_map = processor_config.get("auto_map")
-    if not isinstance(auto_map, dict):
-        return
-
-    def has_processor_ref(ref: str) -> bool:
-        for value in auto_map.values():
-            values = value if isinstance(value, list) else [value]
-            if any(isinstance(item, str) and ref in item for item in values):
-                return True
-        return False
-
-    required = {
-        "processing_minimax.MiniMaxVLProcessor": "processing_minimax.py",
-        "image_processor.MiniMaxM3VLImageProcessor": "image_processor.py",
-        "video_processor.MiniMaxM3VLVideoProcessor": "video_processor.py",
-    }
-    if all(
-        has_processor_ref(ref) and (model_path / file).exists()
-        for ref, file in required.items()
-    ):
-        kwargs["trust_remote_code"] = True
-
-
-def _has_invalid_local_minimax_m3_processor_config(
-    model_path: Union[str, Path],
-) -> bool:
-    model_path = Path(model_path)
-    if not model_path.exists() or not model_path.is_dir():
-        return False
-
-    config_file = model_path / "config.json"
-    processor_file = model_path / "processor_config.json"
-    preprocessor_file = model_path / "preprocessor_config.json"
-    if (
-        not config_file.exists()
-        or not processor_file.exists()
-        or not preprocessor_file.exists()
-    ):
-        return False
-
-    try:
-        config = json.loads(config_file.read_text(encoding="utf-8"))
-        json.loads(processor_file.read_text(encoding="utf-8"))
-        preprocessor_config = json.loads(preprocessor_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        try:
-            config = json.loads(config_file.read_text(encoding="utf-8"))
-            preprocessor_config = json.loads(
-                preprocessor_file.read_text(encoding="utf-8")
-            )
-        except (OSError, json.JSONDecodeError):
-            return False
-    else:
-        return False
-
-    if config.get("model_type") != "minimax_m3_vl":
-        return False
-
-    auto_map = preprocessor_config.get("auto_map")
-    if not isinstance(auto_map, dict):
-        return False
-
-    required_files = (
-        "processing_minimax.py",
-        "image_processor.py",
-        "video_processor.py",
-    )
-    return all((model_path / file).exists() for file in required_files)
-
-
-def _load_minimax_m3_processor_without_processor_config(model_path, **kwargs):
-    model_path = Path(model_path)
-    with tempfile.TemporaryDirectory(prefix="mlx-vlm-minimax-m3-") as tmp:
-        tmp_path = Path(tmp)
-        for item in model_path.iterdir():
-            if item.name == "processor_config.json":
-                continue
-            target = tmp_path / item.name
-            try:
-                target.symlink_to(item, target_is_directory=item.is_dir())
-            except OSError:
-                if item.is_dir():
-                    shutil.copytree(item, target)
-                else:
-                    shutil.copy2(item, target)
-        return AutoProcessor.from_pretrained(tmp_path, **kwargs)
-
-
-def _minimax_m3_smart_resize(
-    height: int,
-    width: int,
-    factor: int = 28,
-    min_pixels: int = 4 * 28 * 28,
-    max_pixels: int = 451584,
-    max_long_side_pixel: Optional[int] = None,
-    max_total_pixels: Optional[int] = None,
-) -> Tuple[int, int]:
-    if max(height, width) / min(height, width) > 200:
-        raise ValueError(
-            "absolute aspect ratio must be smaller than 200, "
-            f"got {max(height, width) / min(height, width)}"
-        )
-    if max_long_side_pixel is None:
-        h_bar = max(factor, round(height / factor) * factor)
-        w_bar = max(factor, round(width / factor) * factor)
-        if h_bar * w_bar > max_pixels:
-            beta = math.sqrt((height * width) / max_pixels)
-            h_bar = math.floor(height / beta / factor) * factor
-            w_bar = math.floor(width / beta / factor) * factor
-        elif h_bar * w_bar < min_pixels:
-            beta = math.sqrt(min_pixels / (height * width))
-            h_bar = math.ceil(height * beta / factor) * factor
-            w_bar = math.ceil(width * beta / factor) * factor
-        return h_bar, w_bar
-
-    long_side = max(height, width)
-    short_side = min(height, width)
-    scaled_height = float(height)
-    scaled_width = float(width)
-    if long_side > max_long_side_pixel:
-        beta = max_long_side_pixel / long_side
-        scaled_height = height * beta
-        scaled_width = width * beta
-    elif short_side < _MINIMAX_M3_MIN_SHORT_SIDE_PIXEL:
-        beta = _MINIMAX_M3_MIN_SHORT_SIDE_PIXEL / short_side
-        scaled_height = height * beta
-        scaled_width = width * beta
-
-    h_bar = max(factor, round(scaled_height / factor) * factor)
-    w_bar = max(factor, round(scaled_width / factor) * factor)
-    if max_total_pixels is not None and h_bar * w_bar > max_total_pixels:
-        raise ValueError(
-            f"image area {h_bar * w_bar} exceeds max_total_pixels "
-            f"{max_total_pixels} after resizing"
-        )
-    return h_bar, w_bar
-
-
-def _minimax_m3_video_shape(video) -> Optional[Tuple[int, int, int]]:
-    shape = getattr(video, "shape", None)
-    if shape is None or len(shape) < 4:
-        return None
-    frames = int(shape[0])
-    if shape[1] in (1, 3):
-        return frames, int(shape[2]), int(shape[3])
-    return frames, int(shape[1]), int(shape[2])
-
-
-def _extend_processor_valid_kwargs(proc, **extra_annotations) -> None:
-    valid_kwargs = getattr(proc, "valid_kwargs", None)
-    annotations = dict(getattr(valid_kwargs, "__annotations__", {}))
-    if not annotations:
-        return
-    changed = False
-    for name, annotation in extra_annotations.items():
-        if name not in annotations:
-            annotations[name] = annotation
-            changed = True
-    if changed:
-        proc.valid_kwargs = TypedDict(
-            f"MLXVLM{proc.__class__.__name__}Kwargs",
-            annotations,
-            total=False,
-        )
-
-
-def _patch_minimax_m3_resize_processor(processor) -> None:
-    image_processor = getattr(processor, "image_processor", None)
-    video_processor = getattr(processor, "video_processor", None)
-    for proc, is_video in ((image_processor, False), (video_processor, True)):
-        if proc is None or getattr(proc, "_mlx_vlm_m3_resize_patch", False):
-            continue
-        name = proc.__class__.__name__.lower()
-        if "minimaxm3vl" not in name:
-            continue
-        if hasattr(proc, "max_long_side_pixel"):
-            continue
-
-        module = sys.modules.get(proc.__class__.__module__)
-        original_smart_resize = getattr(module, "smart_resize", None)
-        if module is None or original_smart_resize is None:
-            continue
-
-        def patched_smart_resize(
-            height,
-            width,
-            factor=28,
-            min_pixels=4 * 28 * 28,
-            max_pixels=451584,
-            _original=original_smart_resize,
-            _is_video=is_video,
-        ):
-            max_long_side_pixel = _MINIMAX_M3_RESIZE_CONTEXT.get()
-            if max_long_side_pixel is None:
-                return _original(
-                    height,
-                    width,
-                    factor=factor,
-                    min_pixels=min_pixels,
-                    max_pixels=max_pixels,
-                )
-            return _minimax_m3_smart_resize(
-                height,
-                width,
-                factor=factor,
-                min_pixels=min_pixels,
-                max_pixels=max_pixels,
-                max_long_side_pixel=max_long_side_pixel,
-                max_total_pixels=(
-                    None if _is_video else _MINIMAX_M3_IMAGE_MAX_TOTAL_PIXELS
-                ),
-            )
-
-        setattr(module, "smart_resize", patched_smart_resize)
-        proc.max_long_side_pixel = None
-        proc.min_short_side_pixel = _MINIMAX_M3_MIN_SHORT_SIDE_PIXEL
-        proc.max_total_pixels = (
-            _MINIMAX_M3_VIDEO_MAX_TOTAL_PIXELS
-            if is_video
-            else _MINIMAX_M3_IMAGE_MAX_TOTAL_PIXELS
-        )
-        _extend_processor_valid_kwargs(proc, max_long_side_pixel=int)
-
-        original_preprocess = proc.preprocess
-
-        def preprocess_with_m3_resize(
-            *args,
-            _proc=proc,
-            _is_video=is_video,
-            _original_preprocess=original_preprocess,
-            **kwargs,
-        ):
-            max_long_side_pixel = kwargs.pop(
-                "max_long_side_pixel", _proc.max_long_side_pixel
-            )
-            if max_long_side_pixel is None:
-                return _original_preprocess(*args, **kwargs)
-
-            videos = kwargs.get("videos")
-            if videos is None and args:
-                videos = args[0]
-            if _is_video and videos is not None:
-                video_items = videos if isinstance(videos, list) else [videos]
-                for video in video_items:
-                    shape = _minimax_m3_video_shape(video)
-                    if shape is None:
-                        continue
-                    frames, height, width = shape
-                    h_bar, w_bar = _minimax_m3_smart_resize(
-                        height,
-                        width,
-                        factor=getattr(_proc, "patch_size", 14)
-                        * getattr(_proc, "merge_size", 2),
-                        max_long_side_pixel=max_long_side_pixel,
-                    )
-                    if h_bar * w_bar * frames > _MINIMAX_M3_VIDEO_MAX_TOTAL_PIXELS:
-                        raise ValueError(
-                            f"video volume {h_bar * w_bar * frames} "
-                            "exceeds max_total_pixels "
-                            f"{_MINIMAX_M3_VIDEO_MAX_TOTAL_PIXELS} after resizing"
-                        )
-
-            token = _MINIMAX_M3_RESIZE_CONTEXT.set(max_long_side_pixel)
-            try:
-                return _original_preprocess(*args, **kwargs)
-            finally:
-                _MINIMAX_M3_RESIZE_CONTEXT.reset(token)
-
-        proc.preprocess = preprocess_with_m3_resize
-
-        original_count = getattr(proc, "get_number_of_image_patches", None)
-        if original_count is not None and not is_video:
-
-            def get_number_of_image_patches(
-                height,
-                width,
-                images_kwargs=None,
-                _proc=proc,
-                _original_count=original_count,
-            ):
-                images_kwargs = images_kwargs or {}
-                max_long_side_pixel = images_kwargs.get(
-                    "max_long_side_pixel", _proc.max_long_side_pixel
-                )
-                if max_long_side_pixel is None:
-                    return _original_count(height, width, images_kwargs)
-                patch_size = images_kwargs.get("patch_size", _proc.patch_size)
-                merge_size = images_kwargs.get("merge_size", _proc.merge_size)
-                h_bar, w_bar = _minimax_m3_smart_resize(
-                    height,
-                    width,
-                    factor=patch_size * merge_size,
-                    max_long_side_pixel=max_long_side_pixel,
-                    max_total_pixels=_MINIMAX_M3_IMAGE_MAX_TOTAL_PIXELS,
-                )
-                return h_bar // patch_size * (w_bar // patch_size)
-
-            proc.get_number_of_image_patches = get_number_of_image_patches
-
-        proc._mlx_vlm_m3_resize_patch = True
-
-
 def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImageProcessor:
     if isinstance(model_path, str):
         model_path = get_model_path(
@@ -1366,16 +1028,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    _maybe_trust_local_minimax_m3_processor(model_path, kwargs)
-    try:
-        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
-    except (OSError, TypeError, ValueError):
-        if not _has_invalid_local_minimax_m3_processor_config(model_path):
-            raise
-        processor = _load_minimax_m3_processor_without_processor_config(
-            model_path, **kwargs
-        )
-    _patch_minimax_m3_resize_processor(processor)
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -1874,9 +1527,7 @@ def load_video(
     min_frames: int = 4,
     max_frames: int = 768,
     frame_factor: int = 2,
-    return_metadata: bool = False,
-    sampling_strategy: Optional[str] = None,
-) -> Tuple[np.ndarray, float] | Tuple[np.ndarray, float, Dict[str, Any]]:
+) -> Tuple[np.ndarray, float]:
     """Read a video file as a (T, C, H, W) numpy array.
 
     Uniformly samples ``nframes`` frames — either a fixed count or derived
@@ -1893,8 +1544,6 @@ def load_video(
         raise ValueError(f"Cannot open video: {video_path}")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 1.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
 
     def _round(n):
         return round(n / frame_factor) * frame_factor
@@ -1905,13 +1554,7 @@ def load_video(
     def _ceil(n):
         return math.ceil(n / frame_factor) * frame_factor
 
-    if sampling_strategy == "minimax_m3" and nframes is None:
-        indices = _minimax_m3_frame_indices(total_frames, video_fps, fps)
-        if len(indices) > max_frames:
-            keep = np.linspace(0, len(indices) - 1, max_frames).round().astype(int)
-            indices = [indices[i] for i in keep]
-        n = len(indices)
-    elif nframes is not None:
+    if nframes is not None:
         n = _round(nframes)
         indices = np.linspace(0, total_frames - 1, n).round().astype(int).tolist()
     else:
@@ -1921,10 +1564,9 @@ def load_video(
         n = min(max(n, lo), hi, total_frames)
         n = _floor(n)
         indices = np.linspace(0, total_frames - 1, n).round().astype(int).tolist()
-    min_n = 1 if sampling_strategy == "minimax_m3" else frame_factor
-    if not (min_n <= n <= total_frames):
+    if not (frame_factor <= n <= total_frames):
         cap.release()
-        raise ValueError(f"nframes must be in [{min_n}, {total_frames}], got {n}.")
+        raise ValueError(f"nframes must be in [{frame_factor}, {total_frames}], got {n}.")
 
     frames = []
     read_indices = []
@@ -1939,79 +1581,9 @@ def load_video(
     if not frames:
         raise ValueError("No frames read from the video.")
 
-    indices = read_indices
-    n = len(frames)
     video_np = np.transpose(np.stack(frames, axis=0), (0, 3, 1, 2))
     sample_fps = n / max(total_frames, 1e-6) * video_fps
-    if return_metadata:
-        return (
-            video_np,
-            sample_fps,
-            {
-                "total_num_frames": total_frames,
-                "fps": video_fps,
-                "width": width,
-                "height": height,
-                "duration": total_frames / video_fps if video_fps else None,
-                "video_backend": "opencv",
-                "frames_indices": list(indices),
-            },
-        )
     return video_np, sample_fps
-
-
-def _minimax_m3_frame_indices(
-    total_frames: int,
-    video_fps: float,
-    fps: float,
-) -> List[int]:
-    if total_frames <= 0 or video_fps <= 0 or fps <= 0:
-        return [0] if total_frames > 0 else []
-
-    read_time_interval = 1.0 / fps
-    eps = 1e-4
-    indices = []
-    prev_kept_ts = -float("inf")
-    while True:
-        if not indices:
-            target_frame = 0
-        else:
-            target_ts = prev_kept_ts + read_time_interval - eps
-            target_frame = math.ceil(target_ts * video_fps)
-            target_frame = max(target_frame, indices[-1] + 1)
-        if target_frame >= total_frames:
-            break
-        indices.append(target_frame)
-        prev_kept_ts = target_frame / video_fps
-
-    last_frame_idx = total_frames - 1
-    last_ts = last_frame_idx / video_fps
-    if indices and indices[-1] != last_frame_idx and last_ts - prev_kept_ts > eps:
-        indices.append(last_frame_idx)
-
-    if not indices:
-        indices = [0]
-    return indices
-
-
-def _video_metadata_from_array(video, fps: Optional[float]) -> Dict[str, Any]:
-    total_num_frames = len(video)
-    shape = getattr(video, "shape", None)
-    height = width = None
-    if shape is not None and len(shape) >= 4:
-        if shape[1] in (1, 3):
-            height, width = int(shape[2]), int(shape[3])
-        else:
-            height, width = int(shape[1]), int(shape[2])
-
-    return {
-        "total_num_frames": total_num_frames,
-        "fps": float(fps) if fps is not None else None,
-        "width": width,
-        "height": height,
-        "duration": total_num_frames / fps if fps else None,
-        "frames_indices": list(range(total_num_frames)),
-    }
 
 
 def process_inputs(
@@ -2262,31 +1834,7 @@ def prepare_inputs(
             )
             audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
-    processor_name = processor.__class__.__name__.lower()
-    image_processor = getattr(processor, "image_processor", None)
-    image_processor_name = (
-        image_processor.__class__.__name__.lower()
-        if image_processor is not None
-        else ""
-    )
-    video_processor = getattr(processor, "video_processor", None)
-    video_processor_name = (
-        video_processor.__class__.__name__.lower()
-        if video_processor is not None
-        else ""
-    )
-    is_minimax_processor = "minimax" in processor_name and (
-        "minimax" in image_processor_name or "minimax" in video_processor_name
-    )
-    is_minimax_video_processor = (
-        "minimax" in processor_name and "minimax" in video_processor_name
-    )
-    provided_video_metadata = (
-        kwargs.pop("video_metadata", None) if is_minimax_video_processor else None
-    )
-
     video_fps = None
-    video_metadata = None
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
@@ -2299,30 +1847,14 @@ def prepare_inputs(
                 f"Got {len(fps_values)} fps values for {len(videos)} videos."
             )
 
-        loaded, video_fps, video_metadata = [], [], []
+        loaded, video_fps = [], []
         for v, fps_value in zip(videos, fps_values):
             if isinstance(v, (str, bytes, Path)):
-                if is_minimax_video_processor:
-                    arr, s_fps, metadata = load_video(
-                        str(v),
-                        fps=fps_value,
-                        return_metadata=True,
-                        sampling_strategy="minimax_m3",
-                    )
-                else:
-                    arr, s_fps = load_video(str(v), fps=fps_value)
-                    metadata = None
+                arr, s_fps = load_video(str(v), fps=fps_value)
             else:
                 arr, s_fps = v, fps_value
-                metadata = (
-                    _video_metadata_from_array(v, fps_value)
-                    if is_minimax_video_processor
-                    else None
-                )
             loaded.append(arr)
             video_fps.append(s_fps)
-            if metadata is not None:
-                video_metadata.append(metadata)
         videos = loaded
 
     model_inputs = {}
@@ -2330,7 +1862,6 @@ def prepare_inputs(
     if (
         hasattr(processor, "image_processor")
         and isinstance(processor.image_processor, BaseImageProcessor)
-        and not is_minimax_processor
     ):
         if not isinstance(prompts, list):
             prompts = [prompts]
@@ -2369,14 +1900,7 @@ def prepare_inputs(
         if has_videos:
             extra["videos"] = videos
             if video_fps is not None:
-                extra["fps"] = video_fps[0] if is_minimax_video_processor else video_fps
-            if "do_resize" not in kwargs and is_minimax_video_processor:
-                extra["do_resize"] = True
-            if is_minimax_video_processor:
-                if provided_video_metadata is not None:
-                    extra["video_metadata"] = provided_video_metadata
-                elif video_metadata:
-                    extra["video_metadata"] = video_metadata
+                extra["fps"] = video_fps
         inputs = process_inputs_with_fallback(
             processor,
             images=images,
