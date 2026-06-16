@@ -1063,6 +1063,72 @@ def test_minimax_m3_omitted_thinking_flag_uses_template_default():
     assert "thinking_mode" not in processor.kwargs
 
 
+def test_minimax_m3_vl_prompt_utils_formats_image_messages():
+    result = apply_chat_template(
+        None,
+        {"model_type": "minimax_m3_vl"},
+        "Describe this image.",
+        return_messages=True,
+        num_images=1,
+    )
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image"},
+                {
+                    "type": "text",
+                    "text": "Describe this image.",
+                    "content": "Describe this image.",
+                },
+            ],
+        }
+    ]
+
+
+def test_minimax_m3_vl_prompt_utils_formats_video_messages():
+    result = apply_chat_template(
+        None,
+        {"model_type": "minimax_m3_vl"},
+        "Summarize this video.",
+        return_messages=True,
+        video=["clip.mp4"],
+        fps=2.0,
+    )
+
+    assert result == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": "clip.mp4",
+                    "max_pixels": 224 * 224,
+                    "fps": 2.0,
+                },
+                {
+                    "type": "text",
+                    "text": "Summarize this video.",
+                    "content": "Summarize this video.",
+                },
+            ],
+        }
+    ]
+
+
+def test_minimax_m3_prompt_utils_formats_text_only_messages():
+    result = apply_chat_template(
+        None,
+        {"model_type": "minimax_m3"},
+        "Write a short answer.",
+        return_messages=True,
+        num_images=1,
+    )
+
+    assert result == [{"role": "user", "content": "Write a short answer."}]
+
+
 class _MiniMaxFakeTokenizer:
     model_input_names = ["input_ids", "attention_mask"]
     pad_token = "<pad>"

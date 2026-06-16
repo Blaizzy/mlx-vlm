@@ -78,6 +78,7 @@ MODEL_CONFIG = {
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
+    "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -101,6 +102,7 @@ MODEL_CONFIG = {
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.TEXT_ONLY,
     "hrm_text": MessageFormat.TEXT_ONLY,
+    "minimax_m3": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -269,6 +271,7 @@ class MessageFormatter:
             "gemma4",
             "gemma4_unified",
             "minicpmv4_6",
+            "minimax_m3_vl",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, role, **kwargs)
 
