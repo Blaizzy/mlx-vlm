@@ -54,6 +54,72 @@ DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
+# Thinking / channel delimiter special tokens the server's thinking splitter
+# anchors on (see ThinkingStreamState._DEFAULT_OPEN_CLOSE_MARKERS and
+# app._count_thinking_tag_tokens). The channel *name* (e.g. "thought") is plain
+# text; only these bracket tokens are registered special tokens.
+_THINKING_MARKER_TOKENS = (
+    "<|channel>",
+    "<channel|>",
+    "<think>",
+    "</think>",
+    "<|START_THINKING|>",
+    "<|END_THINKING|>",
+)
+
+
+def _structural_marker_strings(processor) -> set:
+    """Special-token strings the server's parsers must still see after
+    detokenization: tool-call delimiters (from whichever tool parser this model
+    uses) and thinking/channel delimiters."""
+    markers = set()
+    try:
+        from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+
+        parser_type = _infer_tool_parser_from_processor(processor)
+        if parser_type:
+            module = load_tool_module(parser_type)
+            for attr in ("tool_call_start", "tool_call_end", "_ESCAPE"):
+                value = getattr(module, attr, None)
+                if isinstance(value, str) and value:
+                    markers.add(value)
+    except Exception:
+        logger.debug(
+            "Could not infer tool-call markers for diffusion detok", exc_info=True
+        )
+    markers.update(_THINKING_MARKER_TOKENS)
+    return markers
+
+
+def _diffusion_skip_special_token_ids(tokenizer, processor) -> set:
+    """Special-token ids to drop on the diffusion detokenization path.
+
+    The diffusion canvas is fixed-length and legitimately contains pad/mask/EOS
+    sentinel special tokens, so (unlike the autoregressive path) we strip
+    special tokens by id. But we must NOT strip the tool-call/channel delimiters
+    the server's tool parser and thinking splitter anchor on, or they arrive as
+    inert text (issue #1351). So: all_special_ids minus those marker ids.
+    """
+    all_special = set(getattr(tokenizer, "all_special_ids", None) or [])
+    if not all_special:
+        return all_special
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is None:
+        return all_special
+    unk = getattr(tokenizer, "unk_token_id", None)
+    preserve = set()
+    for marker in _structural_marker_strings(processor):
+        try:
+            token_id = convert(marker)
+        except Exception:
+            continue
+        # Only spare genuine single special tokens. Unknown markers map to the
+        # <unk> id on many tokenizers, and <unk> is itself usually in
+        # all_special_ids -- never un-strip it.
+        if isinstance(token_id, int) and token_id in all_special and token_id != unk:
+            preserve.add(token_id)
+    return all_special - preserve
+
 
 class PromptTooLongError(ValueError):
     """Raised when a request exceeds the configured server context budget."""
@@ -1420,8 +1486,8 @@ class ResponseGenerator:
             raw_inputs.get("attention_mask"),
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            skip_special_token_ids=set(
-                getattr(tokenizer, "all_special_ids", None) or []
+            skip_special_token_ids=_diffusion_skip_special_token_ids(
+                tokenizer, self.processor
             ),
             mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
         )
