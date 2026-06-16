@@ -4,15 +4,24 @@ import logging
 import os
 import shutil
 import time
-import unicodedata
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
+from ..models.diffusion_visualizer import (
+    clip_display_width,
+    display_width,
+    escape_carriage_returns,
+)
 from ..tokenizer_utils import make_streaming_detokenizer
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import (
+    GenerationResult,
+    _chunked_prefill_enabled,
+    generation_stream,
+    wired_limit,
+)
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -20,41 +29,6 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
-
-
-def _display_width(text: str) -> int:
-    width = 0
-    for char in text:
-        if unicodedata.combining(char):
-            continue
-        width += 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-    return width
-
-
-def _clip_display_width(text: str, max_width: int) -> str:
-    if max_width <= 0:
-        return ""
-
-    out = []
-    width = 0
-    clipped = False
-    for char in text:
-        if unicodedata.combining(char):
-            char_width = 0
-        else:
-            char_width = 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
-        if width + char_width > max_width:
-            clipped = True
-            break
-        out.append(char)
-        width += char_width
-
-    if clipped and max_width >= 3:
-        while out and _display_width("".join(out)) > max_width - 3:
-            out.pop()
-        out.append("...")
-
-    return "".join(out)
 
 
 def _diffusion_display_limit(requested_width: Optional[int] = None) -> Optional[int]:
@@ -80,10 +54,11 @@ def _format_diffusion_draft_line(
     response: GenerationResult,
     requested_width: Optional[int] = None,
 ) -> str:
+    text = escape_carriage_returns(response.draft_text)
     width = _diffusion_display_limit(requested_width)
     if width is None:
-        return response.draft_text
-    return _clip_display_width(response.draft_text, width)
+        return text
+    return clip_display_width(text, width)
 
 
 def _print_diffusion_draft(
@@ -98,15 +73,15 @@ def _format_diffusion_live_text(
     text: str,
     requested_width: Optional[int] = None,
     *,
-    preserve_newlines: bool = False,
+    preserve_newlines: bool = True,
 ) -> str:
     width = _diffusion_display_limit(requested_width)
-    text = text.replace("\r", "\\r")
+    text = escape_carriage_returns(text)
     if not preserve_newlines:
         text = text.replace("\n", "\\n")
     if width is None:
         return text
-    return _clip_display_width(text, width)
+    return clip_display_width(text, width)
 
 
 def _print_diffusion_live_text(
@@ -131,7 +106,7 @@ def _terminal_rows_for_text(text: str, columns: Optional[int] = None) -> int:
     columns = max(1, columns)
     rows = 0
     for line in text.split("\n"):
-        width = _display_width(line)
+        width = display_width(line)
         rows += max(1, (width + columns - 1) // columns)
     return rows
 
@@ -197,36 +172,6 @@ def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
         return {}
 
     kwargs = {}
-    if getattr(args, "diffusion_turbo", False):
-        kwargs["diffusion_turbo"] = True
-        if getattr(args, "entropy_bound", None) is not None:
-            kwargs["entropy_bound"] = args.entropy_bound
-        if getattr(args, "turbo_no_monotone", False):
-            kwargs["turbo_monotone"] = False
-        if getattr(args, "turbo_steps", None) is not None:
-            kwargs["turbo_steps"] = args.turbo_steps
-        if getattr(args, "turbo_accept", None):
-            kwargs["turbo_accept"] = args.turbo_accept
-        if getattr(args, "turbo_repair", False):
-            kwargs["turbo_repair"] = True
-        if getattr(args, "turbo_compact", False):
-            kwargs["turbo_compact"] = True
-        if getattr(args, "turbo_repeat_guard", None) is not None:
-            kwargs["turbo_repeat_guard"] = args.turbo_repeat_guard
-        # Two-stage confidence schedule: picky (threshold) for the first
-        # `relax_after` steps, then relaxed (relax_to) for stragglers. This
-        # keeps canvas structure clean without the all-at-once final flush
-        # that compounds errors across re-encoded canvases.
-        relax_to = getattr(args, "turbo_threshold_relax", None)
-        relax_after = getattr(args, "turbo_threshold_relax_after", None)
-        if args.threshold is not None and relax_to is not None:
-            kwargs["turbo_threshold"] = [
-                args.threshold,
-                relax_to,
-                int(relax_after if relax_after is not None else 8),
-            ]
-        elif args.threshold is not None:
-            kwargs["turbo_threshold"] = args.threshold
     if args.max_denoising_steps is not None:
         kwargs["max_denoising_steps"] = args.max_denoising_steps
     if args.diffusion_full_canvas:
@@ -368,6 +313,7 @@ def _diffusion_soft_embedding_weight(embed_tokens: nn.Module) -> mx.array:
             embed_tokens.biases,
             group_size=embed_tokens.group_size,
             bits=embed_tokens.bits,
+            mode=getattr(embed_tokens, "mode", "affine"),
         )
     return embed_tokens.weight
 
@@ -453,31 +399,6 @@ def _diffusion_static_cache_length(
         model_canvas_length
     )
     return prompt_length + cached_canvas_tokens
-
-
-def _diffusion_has_visual_token_types(mm_token_type_ids: Optional[mx.array]) -> bool:
-    if mm_token_type_ids is None:
-        return False
-    return bool(mx.any((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
-
-
-def _diffusion_should_chunk_prefill(
-    *,
-    prefill_step_size: Optional[int],
-    prompt_length: int,
-    has_padding: bool,
-    use_static_cache: bool,
-    pixel_values: Optional[mx.array],
-    mm_token_type_ids: Optional[mx.array],
-) -> bool:
-    if prefill_step_size is None or prompt_length <= prefill_step_size:
-        return False
-    if has_padding or use_static_cache or pixel_values is not None:
-        return False
-    # Visual spans can use bidirectional attention inside the whole block. Keep
-    # those prompts on the existing single prefill until chunking can split on
-    # visual-block boundaries without changing attention semantics.
-    return not _diffusion_has_visual_token_types(mm_token_type_ids)
 
 
 def _diffusion_prefill_cache(
@@ -603,8 +524,7 @@ def _decode_diffusion_masked_draft(
 
     flush_tokens()
     text = " ".join(piece for piece in pieces if piece)
-    text = text.replace("\r", "\\r").replace("\n", "\\n")
-    return text
+    return escape_carriage_returns(text)
 
 
 def stream_diffusion_generate(
@@ -740,13 +660,22 @@ def stream_diffusion_generate(
         cached_sequence_length = prompt_length
         kv_cache = model.make_cache()
     detokenizer = make_streaming_detokenizer(processor)
-    chunk_prefill = _diffusion_should_chunk_prefill(
-        prefill_step_size=prefill_step_size,
-        prompt_length=prompt_length,
-        has_padding=has_padding,
-        use_static_cache=use_static_cache,
-        pixel_values=pixel_values,
-        mm_token_type_ids=mm_token_type_ids,
+    prefill_policy_kwargs = {
+        "attention_mask": attention_mask,
+        "has_padding": has_padding,
+        "use_static_cache": use_static_cache,
+        "pixel_values": pixel_values,
+        "mm_token_type_ids": mm_token_type_ids,
+    }
+    chunk_prefill = (
+        prefill_step_size is not None
+        and prompt_length > prefill_step_size
+        and _chunked_prefill_enabled(
+            model,
+            input_ids=input_ids,
+            prompt_cache=kv_cache,
+            prefill_kwargs=prefill_policy_kwargs,
+        )
     )
 
     generated_tokens = 0
