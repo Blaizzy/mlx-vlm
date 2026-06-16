@@ -635,6 +635,7 @@ class GenerationArguments:
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
+    skip_special_tokens: bool = True
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
@@ -1410,6 +1411,11 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         if hasattr(tokenizer, "stopping_criteria"):
             tokenizer.stopping_criteria.reset(self.config.eos_token_id)
+        skip_special_token_ids = (
+            set(getattr(tokenizer, "all_special_ids", None) or [])
+            if args.skip_special_tokens
+            else set()
+        )
 
         results = stream_diffusion_generate(
             self.model,
@@ -1420,9 +1426,7 @@ class ResponseGenerator:
             raw_inputs.get("attention_mask"),
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            skip_special_token_ids=set(
-                getattr(tokenizer, "all_special_ids", None) or []
-            ),
+            skip_special_token_ids=skip_special_token_ids,
             mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
         )
         try:
@@ -1467,7 +1471,13 @@ class ResponseGenerator:
 
         def flush(tokens, finish_reason=None):
             nonlocal emitted_text, emitted_tokens
-            text = tokenizer.decode(tokens, skip_special_tokens=True) if tokens else ""
+            text = (
+                tokenizer.decode(
+                    tokens, skip_special_tokens=args.skip_special_tokens
+                )
+                if tokens
+                else ""
+            )
             if text.startswith(emitted_text):
                 delta = text[len(emitted_text) :]
             elif not emitted_text:
@@ -1531,7 +1541,7 @@ class ResponseGenerator:
                 eos_early_stop=True,
                 visualize=False,
                 tokenizer=tokenizer,
-                skip_special_tokens=True,
+                skip_special_tokens=args.skip_special_tokens,
                 stats=gen_stats,
                 on_block=on_block,
                 **tuned_kwargs,
