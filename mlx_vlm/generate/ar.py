@@ -33,6 +33,7 @@ from .common import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_QUANTIZED_KV_START,
+    _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
     wired_limit,
@@ -50,48 +51,6 @@ DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
-
-
-def _policy_enabled(policy) -> bool:
-    return bool(getattr(policy, "enabled", policy))
-
-
-def _chunked_prefill_enabled(
-    model,
-    *,
-    input_ids=None,
-    inputs_embeds=None,
-    prompt_cache=None,
-    draft_model=None,
-    draft_kind=None,
-    prefill_kwargs=None,
-) -> bool:
-    prefill_kwargs = prefill_kwargs or {}
-    candidates = [model]
-    language_model = getattr(model, "language_model", None)
-    if language_model is not None and language_model is not model:
-        candidates.append(language_model)
-
-    for candidate in candidates:
-        policy = getattr(candidate, "chunked_prefill_policy", None)
-        if callable(policy):
-            return _policy_enabled(
-                policy(
-                    input_ids=input_ids,
-                    inputs_embeds=inputs_embeds,
-                    prompt_cache=prompt_cache,
-                    draft_model=draft_model,
-                    draft_kind=draft_kind,
-                    prefill_kwargs=prefill_kwargs,
-                )
-            )
-
-    if any(getattr(candidate, "no_chunked_prefill", False) for candidate in candidates):
-        return False
-
-    # Hidden-state speculative prefill is model-contract dependent. Keep unknown
-    # target models conservative unless they expose a chunked_prefill_policy.
-    return draft_model is None
 
 
 def _get_batch_cache_eval_interval() -> int:
@@ -338,25 +297,14 @@ def generate_step(
 
     # Speculative decoding setup
     last_outputs = None
+    speculative_prefill_capture_kwargs = {}
     if draft_model is not None:
         from ..speculative.drafters import validate_drafter_compatibility
 
         validate_drafter_compatibility(model, draft_model, draft_kind)
-        if draft_kind == "mtp":
-            # MTP drafter consumes target's last-layer hidden + shared K/V
-            # (per layer-type) rather than per-layer hidden captures.
-            kwargs["return_hidden"] = True
-            kwargs["return_shared_kv"] = True
-        elif draft_kind == "eagle3":
-            kwargs["capture_layer_ids"] = list(
-                getattr(
-                    draft_model.config,
-                    "capture_layer_ids",
-                    draft_model.config.target_layer_ids,
-                )
-            )
-        else:
-            kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
+        speculative_prefill_capture_kwargs = speculative_prefill_kwargs(
+            draft_kind, draft_model
+        )
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
         if hasattr(lm, "_position_ids"):
@@ -367,18 +315,22 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
+        step_kwargs = kwargs
+        if speculative_prefill_capture_kwargs:
+            step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+
         with mx.stream(generation_stream):
-            if "decoder_input_ids" in kwargs:
+            if "decoder_input_ids" in step_kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
-                    **kwargs,
+                    **step_kwargs,
                 )
             else:
                 outputs = model.language_model(
                     y,
                     inputs_embeds=inputs_embeds,
                     cache=prompt_cache,
-                    **kwargs,
+                    **step_kwargs,
                 )
 
             last_outputs = outputs
@@ -430,6 +382,9 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        policy_kwargs = kwargs
+        if speculative_prefill_capture_kwargs:
+            policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
         if prefill_step_size is not None and not _chunked_prefill_enabled(
             model,
             input_ids=input_ids,
@@ -437,7 +392,7 @@ def generate_step(
             prompt_cache=prompt_cache,
             draft_model=draft_model,
             draft_kind=draft_kind,
-            prefill_kwargs=kwargs,
+            prefill_kwargs=policy_kwargs,
         ):
             prefill_step_size = None
         checkpoint_len = (

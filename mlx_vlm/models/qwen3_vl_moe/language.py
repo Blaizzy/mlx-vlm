@@ -559,7 +559,18 @@ class LanguageModel(nn.Module):
                     if isinstance(cache_offset, mx.array)
                     else int(cache_offset)
                 )
-                visual_pos_masks = visual_pos_masks[:, start : start + inputs.shape[1]]
+                window = inputs.shape[1]
+                # Slice deepstack embeds to this window too; _deepstack_process reads from offset 0.
+                if deepstack_visual_embeds is not None:
+                    n_before = int(visual_pos_masks[:, :start].sum().item())
+                    n_window = int(
+                        visual_pos_masks[:, start : start + window].sum().item()
+                    )
+                    deepstack_visual_embeds = [
+                        embeds[n_before : n_before + n_window]
+                        for embeds in deepstack_visual_embeds
+                    ]
+                visual_pos_masks = visual_pos_masks[:, start : start + window]
             else:
                 rows = []
                 for b in range(visual_pos_masks.shape[0]):

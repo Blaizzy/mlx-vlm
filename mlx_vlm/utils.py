@@ -54,6 +54,31 @@ MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
 
+GENERATION_CONFIG_DEFAULT_KEYS = (
+    "eos_token_id",
+    "temperature",
+    "top_p",
+    "top_k",
+    "do_sample",
+)
+
+
+def apply_generation_config_defaults(model_config, config: dict):
+    for key in GENERATION_CONFIG_DEFAULT_KEYS:
+        if key in config:
+            setattr(model_config, key, config[key])
+    return model_config
+
+
+def _merge_generation_config(config: dict, generation_config: dict) -> None:
+    if not isinstance(generation_config, dict) or not generation_config:
+        return
+
+    config["generation_config"] = generation_config
+    for key in GENERATION_CONFIG_DEFAULT_KEYS:
+        if key in generation_config:
+            config[key] = generation_config[key]
+
 
 def _e4m3_decode_table() -> mx.array:
     """Return a 256-entry ``float32`` LUT mapping every E4M3FN byte to its value.
@@ -506,6 +531,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     model_config = model_class.ModelConfig.from_dict(config)
     modules = ["text", "vision", "perceiver", "projector", "audio"]
     model_config = update_module_configs(model_config, model_class, config, modules)
+    model_config = apply_generation_config_defaults(model_config, config)
 
     model = model_class.Model(model_config)
 
@@ -851,15 +877,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
-            generation_config = {}
             try:
-                with open(generation_config_file, "r") as f:
-                    generation_config = json.load(f)
+                with open(generation_config_file, encoding="utf-8") as f:
+                    _merge_generation_config(config, json.load(f))
             except json.JSONDecodeError:
                 pass
-
-            if eos_token_id := generation_config.get("eos_token_id", False):
-                config["eos_token_id"] = eos_token_id
 
         return config
 

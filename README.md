@@ -108,7 +108,17 @@ On the server, thinking mode is disabled by default. Start the server with `--en
 mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
 ```
 
-Requests can override the server default with `enable_thinking: true` or `enable_thinking: false`.
+You can also set server defaults for the thinking budget and delimiter tokens:
+
+```sh
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --enable-thinking \
+  --thinking-budget 512 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>"
+```
+
+Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
 
 ### Speculative Decoding
 
@@ -329,6 +339,13 @@ mlx_vlm.server --trust-remote-code
 
 # Enable thinking mode by default for requests that do not override it
 mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
+
+# Configure thinking defaults at startup
+mlx_vlm.server --model Qwen/Qwen3.5-4B \
+  --enable-thinking \
+  --thinking-budget 512 \
+  --thinking-start-token "<think>" \
+  --thinking-end-token "</think>"
 ```
 
 #### Server Options
@@ -342,6 +359,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B --enable-thinking
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
 - `--enable-thinking`: Enable thinking mode by default for requests that do not set `enable_thinking`
+- `--thinking-budget`: Default maximum number of tokens allowed inside a thinking block
+- `--thinking-start-token`: Default token that opens a thinking block
+- `--thinking-end-token`: Default token that closes a thinking block (`--thinking-eos-token` is also accepted)
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
@@ -869,9 +889,12 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
+- `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
+- `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
-- `/unload` - Unload current model from memory
+- `/unload` - Unload all loaded model caches from memory
 
 #### Usage Examples
 
@@ -931,9 +954,10 @@ curl -X POST "http://localhost:8080/chat/completions" \
   }'
 ```
 
-##### Audio Support (New)
+##### Audio Input
+
 ```sh
-curl -X POST "http://localhost:8080/generate" \
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
@@ -952,9 +976,33 @@ curl -X POST "http://localhost:8080/generate" \
   }'
 ```
 
-##### Multi-Modal (Image + Audio)
+##### Text-to-Speech
+
 ```sh
-curl -X POST "http://localhost:8080/generate" \
+curl -X POST "http://localhost:8080/v1/audio/speech" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/pocket-tts",
+    "input": "Hello from MLX VLM.",
+    "voice": "fantine",
+    "response_format": "mp3"
+  }' \
+  --output speech.mp3
+```
+
+##### Speech-to-Text
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=mlx-community/parakeet-tdt-0.6b-v3 \
+  -F file=@/path/to/audio.mp3 \
+  -F response_format=json
+```
+
+##### Multi-Modal (Image + Audio)
+
+```sh
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
@@ -972,6 +1020,7 @@ curl -X POST "http://localhost:8080/generate" \
 ```
 
 ##### Responses Endpoint
+
 ```sh
 curl -X POST "http://localhost:8080/responses" \
   -H "Content-Type: application/json" \
@@ -1003,6 +1052,7 @@ curl -X POST "http://localhost:8080/responses" \
 - `enable_thinking`: Override the server thinking-mode default for a request (`true` or `false`)
 - `thinking_budget`: Maximum tokens allowed inside the thinking block
 - `thinking_start_token`: Token that opens a thinking block
+- `thinking_end_token`: Token that closes a thinking block
 - `stream`: Enable streaming responses
 
 
