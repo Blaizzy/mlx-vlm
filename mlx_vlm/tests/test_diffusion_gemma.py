@@ -829,7 +829,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].generation_tokens, 4)
         self.assertGreaterEqual(responses[-1].diffusion_canvas_tokens, 3)
 
-    def test_confidence_threshold_sampler_can_exit_after_one_step(self):
+    def test_default_confidence_threshold_sampler_can_exit_after_one_step(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -846,7 +846,6 @@ class TestDiffusionGemma4(unittest.TestCase):
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
                 max_denoising_steps=4,
-                diffusion_sampler="confidence-threshold",
                 diffusion_threshold=0.0,
             )
         )
@@ -903,6 +902,7 @@ class TestDiffusionGemma4(unittest.TestCase):
                 "",
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
+                diffusion_sampler="entropy-bound",
             )
         )
 
@@ -928,6 +928,7 @@ class TestDiffusionGemma4(unittest.TestCase):
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
                 max_denoising_steps=48,
+                diffusion_sampler="entropy-bound",
             )
         )
 
@@ -1492,46 +1493,34 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
             True,
         )
 
-    def test_auto_sampler_uses_confidence_threshold_for_quantized_weights(self):
-        import mlx.nn as nn
+    def test_diffusion_kwargs_omits_default_confidence_threshold_sampler(self):
+        from types import SimpleNamespace
 
-        from mlx_vlm.generate.diffusion import (
-            DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
-            DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD,
-            _resolve_diffusion_sampler,
-        )
+        from mlx_vlm.generate.diffusion import diffusion_kwargs_from_args
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
-        config_dict = tiny_config_dict()
-        config_dict["text_config"]["hidden_size"] = 32
-        model = Model(ModelConfig.from_dict(config_dict))
-
-        self.assertEqual(
-            _resolve_diffusion_sampler(model, "auto", None),
-            ("entropy-bound", DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD),
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        args = SimpleNamespace(
+            max_denoising_steps=None,
+            diffusion_full_canvas=False,
+            diffusion_min_canvas_length=None,
+            diffusion_max_canvas_length=None,
+            diffusion_sampler="confidence-threshold",
+            threshold=None,
         )
 
-        nn.quantize(
-            model,
-            group_size=32,
-            bits=5,
-            class_predicate=lambda path, module: isinstance(module, nn.Embedding),
+        self.assertEqual(diffusion_kwargs_from_args(args, model.config), {})
+
+        args.diffusion_sampler = "entropy-bound"
+        self.assertEqual(
+            diffusion_kwargs_from_args(args, model.config),
+            {"diffusion_sampler": "entropy-bound"},
         )
 
+        args.threshold = 0.7
         self.assertEqual(
-            _resolve_diffusion_sampler(model, "auto", None),
-            (
-                "confidence-threshold",
-                DEFAULT_QUANTIZED_DIFFUSION_CONFIDENCE_THRESHOLD,
-            ),
-        )
-        self.assertEqual(
-            _resolve_diffusion_sampler(model, "entropy-bound", None),
-            ("entropy-bound", DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD),
-        )
-        self.assertEqual(
-            _resolve_diffusion_sampler(model, "confidence-threshold", 0.7),
-            ("confidence-threshold", 0.7),
+            diffusion_kwargs_from_args(args, model.config),
+            {"diffusion_sampler": "entropy-bound", "diffusion_threshold": 0.7},
         )
 
     def test_stream_generate_with_quantized_embeddings(self):
