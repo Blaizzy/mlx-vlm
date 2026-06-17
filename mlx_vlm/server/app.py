@@ -443,15 +443,46 @@ def load_audio_model(model_path: str):
 @asynccontextmanager
 async def lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
+    adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     if model_path:
-        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-        logger.info("Pre-loading model: %s", model_path)
-        get_cached_model(model_path, adapter_path)
+        logger.info("Pre-loading language model: %s", model_path)
+        get_cached_model(model_path, adapter_path, model_kind="text_generation")
         kv_bits = os.environ.get("KV_BITS")
         kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
         if kv_bits:
             logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Model ready, continuous batching enabled.")
+        logger.info("Language model ready, continuous batching enabled.")
+
+    preload_models = (
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
+            None,
+            "image_generation",
+            "image generation model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_TTS_MODEL", None),
+            None,
+            "audio_tts",
+            "text-to-speech model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_STT_MODEL", None),
+            None,
+            "audio_stt",
+            "speech-to-text model",
+        ),
+    )
+    for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
+        if not preload_model_path:
+            continue
+        logger.info("Pre-loading %s: %s", label, preload_model_path)
+        get_cached_model(
+            preload_model_path,
+            preload_adapter_path,
+            model_kind=model_kind,
+        )
+        logger.info("%s ready.", label.capitalize())
     try:
         yield
     finally:
