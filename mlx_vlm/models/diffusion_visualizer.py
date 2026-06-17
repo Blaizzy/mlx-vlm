@@ -8,16 +8,18 @@ models. The diffusion_gemma package builds its text-stream visualizer on
 the same ``_CanvasRedrawer``.
 
 Rendering lives with the models; the shared generation engine in
-``mlx_vlm.generate.diffusion`` keeps its own draft-text redrawer untouched.
+``mlx_vlm.generate.diffusion`` only reuses the terminal text helpers for its
+fallback draft-text redrawer.
 """
 
+import re
 import shutil
 import time
 import unicodedata
 from typing import Any, Optional
 
 
-def _display_width(text: str) -> int:
+def display_width(text: str) -> int:
     width = 0
     for char in text:
         if unicodedata.combining(char):
@@ -26,11 +28,46 @@ def _display_width(text: str) -> int:
     return width
 
 
+def escape_carriage_returns(text: str) -> str:
+    return text.replace("\r", "\\r")
+
+
+def clip_display_width(text: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+
+    if "\n" in text:
+        return "\n".join(
+            clip_display_width(line, max_width) for line in text.split("\n")
+        )
+
+    out = []
+    width = 0
+    clipped = False
+    for char in text:
+        if unicodedata.combining(char):
+            char_width = 0
+        else:
+            char_width = 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+        if width + char_width > max_width:
+            clipped = True
+            break
+        out.append(char)
+        width += char_width
+
+    if clipped and max_width >= 3:
+        while out and display_width("".join(out)) > max_width - 3:
+            out.pop()
+        out.append("...")
+
+    return "".join(out)
+
+
 def _take_display_width(text: str, width: int) -> str:
     taken = ""
     taken_width = 0
     for char in text:
-        char_width = _display_width(char)
+        char_width = display_width(char)
         if taken_width + char_width > width:
             break
         taken += char
@@ -49,20 +86,29 @@ def _wrap_text(text: str, width: int) -> str:
     for raw_line in text.split("\n"):
         line = ""
         line_width = 0
-        for word in raw_line.split(" "):
-            word_width = _display_width(word)
-            separator = 1 if line else 0
-            if line_width + separator + word_width <= width:
-                line += (" " if separator else "") + word
-                line_width += separator + word_width
+        for word in re.findall(r" *[^ ]+| +", raw_line):
+            word_width = display_width(word)
+            if line and line_width + word_width > width:
+                wrapped_lines.append(line.rstrip(" "))
+                line = ""
+                line_width = 0
+                word = word.lstrip(" ")
+                word_width = display_width(word)
+                if not word:
+                    continue
+
+            if line_width + word_width <= width:
+                line += word
+                line_width += word_width
                 continue
+
             if line:
-                wrapped_lines.append(line)
+                wrapped_lines.append(line.rstrip(" "))
             while word_width > width:
                 head = _take_display_width(word, width)
                 wrapped_lines.append(head)
                 word = word[len(head) :]
-                word_width = _display_width(word)
+                word_width = display_width(word)
             line = word
             line_width = word_width
         wrapped_lines.append(line)
@@ -186,7 +232,7 @@ class DiffusionUnmaskingVisualizer:
         piece = self.tokenizer.decode(
             [token_id], skip_special_tokens=self.skip_special_tokens
         )
-        return piece.replace("\n", "\\n") or " "
+        return escape_carriage_returns(piece) or " "
 
     def visualize(self, tokens: Any, force: bool = False) -> None:
         if not self.active:

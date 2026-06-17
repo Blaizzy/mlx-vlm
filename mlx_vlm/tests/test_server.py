@@ -757,6 +757,62 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     ) == 1
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/v1/metrics"),
+        ("get", "/cache/stats"),
+        ("get", "/v1/cache/stats"),
+        ("post", "/cache/reset"),
+        ("post", "/v1/cache/reset"),
+        ("post", "/unload"),
+    ],
+)
+def test_management_endpoints_allow_requests_without_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    response = getattr(client, method)(path)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/v1/metrics"),
+        ("get", "/cache/stats"),
+        ("get", "/v1/cache/stats"),
+        ("post", "/cache/reset"),
+        ("post", "/v1/cache/reset"),
+        ("post", "/unload"),
+    ],
+)
+def test_management_endpoints_require_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    missing = getattr(client, method)(path)
+    invalid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    valid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer secret-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert valid.status_code == 200
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
@@ -2193,6 +2249,53 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
             "content": "First text block. Second text block.",
         }
     ]
+
+
+def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": "Hello",
+                        "reasoning": "Prior thought",
+                    },
+                    {"role": "user", "content": "Continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2][1] == {
+        "role": "assistant",
+        "content": "Hello",
+        "reasoning": "Prior thought",
+    }
 
 
 def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
@@ -4307,6 +4410,7 @@ class TestResponseGenerator:
             "MLX_VLM_THINKING_BUDGET",
             "MLX_VLM_THINKING_START_TOKEN",
             "MLX_VLM_THINKING_END_TOKEN",
+            "MLX_VLM_SERVER_API_KEY",
             "PREFILL_STEP_SIZE",
             "KV_GROUP_SIZE",
             "KV_QUANT_SCHEME",
@@ -4337,6 +4441,8 @@ class TestResponseGenerator:
                 "<|START_THINKING|>",
                 "--thinking-eos-token",
                 "<|END_THINKING|>",
+                "--api-key",
+                "admin-token",
             ],
         )
         run_calls = []
@@ -4357,6 +4463,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] == "image-demo"
             assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
+            assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
@@ -4371,6 +4478,7 @@ class TestResponseGenerator:
                 "MLX_VLM_THINKING_BUDGET",
                 "MLX_VLM_THINKING_START_TOKEN",
                 "MLX_VLM_THINKING_END_TOKEN",
+                "MLX_VLM_SERVER_API_KEY",
             ):
                 os.environ.pop(env_var, None)
 
