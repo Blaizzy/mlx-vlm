@@ -4,7 +4,8 @@ import logging
 import os
 import shutil
 import time
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -527,6 +528,238 @@ def _decode_diffusion_masked_draft(
     return escape_carriage_returns(text)
 
 
+@dataclass
+class DiffusionCanvasDraft:
+    """A live unmasking frame yielded mid-denoise by a canvas denoiser."""
+
+    text: str
+    step: int
+    total_steps: int
+
+
+@dataclass
+class DiffusionCanvasResult:
+    """The committed canvas + accounting a denoiser returns once per canvas."""
+
+    canvas: mx.array
+    canvas_tokens: int
+    denoising_steps: int
+    work_tokens: int
+
+
+@dataclass
+class DiffusionCanvasDenoiseContext:
+    """Everything a per-canvas denoiser needs from the shared outer loop.
+
+    The outer ``stream_diffusion_generate`` loop owns prefill, the KV-cache
+    commit between canvases, token emission, stopping criteria, and stats;
+    only the per-canvas denoising is pluggable. A denoiser is a generator
+    ``denoise(ctx) -> Iterable[DiffusionCanvasDraft | DiffusionCanvasResult]``
+    that yields zero or more draft frames and then exactly one result.
+    ``compile_graph`` is read back after the call so a compile fallback
+    persists across canvases.
+    """
+
+    model: nn.Module
+    tokenizer: PreTrainedTokenizer
+    input_dtype: Any
+    batch_size: int
+    canvas_length: int
+    vocab_size: int
+    kv_cache: Any
+    decoder_attention_mask: Optional[mx.array]
+    mask_mapping: Any
+    max_denoising_steps: int
+    temperature: float
+    temperature_config: Dict[str, Any]
+    sampler: str
+    threshold: float
+    entropy_bound: float
+    stopping_config: Optional[Dict[str, Any]]
+    soft_embedding_weight: mx.array
+    compile_graph: bool
+    show_unmasking: bool
+    unmasking_interval: int
+    unmasking_width: int
+    skip_special_token_ids: Any
+
+
+def _standard_diffusion_canvas_denoiser(
+    ctx: DiffusionCanvasDenoiseContext,
+) -> Generator[Union[DiffusionCanvasDraft, DiffusionCanvasResult], None, None]:
+    """Checkpoint-faithful entropy/confidence-bound canvas denoiser.
+
+    This is the reference per-canvas loop extracted verbatim from the old
+    inline implementation; behavior is unchanged.
+    """
+    model = ctx.model
+    canvas_length = ctx.canvas_length
+    max_denoising_steps = ctx.max_denoising_steps
+
+    current_canvas = _diffusion_initialize_canvas(
+        ctx.batch_size, canvas_length, ctx.vocab_size, ctx.input_dtype
+    )
+    draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
+    draft_canvas = current_canvas
+    accepted_canvas = current_canvas
+    argmax_canvas = current_canvas
+    self_conditioning_embeddings = None
+    decoder_logits_without_sc, decoder_logits_with_sc = (
+        _make_diffusion_decoder_logits_fns(
+            model, ctx.kv_cache, ctx.mask_mapping, compile_graph=ctx.compile_graph
+        )
+    )
+    diffusion_history: List[mx.array] = []
+    denoising_steps_this_canvas = 0
+
+    if ctx.show_unmasking:
+        draft_text = _decode_diffusion_masked_draft(
+            ctx.tokenizer,
+            [int(token_id) for token_id in draft_canvas[0].tolist()],
+            [False] * canvas_length,
+            ctx.skip_special_token_ids,
+            max_chars=ctx.unmasking_width,
+        )
+        yield DiffusionCanvasDraft(draft_text, 0, max_denoising_steps)
+
+    for cur_step in reversed(range(1, max_denoising_steps + 1)):
+        denoising_steps_this_canvas += 1
+        try:
+            if self_conditioning_embeddings is None:
+                processed_logits = decoder_logits_without_sc(current_canvas)
+            else:
+                processed_logits = decoder_logits_with_sc(
+                    current_canvas, self_conditioning_embeddings
+                )
+        except Exception as exc:
+            if not ctx.compile_graph:
+                raise
+            logger.warning(
+                "Diffusion decoder compilation failed; falling back "
+                "to the eager path: %s",
+                exc,
+            )
+            ctx.compile_graph = False
+            decoder_logits_without_sc, decoder_logits_with_sc = (
+                _make_diffusion_decoder_logits_fns(
+                    model, ctx.kv_cache, ctx.mask_mapping, compile_graph=False
+                )
+            )
+            if self_conditioning_embeddings is None:
+                processed_logits = decoder_logits_without_sc(current_canvas)
+            else:
+                processed_logits = decoder_logits_with_sc(
+                    current_canvas, self_conditioning_embeddings
+                )
+        schedule_temperature = _diffusion_linear_temperature(
+            cur_step, max_denoising_steps, ctx.temperature_config
+        )
+        if schedule_temperature is not None:
+            processed_logits = processed_logits / schedule_temperature
+
+        argmax_canvas = mx.argmax(processed_logits, axis=-1).astype(ctx.input_dtype)
+        if cur_step == 1 and not ctx.show_unmasking:
+            break
+
+        denoiser_canvas = (
+            argmax_canvas
+            if ctx.temperature <= 0
+            else _diffusion_sample_canvas(
+                processed_logits, ctx.input_dtype, ctx.temperature
+            )
+        )
+
+        if ctx.sampler == "entropy-bound":
+            if cur_step > 1:
+                token_entropy, next_self_conditioning_embeddings = (
+                    _diffusion_entropy_and_soft_embeddings(
+                        processed_logits,
+                        ctx.soft_embedding_weight,
+                        model.model.decoder.embed_scale,
+                    )
+                )
+            else:
+                token_entropy = _diffusion_token_entropy(processed_logits)
+                next_self_conditioning_embeddings = None
+            acceptance_mask = _diffusion_entropy_transfer_mask(
+                token_entropy, ctx.entropy_bound
+            )
+            accepted_canvas = mx.where(acceptance_mask, denoiser_canvas, current_canvas)
+            current_canvas = mx.where(
+                acceptance_mask,
+                accepted_canvas,
+                _diffusion_initialize_canvas(
+                    ctx.batch_size, canvas_length, ctx.vocab_size, ctx.input_dtype
+                ),
+            )
+            draft_reveal_mask = acceptance_mask
+            draft_canvas = argmax_canvas
+        else:
+            next_self_conditioning_embeddings = None
+            unrevealed_mask = ~draft_reveal_mask
+            confidence = _diffusion_token_probability(processed_logits, denoiser_canvas)
+            acceptance_mask = _diffusion_confidence_transfer_mask(
+                confidence,
+                unrevealed_mask,
+                ctx.threshold,
+                force_all=cur_step == 1,
+            )
+            accepted_canvas = mx.where(acceptance_mask, denoiser_canvas, draft_canvas)
+            current_canvas = mx.where(
+                draft_reveal_mask | acceptance_mask,
+                accepted_canvas,
+                _diffusion_initialize_canvas(
+                    ctx.batch_size, canvas_length, ctx.vocab_size, ctx.input_dtype
+                ),
+            )
+            draft_reveal_mask = draft_reveal_mask | acceptance_mask
+            draft_canvas = mx.where(acceptance_mask, accepted_canvas, draft_canvas)
+
+        displayed_step = max_denoising_steps - cur_step + 1
+        should_show_unmasking = ctx.show_unmasking and (
+            displayed_step == 1
+            or cur_step == 1
+            or displayed_step % ctx.unmasking_interval == 0
+        )
+        if should_show_unmasking:
+            mx.eval(draft_canvas, draft_reveal_mask)
+            draft_text = _decode_diffusion_masked_draft(
+                ctx.tokenizer,
+                [int(token_id) for token_id in draft_canvas[0].tolist()],
+                [bool(v) for v in draft_reveal_mask[0].tolist()],
+                ctx.skip_special_token_ids,
+                max_chars=ctx.unmasking_width,
+            )
+            yield DiffusionCanvasDraft(draft_text, displayed_step, max_denoising_steps)
+
+        if ctx.sampler == "confidence-threshold" and bool(
+            mx.all(draft_reveal_mask).item()
+        ):
+            accepted_canvas = draft_canvas
+            break
+
+        if _diffusion_stable_and_confident(
+            argmax_canvas, processed_logits, diffusion_history, ctx.stopping_config
+        ):
+            break
+
+        if cur_step > 1:
+            if next_self_conditioning_embeddings is None:
+                next_self_conditioning_embeddings = _diffusion_soft_embeddings(
+                    processed_logits,
+                    ctx.soft_embedding_weight,
+                    model.model.decoder.embed_scale,
+                )
+            self_conditioning_embeddings = next_self_conditioning_embeddings
+
+    yield DiffusionCanvasResult(
+        canvas=argmax_canvas,
+        canvas_tokens=canvas_length,
+        denoising_steps=denoising_steps_this_canvas,
+        work_tokens=canvas_length * denoising_steps_this_canvas,
+    )
+
+
 def stream_diffusion_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -549,6 +782,8 @@ def stream_diffusion_generate(
     diffusion_show_unmasking: bool = False,
     diffusion_unmasking_interval: int = 1,
     diffusion_unmasking_width: int = DEFAULT_DIFFUSION_UNMASKING_WIDTH,
+    diffusion_canvas_denoiser: Optional[Any] = None,
+    diffusion_repeat_guard: Optional[int] = None,
     mm_token_type_ids: Optional[mx.array] = None,
     prefill_step_size: Optional[int] = None,
 ) -> Generator[GenerationResult, None, None]:
@@ -678,6 +913,8 @@ def stream_diffusion_generate(
         )
     )
 
+    canvas_denoiser = diffusion_canvas_denoiser or _standard_diffusion_canvas_denoiser
+
     generated_tokens = 0
     diffusion_canvas_tokens = 0
     diffusion_denoising_steps = 0
@@ -690,6 +927,12 @@ def stream_diffusion_generate(
     current_canvas = None
     stopped = False
     stop_reason = "length"
+    # Degeneration guard (shared across denoisers): stop if a single token
+    # repeats this many times in a row — natural text never does, so a long
+    # run is an unambiguous collapse signal.
+    repeat_guard = int(diffusion_repeat_guard) if diffusion_repeat_guard else 0
+    prev_emit_id = None
+    repeat_run = 0
 
     def make_result(
         text: str,
@@ -730,8 +973,12 @@ def stream_diffusion_generate(
     with mx.stream(generation_stream):
         # Float view of the embedding table for self-conditioning soft
         # embeddings; dequantized once per call for quantized checkpoints.
-        soft_embedding_weight = _diffusion_soft_embedding_weight(
-            model.model.decoder.embed_tokens
+        # Only the standard denoiser needs it — custom denoisers (e.g. turbo,
+        # which gathers top-K rows instead) avoid the ~1.5 GB dequant entirely.
+        soft_embedding_weight = (
+            _diffusion_soft_embedding_weight(model.model.decoder.embed_tokens)
+            if diffusion_canvas_denoiser is None
+            else None
         )
         canvas_index = 0
         while generated_tokens < max_new_tokens:
@@ -778,225 +1025,59 @@ def stream_diffusion_generate(
                 if decoder_attention_mask is not None
                 else None
             )
-            current_canvas = _diffusion_initialize_canvas(
-                batch_size,
-                canvas_length,
-                vocab_size,
-                input_ids.dtype,
-            )
-            draft_reveal_mask = mx.zeros(current_canvas.shape, dtype=mx.bool_)
-            draft_canvas = current_canvas
-            accepted_canvas = current_canvas
-            argmax_canvas = current_canvas
-            self_conditioning_embeddings = None
             mask_mapping = model.model.decoder._make_decoder_masks(
-                current_canvas[..., None],
+                mx.zeros((batch_size, canvas_length, 1), dtype=mx.bool_),
                 kv_cache,
                 current_decoder_attention_mask,
             )
-            decoder_logits_without_sc, decoder_logits_with_sc = (
-                _make_diffusion_decoder_logits_fns(
-                    model,
-                    kv_cache,
-                    mask_mapping,
-                    compile_graph=diffusion_compile,
-                )
+            ctx = DiffusionCanvasDenoiseContext(
+                model=model,
+                tokenizer=tokenizer,
+                input_dtype=input_ids.dtype,
+                batch_size=batch_size,
+                canvas_length=canvas_length,
+                vocab_size=vocab_size,
+                kv_cache=kv_cache,
+                decoder_attention_mask=current_decoder_attention_mask,
+                mask_mapping=mask_mapping,
+                max_denoising_steps=max_denoising_steps,
+                temperature=temperature,
+                temperature_config=temperature_config,
+                sampler=diffusion_sampler,
+                threshold=diffusion_threshold,
+                entropy_bound=entropy_bound,
+                stopping_config=diffusion_stopping_config,
+                soft_embedding_weight=soft_embedding_weight,
+                compile_graph=diffusion_compile,
+                show_unmasking=diffusion_show_unmasking,
+                unmasking_interval=diffusion_unmasking_interval,
+                unmasking_width=diffusion_unmasking_width,
+                skip_special_token_ids=skip_special_token_ids,
             )
-            diffusion_history: List[mx.array] = []
-            denoising_steps_this_canvas = 0
 
-            if diffusion_show_unmasking:
-                draft_text = _decode_diffusion_masked_draft(
-                    tokenizer,
-                    [int(token_id) for token_id in draft_canvas[0].tolist()],
-                    [False] * canvas_length,
-                    skip_special_token_ids,
-                    max_chars=diffusion_unmasking_width,
-                )
-                yield make_result(
-                    "",
-                    is_draft=True,
-                    draft_text=draft_text,
-                    diffusion_step=0,
-                    diffusion_total_steps=max_denoising_steps,
-                    diffusion_canvas_index=canvas_index,
-                )
-
-            for cur_step in reversed(range(1, max_denoising_steps + 1)):
-                denoising_steps_this_canvas += 1
-                try:
-                    if self_conditioning_embeddings is None:
-                        processed_logits = decoder_logits_without_sc(current_canvas)
-                    else:
-                        processed_logits = decoder_logits_with_sc(
-                            current_canvas,
-                            self_conditioning_embeddings,
-                        )
-                except Exception as exc:
-                    if not diffusion_compile:
-                        raise
-                    logger.warning(
-                        "Diffusion decoder compilation failed; falling back "
-                        "to the eager path: %s",
-                        exc,
-                    )
-                    diffusion_compile = False
-                    decoder_logits_without_sc, decoder_logits_with_sc = (
-                        _make_diffusion_decoder_logits_fns(
-                            model,
-                            kv_cache,
-                            mask_mapping,
-                            compile_graph=False,
-                        )
-                    )
-                    if self_conditioning_embeddings is None:
-                        processed_logits = decoder_logits_without_sc(current_canvas)
-                    else:
-                        processed_logits = decoder_logits_with_sc(
-                            current_canvas,
-                            self_conditioning_embeddings,
-                        )
-                schedule_temperature = _diffusion_linear_temperature(
-                    cur_step,
-                    max_denoising_steps,
-                    temperature_config,
-                )
-                if schedule_temperature is not None:
-                    processed_logits = processed_logits / schedule_temperature
-
-                argmax_canvas = mx.argmax(processed_logits, axis=-1).astype(
-                    input_ids.dtype
-                )
-                if cur_step == 1 and not diffusion_show_unmasking:
-                    break
-
-                denoiser_canvas = (
-                    argmax_canvas
-                    if temperature <= 0
-                    else _diffusion_sample_canvas(
-                        processed_logits,
-                        input_ids.dtype,
-                        temperature,
-                    )
-                )
-
-                if diffusion_sampler == "entropy-bound":
-                    if cur_step > 1:
-                        token_entropy, next_self_conditioning_embeddings = (
-                            _diffusion_entropy_and_soft_embeddings(
-                                processed_logits,
-                                soft_embedding_weight,
-                                model.model.decoder.embed_scale,
-                            )
-                        )
-                    else:
-                        token_entropy = _diffusion_token_entropy(processed_logits)
-                        next_self_conditioning_embeddings = None
-                    acceptance_mask = _diffusion_entropy_transfer_mask(
-                        token_entropy,
-                        entropy_bound,
-                    )
-                    accepted_canvas = mx.where(
-                        acceptance_mask,
-                        denoiser_canvas,
-                        current_canvas,
-                    )
-                    current_canvas = mx.where(
-                        acceptance_mask,
-                        accepted_canvas,
-                        _diffusion_initialize_canvas(
-                            batch_size,
-                            canvas_length,
-                            vocab_size,
-                            input_ids.dtype,
-                        ),
-                    )
-                    draft_reveal_mask = acceptance_mask
-                    draft_canvas = argmax_canvas
-                else:
-                    next_self_conditioning_embeddings = None
-                    unrevealed_mask = ~draft_reveal_mask
-                    confidence = _diffusion_token_probability(
-                        processed_logits,
-                        denoiser_canvas,
-                    )
-                    acceptance_mask = _diffusion_confidence_transfer_mask(
-                        confidence,
-                        unrevealed_mask,
-                        diffusion_threshold,
-                        force_all=cur_step == 1,
-                    )
-                    accepted_canvas = mx.where(
-                        acceptance_mask,
-                        denoiser_canvas,
-                        draft_canvas,
-                    )
-                    current_canvas = mx.where(
-                        draft_reveal_mask | acceptance_mask,
-                        accepted_canvas,
-                        _diffusion_initialize_canvas(
-                            batch_size,
-                            canvas_length,
-                            vocab_size,
-                            input_ids.dtype,
-                        ),
-                    )
-                    draft_reveal_mask = draft_reveal_mask | acceptance_mask
-                    draft_canvas = mx.where(
-                        acceptance_mask, accepted_canvas, draft_canvas
-                    )
-
-                displayed_step = max_denoising_steps - cur_step + 1
-                should_show_unmasking = diffusion_show_unmasking and (
-                    displayed_step == 1
-                    or cur_step == 1
-                    or displayed_step % diffusion_unmasking_interval == 0
-                )
-                if should_show_unmasking:
-                    mx.eval(draft_canvas, draft_reveal_mask)
-                    draft_text = _decode_diffusion_masked_draft(
-                        tokenizer,
-                        [int(token_id) for token_id in draft_canvas[0].tolist()],
-                        [bool(v) for v in draft_reveal_mask[0].tolist()],
-                        skip_special_token_ids,
-                        max_chars=diffusion_unmasking_width,
-                    )
+            canvas_result = None
+            for event in canvas_denoiser(ctx):
+                if isinstance(event, DiffusionCanvasDraft):
                     yield make_result(
                         "",
                         is_draft=True,
-                        draft_text=draft_text,
-                        diffusion_step=displayed_step,
-                        diffusion_total_steps=max_denoising_steps,
+                        draft_text=event.text,
+                        diffusion_step=event.step,
+                        diffusion_total_steps=event.total_steps,
                         diffusion_canvas_index=canvas_index,
                     )
+                    continue
+                canvas_result = event
 
-                if diffusion_sampler == "confidence-threshold" and bool(
-                    mx.all(draft_reveal_mask).item()
-                ):
-                    accepted_canvas = draft_canvas
-                    break
+            # A compile fallback inside the denoiser persists across canvases.
+            diffusion_compile = ctx.compile_graph
+            if canvas_result is None:
+                raise RuntimeError("Diffusion canvas denoiser did not return a canvas.")
 
-                if _diffusion_stable_and_confident(
-                    argmax_canvas,
-                    processed_logits,
-                    diffusion_history,
-                    diffusion_stopping_config,
-                ):
-                    break
-
-                if cur_step > 1:
-                    if next_self_conditioning_embeddings is None:
-                        next_self_conditioning_embeddings = _diffusion_soft_embeddings(
-                            processed_logits,
-                            soft_embedding_weight,
-                            model.model.decoder.embed_scale,
-                        )
-                    self_conditioning_embeddings = next_self_conditioning_embeddings
-
-            current_canvas = argmax_canvas
-            diffusion_canvas_tokens += canvas_length
-            diffusion_denoising_steps += denoising_steps_this_canvas
-            diffusion_work_tokens += canvas_length * denoising_steps_this_canvas
+            current_canvas = canvas_result.canvas
+            diffusion_canvas_tokens += canvas_result.canvas_tokens
+            diffusion_denoising_steps += canvas_result.denoising_steps
+            diffusion_work_tokens += canvas_result.work_tokens
             mx.eval(current_canvas)
 
             for token_id in current_canvas[0].tolist():
@@ -1007,6 +1088,14 @@ def stream_diffusion_generate(
                     stopped = True
                     stop_reason = "stop"
                     break
+
+                if repeat_guard:
+                    repeat_run = repeat_run + 1 if last_token == prev_emit_id else 1
+                    prev_emit_id = last_token
+                    if repeat_run >= repeat_guard:
+                        stopped = True
+                        stop_reason = "repetition"
+                        break
 
                 detokenizer.add_token(
                     last_token, skip_special_token_ids=skip_special_token_ids
@@ -1064,24 +1153,26 @@ def stream_diffusion_generate_from_kwargs(
     skip_special_token_ids,
     kwargs: Dict[str, Any],
 ) -> Generator[GenerationResult, None, None]:
+    # Turbo is a pluggable canvas denoiser, not a separate loop: it reuses the
+    # shared prefill / KV-cache / emission scaffolding below via the
+    # diffusion_canvas_denoiser hook.
+    canvas_denoiser = None
+    diffusion_repeat_guard = None
     if kwargs.pop("diffusion_turbo", False):
-        from .diffusion_turbo import stream_diffusion_turbo_generate
+        from .diffusion_turbo import TurboDiffusionDenoiser
 
-        with wired_limit(model, [generation_stream]):
-            yield from stream_diffusion_turbo_generate(
-                model,
-                processor,
-                tokenizer,
-                input_ids,
-                pixel_values,
-                attention_mask,
-                max_tokens=kwargs.pop("max_tokens", 2048),
-                temperature=kwargs.pop("temperature", DEFAULT_TEMPERATURE),
-                skip_special_token_ids=skip_special_token_ids,
-                **kwargs,
-            )
-            mx.clear_cache()
-        return
+        diffusion_repeat_guard = kwargs.pop("turbo_repeat_guard", 16)
+        canvas_denoiser = TurboDiffusionDenoiser(
+            topk=kwargs.pop("turbo_topk", 64),
+            monotone=kwargs.pop("turbo_monotone", True),
+            eos_early_stop=kwargs.pop("turbo_eos_early_stop", True),
+            steps=kwargs.pop("turbo_steps", None),
+            accept=kwargs.pop("turbo_accept", "entropy-bound"),
+            threshold=kwargs.pop("turbo_threshold", 0.9),
+            repair=kwargs.pop("turbo_repair", False),
+            compact=kwargs.pop("turbo_compact", False),
+            entropy_bound=kwargs.pop("entropy_bound", None),
+        )
 
     max_denoising_steps = kwargs.pop("max_denoising_steps", None)
     diffusion_full_canvas = kwargs.pop("diffusion_full_canvas", False)
@@ -1120,6 +1211,8 @@ def stream_diffusion_generate_from_kwargs(
             diffusion_show_unmasking=diffusion_show_unmasking,
             diffusion_unmasking_interval=diffusion_unmasking_interval,
             diffusion_unmasking_width=diffusion_unmasking_width,
+            diffusion_canvas_denoiser=canvas_denoiser,
+            diffusion_repeat_guard=diffusion_repeat_guard,
             mm_token_type_ids=mm_token_type_ids,
             prefill_step_size=prefill_step_size,
         )

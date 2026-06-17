@@ -38,24 +38,15 @@ the encoder pass so the prefix KV cache stays exact for subsequent blocks.
 
 from __future__ import annotations
 
-import time
-from typing import Any, Generator, Optional
+from typing import Optional
 
 import mlx.core as mx
-import mlx.nn as nn
-from transformers import PreTrainedTokenizer
 
-from ..tokenizer_utils import make_streaming_detokenizer
-from .common import (
-    GenerationResult,
-    _chunked_prefill_enabled,
-    generation_stream,
-)
 from .diffusion import (
-    DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
-    DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
+    DiffusionCanvasDenoiseContext,
+    DiffusionCanvasDraft,
+    DiffusionCanvasResult,
     _diffusion_config_dict,
-    _diffusion_prefill_cache,
 )
 
 DEFAULT_TURBO_TOPK = 64
@@ -399,582 +390,112 @@ class _TurboSelfConditioner:
         return soft * self.embed_scale
 
 
-def _draft_result(make_result, draft_text, step_idx, total_steps, canvas_index):
-    res = make_result("", canvas_index=canvas_index)
-    res.is_draft = True
-    res.draft_text = draft_text
-    res.diffusion_step = step_idx + 1
-    res.diffusion_total_steps = total_steps
-    return res
+DEFAULT_TURBO_REPEAT_GUARD = 16
 
 
-def stream_diffusion_turbo_generate(
-    model: nn.Module,
-    processor: PreTrainedTokenizer,
-    tokenizer: PreTrainedTokenizer,
-    input_ids: mx.array,
-    pixel_values: Optional[mx.array],
-    attention_mask: Optional[mx.array],
-    *,
-    max_tokens: int,
-    skip_special_token_ids,
-    temperature: float = 0.0,
-    max_denoising_steps: Optional[int] = None,
-    diffusion_full_canvas: bool = False,
-    diffusion_min_canvas_length: Optional[int] = None,
-    diffusion_max_canvas_length: Optional[int] = None,
-    entropy_bound: Optional[float] = None,
-    turbo_topk: int = DEFAULT_TURBO_TOPK,
-    turbo_monotone: bool = True,
-    turbo_eos_early_stop: bool = True,
-    turbo_quota: float = 0.0,
-    turbo_steps: Optional[int] = None,
-    turbo_accept: str = "entropy-bound",
-    turbo_threshold: float = 0.9,
-    turbo_window: int = 0,
-    turbo_repair: bool = False,
-    turbo_compact: bool = False,
-    turbo_repeat_guard: int = 16,
-    diffusion_show_unmasking: bool = False,
-    diffusion_unmasking_interval: int = 1,
-    diffusion_unmasking_width: int = 0,
-    mm_token_type_ids: Optional[mx.array] = None,
-    prefill_step_size: Optional[int] = None,
-    **_ignored: Any,
-) -> Generator[GenerationResult, None, None]:
-    if input_ids.shape[0] != 1:
-        raise ValueError("Turbo diffusion generation only supports batch size 1.")
+class TurboDiffusionDenoiser:
+    """High-throughput, opt-in canvas denoiser for DiffusionGemma.
 
-    generation_config = _diffusion_config_dict(
-        getattr(model.config, "generation_config", None)
-    )
-    config_eos_token_ids = generation_config.get("eos_token_id")
-    if config_eos_token_ids is not None and hasattr(tokenizer, "stopping_criteria"):
-        tokenizer.stopping_criteria.add_eos_token_ids(config_eos_token_ids)
-    eos_ids = set(
-        config_eos_token_ids
-        if isinstance(config_eos_token_ids, (list, tuple))
-        else ([config_eos_token_ids] if config_eos_token_ids is not None else [])
-    )
+    Plugs into ``stream_diffusion_generate`` via its ``diffusion_canvas_denoiser``
+    hook, so it reuses the shared prefill / KV-cache-commit / token-emission /
+    stopping / repeat-guard scaffolding and only owns the per-canvas denoise:
+    an exact top-K sampler chain, gathered self-conditioning, the compacted
+    active-set runner (per-layer K/V buffers + shape bucketing), a two-stage
+    confidence schedule, a repair pass, and EOS tail-drop.
 
-    text_config = model.config.text_config
-    batch_size, prompt_length = input_ids.shape
-    prompt_tokens = input_ids.size
-    model_canvas_length = int(model.config.canvas_length)
-    vocab_size = int(text_config.vocab_size)
-    max_new_tokens = int(max_tokens or generation_config.get("max_new_tokens", 256))
-    if max_denoising_steps is None:
-        max_denoising_steps = int(
-            generation_config.get("max_denoising_steps")
-            or DEFAULT_DIFFUSION_MAX_DENOISING_STEPS
+    All dials are constructor args (the dispatch layer forwards them from
+    ``--gen-kwargs``). ``__call__(ctx)`` implements the denoiser protocol:
+    it yields ``DiffusionCanvasDraft`` frames (live unmasking) then exactly one
+    ``DiffusionCanvasResult`` with the committed canvas. Turbo always uses the
+    compacted runner (``compact`` / ``monotone`` are accepted for API
+    compatibility and are effectively always-on).
+    """
+
+    def __init__(
+        self,
+        *,
+        topk: int = DEFAULT_TURBO_TOPK,
+        monotone: bool = True,
+        eos_early_stop: bool = True,
+        steps: Optional[int] = None,
+        accept: str = "entropy-bound",
+        threshold=0.9,
+        repair: bool = False,
+        compact: bool = True,
+        entropy_bound: Optional[float] = None,
+    ):
+        self.topk = topk
+        self.monotone = monotone
+        self.eos_early_stop = eos_early_stop
+        self.steps = steps
+        self.accept = accept
+        self.threshold = threshold
+        self.repair = repair
+        self.compact = compact
+        self.entropy_bound = entropy_bound
+
+    def __call__(self, ctx: DiffusionCanvasDenoiseContext):
+        model = ctx.model
+        gen_cfg = _diffusion_config_dict(
+            getattr(model.config, "generation_config", None)
         )
-
-    max_canvas_length = (
-        model_canvas_length
-        if diffusion_full_canvas
-        else min(
-            model_canvas_length, int(diffusion_max_canvas_length or model_canvas_length)
+        eos = gen_cfg.get("eos_token_id")
+        eos_ids = set(
+            eos
+            if isinstance(eos, (list, tuple))
+            else ([eos] if eos is not None else [])
         )
-    )
-    min_canvas_length = min(
-        max_canvas_length,
-        int(diffusion_min_canvas_length or DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH),
-    )
-
-    sampler_config = _diffusion_config_dict(
-        generation_config.get("sampler_config", None)
-    )
-    if entropy_bound is None:
-        entropy_bound = float(sampler_config.get("entropy_bound", 0.1))
-    t_min = float(generation_config.get("t_min", 0.4))
-    t_max = float(generation_config.get("t_max", 0.8))
-    stability_threshold = int(generation_config.get("stability_threshold", 1))
-    confidence_threshold = float(generation_config.get("confidence_threshold", 0.005))
-
-    decoder = model.model.decoder
-    self_conditioner = _TurboSelfConditioner(decoder)
-    sc_module = decoder.self_conditioning
-    entropy_bound_arr = mx.array(entropy_bound, dtype=mx.float32)
-    softcap_arr = mx.array(
-        float(
+        sampler_cfg = _diffusion_config_dict(gen_cfg.get("sampler_config", None))
+        entropy_bound = (
+            self.entropy_bound
+            if self.entropy_bound is not None
+            else float(sampler_cfg.get("entropy_bound", ctx.entropy_bound))
+        )
+        t_min = float(ctx.temperature_config.get("t_min", 0.4))
+        t_max = float(ctx.temperature_config.get("t_max", 0.8))
+        softcap = float(
             getattr(model.language_model, "final_logit_softcapping", None)
-            or getattr(text_config, "final_logit_softcapping", 30.0)
-        ),
-        dtype=mx.float32,
-    )
+            or getattr(model.config.text_config, "final_logit_softcapping", 30.0)
+        )
+        total_steps = self.steps or ctx.max_denoising_steps
 
-    kv_cache = model.make_cache()
-    detokenizer = make_streaming_detokenizer(processor)
-    has_padding = attention_mask is not None and not bool(mx.all(attention_mask).item())
-    prefill_policy_kwargs = {
-        "attention_mask": attention_mask,
-        "has_padding": has_padding,
-        "use_static_cache": False,
-        "pixel_values": pixel_values,
-        "mm_token_type_ids": mm_token_type_ids,
-    }
-    chunk_prefill = (
-        prefill_step_size is not None
-        and prompt_length > prefill_step_size
-        and _chunked_prefill_enabled(
+        committed = None
+        steps = ctx.max_denoising_steps
+        work_tokens = ctx.canvas_length
+        for event in _run_canvas_compact(
             model,
-            input_ids=input_ids,
-            prompt_cache=kv_cache,
-            prefill_kwargs=prefill_policy_kwargs,
-        )
-    )
-
-    generated_tokens = 0
-    diffusion_canvas_tokens = 0
-    diffusion_denoising_steps = 0
-    diffusion_work_tokens = 0
-    last_token = None
-    prompt_time = 0.0
-    generation_tic = time.perf_counter()
-    tic = time.perf_counter()
-    stopped = False
-    stop_reason = "length"
-    # Degeneration guard: a runaway canvas can commit the same token hundreds of
-    # times ("the the the..."). Natural text effectively never repeats one token
-    # this many times in a row, so a long run is an unambiguous collapse signal;
-    # we stop instead of emitting a wall of garbage up to max_tokens.
-    repeat_guard = int(turbo_repeat_guard) if turbo_repeat_guard else 0
-    prev_emit_id = None
-    repeat_run = 0
-
-    def make_result(text, *, finish_reason=None, canvas_index=0, block_complete=False):
-        generation_time = max(time.perf_counter() - generation_tic, 1e-9)
-        return GenerationResult(
-            text=text,
-            token=last_token,
-            logprobs=None,
-            prompt_tokens=prompt_tokens,
-            generation_tokens=generated_tokens,
-            total_tokens=prompt_tokens + generated_tokens,
-            prompt_tps=prompt_tokens / max(prompt_time, 1e-9),
-            generation_tps=generated_tokens / generation_time,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=finish_reason,
-            diffusion_canvas_tokens=diffusion_canvas_tokens,
-            diffusion_denoising_steps=diffusion_denoising_steps,
-            diffusion_work_tokens=diffusion_work_tokens,
-            diffusion_canvas_tps=diffusion_canvas_tokens / generation_time,
-            diffusion_work_tps=diffusion_work_tokens / generation_time,
-            diffusion_canvas_index=canvas_index,
-            diffusion_block_complete=block_complete,
-        )
-
-    with mx.stream(generation_stream):
-        canvas_index = 0
-        is_prefill = True
-        committed_canvas = None
-
-        while generated_tokens < max_new_tokens:
-            canvas_index += 1
-            if is_prefill:
-                kv_cache = _diffusion_prefill_cache(
-                    model,
-                    input_ids,
-                    attention_mask=attention_mask if has_padding else None,
-                    kv_cache=kv_cache,
-                    pixel_values=pixel_values,
-                    mm_token_type_ids=mm_token_type_ids,
-                    prefill_step_size=prefill_step_size,
-                    chunk_prefill=chunk_prefill,
-                )
-                mx.eval([c.state for c in kv_cache])
-                prompt_time = time.perf_counter() - tic
-                generation_tic = time.perf_counter()
-                is_prefill = False
+            ctx.kv_cache,
+            canvas_length=ctx.canvas_length,
+            vocab_size=ctx.vocab_size,
+            eos_ids=eos_ids,
+            max_denoising_steps=ctx.max_denoising_steps,
+            turbo_topk=self.topk,
+            turbo_threshold=self.threshold,
+            turbo_steps=self.steps,
+            turbo_repair=self.repair,
+            turbo_eos_early_stop=self.eos_early_stop,
+            entropy_bound=entropy_bound,
+            turbo_accept=self.accept,
+            softcap=softcap,
+            t_min=t_min,
+            t_max=t_max,
+            temperature=ctx.temperature,
+            show_unmasking=ctx.show_unmasking,
+            unmask_interval=ctx.unmasking_interval,
+            unmask_width=ctx.unmasking_width,
+            tokenizer=ctx.tokenizer,
+            skip_special_token_ids=ctx.skip_special_token_ids,
+        ):
+            if event[0] == "draft":
+                yield DiffusionCanvasDraft(event[1], event[2] + 1, total_steps)
             else:
-                _, kv_cache = model.model.encoder(
-                    committed_canvas, attention_mask=None, cache=kv_cache
-                )
+                _, committed, _emit_length, steps, work_tokens = event
 
-            remaining = max_new_tokens - generated_tokens
-            canvas_length = (
-                model_canvas_length
-                if diffusion_full_canvas
-                else min(max_canvas_length, max(remaining, min_canvas_length))
-            )
-
-            if turbo_compact:
-                canvas_gen = _run_canvas_compact(
-                    model,
-                    kv_cache,
-                    canvas_length=canvas_length,
-                    vocab_size=vocab_size,
-                    eos_ids=eos_ids,
-                    max_denoising_steps=max_denoising_steps,
-                    turbo_topk=turbo_topk,
-                    turbo_threshold=turbo_threshold,
-                    turbo_steps=turbo_steps,
-                    turbo_repair=turbo_repair,
-                    turbo_eos_early_stop=turbo_eos_early_stop,
-                    entropy_bound=entropy_bound,
-                    turbo_accept=turbo_accept,
-                    softcap=float(softcap_arr.item()),
-                    t_min=t_min,
-                    t_max=t_max,
-                    temperature=temperature,
-                    show_unmasking=diffusion_show_unmasking,
-                    unmask_interval=diffusion_unmasking_interval,
-                    unmask_width=diffusion_unmasking_width,
-                    tokenizer=tokenizer,
-                    skip_special_token_ids=skip_special_token_ids,
-                )
-                committed_list = None
-                for frame in canvas_gen:
-                    if frame[0] == "draft":
-                        _, draft_text, step_idx = frame
-                        yield _draft_result(
-                            make_result,
-                            draft_text,
-                            step_idx,
-                            turbo_steps or max_denoising_steps,
-                            canvas_index,
-                        )
-                    else:
-                        _, committed_list, emit_length, c_steps, c_work = frame
-                diffusion_canvas_tokens += canvas_length
-                diffusion_denoising_steps += c_steps
-                diffusion_work_tokens += c_work
-                committed_canvas = mx.array(
-                    [committed_list[:emit_length]], dtype=mx.int32
-                )
-                for token_id in committed_list[:emit_length]:
-                    last_token = int(token_id)
-                    generated_tokens += 1
-                    if tokenizer.stopping_criteria(last_token):
-                        stopped = True
-                        stop_reason = "stop"
-                        break
-                    if repeat_guard:
-                        repeat_run = repeat_run + 1 if last_token == prev_emit_id else 1
-                        prev_emit_id = last_token
-                        if repeat_run >= repeat_guard:
-                            stopped = True
-                            stop_reason = "repetition"
-                            break
-                    detokenizer.add_token(
-                        last_token, skip_special_token_ids=skip_special_token_ids
-                    )
-                    yield make_result(
-                        detokenizer.last_segment, canvas_index=canvas_index
-                    )
-                    if generated_tokens >= max_new_tokens:
-                        stopped = True
-                        stop_reason = "length"
-                        break
-                yield make_result("", canvas_index=canvas_index, block_complete=True)
-                if stopped:
-                    break
-                mx.clear_cache()
-                continue
-
-            # int32 throughout: int64 scatter ops hit a broken Metal JIT
-            # template on macOS 27 (atomic packing_size<long> divide-by-zero).
-            canvas = mx.random.randint(0, vocab_size, (batch_size, canvas_length))
-            frozen = mx.zeros((batch_size, canvas_length), dtype=mx.bool_)
-            committed = canvas
-            sc_embeddings = None
-            prev_argmax = None
-            stable_count = 0
-            steps_this_canvas = 0
-            work_tokens_this_canvas = 0
-
-            masks = decoder._make_decoder_masks(canvas[..., None], kv_cache, None)
-
-            final_canvas = None
-            emit_length = canvas_length
-
-            for step in range(max_denoising_steps):
-                steps_this_canvas += 1
-                # Decoder forward over the full canvas (frozen tokens keep
-                # providing exact attention context).
-                inputs_embeds = decoder.embed_tokens(canvas) * decoder.embed_scale
-                if sc_embeddings is None:
-                    soft = mx.zeros_like(inputs_embeds)
-                else:
-                    soft = sc_embeddings.astype(inputs_embeds.dtype)
-                h = sc_module(inputs_embeds, soft)
-                cache_list = kv_cache or [None] * len(decoder.layers)
-                offset = (
-                    cache_list[0].offset
-                    if cache_list and getattr(cache_list[0], "keys", None) is not None
-                    else 0
-                )
-                for layer, c in zip(decoder.layers, cache_list):
-                    h = layer(
-                        h, masks.get(layer.layer_type), c, decoder=True, offset=offset
-                    )
-                h = decoder.norm(h)
-
-                if turbo_monotone and step > 0:
-                    active_idx = mx.array(active_positions)
-                    h_active = h[:, active_idx, :]
-                else:
-                    active_idx = None
-                    h_active = h
-                work_tokens_this_canvas += int(h_active.shape[1])
-
-                raw_logits = decoder.embed_tokens.as_linear(h_active)
-                vals, idx = _topk_logits(raw_logits, turbo_topk)
-
-                frac = 1.0 - step / max(max_denoising_steps - 1, 1)
-                step_temp = mx.array(t_min + (t_max - t_min) * frac, dtype=mx.float32)
-                probs, entropy = _topk_postprocess(vals, softcap_arr, step_temp)
-
-                # Proposal per position: argmax (temp<=0) or categorical in top-K.
-                if temperature <= 0:
-                    sel = mx.argmax(probs, axis=-1)
-                else:
-                    sel = mx.random.categorical(
-                        mx.log(probs + 1e-20) / max(temperature, 1e-5)
-                    )
-                proposal = (
-                    mx.take_along_axis(idx, sel[..., None], axis=-1)
-                    .squeeze(-1)
-                    .astype(mx.int32)
-                )
-                top1 = (
-                    mx.take_along_axis(
-                        idx, mx.argmax(probs, axis=-1)[..., None], axis=-1
-                    )
-                    .squeeze(-1)
-                    .astype(mx.int32)
-                )
-
-                quota_n = 0
-                n_active = int(entropy.shape[-1])
-                if turbo_quota > 0:
-                    quota_n = max(1, int(n_active * turbo_quota))
-
-                flush = turbo_steps is not None and step >= turbo_steps - 1
-                if flush:
-                    # Final-step flush (reference fast-mode semantics): after
-                    # turbo_steps - 1 refinement rounds the leftovers are
-                    # well-conditioned on the committed context, so taking
-                    # their argmax wholesale costs little quality and bounds
-                    # the canvas at exactly turbo_steps forwards.
-                    accept = mx.ones(entropy.shape, dtype=mx.bool_)
-                elif turbo_accept == "confidence":
-                    # Fast-dLLM-style absolute-readiness rule: commit every
-                    # position whose top-1 probability clears the threshold;
-                    # if none qualify, force the single most confident one so
-                    # the canvas always makes progress.
-                    top_p = probs.max(axis=-1)
-                    accept = top_p >= turbo_threshold
-                    if turbo_window > 0 and turbo_monotone:
-                        # Left-anchored acceptance window: only commit within
-                        # turbo_window positions of the unfrozen frontier so
-                        # every commit has solid left context (sub-block
-                        # scheduling a la Fast-dLLM v2).
-                        if active_idx is None:
-                            frontier_limit = turbo_window
-                            pos_of_active = mx.arange(canvas_length)[None, :]
-                        else:
-                            frontier_limit = active_positions[0] + turbo_window
-                            pos_of_active = active_idx[None, :]
-                        accept = accept & (pos_of_active < frontier_limit)
-                    if not bool(mx.any(accept).item()):
-                        best = mx.argmax(top_p, axis=-1)
-                        accept = mx.arange(top_p.shape[-1])[None, :] == best[:, None]
-                else:
-                    accept = _entropy_transfer_mask(entropy, entropy_bound_arr, quota_n)
-
-                if turbo_monotone:
-                    if active_idx is None:
-                        # step 0: active set == all positions
-                        new_frozen = accept
-                        committed = mx.where(accept, proposal, committed)
-                        canvas = mx.where(
-                            accept,
-                            committed,
-                            mx.random.randint(
-                                0, vocab_size, (batch_size, canvas_length)
-                            ),
-                        )
-                        frozen = frozen | new_frozen
-                        argmax_full = top1
-                    else:
-                        # scatter active results back into full-canvas tensors
-                        committed_active = mx.where(
-                            accept,
-                            proposal,
-                            mx.take_along_axis(committed, active_idx[None, :], axis=-1),
-                        )
-                        committed = mx.put_along_axis(
-                            committed, active_idx[None, :], committed_active, axis=-1
-                        )
-                        noise = mx.random.randint(0, vocab_size, accept.shape)
-                        canvas_active = mx.where(accept, committed_active, noise)
-                        canvas = mx.put_along_axis(
-                            canvas, active_idx[None, :], canvas_active, axis=-1
-                        )
-                        frozen = mx.put_along_axis(
-                            frozen,
-                            active_idx[None, :],
-                            mx.take_along_axis(frozen, active_idx[None, :], axis=-1)
-                            | accept,
-                            axis=-1,
-                        )
-                        argmax_full = mx.put_along_axis(
-                            committed.astype(top1.dtype),
-                            active_idx[None, :],
-                            top1,
-                            axis=-1,
-                        )
-                else:
-                    committed = mx.where(accept, proposal, canvas)
-                    canvas = mx.where(
-                        accept,
-                        committed,
-                        mx.random.randint(0, vocab_size, (batch_size, canvas_length)),
-                    )
-                    argmax_full = top1
-
-                # Self-conditioning for next step (skip on the final step).
-                sc_active = self_conditioner.soft_embeddings(probs, idx)
-                if turbo_monotone and active_idx is not None:
-                    base = (
-                        sc_embeddings
-                        if sc_embeddings is not None
-                        else mx.zeros(
-                            (batch_size, canvas_length, sc_active.shape[-1]),
-                            dtype=sc_active.dtype,
-                        )
-                    )
-                    sc_embeddings = mx.put_along_axis(
-                        base,
-                        mx.broadcast_to(
-                            active_idx[None, :, None],
-                            (batch_size, active_idx.size, sc_active.shape[-1]),
-                        ),
-                        sc_active,
-                        axis=1,
-                    )
-                else:
-                    sc_embeddings = sc_active
-
-                # --- host sync point: small tensors only ---
-                if turbo_monotone:
-                    mx.eval(frozen, committed, entropy)
-                    frozen_list = frozen[0].tolist()
-                    active_positions = [i for i, f in enumerate(frozen_list) if not f]
-                    mean_entropy = float(mx.mean(entropy).item())
-
-                    if turbo_eos_early_stop and eos_ids:
-                        committed_list = committed[0].tolist()
-                        eos_pos = None
-                        for i, (tok, fz) in enumerate(zip(committed_list, frozen_list)):
-                            if fz and int(tok) in eos_ids:
-                                eos_pos = i
-                                break
-                        if eos_pos is not None and all(frozen_list[: eos_pos + 1]):
-                            final_canvas = committed
-                            emit_length = eos_pos + 1
-                            break
-
-                    if not active_positions:
-                        final_canvas = committed
-                        break
-                    if not frozen_list or len(active_positions) == canvas_length:
-                        active_positions = list(range(canvas_length))
-                else:
-                    mx.eval(argmax_full, entropy)
-                    mean_entropy = float(mx.mean(entropy).item())
-
-                # stability check on argmax predictions
-                if prev_argmax is not None and turbo_monotone is False:
-                    if bool(mx.all(argmax_full == prev_argmax).item()):
-                        stable_count += 1
-                    else:
-                        stable_count = 0
-                    if (
-                        stable_count >= stability_threshold
-                        and mean_entropy < confidence_threshold
-                    ):
-                        final_canvas = argmax_full
-                        break
-                prev_argmax = argmax_full
-
-            if final_canvas is None:
-                final_canvas = committed if turbo_monotone else argmax_full
-
-            if turbo_repair and emit_length == canvas_length:
-                # One repair forward with the fully committed canvas as input:
-                # take the model's argmax everywhere, recovering the reference
-                # sampler's trailing "final canvas = argmax of last forward"
-                # semantics so early-frozen tokens get a revision opportunity.
-                inputs_embeds = decoder.embed_tokens(final_canvas) * decoder.embed_scale
-                soft = (
-                    sc_embeddings.astype(inputs_embeds.dtype)
-                    if sc_embeddings is not None
-                    else mx.zeros_like(inputs_embeds)
-                )
-                h = sc_module(inputs_embeds, soft)
-                cache_list = kv_cache or [None] * len(decoder.layers)
-                offset = (
-                    cache_list[0].offset
-                    if cache_list and getattr(cache_list[0], "keys", None) is not None
-                    else 0
-                )
-                for layer, c in zip(decoder.layers, cache_list):
-                    h = layer(
-                        h, masks.get(layer.layer_type), c, decoder=True, offset=offset
-                    )
-                h = decoder.norm(h)
-                raw_logits = decoder.embed_tokens.as_linear(h)
-                vals, idx = _topk_logits(raw_logits, turbo_topk)
-                final_canvas = (
-                    mx.take_along_axis(
-                        idx, mx.argmax(vals, axis=-1)[..., None], axis=-1
-                    )
-                    .squeeze(-1)
-                    .astype(mx.int32)
-                )
-                steps_this_canvas += 1
-                work_tokens_this_canvas += canvas_length
-
-            mx.eval(final_canvas)
-            diffusion_canvas_tokens += canvas_length
-            diffusion_denoising_steps += steps_this_canvas
-            diffusion_work_tokens += work_tokens_this_canvas
-
-            committed_canvas = final_canvas[:, :emit_length]
-            for token_id in committed_canvas[0].tolist():
-                last_token = int(token_id)
-                generated_tokens += 1
-                if tokenizer.stopping_criteria(last_token):
-                    stopped = True
-                    stop_reason = "stop"
-                    break
-                if repeat_guard:
-                    repeat_run = repeat_run + 1 if last_token == prev_emit_id else 1
-                    prev_emit_id = last_token
-                    if repeat_run >= repeat_guard:
-                        stopped = True
-                        stop_reason = "repetition"
-                        break
-                detokenizer.add_token(
-                    last_token, skip_special_token_ids=skip_special_token_ids
-                )
-                yield make_result(detokenizer.last_segment, canvas_index=canvas_index)
-                if generated_tokens >= max_new_tokens:
-                    stopped = True
-                    stop_reason = "length"
-                    break
-
-            yield make_result("", canvas_index=canvas_index, block_complete=True)
-
-            if stopped:
-                break
-            mx.clear_cache()
-
-    if prompt_time == 0.0:
-        prompt_time = time.perf_counter() - tic
-    detokenizer.finalize()
-    yield make_result(
-        detokenizer.last_segment, finish_reason=stop_reason if stopped else "length"
-    )
+        if committed is None:
+            raise RuntimeError("Turbo denoiser produced no canvas.")
+        yield DiffusionCanvasResult(
+            canvas=mx.array([committed], dtype=ctx.input_dtype),
+            canvas_tokens=ctx.canvas_length,
+            denoising_steps=steps,
+            work_tokens=work_tokens,
+        )
