@@ -175,6 +175,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help=(
+            "Optional bearer token required for management endpoints such as "
+            "/health, /metrics, /cache/stats, /cache/reset, and /unload. "
+            "Maps to the MLX_VLM_SERVER_API_KEY env var."
+        ),
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -220,6 +230,8 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+    if args.api_key:
+        os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

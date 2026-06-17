@@ -756,6 +756,62 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     ) == 1
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/v1/metrics"),
+        ("get", "/cache/stats"),
+        ("get", "/v1/cache/stats"),
+        ("post", "/cache/reset"),
+        ("post", "/v1/cache/reset"),
+        ("post", "/unload"),
+    ],
+)
+def test_management_endpoints_allow_requests_without_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    response = getattr(client, method)(path)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/v1/metrics"),
+        ("get", "/cache/stats"),
+        ("get", "/v1/cache/stats"),
+        ("post", "/cache/reset"),
+        ("post", "/v1/cache/reset"),
+        ("post", "/unload"),
+    ],
+)
+def test_management_endpoints_require_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    missing = getattr(client, method)(path)
+    invalid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    valid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer secret-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert valid.status_code == 200
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
@@ -4350,6 +4406,7 @@ class TestResponseGenerator:
             "MLX_VLM_THINKING_BUDGET",
             "MLX_VLM_THINKING_START_TOKEN",
             "MLX_VLM_THINKING_END_TOKEN",
+            "MLX_VLM_SERVER_API_KEY",
             "PREFILL_STEP_SIZE",
             "KV_GROUP_SIZE",
             "KV_QUANT_SCHEME",
@@ -4374,6 +4431,8 @@ class TestResponseGenerator:
                 "<|START_THINKING|>",
                 "--thinking-eos-token",
                 "<|END_THINKING|>",
+                "--api-key",
+                "admin-token",
             ],
         )
         run_calls = []
@@ -4390,6 +4449,7 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
             assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
             assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
+            assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
@@ -4401,6 +4461,7 @@ class TestResponseGenerator:
                 "MLX_VLM_THINKING_BUDGET",
                 "MLX_VLM_THINKING_START_TOKEN",
                 "MLX_VLM_THINKING_END_TOKEN",
+                "MLX_VLM_SERVER_API_KEY",
             ):
                 os.environ.pop(env_var, None)
 
