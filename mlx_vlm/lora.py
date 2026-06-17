@@ -187,6 +187,7 @@ def main(args):
             config,
             processor,
             image_resize_shape=args.image_resize_shape,
+            train_on_completions=args.train_on_completions,
         )
 
     # Setup model for training
