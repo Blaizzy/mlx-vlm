@@ -43,6 +43,7 @@ from ..speculative.utils import (
 )
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
+from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
 
@@ -294,6 +295,75 @@ def get_server_thinking_start_token():
 
 def get_server_thinking_end_token():
     return os.environ.get("MLX_VLM_THINKING_END_TOKEN")
+
+
+_DIFFUSION_STRUCTURAL_MARKERS = {
+    "<|channel>",
+    "<channel|>",
+    "<|START_THINKING|>",
+    "<|END_THINKING|>",
+    "<|START_TEXT|>",
+    "<|END_TEXT|>",
+    DEFAULT_THINKING_START_TOKEN,
+    DEFAULT_THINKING_END_TOKEN,
+    # Gemma tool-call string literal delimiter.
+    '<|"|>',
+}
+
+
+def _encode_marker_token_ids(tokenizer, marker: Optional[str]) -> List[int]:
+    if not marker:
+        return []
+    try:
+        ids = tokenizer.encode(marker, add_special_tokens=False)
+    except TypeError:
+        ids = tokenizer.encode(marker)
+    except Exception:
+        return []
+    if hasattr(ids, "tolist"):
+        ids = ids.tolist()
+    if isinstance(ids, int):
+        return [ids]
+    if not isinstance(ids, (list, tuple)):
+        return []
+    return [int(token_id) for token_id in ids]
+
+
+def _diffusion_structural_marker_ids(tokenizer, processor, args) -> set:
+    markers = set(_DIFFUSION_STRUCTURAL_MARKERS)
+    if args.thinking_start_token is not None:
+        markers.add(args.thinking_start_token)
+    if args.thinking_end_token is not None:
+        markers.add(args.thinking_end_token)
+
+    tool_parser_type = _infer_tool_parser_from_processor(processor)
+    if tool_parser_type:
+        try:
+            tool_module = load_tool_module(tool_parser_type)
+        except Exception:
+            tool_module = None
+        if tool_module is not None:
+            for attr in ("tool_call_start", "tool_call_end"):
+                marker = getattr(tool_module, attr, None)
+                if marker:
+                    markers.add(marker)
+
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    marker_ids = set()
+    for marker in markers:
+        token_ids = _encode_marker_token_ids(tokenizer, marker)
+        if len(token_ids) != 1:
+            continue
+        token_id = token_ids[0]
+        if unk_token_id is not None and token_id == unk_token_id:
+            continue
+        marker_ids.add(token_id)
+    return marker_ids
+
+
+def _diffusion_skip_special_token_ids(tokenizer, processor, args) -> set:
+    skip_ids = set(getattr(tokenizer, "all_special_ids", None) or [])
+    return skip_ids - _diffusion_structural_marker_ids(tokenizer, processor, args)
 
 
 def get_quantized_kv_bits(model: str):
@@ -1420,8 +1490,8 @@ class ResponseGenerator:
             raw_inputs.get("attention_mask"),
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            skip_special_token_ids=set(
-                getattr(tokenizer, "all_special_ids", None) or []
+            skip_special_token_ids=_diffusion_skip_special_token_ids(
+                tokenizer, self.processor, args
             ),
             mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
         )

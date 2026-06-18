@@ -4858,6 +4858,59 @@ class TestProcessToolCalls:
         }
 
 
+class TestDiffusionSkipSpecialTokens:
+    """Tests for diffusion detokenizer special-token preservation."""
+
+    class Tokenizer:
+        all_special_ids = [0, 1, 2, 3, 48, 49, 52, 100, 101, 200, 201]
+        unk_token_id = 0
+
+        vocab = {
+            "<pad>": [1],
+            "<eos>": [2],
+            "<mask>": [3],
+            "<|tool_call>": [48],
+            "<tool_call|>": [49],
+            '<|"|>': [52],
+            "<|channel>": [100],
+            "<channel|>": [101],
+            "<custom_think>": [200],
+            "</custom_think>": [201],
+        }
+
+        def encode(self, marker, add_special_tokens=False):
+            return self.vocab.get(marker, [self.unk_token_id])
+
+    class Processor:
+        tokenizer = SimpleNamespace(chat_template="{{ '<|tool_call>' }}")
+
+    def test_preserves_tool_channel_and_custom_thinking_markers(self):
+        args = SimpleNamespace(
+            thinking_start_token="<custom_think>",
+            thinking_end_token="</custom_think>",
+        )
+
+        skip_ids = server_generation._diffusion_skip_special_token_ids(
+            self.Tokenizer(), self.Processor(), args
+        )
+
+        assert {1, 2, 3}.issubset(skip_ids)
+        assert 0 in skip_ids
+        assert not ({48, 49, 52, 100, 101, 200, 201} & skip_ids)
+
+    def test_unknown_custom_markers_do_not_preserve_unk(self):
+        args = SimpleNamespace(
+            thinking_start_token="<unknown>",
+            thinking_end_token="</unknown>",
+        )
+
+        skip_ids = server_generation._diffusion_skip_special_token_ids(
+            self.Tokenizer(), self.Processor(), args
+        )
+
+        assert 0 in skip_ids
+
+
 class TestCountThinkingTagTokens:
     """Tests for thinking tag token counting."""
 
