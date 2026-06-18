@@ -346,7 +346,7 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["cache_key"] == (
         "demo-model",
         "adapter-a",
-        "auto",
+        "text_generation",
     )
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
