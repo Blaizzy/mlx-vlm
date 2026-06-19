@@ -168,6 +168,24 @@ def test_apply_generation_config_defaults_preserves_model_config_signature():
     assert not hasattr(model_config, "max_new_tokens")
 
 
+def test_apply_generation_config_defaults_skips_read_only_properties():
+    class ModelConfig:
+        @property
+        def eos_token_id(self):
+            return [2, 3]
+
+    model_config = apply_generation_config_defaults(
+        ModelConfig(),
+        {
+            "eos_token_id": [4, 5],
+            "temperature": 1.0,
+        },
+    )
+
+    assert model_config.eos_token_id == [2, 3]
+    assert model_config.temperature == 1.0
+
+
 def test_sanitize_weights():
     class DummyModel:
         def __init__(self, config=None):

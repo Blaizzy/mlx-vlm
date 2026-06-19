@@ -66,6 +66,9 @@ GENERATION_CONFIG_DEFAULT_KEYS = (
 def apply_generation_config_defaults(model_config, config: dict):
     for key in GENERATION_CONFIG_DEFAULT_KEYS:
         if key in config:
+            descriptor = inspect.getattr_static(type(model_config), key, None)
+            if isinstance(descriptor, property) and descriptor.fset is None:
+                continue
             setattr(model_config, key, config[key])
     return model_config
 
