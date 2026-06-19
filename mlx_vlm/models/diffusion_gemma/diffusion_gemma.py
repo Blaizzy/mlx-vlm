@@ -135,13 +135,10 @@ class Model(nn.Module):
         self,
         processed_logits: mx.array,
         embedding_weight: mx.array = None,
-        *,
-        token_probs: mx.array = None,
     ):
         return self.model.decoder.diffusion_self_conditioning(
             processed_logits,
             embedding_weight,
-            token_probs=token_probs,
         )
 
     def diffusion_prefill_cache(

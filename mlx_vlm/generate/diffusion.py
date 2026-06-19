@@ -310,14 +310,6 @@ def _diffusion_token_entropy(processed_logits: mx.array) -> mx.array:
     return -mx.sum(probs * log_probs, axis=-1)
 
 
-@mx.compile
-def _diffusion_entropy_probs_chain(logits: mx.array) -> Tuple[mx.array, mx.array]:
-    log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-    probs = mx.exp(log_probs)
-    entropy = -mx.sum(probs * log_probs, axis=-1)
-    return probs, entropy
-
-
 def _diffusion_confidence_transfer_mask(
     confidence: mx.array,
     unrevealed_mask: mx.array,
@@ -814,13 +806,10 @@ def stream_diffusion_generate(
 
                 if diffusion_sampler == "entropy-bound":
                     if cur_step > 1:
-                        token_probs, token_entropy = _diffusion_entropy_probs_chain(
-                            processed_logits.astype(mx.float32)
-                        )
+                        token_entropy = _diffusion_token_entropy(processed_logits)
                         next_self_conditioning = model.diffusion_self_conditioning(
                             processed_logits,
                             self_conditioning_context,
-                            token_probs=token_probs,
                         )
                     else:
                         token_entropy = _diffusion_token_entropy(processed_logits)

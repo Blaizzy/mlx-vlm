@@ -278,14 +278,12 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertLess(float(max_diff.item()), 1e-6)
 
     def test_precomputed_self_conditioning_embeddings_match_logits_path(self):
-        from mlx_vlm.generate.diffusion import (
-            _diffusion_entropy_probs_chain,
-            _diffusion_token_entropy,
-        )
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
         config = ModelConfig.from_dict(tiny_config_dict())
         model = Model(config)
+        decoder = model.model.decoder
+        decoder.embed_tokens.weight = decoder.embed_tokens.weight.astype(mx.bfloat16)
         input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
         canvas_ids = mx.array([[6, 7, 8]], dtype=mx.int32)
         self_conditioning_logits = mx.linspace(
@@ -293,20 +291,18 @@ class TestDiffusionGemma4(unittest.TestCase):
             0.5,
             config.text_config.vocab_size * canvas_ids.shape[-1],
         ).reshape(1, canvas_ids.shape[-1], -1)
-
-        token_probs, entropy = _diffusion_entropy_probs_chain(
-            self_conditioning_logits.astype(mx.float32)
+        stored_self_conditioning_logits = self_conditioning_logits.astype(
+            decoder.embed_tokens.weight.dtype
         )
+
         self_conditioning_embeddings = model.diffusion_self_conditioning(
             self_conditioning_logits,
             model.diffusion_prepare_self_conditioning(),
-            token_probs=token_probs,
-        )
-        expected_entropy = _diffusion_token_entropy(self_conditioning_logits)
+        ).astype(decoder.embed_tokens.weight.dtype)
         logits_output = model(
             input_ids=input_ids,
             canvas_ids=canvas_ids,
-            self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_logits=stored_self_conditioning_logits,
         ).logits
         embeddings_output = model(
             input_ids=input_ids,
@@ -314,11 +310,9 @@ class TestDiffusionGemma4(unittest.TestCase):
             self_conditioning_embeddings=self_conditioning_embeddings,
         ).logits
         max_diff = mx.max(mx.abs(logits_output - embeddings_output))
-        entropy_diff = mx.max(mx.abs(entropy - expected_entropy))
-        mx.eval(max_diff, entropy_diff)
+        mx.eval(max_diff)
 
         self.assertLess(float(max_diff.item()), 1e-5)
-        self.assertLess(float(entropy_diff.item()), 1e-5)
 
     def test_transformers_58_logits_and_denoising_step_parity_if_available(self):
         try:

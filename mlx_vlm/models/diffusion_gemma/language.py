@@ -393,15 +393,15 @@ class DecoderModel(nn.Module):
         self,
         processed_logits: mx.array,
         embedding_weight: Optional[mx.array],
-        *,
-        token_probs: Optional[mx.array] = None,
     ) -> mx.array:
         if self.prefers_logits_self_conditioning:
             return processed_logits
-        probs = (
-            token_probs
-            if token_probs is not None
-            else mx.softmax(processed_logits, axis=-1, precise=True)
+        # Match the HF generation path: self-conditioning logits are stored in
+        # the embedding dtype before the next decoder softmax.
+        probs = mx.softmax(
+            processed_logits.astype(embedding_weight.dtype),
+            axis=-1,
+            precise=True,
         )
         return (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
             embedding_weight.dtype
@@ -901,13 +901,10 @@ class LanguageModel(nn.Module):
         self,
         processed_logits: mx.array,
         embedding_weight: Optional[mx.array],
-        *,
-        token_probs: Optional[mx.array] = None,
     ) -> mx.array:
         return self.model.decoder.diffusion_self_conditioning(
             processed_logits,
             embedding_weight,
-            token_probs=token_probs,
         )
 
     def diffusion_prefill_cache(
