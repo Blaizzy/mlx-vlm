@@ -1100,9 +1100,6 @@ async def responses_endpoint(request: Request):
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1730,9 +1727,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
