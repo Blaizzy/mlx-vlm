@@ -583,7 +583,7 @@ def get_cached_model(
         effective_model_kind = "image_generation"
     else:
         cache_group = "text_generation"
-        effective_model_kind = model_kind
+        effective_model_kind = "text_generation" if model_kind == "auto" else model_kind
 
     registry = _model_cache_registry()
     if adapter_path is _INHERIT_ADAPTER:
