@@ -231,10 +231,10 @@ def main():
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
-        if args.draft_kind is not None:
-            os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
-        if args.draft_block_size is not None:
-            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.draft_kind is not None:
+        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+    if args.draft_block_size is not None:
+        os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
