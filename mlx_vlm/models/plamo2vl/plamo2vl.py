@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
-from .language import LanguageModel, TextConfig, RMSNorm
+from .language import LanguageModel, RMSNorm, TextConfig
 from .vision import VisionConfig, VisionModel
 
 
@@ -26,7 +26,9 @@ class ModelConfig:
             k: v for k, v in params.items() if k in inspect.signature(cls).parameters
         }
         if "vision_config" in params and "image_token_index" not in values:
-            values["image_token_index"] = params["vision_config"].get("image_token_id", 100002)
+            values["image_token_index"] = params["vision_config"].get(
+                "image_token_id", 100002
+            )
         return cls(**values)
 
 
@@ -90,7 +92,10 @@ class Model(nn.Module):
                 key = f"language_model.{key}"
             if "._bias" in key:
                 key = key.replace("._bias", ".bias")
-            if "vision_model.vision_encoder.model.embeddings.patch_embedding.weight" in key:
+            if (
+                "vision_model.vision_encoder.model.embeddings.patch_embedding.weight"
+                in key
+            ):
                 if value.ndim == 4 and value.shape[1] == 3:
                     value = value.transpose(0, 2, 3, 1)
             if "language_model.model.layers.layers." in key and "conv1d.weight" in key:

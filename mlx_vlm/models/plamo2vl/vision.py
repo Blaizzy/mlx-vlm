@@ -4,7 +4,8 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..llava.vision import ClipVisionModel, VisionConfig as SiglipVisionConfig
+from ..llava.vision import ClipVisionModel
+from ..llava.vision import VisionConfig as SiglipVisionConfig
 
 
 @dataclass
