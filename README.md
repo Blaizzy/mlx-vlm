@@ -369,6 +369,12 @@ mlx_vlm.server --port 8080
 # Preload a model at startup (Hugging Face repo or local path)
 mlx_vlm.server --model <hf_repo_or_local_path>
 
+# Preload separate model kinds at startup
+mlx_vlm.server --model <language_model> \
+  --image-model <image_generation_model> \
+  --tts-model <text_to_speech_model> \
+  --stt-model <speech_to_text_model>
+
 # Preload a model with adapter
 mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
@@ -388,7 +394,10 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 #### Server Options
 
-- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--image-model`: Preload an image generation model at server startup
+- `--tts-model`: Preload a text-to-speech model at server startup
+- `--stt-model`: Preload a speech-to-text model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
