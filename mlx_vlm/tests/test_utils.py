@@ -118,26 +118,26 @@ class MockProcessor:
 
 
 def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+    generation_config = {
+        "eos_token_id": [2, 3],
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_new_tokens": 4096,
+    }
     (tmp_path / "config.json").write_text(
         json.dumps({"model_type": "demo", "eos_token_id": 1}),
         encoding="utf-8",
     )
     (tmp_path / "generation_config.json").write_text(
-        json.dumps(
-            {
-                "eos_token_id": [2, 3],
-                "do_sample": True,
-                "temperature": 1.0,
-                "top_p": 0.95,
-                "top_k": 64,
-                "max_new_tokens": 4096,
-            }
-        ),
+        json.dumps(generation_config),
         encoding="utf-8",
     )
 
     config = load_config(tmp_path)
 
+    assert config["generation_config"] == generation_config
     assert config["eos_token_id"] == [2, 3]
     assert config["do_sample"] is True
     assert config["temperature"] == 1.0
@@ -536,6 +536,43 @@ def test_load_model_routes_text_models_through_existing_loader():
     assert getattr(model, "_is_text_model", False) is True
 
 
+def test_load_model_forwards_strict_to_load_weights():
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+    weights = {"weight": mx.zeros((1,), dtype=mx.float16)}
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "fake"),
+        ),
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True, strict=False)
+
+    assert model.loaded_weights == list(weights.items())
+    assert model.loaded_strict is False
+
+
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     path = tmp_path / "model.safetensors"
     header = {
@@ -579,8 +616,9 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
             self.config = config
             self.language_model = nn.Linear(2, 2, bias=False)
 
-        def load_weights(self, weights):
+        def load_weights(self, weights, strict=True):
             self.loaded_weights = weights
+            self.loaded_strict = strict
 
     fake_model_class = SimpleNamespace(
         ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
@@ -644,8 +682,9 @@ def test_load_model_quantizes_projector_with_scales_when_skip_vision():
             self.multi_modal_projector = FakeProjector()
             self.language_model = nn.Linear(64, 64, bias=False)
 
-        def load_weights(self, weights):
+        def load_weights(self, weights, strict=True):
             self.loaded_weights = weights
+            self.loaded_strict = strict
 
     fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
     weights = {

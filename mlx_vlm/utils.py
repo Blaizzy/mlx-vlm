@@ -70,6 +70,16 @@ def apply_generation_config_defaults(model_config, config: dict):
     return model_config
 
 
+def _merge_generation_config(config: dict, generation_config: dict) -> None:
+    if not isinstance(generation_config, dict) or not generation_config:
+        return
+
+    config["generation_config"] = generation_config
+    for key in GENERATION_CONFIG_DEFAULT_KEYS:
+        if key in generation_config:
+            config[key] = generation_config[key]
+
+
 def _e4m3_decode_table() -> mx.array:
     """Return a 256-entry ``float32`` LUT mapping every E4M3FN byte to its value.
 
@@ -469,6 +479,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+    strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
@@ -645,7 +656,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
@@ -866,16 +877,11 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
 
         generation_config_file = model_path / "generation_config.json"
         if generation_config_file.exists():
-            generation_config = {}
             try:
-                with open(generation_config_file, "r") as f:
-                    generation_config = json.load(f)
+                with open(generation_config_file, encoding="utf-8") as f:
+                    _merge_generation_config(config, json.load(f))
             except json.JSONDecodeError:
                 pass
-
-            for key in GENERATION_CONFIG_DEFAULT_KEYS:
-                if key in generation_config:
-                    config[key] = generation_config[key]
 
         return config
 
@@ -1882,7 +1888,7 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
         self.tokenizer = tokenizer
 

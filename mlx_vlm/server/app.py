@@ -2,6 +2,7 @@ import asyncio
 import gc
 import logging
 import os
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -13,7 +14,7 @@ import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
-from huggingface_hub.errors import CacheNotFound
+from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 
 from .. import apc as _apc
 from ..generate import (
@@ -28,11 +29,13 @@ from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from .anthropic import register_routes as register_anthropic_routes
+from .audio import register_routes as register_audio_routes
 from .generation import (
     GenerationArguments,
     PromptTooLongError,
     ResponseGenerator,
     ServerMetricsStore,
+    _build_metrics_envelope,
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
@@ -47,17 +50,68 @@ from .generation import (
 )
 from .openai import register_routes as register_openai_routes
 from .responses_state import _split_thinking as _split_thinking_text
-from .runtime import runtime
+from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
 
 logger = logging.getLogger("mlx_vlm.server")
 
 
+def _server_api_key() -> Optional[str]:
+    key = os.environ.get(SERVER_API_KEY_ENV)
+    return key if key else None
+
+
+def _require_management_api_key(request: Request) -> None:
+    api_key = _server_api_key()
+    if api_key is None:
+        return
+
+    expected = f"Bearer {api_key}"
+    supplied = request.headers.get("Authorization", "")
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _cache_group_for_cache(cache: dict) -> str:
+    model_kind = cache.get("model_kind")
+    if model_kind == "image_generation":
+        return "image_generation"
+    if model_kind == "image_edit":
+        return "image_edit"
+    if model_kind == "audio_tts":
+        return "tts"
+    if model_kind == "audio_stt":
+        return "stt"
+    if model_kind == "audio":
+        return "audio"
+    return "text_generation"
+
+
+def _model_cache_registry() -> ModelCacheRegistry:
+    cache = runtime.model_cache
+    if isinstance(cache, ModelCacheRegistry):
+        return cache
+
+    registry = ModelCacheRegistry()
+    if isinstance(cache, dict) and cache:
+        registry.set(_cache_group_for_cache(cache), cache)
+    runtime.model_cache = registry
+    return registry
+
+
 def _server_runtime_snapshot() -> dict:
-    config = runtime.model_cache.get("config")
+    registry = _model_cache_registry()
+    default_cache = registry.for_kind("text_generation")
+    processor = default_cache.get("processor")
+    config = default_cache.get("config")
     text_config = getattr(config, "text_config", None)
     native_context_size = getattr(text_config, "max_position_embeddings", None)
     configured_context_limit = get_configured_context_limit()
@@ -74,20 +128,33 @@ def _server_runtime_snapshot() -> dict:
             queue_depth = runtime.response_generator.requests.qsize()
         except Exception:
             queue_depth = 0
+    audio_queue_depth = 0
+    if runtime.audio_queue is not None and hasattr(runtime.audio_queue, "qsize"):
+        try:
+            audio_queue_depth = runtime.audio_queue.qsize()
+        except Exception:
+            audio_queue_depth = 0
     return {
-        "loaded_model": runtime.model_cache.get("model_path", None),
-        "loaded_adapter": runtime.model_cache.get("adapter_path", None),
-        "model_kind": runtime.model_cache.get("model_kind", "text_generation"),
+        "loaded_model": default_cache.get("model_path", None),
+        "loaded_adapter": default_cache.get("adapter_path", None),
+        "loaded_models": {
+            group: {
+                "model": cache.get("model_path"),
+                "adapter": cache.get("adapter_path"),
+                "model_kind": cache.get("model_kind"),
+            }
+            for group, cache in registry.items()
+        },
+        "model_kind": default_cache.get("model_kind", "text_generation"),
         "loaded_context_size": native_context_size,
         "configured_context_limit": configured_context_limit,
         "effective_context_limit": effective_context_limit,
         "loaded_tool_parser": (
-            _infer_tool_parser_from_processor(runtime.model_cache.get("processor"))
-            if runtime.model_cache.get("processor")
-            else None
+            _infer_tool_parser_from_processor(processor) if processor else None
         ),
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
+        "audio_queue_depth": audio_queue_depth,
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -367,19 +434,61 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def load_audio_model(model_path: str):
+    from mlx_audio.utils import load_model
+
+    return load_model(model_path)
+
+
 @asynccontextmanager
 async def lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
+    adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     if model_path:
-        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-        logger.info("Pre-loading model: %s", model_path)
-        get_cached_model(model_path, adapter_path)
+        logger.info("Pre-loading language model: %s", model_path)
+        get_cached_model(model_path, adapter_path, model_kind="text_generation")
         kv_bits = os.environ.get("KV_BITS")
         kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
         if kv_bits:
             logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Model ready, continuous batching enabled.")
-    yield
+        logger.info("Language model ready, continuous batching enabled.")
+
+    preload_models = (
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
+            None,
+            "image_generation",
+            "image generation model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_TTS_MODEL", None),
+            None,
+            "audio_tts",
+            "text-to-speech model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_STT_MODEL", None),
+            None,
+            "audio_stt",
+            "speech-to-text model",
+        ),
+    )
+    for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
+        if not preload_model_path:
+            continue
+        logger.info("Pre-loading %s: %s", label, preload_model_path)
+        get_cached_model(
+            preload_model_path,
+            preload_adapter_path,
+            model_kind=model_kind,
+        )
+        logger.info("%s ready.", label.capitalize())
+    try:
+        yield
+    finally:
+        if runtime.audio_queue is not None:
+            runtime.audio_queue.stop_and_join()
+            runtime.audio_queue = None
 
 
 app = FastAPI(
@@ -403,6 +512,51 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 _INHERIT_ADAPTER = object()
 
 
+def _unload_model_cache_group(cache_group: str) -> bool:
+    registry = _model_cache_registry()
+    cache = registry.for_kind(cache_group)
+    if not cache:
+        return False
+
+    print(
+        f"Unloading {cache_group} model: {cache.get('model_path')}, "
+        f"Adapter: {cache.get('adapter_path')}"
+    )
+
+    response_generator = cache.get("response_generator")
+    if response_generator is not None:
+        print("Stopping ResponseGenerator...")
+        response_generator.stop_and_join()
+        if runtime.response_generator is response_generator:
+            runtime.response_generator = None
+
+    apc_manager = cache.get("apc_manager")
+    if apc_manager is not None:
+        apc_manager.clear()
+        if runtime.apc_manager is apc_manager:
+            runtime.apc_manager = None
+
+    if "vision_cache" in cache:
+        cache["vision_cache"].clear()
+
+    registry.pop(cache_group)
+    gc.collect()
+    mx.clear_cache()
+    return True
+
+
+def _audio_model_kind(model_kind: str) -> bool:
+    return model_kind in ("audio", "audio_tts", "audio_stt")
+
+
+def _audio_cache_group(model_kind: str) -> str:
+    if model_kind == "audio_tts":
+        return "tts"
+    if model_kind == "audio_stt":
+        return "stt"
+    return "audio"
+
+
 def get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
@@ -413,27 +567,50 @@ def get_cached_model(
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+    load_as_edit = model_kind == "image_edit"
+    load_as_audio = _audio_model_kind(model_kind)
+    load_as_image = model_kind == "image_generation" or (
+        model_kind == "auto" and is_image_generation_model(model_path)
+    )
+    if load_as_edit:
+        cache_group = "image_edit"
+        effective_model_kind = "image_edit"
+    elif load_as_audio:
+        cache_group = _audio_cache_group(model_kind)
+        effective_model_kind = model_kind
+    elif load_as_image:
+        cache_group = "image_generation"
+        effective_model_kind = "image_generation"
+    else:
+        cache_group = "text_generation"
+        effective_model_kind = "text_generation" if model_kind == "auto" else model_kind
+
+    registry = _model_cache_registry()
     if adapter_path is _INHERIT_ADAPTER:
-        cached = runtime.model_cache.get("cache_key")
+        cached_cache = registry.for_kind(cache_group)
+        cached = cached_cache.get("cache_key")
         adapter_path = cached[1] if cached and cached[0] == model_path else None
 
-    cache_key = (model_path, adapter_path, model_kind)
+    cache_key = (model_path, adapter_path, effective_model_kind)
+    cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
-    if runtime.model_cache.get("cache_key") == cache_key:
+    if cached_cache and cached_cache.get("cache_key") == cache_key:
+        if cache_group == "text_generation":
+            runtime.response_generator = cached_cache.get("response_generator")
+            runtime.apc_manager = cached_cache.get("apc_manager")
         print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
         return (
-            runtime.model_cache["model"],
-            runtime.model_cache["processor"],
-            runtime.model_cache["config"],
+            cached_cache["model"],
+            cached_cache["processor"],
+            cached_cache["config"],
         )
 
-    # If cache exists but doesn't match, clear it
-    if runtime.model_cache:
-        print("New model request, clearing existing cache...")
-        unload_model_sync()  # Use a synchronous version for internal call
+    # If this kind has a different model cached, clear only that cache group.
+    if cached_cache:
+        print(f"New {cache_group} model request, clearing existing cache...")
+        _unload_model_cache_group(cache_group)
 
-    load_as_edit = model_kind == "image_edit"
     if load_as_edit:
         if adapter_path is not None:
             raise HTTPException(
@@ -455,9 +632,7 @@ def get_cached_model(
             model_type=getattr(model, "family", "image_edit"),
             text_config=None,
         )
-        runtime.response_generator = None
-        runtime.apc_manager = None
-        runtime.model_cache = {
+        cache = {
             "cache_key": cache_key,
             "model_path": model_path,
             "adapter_path": None,
@@ -467,11 +642,9 @@ def get_cached_model(
             "model_kind": "image_edit",
             "generation_lock": Lock(),
         }
+        registry.set(cache_group, cache)
         return model, None, config
 
-    load_as_image = model_kind == "image_generation" or (
-        model_kind == "auto" and is_image_generation_model(model_path)
-    )
     if load_as_image:
         if adapter_path is not None:
             raise HTTPException(
@@ -493,9 +666,7 @@ def get_cached_model(
             model_type=getattr(model, "family", "image_generation"),
             text_config=None,
         )
-        runtime.response_generator = None
-        runtime.apc_manager = None
-        runtime.model_cache = {
+        cache = {
             "cache_key": cache_key,
             "model_path": model_path,
             "adapter_path": None,
@@ -505,6 +676,51 @@ def get_cached_model(
             "model_kind": "image_generation",
             "generation_lock": Lock(),
         }
+        registry.set(cache_group, cache)
+        return model, None, config
+
+    if load_as_audio:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for audio models.",
+            )
+        print(f"Loading audio model from: {model_path}")
+        try:
+            model = _server_package_attr("load_audio_model", load_audio_model)(
+                model_path
+            )
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported audio model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load audio model: {e}"
+            ) from e
+        config = SimpleNamespace(
+            model_type=getattr(model, "model_type", "audio"),
+            text_config=None,
+        )
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": None,
+            "config": config,
+            "model_kind": model_kind,
+            "generation_lock": Lock(),
+        }
+        registry.set(cache_group, cache)
         return model, None, config
 
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
@@ -519,7 +735,7 @@ def get_cached_model(
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
 
-    runtime.response_generator = ResponseGenerator(
+    response_generator = ResponseGenerator(
         model_path=model_path,
         adapter_path=adapter_path,
         vision_cache=vision_cache,
@@ -531,14 +747,13 @@ def get_cached_model(
         apc_manager=runtime.apc_manager,
     )
     try:
-        model, processor, config = runtime.response_generator.wait_until_ready()
+        model, processor, config = response_generator.wait_until_ready()
     except Exception:
-        runtime.response_generator.stop_and_join()
-        runtime.response_generator = None
+        response_generator.stop_and_join()
         vision_cache.clear()
         raise
 
-    runtime.model_cache = {
+    cache = {
         "cache_key": cache_key,
         "model_path": model_path,
         "adapter_path": adapter_path,
@@ -546,40 +761,41 @@ def get_cached_model(
         "processor": processor,
         "config": config,
         "vision_cache": vision_cache,
+        "model_kind": "text_generation",
+        "response_generator": response_generator,
+        "apc_manager": runtime.apc_manager,
     }
+    registry.set(cache_group, cache)
+    runtime.response_generator = response_generator
+    runtime.apc_manager = cache["apc_manager"]
 
     return model, processor, config
 
 
 # Synchronous unload function for internal use
 def unload_model_sync():
-    if not runtime.model_cache:
-        return False
+    unloaded_any = False
+    if runtime.audio_queue is not None:
+        is_audio_worker = getattr(
+            runtime.audio_queue, "is_worker_thread", lambda: False
+        )
+        if not is_audio_worker():
+            print("Stopping AudioRequestQueue...")
+            runtime.audio_queue.stop_and_join()
+            runtime.audio_queue = None
+            unloaded_any = True
 
-    print(
-        f"Unloading model: {runtime.model_cache.get('model_path')}, Adapter: {runtime.model_cache.get('adapter_path')}"
-    )
+    registry = _model_cache_registry()
+    for cache_group, _ in list(registry.items()):
+        unloaded_any = _unload_model_cache_group(cache_group) or unloaded_any
 
-    # Stop the ResponseGenerator if running
-    if runtime.response_generator is not None:
-        print("Stopping ResponseGenerator...")
-        runtime.response_generator.stop_and_join()
-        runtime.response_generator = None
-
-    # Drop APC blocks for the previous model
-    if runtime.apc_manager is not None:
-        runtime.apc_manager.clear()
-        runtime.apc_manager = None
-
-    # Clear vision cache before dropping references
-    if "vision_cache" in runtime.model_cache:
-        runtime.model_cache["vision_cache"].clear()
-    runtime.model_cache = {}
-    # Force garbage collection
+    runtime.response_generator = None
+    runtime.apc_manager = None
     gc.collect()
     mx.clear_cache()
-    print("Model unloaded and cache cleared.")
-    return True
+    if unloaded_any:
+        print("Model caches cleared.")
+    return unloaded_any
 
 
 _protocol_deps = SimpleNamespace(
@@ -607,9 +823,11 @@ _protocol_deps = SimpleNamespace(
     split_thinking=_split_thinking,
     count_thinking_tag_tokens=_count_thinking_tag_tokens,
     make_logprob_content=_make_logprob_content,
+    build_metrics_envelope=_build_metrics_envelope,
 )
 register_anthropic_routes(app, _protocol_deps)
 register_openai_routes(app, _protocol_deps)
+register_audio_routes(app, _protocol_deps)
 
 
 @app.get("/models", response_model=ModelsResponse)
@@ -646,11 +864,19 @@ def models_endpoint():
         {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
         for repo in downloaded_models
     ]
-    loaded_model = runtime.model_cache.get("model_path")
-    if loaded_model and all(model["id"] != loaded_model for model in models):
-        models.append(
-            {"id": loaded_model, "object": "model", "created": int(time.time())}
-        )
+    loaded_models = {
+        cache.get("model_path")
+        for cache in _model_cache_registry().values()
+        if cache.get("model_path")
+    }
+    loaded_model = _model_cache_registry().get("model_path")
+    if loaded_model:
+        loaded_models.add(loaded_model)
+    for loaded in sorted(loaded_models):
+        if all(model["id"] != loaded for model in models):
+            models.append(
+                {"id": loaded, "object": "model", "created": int(time.time())}
+            )
 
     response = {"object": "list", "data": models}
 
@@ -668,15 +894,17 @@ async def add_server_header(request: Request, call_next):
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """
     Check if the server is healthy and what model is loaded.
     """
+    _require_management_api_key(request)
     runtime = _server_runtime_snapshot()
     return {
         "status": "healthy",
         "loaded_model": runtime["loaded_model"],
         "loaded_adapter": runtime["loaded_adapter"],
+        "loaded_models": runtime["loaded_models"],
         "loaded_context_size": runtime["loaded_context_size"],
         "configured_context_limit": runtime["configured_context_limit"],
         "effective_context_limit": runtime["effective_context_limit"],
@@ -688,7 +916,8 @@ async def health_check():
 
 @app.get("/metrics")
 @app.get("/v1/metrics", include_in_schema=False)
-async def metrics_endpoint():
+async def metrics_endpoint(request: Request):
+    _require_management_api_key(request)
     payload = runtime.metrics.snapshot()
     payload["server"] = _server_runtime_snapshot()
     return payload
@@ -696,8 +925,9 @@ async def metrics_endpoint():
 
 @app.get("/v1/cache/stats")
 @app.get("/cache/stats", include_in_schema=False)
-async def apc_cache_stats():
+async def apc_cache_stats(request: Request):
     """Return Automatic Prefix Cache statistics (or ``enabled=false``)."""
+    _require_management_api_key(request)
     if runtime.apc_manager is None:
         return {"enabled": False}
     snap = runtime.apc_manager.stats_snapshot()
@@ -707,7 +937,8 @@ async def apc_cache_stats():
 
 @app.post("/v1/cache/reset")
 @app.post("/cache/reset", include_in_schema=False)
-async def apc_cache_reset():
+async def apc_cache_reset(request: Request):
+    _require_management_api_key(request)
     if runtime.apc_manager is None:
         return {"enabled": False}
     runtime.apc_manager.clear()
@@ -715,13 +946,16 @@ async def apc_cache_reset():
 
 
 @app.post("/unload")
-async def unload_model_endpoint():
+async def unload_model_endpoint(request: Request):
     """
     Unload the currently loaded model from memory.
     """
+    _require_management_api_key(request)
+    snapshot = _server_runtime_snapshot()
     unloaded_info = {
-        "model_name": runtime.model_cache.get("model_path", None),
-        "adapter_name": runtime.model_cache.get("adapter_path", None),
+        "model_name": snapshot["loaded_model"],
+        "adapter_name": snapshot["loaded_adapter"],
+        "models": snapshot["loaded_models"],
     }
 
     if not unload_model_sync():  # Use the synchronous unload function
@@ -729,7 +963,7 @@ async def unload_model_endpoint():
 
     return {
         "status": "success",
-        "message": f"Model unloaded successfully",
+        "message": "Model unloaded successfully",
         "unloaded": unloaded_info,
     }
 

@@ -96,6 +96,14 @@ _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
 _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
 
 
+def _runtime_cache_get(key, default=None, *, kind=None):
+    cache = runtime.model_cache
+    try:
+        return cache.get(key, default, kind=kind)
+    except TypeError:
+        return cache.get(key, default)
+
+
 def _looks_like_audio_reference(value: str) -> bool:
     return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
         _AUDIO_REFERENCE_SUFFIXES
@@ -351,7 +359,7 @@ async def images_generations_endpoint(request: Request):
         model, _, _ = get_cached_model(
             image_request.model, model_kind="image_generation"
         )
-        generation_lock = runtime.model_cache.get("generation_lock")
+        generation_lock = _runtime_cache_get("generation_lock", kind="image_generation")
 
         def _generate_all():
             results = []
@@ -482,7 +490,7 @@ async def images_edits_endpoint(request: Request):
     )
     try:
         model, _, _ = get_cached_model(image_request.model, model_kind="image_edit")
-        generation_lock = runtime.model_cache.get("generation_lock")
+        generation_lock = _runtime_cache_get("generation_lock", kind="image_edit")
 
         def _generate_all():
             results = []
@@ -902,7 +910,7 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
-                            output_tokens += 1
+                            output_tokens += getattr(token, "token_count", 1)
                             delta = token.text
                             full_text += delta
                             in_tool_call, delta = suppress_tool_call_content(
@@ -1092,9 +1100,7 @@ async def responses_endpoint(request: Request):
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1366,6 +1372,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
                 msg["name"] = message.name
+            if message.reasoning is not None:
+                msg["reasoning"] = message.reasoning
 
             processed_messages.append(msg)
 
@@ -1468,7 +1476,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
-                            output_tokens += 1
+                            output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             metrics.record_chunk(token)
 
@@ -1720,9 +1728,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1771,7 +1777,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         pt = ctx.prompt_tokens
                         for token in token_iter:
                             text += token.text
-                            gt += 1
+                            gt += getattr(token, "token_count", 1)
                             metrics.record_chunk(token)
                             if request.logprobs and token.finish_reason != "stop":
                                 logprobs.append(

@@ -117,6 +117,17 @@ def _resolve_adapter_file(args: TrainingArgs) -> Path:
     return Path(TrainingArgs.__dataclass_fields__["adapter_file"].default)
 
 
+def _model_type(model):
+    model_type = getattr(model, "model_type", None)
+    if model_type is not None:
+        return model_type
+
+    config = getattr(model, "config", None)
+    if isinstance(config, dict):
+        return config.get("model_type")
+    return getattr(config, "model_type", None)
+
+
 def vision_language_loss_fn(
     model, batch, train_on_completions=False, assistant_id=77091
 ):
@@ -125,28 +136,6 @@ def vision_language_loss_fn(
     attention_mask = batch["attention_mask"]
 
     batch_size, seq_length = input_ids.shape
-
-    if train_on_completions:
-        weight_mask = mx.ones_like(attention_mask)
-
-        assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
-        input_ids_np = np.array(input_ids)
-        for row_idx, row in enumerate(input_ids_np):
-            positions = np.where(row == assistant_id)[0]
-            if positions.size > 0:
-                assistant_response_index[row_idx] = positions[0]
-
-        range_matrix = mx.repeat(
-            mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
-        )
-        assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
-            -1, 1
-        )
-        weight_mask = mx.where(assistant_mask, mx.zeros_like(weight_mask), weight_mask)[
-            :, 1:
-        ]
-    else:
-        weight_mask = None
 
     input_ids = input_ids[:, :-1]
     attention_mask = attention_mask[:, :-1]
@@ -158,10 +147,13 @@ def vision_language_loss_fn(
     kwargs = {
         k: v
         for k, v in batch.items()
-        if k not in ["input_ids", "pixel_values", "attention_mask"]
+        if k not in ["input_ids", "pixel_values", "attention_mask", "completion_mask"]
     }
 
-    outputs = model(input_ids, pixel_values, attention_mask, **kwargs)
+    model_attention_mask = (
+        None if _model_type(model) == "gemma4_unified" else attention_mask
+    )
+    outputs = model(input_ids, pixel_values, model_attention_mask, **kwargs)
     logits = outputs.logits.astype(mx.float32)
 
     def align_logits_with_labels(logits, labels):
@@ -178,19 +170,36 @@ def vision_language_loss_fn(
     seq_len = input_ids.shape[1]
     lengths = mx.minimum(lengths, seq_len)
     length_mask = mx.arange(seq_len)[None, :] < lengths[:, None]
+    loss_mask = length_mask
 
-    ce = (
-        nn.losses.cross_entropy(
-            logits,
-            labels,
-            weights=weight_mask,
-        )
-        * length_mask
-    )
-    ntoks = length_mask.sum()
-    ce = ce.sum() / ntoks
+    if train_on_completions:
+        if "completion_mask" in batch:
+            loss_mask = loss_mask * batch["completion_mask"][:, 1:]
+        else:
+            completion_mask = mx.ones_like(batch["attention_mask"])
 
-    return (ce * length_mask).sum() / length_mask.sum()
+            assistant_response_index = np.full((batch_size,), -1, dtype=np.int32)
+            input_ids_np = np.array(batch["input_ids"])
+            for row_idx, row in enumerate(input_ids_np):
+                positions = np.where(row == assistant_id)[0]
+                if positions.size > 0:
+                    assistant_response_index[row_idx] = positions[0]
+
+            range_matrix = mx.repeat(
+                mx.expand_dims(mx.arange(seq_length), 0), batch_size, axis=0
+            )
+            assistant_mask = range_matrix <= mx.array(assistant_response_index).reshape(
+                -1, 1
+            )
+            completion_mask = mx.where(
+                assistant_mask,
+                mx.zeros_like(completion_mask),
+                completion_mask,
+            )
+            loss_mask = loss_mask * completion_mask[:, 1:]
+
+    ce = nn.losses.cross_entropy(logits, labels)
+    return (ce * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1)
 
 
 def iterate_batches(dataset, batch_size, max_seq_length, train=False):
@@ -226,6 +235,8 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
 
             input_ids_batch = np.zeros((len(items), padded_len), dtype=np.int32)
             attention_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
+            has_completion_mask = any("completion_mask" in item for item in items)
+            completion_mask_batch = np.zeros((len(items), padded_len), dtype=np.int32)
 
             for i, item in enumerate(items):
                 arr = np.array(_squeeze_leading_batch_dim(item["input_ids"])).reshape(
@@ -242,6 +253,12 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 else:
                     attention_mask_batch[i, :L] = 1
 
+                if "completion_mask" in item:
+                    completion_mask = np.array(
+                        _squeeze_leading_batch_dim(item["completion_mask"])
+                    ).reshape(-1)
+                    completion_mask_batch[i, :L] = completion_mask[:L]
+
             pixel_values_batch = None
             if "pixel_values" in items[0] and items[0]["pixel_values"] is not None:
                 pixel_values_batch = _collate_arrays(
@@ -253,11 +270,19 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 "attention_mask": mx.array(attention_mask_batch),
                 "pixel_values": pixel_values_batch,
             }
+            if has_completion_mask:
+                batch["completion_mask"] = mx.array(completion_mask_batch)
 
             extra_keys = [
                 k
                 for k in items[0]
-                if k not in ("input_ids", "attention_mask", "pixel_values")
+                if k
+                not in (
+                    "input_ids",
+                    "attention_mask",
+                    "completion_mask",
+                    "pixel_values",
+                )
             ]
             for k in extra_keys:
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]

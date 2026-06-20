@@ -331,6 +331,12 @@ mlx_vlm.server --port 8080
 # Preload a model at startup (Hugging Face repo or local path)
 mlx_vlm.server --model <hf_repo_or_local_path>
 
+# Preload separate model kinds at startup
+mlx_vlm.server --model <language_model> \
+  --image-model <image_generation_model> \
+  --tts-model <text_to_speech_model> \
+  --stt-model <speech_to_text_model>
+
 # Preload a model with adapter
 mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
@@ -350,7 +356,10 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 #### Server Options
 
-- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--image-model`: Preload an image generation model at server startup
+- `--tts-model`: Preload a text-to-speech model at server startup
+- `--stt-model`: Preload a speech-to-text model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4)
@@ -889,9 +898,12 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
+- `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
+- `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
 - `/health` - Check server status
 - `/metrics` and `/v1/metrics` - Inspect rolling request metrics, throughput, and runtime counters
-- `/unload` - Unload current model from memory
+- `/unload` - Unload all loaded model caches from memory
 
 #### Usage Examples
 
@@ -951,9 +963,10 @@ curl -X POST "http://localhost:8080/chat/completions" \
   }'
 ```
 
-##### Audio Support (New)
+##### Audio Input
+
 ```sh
-curl -X POST "http://localhost:8080/generate" \
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
@@ -972,9 +985,33 @@ curl -X POST "http://localhost:8080/generate" \
   }'
 ```
 
-##### Multi-Modal (Image + Audio)
+##### Text-to-Speech
+
 ```sh
-curl -X POST "http://localhost:8080/generate" \
+curl -X POST "http://localhost:8080/v1/audio/speech" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/pocket-tts",
+    "input": "Hello from MLX VLM.",
+    "voice": "fantine",
+    "response_format": "mp3"
+  }' \
+  --output speech.mp3
+```
+
+##### Speech-to-Text
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=mlx-community/parakeet-tdt-0.6b-v3 \
+  -F file=@/path/to/audio.mp3 \
+  -F response_format=json
+```
+
+##### Multi-Modal (Image + Audio)
+
+```sh
+curl -X POST "http://localhost:8080/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-community/gemma-3n-E2B-it-4bit",
@@ -992,6 +1029,7 @@ curl -X POST "http://localhost:8080/generate" \
 ```
 
 ##### Responses Endpoint
+
 ```sh
 curl -X POST "http://localhost:8080/responses" \
   -H "Content-Type: application/json" \
