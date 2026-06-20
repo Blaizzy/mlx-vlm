@@ -81,7 +81,13 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.activation_fn = nn.GELU(approx="fast")
+        self.hidden_act = getattr(config, "hidden_act", "gelu")
+        if self.hidden_act in {"gelu_pytorch_tanh", "gelu_new"}:
+            self.activation_fn = nn.GELU(approx="precise")
+        elif self.hidden_act == "gelu":
+            self.activation_fn = nn.GELU(approx="fast")
+        else:
+            raise ValueError(f"Unsupported vision activation: {self.hidden_act}")
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
