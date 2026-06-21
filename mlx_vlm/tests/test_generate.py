@@ -616,6 +616,283 @@ class TestBatchGenerator:
         assert [p.prompt_tokens for p in progress] == [5, 3]
         assert [p.cached_tokens for p in progress] == [3, 0]
 
+    def test_prompt_step_respects_scheduler_token_budget(self):
+        class RecordingModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_ids, **kwargs):
+                self.calls.append((input_ids.shape, kwargs.get("n_to_process")))
+                return SimpleNamespace(logits=mx.zeros((input_ids.shape[0], 1, 4)))
+
+        model = RecordingModel()
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5, 6]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 6, 4)),
+            prompt_kwargs={},
+            prefill_step_size=8,
+            warm_cache=[],
+        )
+
+        assert batch.needs_processing(max_tokens=3)
+        assert batch.prompt_step(max_tokens=3) == 3
+        assert batch.remaining_prompt_tokens() == 3
+        assert model.calls == [((1, 3), 3)]
+
+    def test_prompt_step_divides_scheduler_token_budget_across_rows(self):
+        class RecordingModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_ids, **kwargs):
+                self.calls.append((input_ids.shape, kwargs.get("n_to_process")))
+                return SimpleNamespace(logits=mx.zeros((input_ids.shape[0], 1, 4)))
+
+        model = RecordingModel()
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1, 2],
+            input_ids=[list(range(10)), list(range(10, 20))],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 10, 4)),
+            prompt_kwargs={},
+            prefill_step_size=10,
+            warm_cache=[],
+        )
+
+        assert batch.needs_processing(max_tokens=6)
+        assert batch.prompt_step(max_tokens=6) == 3
+        assert batch.remaining_prompt_tokens() == 7
+        assert model.calls == [((2, 3), 3)]
+
+    def test_decode_tokens_consume_prefill_budget_first(self):
+        class FakeGenerationBatch:
+            def __len__(self):
+                return 3
+
+            def next(self):
+                return [
+                    GenerationBatch.Response(i, 100 + i, 0.0, None)
+                    for i in range(3)
+                ]
+
+        class FakePromptBatch:
+            def __init__(self):
+                self.step_budgets = []
+
+            def needs_processing(self, max_tokens=None):
+                return True
+
+            def prompt_step(self, max_tokens=None):
+                self.step_budgets.append(max_tokens)
+                return max_tokens
+
+            def record_prompt_time(self, elapsed_s):
+                self.elapsed_s = elapsed_s
+
+        prompt_batch = FakePromptBatch()
+        bg = object.__new__(BatchGenerator)
+        bg._wire_stack = None
+        bg._generation_batch = FakeGenerationBatch()
+        bg._prompt_batch = prompt_batch
+        bg._unprocessed_sequences = []
+        bg._gen_tokens_counter = 0
+        bg._steps_counter = 0
+        bg._cache_eval_interval = 0
+        bg._prompt_time_counter = 0.0
+        bg._prompt_tokens_counter = 0
+        bg.completion_batch_size = 8
+        bg.max_num_batched_tokens = 5
+
+        prompt_responses, generation_responses = BatchGenerator._next(bg)
+
+        assert prompt_responses == []
+        assert len(generation_responses) == 3
+        assert prompt_batch.step_budgets == [2]
+
+    def test_prompt_waits_when_decode_uses_full_token_budget(self):
+        class FakeGenerationBatch:
+            def __len__(self):
+                return 4
+
+            def next(self):
+                return [
+                    GenerationBatch.Response(i, 100 + i, 0.0, None)
+                    for i in range(4)
+                ]
+
+        class FakePromptBatch:
+            def __init__(self):
+                self.called = False
+
+            def needs_processing(self, max_tokens=None):
+                self.called = True
+                return True
+
+        prompt_batch = FakePromptBatch()
+        bg = object.__new__(BatchGenerator)
+        bg._wire_stack = None
+        bg._generation_batch = FakeGenerationBatch()
+        bg._prompt_batch = prompt_batch
+        bg._unprocessed_sequences = []
+        bg._gen_tokens_counter = 0
+        bg._steps_counter = 0
+        bg._cache_eval_interval = 0
+        bg._prompt_time_counter = 0.0
+        bg._prompt_tokens_counter = 0
+        bg.completion_batch_size = 8
+        bg.max_num_batched_tokens = 4
+
+        _, generation_responses = BatchGenerator._next(bg)
+
+        assert len(generation_responses) == 4
+        assert not prompt_batch.called
+
+    def test_waiting_prompt_admits_with_partial_prefill_batch_capacity(self):
+        class FakeGenerationBatch:
+            def __len__(self):
+                return 1
+
+            def next(self):
+                return [GenerationBatch.Response(1, 101, 0.0, None)]
+
+        class FakePromptBatch:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.total_prompt_tokens = sum(len(ids) for ids in kwargs["input_ids"])
+                self.step_budgets = []
+
+            def needs_processing(self, max_tokens=None):
+                return True
+
+            def prompt_step(self, max_tokens=None):
+                self.step_budgets.append(max_tokens)
+                return max_tokens
+
+            def record_prompt_time(self, elapsed_s):
+                self.elapsed_s = elapsed_s
+
+        bg = object.__new__(BatchGenerator)
+        bg._wire_stack = None
+        bg._generation_batch = FakeGenerationBatch()
+        bg._prompt_batch = None
+        bg._unprocessed_sequences = [
+            (
+                2,
+                [1, 2, 3, 4, 5],
+                1,
+                {"inputs_embeds": mx.ones((1, 5, 4))},
+                [],
+                None,
+            )
+        ]
+        bg._gen_tokens_counter = 0
+        bg._steps_counter = 0
+        bg._cache_eval_interval = 0
+        bg._prompt_time_counter = 0.0
+        bg._prompt_tokens_counter = 0
+        bg.completion_batch_size = 2
+        bg.max_num_batched_tokens = 4
+        bg.prefill_batch_size = 8
+        bg.prefill_step_size = 8
+        bg.kv_bits = None
+        bg.kv_group_size = 64
+        bg.kv_quant_scheme = "affine"
+        bg.apc_manager = None
+        bg.apc_mode = None
+        bg.model = SimpleNamespace()
+        bg.compute_logprobs = False
+        bg.top_logprobs_k = 0
+        bg.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        bg.tokenizer = SimpleNamespace(stopping_criteria=object())
+        bg.draft_model = None
+        bg.draft_kind = None
+        bg.draft_block_size = None
+        bg.greedy_sampling = False
+
+        with patch.object(generate_module, "PromptProcessingBatch", FakePromptBatch):
+            _, generation_responses = BatchGenerator._next(bg)
+
+        assert len(generation_responses) == 1
+        assert bg._unprocessed_sequences == []
+        assert bg._prompt_batch.kwargs["uids"] == [2]
+        assert bg._prompt_batch.step_budgets == [3]
+        assert bg._prompt_tokens_counter == 5
+
+    def test_waiting_prompt_admission_is_capped_by_prefill_token_budget(self):
+        class FakeGenerationBatch:
+            def __len__(self):
+                return 1
+
+            def next(self):
+                return [GenerationBatch.Response(1, 101, 0.0, None)]
+
+        class FakePromptBatch:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.total_prompt_tokens = sum(len(ids) for ids in kwargs["input_ids"])
+                self.step_budgets = []
+
+            def needs_processing(self, max_tokens=None):
+                return True
+
+            def prompt_step(self, max_tokens=None):
+                self.step_budgets.append(max_tokens)
+                return max_tokens
+
+            def record_prompt_time(self, elapsed_s):
+                self.elapsed_s = elapsed_s
+
+        bg = object.__new__(BatchGenerator)
+        bg._wire_stack = None
+        bg._generation_batch = FakeGenerationBatch()
+        bg._prompt_batch = None
+        bg._unprocessed_sequences = [
+            (
+                uid,
+                [1, 2, 3],
+                1,
+                {"inputs_embeds": mx.ones((1, 3, 4))},
+                [],
+                None,
+            )
+            for uid in range(2, 6)
+        ]
+        bg._gen_tokens_counter = 0
+        bg._steps_counter = 0
+        bg._cache_eval_interval = 0
+        bg._prompt_time_counter = 0.0
+        bg._prompt_tokens_counter = 0
+        bg.completion_batch_size = 10
+        bg.max_num_batched_tokens = 3
+        bg.prefill_batch_size = 8
+        bg.prefill_step_size = 8
+        bg.kv_bits = None
+        bg.kv_group_size = 64
+        bg.kv_quant_scheme = "affine"
+        bg.apc_manager = None
+        bg.apc_mode = None
+        bg.model = SimpleNamespace()
+        bg.compute_logprobs = False
+        bg.top_logprobs_k = 0
+        bg.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        bg.tokenizer = SimpleNamespace(stopping_criteria=object())
+        bg.draft_model = None
+        bg.draft_kind = None
+        bg.draft_block_size = None
+        bg.greedy_sampling = False
+
+        with patch.object(generate_module, "PromptProcessingBatch", FakePromptBatch):
+            _, generation_responses = BatchGenerator._next(bg)
+
+        assert len(generation_responses) == 1
+        assert bg._prompt_batch.kwargs["uids"] == [2, 3]
+        assert [uid for uid, *_ in bg._unprocessed_sequences] == [4, 5]
+        assert bg._prompt_batch.step_budgets == [2]
+
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
@@ -1962,8 +2239,8 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
         captured.update(kwargs)
         return SimpleNamespace(
             total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
-            needs_processing=lambda: True,
-            prompt_step=lambda: 0,
+            needs_processing=lambda max_tokens=None: True,
+            prompt_step=lambda max_tokens=None: 0,
         )
 
     with patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch):

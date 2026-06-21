@@ -1,0 +1,169 @@
+{
+  "label": "before",
+  "commit": "8b6e3c1a",
+  "repo": "/private/tmp/mlx-vlm-before-m3-bench-8b6e3c1a",
+  "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+  "load_s": 0.9189679579576477,
+  "results": [
+    {
+      "mode": "decode_only",
+      "decode_rows": 1,
+      "latency_ms": [
+        30.853834003210068,
+        30.848458991385996,
+        30.58725001756102
+      ],
+      "prefill_tokens": [
+        0,
+        0,
+        0
+      ],
+      "decode_counts": [
+        1,
+        1,
+        1
+      ],
+      "median_ms": 30.848458991385996,
+      "mean_ms": 30.76318100405236,
+      "p95_ms": 30.85329650202766,
+      "min_ms": 30.58725001756102,
+      "max_ms": 30.853834003210068,
+      "median_prefill_tokens": 0,
+      "mean_prefill_tokens": 0,
+      "median_decode_responses": 1,
+      "label": "before",
+      "commit": "8b6e3c1a",
+      "repo": "/private/tmp/mlx-vlm-before-m3-bench-8b6e3c1a",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": false,
+      "max_num_batched_tokens": 64,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 2577,
+      "iterations": 3,
+      "warmup": 1,
+      "load_s": 0.9189679579576477,
+      "peak_memory_gb": 239.999800992
+    },
+    {
+      "mode": "decode_only",
+      "decode_rows": 2,
+      "latency_ms": [
+        40.61016708146781,
+        40.074999909847975,
+        41.78345901891589
+      ],
+      "prefill_tokens": [
+        0,
+        0,
+        0
+      ],
+      "decode_counts": [
+        2,
+        2,
+        2
+      ],
+      "median_ms": 40.61016708146781,
+      "mean_ms": 40.82287533674389,
+      "p95_ms": 41.66612982517108,
+      "min_ms": 40.074999909847975,
+      "max_ms": 41.78345901891589,
+      "median_prefill_tokens": 0,
+      "mean_prefill_tokens": 0,
+      "median_decode_responses": 2,
+      "label": "before",
+      "commit": "8b6e3c1a",
+      "repo": "/private/tmp/mlx-vlm-before-m3-bench-8b6e3c1a",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": false,
+      "max_num_batched_tokens": 64,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 2577,
+      "iterations": 3,
+      "warmup": 1,
+      "load_s": 0.9189679579576477,
+      "peak_memory_gb": 240.334624316
+    },
+    {
+      "mode": "decode_with_prefill",
+      "decode_rows": 1,
+      "latency_ms": [
+        5202.006416977383,
+        5204.1789590148255,
+        5204.924958059564
+      ],
+      "prefill_tokens": [
+        2048,
+        2048,
+        2048
+      ],
+      "decode_counts": [
+        1,
+        1,
+        1
+      ],
+      "median_ms": 5204.1789590148255,
+      "mean_ms": 5203.703444683924,
+      "p95_ms": 5204.85035815509,
+      "min_ms": 5202.006416977383,
+      "max_ms": 5204.924958059564,
+      "median_prefill_tokens": 2048,
+      "mean_prefill_tokens": 2048,
+      "median_decode_responses": 1,
+      "label": "before",
+      "commit": "8b6e3c1a",
+      "repo": "/private/tmp/mlx-vlm-before-m3-bench-8b6e3c1a",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": false,
+      "max_num_batched_tokens": 64,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 2577,
+      "iterations": 3,
+      "warmup": 1,
+      "load_s": 0.9189679579576477,
+      "peak_memory_gb": 242.531246502
+    },
+    {
+      "mode": "decode_with_prefill",
+      "decode_rows": 2,
+      "latency_ms": [
+        5217.188750044443,
+        5215.338167035952,
+        5215.284207952209
+      ],
+      "prefill_tokens": [
+        2048,
+        2048,
+        2048
+      ],
+      "decode_counts": [
+        2,
+        2,
+        2
+      ],
+      "median_ms": 5215.338167035952,
+      "mean_ms": 5215.937041677535,
+      "p95_ms": 5217.003691743594,
+      "min_ms": 5215.284207952209,
+      "max_ms": 5217.188750044443,
+      "median_prefill_tokens": 2048,
+      "mean_prefill_tokens": 2048,
+      "median_decode_responses": 2,
+      "label": "before",
+      "commit": "8b6e3c1a",
+      "repo": "/private/tmp/mlx-vlm-before-m3-bench-8b6e3c1a",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": false,
+      "max_num_batched_tokens": 64,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 2577,
+      "iterations": 3,
+      "warmup": 1,
+      "load_s": 0.9189679579576477,
+      "peak_memory_gb": 242.54795922
+    }
+  ]
+}

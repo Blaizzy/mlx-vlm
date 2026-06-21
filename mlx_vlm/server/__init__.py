@@ -72,6 +72,7 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_max_num_batched_tokens,
     get_max_kv_size,
     get_prefill_step_size,
     get_quantized_kv_bits,

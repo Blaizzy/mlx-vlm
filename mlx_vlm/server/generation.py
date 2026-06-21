@@ -18,6 +18,7 @@ from .. import apc as _apc
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
@@ -75,6 +76,15 @@ def _notify_queues(queues, *items):
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_max_num_batched_tokens():
+    return int(
+        os.environ.get(
+            "MLX_VLM_MAX_NUM_BATCHED_TOKENS",
+            os.environ.get("MAX_NUM_BATCHED_TOKENS", DEFAULT_MAX_NUM_BATCHED_TOKENS),
+        )
+    )
 
 
 def get_server_max_tokens():
@@ -1277,6 +1287,7 @@ class ResponseGenerator:
                             quantized_kv_start=self.quantized_kv_start,
                             compute_logprobs=bool(args.logprobs),
                             top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
+                            max_num_batched_tokens=get_max_num_batched_tokens(),
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
                             draft_model=self.draft_model,

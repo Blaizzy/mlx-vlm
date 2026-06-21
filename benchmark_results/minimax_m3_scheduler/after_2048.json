@@ -1,0 +1,89 @@
+{
+  "label": "after-2048",
+  "commit": "8b6e3c1a",
+  "repo": "/Users/prince_canuma/Documents/mlx-vlm",
+  "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+  "load_s": 0.974044416914694,
+  "results": [
+    {
+      "mode": "decode_with_prefill",
+      "decode_rows": 1,
+      "latency_ms": [
+        5207.701209001243,
+        5206.984625081532,
+        5211.853209068067
+      ],
+      "prefill_tokens": [
+        2047,
+        2047,
+        2047
+      ],
+      "decode_counts": [
+        1,
+        1,
+        1
+      ],
+      "median_ms": 5207.701209001243,
+      "mean_ms": 5208.846347716947,
+      "p95_ms": 5211.438009061385,
+      "min_ms": 5206.984625081532,
+      "max_ms": 5211.853209068067,
+      "median_prefill_tokens": 2047,
+      "mean_prefill_tokens": 2047,
+      "median_decode_responses": 1,
+      "label": "after-2048",
+      "commit": "8b6e3c1a",
+      "repo": "/Users/prince_canuma/Documents/mlx-vlm",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": true,
+      "max_num_batched_tokens": 2048,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 2577,
+      "iterations": 3,
+      "warmup": 1,
+      "load_s": 0.974044416914694,
+      "peak_memory_gb": 242.46467433
+    },
+    {
+      "mode": "decode_with_prefill",
+      "decode_rows": 2,
+      "latency_ms": [
+        5222.258833004162,
+        5221.560958074406,
+        5223.1970420107245
+      ],
+      "prefill_tokens": [
+        2046,
+        2046,
+        2046
+      ],
+      "decode_counts": [
+        2,
+        2,
+        2
+      ],
+      "median_ms": 5222.258833004162,
+      "mean_ms": 5222.338944363098,
+      "p95_ms": 5223.103221110068,
+      "min_ms": 5221.560958074406,
+      "max_ms": 5223.1970420107245,
+      "median_prefill_tokens": 2046,
+      "mean_prefill_tokens": 2046,
+      "median_decode_responses": 2,
+      "label": "after-2048",
+      "commit": "8b6e3c1a",
+      "repo": "/Users/prince_canuma/Documents/mlx-vlm",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": true,
+      "max_num_batched_tokens": 2048,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 2577,
+      "iterations": 3,
+      "warmup": 1,
+      "load_s": 0.974044416914694,
+      "peak_memory_gb": 242.61321199
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "label": "after-batched-prefill-smoke",
+  "commit": "8b6e3c1a",
+  "repo": "/Users/prince_canuma/Documents/mlx-vlm",
+  "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+  "load_s": 0.9180317090358585,
+  "results": [
+    {
+      "mode": "decode_with_prefill",
+      "decode_rows": 2,
+      "latency_ms": [
+        455.2019579568878
+      ],
+      "prefill_tokens": [
+        62
+      ],
+      "decode_counts": [
+        2
+      ],
+      "median_ms": 455.2019579568878,
+      "mean_ms": 455.2019579568878,
+      "p95_ms": 455.2019579568878,
+      "min_ms": 455.2019579568878,
+      "max_ms": 455.2019579568878,
+      "median_prefill_tokens": 62,
+      "mean_prefill_tokens": 62,
+      "median_decode_responses": 2,
+      "label": "after-batched-prefill-smoke",
+      "commit": "8b6e3c1a",
+      "repo": "/Users/prince_canuma/Documents/mlx-vlm",
+      "model_path": "/Users/prince_canuma/MiniMax-M3-4bit",
+      "version_has_token_budget": true,
+      "max_num_batched_tokens": 64,
+      "prefill_step_size": 2048,
+      "active_prompt_tokens": 186,
+      "pending_prompt_tokens": 657,
+      "iterations": 1,
+      "warmup": 0,
+      "load_s": 0.9180317090358585,
+      "peak_memory_gb": 239.975359624
+    }
+  ]
+}

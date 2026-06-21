@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="760" viewBox="0 0 1040 760">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="520.0" y="28.0" font-family="Arial, sans-serif" font-size="20" font-weight="bold" text-anchor="middle" fill="#1f2937">MiniMax M3: 4 Active Requests, 128 Tokens Each</text>
+<text x="520.0" y="50.0" font-family="Arial, sans-serif" font-size="12" font-weight="normal" text-anchor="middle" fill="#475569">512 active decode tokens total; 2577-token pending prompt inserted concurrently</text>
+<rect x="24" y="76" width="992" height="205" fill="#fff" stroke="#d1d5db"/>
+<text x="520.0" y="99.0" font-family="Arial, sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2937">Total Time To Emit 512 Active Tokens</text>
+<line x1="104" y1="112" x2="104" y2="227" stroke="#374151"/>
+<line x1="104" y1="227" x2="986" y2="227" stroke="#374151"/>
+<line x1="100" y1="227.0" x2="986" y2="227.0" stroke="#e5e7eb"/>
+<text x="96.0" y="231.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">0</text>
+<line x1="100" y1="198.2" x2="986" y2="198.2" stroke="#e5e7eb"/>
+<text x="96.0" y="202.2" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">12500</text>
+<line x1="100" y1="169.5" x2="986" y2="169.5" stroke="#e5e7eb"/>
+<text x="96.0" y="173.5" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">25000</text>
+<line x1="100" y1="140.8" x2="986" y2="140.8" stroke="#e5e7eb"/>
+<text x="96.0" y="144.8" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">37500</text>
+<line x1="100" y1="112.0" x2="986" y2="112.0" stroke="#e5e7eb"/>
+<text x="96.0" y="116.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">50000</text>
+<rect x="404.0" y="196.1" width="120.0" height="30.9" fill="#ea580c"/>
+<text x="464.0" y="191.1" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">13428</text>
+<text x="464.0" y="245.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">after-2048</text>
+<rect x="566.0" y="171.4" width="120.0" height="55.6" fill="#dc2626"/>
+<text x="626.0" y="166.4" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">24176</text>
+<text x="626.0" y="245.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">after-64</text>
+<text x="545.0" y="269.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">ms</text>
+<rect x="24" y="305" width="992" height="205" fill="#fff" stroke="#d1d5db"/>
+<text x="520.0" y="328.0" font-family="Arial, sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2937">Worst Scheduler Tick During Stream</text>
+<line x1="104" y1="341" x2="104" y2="456" stroke="#374151"/>
+<line x1="104" y1="456" x2="986" y2="456" stroke="#374151"/>
+<line x1="100" y1="456.0" x2="986" y2="456.0" stroke="#e5e7eb"/>
+<text x="96.0" y="460.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">0</text>
+<line x1="100" y1="427.2" x2="986" y2="427.2" stroke="#e5e7eb"/>
+<text x="96.0" y="431.2" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">2500</text>
+<line x1="100" y1="398.5" x2="986" y2="398.5" stroke="#e5e7eb"/>
+<text x="96.0" y="402.5" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">5000</text>
+<line x1="100" y1="369.8" x2="986" y2="369.8" stroke="#e5e7eb"/>
+<text x="96.0" y="373.8" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">7500</text>
+<line x1="100" y1="341.0" x2="986" y2="341.0" stroke="#e5e7eb"/>
+<text x="96.0" y="345.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">10000</text>
+<rect x="404.0" y="395.8" width="120.0" height="60.2" fill="#ea580c"/>
+<text x="464.0" y="390.8" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">5233</text>
+<text x="464.0" y="474.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">after-2048</text>
+<rect x="566.0" y="449.5" width="120.0" height="6.5" fill="#dc2626"/>
+<text x="626.0" y="444.5" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">569</text>
+<text x="626.0" y="474.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">after-64</text>
+<text x="545.0" y="498.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">ms</text>
+<rect x="24" y="534" width="992" height="205" fill="#fff" stroke="#d1d5db"/>
+<text x="520.0" y="557.0" font-family="Arial, sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2937">Active Decode Throughput</text>
+<line x1="104" y1="570" x2="104" y2="685" stroke="#374151"/>
+<line x1="104" y1="685" x2="986" y2="685" stroke="#374151"/>
+<line x1="100" y1="685.0" x2="986" y2="685.0" stroke="#e5e7eb"/>
+<text x="96.0" y="689.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">0</text>
+<line x1="100" y1="656.2" x2="986" y2="656.2" stroke="#e5e7eb"/>
+<text x="96.0" y="660.2" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">12</text>
+<line x1="100" y1="627.5" x2="986" y2="627.5" stroke="#e5e7eb"/>
+<text x="96.0" y="631.5" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">25</text>
+<line x1="100" y1="598.8" x2="986" y2="598.8" stroke="#e5e7eb"/>
+<text x="96.0" y="602.8" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">38</text>
+<line x1="100" y1="570.0" x2="986" y2="570.0" stroke="#e5e7eb"/>
+<text x="96.0" y="574.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">50</text>
+<rect x="404.0" y="597.3" width="120.0" height="87.7" fill="#ea580c"/>
+<text x="464.0" y="592.3" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">38.13</text>
+<text x="464.0" y="703.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">after-2048</text>
+<rect x="566.0" y="636.3" width="120.0" height="48.7" fill="#dc2626"/>
+<text x="626.0" y="631.3" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">21.18</text>
+<text x="626.0" y="703.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="middle" fill="#1f2937">after-64</text>
+<text x="545.0" y="727.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">tokens/s</text>
+</svg>

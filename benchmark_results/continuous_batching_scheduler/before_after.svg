@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="720" viewBox="0 0 1040 720">
+<rect width="100%" height="100%" fill="#f8fafc"/>
+<text x="520.0" y="28.0" font-family="Arial, sans-serif" font-size="20" font-weight="bold" text-anchor="middle" fill="#1f2937">Continuous Batching Scheduler: Before vs After</text>
+<text x="520.0" y="50.0" font-family="Arial, sans-serif" font-size="12" font-weight="normal" text-anchor="middle" fill="#475569">Synthetic one-step benchmark: decode responses emitted after concurrent prefill work</text>
+<rect x="24" y="76" width="992" height="285" fill="#ffffff" stroke="#d1d5db"/>
+<text x="520.0" y="98.0" font-family="Arial, sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2937">Mixed Decode + Prefill: Median _next() Latency</text>
+<line x1="94" y1="108" x2="94" y2="308" stroke="#374151"/>
+<line x1="94" y1="308" x2="991" y2="308" stroke="#374151"/>
+<line x1="90" y1="308.0" x2="991" y2="308.0" stroke="#e5e7eb"/>
+<text x="86.0" y="312.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">0</text>
+<line x1="90" y1="258.0" x2="991" y2="258.0" stroke="#e5e7eb"/>
+<text x="86.0" y="262.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">25</text>
+<line x1="90" y1="208.0" x2="991" y2="208.0" stroke="#e5e7eb"/>
+<text x="86.0" y="212.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">50</text>
+<line x1="90" y1="158.0" x2="991" y2="158.0" stroke="#e5e7eb"/>
+<text x="86.0" y="162.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">75</text>
+<line x1="90" y1="108.0" x2="991" y2="108.0" stroke="#e5e7eb"/>
+<text x="86.0" y="112.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">100</text>
+<text x="206.1" y="326.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">1</text>
+<rect x="168.1" y="209.2" width="34.0" height="98.8" fill="#2563eb"/>
+<text x="185.1" y="205.2" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">49.4</text>
+<rect x="206.1" y="304.2" width="34.0" height="3.8" fill="#dc2626"/>
+<text x="223.1" y="300.2" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">1.9</text>
+<text x="430.4" y="326.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">8</text>
+<rect x="392.4" y="209.7" width="34.0" height="98.3" fill="#2563eb"/>
+<text x="409.4" y="205.7" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">49.1</text>
+<rect x="430.4" y="304.5" width="34.0" height="3.5" fill="#dc2626"/>
+<text x="447.4" y="300.5" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">1.8</text>
+<text x="654.6" y="326.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">32</text>
+<rect x="616.6" y="209.1" width="34.0" height="98.9" fill="#2563eb"/>
+<text x="633.6" y="205.1" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">49.4</text>
+<rect x="654.6" y="305.5" width="34.0" height="2.5" fill="#dc2626"/>
+<text x="671.6" y="301.5" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">1.2</text>
+<text x="878.9" y="326.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">64</text>
+<rect x="840.9" y="209.7" width="34.0" height="98.3" fill="#2563eb"/>
+<text x="857.9" y="205.7" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">49.1</text>
+<rect x="878.9" y="307.0" width="34.0" height="1.0" fill="#dc2626"/>
+<text x="895.9" y="303.0" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">0.5</text>
+<text x="542.5" y="349.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">active decode rows</text>
+<text x="39.0" y="208.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">ms</text>
+<rect x="841" y="112" width="11" height="11" fill="#2563eb"/>
+<text x="859.0" y="122.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="start" fill="#1f2937">before</text>
+<rect x="841" y="130" width="11" height="11" fill="#dc2626"/>
+<text x="859.0" y="140.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="start" fill="#1f2937">after</text>
+<rect x="24" y="386" width="992" height="285" fill="#ffffff" stroke="#d1d5db"/>
+<text x="520.0" y="408.0" font-family="Arial, sans-serif" font-size="15" font-weight="bold" text-anchor="middle" fill="#1f2937">Prefill Tokens Scheduled In Same Iteration</text>
+<line x1="94" y1="418" x2="94" y2="618" stroke="#374151"/>
+<line x1="94" y1="618" x2="991" y2="618" stroke="#374151"/>
+<line x1="90" y1="618.0" x2="991" y2="618.0" stroke="#e5e7eb"/>
+<text x="86.0" y="622.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">0</text>
+<line x1="90" y1="568.0" x2="991" y2="568.0" stroke="#e5e7eb"/>
+<text x="86.0" y="572.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">1250</text>
+<line x1="90" y1="518.0" x2="991" y2="518.0" stroke="#e5e7eb"/>
+<text x="86.0" y="522.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">2500</text>
+<line x1="90" y1="468.0" x2="991" y2="468.0" stroke="#e5e7eb"/>
+<text x="86.0" y="472.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">3750</text>
+<line x1="90" y1="418.0" x2="991" y2="418.0" stroke="#e5e7eb"/>
+<text x="86.0" y="422.0" font-family="Arial, sans-serif" font-size="10" font-weight="normal" text-anchor="end" fill="#1f2937">5000</text>
+<text x="206.1" y="636.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">1</text>
+<rect x="168.1" y="536.1" width="34.0" height="81.9" fill="#2563eb"/>
+<text x="185.1" y="532.1" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">2048.0</text>
+<rect x="206.1" y="615.5" width="34.0" height="2.5" fill="#dc2626"/>
+<text x="223.1" y="611.5" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">63.0</text>
+<text x="430.4" y="636.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">8</text>
+<rect x="392.4" y="536.1" width="34.0" height="81.9" fill="#2563eb"/>
+<text x="409.4" y="532.1" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">2048.0</text>
+<rect x="430.4" y="615.8" width="34.0" height="2.2" fill="#dc2626"/>
+<text x="447.4" y="611.8" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">56.0</text>
+<text x="654.6" y="636.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">32</text>
+<rect x="616.6" y="536.1" width="34.0" height="81.9" fill="#2563eb"/>
+<text x="633.6" y="532.1" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">2048.0</text>
+<rect x="654.6" y="616.7" width="34.0" height="1.3" fill="#dc2626"/>
+<text x="671.6" y="612.7" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">32.0</text>
+<text x="878.9" y="636.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">64</text>
+<rect x="840.9" y="536.1" width="34.0" height="81.9" fill="#2563eb"/>
+<text x="857.9" y="532.1" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">2048.0</text>
+<rect x="878.9" y="618.0" width="34.0" height="0.0" fill="#dc2626"/>
+<text x="895.9" y="614.0" font-family="Arial, sans-serif" font-size="9" font-weight="normal" text-anchor="middle" fill="#1f2937">0.0</text>
+<text x="542.5" y="659.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">active decode rows</text>
+<text x="39.0" y="518.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">tokens</text>
+<rect x="841" y="422" width="11" height="11" fill="#2563eb"/>
+<text x="859.0" y="432.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="start" fill="#1f2937">before</text>
+<rect x="841" y="440" width="11" height="11" fill="#dc2626"/>
+<text x="859.0" y="450.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="start" fill="#1f2937">after</text>
+<text x="520.0" y="700.0" font-family="Arial, sans-serif" font-size="11" font-weight="normal" text-anchor="middle" fill="#1f2937">Decode-only sanity sample: after 1 rows: 0.01 ms, before 1 rows: 0.01 ms, after 8 rows: 0.06 ms, before 8 rows: 0.06 ms</text>
+</svg>

@@ -27,6 +27,7 @@ from mlx_vlm.models.minimax_m3_vl.vision import (
     MiniMaxVisionTransformer,
     _apply_vision_rope,
 )
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.prompt_utils import apply_chat_template
 
 
@@ -1312,6 +1313,20 @@ def test_minimax_m3_to_batch_preserves_warm_kv_and_index_cache():
     assert extracted.kv_cache.state[0].tolist() == keys.tolist()
     assert extracted.kv_cache.state[1].tolist() == values.tolist()
     assert extracted.index_keys.tolist() == index_keys.tolist()
+
+
+def test_minimax_m3_make_cache_uses_custom_to_batch_for_prefill_batches():
+    class SparseCacheModel:
+        def make_cache(self):
+            return [MiniMaxM3KVCache()]
+
+    prompt_cache = _make_cache(SparseCacheModel(), left_padding=[2, 0])
+
+    assert len(prompt_cache) == 1
+    assert isinstance(prompt_cache[0], MiniMaxM3BatchKVCache)
+    assert prompt_cache[0].empty() is True
+    assert prompt_cache[0].offset.tolist() == [-2, 0]
+    assert prompt_cache[0].left_padding.tolist() == [2, 0]
 
 
 def test_minimax_m3_rollback_speculative_cache_trims_index_cache():

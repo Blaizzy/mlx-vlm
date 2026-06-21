@@ -7,6 +7,7 @@ import uvicorn
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
 )
@@ -66,6 +67,15 @@ def main():
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
         help="Tokens per prefill step (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=DEFAULT_MAX_NUM_BATCHED_TOKENS,
+        help=(
+            "Maximum decode + prefill tokens scheduled per continuous-batching "
+            "iteration (default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -203,6 +213,7 @@ def main():
             os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    os.environ["MLX_VLM_MAX_NUM_BATCHED_TOKENS"] = str(args.max_num_batched_tokens)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.thinking_budget is not None:
