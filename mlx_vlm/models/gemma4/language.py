@@ -474,6 +474,14 @@ class Gemma4TextModel(nn.Module):
             return base_mask
         if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
             return base_mask
+        if base_mask.shape[-2] != base_mask.shape[-1]:
+            # Continuous batching can hand us a (B, 1, q, kv) step mask with
+            # q != kv (chunked prefill / coalesced decode). The overlay below is
+            # built over the full key sequence, so the boolean OR would
+            # broadcast-fail. The bidirectional vision overlay is only valid on a
+            # square full-sequence prefill mask; fall back to the causal base
+            # mask for non-square steps.
+            return base_mask
 
         block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
         q_blocks = mx.expand_dims(block_sequence_ids, -1)
