@@ -268,6 +268,13 @@ class ChatMessage(FlexibleBaseModel):
     reasoning: Optional[str] = Field(
         None, description="Thinking/reasoning content (when thinking is enabled)."
     )
+    reasoning_content: Optional[str] = Field(
+        None,
+        description=(
+            "OpenAI-compatible thinking/reasoning content "
+            "(when thinking is enabled)."
+        ),
+    )
     tool_calls: Optional[List[Any]] = Field(
         None, description="Tool calls made by the assistant."
     )
@@ -275,6 +282,12 @@ class ChatMessage(FlexibleBaseModel):
         None, description="ID of the tool call this message is a response to."
     )
     name: Optional[str] = Field(None, description="Name of the tool/function.")
+
+    def model_post_init(self, __context):
+        if self.reasoning_content is None and self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        elif self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
 
 
 class OpenAIRequest(FlexibleBaseModel):
