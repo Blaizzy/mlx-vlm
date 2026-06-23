@@ -98,6 +98,17 @@ python -m mlx_vlm.generate \
   --temperature 1.0 --top-p 0.95 --top-k 64
 ```
 
+For text-dense images, increase the image soft-token budget:
+
+```sh
+python -m mlx_vlm.generate \
+  --model google/gemma-4-e4b-it \
+  --image path/to/slide.png \
+  --prompt "Transcribe all visible text." \
+  --vision-soft-tokens-per-image 1120 \
+  --max-tokens 500
+```
+
 ### Audio understanding (2B/4B only)
 
 ```sh
@@ -189,6 +200,7 @@ result = generate(
     processor=processor,
     prompt=prompt,
     image=image,
+    vision_soft_tokens_per_image=1120,
     max_tokens=500,
     temperature=1.0,
     top_p=0.95,

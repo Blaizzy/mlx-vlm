@@ -165,6 +165,13 @@ def parse_arguments():
         help="Resize shape for the image.",
     )
     parser.add_argument(
+        "--vision-soft-tokens-per-image",
+        type=int,
+        choices=(70, 140, 280, 560, 1120),
+        default=None,
+        help="Gemma 4 image soft-token budget per image.",
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         nargs="+",
@@ -1547,6 +1554,13 @@ def main():
             }
             if args.resize_shape is not None:
                 stream_kwargs["resize_shape"] = args.resize_shape
+            vision_soft_tokens_per_image = getattr(
+                args, "vision_soft_tokens_per_image", None
+            )
+            if vision_soft_tokens_per_image is not None:
+                stream_kwargs["vision_soft_tokens_per_image"] = (
+                    vision_soft_tokens_per_image
+                )
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
             if is_masked_text_diffusion:
@@ -1617,6 +1631,11 @@ def main():
         }
         if args.resize_shape is not None:
             gen_kwargs["resize_shape"] = args.resize_shape
+        vision_soft_tokens_per_image = getattr(
+            args, "vision_soft_tokens_per_image", None
+        )
+        if vision_soft_tokens_per_image is not None:
+            gen_kwargs["vision_soft_tokens_per_image"] = vision_soft_tokens_per_image
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
         if is_masked_diffusion_text_model(model):

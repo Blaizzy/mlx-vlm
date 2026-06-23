@@ -362,8 +362,13 @@ class VisionPooler(nn.Module):
         )
 
         length = output_length or self.default_output_length
+        if length > hidden_states.shape[1]:
+            raise ValueError(
+                f"Cannot output more soft tokens (requested {length}) than there "
+                f"are patches ({hidden_states.shape[1]})."
+            )
         if hidden_states.shape[1] == length:
-            mask = padding_positions
+            mask = ~padding_positions
         else:
             hidden_states, mask = self._avg_pool_by_positions(
                 hidden_states, patch_positions, length
@@ -414,29 +419,39 @@ class VisionModel(nn.Module):
             self.std_bias = mx.zeros((config.hidden_size,))
             self.std_scale = mx.ones((config.hidden_size,))
 
-    def _patch_positions_single(self, H, W):
+    def _patch_positions_single(self, H, W, max_patches=None):
         """Compute patch positions and padding mask for a single image."""
         pH = H // self.patch_size
         pW = W // self.patch_size
         num_patches = pH * pW
+        max_patches = max_patches or self.max_patches
 
         grid_x = np.arange(pW)
         grid_y = np.arange(pH)
         gx, gy = np.meshgrid(grid_x, grid_y, indexing="xy")
         real_positions = np.stack([gx.flatten(), gy.flatten()], axis=-1)
 
-        num_padding = self.max_patches - num_patches
+        num_padding = max_patches - num_patches
         if num_padding > 0:
             pad_positions = np.full((num_padding, 2), -1, dtype=np.int64)
             patch_positions = np.concatenate([real_positions, pad_positions], axis=0)
         else:
-            patch_positions = real_positions[: self.max_patches]
+            patch_positions = real_positions[:max_patches]
 
-        padding_mask = np.zeros(self.max_patches, dtype=bool)
+        padding_mask = np.zeros(max_patches, dtype=bool)
         if num_padding > 0:
             padding_mask[num_patches:] = True
 
         return patch_positions.astype(np.int32), padding_mask, num_patches
+
+    def _output_length_for_patches(self, num_patches):
+        pool_area = self.pooling_kernel_size**2
+        if num_patches % pool_area != 0:
+            raise ValueError(
+                f"Cannot pool {num_patches} patches with pooling kernel "
+                f"{self.pooling_kernel_size}."
+            )
+        return num_patches // pool_area
 
     def __call__(self, pixel_values) -> mx.array:
         # Handle list of different-sized images: process each individually
@@ -459,24 +474,18 @@ class VisionModel(nn.Module):
 
         if all_same_size:
             num_real = (H // self.patch_size) * (W // self.patch_size)
-            num_real = min(num_real, self.max_patches)
-            positions, padding_mask, _ = self._patch_positions_single(H, W)
+            output_length = self._output_length_for_patches(num_real)
+            positions, padding_mask, _ = self._patch_positions_single(
+                H, W, max_patches=num_real
+            )
             # Tile for batch
             patch_positions = mx.array(np.tile(positions[None], (B, 1, 1)))
             padding_positions = mx.array(np.tile(padding_mask[None], (B, 1)))
 
             inputs_embeds = self.patch_embedder(
-                pixel_values,
-                patch_positions[:, :num_real],
-                padding_positions[:, :num_real],
+                pixel_values, patch_positions, padding_positions
             )
 
-            num_padding = self.max_patches - num_real
-            if num_padding > 0:
-                pad_embeds = mx.zeros(
-                    (B, num_padding, inputs_embeds.shape[-1]), dtype=inputs_embeds.dtype
-                )
-                inputs_embeds = mx.concatenate([inputs_embeds, pad_embeds], axis=1)
         else:
             # Per-image processing for different sizes (shouldn't happen with padding)
             all_embeds = []
@@ -485,16 +494,15 @@ class VisionModel(nn.Module):
             for i in range(B):
                 img = pixel_values[i : i + 1]
                 _, _, h, w = img.shape
-                pos, pad_mask, n_real = self._patch_positions_single(h, w)
+                n_real = (h // self.patch_size) * (w // self.patch_size)
+                output_length = self._output_length_for_patches(n_real)
+                pos, pad_mask, _ = self._patch_positions_single(
+                    h, w, max_patches=n_real
+                )
                 pos_mx = mx.array(pos[None])
                 pad_mx = mx.array(pad_mask[None])
-                n_real = min(n_real, self.max_patches)
 
-                emb = self.patch_embedder(img, pos_mx[:, :n_real], pad_mx[:, :n_real])
-                n_pad = self.max_patches - n_real
-                if n_pad > 0:
-                    pad_emb = mx.zeros((1, n_pad, emb.shape[-1]), dtype=emb.dtype)
-                    emb = mx.concatenate([emb, pad_emb], axis=1)
+                emb = self.patch_embedder(img, pos_mx, pad_mx)
                 all_embeds.append(emb)
                 all_positions.append(pos_mx)
                 all_padding.append(pad_mx)
@@ -516,14 +524,12 @@ class VisionModel(nn.Module):
 
         hidden_states = self.encoder(inputs_embeds, patch_positions, attn_mask)
 
-        pooled, pool_mask = self.pooler(
-            hidden_states, patch_positions, padding_positions
+        pooled, valid_mask = self.pooler(
+            hidden_states,
+            patch_positions,
+            padding_positions,
+            output_length=output_length,
         )
-
-        if pool_mask.shape[1] == self.default_output_length:
-            valid_mask = pool_mask
-        else:
-            valid_mask = ~pool_mask
 
         all_real = []
         for i in range(B):

@@ -471,6 +471,8 @@ class Gemma4Processor(ProcessorMixin):
         videos: Optional[List] = None,
         fps: Optional[Union[float, List[float]]] = None,
         return_mm_token_type_ids: bool = True,
+        max_soft_tokens: Optional[int] = None,
+        vision_soft_tokens_per_image: Optional[int] = None,
         **kwargs,
     ) -> BatchFeature:
         if text is None and images is None and audio is None and videos is None:
@@ -494,7 +496,24 @@ class Gemma4Processor(ProcessorMixin):
         image_inputs = {}
         if images is not None:
             images = self.image_processor.fetch_images(images)
-            image_data, num_soft_tokens = self.image_processor(images)
+            if (
+                max_soft_tokens is not None
+                and vision_soft_tokens_per_image is not None
+                and max_soft_tokens != vision_soft_tokens_per_image
+            ):
+                raise ValueError(
+                    "`max_soft_tokens` and `vision_soft_tokens_per_image` must "
+                    "match when both are provided."
+                )
+            image_max_soft_tokens = (
+                vision_soft_tokens_per_image
+                if vision_soft_tokens_per_image is not None
+                else max_soft_tokens
+            )
+            image_kwargs = {}
+            if image_max_soft_tokens is not None:
+                image_kwargs["max_soft_tokens"] = image_max_soft_tokens
+            image_data, num_soft_tokens = self.image_processor(images, **image_kwargs)
             image_inputs = image_data
 
             if text is not None and num_soft_tokens is not None:
@@ -749,6 +768,8 @@ class Gemma4Processor(ProcessorMixin):
             "truncation",
             "max_length",
             "fps",
+            "max_soft_tokens",
+            "vision_soft_tokens_per_image",
         ):
             if key in kwargs:
                 processor_kwargs[key] = kwargs.pop(key)

@@ -10,10 +10,21 @@ from .language import LanguageModel, RMSNormNoScale
 from .vision import VisionModel
 
 
-def masked_scatter(input_tensor, mask, source):
+def masked_scatter(input_tensor, mask, source, allow_truncate=False):
     mask_flat = mask.flatten().astype(mx.int32)
+    n_mask = int(mask_flat.sum().item())
+    if source.size < n_mask or (source.size != n_mask and not allow_truncate):
+        hidden_size = input_tensor.shape[-1]
+        n_tokens = n_mask // hidden_size
+        n_features = source.size // hidden_size
+        raise ValueError(
+            "Multimodal features and tokens do not match: "
+            f"tokens {n_tokens}, features {n_features}"
+        )
+    if n_mask == 0:
+        return input_tensor
     indices = mx.cumsum(mask_flat) - 1
-    aligned = source.flatten()[indices % source.size]
+    aligned = source.flatten()[indices]
     return mx.where(mask_flat, aligned, input_tensor.flatten()).reshape(
         input_tensor.shape
     )
@@ -102,7 +113,9 @@ class Model(nn.Module):
                 per_layer_inputs_tokens
             )
 
-        def _scatter(source, token_id, encode, cached_kw=None, key_kw=None):
+        def _scatter(
+            source, token_id, encode, cached_kw=None, key_kw=None, allow_truncate=False
+        ):
             if source is None or token_id is None:
                 return inputs_embeds
             vision_cache = kwargs.get("vision_cache", None) if key_kw else None
@@ -121,7 +134,12 @@ class Model(nn.Module):
             mask_expanded = mx.broadcast_to(
                 mx.expand_dims(input_ids == token_id, -1), inputs_embeds.shape
             )
-            return masked_scatter(inputs_embeds, mask_expanded, features)
+            return masked_scatter(
+                inputs_embeds,
+                mask_expanded,
+                features,
+                allow_truncate=allow_truncate,
+            )
 
         def _encode_vision(pixels):
             return self.embed_vision(self.vision_tower(pixels))
@@ -156,6 +174,7 @@ class Model(nn.Module):
                 audio_features,
                 self.config.audio_token_id,
                 _encode_audio,
+                allow_truncate=True,
             )
 
         return InputEmbeddingsFeatures(
