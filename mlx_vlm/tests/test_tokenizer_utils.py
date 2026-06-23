@@ -9,11 +9,13 @@ from mlx_vlm.tokenizer_utils import (
     SPMStreamingDetokenizer,
     StreamingDetokenizer,
     TokenizerWrapper,
+    _is_bpe_byte_fallback_tokenizer,
     _is_bpe_decoder,
     _is_spm_decoder,
     _is_spm_decoder_no_space,
     _match,
     _remove_space,
+    load_tokenizer,
     make_streaming_detokenizer,
 )
 
@@ -199,6 +201,34 @@ class TestIsBpeDecoder:
     def test_non_dict(self):
         assert _is_bpe_decoder("ByteLevel") is False
         assert _is_bpe_decoder(None) is False
+
+
+class TestIsBpeByteFallbackTokenizer:
+    """Tests for BPE tokenizers that use byte fallback decoding."""
+
+    def test_detects_bpe_byte_fallback_sequence(self):
+        tokenizer_content = {
+            "model": {"type": "BPE"},
+            "decoder": {
+                "type": "Sequence",
+                "decoders": [
+                    {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                    {"type": "ByteFallback"},
+                    {"type": "Fuse"},
+                    {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+                ],
+            },
+        }
+
+        assert _is_bpe_byte_fallback_tokenizer(tokenizer_content) is True
+
+    def test_ignores_non_bpe_tokenizer(self):
+        tokenizer_content = {
+            "model": {"type": "Unigram"},
+            "decoder": {"type": "ByteFallback"},
+        }
+
+        assert _is_bpe_byte_fallback_tokenizer(tokenizer_content) is False
 
 
 # ============================================================================
@@ -711,6 +741,29 @@ class TestBPEStreamingDetokenizer:
 
         assert detokenizer.text == "Got it, the user"
 
+    def test_decodes_byte_level_chinese_tokens(self):
+        tokenizer = MockBPETokenizer()
+        tokenizer.vocab = {
+            "ç»": 0,
+            "¿": 1,
+            "æ´": 2,
+            "²": 3,
+            "ä»ķ": 4,
+            "æł¼": 5,
+            "ç»´": 6,
+            "èĬ±": 7,
+            "åĽŃ": 8,
+            "åħ¬": 9,
+            "å¯ĵ": 10,
+        }
+        detokenizer = BPEStreamingDetokenizer(tokenizer)
+
+        for token in range(11):
+            detokenizer.add_token(token)
+        detokenizer.finalize()
+
+        assert detokenizer.text == "绿洲仕格维花园公寓"
+
 
 # ============================================================================
 # Tests for TokenizerWrapper
@@ -739,6 +792,31 @@ class TestTokenizerWrapper:
         wrapper = TokenizerWrapper(tokenizer, SPMStreamingDetokenizer)
 
         assert isinstance(wrapper.detokenizer, SPMStreamingDetokenizer)
+
+    def test_load_tokenizer_uses_bpe_for_bpe_byte_fallback(self, tmp_path, monkeypatch):
+        (tmp_path / "tokenizer.json").write_text(
+            """{
+              "model": {"type": "BPE"},
+              "decoder": {
+                "type": "Sequence",
+                "decoders": [
+                  {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+                  {"type": "ByteFallback"},
+                  {"type": "Fuse"},
+                  {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+                ]
+              }
+            }"""
+        )
+
+        monkeypatch.setattr(
+            "mlx_vlm.tokenizer_utils.AutoTokenizer.from_pretrained",
+            lambda *_args, **_kwargs: MockBPETokenizer(),
+        )
+
+        wrapper = load_tokenizer(tmp_path)
+
+        assert isinstance(wrapper.detokenizer, BPEStreamingDetokenizer)
 
 
 # ============================================================================

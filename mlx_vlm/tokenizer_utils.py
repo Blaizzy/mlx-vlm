@@ -450,6 +450,22 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _has_decoder(decoder, decoder_type):
+    if isinstance(decoder, dict):
+        return decoder.get("type") == decoder_type or any(
+            _has_decoder(value, decoder_type) for value in decoder.values()
+        )
+    if isinstance(decoder, list):
+        return any(_has_decoder(value, decoder_type) for value in decoder)
+    return False
+
+
+def _is_bpe_byte_fallback_tokenizer(tokenizer_content):
+    return tokenizer_content.get("model", {}).get("type") == "BPE" and _has_decoder(
+        tokenizer_content.get("decoder"), "ByteFallback"
+    )
+
+
 def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={}):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -468,7 +484,9 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
                 raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
 
         if "decoder" in tokenizer_content:
-            if _is_spm_decoder(tokenizer_content["decoder"]):
+            if _is_bpe_byte_fallback_tokenizer(tokenizer_content):
+                detokenizer_class = BPEStreamingDetokenizer
+            elif _is_spm_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = SPMStreamingDetokenizer
             elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
                 detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
