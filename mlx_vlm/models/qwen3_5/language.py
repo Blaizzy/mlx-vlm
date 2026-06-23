@@ -1204,6 +1204,10 @@ def _qwen3_5_ragged_decode_attention(
     pads: List[int],
     scale: float,
 ) -> Optional[mx.array]:
+    # Metal-only fast path; on other backends (e.g. CUDA) return None so the
+    # caller falls back to portable per-pad-group scaled_dot_product_attention.
+    if not mx.metal.is_available():
+        return None
     if (
         queries.ndim != 4
         or keys.ndim != 4
