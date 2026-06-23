@@ -72,12 +72,13 @@ def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
     return out.astype(conv_input.dtype)[:, None, :]
 
 
-_TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
-    name="qwen3_5_target_verify_gemv",
-    input_names=["x", "weight"],
-    output_names=["out"],
-    header="#include <metal_simdgroup>\nusing namespace metal;\n",
-    source=r"""
+_TARGET_VERIFY_GEMV = (
+    mx.fast.metal_kernel(
+        name="qwen3_5_target_verify_gemv",
+        input_names=["x", "weight"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=r"""
         uint lane = thread_position_in_grid.x;
         uint out_block = thread_position_in_grid.y;
         uint row = thread_position_in_grid.z;
@@ -145,7 +146,10 @@ _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
             }
         }
     """,
-) if mx.metal.is_available() else None
+    )
+    if mx.metal.is_available()
+    else None
+)
 
 
 def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:

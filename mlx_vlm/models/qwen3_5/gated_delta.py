@@ -1,4 +1,3 @@
-import math
 from functools import partial
 from typing import Optional
 
@@ -18,17 +17,13 @@ def _compute_g_beta(A_log, a, b, dt_bias):
 
 
 def _invert_unit_lower(Tmat: mx.array, C: int) -> mx.array:
-    """Inverse of a batched unit lower-triangular matrix ``Tmat = I + N`` with
-    ``N`` strictly-lower (hence nilpotent). Uses the log-depth identity
+    """Inverse of a batched unit lower-triangular matrix ``Tmat`` (``[..., C, C]``,
+    unit diagonal) via forward substitution, batched over all chunks/heads.
 
-        (I + N)^-1 = (I - N) * prod_{k>=1} (I + N^(2^k))
-
-    which needs only ~log2(C) batched matmuls (vs a C-step forward
-    substitution). Fewer/shallower graph nodes — important so CUDA-graph
-    capture in the batched server path doesn't choke."""
-    # Numerically-stable forward substitution (the log-depth repeated-squaring
-    # Neumann inverse overflows when N has O(1) entries, which happens with
-    # correlated keys). Sequential in C but batched over all chunks/heads.
+    Sequential in C (small, fixed) but numerically stable. A log-depth
+    repeated-squaring (Neumann) inverse is faster but overflows when N has
+    O(1) entries — exactly the regime here, since correlated keys give KK
+    off-diagonals ~1."""
     X = mx.broadcast_to(mx.eye(C, dtype=mx.float32), Tmat.shape) + mx.zeros_like(Tmat)
     rows = [X[..., 0:1, :]]
     for i in range(1, C):
@@ -73,8 +68,8 @@ def gated_delta_chunked(q, k, v, g, beta, state, mask=None, C: int = 64):
     def rc(x, D):
         return x.reshape(B, nC, C, Hv, D).transpose(0, 3, 1, 2, 4).astype(mx.float32)
 
-    q, k, v = rc(q, Dk), rc(k, Dk), rc(v, Dv)               # [B,Hv,nC,C,D]
-    g = g.reshape(B, nC, C, Hv).transpose(0, 3, 1, 2)        # [B,Hv,nC,C]
+    q, k, v = rc(q, Dk), rc(k, Dk), rc(v, Dv)  # [B,Hv,nC,C,D]
+    g = g.reshape(B, nC, C, Hv).transpose(0, 3, 1, 2)  # [B,Hv,nC,C]
     beta = beta.reshape(B, nC, C, Hv).transpose(0, 3, 1, 2)
 
     # clip g off 0: compute_g can underflow to exactly 0.0 in fp32, and
@@ -93,24 +88,29 @@ def gated_delta_chunked(q, k, v, g, beta, state, mask=None, C: int = 64):
     Tinv = _invert_unit_lower(mx.eye(C, dtype=mx.float32) + A, C)
 
     kbeta = (beta * cumg)[..., :, None] * k
-    U0 = Tinv @ (beta[..., :, None] * v)                    # [B,Hv,nC,C,Dv]
-    Kt = Tinv @ kbeta                                       # [B,Hv,nC,C,Dk]
+    U0 = Tinv @ (beta[..., :, None] * v)  # [B,Hv,nC,C,Dv]
+    Kt = Tinv @ kbeta  # [B,Hv,nC,C,Dk]
     M = dr * (q @ mx.swapaxes(k, -1, -2)) * lower_incl
     Qeff = cumg[..., :, None] * q - M @ Kt
     MU0 = M @ U0
     cumg_last = cumg[..., -1]
-    ratio_last = mx.exp(lcg[..., -1, None] - lcg)           # cumg_last/cumg_i
+    ratio_last = mx.exp(lcg[..., -1, None] - lcg)  # cumg_last/cumg_i
 
-    S = state.astype(mx.float32) if state is not None else mx.zeros(
-        (B, Hv, Dv, Dk), mx.float32
+    S = (
+        state.astype(mx.float32)
+        if state is not None
+        else mx.zeros((B, Hv, Dv, Dk), mx.float32)
     )
     ys = []
     for c in range(nC):
-        St = mx.swapaxes(S, -1, -2)                         # [B,Hv,Dk,Dv]
-        ys.append(MU0[:, :, c] + Qeff[:, :, c] @ St)        # [B,Hv,C,Dv]
+        St = mx.swapaxes(S, -1, -2)  # [B,Hv,Dk,Dv]
+        ys.append(MU0[:, :, c] + Qeff[:, :, c] @ St)  # [B,Hv,C,Dv]
         Uc = U0[:, :, c] - Kt[:, :, c] @ St
         Uscaled = ratio_last[:, :, c][..., None] * Uc
-        S = cumg_last[:, :, c][..., None, None] * S + mx.swapaxes(Uscaled, -1, -2) @ k[:, :, c]
+        S = (
+            cumg_last[:, :, c][..., None, None] * S
+            + mx.swapaxes(Uscaled, -1, -2) @ k[:, :, c]
+        )
     Y = mx.stack(ys, axis=2).transpose(0, 2, 3, 1, 4).reshape(B, Tp, Hv, Dv)[:, :T]
     Y = Y.astype(in_dtype)
     # Schedule this (large, dynamically-shaped) prefill subgraph for evaluation
