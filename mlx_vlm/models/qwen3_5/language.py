@@ -145,12 +145,13 @@ _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
             }
         }
     """,
-)
+) if mx.metal.is_available() else None
 
 
 def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
     return (
-        target_verify
+        _TARGET_VERIFY_GEMV is not None
+        and target_verify
         and x.ndim == 3
         and x.shape[1] > 1
         and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
