@@ -22,11 +22,10 @@ from mlx_vlm.generate import (
     SpeculativeGenerationBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
-    normalize_rope_deltas,
 )
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
-from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.generate import normalize_resize_shape, normalize_rope_deltas
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
