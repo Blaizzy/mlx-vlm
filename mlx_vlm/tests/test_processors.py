@@ -2227,6 +2227,16 @@ class TestDotsVLPatch(unittest.TestCase):
         )
 
 
+class TestUnlimitedOCRPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "unlimited-ocr",
+            "mlx_vlm.models.unlimitedocr.processing_unlimitedocr",
+            "UnlimitedOCRProcessor",
+        )
+
+
 class TestDeepseekV4Processor(unittest.TestCase):
     class MockTokenizer:
         chat_template = None
