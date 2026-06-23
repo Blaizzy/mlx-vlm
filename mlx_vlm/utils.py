@@ -1888,7 +1888,7 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
         self.tokenizer = tokenizer
 

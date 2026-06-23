@@ -4190,6 +4190,60 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_moondream2(self):
+        from mlx_vlm.models import moondream2
+
+        text_config = moondream2.TextConfig(
+            model_type="moondream2",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            partial_rotary_factor=0.5,
+            rms_norm_eps=1e-5,
+        )
+
+        vision_config = moondream2.VisionConfig(
+            model_type="moondream2_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            patch_size=14,
+            crop_size=28,
+            in_channels=3,
+            proj_inner_dim=64,
+            proj_out_dim=64,
+            attention_bias=True,
+            layer_norm_eps=1e-5,
+        )
+
+        config = moondream2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="moondream2",
+        )
+        model = moondream2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            text_config.model_type,
+            text_config.vocab_size,
+            text_config.num_hidden_layers,
+        )
+
+        batch_size = 1
+        crop_size = vision_config.crop_size
+        pixel_values = mx.random.uniform(shape=(batch_size, crop_size, crop_size, 3))
+        features = model.vision.encoder(pixel_values)
+        grid_size = crop_size // vision_config.patch_size
+        num_patches = grid_size * grid_size
+        self.assertEqual(
+            features.shape, (batch_size, num_patches, vision_config.hidden_size)
+        )
+
     def test_moondream3(self):
         from mlx_vlm.models import moondream3
 
