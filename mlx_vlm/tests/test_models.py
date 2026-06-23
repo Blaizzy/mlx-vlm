@@ -2,6 +2,7 @@ import importlib
 import inspect
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -11,6 +12,26 @@ from mlx.utils import tree_map
 
 
 class TestModels(unittest.TestCase):
+    def test_mrope_embedding_wrappers_return_request_local_rope_deltas(self):
+        models_root = Path(__file__).resolve().parents[1] / "models"
+        wrapper_paths = [
+            models_root / "paddleocr_vl" / "paddleocr_vl.py",
+            models_root / "qwen2_vl" / "qwen2_vl.py",
+            models_root / "qwen2_5_vl" / "qwen2_5_vl.py",
+            models_root / "qwen3_vl" / "qwen3_vl.py",
+            models_root / "qwen3_vl_moe" / "qwen3_vl_moe.py",
+            models_root / "qwen3_5" / "qwen3_5.py",
+            models_root / "glm_ocr" / "glm_ocr.py",
+            models_root / "glm4v" / "glm4v.py",
+            models_root / "glm4v_moe" / "glm4v_moe.py",
+        ]
+
+        for path in wrapper_paths:
+            with self.subTest(path=path):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn("self.language_model._rope_deltas = rope_deltas", source)
+                self.assertIn("rope_deltas=rope_deltas", source)
+
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
         self.assertEqual(len(model.layers), num_layers)

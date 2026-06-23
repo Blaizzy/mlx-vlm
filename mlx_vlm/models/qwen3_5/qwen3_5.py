@@ -25,7 +25,6 @@ def sanitize_key(key):
 
 
 class Model(Qwen3VLModel):
-
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
         nn.Module.__init__(self)
@@ -82,6 +81,7 @@ class Model(Qwen3VLModel):
         )
 
         # Pre-calculate position_ids for chunked prefill
+        rope_deltas = None
         if image_grid_thw is not None or video_grid_thw is not None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, image_grid_thw, video_grid_thw, mask
@@ -91,6 +91,7 @@ class Model(Qwen3VLModel):
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod

@@ -7,6 +7,7 @@ from ..models import cache
 from .common import (
     _dflash_block_total,
     _format_speculative_stats,
+    _speculative_target_kwargs,
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
@@ -49,6 +50,7 @@ __all__ = [
     "_mtp_rounds_batch",
     "_mtp_shared_kv_from_prompt_cache",
     "_mtp_verify_target",
+    "_speculative_target_kwargs",
     "_speculative_walk",
     "_speculative_walk_batch",
     "_speculative_walk_batch_deferred_greedy",
@@ -133,8 +135,10 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    target_kwargs: Optional[dict] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
+    target_kwargs = _speculative_target_kwargs(target_kwargs)
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -152,6 +156,7 @@ def run_speculative_server_rounds(
                     draft_block_size=draft_block_size,
                     token_dtype=token_dtype,
                     greedy_sampling=greedy_sampling,
+                    target_kwargs=target_kwargs,
                 )
             )
             return
@@ -170,6 +175,7 @@ def run_speculative_server_rounds(
             stop_check=stop_check,
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
+            target_kwargs=target_kwargs,
         )
         return
 
@@ -189,6 +195,7 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            target_kwargs=target_kwargs,
         )
         return
 
@@ -204,6 +211,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            target_kwargs=target_kwargs,
         )
         return
 
@@ -226,8 +234,10 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
+    prompt_kwargs: Optional[dict] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
+    target_kwargs = _speculative_target_kwargs(prompt_kwargs)
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states
@@ -250,6 +260,7 @@ def run_speculative_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=input_ids.dtype,
                 greedy_sampling=sampler_is_greedy,
+                target_kwargs=target_kwargs,
             )
         else:
             mx.eval(first_token)
@@ -277,6 +288,7 @@ def run_speculative_rounds(
                 token_dtype=input_ids.dtype,
                 eos_token_ids=eos_set,
                 greedy_sampling=sampler_is_greedy,
+                target_kwargs=target_kwargs,
             )
         return
 
@@ -298,6 +310,7 @@ def run_speculative_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=input_ids.dtype,
                 greedy_sampling=sampler_is_greedy,
+                target_kwargs=target_kwargs,
             )
         else:
             mx.eval(first_token)
@@ -323,6 +336,7 @@ def run_speculative_rounds(
                 token_dtype=input_ids.dtype,
                 eos_token_ids=eos_set,
                 greedy_sampling=sampler_is_greedy,
+                target_kwargs=target_kwargs,
             )
         return
 
@@ -346,6 +360,7 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            target_kwargs=target_kwargs,
         )
     else:
         mx.eval(first_token)
@@ -361,4 +376,5 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            target_kwargs=target_kwargs,
         )

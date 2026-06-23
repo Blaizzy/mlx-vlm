@@ -1056,14 +1056,17 @@ def test_images_edits_writes_paths(client, monkeypatch, tmp_path):
 
 
 class _RecordingSpeculativeLM:
-    def __init__(self, draft_kind):
+    def __init__(self, draft_kind, post_prefill_rope_deltas=None):
         self.calls = []
         self.draft_kind = draft_kind
         self._position_ids = "stale"
         self._rope_deltas = "stale"
+        self.post_prefill_rope_deltas = post_prefill_rope_deltas
 
     def __call__(self, inputs, cache=None, **kwargs):
         self.calls.append({"inputs": inputs, "cache": cache, **kwargs})
+        if self.post_prefill_rope_deltas is not None:
+            self._rope_deltas = self.post_prefill_rope_deltas
         batch_size, seq_len = inputs.shape
         logits = mx.broadcast_to(
             mx.array([[[0.0, 1.0, 0.0, 0.0, 0.0]]], dtype=mx.float32),
@@ -1083,8 +1086,10 @@ class _RecordingSpeculativeLM:
         )
 
 
-def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
-    lm = _RecordingSpeculativeLM(draft_kind)
+def _run_speculative_prefill_once(
+    monkeypatch, *, draft_kind, request_specs, post_prefill_rope_deltas=None
+):
+    lm = _RecordingSpeculativeLM(draft_kind, post_prefill_rope_deltas)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
     gen.processor = SimpleNamespace()
@@ -1244,6 +1249,84 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
     assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
     assert "_apc_image_hash" not in call
     assert "_apc_tenant" not in call
+
+
+def test_speculative_server_threads_rope_deltas_to_decode_rounds(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="dflash",
+        request_specs=[
+            {
+                "input_ids": mx.array([[31, 32, 33]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                    "rope_deltas": mx.array([[5]], dtype=mx.int32),
+                },
+            },
+            {
+                "input_ids": mx.array([[41, 42]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 9.0, dtype=mx.float32),
+                    "rope_deltas": mx.array([[7]], dtype=mx.int32),
+                },
+            },
+        ],
+    )
+
+    target_kwargs = call["round_kwargs"]["target_kwargs"]
+    assert target_kwargs["rope_deltas"].tolist() == [[5], [7]]
+
+
+def test_speculative_server_pads_missing_rope_deltas_rows(monkeypatch):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="dflash",
+        request_specs=[
+            {
+                "input_ids": mx.array([[31, 32, 33]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                    "rope_deltas": mx.array([[5]], dtype=mx.int32),
+                },
+            },
+            {
+                "input_ids": mx.array([[41, 42]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 9.0, dtype=mx.float32),
+                },
+            },
+        ],
+    )
+
+    target_kwargs = call["round_kwargs"]["target_kwargs"]
+    assert target_kwargs["rope_deltas"].tolist() == [[5], [0]]
+
+
+def test_speculative_server_uses_post_prefill_rope_deltas_for_decode_rounds(
+    monkeypatch,
+):
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="dflash",
+        post_prefill_rope_deltas=mx.array([[11], [13]], dtype=mx.int32),
+        request_specs=[
+            {
+                "input_ids": mx.array([[31, 32, 33]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
+                },
+            },
+            {
+                "input_ids": mx.array([[41, 42]], dtype=mx.int32),
+                "gen_kwargs": {
+                    "inputs_embeds": mx.full((1, 2, 4), 9.0, dtype=mx.float32),
+                },
+            },
+        ],
+    )
+
+    target_kwargs = call["round_kwargs"]["target_kwargs"]
+    assert target_kwargs["rope_deltas"].tolist() == [[11], [13]]
 
 
 def test_responses_endpoint_forwards_new_sampling_args(client):

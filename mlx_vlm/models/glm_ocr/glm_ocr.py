@@ -70,6 +70,7 @@ class Model(nn.Module):
         )
 
         # Pre-calculate position_ids for chunked prefill (like Qwen3-VL)
+        rope_deltas = None
         if image_grid_thw is not None or video_grid_thw is not None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, image_grid_thw, video_grid_thw, mask
@@ -77,7 +78,10 @@ class Model(nn.Module):
             self.language_model._position_ids = position_ids
             self.language_model._rope_deltas = rope_deltas
 
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds,
+            rope_deltas=rope_deltas,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(

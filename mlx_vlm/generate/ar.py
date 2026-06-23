@@ -36,6 +36,7 @@ from .common import (
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
+    normalize_rope_deltas,
     wired_limit,
 )
 
@@ -382,6 +383,7 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        prompt_kwargs_for_speculative_decode = dict(kwargs)
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
@@ -449,6 +451,22 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
+    decode_prompt_kwargs = prompt_kwargs_for_speculative_decode
+    if draft_model is not None:
+        decode_prompt_kwargs = dict(prompt_kwargs_for_speculative_decode)
+        rope_deltas = decode_prompt_kwargs.get("rope_deltas")
+        broadcast_singleton = False
+        if rope_deltas is None:
+            language_model = getattr(model, "language_model", model)
+            rope_deltas = getattr(language_model, "_rope_deltas", None)
+            broadcast_singleton = rope_deltas is not None
+        if rope_deltas is not None:
+            decode_prompt_kwargs["rope_deltas"] = normalize_rope_deltas(
+                rope_deltas,
+                input_ids.shape[0],
+                broadcast_singleton=broadcast_singleton,
+            )
+
     mx.async_eval(y, logprobs)
 
     # Speculative decoding
@@ -466,6 +484,7 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            prompt_kwargs=decode_prompt_kwargs,
         )
         return
 
@@ -600,6 +619,31 @@ def _pad_sequence_aligned_prompt_kwarg(
     return mx.concatenate(parts, axis=1)
 
 
+def _add_per_row_prompt_kwarg(
+    per_row_keys: dict, key: str, row_v: mx.array, row_idx: int, batch_size: int
+) -> None:
+    if key == "rope_deltas":
+        rows = per_row_keys.setdefault(key, [None] * batch_size)
+        rows[row_idx] = row_v
+    else:
+        per_row_keys.setdefault(key, []).append(row_v)
+
+
+def _merge_per_row_prompt_kwargs(per_row_keys: dict) -> dict:
+    merged = {}
+    for key, values in per_row_keys.items():
+        if key == "rope_deltas":
+            template = next((v for v in values if v is not None), None)
+            if template is None:
+                continue
+            values = [
+                v if v is not None else mx.zeros(template.shape, dtype=template.dtype)
+                for v in values
+            ]
+        merged[key] = mx.concatenate(values, axis=0)
+    return merged
+
+
 def _merge_prefill_prompt_kwargs(
     prompt_kwargs_list: List[Optional[dict]],
     input_ids: List[List[int]],
@@ -641,11 +685,10 @@ def _merge_prefill_prompt_kwargs(
                     row_v = _pad_sequence_aligned_prompt_kwarg(
                         row_v, max_length, left=True
                     )
-                per_row_keys.setdefault(k, []).append(row_v)
-            elif k not in merged_kwargs:
+                _add_per_row_prompt_kwarg(per_row_keys, k, row_v, i, batch_size)
+            elif k not in merged_kwargs and k not in per_row_keys:
                 merged_kwargs[k] = v
-    for k, vs in per_row_keys.items():
-        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+    merged_kwargs.update(_merge_per_row_prompt_kwargs(per_row_keys))
 
     return inputs_embeds, merged_kwargs
 
@@ -1280,6 +1323,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        target_kwargs: Optional[dict] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1297,6 +1341,7 @@ class SpeculativeGenerationBatch:
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
         self.greedy_sampling = greedy_sampling
+        self.target_kwargs = dict(target_kwargs or {})
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
@@ -1383,6 +1428,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            target_kwargs=self.target_kwargs,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1851,6 +1897,21 @@ class PromptProcessingBatch:
                     self._suffix_lens,
                 )
 
+        prompt_rope_deltas = self._prompt_kwargs.get("rope_deltas")
+        if prompt_rope_deltas is not None:
+            rope_deltas = self._normalize_rope_deltas(
+                prompt_rope_deltas, first_tokens.shape[0]
+            )
+        else:
+            language_model = getattr(self.model, "language_model", self.model)
+            rope_deltas = self._capture_rope_deltas(
+                language_model, first_tokens.shape[0]
+            )
+
+        target_kwargs = {}
+        if rope_deltas is not None:
+            target_kwargs["rope_deltas"] = rope_deltas
+
         if self.draft_model is not None and self.draft_kind is not None:
             gen_batch = SpeculativeGenerationBatch(
                 model=self.model,
@@ -1870,6 +1931,7 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                target_kwargs=target_kwargs,
             )
             compute_logprobs = False
         else:
@@ -1903,39 +1965,7 @@ class PromptProcessingBatch:
             gen_batch._next_top_idx = top_idx
             gen_batch._next_top_lp = top_lp
 
-        language_model = getattr(self.model, "language_model", self.model)
-        rope_deltas = self._capture_rope_deltas(language_model, len(gen_batch.uids))
         if rope_deltas is not None:
-            # Normalize to shape (B, 1) so extend/filter stay consistent.
-            if rope_deltas.ndim == 0:
-                rope_deltas = rope_deltas.reshape(1, 1)
-            elif rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas[:, None]
-            # When a warm-start batch reuses the model's cached _rope_deltas
-            # (computed during a previous prefill with a smaller batch), the
-            # batch dim won't match this prompt batch's row count. Realign
-            # so extend()/filter() down the line stay consistent with the
-            # generation batch's row count.
-            target_b = first_tokens.shape[0]
-            if rope_deltas.shape[0] != target_b:
-                if rope_deltas.shape[0] == 1:
-                    rope_deltas = mx.broadcast_to(
-                        rope_deltas, (target_b, rope_deltas.shape[1])
-                    )
-                elif rope_deltas.shape[0] < target_b:
-                    pad = target_b - rope_deltas.shape[0]
-                    rope_deltas = mx.concatenate(
-                        [
-                            rope_deltas,
-                            mx.broadcast_to(
-                                rope_deltas[-1:],
-                                (pad, rope_deltas.shape[1]),
-                            ),
-                        ],
-                        axis=0,
-                    )
-                else:
-                    rope_deltas = rope_deltas[:target_b]
             gen_batch._rope_deltas = rope_deltas
 
         # Final prefill produces the first generated token and mutates the
@@ -2010,32 +2040,20 @@ class PromptProcessingBatch:
         return self._total_prompt_tokens
 
     @staticmethod
+    def _normalize_rope_deltas(
+        rope_deltas, B: int, *, broadcast_singleton: bool = False
+    ):
+        return normalize_rope_deltas(
+            rope_deltas, B, broadcast_singleton=broadcast_singleton
+        )
+
+    @staticmethod
     def _capture_rope_deltas(language_model, B: int):
         if not hasattr(language_model, "_rope_deltas"):
             return None
-        rope_deltas = language_model._rope_deltas
-        if rope_deltas is None:
-            return mx.zeros((B, 1), dtype=mx.int32)
-        if rope_deltas.ndim == 0:
-            rope_deltas = rope_deltas.reshape(1, 1)
-        elif rope_deltas.ndim == 1:
-            rope_deltas = rope_deltas[:, None]
-        # Falcon OCR emits a singleton meant to broadcast across rows.
-        if rope_deltas.shape[0] == 1 and B > 1:
-            rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
-        if rope_deltas.shape[0] != B:
-            if rope_deltas.shape[0] > B:
-                rope_deltas = rope_deltas[:B]
-            else:
-                pad = B - rope_deltas.shape[0]
-                rope_deltas = mx.concatenate(
-                    [
-                        rope_deltas,
-                        mx.broadcast_to(rope_deltas[-1:], (pad, rope_deltas.shape[1])),
-                    ],
-                    axis=0,
-                )
-        return rope_deltas
+        return PromptProcessingBatch._normalize_rope_deltas(
+            language_model._rope_deltas, B, broadcast_singleton=True
+        )
 
 
 class BatchGenerator:
@@ -2365,11 +2383,10 @@ class BatchGenerator:
                             max_suffix_len,
                             left=False,
                         )
-                    per_row_keys.setdefault(k, []).append(row_v)
-                elif k not in merged_kwargs:
+                    _add_per_row_prompt_kwarg(per_row_keys, k, row_v, i, batch_size)
+                elif k not in merged_kwargs and k not in per_row_keys:
                     merged_kwargs[k] = v
-        for k, vs in per_row_keys.items():
-            merged_kwargs[k] = mx.concatenate(vs, axis=0)
+        merged_kwargs.update(_merge_per_row_prompt_kwargs(per_row_keys))
 
         apc_mode = getattr(self, "apc_mode", "block")
         if apc_mode == "exact":
@@ -3048,7 +3065,10 @@ def _generate_batch(
         input_ids, pixel_values, mask=mask, **data_kwargs
     )
 
-    gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
+    gen_kwargs = {
+        **data_kwargs,
+        **embedding_output.to_dict(),
+    }
 
     if kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE) is not None:
         policy_kwargs = dict(gen_kwargs)

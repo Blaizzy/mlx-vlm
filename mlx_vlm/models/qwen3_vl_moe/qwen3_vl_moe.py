@@ -90,6 +90,7 @@ class Model(nn.Module):
         mx.eval(deepstack_visual_embeds)
 
         # Pre-calculate position_ids for chunked prefill
+        rope_deltas = None
         if image_grid_thw is not None or video_grid_thw is not None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, image_grid_thw, video_grid_thw, mask
@@ -101,6 +102,7 @@ class Model(nn.Module):
             inputs_embeds=inputs_embeds,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod

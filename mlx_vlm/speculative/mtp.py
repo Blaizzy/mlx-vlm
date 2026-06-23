@@ -6,6 +6,7 @@ import mlx.nn as nn
 
 from ..models import cache
 from .common import (
+    _active_target_kwargs,
     _batch_cache_left_padding,
     _dflash_block_total,
     _record_speculative_round,
@@ -140,8 +141,10 @@ def _mtp_verify_target(
     sampler: Callable[[mx.array], mx.array],
     *,
     sample_target_tokens: bool = True,
+    target_kwargs: Optional[dict] = None,
 ) -> _MTPVerifyResult:
-    if sample_target_tokens:
+    target_kwargs = target_kwargs or {}
+    if sample_target_tokens and not target_kwargs:
         argmax_from_hidden = getattr(lm, "speculative_argmax_from_hidden", None)
         if callable(argmax_from_hidden):
             result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
@@ -155,7 +158,7 @@ def _mtp_verify_target(
         if result is not None:
             return result
 
-    if hasattr(lm, "speculative_logits_from_hidden"):
+    if not target_kwargs and hasattr(lm, "speculative_logits_from_hidden"):
         result = _mtp_verify_without_logits(lm, verify_input, prompt_cache)
         if result is not None:
             return result
@@ -165,6 +168,7 @@ def _mtp_verify_target(
         cache=prompt_cache,
         return_hidden=True,
         return_shared_kv=True,
+        **target_kwargs,
     )
     return _MTPVerifyResult(
         hidden=verify_out.hidden_states[-1],
@@ -363,7 +367,7 @@ def _speculative_walk_batch_deferred_uniform(
 
 
 def _sampler_supports_positioned_target(
-    sampler: Callable[[mx.array], mx.array]
+    sampler: Callable[[mx.array], mx.array],
 ) -> bool:
     return callable(getattr(sampler, "sample_target", None))
 
@@ -534,6 +538,7 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    target_kwargs: Optional[dict] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
 
@@ -626,6 +631,7 @@ def _mtp_rounds(
                 prompt_cache,
                 sampler,
                 sample_target_tokens=greedy_sampling,
+                target_kwargs=target_kwargs,
             )
         accepted, new_tokens = _mtp_acceptance_walk(
             lm,
@@ -826,6 +832,7 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    target_kwargs: Optional[dict] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -916,12 +923,14 @@ def _mtp_rounds_batch(
         # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+            active_target_kwargs = _active_target_kwargs(target_kwargs, active_idx)
             verify = _mtp_verify_target(
                 lm,
                 verify_input,
                 prompt_cache,
                 sampler,
                 sample_target_tokens=greedy_sampling,
+                target_kwargs=active_target_kwargs,
             )
             hidden_full = verify.hidden  # [B_active, bs, H]
 

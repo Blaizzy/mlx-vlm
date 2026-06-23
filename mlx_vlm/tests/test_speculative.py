@@ -30,7 +30,11 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
-from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
+from mlx_vlm.speculative.common import (
+    _active_target_kwargs,
+    _speculative_target_kwargs,
+    _SpeculativeSamplerRNG,
+)
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -1422,6 +1426,51 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     assert fake_head.calls == 1
 
 
+def test_speculative_target_kwargs_whitelists_decode_safe_prompt_kwargs():
+    rope_deltas = mx.array([[5], [7]], dtype=mx.int32)
+
+    target_kwargs = _speculative_target_kwargs(
+        {
+            "rope_deltas": rope_deltas,
+            "inputs_embeds": mx.zeros((2, 3, 4), dtype=mx.float32),
+            "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
+        }
+    )
+
+    assert target_kwargs == {"rope_deltas": rope_deltas}
+    assert _speculative_target_kwargs({"rope_deltas": None}) == {}
+    assert _speculative_target_kwargs(None) == {}
+    assert (
+        _speculative_target_kwargs({"rope_deltas": mx.zeros((3, 1), dtype=mx.int32)})
+        == {}
+    )
+    same_deltas = mx.array([[5], [5], [5]], dtype=mx.int32)
+    assert _speculative_target_kwargs({"rope_deltas": same_deltas}) == {
+        "rope_deltas": same_deltas
+    }
+    singleton_delta = mx.array([[5]], dtype=mx.int32)
+    assert _speculative_target_kwargs({"rope_deltas": singleton_delta}) == {
+        "rope_deltas": singleton_delta
+    }
+
+
+def test_active_target_kwargs_slices_original_batch_rows():
+    rope_deltas = mx.array([[5], [7], [9]], dtype=mx.int32)
+
+    target_kwargs = _active_target_kwargs(
+        {"rope_deltas": rope_deltas, "marker": "keep"},
+        [0, 2],
+    )
+
+    assert target_kwargs["rope_deltas"].tolist() == [[5], [9]]
+    assert target_kwargs["marker"] == "keep"
+
+    active_sized = mx.array([[7], [9]], dtype=mx.int32)
+    target_kwargs = _active_target_kwargs({"rope_deltas": active_sized}, [1, 2])
+
+    assert target_kwargs["rope_deltas"] is active_sized
+
+
 def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     calls = []
 
@@ -1449,6 +1498,10 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
             token_dtype=mx.int32,
             greedy_sampling=False,
             row_ids=[0],
+            target_kwargs={
+                "rope_deltas": mx.array([[6]], dtype=mx.int32),
+                "inputs_embeds": mx.zeros((1, 2, 4), dtype=mx.float32),
+            },
         )
     )
 
@@ -1456,6 +1509,45 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert calls
     assert calls[0][2]["first_bonus"].tolist() == [2]
     assert calls[0][2]["row_ids"] == [0]
+    assert calls[0][2]["target_kwargs"]["rope_deltas"].tolist() == [[6]]
+    assert "inputs_embeds" not in calls[0][2]["target_kwargs"]
+
+
+def test_run_speculative_rounds_threads_target_kwargs(monkeypatch):
+    calls = []
+
+    def fake_batch(*args, **kwargs):
+        del args
+        calls.append(kwargs)
+        yield [4, 5], None
+
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds_batch", fake_batch)
+
+    result = list(
+        speculative_utils.run_speculative_rounds(
+            SimpleNamespace(config=SimpleNamespace()),
+            SimpleNamespace(),
+            prompt_cache=[],
+            input_ids=mx.array([[11, 12], [21, 22]], dtype=mx.int32),
+            first_token=mx.array([[2], [3]], dtype=mx.int32),
+            logprobs=mx.zeros((2, 4), dtype=mx.float32),
+            last_outputs=SimpleNamespace(
+                hidden_states=[mx.zeros((2, 2, 3), dtype=mx.float32)]
+            ),
+            draft_kind="dflash",
+            max_tokens=4,
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            prompt_kwargs={
+                "rope_deltas": mx.array([[5], [7]], dtype=mx.int32),
+                "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
+            },
+        )
+    )
+
+    assert result[0][0] == [2, 3]
+    assert result[1] == ([4, 5], None)
+    assert calls[0]["target_kwargs"]["rope_deltas"].tolist() == [[5], [7]]
+    assert "image_grid_thw" not in calls[0]["target_kwargs"]
 
 
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
@@ -1572,6 +1664,54 @@ def test_mtp_verify_target_prefers_argmax_hidden_hook_for_greedy_tokens():
     assert result.shared_kv_states == {"full": ("k", "v")}
     assert result.gdn_states == ["gdn"]
     assert result.target_tokens is target_tokens
+
+
+def test_mtp_verify_target_with_target_kwargs_uses_standard_forward():
+    verify_input = mx.array([[7, 8]], dtype=mx.int32)
+    calls = []
+
+    class LM:
+        def speculative_verify_logits(self, *args):
+            raise AssertionError("fast logits hook must not run with target kwargs")
+
+        def speculative_verify_hidden(self, *args):
+            raise AssertionError("hidden-only hook must not run with target kwargs")
+
+        def speculative_argmax_from_hidden(self, *args):
+            raise AssertionError("argmax hidden hook must not run with target kwargs")
+
+        def __call__(self, inputs, cache, return_hidden, return_shared_kv, **kwargs):
+            calls.append(
+                {
+                    "inputs": inputs,
+                    "cache": cache,
+                    "return_hidden": return_hidden,
+                    "return_shared_kv": return_shared_kv,
+                    "kwargs": kwargs,
+                }
+            )
+            return SimpleNamespace(
+                hidden_states=[mx.ones((1, 2, 3), dtype=mx.float32)],
+                shared_kv_states={"full": ("k", "v")},
+                logits=mx.zeros((1, 2, 5), dtype=mx.float32),
+                gdn_states=["gdn"],
+            )
+
+    result = _mtp_verify_target(
+        LM(),
+        verify_input,
+        prompt_cache=["cache"],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        target_kwargs={"rope_deltas": mx.array([[5]], dtype=mx.int32)},
+    )
+
+    assert calls[0]["inputs"] is verify_input
+    assert calls[0]["cache"] == ["cache"]
+    assert calls[0]["return_hidden"] is True
+    assert calls[0]["return_shared_kv"] is True
+    assert calls[0]["kwargs"]["rope_deltas"].tolist() == [[5]]
+    assert result.shared_kv_states == {"full": ("k", "v")}
+    assert result.target_tokens.tolist() == [[0, 0]]
 
 
 def test_mtp_rounds_rolls_back_gemma_without_gdn_states():

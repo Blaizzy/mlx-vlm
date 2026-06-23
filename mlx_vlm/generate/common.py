@@ -20,6 +20,40 @@ DEFAULT_QUANTIZED_KV_START = 5000
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def normalize_rope_deltas(rope_deltas, B: int, *, broadcast_singleton: bool = False):
+    if rope_deltas is None:
+        return mx.zeros((B, 1), dtype=mx.int32)
+    if rope_deltas.ndim == 0:
+        rope_deltas = rope_deltas.reshape(1, 1)
+    elif rope_deltas.ndim == 1:
+        rope_deltas = rope_deltas[:, None]
+
+    # Falcon OCR's mutable model state emits a singleton meant to broadcast
+    # across rows. Prompt-kwarg merges must not use this fallback, because a
+    # singleton there can mean only one row provided rope_deltas.
+    if broadcast_singleton and rope_deltas.shape[0] == 1 and B > 1:
+        rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
+    if rope_deltas.shape[0] != B:
+        if rope_deltas.shape[0] > B:
+            rope_deltas = rope_deltas[:B]
+        else:
+            pad = B - rope_deltas.shape[0]
+            pad_shape = (pad,) + tuple(rope_deltas.shape[1:])
+            pad_values = (
+                mx.broadcast_to(rope_deltas[-1:], pad_shape)
+                if broadcast_singleton
+                else mx.zeros(pad_shape, dtype=rope_deltas.dtype)
+            )
+            rope_deltas = mx.concatenate(
+                [
+                    rope_deltas,
+                    pad_values,
+                ],
+                axis=0,
+            )
+    return rope_deltas
+
+
 def _policy_enabled(policy) -> bool:
     return bool(getattr(policy, "enabled", policy))
 

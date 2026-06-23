@@ -22,6 +22,7 @@ from mlx_vlm.generate import (
     SpeculativeGenerationBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
+    normalize_rope_deltas,
 )
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
@@ -430,6 +431,131 @@ class TestGenerationBatch:
             [7],
         ]
         assert self._capture(mx.array([[5], [7], [9]], dtype=mx.int32), 2).tolist() == [
+            [5],
+            [7],
+        ]
+
+    def test_normalize_rope_deltas_only_broadcasts_when_requested(self):
+        deltas = mx.array([[5]], dtype=mx.int32)
+
+        assert normalize_rope_deltas(deltas, 3).tolist() == [[5], [0], [0]]
+        assert normalize_rope_deltas(deltas, 3, broadcast_singleton=True).tolist() == [
+            [5],
+            [5],
+            [5],
+        ]
+
+    def test_prompt_batch_uses_prompt_kwargs_rope_deltas(self):
+        class FakeModel:
+            def __init__(self):
+                self.language_model = SimpleNamespace(
+                    _rope_deltas=mx.array([[99]], dtype=mx.int32)
+                )
+                self.calls = []
+
+            def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+                del cache, inputs_embeds
+                self.calls.append(kwargs)
+                batch_size, seq_len = input_ids.shape
+                return SimpleNamespace(logits=mx.zeros((batch_size, seq_len, 8)))
+
+        model = FakeModel()
+        prompt_rope_deltas = mx.array([[5], [7], [9]], dtype=mx.int32)
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[0, 1, 2],
+            input_ids=[[1, 2], [3, 4], [5, 6]],
+            max_tokens=[1, 1, 1],
+            inputs_embeds=mx.zeros((3, 2, 4)),
+            prompt_kwargs={"rope_deltas": prompt_rope_deltas},
+            prefill_step_size=None,
+            warm_cache=[],
+        )
+
+        gen_batch = batch.generate(
+            lambda logprobs: mx.argmax(logprobs, axis=-1),
+            lambda tok: False,
+        )
+
+        assert model.calls[-1]["rope_deltas"].tolist() == [[5], [7], [9]]
+        assert gen_batch._rope_deltas.tolist() == [[5], [7], [9]]
+
+    def test_prompt_batch_captures_post_prefill_rope_deltas(self):
+        class FakeModel:
+            def __init__(self):
+                self.language_model = SimpleNamespace(
+                    _rope_deltas=mx.array([[99]], dtype=mx.int32)
+                )
+
+            def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+                del cache, inputs_embeds, kwargs
+                self.language_model._rope_deltas = mx.array([[5], [7]], dtype=mx.int32)
+                batch_size, seq_len = input_ids.shape
+                return SimpleNamespace(logits=mx.zeros((batch_size, seq_len, 8)))
+
+        batch = PromptProcessingBatch(
+            model=FakeModel(),
+            uids=[0, 1],
+            input_ids=[[1, 2], [3, 4]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.zeros((2, 2, 4)),
+            prompt_kwargs={"rope_deltas": None},
+            prefill_step_size=None,
+            warm_cache=[],
+        )
+
+        gen_batch = batch.generate(
+            lambda logprobs: mx.argmax(logprobs, axis=-1),
+            lambda tok: False,
+        )
+
+        assert gen_batch._rope_deltas.tolist() == [[5], [7]]
+
+    def test_speculative_prompt_batch_threads_rope_deltas_to_rounds(self, monkeypatch):
+        class FakeModel:
+            def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+                del cache, inputs_embeds, kwargs
+                batch_size, seq_len = input_ids.shape
+                return SimpleNamespace(
+                    logits=mx.zeros((batch_size, seq_len, 8), dtype=mx.float32),
+                    hidden_states=[
+                        mx.zeros((batch_size, seq_len, 4), dtype=mx.float32)
+                    ],
+                    gdn_states=None,
+                )
+
+        captured = {}
+
+        def fake_rounds(*args, **kwargs):
+            del args
+            captured["kwargs"] = kwargs
+            yield [4, 5], None
+
+        monkeypatch.setattr(ar_module, "run_speculative_server_rounds", fake_rounds)
+
+        batch = PromptProcessingBatch(
+            model=FakeModel(),
+            uids=[0, 1],
+            input_ids=[[1, 2], [3, 4]],
+            max_tokens=[2, 2],
+            inputs_embeds=mx.zeros((2, 2, 4), dtype=mx.float32),
+            prompt_kwargs={"rope_deltas": mx.array([[5], [7]], dtype=mx.int32)},
+            prefill_step_size=None,
+            warm_cache=[],
+            draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0])),
+            draft_kind="dflash",
+        )
+
+        gen_batch = batch.generate(
+            lambda logprobs: mx.argmax(logprobs, axis=-1),
+            lambda tok: False,
+        )
+
+        assert isinstance(gen_batch, SpeculativeGenerationBatch)
+        gen_batch.next()
+        gen_batch.next()
+
+        assert captured["kwargs"]["target_kwargs"]["rope_deltas"].tolist() == [
             [5],
             [7],
         ]
@@ -1610,7 +1736,9 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
 
     embedding_output = MagicMock()
     embedding_output.inputs_embeds = mx.zeros((1, 5, 4))
-    embedding_output.to_dict.return_value = {}
+    embedding_output.to_dict.return_value = {
+        "rope_deltas": mx.array([[5]], dtype=mx.int32)
+    }
     model.get_input_embeddings.return_value = embedding_output
 
     draft_model = SimpleNamespace(
@@ -1624,7 +1752,9 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
         patch.object(
             generate_module, "make_sampler", return_value=lambda _: mx.array([0])
         ),
-        patch.object(ar_module, "run_speculative_rounds", return_value=iter(())),
+        patch.object(
+            ar_module, "run_speculative_rounds", return_value=iter(())
+        ) as run_speculative_rounds,
     ):
         gen = generate_module.generate_step(
             input_ids=mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
@@ -1641,6 +1771,71 @@ def test_generate_step_chunks_prefill_when_model_policy_allows_speculation():
     assert model.language_model.call_args_list[0].kwargs["n_to_process"] == 2
     assert model.language_model.call_args_list[1].kwargs["n_to_process"] == 2
     model.chunked_prefill_policy.assert_called_once()
+    assert run_speculative_rounds.call_args.kwargs["prompt_kwargs"][
+        "rope_deltas"
+    ].tolist() == [[5]]
+
+
+def test_generate_step_speculative_uses_post_prefill_rope_deltas():
+    class FakeLanguageModel:
+        def __init__(self):
+            self._position_ids = None
+            self._rope_deltas = None
+
+        def __call__(self, inputs, cache=None, inputs_embeds=None, **kwargs):
+            del cache, inputs_embeds, kwargs
+            self._rope_deltas = mx.array([[5], [7]], dtype=mx.int32)
+            batch_size, seq_len = inputs.shape
+            return SimpleNamespace(
+                logits=mx.zeros((batch_size, seq_len, 4), dtype=mx.float32),
+                hidden_states=[mx.zeros((batch_size, seq_len, 3), dtype=mx.float32)],
+                shared_kv_states={},
+                cross_attention_states=None,
+                encoder_outputs=None,
+            )
+
+    class FakeModel:
+        def __init__(self):
+            self.language_model = FakeLanguageModel()
+            self.config = SimpleNamespace(eos_token_id=None)
+
+        def get_input_embeddings(self, input_ids, pixel_values=None, mask=None):
+            del pixel_values, mask
+            return SimpleNamespace(
+                inputs_embeds=mx.zeros((*input_ids.shape, 3), dtype=mx.float32),
+                to_dict=lambda: {},
+            )
+
+    draft_model = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[]))
+
+    with (
+        patch("mlx_vlm.speculative.drafters.validate_drafter_compatibility"),
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module,
+            "make_sampler",
+            return_value=lambda logits: mx.argmax(logits, axis=-1),
+        ),
+        patch.object(
+            ar_module, "run_speculative_rounds", return_value=iter(())
+        ) as run_speculative_rounds,
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1, 2, 3], [4, 5, 6]], dtype=mx.int32),
+            model=FakeModel(),
+            pixel_values=None,
+            mask=None,
+            max_tokens=2,
+            prefill_step_size=None,
+            draft_model=draft_model,
+            draft_kind="dflash",
+        )
+        list(gen)
+
+    assert run_speculative_rounds.call_args.kwargs["prompt_kwargs"][
+        "rope_deltas"
+    ].tolist() == [[5], [7]]
 
 
 def test_chunked_prefill_policy_defaults_conservative_for_speculation():
@@ -1976,6 +2171,44 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     assert "_apc_tenant" not in prompt_kwargs
     assert prompt_kwargs["per_layer_inputs"][0, :, 0, 0].tolist() == [0, 0, 1, 1]
     assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
+
+
+def test_merge_prefill_prompt_kwargs_pads_missing_rope_deltas_rows():
+    input_ids = [[1, 2], [3, 4], [5, 6]]
+    prompt_kwargs = [
+        {
+            "inputs_embeds": mx.ones((1, 2, 3), dtype=mx.float32),
+            "rope_deltas": mx.array([[5]], dtype=mx.int32),
+        },
+        {
+            "inputs_embeds": mx.ones((1, 2, 3), dtype=mx.float32),
+        },
+        {
+            "inputs_embeds": mx.ones((1, 2, 3), dtype=mx.float32),
+            "rope_deltas": mx.array([[9]], dtype=mx.int32),
+        },
+    ]
+
+    _, merged = ar_module._merge_prefill_prompt_kwargs(prompt_kwargs, input_ids)
+
+    assert merged["rope_deltas"].tolist() == [[5], [0], [9]]
+
+
+def test_merge_prefill_prompt_kwargs_keeps_late_rope_delta_row_position():
+    input_ids = [[1, 2], [3, 4]]
+    prompt_kwargs = [
+        {
+            "inputs_embeds": mx.ones((1, 2, 3), dtype=mx.float32),
+        },
+        {
+            "inputs_embeds": mx.ones((1, 2, 3), dtype=mx.float32),
+            "rope_deltas": mx.array([[7]], dtype=mx.int32),
+        },
+    ]
+
+    _, merged = ar_module._merge_prefill_prompt_kwargs(prompt_kwargs, input_ids)
+
+    assert merged["rope_deltas"].tolist() == [[0], [7]]
 
 
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():

@@ -4,6 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .common import (
+    _active_target_kwargs,
     _batch_cache_left_padding,
     _record_speculative_round,
     _SpeculativeSamplerRNG,
@@ -164,12 +165,15 @@ def _eagle3_verify_target(
     prompt_cache: List[Any],
     sampler: Callable[[mx.array], mx.array],
     target_layer_ids: List[int],
+    target_kwargs: Optional[dict] = None,
 ):
+    target_kwargs = target_kwargs or {}
     if verify_input.shape[1] > 1 and "gemma4" in type(lm).__module__:
         first_out = lm(
             verify_input[:, :1],
             cache=prompt_cache,
             capture_layer_ids=target_layer_ids,
+            **target_kwargs,
         )
         hidden_chunks = [mx.concatenate(first_out.hidden_states, axis=-1)]
         target_chunks = [sampler(first_out.logits)]
@@ -180,6 +184,7 @@ def _eagle3_verify_target(
                 verify_input[:, 1:],
                 cache=prompt_cache,
                 capture_layer_ids=target_layer_ids,
+                **target_kwargs,
             )
             hidden_chunks.append(mx.concatenate(tail_out.hidden_states, axis=-1))
             target_chunks.append(sampler(tail_out.logits))
@@ -194,6 +199,7 @@ def _eagle3_verify_target(
         verify_input,
         cache=prompt_cache,
         capture_layer_ids=target_layer_ids,
+        **target_kwargs,
     )
     hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
     target_tokens = sampler(verify_out.logits)
@@ -354,6 +360,7 @@ def _eagle3_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    target_kwargs: Optional[dict] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -417,15 +424,18 @@ def _eagle3_rounds(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
-            hot_verify = _eagle3_verify_target_hot(
-                lm,
-                draft_model,
-                verify_input,
-                prompt_cache,
-                sampler,
-                target_layer_ids,
-                _eagle3_eos_token_ids(model),
-            )
+            active_target_kwargs = target_kwargs or {}
+            hot_verify = None
+            if not active_target_kwargs:
+                hot_verify = _eagle3_verify_target_hot(
+                    lm,
+                    draft_model,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    target_layer_ids,
+                    _eagle3_eos_token_ids(model),
+                )
             if hot_verify is None:
                 verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
                     lm,
@@ -433,6 +443,7 @@ def _eagle3_rounds(
                     prompt_cache,
                     sampler,
                     target_layer_ids,
+                    target_kwargs=active_target_kwargs,
                 )
             else:
                 verify_hidden, target_tokens, gdn_states = hot_verify
@@ -490,6 +501,7 @@ def _eagle3_rounds_batch(
     stop_check: Optional[Callable[[int, int], bool]] = None,
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
+    target_kwargs: Optional[dict] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -579,15 +591,18 @@ def _eagle3_rounds_batch(
 
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            hot_verify = _eagle3_verify_target_hot(
-                lm,
-                draft_model,
-                verify_input,
-                prompt_cache,
-                sampler,
-                target_layer_ids,
-                _eagle3_eos_token_ids(model),
-            )
+            active_target_kwargs = _active_target_kwargs(target_kwargs, active_idx)
+            hot_verify = None
+            if not active_target_kwargs:
+                hot_verify = _eagle3_verify_target_hot(
+                    lm,
+                    draft_model,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    target_layer_ids,
+                    _eagle3_eos_token_ids(model),
+                )
             if hot_verify is None:
                 verify_hidden, target_tokens, gdn_states = _eagle3_verify_target(
                     lm,
@@ -595,6 +610,7 @@ def _eagle3_rounds_batch(
                     prompt_cache,
                     sampler,
                     target_layer_ids,
+                    target_kwargs=active_target_kwargs,
                 )
             else:
                 verify_hidden, target_tokens, gdn_states = hot_verify

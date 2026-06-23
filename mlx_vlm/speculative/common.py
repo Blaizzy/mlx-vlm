@@ -217,6 +217,38 @@ def _record_speculative_round(
         draft_model.draft_lens.append(int(draft_count))
 
 
+def _speculative_target_kwargs(prompt_kwargs: Optional[dict]) -> dict:
+    if not prompt_kwargs:
+        return {}
+
+    rope_deltas = prompt_kwargs.get("rope_deltas")
+    if rope_deltas is None:
+        return {}
+    if isinstance(rope_deltas, mx.array):
+        if bool(mx.all(rope_deltas == 0).item()):
+            return {}
+    return {"rope_deltas": rope_deltas}
+
+
+def _active_target_kwargs(target_kwargs: Optional[dict], active_idx: List[int]) -> dict:
+    if not target_kwargs or not active_idx:
+        return {}
+
+    max_active_idx = max(active_idx)
+    idx = mx.array(active_idx, dtype=mx.int32)
+    out = {}
+    for key, value in target_kwargs.items():
+        if isinstance(value, mx.array) and value.ndim > 0:
+            if value.shape[0] > max_active_idx:
+                out[key] = value[idx]
+                continue
+            if value.shape[0] == len(active_idx):
+                out[key] = value
+                continue
+        out[key] = value
+    return out
+
+
 def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int]) -> int:
     if draft_block_size is not None:
         return int(draft_block_size)

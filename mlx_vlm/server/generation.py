@@ -31,6 +31,7 @@ from ..generate import (
     _chunked_prefill_enabled,
     _make_cache,
     _merge_prefill_prompt_kwargs,
+    normalize_rope_deltas,
 )
 from ..generate.common import generation_stream, wired_limit
 from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
@@ -1149,7 +1150,10 @@ class ResponseGenerator:
         # Remove cache kwargs before passing to BatchGenerator
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
-        gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        gen_kwargs = {
+            **data_kwargs,
+            **embed.to_dict(),
+        }
         if images is not None:
             gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
         elif pixel_values is not None:
@@ -1659,6 +1663,16 @@ class ResponseGenerator:
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
                 )
+                decode_target_kwargs = {}
+                rope_deltas = prompt_kwargs.get("rope_deltas")
+                broadcast_singleton = False
+                if rope_deltas is None:
+                    rope_deltas = getattr(lm, "_rope_deltas", None)
+                    broadcast_singleton = rope_deltas is not None
+                if rope_deltas is not None:
+                    decode_target_kwargs["rope_deltas"] = normalize_rope_deltas(
+                        rope_deltas, B, broadcast_singleton=broadcast_singleton
+                    )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B
@@ -1739,6 +1753,7 @@ class ResponseGenerator:
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
+                    target_kwargs=decode_target_kwargs,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
