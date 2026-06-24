@@ -1968,7 +1968,7 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
     ]
 
     assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
-    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
     assert "<|channel>" not in response.text
     assert "<channel|>" not in response.text
 
@@ -2028,10 +2028,52 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
         if chunk.get("choices") and chunk["choices"][0].get("delta")
     ]
 
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
     assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
         "Custom reasoning."
     )
     assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
+
+
+def test_chat_completions_response_uses_reasoning_content(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+    result = GenerationResult(
+        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert message["reasoning_content"] == "Custom reasoning."
+    assert message["reasoning"] == "Custom reasoning."
+    assert message["content"] == "Custom answer."
 
 
 @pytest.mark.parametrize(
@@ -2405,7 +2447,7 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
-def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
+def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -2437,7 +2479,7 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
                     {
                         "role": "assistant",
                         "content": "Hello",
-                        "reasoning": "Prior thought",
+                        "reasoning_content": "Prior thought",
                     },
                     {"role": "user", "content": "Continue"},
                 ],
@@ -2448,6 +2490,7 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
     assert mock_template.call_args.args[2][1] == {
         "role": "assistant",
         "content": "Hello",
+        "reasoning_content": "Prior thought",
         "reasoning": "Prior thought",
     }
 
@@ -4967,6 +5010,14 @@ class TestChatMessageSchema:
         msg = server.ChatMessage(
             role="assistant", content="answer", reasoning="thought"
         )
+        assert msg.reasoning == "thought"
+        assert msg.reasoning_content == "thought"
+
+    def test_reasoning_content_field(self):
+        msg = server.ChatMessage(
+            role="assistant", content="answer", reasoning_content="thought"
+        )
+        assert msg.reasoning_content == "thought"
         assert msg.reasoning == "thought"
 
 
