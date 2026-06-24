@@ -281,11 +281,16 @@ class Gemma4VideoProcessor:
         if target_h == H and target_w == W:
             return video
 
-        resized = np.empty((T, C, target_h, target_w), dtype=video.dtype)
+        resized = np.empty((T, C, target_h, target_w), dtype=np.uint8)
         for i, frame in enumerate(video):
             arr = np.transpose(frame, (1, 2, 0))
             if arr.dtype in (np.float32, np.float64):
-                arr = (arr * 255).clip(0, 255).astype(np.uint8)
+                if arr.max() > 1.0:
+                    arr = arr.astype(np.uint8)
+                else:
+                    arr = (arr * 255).clip(0, 255).astype(np.uint8)
+            elif arr.dtype != np.uint8:
+                arr = arr.astype(np.uint8)
             pil = Image.fromarray(arr)
             pil = pil.resize((target_w, target_h), resample=Image.BICUBIC)
             resized[i] = np.transpose(np.array(pil), (2, 0, 1))

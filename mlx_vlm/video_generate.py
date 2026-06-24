@@ -624,7 +624,7 @@ def main():
 
     kwargs["video"] = args.video
     kwargs["input_ids"] = input_ids
-    kwargs["pixel_values"] = pixel_values
+    kwargs["pixel_values_videos"] = pixel_values
     kwargs["mask"] = mask
     kwargs["temperature"] = args.temperature
     kwargs["max_tokens"] = args.max_tokens
