@@ -25,7 +25,11 @@ from mlx_vlm.generate import (
 )
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
-from mlx_vlm.generate import normalize_resize_shape, normalize_rope_deltas
+from mlx_vlm.generate import (
+    normalize_legacy_rope_deltas,
+    normalize_resize_shape,
+    normalize_rope_deltas,
+)
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -434,11 +438,11 @@ class TestGenerationBatch:
             [7],
         ]
 
-    def test_normalize_rope_deltas_only_broadcasts_when_requested(self):
+    def test_rope_delta_normalizers_distinguish_prompt_and_legacy_fallbacks(self):
         deltas = mx.array([[5]], dtype=mx.int32)
 
         assert normalize_rope_deltas(deltas, 3).tolist() == [[5], [0], [0]]
-        assert normalize_rope_deltas(deltas, 3, broadcast_singleton=True).tolist() == [
+        assert normalize_legacy_rope_deltas(deltas, 3).tolist() == [
             [5],
             [5],
             [5],

@@ -20,7 +20,7 @@ DEFAULT_QUANTIZED_KV_START = 5000
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
-def normalize_rope_deltas(rope_deltas, B: int, *, broadcast_singleton: bool = False):
+def _normalize_rope_deltas(rope_deltas, B: int, *, pad_missing_rows_with_last: bool):
     if rope_deltas is None:
         return mx.zeros((B, 1), dtype=mx.int32)
     if rope_deltas.ndim == 0:
@@ -28,10 +28,7 @@ def normalize_rope_deltas(rope_deltas, B: int, *, broadcast_singleton: bool = Fa
     elif rope_deltas.ndim == 1:
         rope_deltas = rope_deltas[:, None]
 
-    # Falcon OCR's mutable model state emits a singleton meant to broadcast
-    # across rows. Prompt-kwarg merges must not use this fallback, because a
-    # singleton there can mean only one row provided rope_deltas.
-    if broadcast_singleton and rope_deltas.shape[0] == 1 and B > 1:
+    if pad_missing_rows_with_last and rope_deltas.shape[0] == 1 and B > 1:
         rope_deltas = mx.broadcast_to(rope_deltas, (B, 1))
     if rope_deltas.shape[0] != B:
         if rope_deltas.shape[0] > B:
@@ -41,7 +38,7 @@ def normalize_rope_deltas(rope_deltas, B: int, *, broadcast_singleton: bool = Fa
             pad_shape = (pad,) + tuple(rope_deltas.shape[1:])
             pad_values = (
                 mx.broadcast_to(rope_deltas[-1:], pad_shape)
-                if broadcast_singleton
+                if pad_missing_rows_with_last
                 else mx.zeros(pad_shape, dtype=rope_deltas.dtype)
             )
             rope_deltas = mx.concatenate(
@@ -52,6 +49,14 @@ def normalize_rope_deltas(rope_deltas, B: int, *, broadcast_singleton: bool = Fa
                 axis=0,
             )
     return rope_deltas
+
+
+def normalize_rope_deltas(rope_deltas, B: int):
+    return _normalize_rope_deltas(rope_deltas, B, pad_missing_rows_with_last=False)
+
+
+def normalize_legacy_rope_deltas(rope_deltas, B: int):
+    return _normalize_rope_deltas(rope_deltas, B, pad_missing_rows_with_last=True)
 
 
 def _policy_enabled(policy) -> bool:

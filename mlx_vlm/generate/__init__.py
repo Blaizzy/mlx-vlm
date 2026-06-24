@@ -14,6 +14,7 @@ from .common import (
     PromptCacheState,
     generation_stream,
     maybe_quantize_kv_cache,
+    normalize_legacy_rope_deltas,
     normalize_rope_deltas,
     wired_limit,
 )
@@ -70,6 +71,7 @@ __all__ = [
     "load_image_model",
     "main",
     "maybe_quantize_kv_cache",
+    "normalize_legacy_rope_deltas",
     "normalize_rope_deltas",
     "parse_arguments",
     "stream_generate",

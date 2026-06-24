@@ -31,6 +31,7 @@ from ..generate import (
     _chunked_prefill_enabled,
     _make_cache,
     _merge_prefill_prompt_kwargs,
+    normalize_legacy_rope_deltas,
     normalize_rope_deltas,
 )
 from ..generate.common import generation_stream, wired_limit
@@ -1665,14 +1666,16 @@ class ResponseGenerator:
                 )
                 decode_target_kwargs = {}
                 rope_deltas = prompt_kwargs.get("rope_deltas")
-                broadcast_singleton = False
-                if rope_deltas is None:
-                    rope_deltas = getattr(lm, "_rope_deltas", None)
-                    broadcast_singleton = rope_deltas is not None
                 if rope_deltas is not None:
                     decode_target_kwargs["rope_deltas"] = normalize_rope_deltas(
-                        rope_deltas, B, broadcast_singleton=broadcast_singleton
+                        rope_deltas, B
                     )
+                else:
+                    rope_deltas = getattr(lm, "_rope_deltas", None)
+                    if rope_deltas is not None:
+                        decode_target_kwargs["rope_deltas"] = (
+                            normalize_legacy_rope_deltas(rope_deltas, B)
+                        )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B

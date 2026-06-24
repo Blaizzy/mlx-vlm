@@ -36,6 +36,7 @@ from .common import (
     _chunked_prefill_enabled,
     generation_stream,
     maybe_quantize_kv_cache,
+    normalize_legacy_rope_deltas,
     normalize_rope_deltas,
     wired_limit,
 )
@@ -383,7 +384,7 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
-        prompt_kwargs_for_speculative_decode = dict(kwargs)
+        target_decode_kwargs = dict(kwargs)
         policy_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             policy_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
@@ -451,20 +452,18 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    decode_prompt_kwargs = prompt_kwargs_for_speculative_decode
     if draft_model is not None:
-        decode_prompt_kwargs = dict(prompt_kwargs_for_speculative_decode)
-        rope_deltas = decode_prompt_kwargs.get("rope_deltas")
-        broadcast_singleton = False
+        rope_deltas = target_decode_kwargs.get("rope_deltas")
         if rope_deltas is None:
             language_model = getattr(model, "language_model", model)
             rope_deltas = getattr(language_model, "_rope_deltas", None)
-            broadcast_singleton = rope_deltas is not None
-        if rope_deltas is not None:
-            decode_prompt_kwargs["rope_deltas"] = normalize_rope_deltas(
-                rope_deltas,
-                input_ids.shape[0],
-                broadcast_singleton=broadcast_singleton,
+            if rope_deltas is not None:
+                target_decode_kwargs["rope_deltas"] = normalize_legacy_rope_deltas(
+                    rope_deltas, input_ids.shape[0]
+                )
+        else:
+            target_decode_kwargs["rope_deltas"] = normalize_rope_deltas(
+                rope_deltas, input_ids.shape[0]
             )
 
     mx.async_eval(y, logprobs)
@@ -484,7 +483,7 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
-            prompt_kwargs=decode_prompt_kwargs,
+            prompt_kwargs=target_decode_kwargs,
         )
         return
 
@@ -2040,20 +2039,14 @@ class PromptProcessingBatch:
         return self._total_prompt_tokens
 
     @staticmethod
-    def _normalize_rope_deltas(
-        rope_deltas, B: int, *, broadcast_singleton: bool = False
-    ):
-        return normalize_rope_deltas(
-            rope_deltas, B, broadcast_singleton=broadcast_singleton
-        )
+    def _normalize_rope_deltas(rope_deltas, B: int):
+        return normalize_rope_deltas(rope_deltas, B)
 
     @staticmethod
     def _capture_rope_deltas(language_model, B: int):
         if not hasattr(language_model, "_rope_deltas"):
             return None
-        return PromptProcessingBatch._normalize_rope_deltas(
-            language_model._rope_deltas, B, broadcast_singleton=True
-        )
+        return normalize_legacy_rope_deltas(language_model._rope_deltas, B)
 
 
 class BatchGenerator:
