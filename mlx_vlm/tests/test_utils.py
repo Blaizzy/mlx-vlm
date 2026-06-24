@@ -465,6 +465,42 @@ def test_stopping_criteria_reset():
     assert stopping_criteria(7) is True
 
 
+def test_stopping_criteria_reset_no_aliasing():
+    # reset() must defensively copy the caller's list, otherwise a later
+    # add_eos_token_ids() mutates the caller's object in place. On a long-lived
+    # server, reset() is called with the shared ``model.config.eos_token_id``
+    # list, so the leak permanently appends per-request stop tokens to the model
+    # config (see generate/dispatch.py and server/generation.py call sites).
+    class MockProcessor:
+        def __init__(self):
+            self.tokenizer = type(
+                "DummyTokenizer", (), {"pad_token": None, "eos_token": "[EOS]"}
+            )()
+
+        def encode(self, text, add_special_tokens=False):
+            if "[EOS]" in text:
+                return [32008]
+            return [1]
+
+    processor = MockProcessor()
+    stopping_criteria = StoppingCriteria([2], processor)
+
+    # Simulate the shared model-config EOS list reused across requests.
+    shared_config_eos = [5, 7]
+    stopping_criteria.reset(shared_config_eos)
+
+    # A per-request custom stop token must not leak back into the shared list.
+    stopping_criteria.add_eos_token_ids("[EOS]")
+    assert stopping_criteria.eos_token_ids == [5, 7, 32008]
+    assert shared_config_eos == [5, 7]
+
+    # Sequential requests must not accumulate stop tokens in the shared config.
+    for _ in range(3):
+        stopping_criteria.reset(shared_config_eos)
+        stopping_criteria.add_eos_token_ids("[EOS]")
+        assert shared_config_eos == [5, 7]
+
+
 def test_load_passes_revision():
     model_mock = MagicMock()
     model_mock.config = MagicMock(eos_token_id=None)
