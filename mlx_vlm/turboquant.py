@@ -4205,7 +4205,6 @@ class _TurboQuantMSECodec:
         return self._rotate_inverse(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
-        # Fast path for single-token decode: Hadamard rotation + fused quantize
         if self.bits > 0:
             D = self.dim
             flat = vectors.reshape(-1, D).astype(mx.float32)
