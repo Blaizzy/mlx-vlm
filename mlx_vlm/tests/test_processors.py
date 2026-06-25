@@ -2232,7 +2232,7 @@ class TestUnlimitedOCRPatch(unittest.TestCase):
         _assert_patch_intercepts(
             self,
             "unlimited-ocr",
-            "mlx_vlm.models.unlimitedocr.processing_unlimitedocr",
+            "mlx_vlm.models.unlimited_ocr.processing_unlimitedocr",
             "UnlimitedOCRProcessor",
         )
 

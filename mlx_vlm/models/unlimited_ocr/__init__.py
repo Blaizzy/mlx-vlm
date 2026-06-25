@@ -1,4 +1,4 @@
-import mlx_vlm.models.unlimitedocr.processing_unlimitedocr  # noqa: F401 (installs processor patch)
+import mlx_vlm.models.unlimited_ocr.processing_unlimitedocr  # noqa: F401 (installs processor patch)
 
 from ..deepseekocr.sam import SAMEncoder
 from ..deepseekocr.vision import VisionModel

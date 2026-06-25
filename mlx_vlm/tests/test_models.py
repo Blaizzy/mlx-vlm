@@ -5409,9 +5409,9 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self._check_returns_input_embeddings_features(model, "deepseekocr")
 
     def test_unlimitedocr_config_and_input_embeddings(self):
-        from mlx_vlm.models import unlimitedocr
+        from mlx_vlm.models import unlimited_ocr
 
-        config = unlimitedocr.ModelConfig.from_dict(
+        config = unlimited_ocr.ModelConfig.from_dict(
             {
                 "model_type": "unlimited-ocr",
                 "language_config": {
@@ -5456,13 +5456,13 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertEqual(config.text_config.vocab_size, 32)
         self.assertEqual(config.text_config.max_position_embeddings, 32768)
 
-        model = unlimitedocr.Model(config)
-        self._check_returns_input_embeddings_features(model, "unlimitedocr")
+        model = unlimited_ocr.Model(config)
+        self._check_returns_input_embeddings_features(model, "unlimited_ocr")
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "RingSlidingKVCache")
         self.assertEqual(cache[0].window_size, 128)
 
-        ring_cache = unlimitedocr.RingSlidingKVCache(window_size=2)
+        ring_cache = unlimited_ocr.RingSlidingKVCache(window_size=2)
         keys = mx.arange(6, dtype=mx.float32).reshape(1, 1, 3, 2)
         values = keys + 100
         ring_cache.update_and_fetch(keys, values)
@@ -5498,7 +5498,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             "model.image_newline": mx.zeros((1,)),
             "lm_head.weight": mx.zeros((1, 1)),
         }
-        sanitized = unlimitedocr.Model.sanitize(weights)
+        sanitized = unlimited_ocr.Model.sanitize(weights)
         self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", sanitized)
         self.assertIn("language_model.model.embed_tokens.weight", sanitized)
         self.assertIn("language_model.model.norm.weight", sanitized)

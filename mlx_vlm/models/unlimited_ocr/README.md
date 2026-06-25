@@ -311,7 +311,7 @@ mlx_vlm.generate \
 
 ## Implementation Notes
 
-Unlimited-OCR uses Hugging Face `model_type: unlimited-ocr`. The MLX module name is `unlimitedocr`, and `mlx_vlm` remaps the Hugging Face model type automatically.
+Unlimited-OCR uses Hugging Face `model_type: unlimited-ocr`. The MLX module name is `unlimited_ocr`, and `mlx_vlm` remaps the Hugging Face model type automatically.
 
 The processor loads the tokenizer and `processor_config.json` directly to avoid requiring upstream PyTorch remote-code dependencies during MLX inference.
 
