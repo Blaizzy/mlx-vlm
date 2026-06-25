@@ -7861,3 +7861,20 @@ class TestDeepseekV4HISA(unittest.TestCase):
             ix._hisa_select(q, pooled, x, k), self._flat_select(ix, q, pooled, x, k), k
         )
         self.assertGreaterEqual(r, 0.7)
+
+    def test_hisa_batched_l_gt_1_matches_flat(self):
+        # L>1 batched HISA (hisa_kernel.hisa_select): keep-all must return the
+        # exact flat per-query top-k for every query position.
+        from mlx_vlm.models.deepseek_v4.hisa_kernel import hisa_select
+
+        mx.random.seed(2)
+        H, Dh, Np, k, block = 8, 64, 512, 16, 64
+        scale = Dh**-0.5
+        q = mx.random.normal((1, H, 4, Dh))  # L = 4 queries
+        pooled = mx.random.normal((1, Np, Dh))
+        weights = mx.random.normal((1, 4, H)) * (H**-0.5)
+        out = hisa_select(q, pooled, weights, scale, k, block, index_keep=Np // block)
+        wk_h = (weights * scale).transpose(0, 2, 1)[..., None]
+        flat = (mx.maximum(q @ pooled[:, None].swapaxes(-1, -2), 0) * wk_h).sum(1)
+        ftk = mx.argpartition(-flat, kth=k - 1, axis=-1)[..., :k]
+        self.assertTrue(bool(mx.array_equal(mx.sort(out, -1), mx.sort(ftk, -1))))

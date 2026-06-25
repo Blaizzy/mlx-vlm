@@ -17,6 +17,7 @@ from ..base import (
 )
 from ..cache import CacheList, PoolingCache, RotatingKVCache
 from .config import ModelConfig
+from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 
 
@@ -568,6 +569,32 @@ class Indexer(nn.Module):
             and self.index_keep * self.index_block >= k
         ):
             return self._hisa_select(q, pooled, x, k)
+
+        # HISA batched path for L > 1 (prefill / speculative decode). Honors the
+        # causal mask via valid_len = #visible pooled positions per query (the
+        # pool mask is contiguous-causal, so the count is the visibility cutoff).
+        if (
+            L > 1
+            and self.index_block > 0
+            and Np >= self.index_block * self.index_keep
+            and self.index_keep * self.index_block >= k
+        ):
+            if pmask is None:
+                valid_len = mx.full((B, L), Np, dtype=mx.int32)
+            else:
+                pm = pmask if pmask.ndim == 3 else pmask[None]
+                valid_len = mx.broadcast_to(pm, (B, L, pm.shape[-1])).sum(-1)
+            weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
+            return hisa_select(
+                q,
+                pooled,
+                weights,
+                self.scale,
+                k,
+                self.index_block,
+                self.index_keep,
+                valid_len,
+            )
 
         scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
             mx.float32
