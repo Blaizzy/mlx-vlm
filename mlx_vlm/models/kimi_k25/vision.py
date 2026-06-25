@@ -1,3 +1,4 @@
+import math
 from typing import List, Optional
 
 import mlx.core as mx
@@ -5,6 +6,30 @@ import mlx.nn as nn
 
 from ..kernels import bicubic_interpolate
 from .config import VisionConfig
+
+_TEMPORAL_EMB_CACHE = {}
+
+
+def _temporal_sincos_emb(num_frames: int, dim: int) -> mx.array:
+    """InternVideo2-style 1D sin-cos temporal embedding, shape (num_frames, dim).
+
+    Computed and cached at module level so it is never a checkpoint parameter.
+    """
+    key = (num_frames, dim)
+    if key not in _TEMPORAL_EMB_CACHE:
+        pos = mx.arange(num_frames, dtype=mx.float32)[:, None]
+        half = max(dim // 2, 1)
+        freq = mx.exp(-math.log(10000.0) * mx.arange(half, dtype=mx.float32) / half)[
+            None
+        ]
+        ang = pos * freq
+        emb = mx.concatenate([mx.sin(ang), mx.cos(ang)], axis=-1)
+        if emb.shape[-1] < dim:  # odd dim
+            emb = mx.concatenate(
+                [emb, mx.zeros((num_frames, dim - emb.shape[-1]))], axis=-1
+            )
+        _TEMPORAL_EMB_CACHE[key] = emb[:, :dim]
+    return _TEMPORAL_EMB_CACHE[key]
 
 
 def check_array_shape(arr):
@@ -76,7 +101,25 @@ class Learnable2DInterpPosEmb(nn.Module):
     def __call__(self, x: mx.array, grid_hws: mx.array) -> mx.array:
         pos_embs = []
         for shape in grid_hws.tolist():
-            if shape == self.weight.shape[:-1]:
+            if len(shape) == 3:
+                # video (t, h, w): spatial emb tiled across frames + temporal emb
+                t, h, w = shape
+                spatial = (
+                    bicubic_interpolate(
+                        mx.expand_dims(self.weight.transpose(2, 0, 1), axis=0),
+                        size=(h, w),
+                    )
+                    .squeeze(0)
+                    .transpose(1, 2, 0)
+                    .flatten(end_axis=1)
+                )
+                temporal = _temporal_sincos_emb(t, spatial.shape[-1]).astype(
+                    spatial.dtype
+                )
+                pos_embs.append(
+                    mx.tile(spatial, (t, 1)) + mx.repeat(temporal, h * w, axis=0)
+                )
+            elif shape == self.weight.shape[:-1]:
                 pos_embs.append(self.weight.flatten(end_axis=1))
             else:
                 result = (
@@ -193,40 +236,31 @@ class Attention(nn.Module):
         seq_length = x.shape[0]
         qkv = self.wqkv(x)
 
-        qkv_shape = qkv.shape[:-1] + (
-            3,
-            self.num_heads,
-            self.head_dim,
-        )
-        # xqkv: (batch_size, seqlen, 3, nheads, headdim)
-        qkv = qkv.reshape(*qkv_shape)
-
-        q, k, v = mx.split(qkv, 3, axis=1)
-        q = q.squeeze(1)
-        k = k.squeeze(1)
-        v = v.squeeze(1)
+        # xqkv: (seqlen, 3, nheads, headdim)
+        qkv = qkv.reshape(seq_length, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # each (seq, nheads, headdim)
 
         q, k = apply_rope(q, k, rotary_pos_emb)
 
-        attention_mask = mx.zeros((1, seq_length, seq_length), dtype=x.dtype)
+        # Block-diagonal varlen attention: each image / video-chunk segment
+        # attends only within itself. This is the correct mask for multiple
+        # images / video chunks and avoids the O(seq^2) [1, seq, seq] matrix.
+        # A single segment is mathematically identical to full attention.
+        bounds = [int(c) for c in cu_seqlens]
+        outputs = []
+        for i in range(1, len(bounds)):
+            s, e = bounds[i - 1], bounds[i]
+            qs = q[s:e].transpose(1, 0, 2)  # (nheads, n, headdim)
+            ks = k[s:e].transpose(1, 0, 2)
+            vs = v[s:e].transpose(1, 0, 2)
+            attn = qs @ ks.swapaxes(-2, -1) / mx.sqrt(qs.shape[-1])
+            attn = mx.softmax(attn, axis=-1).astype(qs.dtype)
+            o = (attn @ vs).transpose(1, 0, 2).reshape(e - s, -1)
+            outputs.append(o)
 
-        # Create attention mask for each sequence in the batch
-        for i in range(1, len(cu_seqlens)):
-            start = int(cu_seqlens[i - 1])
-            end = int(cu_seqlens[i])
-            attention_mask[..., start:end, start:end] = 1
-
-        q = q.transpose(1, 0, 2)
-        k = k.transpose(1, 0, 2)
-        v = v.transpose(1, 0, 2)
-
-        attn_weight = q @ k.swapaxes(-2, -1) / mx.sqrt(q.shape[-1])
-        attn_weight += attention_mask
-        attn_weight = mx.softmax(attn_weight, axis=-1).astype(q.dtype)
-
-        attn_output = attn_weight @ v
-        attn_output = attn_output.transpose(1, 0, 2)
-        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = (
+            outputs[0] if len(outputs) == 1 else mx.concatenate(outputs, axis=0)
+        )
         return self.wo(attn_output)
 
 
@@ -343,21 +377,28 @@ class Rope2DPosEmb(nn.Module):
         if self._freqs_cis is None:
             self._freqs_cis = self._precompute_freqs_cis()
 
-        shapes = grid_hws.tolist()
-        assert all(
-            1 <= h <= self.max_height and 1 <= w <= self.max_width for h, w in shapes
-        ), (
-            shapes,
-            self.max_height,
-            self.max_width,
-        )
-
         freqs_cis_list = []
-        for h, w in shapes:
-            # Get the slice of precomputed frequencies for this shape
-            shape_freqs = self._freqs_cis[:h, :w]
-            # Reshape to flatten the spatial dimensions
-            shape_freqs = shape_freqs.reshape(-1, self.dim // 2)
+        for shape in grid_hws.tolist():
+            # (t, h, w) video grid -> t=1 for a 2-col (h, w) image grid
+            t, h, w = (
+                (shape[0], shape[1], shape[2])
+                if len(shape) == 3
+                else (
+                    1,
+                    shape[0],
+                    shape[1],
+                )
+            )
+            assert 1 <= h <= self.max_height and 1 <= w <= self.max_width, (
+                shape,
+                self.max_height,
+                self.max_width,
+            )
+            # Spatial freqs for one frame, flattened over (h, w)
+            shape_freqs = self._freqs_cis[:h, :w].reshape(-1, self.dim // 2)
+            # Tile the per-frame 2D freqs across the t temporal positions
+            if t > 1:
+                shape_freqs = mx.tile(shape_freqs, (t, 1))
             freqs_cis_list.append(shape_freqs)
 
         freqs_cis = mx.concatenate(freqs_cis_list, axis=0)
@@ -370,15 +411,25 @@ def patch_merger(
     merge_kernel_size: list[int, int] = (2, 2),
 ) -> List[mx.array]:
     d_model = x.shape[-1]
+    kernel_height, kernel_width = merge_kernel_size
 
     outputs = []
     pre_sum = 0
     for x_shape in grid_hws.tolist():
-        height, width = x_shape[0], x_shape[1]
+        # (t, h, w) video grid -> t=1 for a 2-col (h, w) image grid
+        t, height, width = (
+            (x_shape[0], x_shape[1], x_shape[2])
+            if len(x_shape) == 3
+            else (1, x_shape[0], x_shape[1])
+        )
+        n = t * height * width
         # Get the current sequence
-        seq = x[pre_sum : pre_sum + height * width]
-        # Reshape along self.merge_kernel_size and concat to the last dimension
-        kernel_height, kernel_width = merge_kernel_size
+        seq = x[pre_sum : pre_sum + n]
+        # sd2_tpool: temporal-mean-pool over t so each chunk collapses to one
+        # spatial token set before the 2x2 spatial merge.
+        if t > 1:
+            seq = seq.reshape(t, height * width, d_model).mean(axis=0)
+        # Reshape along merge_kernel_size and concat to the last dimension
         new_height, new_width = height // kernel_height, width // kernel_width
         reshaped_seq = seq.reshape(
             new_height, kernel_height, new_width, kernel_width, d_model
@@ -388,7 +439,7 @@ def patch_merger(
             new_height * new_width, kernel_height * kernel_width, -1
         )
         outputs.append(padded_seq)
-        pre_sum += height * width
+        pre_sum += n
 
     return outputs
 
@@ -428,16 +479,12 @@ class VisionModel(nn.Module):
         hidden_states = self.patch_embed(hidden_states, grid_thw)
         rotary_pos_emb = self.rope_pos_emb.get_freqs_cis(grid_thw)
 
-        # Assuming grid_thw has shape (batch_size, 3)
-        batch_size = grid_thw.shape[0]
-
-        # Calculate cu_seqlens for each item in the batch
-        lengths = mx.concatenate(
-            (
-                mx.zeros((1,), dtype=grid_thw.dtype),
-                grid_thw[:, 0] * grid_thw[:, 1],
-            )
-        )
+        # cu_seqlens spans the full token count per item: t*h*w for a 3-col
+        # (t, h, w) grid, h*w for a 2-col (h, w) image grid (unchanged).
+        seqlens = grid_thw[:, 0]
+        for c in range(1, grid_thw.shape[1]):
+            seqlens = seqlens * grid_thw[:, c]
+        lengths = mx.concatenate((mx.zeros((1,), dtype=grid_thw.dtype), seqlens))
         cu_seqlens = mx.cumsum(lengths.astype(mx.int32), axis=0)
 
         encoder_states = (hidden_states,) if output_hidden_states else None

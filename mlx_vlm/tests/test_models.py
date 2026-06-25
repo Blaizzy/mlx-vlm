@@ -7771,3 +7771,105 @@ class TestRTDetrV2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKimiK25VideoVision(unittest.TestCase):
+    """kimi_k25 MoonViT tower: a 3-col (t, h, w) video grid must run end to end
+    (temporal pos-emb, t-tiled RoPE, t*h*w cu_seqlens, block-diagonal attention,
+    temporal pooling) while the 2-col (h, w) image path stays unchanged."""
+
+    P, C, EMBED, HEADS = 4, 3, 64, 4
+
+    @classmethod
+    def _tower(cls, seed=0):
+        from mlx_vlm.models.kimi_k25.config import VisionConfig
+        from mlx_vlm.models.kimi_k25.vision import VisionModel
+
+        cfg = VisionConfig(
+            depth=2,
+            embed_dim=cls.EMBED,
+            hidden_size=cls.EMBED,
+            num_heads=cls.HEADS,
+            patch_size=cls.P,
+            num_channels=cls.C,
+            init_pos_emb_height=8,
+            intermediate_size=128,
+            spatial_merge_size=2,
+        )
+        cfg.merge_kernel_size = (2, 2)
+        mx.random.seed(seed)
+        vm = VisionModel(cfg)
+        mx.eval(vm.parameters())
+        return vm
+
+    @classmethod
+    def _pixels(cls, n, seed=123):
+        mx.random.seed(seed)
+        return mx.random.normal((n, cls.P, cls.P, cls.C))
+
+    def test_image_path_unchanged(self):
+        # New block-diagonal attention must equal the old full [1, seq, seq]-mask
+        # attention for a single segment (the image case).
+        from mlx_vlm.models.kimi_k25.vision import Attention, apply_rope
+
+        vm = self._tower()
+        att = Attention(self.EMBED, self.HEADS)
+        mx.eval(att.parameters())
+        n = 16
+        mx.random.seed(7)
+        x = mx.random.normal((n, self.EMBED))
+        rope = vm.rope_pos_emb.get_freqs_cis(mx.array([[4, 4]]))
+        cu = mx.array([0, n], dtype=mx.int32)
+
+        def old_full_mask(att, x, cu, rope):
+            seq = x.shape[0]
+            qkv = att.wqkv(x).reshape(seq, 3, att.num_heads, att.head_dim)
+            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+            q, k = apply_rope(q, k, rope)
+            mask = mx.zeros((1, seq, seq), dtype=x.dtype)
+            for i in range(1, len(cu)):
+                s, e = int(cu[i - 1]), int(cu[i])
+                mask[..., s:e, s:e] = 1
+            q, k, v = (z.transpose(1, 0, 2) for z in (q, k, v))
+            aw = q @ k.swapaxes(-2, -1) / mx.sqrt(q.shape[-1])
+            aw = mx.softmax(aw + mask, axis=-1).astype(q.dtype)
+            return att.wo((aw @ v).transpose(1, 0, 2).reshape(seq, -1))
+
+        self.assertTrue(
+            mx.allclose(att(x, cu, rope), old_full_mask(att, x, cu, rope), atol=1e-5)
+        )
+
+    def test_video_grid_runs_and_image_still_works(self):
+        vm = self._tower()
+        img = vm(self._pixels(4 * 4), mx.array([[4, 4]]))
+        self.assertEqual(img[0].shape, (4, 4, self.EMBED))
+        vid = vm(self._pixels(2 * 4 * 4), mx.array([[2, 4, 4]]))
+        mx.eval(vid[0])
+        self.assertEqual(vid[0].shape, (4, 4, self.EMBED))
+        self.assertFalse(bool(mx.any(mx.isnan(vid[0]))))
+
+    def test_temporal_pool_collapses_frames(self):
+        # Merged token count must be independent of t (sd2_tpool over frames).
+        vm = self._tower()
+        counts = {
+            t: vm(self._pixels(t * 4 * 4), mx.array([[t, 4, 4]]))[0].shape[0]
+            for t in (1, 2, 4)
+        }
+        self.assertEqual(set(counts.values()), {(4 // 2) * (4 // 2)})
+
+    def test_block_diagonal_no_cross_chunk_leakage(self):
+        from mlx_vlm.models.kimi_k25.vision import Attention
+
+        vm = self._tower()
+        att = Attention(self.EMBED, self.HEADS)
+        mx.eval(att.parameters())
+        n_a = n_b = 8
+        cu = mx.array([0, n_a, n_a + n_b], dtype=mx.int32)
+        rope = vm.rope_pos_emb.get_freqs_cis(mx.array([[2, 4], [2, 4]]))
+        mx.random.seed(9)
+        x = mx.random.normal((n_a + n_b, self.EMBED))
+        out_b = att(x, cu, rope)[n_a:]
+        xp = mx.array(x)
+        xp[:n_a] = mx.random.normal((n_a, self.EMBED))
+        out_b_perturbed = att(xp, cu, rope)[n_a:]
+        self.assertTrue(mx.allclose(out_b, out_b_perturbed, atol=1e-6))
