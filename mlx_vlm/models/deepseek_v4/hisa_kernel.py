@@ -5,9 +5,6 @@ Replaces the indexer's flat O(Np) top-k scan with a two-stage hierarchy:
   2. fine:   gather only the kept blocks' positions and score them -- tiled over L so
              the candidate tensor stays bounded (memory flat in L) -- then top-k.
 
-Implemented entirely in MLX: the tiled `matmul` uses MLX's optimized GEMM, which
-benchmarks faster than a hand-written Metal kernel here while keeping memory flat
-in L. Matches the exact flat top-k in the keep-all limit; approximates it otherwise.
 
 paper: https://arxiv.org/abs/2603.28458
 """
