@@ -7872,3 +7872,110 @@ class TestRTDetrV2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDeepseekV4HISA(unittest.TestCase):
+    """HISA hierarchical indexer (deepseek_v4): block-coarse -> token-fine
+    selection must match the flat top-k scan in the keep-all limit and recover
+    most of the top-k when relevance is block-clustered."""
+
+    @staticmethod
+    def _indexer(
+        index_block,
+        index_keep,
+        index_topk=32,
+        n_heads=8,
+        head_dim=64,
+        hidden=256,
+        q_lora_rank=64,
+        seed=0,
+    ):
+        from mlx_vlm.models.deepseek_v4.config import ModelConfig
+        from mlx_vlm.models.deepseek_v4.language import Indexer
+
+        mx.random.seed(seed)
+        cfg = ModelConfig(
+            hidden_size=hidden,
+            q_lora_rank=q_lora_rank,
+            index_n_heads=n_heads,
+            index_head_dim=head_dim,
+            index_topk=index_topk,
+            index_block=index_block,
+            index_keep=index_keep,
+        )
+        ix = Indexer(cfg, compress_ratio=4)
+        mx.eval(ix.parameters())
+        return ix
+
+    @staticmethod
+    def _flat_select(ix, q, pooled, x, k):
+        f32 = mx.float32
+        s = mx.maximum(q.astype(f32) @ pooled[:, None].swapaxes(-1, -2).astype(f32), 0)
+        s = s * ix.scale
+        w = ix.weights_proj(x).astype(f32) * (ix.n_heads**-0.5)
+        s = (s * w.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        return mx.argpartition(-s, kth=k - 1, axis=-1)[..., :k]
+
+    @staticmethod
+    def _recall(a, b, k):
+        a, b = a.reshape(-1, k).tolist(), b.reshape(-1, k).tolist()
+        return sum(len(set(x) & set(y)) for x, y in zip(a, b)) / (len(a) * k)
+
+    def test_hisa_equals_flat_when_all_blocks_kept(self):
+        Np, block = 512, 64
+        ix = self._indexer(index_block=block, index_keep=Np // block, index_topk=32)
+        mx.random.seed(1)
+        q = mx.random.normal((2, ix.n_heads, 1, ix.head_dim))
+        pooled = mx.random.normal((2, Np, ix.head_dim))
+        x = mx.random.normal((2, 1, 256))
+        k = min(ix.index_topk, Np)
+        hisa = ix._hisa_select(q, pooled, x, k)
+        flat = self._flat_select(ix, q, pooled, x, k)
+        self.assertEqual(self._recall(hisa, flat, k), 1.0)
+
+    def test_hisa_shape_and_valid_indices(self):
+        Np = 2048
+        ix = self._indexer(index_block=64, index_keep=8, index_topk=32)
+        mx.random.seed(1)
+        q = mx.random.normal((2, ix.n_heads, 1, ix.head_dim))
+        pooled = mx.random.normal((2, Np, ix.head_dim))
+        x = mx.random.normal((2, 1, 256))
+        k = min(ix.index_topk, Np)
+        out = ix._hisa_select(q, pooled, x, k)
+        self.assertEqual(out.shape, (2, 1, k))
+        self.assertGreaterEqual(int(out.min()), 0)
+        self.assertLess(int(out.max()), Np)
+
+    def test_hisa_high_recall_on_clustered_prefix(self):
+        Np, block = 4096, 64
+        ix = self._indexer(index_block=block, index_keep=8, index_topk=64)
+        mx.random.seed(1)
+        nb = Np // block
+        dc = mx.random.normal((nb, 1, ix.head_dim)) * 2.0
+        pooled = (dc + mx.random.normal((nb, block, ix.head_dim))).reshape(
+            1, Np, ix.head_dim
+        )
+        q = mx.random.normal((1, ix.n_heads, 1, ix.head_dim))
+        x = mx.random.normal((1, 1, 256))
+        k = ix.index_topk
+        r = self._recall(
+            ix._hisa_select(q, pooled, x, k), self._flat_select(ix, q, pooled, x, k), k
+        )
+        self.assertGreaterEqual(r, 0.7)
+
+    def test_hisa_batched_l_gt_1_matches_flat(self):
+        # L>1 batched HISA (hisa_kernel.hisa_select): keep-all must return the
+        # exact flat per-query top-k for every query position.
+        from mlx_vlm.models.deepseek_v4.hisa_kernel import hisa_select
+
+        mx.random.seed(2)
+        H, Dh, Np, k, block = 8, 64, 512, 16, 64
+        scale = Dh**-0.5
+        q = mx.random.normal((1, H, 4, Dh))  # L = 4 queries
+        pooled = mx.random.normal((1, Np, Dh))
+        weights = mx.random.normal((1, 4, H)) * (H**-0.5)
+        out = hisa_select(q, pooled, weights, scale, k, block, index_keep=Np // block)
+        wk_h = (weights * scale).transpose(0, 2, 1)[..., None]
+        flat = (mx.maximum(q @ pooled[:, None].swapaxes(-1, -2), 0) * wk_h).sum(1)
+        ftk = mx.argpartition(-flat, kth=k - 1, axis=-1)[..., :k]
+        self.assertTrue(bool(mx.array_equal(mx.sort(out, -1), mx.sort(ftk, -1))))
