@@ -6159,6 +6159,22 @@ class BatchTurboQuantKVCache(_BaseCache):
             _QuantizedStateProxy(vs, self._idx, n_heads),
         )
 
+    def zero_row_tail(self, bi: int, start: int, end: int):
+        if start >= end:
+            return
+
+        def _z(arr, ndim):
+            if ndim == 3:
+                arr[bi, :, start:end] = 0
+            else:
+                arr[bi, :, start:end, :] = 0
+            return arr
+
+        if self.keys is not None:
+            self.keys = _map_state(self.keys, _z)
+        if self.values is not None:
+            self.values = _map_state(self.values, _z)
+
     # ------------------------------------------------------------------
     # Batch operations for Batch.filter / Batch.extend
     # ------------------------------------------------------------------
