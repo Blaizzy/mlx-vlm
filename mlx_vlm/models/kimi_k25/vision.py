@@ -1,4 +1,5 @@
 import math
+from functools import lru_cache
 from typing import List, Optional
 
 import mlx.core as mx
@@ -7,29 +8,24 @@ import mlx.nn as nn
 from ..kernels import bicubic_interpolate
 from .config import VisionConfig
 
-_TEMPORAL_EMB_CACHE = {}
 
-
+@lru_cache(maxsize=32)
 def _temporal_sincos_emb(num_frames: int, dim: int) -> mx.array:
     """InternVideo2-style 1D sin-cos temporal embedding, shape (num_frames, dim).
 
-    Computed and cached at module level so it is never a checkpoint parameter.
+    Bounded lru_cache so it is never a checkpoint parameter and device buffers
+    aren't retained indefinitely.
     """
-    key = (num_frames, dim)
-    if key not in _TEMPORAL_EMB_CACHE:
-        pos = mx.arange(num_frames, dtype=mx.float32)[:, None]
-        half = max(dim // 2, 1)
-        freq = mx.exp(-math.log(10000.0) * mx.arange(half, dtype=mx.float32) / half)[
-            None
-        ]
-        ang = pos * freq
-        emb = mx.concatenate([mx.sin(ang), mx.cos(ang)], axis=-1)
-        if emb.shape[-1] < dim:  # odd dim
-            emb = mx.concatenate(
-                [emb, mx.zeros((num_frames, dim - emb.shape[-1]))], axis=-1
-            )
-        _TEMPORAL_EMB_CACHE[key] = emb[:, :dim]
-    return _TEMPORAL_EMB_CACHE[key]
+    pos = mx.arange(num_frames, dtype=mx.float32)[:, None]
+    half = max(dim // 2, 1)
+    freq = mx.exp(-math.log(10000.0) * mx.arange(half, dtype=mx.float32) / half)[None]
+    ang = pos * freq
+    emb = mx.concatenate([mx.sin(ang), mx.cos(ang)], axis=-1)
+    if emb.shape[-1] < dim:  # odd dim
+        emb = mx.concatenate(
+            [emb, mx.zeros((num_frames, dim - emb.shape[-1]))], axis=-1
+        )
+    return emb[:, :dim]
 
 
 def check_array_shape(arr):
