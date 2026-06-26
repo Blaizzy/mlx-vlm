@@ -1730,6 +1730,48 @@ class TestModels(unittest.TestCase):
             "language_model.lm_head.weight",
         )
 
+    def test_qwen3_5_moe_sanitize_slices_gate_up_proj(self):
+        from mlx_vlm.models import qwen3_5_moe
+
+        model = qwen3_5_moe.Model.__new__(qwen3_5_moe.Model)
+        model.config = SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_hidden_layers=1,
+                tie_word_embeddings=False,
+            )
+        )
+        gate_up = mx.arange(2 * 8 * 4, dtype=mx.float32).reshape(2, 8, 4)
+        down = mx.ones((2, 4, 4), dtype=mx.float32)
+        weights = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": gate_up,
+            "model.language_model.layers.0.mlp.experts.down_proj": down,
+        }
+
+        original_split = mx.split
+
+        def fail_split(*args, **kwargs):
+            raise AssertionError("sanitize should slice gate_up_proj, not split it")
+
+        try:
+            mx.split = fail_split
+            sanitized = model.sanitize(weights)
+        finally:
+            mx.split = original_split
+
+        prefix = "language_model.model.layers.0.mlp.switch_mlp"
+        self.assertEqual(
+            sanitized[f"{prefix}.gate_proj.weight"].tolist(),
+            gate_up[..., :4, :].tolist(),
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.up_proj.weight"].tolist(),
+            gate_up[..., 4:, :].tolist(),
+        )
+        self.assertEqual(
+            sanitized[f"{prefix}.down_proj.weight"].tolist(),
+            down.tolist(),
+        )
+
     def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
         if not mx.metal.is_available():
             self.skipTest("requires Metal streams")
