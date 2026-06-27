@@ -2913,11 +2913,12 @@ def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
         float sq = val * val;
         float sg_sum = simd_sum(sq);
 
-        threadgroup float sg_norms[8];
+        constexpr int n_sg = (Dim + 31) / 32;
+        threadgroup float sg_norms[32];
         if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        float total_sq = (sg_id == 0 && sg_lid < n_sg) ? sg_norms[sg_lid] : 0.0f;
         total_sq = simd_sum(total_sq);
         // Broadcast norm to all threads
         if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;
@@ -4219,8 +4220,7 @@ class _TurboQuantMSECodec:
         return self._rotate_inverse(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
-        # Fast path for single-token decode: Hadamard rotation + fused quantize
-        if vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht:
+        if self.bits > 0:
             D = self.dim
             flat = vectors.reshape(-1, D).astype(mx.float32)
             BH = flat.shape[0]
@@ -6179,6 +6179,22 @@ class BatchTurboQuantKVCache(_BaseCache):
             _QuantizedStateProxy(ks, self._idx, n_heads),
             _QuantizedStateProxy(vs, self._idx, n_heads),
         )
+
+    def zero_row_tail(self, bi: int, start: int, end: int):
+        if start >= end:
+            return
+
+        def _z(arr, ndim):
+            if ndim == 3:
+                arr[bi, :, start:end] = 0
+            else:
+                arr[bi, :, start:end, :] = 0
+            return arr
+
+        if self.keys is not None:
+            self.keys = _map_state(self.keys, _z)
+        if self.values is not None:
+            self.values = _map_state(self.values, _z)
 
     # ------------------------------------------------------------------
     # Batch operations for Batch.filter / Batch.extend

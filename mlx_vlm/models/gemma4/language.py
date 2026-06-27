@@ -474,6 +474,8 @@ class Gemma4TextModel(nn.Module):
             return base_mask
         if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
             return base_mask
+        if base_mask.shape[-2] != base_mask.shape[-1]:
+            return base_mask
 
         block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
         q_blocks = mx.expand_dims(block_sequence_ids, -1)
