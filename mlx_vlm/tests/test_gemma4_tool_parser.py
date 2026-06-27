@@ -3,6 +3,8 @@
 import json
 import unittest
 
+import mlx_vlm.tool_parsers.gemma4 as gemma4
+from mlx_vlm.server.responses_state import process_tool_calls
 from mlx_vlm.tool_parsers.gemma4 import parse_tool_call
 
 # Wire-format helpers
@@ -94,6 +96,39 @@ class TestGemma4ToolParser(unittest.TestCase):
         self.assertIsInstance(result["arguments"], str)
         parsed = json.loads(result["arguments"])
         self.assertEqual(parsed, {"city": "Berlin"})
+
+    # ── DiffusionGemma payload tolerance ──────────────────────────────────
+
+    def test_bare_call_syntax(self):
+        result = parse_tool_call("call:get_weather{city:Austin}")
+        self.assertEqual(result["name"], "get_weather")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"city": "Austin"})
+
+    def test_bare_function_syntax(self):
+        result = parse_tool_call("get_weather{city:Austin}")
+        self.assertEqual(result["name"], "get_weather")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"city": "Austin"})
+
+    def test_process_tool_calls_handles_raw_diffusion_gemma_output(self):
+        result = process_tool_calls(
+            _wrap(f"call:get_weather{{city:{_str('Austin')}}}"),
+            gemma4,
+            tools=None,
+        )
+
+        self.assertEqual(len(result["calls"]), 1)
+        self.assertEqual(result["calls"][0]["function"]["name"], "get_weather")
+        args = json.loads(result["calls"][0]["function"]["arguments"])
+        self.assertEqual(args, {"city": "Austin"})
+        self.assertEqual(result["remaining_text"], "")
+
+    def test_process_tool_calls_ignores_non_call_prose(self):
+        result = process_tool_calls("Like call: prince", gemma4, tools=None)
+
+        self.assertEqual(result["calls"], [])
+        self.assertEqual(result["remaining_text"], "Like call: prince")
 
     # ── error path ────────────────────────────────────────────────────────
 
