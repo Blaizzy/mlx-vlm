@@ -978,10 +978,10 @@ def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
 
 def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
     text_config = _tiny_qwen3_5_text_config()
-    text_config.hidden_size = 64
-    text_config.intermediate_size = 128
+    text_config.hidden_size = 32
+    text_config.intermediate_size = 64
     text_config.num_hidden_layers = 2
-    text_config.num_attention_heads = 2
+    text_config.num_attention_heads = 1
     text_config.num_key_value_heads = 1
     text_config.head_dim = 32
     text_config.full_attention_interval = 2
