@@ -6321,10 +6321,13 @@ class BatchTurboQuantKVCache(_BaseCache):
         self.seed = int(v[2])
 
     def is_trimmable(self):
-        return False
+        return True
 
     def trim(self, n):
-        return 0
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
 
     def empty(self):
         return self.keys is None
