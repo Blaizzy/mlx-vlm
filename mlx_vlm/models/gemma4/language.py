@@ -788,8 +788,12 @@ class LanguageModel(nn.Module):
                 for bi in range(accepted.shape[0]):
                     start = verify_start + int(ve[bi])
                     if start < kv_len:
-                        c.keys[bi, :, start:kv_len, :] = 0
-                        c.values[bi, :, start:kv_len, :] = 0
+                        zero_row_tail = getattr(c, "zero_row_tail", None)
+                        if callable(zero_row_tail):
+                            zero_row_tail(bi, start, kv_len)
+                        else:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
         return max_a
 
     def sanitize(self, weights):

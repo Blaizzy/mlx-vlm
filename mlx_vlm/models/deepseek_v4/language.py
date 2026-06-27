@@ -1373,8 +1373,12 @@ class LanguageModel(nn.Module):
                 for bi, valid_end in enumerate(valid_ends.tolist()):
                     start = verify_start + int(valid_end)
                     if start < kv_len:
-                        cache.keys[bi, :, start:kv_len, :] = 0
-                        cache.values[bi, :, start:kv_len, :] = 0
+                        zero_row_tail = getattr(cache, "zero_row_tail", None)
+                        if callable(zero_row_tail):
+                            zero_row_tail(bi, start, kv_len)
+                        else:
+                            cache.keys[bi, :, start:kv_len, :] = 0
+                            cache.values[bi, :, start:kv_len, :] = 0
 
         return max_a
 
