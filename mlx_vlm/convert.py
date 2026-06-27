@@ -171,6 +171,7 @@ def convert(
             return model_quant_predicate(path, module)
         return True
 
+    # TODO: Remove once all LM models are migrated
     # Text-only models wrap the real mlx-lm model under `language_model._model`.
     # nn.Module.parameters() can't reach that underscore child, so dtype-cast,
     # quantization, and save_weights must operate on the inner model -- the same
