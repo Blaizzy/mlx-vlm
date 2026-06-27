@@ -6,7 +6,12 @@ import mlx.nn as nn
 
 from mlx_vlm.trainer.datasets import VisionDataset
 from mlx_vlm.trainer.lora import LoRaLayer
-from mlx_vlm.trainer.sft_trainer import TrainingArgs, iterate_batches, train
+from mlx_vlm.trainer.sft_trainer import (
+    TrainingArgs,
+    iterate_batches,
+    train,
+    vision_language_loss_fn,
+)
 
 
 class TestDataset(unittest.TestCase):
@@ -129,6 +134,87 @@ class TestDataset(unittest.TestCase):
         self.assertEqual(dataset.config, self.mock_config)
         self.assertEqual(dataset.processor, self.mock_processor)
 
+    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_dataset_adds_completion_mask_from_chat_template(
+        self, mock_prepare_inputs, mock_apply_chat_template
+    ):
+        dataset = VisionDataset(
+            self.mock_hf_dataset,
+            self.mock_config,
+            self.mock_processor,
+            train_on_completions=True,
+        )
+
+        messages = [
+            {"role": "user", "content": "Use the tool."},
+            {"role": "assistant", "content": "tool call"},
+        ]
+        self.mock_hf_dataset.__getitem__.return_value = {"messages": messages}
+
+        def fake_apply_chat_template(
+            _processor, _config, conversation, add_generation_prompt, **_kwargs
+        ):
+            if add_generation_prompt:
+                self.assertEqual(conversation, messages[:-1])
+                return "prefix"
+            self.assertEqual(conversation, messages)
+            return "full"
+
+        def fake_prepare_inputs(**kwargs):
+            prompts = kwargs["prompts"]
+            if prompts == ["prefix"]:
+                return {"input_ids": mx.array([[1, 2]])}
+            return {
+                "input_ids": mx.array([[1, 2, 3, 4]]),
+                "attention_mask": mx.array([[1, 1, 1, 1]]),
+            }
+
+        mock_apply_chat_template.side_effect = fake_apply_chat_template
+        mock_prepare_inputs.side_effect = fake_prepare_inputs
+
+        result = dataset[0]
+
+        self.assertIn("completion_mask", result)
+        self.assertTrue(
+            mx.array_equal(result["completion_mask"], mx.array([[0, 0, 1, 1]]))
+        )
+
+    @patch("mlx_vlm.trainer.datasets.apply_chat_template")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    def test_dataset_skips_completion_mask_when_not_training_on_completions(
+        self, mock_prepare_inputs, mock_apply_chat_template
+    ):
+        dataset = VisionDataset(
+            self.mock_hf_dataset,
+            self.mock_config,
+            self.mock_processor,
+        )
+
+        messages = [
+            {"role": "user", "content": "Use the tool."},
+            {"role": "assistant", "content": "tool call"},
+        ]
+        self.mock_hf_dataset.__getitem__.return_value = {"messages": messages}
+
+        mock_apply_chat_template.return_value = "full"
+        mock_prepare_inputs.return_value = {
+            "input_ids": mx.array([[1, 2, 3, 4]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+        }
+
+        result = dataset[0]
+
+        self.assertNotIn("completion_mask", result)
+        mock_apply_chat_template.assert_called_once_with(
+            self.mock_processor,
+            self.mock_config,
+            messages,
+            add_generation_prompt=False,
+            num_images=0,
+            num_audios=0,
+        )
+
 
 class TestBatchCollation(unittest.TestCase):
     def test_iterate_batches_concatenates_variable_length_pixel_values(self):
@@ -153,6 +239,33 @@ class TestBatchCollation(unittest.TestCase):
         self.assertEqual(batch["pixel_values"].shape, (5, 4))
         self.assertTrue(
             mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
+        )
+
+    def test_iterate_batches_pads_completion_mask(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": None,
+                "completion_mask": mx.array([0, 1, 1]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": None,
+                "completion_mask": mx.array([0, 1]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertIn("completion_mask", batch)
+        self.assertEqual(batch["completion_mask"].shape, (2, 32))
+        self.assertTrue(
+            mx.array_equal(batch["completion_mask"][0, :3], mx.array([0, 1, 1]))
+        )
+        self.assertTrue(
+            mx.array_equal(batch["completion_mask"][1, :2], mx.array([0, 1]))
         )
 
 
@@ -260,6 +373,99 @@ class TestTrainer(unittest.TestCase):
                 "adapters.safetensors",
             ],
         )
+
+    def test_gemma4_unified_loss_lets_model_build_internal_masks(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class CaptureModel:
+            model_type = "gemma4_unified"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                self.mask = mask
+                self.kwargs = kwargs
+                vocab_size = 10
+                return DummyOutput(mx.zeros((*input_ids.shape, vocab_size)))
+
+        model = CaptureModel()
+        batch = {
+            "input_ids": mx.array([[1, 2, 3, 4]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+            "pixel_values": None,
+        }
+
+        vision_language_loss_fn(model, batch)
+
+        self.assertIsNone(model.mask)
+
+    def test_completion_mask_is_used_without_passing_to_model(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class CaptureModel:
+            model_type = "test_model"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                self.mask = mask
+                self.kwargs = kwargs
+                vocab_size = 10
+                return DummyOutput(mx.zeros((*input_ids.shape, vocab_size)))
+
+        model = CaptureModel()
+        batch = {
+            "input_ids": mx.array([[1, 2, 3, 4]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+            "completion_mask": mx.array([[0, 0, 1, 1]]),
+            "pixel_values": None,
+        }
+
+        vision_language_loss_fn(
+            model, batch, train_on_completions=True, assistant_id=999
+        )
+
+        self.assertTrue(mx.array_equal(model.mask, mx.array([[1, 1, 1]])))
+        self.assertNotIn("completion_mask", model.kwargs)
+
+    def test_completion_mask_loss_denominator_uses_masked_token_count(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        class FixedLogitsModel:
+            model_type = "test_model"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                logits = mx.array(
+                    [
+                        [
+                            [4.0, 0.0],
+                            [0.0, 4.0],
+                            [4.0, 0.0],
+                        ]
+                    ]
+                )
+                return DummyOutput(logits=logits)
+
+        model = FixedLogitsModel()
+        batch = {
+            "input_ids": mx.array([[1, 0, 1, 0]]),
+            "attention_mask": mx.array([[1, 1, 1, 1]]),
+            "completion_mask": mx.array([[0, 0, 1, 0]]),
+            "pixel_values": None,
+        }
+
+        labels = batch["input_ids"][:, 1:]
+        logits = model(None, None, None).logits
+        ce = nn.losses.cross_entropy(logits, labels)
+        expected = ce[0, 1]
+
+        actual = vision_language_loss_fn(
+            model, batch, train_on_completions=True, assistant_id=999
+        )
+
+        self.assertAlmostEqual(actual.item(), expected.item(), places=6)
 
 
 class TestLoRaScaling(unittest.TestCase):

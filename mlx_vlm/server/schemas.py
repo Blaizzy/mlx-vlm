@@ -1,7 +1,7 @@
 import os
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 if TYPE_CHECKING:
@@ -265,8 +265,15 @@ class ChatMessage(FlexibleBaseModel):
         ResponseInputMessageContentListParam,
         ResponseOutputMessageContentList,
     ] = Field(None, description="Content of the message.")
+    reasoning_content: Optional[str] = Field(
+        None,
+        description="Thinking/reasoning content (when thinking is enabled).",
+    )
     reasoning: Optional[str] = Field(
-        None, description="Thinking/reasoning content (when thinking is enabled)."
+        None,
+        description=(
+            "Deprecated alias for reasoning_content, kept for backward compatibility."
+        ),
     )
     tool_calls: Optional[List[Any]] = Field(
         None, description="Tool calls made by the assistant."
@@ -275,6 +282,14 @@ class ChatMessage(FlexibleBaseModel):
         None, description="ID of the tool call this message is a response to."
     )
     name: Optional[str] = Field(None, description="Name of the tool/function.")
+
+    @model_validator(mode="after")
+    def sync_reasoning_aliases(self):
+        if self.reasoning_content is None and self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        elif self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        return self
 
 
 class OpenAIRequest(FlexibleBaseModel):

@@ -17,6 +17,7 @@ from ..base import (
 )
 from ..cache import CacheList, PoolingCache, RotatingKVCache
 from .config import ModelConfig
+from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
 
 
@@ -492,6 +493,47 @@ class Indexer(nn.Module):
         self.weights_proj = nn.Linear(config.hidden_size, self.n_heads, bias=False)
         self.compressor = Compressor(config, compress_ratio, self.head_dim)
         self.scale = self.head_dim**-0.5
+        self.index_block = getattr(config, "index_block", 0)
+        self.index_keep = getattr(config, "index_keep", 0)
+
+    def _hisa_select(self, q: mx.array, pooled: mx.array, x: mx.array, k: int):
+        """HISA hierarchical decode selection: coarse block filter -> fine top-k.
+
+        q: (B, n_heads, 1, head_dim); pooled: (B, Np, head_dim). Returns (B, 1, k)
+        indices into the prefix, matching the flat path's output. Scans n_blocks
+        coarse reps + index_keep*index_block fine candidates instead of all Np.
+
+        paper: https://arxiv.org/abs/2603.28458
+        """
+
+        B, Np, hd = pooled.shape
+        b = self.index_block
+        nb = Np // b
+        usable = nb * b
+        w = self.weights_proj(x).astype(mx.float32) * (
+            self.n_heads**-0.5
+        )  # (B,1,n_heads)
+        wq = w.swapaxes(-1, -2)[..., None]  # (B,n_heads,1,1)
+
+        # coarse: score block-mean representatives
+        rep = pooled[:, :usable].reshape(B, nb, b, hd).mean(axis=2)  # (B,nb,hd)
+        cs = mx.maximum(
+            q.astype(mx.float32) @ rep[:, None].swapaxes(-1, -2).astype(mx.float32), 0
+        )
+        cscore = (cs * self.scale * wq).sum(axis=1)  # (B,1,nb)
+        Kb = min(self.index_keep, nb)
+        top_blk = mx.argpartition(-cscore, kth=Kb - 1, axis=-1)[..., :Kb]  # (B,1,Kb)
+
+        # fine: score only positions inside the retained blocks
+        pos = (top_blk[..., None] * b + mx.arange(b)).reshape(B, 1, Kb * b)
+        idx = mx.broadcast_to(pos.reshape(B, Kb * b)[..., None], (B, Kb * b, hd))
+        cand = mx.take_along_axis(pooled, idx, axis=1)  # (B,Kb*b,hd)
+        fs = mx.maximum(
+            q.astype(mx.float32) @ cand[:, None].swapaxes(-1, -2).astype(mx.float32), 0
+        )
+        fscore = (fs * self.scale * wq).sum(axis=1)  # (B,1,Kb*b)
+        sel = mx.argpartition(-fscore, kth=k - 1, axis=-1)[..., :k]  # (B,1,k)
+        return mx.take_along_axis(pos, sel, axis=-1)
 
     def __call__(
         self,
@@ -510,20 +552,62 @@ class Indexer(nn.Module):
         q = q.transpose(0, 2, 1, 3)
         q = position_rope(q, offset)
 
+        Np = pooled.shape[1]
+        k = min(self.index_topk, Np)
+        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
+
+        # HISA hierarchical decode fast-path happends only when there is no mask to honor
+        # (single-token decode within the pool window => pmask is None), the
+        # prefix is long enough to block, and there are enough fine candidates.
+
+        if (
+            L == 1
+            and pmask is None
+            and pool_cache is not None
+            and self.index_block > 0
+            and Np >= self.index_block * self.index_keep
+            and self.index_keep * self.index_block >= k
+        ):
+            return self._hisa_select(q, pooled, x, k)
+
+        # HISA batched path for L > 1 (prefill / speculative decode). Honors the
+        # causal mask via valid_len = #visible pooled positions per query (the
+        # pool mask is contiguous-causal, so the count is the visibility cutoff).
+        if (
+            L > 1
+            and self.index_block > 0
+            and Np >= self.index_block * self.index_keep
+            and self.index_keep * self.index_block >= k
+        ):
+            if pmask is None:
+                valid_len = mx.full((B, L), Np, dtype=mx.int32)
+            else:
+                pm = pmask if pmask.ndim == 3 else pmask[None]
+                valid_len = mx.broadcast_to(pm, (B, L, pm.shape[-1])).sum(-1)
+            weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
+            return hisa_select(
+                q,
+                pooled,
+                weights,
+                self.scale,
+                k,
+                self.index_block,
+                self.index_keep,
+                valid_len,
+            )
+
         scores = q.astype(mx.float32) @ pooled[:, None].swapaxes(-1, -2).astype(
             mx.float32
         )
         scores = mx.maximum(scores, 0) * self.scale
         weights = self.weights_proj(x).astype(mx.float32) * (self.n_heads**-0.5)
         scores = (scores * weights.swapaxes(-1, -2)[..., None]).sum(axis=1)
-        pmask = pool_cache.make_mask(L, offset) if pool_cache is not None else None
         if pmask is not None:
             scores = mx.where(
                 pmask if pmask.ndim == 3 else pmask[None],
                 scores,
                 mx.finfo(scores.dtype).min,
             )
-        k = min(self.index_topk, pooled.shape[1])
         return mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
 
 
@@ -1289,8 +1373,12 @@ class LanguageModel(nn.Module):
                 for bi, valid_end in enumerate(valid_ends.tolist()):
                     start = verify_start + int(valid_end)
                     if start < kv_len:
-                        cache.keys[bi, :, start:kv_len, :] = 0
-                        cache.values[bi, :, start:kv_len, :] = 0
+                        zero_row_tail = getattr(cache, "zero_row_tail", None)
+                        if callable(zero_row_tail):
+                            zero_row_tail(bi, start, kv_len)
+                        else:
+                            cache.keys[bi, :, start:kv_len, :] = 0
+                            cache.values[bi, :, start:kv_len, :] = 0
 
         return max_a
 

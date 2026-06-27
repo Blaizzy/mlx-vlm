@@ -94,6 +94,7 @@ MODEL_CONFIG = {
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
+    "moondream2": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,

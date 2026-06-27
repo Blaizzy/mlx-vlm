@@ -1102,9 +1102,7 @@ async def responses_endpoint(request: Request):
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1376,8 +1374,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
                 msg["name"] = message.name
-            if message.reasoning is not None:
-                msg["reasoning"] = message.reasoning
+            if message.reasoning_content is not None:
+                msg["reasoning_content"] = message.reasoning_content
+                msg["reasoning"] = message.reasoning_content
 
             processed_messages.append(msg)
 
@@ -1461,8 +1460,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState.from_prompt(
-                            formatted_prompt,
+                        thinking_state = ThinkingStreamState(
                             gen_args.enable_thinking,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
@@ -1599,8 +1597,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState.from_prompt(
-                            formatted_prompt,
+                        thinking_state = ThinkingStreamState(
                             gen_args.enable_thinking,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
@@ -1736,9 +1733,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
