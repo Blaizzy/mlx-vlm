@@ -7,6 +7,12 @@ tool_call_end = "<tool_call|>"
 
 _ESCAPE = '<|"|>'
 
+# Character class for a (possibly namespaced) tool/function name. Defined once
+# because every regex that recognizes a name must accept the same characters;
+# letting them drift is how bare namespaced names (e.g. ``mcp.calendar:get``)
+# silently regressed after the ``call:``-prefixed paths gained ``.``/``:`` support.
+_NAME_CHARS = r"[\w.:-]+"
+
 
 def _find_matching_brace(text, start):
     """Find the index of the closing '}' that matches the '{' at *start*,
@@ -142,7 +148,7 @@ def _parse_array(text):
 # match the balanced outer braces (handles arbitrary nesting).
 # Function name accepts common namespaced tool ids used by MCP and agents.
 _tool_call_regex = re.compile(
-    r"call:([\w.:-]+)(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
+    r"call:(" + _NAME_CHARS + r")(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
 )
 
 
@@ -152,14 +158,14 @@ def parse_tool_call(text, tools=None):
     )
     if text.startswith(":"):
         text = f"call{text}"
-    elif not text.startswith("call:") and re.match(r"^[\w-]+\{", text):
+    elif not text.startswith("call:") and re.match(r"^" + _NAME_CHARS + r"\{", text):
         text = f"call:{text}"
 
     # Try recursive-group regex first for well-formed calls
     match = _tool_call_regex.search(text)
     if not match:
         # Fallback: find 'call:<name>{' and then balance braces manually
-        m = re.search(r"call:([\w.:-]+)\{", text)
+        m = re.search(r"call:(" + _NAME_CHARS + r")\{", text)
         if not m:
             raise ValueError("No function call found in tool call text.")
         func_name = m.group(1)

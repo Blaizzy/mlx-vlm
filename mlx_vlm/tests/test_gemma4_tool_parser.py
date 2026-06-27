@@ -87,6 +87,31 @@ class TestGemma4ToolParser(unittest.TestCase):
         args = json.loads(result["arguments"])
         self.assertEqual(args, {"limit": 5})
 
+    # ── bare namespaced names (no ``call:`` prefix) ───────────────────────
+    # The ``call:``-prefixed paths accept ``.``/``:`` in names, but the
+    # bare-name normalization that re-adds a missing ``call:`` prefix must
+    # recognize the same character set, otherwise a namespaced name emitted
+    # without the prefix fails to parse.
+
+    def test_bare_dotted_namespaced_name(self):
+        result = parse_tool_call("mcp.calendar{limit:5}")
+        self.assertEqual(result["name"], "mcp.calendar")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"limit": 5})
+
+    def test_bare_colon_namespaced_name(self):
+        text = _wrap(f"google-workspace:list_events{{action:{_str('list_events')}}}")
+        result = parse_tool_call(text)
+        self.assertEqual(result["name"], "google-workspace:list_events")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"action": "list_events"})
+
+    def test_bare_dotted_and_colon_namespaced_name(self):
+        result = parse_tool_call("mcp.calendar:list_events{limit:5}")
+        self.assertEqual(result["name"], "mcp.calendar:list_events")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"limit": 5})
+
     # ── arguments type ────────────────────────────────────────────────────
 
     def test_arguments_is_json_string(self):
