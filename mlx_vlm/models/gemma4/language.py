@@ -474,6 +474,8 @@ class Gemma4TextModel(nn.Module):
             return base_mask
         if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
             return base_mask
+        if base_mask.shape[-2] != base_mask.shape[-1]:
+            return base_mask
 
         block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
         q_blocks = mx.expand_dims(block_sequence_ids, -1)
@@ -786,8 +788,12 @@ class LanguageModel(nn.Module):
                 for bi in range(accepted.shape[0]):
                     start = verify_start + int(ve[bi])
                     if start < kv_len:
-                        c.keys[bi, :, start:kv_len, :] = 0
-                        c.values[bi, :, start:kv_len, :] = 0
+                        zero_row_tail = getattr(c, "zero_row_tail", None)
+                        if callable(zero_row_tail):
+                            zero_row_tail(bi, start, kv_len)
+                        else:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
         return max_a
 
     def sanitize(self, weights):

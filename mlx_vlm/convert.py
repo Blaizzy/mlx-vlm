@@ -171,8 +171,20 @@ def convert(
             return model_quant_predicate(path, module)
         return True
 
+    # TODO: Remove once all LM models are migrated
+    # Text-only models wrap the real mlx-lm model under `language_model._model`.
+    # nn.Module.parameters() can't reach that underscore child, so dtype-cast,
+    # quantization, and save_weights must operate on the inner model -- the same
+    # one load_model quantizes (see utils.load_model). Otherwise convert writes
+    # an empty safetensors and mixed-bit per-layer keys don't match on reload.
+    target = (
+        model.language_model._model
+        if getattr(model, "_is_text_model", False)
+        else model
+    )
+
     if isinstance(quant_predicate, str):
-        quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
+        quant_predicate = mixed_quant_predicate_builder(quant_predicate, target)
 
     quant_predicate = quant_predicate or base_quant_predicate
 
@@ -191,7 +203,7 @@ def convert(
             else:
                 return v
 
-        model.update(tree_map_with_path(set_dtype, model.parameters()))
+        target.update(tree_map_with_path(set_dtype, target.parameters()))
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
@@ -200,13 +212,13 @@ def convert(
         from mlx_lm.utils import quantize_model
 
         _preserve_existing_deepseek_v4_quantization(
-            config, model, q_group_size, q_bits, q_mode
+            config, target, q_group_size, q_bits, q_mode
         )
 
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
-        model, config = quantize_model(
-            model,
+        target, config = quantize_model(
+            target,
             config,
             q_group_size,
             q_bits,
@@ -218,12 +230,12 @@ def convert(
         from mlx_lm.utils import dequantize_model
 
         print("[INFO] Dequantizing")
-        model = dequantize_model(model)
+        target = dequantize_model(target)
 
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
 
-    save_weights(mlx_path, model, donate_weights=True)
+    save_weights(mlx_path, target, donate_weights=True)
 
     # Copy Python and JSON files from the model path to the MLX path
     for pattern in ["*.py", "*.json"]:

@@ -479,6 +479,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+    strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
@@ -655,7 +656,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
@@ -1887,7 +1888,7 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
         self.tokenizer = tokenizer
 

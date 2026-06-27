@@ -47,7 +47,25 @@ def main():
         "--model",
         type=str,
         default=None,
-        help="Pre-load a model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
+        help="Pre-load a language model at startup (e.g. mlx-community/Qwen2.5-VL-3B-Instruct-4bit).",
+    )
+    parser.add_argument(
+        "--image-model",
+        type=str,
+        default=None,
+        help="Pre-load an image generation model at startup.",
+    )
+    parser.add_argument(
+        "--tts-model",
+        type=str,
+        default=None,
+        help="Pre-load a text-to-speech model at startup.",
+    )
+    parser.add_argument(
+        "--stt-model",
+        type=str,
+        default=None,
+        help="Pre-load a speech-to-text model at startup.",
     )
     parser.add_argument(
         "--adapter-path",
@@ -175,6 +193,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help=(
+            "Optional bearer token required for management endpoints such as "
+            "/health, /metrics, /cache/stats, /cache/reset, and /unload. "
+            "Maps to the MLX_VLM_SERVER_API_KEY env var."
+        ),
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -194,13 +222,19 @@ def main():
         os.environ["MLX_VLM_PRELOAD_MODEL"] = args.model
         if args.adapter_path:
             os.environ["MLX_VLM_PRELOAD_ADAPTER"] = args.adapter_path
+    if args.image_model:
+        os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] = args.image_model
+    if args.tts_model:
+        os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] = args.tts_model
+    if args.stt_model:
+        os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
-        if args.draft_kind is not None:
-            os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
-        if args.draft_block_size is not None:
-            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.draft_kind is not None:
+        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+    if args.draft_block_size is not None:
+        os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
@@ -220,6 +254,8 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+    if args.api_key:
+        os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

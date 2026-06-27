@@ -2,6 +2,7 @@ import asyncio
 import gc
 import logging
 import os
+import secrets
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -54,8 +55,29 @@ from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
 
 logger = logging.getLogger("mlx_vlm.server")
+
+
+def _server_api_key() -> Optional[str]:
+    key = os.environ.get(SERVER_API_KEY_ENV)
+    return key if key else None
+
+
+def _require_management_api_key(request: Request) -> None:
+    api_key = _server_api_key()
+    if api_key is None:
+        return
+
+    expected = f"Bearer {api_key}"
+    supplied = request.headers.get("Authorization", "")
+    if not secrets.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def _cache_group_for_cache(cache: dict) -> str:
@@ -421,15 +443,46 @@ def load_audio_model(model_path: str):
 @asynccontextmanager
 async def lifespan(app):
     model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
+    adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
     if model_path:
-        adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-        logger.info("Pre-loading model: %s", model_path)
-        get_cached_model(model_path, adapter_path)
+        logger.info("Pre-loading language model: %s", model_path)
+        get_cached_model(model_path, adapter_path, model_kind="text_generation")
         kv_bits = os.environ.get("KV_BITS")
         kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
         if kv_bits:
             logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Model ready, continuous batching enabled.")
+        logger.info("Language model ready, continuous batching enabled.")
+
+    preload_models = (
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
+            None,
+            "image_generation",
+            "image generation model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_TTS_MODEL", None),
+            None,
+            "audio_tts",
+            "text-to-speech model",
+        ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_STT_MODEL", None),
+            None,
+            "audio_stt",
+            "speech-to-text model",
+        ),
+    )
+    for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
+        if not preload_model_path:
+            continue
+        logger.info("Pre-loading %s: %s", label, preload_model_path)
+        get_cached_model(
+            preload_model_path,
+            preload_adapter_path,
+            model_kind=model_kind,
+        )
+        logger.info("%s ready.", label.capitalize())
     try:
         yield
     finally:
@@ -530,7 +583,7 @@ def get_cached_model(
         effective_model_kind = "image_generation"
     else:
         cache_group = "text_generation"
-        effective_model_kind = model_kind
+        effective_model_kind = "text_generation" if model_kind == "auto" else model_kind
 
     registry = _model_cache_registry()
     if adapter_path is _INHERIT_ADAPTER:
@@ -841,10 +894,11 @@ async def add_server_header(request: Request, call_next):
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(request: Request):
     """
     Check if the server is healthy and what model is loaded.
     """
+    _require_management_api_key(request)
     runtime = _server_runtime_snapshot()
     return {
         "status": "healthy",
@@ -862,7 +916,8 @@ async def health_check():
 
 @app.get("/metrics")
 @app.get("/v1/metrics", include_in_schema=False)
-async def metrics_endpoint():
+async def metrics_endpoint(request: Request):
+    _require_management_api_key(request)
     payload = runtime.metrics.snapshot()
     payload["server"] = _server_runtime_snapshot()
     return payload
@@ -870,8 +925,9 @@ async def metrics_endpoint():
 
 @app.get("/v1/cache/stats")
 @app.get("/cache/stats", include_in_schema=False)
-async def apc_cache_stats():
+async def apc_cache_stats(request: Request):
     """Return Automatic Prefix Cache statistics (or ``enabled=false``)."""
+    _require_management_api_key(request)
     if runtime.apc_manager is None:
         return {"enabled": False}
     snap = runtime.apc_manager.stats_snapshot()
@@ -881,7 +937,8 @@ async def apc_cache_stats():
 
 @app.post("/v1/cache/reset")
 @app.post("/cache/reset", include_in_schema=False)
-async def apc_cache_reset():
+async def apc_cache_reset(request: Request):
+    _require_management_api_key(request)
     if runtime.apc_manager is None:
         return {"enabled": False}
     runtime.apc_manager.clear()
@@ -889,10 +946,11 @@ async def apc_cache_reset():
 
 
 @app.post("/unload")
-async def unload_model_endpoint():
+async def unload_model_endpoint(request: Request):
     """
     Unload the currently loaded model from memory.
     """
+    _require_management_api_key(request)
     snapshot = _server_runtime_snapshot()
     unloaded_info = {
         "model_name": snapshot["loaded_model"],

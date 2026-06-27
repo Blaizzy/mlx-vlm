@@ -4190,6 +4190,60 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_moondream2(self):
+        from mlx_vlm.models import moondream2
+
+        text_config = moondream2.TextConfig(
+            model_type="moondream2",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            vocab_size=256,
+            partial_rotary_factor=0.5,
+            rms_norm_eps=1e-5,
+        )
+
+        vision_config = moondream2.VisionConfig(
+            model_type="moondream2_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            patch_size=14,
+            crop_size=28,
+            in_channels=3,
+            proj_inner_dim=64,
+            proj_out_dim=64,
+            attention_bias=True,
+            layer_norm_eps=1e-5,
+        )
+
+        config = moondream2.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="moondream2",
+        )
+        model = moondream2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            text_config.model_type,
+            text_config.vocab_size,
+            text_config.num_hidden_layers,
+        )
+
+        batch_size = 1
+        crop_size = vision_config.crop_size
+        pixel_values = mx.random.uniform(shape=(batch_size, crop_size, crop_size, 3))
+        features = model.vision.encoder(pixel_values)
+        grid_size = crop_size // vision_config.patch_size
+        num_patches = grid_size * grid_size
+        self.assertEqual(
+            features.shape, (batch_size, num_patches, vision_config.hidden_size)
+        )
+
     def test_moondream3(self):
         from mlx_vlm.models import moondream3
 
@@ -7717,3 +7771,212 @@ class TestRTDetrV2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKimiK25VideoVision(unittest.TestCase):
+    """kimi_k25 MoonViT tower: a 3-col (t, h, w) video grid must run end to end
+    (temporal pos-emb, t-tiled RoPE, t*h*w cu_seqlens, block-diagonal attention,
+    temporal pooling) while the 2-col (h, w) image path stays unchanged."""
+
+    P, C, EMBED, HEADS = 4, 3, 64, 4
+
+    @classmethod
+    def _tower(cls, seed=0):
+        from mlx_vlm.models.kimi_k25.config import VisionConfig
+        from mlx_vlm.models.kimi_k25.vision import VisionModel
+
+        cfg = VisionConfig(
+            depth=2,
+            embed_dim=cls.EMBED,
+            hidden_size=cls.EMBED,
+            num_heads=cls.HEADS,
+            patch_size=cls.P,
+            num_channels=cls.C,
+            init_pos_emb_height=8,
+            intermediate_size=128,
+            spatial_merge_size=2,
+        )
+        cfg.merge_kernel_size = (2, 2)
+        mx.random.seed(seed)
+        vm = VisionModel(cfg)
+        mx.eval(vm.parameters())
+        return vm
+
+    @classmethod
+    def _pixels(cls, n, seed=123):
+        mx.random.seed(seed)
+        return mx.random.normal((n, cls.P, cls.P, cls.C))
+
+    def test_image_path_unchanged(self):
+        # New block-diagonal attention must equal the old full [1, seq, seq]-mask
+        # attention for a single segment (the image case).
+        from mlx_vlm.models.kimi_k25.vision import Attention, apply_rope
+
+        vm = self._tower()
+        att = Attention(self.EMBED, self.HEADS)
+        mx.eval(att.parameters())
+        n = 16
+        mx.random.seed(7)
+        x = mx.random.normal((n, self.EMBED))
+        rope = vm.rope_pos_emb.get_freqs_cis(mx.array([[4, 4]]))
+        cu = mx.array([0, n], dtype=mx.int32)
+
+        def old_full_mask(att, x, cu, rope):
+            seq = x.shape[0]
+            qkv = att.wqkv(x).reshape(seq, 3, att.num_heads, att.head_dim)
+            q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+            q, k = apply_rope(q, k, rope)
+            mask = mx.zeros((1, seq, seq), dtype=x.dtype)
+            for i in range(1, len(cu)):
+                s, e = int(cu[i - 1]), int(cu[i])
+                mask[..., s:e, s:e] = 1
+            q, k, v = (z.transpose(1, 0, 2) for z in (q, k, v))
+            aw = q @ k.swapaxes(-2, -1) / mx.sqrt(q.shape[-1])
+            aw = mx.softmax(aw + mask, axis=-1).astype(q.dtype)
+            return att.wo((aw @ v).transpose(1, 0, 2).reshape(seq, -1))
+
+        self.assertTrue(
+            mx.allclose(att(x, cu, rope), old_full_mask(att, x, cu, rope), atol=1e-5)
+        )
+
+    def test_video_grid_runs_and_image_still_works(self):
+        vm = self._tower()
+        img = vm(self._pixels(4 * 4), mx.array([[4, 4]]))
+        self.assertEqual(img[0].shape, (4, 4, self.EMBED))
+        vid = vm(self._pixels(2 * 4 * 4), mx.array([[2, 4, 4]]))
+        mx.eval(vid[0])
+        self.assertEqual(vid[0].shape, (4, 4, self.EMBED))
+        self.assertFalse(bool(mx.any(mx.isnan(vid[0]))))
+
+    def test_temporal_pool_collapses_frames(self):
+        # Merged token count must be independent of t (sd2_tpool over frames).
+        vm = self._tower()
+        counts = {
+            t: vm(self._pixels(t * 4 * 4), mx.array([[t, 4, 4]]))[0].shape[0]
+            for t in (1, 2, 4)
+        }
+        self.assertEqual(set(counts.values()), {(4 // 2) * (4 // 2)})
+
+    def test_block_diagonal_no_cross_chunk_leakage(self):
+        from mlx_vlm.models.kimi_k25.vision import Attention
+
+        vm = self._tower()
+        att = Attention(self.EMBED, self.HEADS)
+        mx.eval(att.parameters())
+        n_a = n_b = 8
+        cu = mx.array([0, n_a, n_a + n_b], dtype=mx.int32)
+        rope = vm.rope_pos_emb.get_freqs_cis(mx.array([[2, 4], [2, 4]]))
+        mx.random.seed(9)
+        x = mx.random.normal((n_a + n_b, self.EMBED))
+        out_b = att(x, cu, rope)[n_a:]
+        xp = mx.array(x)
+        xp[:n_a] = mx.random.normal((n_a, self.EMBED))
+        out_b_perturbed = att(xp, cu, rope)[n_a:]
+        self.assertTrue(mx.allclose(out_b, out_b_perturbed, atol=1e-6))
+
+
+class TestDeepseekV4HISA(unittest.TestCase):
+    """HISA hierarchical indexer (deepseek_v4): block-coarse -> token-fine
+    selection must match the flat top-k scan in the keep-all limit and recover
+    most of the top-k when relevance is block-clustered."""
+
+    @staticmethod
+    def _indexer(
+        index_block,
+        index_keep,
+        index_topk=32,
+        n_heads=8,
+        head_dim=64,
+        hidden=256,
+        q_lora_rank=64,
+        seed=0,
+    ):
+        from mlx_vlm.models.deepseek_v4.config import ModelConfig
+        from mlx_vlm.models.deepseek_v4.language import Indexer
+
+        mx.random.seed(seed)
+        cfg = ModelConfig(
+            hidden_size=hidden,
+            q_lora_rank=q_lora_rank,
+            index_n_heads=n_heads,
+            index_head_dim=head_dim,
+            index_topk=index_topk,
+            index_block=index_block,
+            index_keep=index_keep,
+        )
+        ix = Indexer(cfg, compress_ratio=4)
+        mx.eval(ix.parameters())
+        return ix
+
+    @staticmethod
+    def _flat_select(ix, q, pooled, x, k):
+        f32 = mx.float32
+        s = mx.maximum(q.astype(f32) @ pooled[:, None].swapaxes(-1, -2).astype(f32), 0)
+        s = s * ix.scale
+        w = ix.weights_proj(x).astype(f32) * (ix.n_heads**-0.5)
+        s = (s * w.swapaxes(-1, -2)[..., None]).sum(axis=1)
+        return mx.argpartition(-s, kth=k - 1, axis=-1)[..., :k]
+
+    @staticmethod
+    def _recall(a, b, k):
+        a, b = a.reshape(-1, k).tolist(), b.reshape(-1, k).tolist()
+        return sum(len(set(x) & set(y)) for x, y in zip(a, b)) / (len(a) * k)
+
+    def test_hisa_equals_flat_when_all_blocks_kept(self):
+        Np, block = 512, 64
+        ix = self._indexer(index_block=block, index_keep=Np // block, index_topk=32)
+        mx.random.seed(1)
+        q = mx.random.normal((2, ix.n_heads, 1, ix.head_dim))
+        pooled = mx.random.normal((2, Np, ix.head_dim))
+        x = mx.random.normal((2, 1, 256))
+        k = min(ix.index_topk, Np)
+        hisa = ix._hisa_select(q, pooled, x, k)
+        flat = self._flat_select(ix, q, pooled, x, k)
+        self.assertEqual(self._recall(hisa, flat, k), 1.0)
+
+    def test_hisa_shape_and_valid_indices(self):
+        Np = 2048
+        ix = self._indexer(index_block=64, index_keep=8, index_topk=32)
+        mx.random.seed(1)
+        q = mx.random.normal((2, ix.n_heads, 1, ix.head_dim))
+        pooled = mx.random.normal((2, Np, ix.head_dim))
+        x = mx.random.normal((2, 1, 256))
+        k = min(ix.index_topk, Np)
+        out = ix._hisa_select(q, pooled, x, k)
+        self.assertEqual(out.shape, (2, 1, k))
+        self.assertGreaterEqual(int(out.min()), 0)
+        self.assertLess(int(out.max()), Np)
+
+    def test_hisa_high_recall_on_clustered_prefix(self):
+        Np, block = 4096, 64
+        ix = self._indexer(index_block=block, index_keep=8, index_topk=64)
+        mx.random.seed(1)
+        nb = Np // block
+        dc = mx.random.normal((nb, 1, ix.head_dim)) * 2.0
+        pooled = (dc + mx.random.normal((nb, block, ix.head_dim))).reshape(
+            1, Np, ix.head_dim
+        )
+        q = mx.random.normal((1, ix.n_heads, 1, ix.head_dim))
+        x = mx.random.normal((1, 1, 256))
+        k = ix.index_topk
+        r = self._recall(
+            ix._hisa_select(q, pooled, x, k), self._flat_select(ix, q, pooled, x, k), k
+        )
+        self.assertGreaterEqual(r, 0.7)
+
+    def test_hisa_batched_l_gt_1_matches_flat(self):
+        # L>1 batched HISA (hisa_kernel.hisa_select): keep-all must return the
+        # exact flat per-query top-k for every query position.
+        from mlx_vlm.models.deepseek_v4.hisa_kernel import hisa_select
+
+        mx.random.seed(2)
+        H, Dh, Np, k, block = 8, 64, 512, 16, 64
+        scale = Dh**-0.5
+        q = mx.random.normal((1, H, 4, Dh))  # L = 4 queries
+        pooled = mx.random.normal((1, Np, Dh))
+        weights = mx.random.normal((1, 4, H)) * (H**-0.5)
+        out = hisa_select(q, pooled, weights, scale, k, block, index_keep=Np // block)
+        wk_h = (weights * scale).transpose(0, 2, 1)[..., None]
+        flat = (mx.maximum(q @ pooled[:, None].swapaxes(-1, -2), 0) * wk_h).sum(1)
+        ftk = mx.argpartition(-flat, kth=k - 1, axis=-1)[..., :k]
+        self.assertTrue(bool(mx.array_equal(mx.sort(out, -1), mx.sort(ftk, -1))))
