@@ -124,6 +124,7 @@ def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
         "temperature": 1.0,
         "top_p": 0.95,
         "top_k": 64,
+        "min_p": 0.02,
         "max_new_tokens": 4096,
     }
     (tmp_path / "config.json").write_text(
@@ -143,6 +144,7 @@ def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
     assert config["temperature"] == 1.0
     assert config["top_p"] == 0.95
     assert config["top_k"] == 64
+    assert config["min_p"] == 0.02
     assert "max_new_tokens" not in config
 
 
@@ -156,6 +158,7 @@ def test_apply_generation_config_defaults_preserves_model_config_signature():
             "temperature": 1.0,
             "top_p": 0.95,
             "top_k": 64,
+            "min_p": 0.02,
             "do_sample": True,
             "max_new_tokens": 4096,
         },
@@ -164,6 +167,7 @@ def test_apply_generation_config_defaults_preserves_model_config_signature():
     assert model_config.temperature == 1.0
     assert model_config.top_p == 0.95
     assert model_config.top_k == 64
+    assert model_config.min_p == 0.02
     assert model_config.do_sample is True
     assert not hasattr(model_config, "max_new_tokens")
 

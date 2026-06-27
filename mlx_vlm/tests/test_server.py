@@ -204,6 +204,25 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
     assert batched.tolist() == [single_0.item(), single_1.item()]
 
 
+def test_make_sampler_forwards_top_k_min_p_and_seed():
+    """Regression: the batched path dropped per-request top_k/min_p because
+    _make_sampler built the positioned sampler from temperature/top_p/seed
+    only, even though GenerationArguments carried all five knobs."""
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    args = server_generation.GenerationArguments(
+        temperature=0.8, top_p=0.9, top_k=5, min_p=0.25, seed=11
+    )
+
+    sampler = gen._make_sampler(args)
+
+    assert isinstance(sampler, server_generation._PositionedTargetSampler)
+    assert sampler.temperature == 0.8
+    assert sampler.top_p == 0.9
+    assert sampler.top_k == 5
+    assert sampler.min_p == 0.25
+    assert sampler.seed == 11
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")
@@ -4363,6 +4382,41 @@ class TestResponseGenerator:
         assert args.temperature == 0.0
         assert args.top_p == 1.0
         assert args.top_k == 0
+
+    def test_build_gen_args_min_p_default_from_model_generation_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(min_p=0.05),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.min_p == 0.05
+
+    def test_build_gen_args_request_min_p_overrides_model_generation_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(min_p=0.05),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            min_p=0.0,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.min_p == 0.0
 
     def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
         req = server.ChatRequest(
