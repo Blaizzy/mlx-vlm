@@ -1,0 +1,14 @@
+{
+  "name": "mlx-vlm-skills",
+  "description": "Skills for MLX-VLM CLI inference, server inference, HF cache model listing, and reproducible GitHub issues.",
+  "version": "0.1.0",
+  "author": {
+    "name": "MLX-VLM contributors"
+  },
+  "keywords": [
+    "mlx",
+    "mlx-vlm",
+    "vision-language-models",
+    "apple-silicon"
+  ]
+}
