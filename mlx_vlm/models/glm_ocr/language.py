@@ -400,6 +400,10 @@ class LanguageModel(nn.Module):
                         spatial_merge_size
                     )
 
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 position_ids_np[:, batch_idx, valid_indices] = llm_positions
                 mrope_position_deltas.append(
