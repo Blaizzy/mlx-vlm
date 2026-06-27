@@ -575,6 +575,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                     model_class.AudioModel, weights, model_config.audio_config
                 )
 
+    _lm = getattr(model, "language_model", None)
+    _is_unused = getattr(_lm, "_is_unused_shared_kv_weight", None)
+    if callable(_is_unused):
+        weights = {k: v for k, v in weights.items() if not _is_unused(k)}
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
         if quantization_config is None:

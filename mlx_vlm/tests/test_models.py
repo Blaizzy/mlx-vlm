@@ -3230,6 +3230,101 @@ class TestModels(unittest.TestCase):
             "language_model.model.layers.3.self_attn.v_proj.weight", weights
         )
 
+    def test_gemma4_kv_shared_mlx_format_load(self):
+        # #1416: mlx-format load skips sanitize; load_model must still drop
+        # unused KV-shared weights or strict load_weights fails.
+        import tempfile
+        from pathlib import Path
+
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import gemma4
+        from mlx_vlm.utils import load_model, save_config
+
+        text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=64,
+            vocab_size_per_layer_input=64,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            layer_types=["sliding_attention"] * 4,
+            sliding_window=32,
+            final_logit_softcapping=30.0,
+        )
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=2,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        config = gemma4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="gemma4",
+            vocab_size=64,
+            image_token_id=63,
+            audio_config=None,
+        )
+        model = gemma4.Model(config)
+        mx.eval(model.parameters())
+
+        first_shared = text_config.num_hidden_layers - text_config.num_kv_shared_layers
+        shared_attn = model.language_model.model.layers[first_shared].self_attn
+        self.assertTrue(getattr(shared_attn, "is_kv_shared_layer", False))
+        self.assertFalse(hasattr(shared_attn, "k_proj"))
+
+        weights = dict(tree_flatten(model.parameters()))
+        n_kv, hd = text_config.num_key_value_heads, text_config.head_dim
+        for i in range(first_shared, text_config.num_hidden_layers):
+            base = f"language_model.model.layers.{i}.self_attn."
+            weights[base + "k_proj.weight"] = mx.zeros(
+                (n_kv * hd, text_config.hidden_size)
+            )
+            weights[base + "v_proj.weight"] = mx.zeros(
+                (n_kv * hd, text_config.hidden_size)
+            )
+            weights[base + "k_norm.weight"] = mx.zeros((hd,))
+
+        config_dict = {
+            "model_type": "gemma4",
+            "vocab_size": config.vocab_size,
+            "image_token_id": config.image_token_id,
+            "audio_config": None,
+            "text_config": vars(text_config).copy(),
+            "vision_config": vars(vision_config).copy(),
+        }
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            model_path = Path(model_dir)
+            mx.save_safetensors(
+                str(model_path / "model.safetensors"),
+                weights,
+                metadata={"format": "mlx"},
+            )
+            save_config(config_dict, model_path / "config.json")
+            loaded = load_model(model_path)  # must not raise
+
+        logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32)).logits
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 3, config.vocab_size))
+
     def test_gemma4_unified(self):
         import tempfile
         from pathlib import Path
