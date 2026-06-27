@@ -43,6 +43,8 @@ class ModelConfig(BaseModelConfig):
     index_n_heads: int = 64
     index_head_dim: int = 128
     index_topk: int = 512
+    index_block: int = 64  # HISA
+    index_keep: int = 16  # HISA
     num_nextn_predict_layers: int = 1
     tie_word_embeddings: bool = False
     bos_token_id: Optional[int] = None

@@ -782,6 +782,8 @@ async def responses_endpoint(request: Request):
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if chat_tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -1372,8 +1374,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
                 msg["name"] = message.name
-            if message.reasoning is not None:
-                msg["reasoning"] = message.reasoning
+            if message.reasoning_content is not None:
+                msg["reasoning_content"] = message.reasoning_content
+                msg["reasoning"] = message.reasoning_content
 
             processed_messages.append(msg)
 
@@ -1388,6 +1391,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         formatted_prompt = apply_chat_template(
             processor,
