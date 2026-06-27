@@ -380,6 +380,33 @@ class DecoderModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_conditioning = SelfConditioning(config)
 
+    @property
+    def prefers_logits_self_conditioning(self) -> bool:
+        return isinstance(self.embed_tokens, nn.QuantizedEmbedding)
+
+    def diffusion_prepare_self_conditioning(self) -> Optional[mx.array]:
+        if self.prefers_logits_self_conditioning:
+            return None
+        return self.embed_tokens.weight
+
+    def diffusion_self_conditioning(
+        self,
+        processed_logits: mx.array,
+        embedding_weight: Optional[mx.array],
+    ) -> mx.array:
+        if self.prefers_logits_self_conditioning:
+            return processed_logits
+        # Match the HF generation path: self-conditioning logits are stored in
+        # the embedding dtype before the next decoder softmax.
+        probs = mx.softmax(
+            processed_logits.astype(embedding_weight.dtype),
+            axis=-1,
+            precise=True,
+        )
+        return (probs.astype(embedding_weight.dtype) @ embedding_weight).astype(
+            embedding_weight.dtype
+        ) * self.embed_scale
+
     def _embed_canvas(
         self,
         canvas_ids,
@@ -741,6 +768,58 @@ class DiffusionGemma4Backbone(nn.Module):
         self.decoder = DecoderModel(config.text_config)
         self.encoder = EncoderModel(config, self.decoder)
 
+    def diffusion_prefill_cache(
+        self,
+        input_ids: mx.array,
+        *,
+        attention_mask: Optional[mx.array],
+        cache,
+        pixel_values: Optional[mx.array],
+        mm_token_type_ids: Optional[mx.array],
+        prefill_step_size: Optional[int],
+        chunk_prefill: bool,
+    ):
+        if not chunk_prefill:
+            _, cache = self.encoder(
+                input_ids,
+                attention_mask=attention_mask,
+                cache=cache,
+                pixel_values=pixel_values,
+                mm_token_type_ids=mm_token_type_ids,
+            )
+            return cache
+
+        for start in range(0, input_ids.shape[1], prefill_step_size):
+            end = min(start + prefill_step_size, input_ids.shape[1])
+            _, cache = self.encoder(
+                input_ids[:, start:end],
+                attention_mask=None,
+                cache=cache,
+            )
+            mx.eval([c.state for c in cache])
+            mx.clear_cache()
+        return cache
+
+    def diffusion_update_cache(self, input_ids: mx.array, *, cache):
+        _, cache = self.encoder(
+            input_ids,
+            attention_mask=None,
+            cache=cache,
+        )
+        return cache
+
+    def diffusion_decoder_masks(
+        self,
+        canvas_ids: mx.array,
+        cache,
+        decoder_attention_mask: Optional[mx.array],
+    ):
+        return self.decoder._make_decoder_masks(
+            canvas_ids[..., None],
+            cache,
+            decoder_attention_mask,
+        )
+
     def __call__(
         self,
         input_ids: Optional[mx.array] = None,
@@ -811,6 +890,80 @@ class LanguageModel(nn.Module):
         del input_ids, inputs_embeds, prompt_cache, draft_model, draft_kind
         return self.model.encoder.chunked_prefill_policy(prefill_kwargs=prefill_kwargs)
 
+    @property
+    def prefers_logits_self_conditioning(self) -> bool:
+        return self.model.decoder.prefers_logits_self_conditioning
+
+    def diffusion_prepare_self_conditioning(self) -> Optional[mx.array]:
+        return self.model.decoder.diffusion_prepare_self_conditioning()
+
+    def diffusion_self_conditioning(
+        self,
+        processed_logits: mx.array,
+        embedding_weight: Optional[mx.array],
+    ) -> mx.array:
+        return self.model.decoder.diffusion_self_conditioning(
+            processed_logits,
+            embedding_weight,
+        )
+
+    def diffusion_prefill_cache(
+        self,
+        input_ids: mx.array,
+        *,
+        attention_mask: Optional[mx.array],
+        cache,
+        pixel_values: Optional[mx.array],
+        mm_token_type_ids: Optional[mx.array],
+        prefill_step_size: Optional[int],
+        chunk_prefill: bool,
+    ):
+        return self.model.diffusion_prefill_cache(
+            input_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
+            prefill_step_size=prefill_step_size,
+            chunk_prefill=chunk_prefill,
+        )
+
+    def diffusion_update_cache(self, input_ids: mx.array, *, cache):
+        return self.model.diffusion_update_cache(input_ids, cache=cache)
+
+    def diffusion_decoder_masks(
+        self,
+        canvas_ids: mx.array,
+        cache,
+        decoder_attention_mask: Optional[mx.array],
+    ):
+        return self.model.diffusion_decoder_masks(
+            canvas_ids,
+            cache,
+            decoder_attention_mask,
+        )
+
+    def diffusion_decoder_logits(
+        self,
+        canvas_ids: mx.array,
+        cache=None,
+        self_conditioning: Optional[mx.array] = None,
+        decoder_attention_mask: Optional[mx.array] = None,
+    ):
+        kwargs = (
+            {"self_conditioning_logits": self_conditioning}
+            if self.prefers_logits_self_conditioning
+            else {"self_conditioning_embeddings": self_conditioning}
+        )
+        hidden_states = self.model.decoder(
+            canvas_ids,
+            cache=cache,
+            decoder_attention_mask=decoder_attention_mask,
+            **kwargs,
+        )
+        logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
+        return self._softcap(logits)
+
     def __call__(
         self,
         input_ids: Optional[mx.array] = None,
@@ -840,8 +993,12 @@ class LanguageModel(nn.Module):
         def predicate(path, m):
             if not hasattr(m, "to_quantized"):
                 return False
-            if "router" in path or path.endswith(
-                ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+            if (
+                path.endswith(
+                    ("embed_tokens", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")
+                )
+                or ".self_attn." in path
+                or "router" in path
             ):
                 return {"group_size": 64, "bits": 8}
             return True
