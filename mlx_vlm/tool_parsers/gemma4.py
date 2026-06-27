@@ -148,10 +148,7 @@ _tool_call_regex = re.compile(
 
 def parse_tool_call(text, tools=None):
     text = (
-        text.strip()
-        .removeprefix(tool_call_start)
-        .removesuffix(tool_call_end)
-        .strip()
+        text.strip().removeprefix(tool_call_start).removesuffix(tool_call_end).strip()
     )
     if text.startswith(":"):
         text = f"call{text}"

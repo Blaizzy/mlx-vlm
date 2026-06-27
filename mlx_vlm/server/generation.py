@@ -1473,9 +1473,7 @@ class ResponseGenerator:
         def flush(tokens, finish_reason=None):
             nonlocal emitted_text, emitted_tokens
             text = (
-                tokenizer.decode(
-                    tokens, skip_special_tokens=args.skip_special_tokens
-                )
+                tokenizer.decode(tokens, skip_special_tokens=args.skip_special_tokens)
                 if tokens
                 else ""
             )

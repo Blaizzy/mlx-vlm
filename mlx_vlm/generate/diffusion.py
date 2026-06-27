@@ -4,7 +4,7 @@ import logging
 import os
 import shutil
 import time
-from typing import Any, Dict, Generator, List, Optional, Tuple
+from typing import Any, Dict, Generator, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

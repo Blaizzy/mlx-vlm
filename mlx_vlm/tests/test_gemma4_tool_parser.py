@@ -3,8 +3,8 @@
 import json
 import unittest
 
-from mlx_vlm.server.responses_state import process_tool_calls
 import mlx_vlm.tool_parsers.gemma4 as gemma4
+from mlx_vlm.server.responses_state import process_tool_calls
 from mlx_vlm.tool_parsers.gemma4 import parse_tool_call
 
 # Wire-format helpers
