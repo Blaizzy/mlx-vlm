@@ -1994,44 +1994,45 @@ class LanguageModel(nn.Module):
                 valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
             return valid_ends_mx
 
-        # Separate trimmable (KV) caches from SSM caches.
+        def _is_ssm_cache(c):
+            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
+
         ssm_caches = []
         for c in caches:
             if c is None:
                 continue
-            if c.is_trimmable():
-                if trim > 0:
-                    c.trim(trim)
-                right_trimmed = False
-                if is_batch and max_a > 0:
-                    extra_trim_list = [max_a - a for a in accepted_list]
-                    if any(extra_trim_list):
-                        prepare = getattr(c, "prepare", None)
-                        finalize = getattr(c, "finalize", None)
-                        if (
-                            c.keys is not None
-                            and callable(prepare)
-                            and callable(finalize)
-                        ):
-                            prepare(right_padding=extra_trim_list)
-                            finalize()
-                            right_trimmed = True
-                if (
-                    is_batch
-                    and not right_trimmed
-                    and hasattr(c, "_idx")
-                    and c.keys is not None
-                    and max_a > 0
-                ):
-                    kv_len = c._idx
-                    verify_start = kv_len - n
-                    for bi, ve in enumerate(valid_ends_list):
-                        start = verify_start + ve
-                        if start < kv_len:
+            if _is_ssm_cache(c):
+                ssm_caches.append(c)
+                continue
+            if c.is_trimmable() and trim > 0:
+                c.trim(trim)
+            right_trimmed = False
+            if is_batch and max_a > 0:
+                extra_trim_list = [max_a - a for a in accepted_list]
+                if any(extra_trim_list):
+                    prepare = getattr(c, "prepare", None)
+                    finalize = getattr(c, "finalize", None)
+                    if c.keys is not None and callable(prepare) and callable(finalize):
+                        prepare(right_padding=extra_trim_list)
+                        finalize()
+                        right_trimmed = True
+            if (
+                is_batch
+                and not right_trimmed
+                and hasattr(c, "_idx")
+                and c.keys is not None
+                and max_a > 0
+            ):
+                kv_len = c._idx
+                verify_start = kv_len - n
+                for bi, ve in enumerate(valid_ends_list):
+                    start = verify_start + ve
+                    if start < kv_len:
+                        if hasattr(c, "zero_row_tail"):
+                            c.zero_row_tail(bi, start, kv_len)
+                        else:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
-            else:
-                ssm_caches.append(c)
 
         if not ssm_caches:
             return max_a
@@ -2361,6 +2362,10 @@ class LanguageModel(nn.Module):
                     t_index = mx.broadcast_to(t_index, (3, text_len))
 
                     llm_pos_ids_list.append(t_index + st_idx)
+
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()

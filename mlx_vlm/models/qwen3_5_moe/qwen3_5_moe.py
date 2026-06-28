@@ -1,4 +1,3 @@
-import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
@@ -28,9 +27,13 @@ class Model(Qwen3_5Model):
             prefix = f"model.language_model.layers.{l}.mlp"
             # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
             gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+            mid = gate_up_weight.shape[-2] // 2
+            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
+                ..., :mid, :
+            ]
+            weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
+                ..., mid:, :
+            ]
             # down_proj
             weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                 f"{prefix}.experts.down_proj"

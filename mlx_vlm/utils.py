@@ -1929,7 +1929,7 @@ class StoppingCriteria:
             eos_token_ids = [eos_token_ids]
 
         if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids

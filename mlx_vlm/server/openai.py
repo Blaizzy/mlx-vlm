@@ -782,6 +782,8 @@ async def responses_endpoint(request: Request):
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if chat_tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -885,6 +887,13 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
+                    thinking_state = ThinkingStreamState(
+                        gen_args.enable_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    )
+                    reasoning_item_id = f"rs_{uuid.uuid4().hex}"
+                    streamed_reasoning = ""
 
                     if runtime.response_generator is not None:
                         # generate() blocks on _cpu_preprocess + queue.get;
@@ -911,8 +920,23 @@ async def responses_endpoint(request: Request):
                             if token is None:
                                 break
                             output_tokens += getattr(token, "token_count", 1)
-                            delta = token.text
-                            full_text += delta
+                            raw_delta = token.text
+                            full_text += raw_delta
+                            thinking_delta = thinking_state.feed(raw_delta)
+                            if thinking_delta.reasoning:
+                                streamed_reasoning += thinking_delta.reasoning
+                                yield _response_sse_event(
+                                    "response.reasoning_text.delta",
+                                    {
+                                        "type": "response.reasoning_text.delta",
+                                        "response_id": response_id,
+                                        "item_id": reasoning_item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": thinking_delta.reasoning,
+                                    },
+                                )
+                            delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
@@ -946,8 +970,23 @@ async def responses_endpoint(request: Request):
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
-                            delta = chunk.text
-                            full_text += delta
+                            raw_delta = chunk.text
+                            full_text += raw_delta
+                            thinking_delta = thinking_state.feed(raw_delta)
+                            if thinking_delta.reasoning:
+                                streamed_reasoning += thinking_delta.reasoning
+                                yield _response_sse_event(
+                                    "response.reasoning_text.delta",
+                                    {
+                                        "type": "response.reasoning_text.delta",
+                                        "response_id": response_id,
+                                        "item_id": reasoning_item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": thinking_delta.reasoning,
+                                    },
+                                )
+                            delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
@@ -973,11 +1012,29 @@ async def responses_endpoint(request: Request):
                             tool_registry,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            reasoning_item_id,
                         )
                     )
                     tool_output_items = [
-                        item for item in output_items if item.get("type") != "message"
+                        item
+                        for item in output_items
+                        if item.get("type") not in ("message", "reasoning")
                     ]
+                    reasoning_output_items = [
+                        item for item in output_items if item.get("type") == "reasoning"
+                    ]
+                    if streamed_reasoning:
+                        yield _response_sse_event(
+                            "response.reasoning_text.done",
+                            {
+                                "type": "response.reasoning_text.done",
+                                "response_id": response_id,
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": streamed_reasoning,
+                            },
+                        )
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -996,14 +1053,26 @@ async def responses_endpoint(request: Request):
                         role="assistant",
                         content=[final_content_part] if clean_text else [],
                     )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+                    message_output_items = [
+                        item for item in output_items if item.get("type") == "message"
+                    ]
+                    final_message_payload = (
+                        message_output_items[0]
+                        if message_output_items
+                        else final_message_item.model_dump()
+                    )
+                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_payload).model_dump_json()}\n\n"
 
                     completed_output = []
-                    if clean_text:
+                    completed_output.extend(reasoning_output_items)
+                    if message_output_items:
+                        completed_output.extend(message_output_items)
+                    elif clean_text:
                         completed_output.append(final_message_item.model_dump())
+                    tool_start_index = len(completed_output)
                     completed_output.extend(tool_output_items)
                     for output_index, tool_item in enumerate(
-                        tool_output_items, start=1
+                        tool_output_items, start=tool_start_index
                     ):
                         yield _response_sse_event(
                             "response.output_item.added",
@@ -1013,6 +1082,21 @@ async def responses_endpoint(request: Request):
                                 "item": tool_item,
                             },
                         )
+                        if tool_item.get("type") == "function_call":
+                            yield _response_sse_event(
+                                "response.function_call_arguments.done",
+                                {
+                                    "type": "response.function_call_arguments.done",
+                                    "response_id": response_id,
+                                    "item_id": tool_item.get("id")
+                                    or tool_item.get("call_id"),
+                                    "output_index": output_index,
+                                    "call_id": tool_item.get("call_id"),
+                                    "name": tool_item.get("name"),
+                                    "arguments": tool_item.get("arguments") or "{}",
+                                    "item": tool_item,
+                                },
+                            )
                         yield _response_sse_event(
                             "response.output_item.done",
                             {
@@ -1389,6 +1473,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         formatted_prompt = apply_chat_template(
             processor,

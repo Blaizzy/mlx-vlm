@@ -539,6 +539,13 @@ class LanguageModel(nn.Module):
                     text_pos_3d = mx.stack([text_pos, text_pos, text_pos], axis=0)
                     llm_pos_ids_list.append(text_pos_3d)
 
+                if not llm_pos_ids_list:
+                    batch_position_ids.append(
+                        mx.zeros((seq_length, 3), dtype=input_ids.dtype)
+                    )
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1)  # [3, seq_len]
                 batch_position_ids.append(llm_positions.T)  # [seq_len, 3]
                 mrope_position_deltas.append(llm_positions.max() + 1 - seq_length)

@@ -1157,9 +1157,8 @@ With more coming soon.
 
 #### Command Line
 ```sh
-mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
 ```
-
 
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
 

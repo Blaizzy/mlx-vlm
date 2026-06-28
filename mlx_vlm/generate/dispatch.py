@@ -261,8 +261,12 @@ def parse_arguments():
     parser.add_argument(
         "--diffusion-sampler",
         choices=["entropy-bound", "confidence-threshold"],
-        default="entropy-bound",
-        help="Canvas update sampler for diffusion generation.",
+        default="confidence-threshold",
+        help=(
+            "Canvas update sampler for diffusion generation. Use entropy-bound "
+            "for reference-style denoising; confidence-threshold is faster for "
+            "quantized block-diffusion checkpoints."
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -270,8 +274,9 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling; masked-diffusion "
-            "models use their checkpoint reference defaults."
+            f"Default: {DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD:g} for "
+            "confidence-threshold sampling; "
+            "masked-diffusion models use their checkpoint reference defaults."
         ),
     )
     parser.add_argument(
@@ -623,6 +628,7 @@ class PromptCacheState:
 
 from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
+    DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
@@ -1401,7 +1407,7 @@ def main():
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
         "diffusion_max_canvas_length": None,
-        "diffusion_sampler": "entropy-bound",
+        "diffusion_sampler": "confidence-threshold",
         "threshold": None,
         "min_threshold": None,
         "block_length": None,
