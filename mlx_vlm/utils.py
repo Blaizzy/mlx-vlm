@@ -913,12 +913,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
-        model_type = config["model_type"].lower()
-        if model_type.startswith("pp_ocrv6") and hasattr(
-            model_class.ImageProcessor, "from_pretrained"
-        ):
-            return model_class.ImageProcessor.from_pretrained(model_path)
-
         init_signature = inspect.signature(model_class.ImageProcessor.__init__)
 
         if "config" in init_signature.parameters:
@@ -932,11 +926,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-
-    config = load_config(model_path, **kwargs)
-    if config["model_type"].lower().startswith("pp_ocrv6"):
-        return load_image_processor(model_path, **kwargs)
-
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
