@@ -5,7 +5,7 @@ from typing import List
 
 import mlx.core as mx
 from PIL import Image, ImageOps
-from transformers import LlamaTokenizerFast
+from transformers import PreTrainedTokenizerFast
 
 from ..base import install_auto_processor_patch
 from ..deepseekocr.processing_deepseekocr import (
@@ -36,12 +36,12 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
 
         processor_config.pop("processor_class", None)
         processor_config.update(kwargs)
-        tokenizer = LlamaTokenizerFast.from_pretrained(path)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(path)
         return cls(tokenizer=tokenizer, **processor_config)
 
     def __init__(
         self,
-        tokenizer: LlamaTokenizerFast,
+        tokenizer: PreTrainedTokenizerFast,
         candidate_resolutions=((1024, 1024),),
         patch_size: int = 16,
         downsample_ratio: int = 4,

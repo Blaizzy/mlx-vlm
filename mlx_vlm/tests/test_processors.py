@@ -2236,6 +2236,38 @@ class TestUnlimitedOCRPatch(unittest.TestCase):
             "UnlimitedOCRProcessor",
         )
 
+    def test_from_pretrained_uses_pretrained_tokenizer_fast(self):
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.unlimited_ocr.processing_unlimitedocr import (
+            UnlimitedOCRProcessor,
+        )
+
+        tokenizer = _mock_tokenizer(
+            vocab={"<image>": 128815},
+            bos_token_id=1,
+            eos_token_id=2,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                patch(
+                    "mlx_vlm.models.unlimited_ocr.processing_unlimitedocr."
+                    "PreTrainedTokenizerFast.from_pretrained",
+                    return_value=tokenizer,
+                ) as from_pretrained,
+                patch.object(
+                    UnlimitedOCRProcessor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = UnlimitedOCRProcessor.from_pretrained(tmpdir)
+
+        from_pretrained.assert_called_once_with(Path(tmpdir))
+        self.assertIs(processor.tokenizer, tokenizer)
+
 
 class TestDeepseekV4Processor(unittest.TestCase):
     class MockTokenizer:
