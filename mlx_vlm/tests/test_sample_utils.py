@@ -1,8 +1,94 @@
+import math
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 
-from mlx_vlm.sample_utils import top_p_sampling
+from mlx_vlm.sample_utils import (
+    SlidingWindowNoRepeatNGramProcessor,
+    make_sliding_window_no_repeat_ngram_processor,
+    top_p_sampling,
+)
+
+
+class TestSlidingWindowNoRepeatNGramProcessor(unittest.TestCase):
+    def test_blocks_repeated_ngram_completion(self):
+        processor = SlidingWindowNoRepeatNGramProcessor(3, window_size=20)
+        logits = processor(
+            mx.array([10, 11, 12, 7, 10, 11], dtype=mx.int32),
+            mx.zeros([20]),
+        )
+        mx.eval(logits)
+
+        self.assertTrue(math.isinf(logits[12].item()))
+        self.assertEqual(logits[13].item(), 0)
+
+    def test_respects_sliding_window(self):
+        processor = SlidingWindowNoRepeatNGramProcessor(3, window_size=3)
+        logits = processor(
+            mx.array([10, 11, 12, 7, 10, 11], dtype=mx.int32),
+            mx.zeros([20]),
+        )
+        mx.eval(logits)
+
+        self.assertEqual(logits[12].item(), 0)
+
+    def test_respects_whitelist(self):
+        processor = SlidingWindowNoRepeatNGramProcessor(
+            3, window_size=20, whitelist_token_ids=[12]
+        )
+        logits = processor(
+            mx.array([10, 11, 12, 7, 10, 11], dtype=mx.int32),
+            mx.zeros([20]),
+        )
+        mx.eval(logits)
+
+        self.assertEqual(logits[12].item(), 0)
+
+    def test_batched_sequences_get_independent_bans(self):
+        processor = SlidingWindowNoRepeatNGramProcessor(3, window_size=20)
+        logits = processor(
+            mx.array(
+                [
+                    [10, 11, 12, 10, 11],
+                    [20, 21, 22, 20, 21],
+                ],
+                dtype=mx.int32,
+            ),
+            mx.zeros([2, 30]),
+        )
+        mx.eval(logits)
+
+        self.assertTrue(math.isinf(logits[0, 12].item()))
+        self.assertEqual(logits[0, 22].item(), 0)
+        self.assertTrue(math.isinf(logits[1, 22].item()))
+        self.assertEqual(logits[1, 12].item(), 0)
+
+
+class TestMakeSlidingWindowNoRepeatNGramProcessor(unittest.TestCase):
+    def test_unlimited_ocr_defaults_match_reference_inference(self):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="unlimited-ocr"))
+
+        single = make_sliding_window_no_repeat_ngram_processor(model, media=["page"])
+        multi = make_sliding_window_no_repeat_ngram_processor(
+            model, media=["page1", "page2"]
+        )
+
+        self.assertEqual(single.ngram_size, 35)
+        self.assertEqual(single.window_size, 128)
+        self.assertEqual(multi.ngram_size, 35)
+        self.assertEqual(multi.window_size, 1024)
+
+    def test_non_unlimited_model_requires_explicit_size(self):
+        model = SimpleNamespace(config=SimpleNamespace(model_type="other"))
+
+        self.assertIsNone(make_sliding_window_no_repeat_ngram_processor(model))
+
+        processor = make_sliding_window_no_repeat_ngram_processor(
+            model, no_repeat_ngram_size=4, ngram_window=16
+        )
+        self.assertEqual(processor.ngram_size, 4)
+        self.assertEqual(processor.window_size, 16)
 
 
 class TestTopPSampling(unittest.TestCase):

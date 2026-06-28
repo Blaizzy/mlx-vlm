@@ -26,6 +26,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.sample_utils import SlidingWindowNoRepeatNGramProcessor
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -1734,6 +1735,103 @@ def test_stream_generate_forwards_verbose_to_generate_step():
         )
 
     assert captured["verbose"] is True
+
+
+def test_stream_generate_adds_unlimited_ocr_no_repeat_processor_defaults():
+    captured = {}
+
+    class FakeStoppingCriteria:
+        def __call__(self, token):
+            return True
+
+    class FakeDetokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            pass
+
+        def finalize(self):
+            pass
+
+    def fake_generate_step(*args, **kwargs):
+        captured["processors"] = kwargs.get("logits_processors")
+        yield 7, mx.zeros((1, 8))
+
+    tokenizer = SimpleNamespace(stopping_criteria=FakeStoppingCriteria())
+    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="unlimited-ocr", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                image=["page1", "page2"],
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+            )
+        )
+
+    (processor,) = captured["processors"]
+    assert isinstance(processor, SlidingWindowNoRepeatNGramProcessor)
+    assert processor.ngram_size == 35
+    assert processor.window_size == 1024
+
+
+def test_stream_generate_can_disable_unlimited_ocr_no_repeat_processor():
+    captured = {}
+
+    class FakeDetokenizer:
+        last_segment = ""
+
+        def reset(self):
+            pass
+
+        def add_token(self, token, skip_special_token_ids=None):
+            pass
+
+        def finalize(self):
+            pass
+
+    def fake_generate_step(*args, **kwargs):
+        captured["processors"] = kwargs.get("logits_processors")
+        if False:
+            yield None
+
+    tokenizer = SimpleNamespace(stopping_criteria=lambda token: False)
+    processor = SimpleNamespace(tokenizer=tokenizer, detokenizer=FakeDetokenizer())
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="unlimited-ocr", eos_token_id=[]),
+        language_model=SimpleNamespace(),
+    )
+
+    with patch.object(dispatch_module, "generate_step", side_effect=fake_generate_step):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                image=["page1", "page2"],
+                input_ids=mx.array([[1]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[],
+                max_tokens=1,
+                no_repeat_ngram_size=0,
+            )
+        )
+
+    assert captured["processors"] is None
 
 
 def test_normalize_resize_shape_expands_single_value():

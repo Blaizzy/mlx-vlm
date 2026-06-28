@@ -260,6 +260,21 @@ class TestApplyChatTemplateIntegration:
 
         assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
 
+    def test_unlimited_ocr_uses_single_image_token_without_newline(self):
+        """Unlimited-OCR reference prompts use one '<image>' token even for PDFs."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "unlimited-ocr"},
+            "Multi page parsing.",
+            num_images=14,
+        )
+
+        assert result == "<image>Multi page parsing."
+        assert result.count("<image>") == 1
+        assert "<image>\n" not in result
+
     def test_tool_call_arguments_json_string_is_normalized(self):
         """OpenAI-style JSON-string tool call arguments should become dicts."""
         from mlx_vlm.prompt_utils import apply_chat_template
