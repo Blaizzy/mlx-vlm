@@ -233,6 +233,7 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
         output_hidden_states: bool = False,
+        early_exit_layer: Optional[int] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -269,6 +270,11 @@ class Qwen3VLMoEModel(nn.Module):
                     visual_pos_masks,
                     deepstack_visual_embeds[layer_idx],
                 )
+
+            # Return this layer's hidden state directly: same tensor as
+            # output_hidden_states[early_exit_layer + 1], minus the unused tail.
+            if early_exit_layer is not None and layer_idx == early_exit_layer:
+                return h
 
             if layer_idx % 4 == 0:
                 mx.eval(h)
@@ -563,6 +569,7 @@ class LanguageModel(nn.Module):
         visual_pos_masks = kwargs.get("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
+        early_exit_layer = kwargs.pop("early_exit_layer", None)
 
         out = self.model(
             inputs,
@@ -572,7 +579,14 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             output_hidden_states=output_hidden_states,
+            early_exit_layer=early_exit_layer,
         )
+
+        # Early-exit path: ``out`` is the raw hidden state of ``early_exit_layer``
+        # (no norm, no lm_head, so no logits). Return it as a 1-element
+        # hidden_states list to match the LanguageModelOutput contract.
+        if early_exit_layer is not None:
+            return LanguageModelOutput(logits=None, hidden_states=[out])
 
         if output_hidden_states:
             hidden_states, all_hidden_states = out

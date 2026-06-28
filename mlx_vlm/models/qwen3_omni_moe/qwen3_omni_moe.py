@@ -142,11 +142,11 @@ class Model(nn.Module):
         outputs = self.thinker.language_model(
             input_ids,
             inputs_embeds=inputs_embeds,
-            output_hidden_states=True,
+            early_exit_layer=target_layer_idx,
             **lm_kwargs,
         )
 
-        hidden_states = outputs.hidden_states[target_layer_idx + 1]
+        hidden_states = outputs.hidden_states[0]
 
         return hidden_states, inputs_embeds
 
