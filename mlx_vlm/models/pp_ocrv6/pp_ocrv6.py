@@ -696,23 +696,27 @@ class Model(nn.Module):
 class ImageProcessor:
     model_input_names = ["pixel_values"]
 
-    def __init__(self, **kwargs):
-        self.config = kwargs
-        self.character_list = kwargs.get("character_list", [])
-        processor_type = kwargs.get("image_processor_type") or ""
-        self.is_detection = "Det" in processor_type
-        self.size = kwargs.get("size")
+    def __init__(self, config=None, **kwargs):
+        data = dict(config or {})
+        data.update(kwargs)
+
+        self.config = data
+        self.character_list = data.get("character_list", [])
+        processor_type = data.get("image_processor_type") or ""
+        model_type = str(data.get("model_type", "")).lower()
+        self.is_detection = "Det" in processor_type or model_type.endswith("_det")
+        self.size = data.get("size")
         if self.size is None and not self.is_detection:
             self.size = {"height": 48, "width": 320}
-        self.pad_size = kwargs.get("pad_size", self.size)
-        self.image_mean = kwargs.get("image_mean", [0.485, 0.456, 0.406])
-        self.image_std = kwargs.get("image_std", [0.229, 0.224, 0.225])
-        self.rescale_factor = kwargs.get("rescale_factor", 1 / 255)
-        self.do_pad = kwargs.get("do_pad", False)
-        self.max_image_width = kwargs.get("max_image_width", 3200)
-        self.limit_side_len = kwargs.get("limit_side_len", 736)
-        self.limit_type = kwargs.get("limit_type", "min")
-        self.image_mode = kwargs.get("image_mode", "BGR")
+        self.pad_size = data.get("pad_size", self.size)
+        self.image_mean = data.get("image_mean", [0.485, 0.456, 0.406])
+        self.image_std = data.get("image_std", [0.229, 0.224, 0.225])
+        self.rescale_factor = data.get("rescale_factor", 1 / 255)
+        self.do_pad = data.get("do_pad", False)
+        self.max_image_width = data.get("max_image_width", 3200)
+        self.limit_side_len = data.get("limit_side_len", 736)
+        self.limit_type = data.get("limit_type", "min")
+        self.image_mode = data.get("image_mode", "BGR")
 
     @classmethod
     def from_pretrained(cls, path, **kwargs):
