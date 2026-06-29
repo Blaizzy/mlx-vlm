@@ -1,181 +1,244 @@
 # Unlimited-OCR
 
-Unlimited-OCR is an OCR and document-understanding model from [baidu/Unlimited-OCR](https://github.com/baidu/Unlimited-OCR). It extends the DeepSeek-OCR family with a DeepSeek-V2 language backbone, SAM ViT-B global/local visual features, and a CLIP-L style vision tower.
+Unlimited-OCR is Baidu's OCR/document-parsing model for **one-shot long-horizon parsing**. The upstream project is [baidu/Unlimited-OCR](https://github.com/baidu/Unlimited-OCR), and the Hugging Face checkpoint is `baidu/Unlimited-OCR` with `model_type: unlimited-ocr`.
+
+This README only documents the prompt formats and settings that are either shown by upstream or verified in the MLX implementation.
 
 ## Model Architecture
 
 ```
-                    ┌─────────────────────────────────────────────────────────────────────┐
-                    │                         Dynamic Resolution                           │
-                    ├─────────────────────────────────────────────────────────────────────┤
-Local Patches       │  640×640 → SAM (10×10×1024) → CLIP-L (101×1024) → Proj (100×1280)  │
-(0-32 patches)      │                                                                      │
-                    ├─────────────────────────────────────────────────────────────────────┤
-Global View         │ 1024×1024 → SAM (16×16×1024) → CLIP-L (257×1024) → Proj (256×1280) │
-(1 image)           │                                                                      │
-                    └─────────────────────────────────────────────────────────────────────┘
-                                                        ↓
-                              [local_patches, global_view, view_separator]
-                                                        ↓
-                                            Language Model (DeepSeek-V2)
+                        input document image(s)
+                                  │
+                                  ▼
+                    ┌─────────────────────────────┐
+                    │ Dynamic image preprocessing │
+                    ├─────────────────────────────┤
+                    │ gundam: 1024 global view    │
+                    │         + 640 local crops   │
+                    │ base:   1024 global view    │
+                    └──────────────┬──────────────┘
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │ SAM ViT-B + CLIP-L features │
+                    │ concatenated → 2048-dim     │
+                    └──────────────┬──────────────┘
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │ Linear projector → 1280 dim │
+                    └──────────────┬──────────────┘
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │ DeepSeek-V2-style decoder   │
+                    │ with R-SWA KV-cache         │
+                    └─────────────────────────────┘
 ```
 
-The upstream model has two common image modes:
+The released checkpoint configuration uses:
 
-| Mode | Settings | Use case |
-|------|----------|----------|
-| `gundam` | `base_size=1024`, `image_size=640`, `cropping=True` | Default single-image OCR with dynamic crops |
-| `base` | `image_size=1024`, `cropping=False` | Global-view-only OCR; used by upstream for multi-page/PDF workflows |
+- a `deeplip_b_l` vision stack with `sam_vit_b` and `clip-l-14-224` components;
+- a projector from 2048 visual-feature dimensions to the 1280-dimensional language hidden size;
+- a 12-layer DeepSeek-V2-style MoE language decoder with `max_position_embeddings=32768`;
+- `sliding_window_size=128` for Unlimited-OCR's Reference Sliding Window Attention (R-SWA).
+
+The MLX implementation keeps the prompt/prefill KV cache and uses a small ring buffer for generated-token KV entries, matching the upstream R-SWA decode behavior.
 
 ## Prompt Formats
 
-When using `mlx_vlm.generate`, pass the task text only. The CLI applies the image-token prompt template automatically, so do **not** manually prefix CLI prompts with `<image>`.
+When using `mlx_vlm.generate` or `apply_chat_template`, pass the task text only. MLX inserts the `<image>` token for you.
 
-### Document to Markdown
-Convert a document image to structured markdown format:
-```
-<|grounding|>Convert the document to markdown.
-```
+### Single-image document parsing
 
-### General OCR
-Extract all text from an image with structured layout/grounding:
+Upstream Transformers example:
+
 ```
-<|grounding|>OCR this image.
+<image>document parsing.
 ```
 
-### Free OCR
-Extract text without explicitly requesting structured layout:
+MLX prompt text:
+
 ```
-Free OCR.
+document parsing.
 ```
 
-### Parse Figures
-Extract and describe figures/charts in documents:
+### Multi-page / PDF parsing
+
+Upstream `infer_multi` example:
+
 ```
-Parse the figure.
+<image>Multi page parsing.
 ```
 
-### Text Localization (Grounding)
-Locate specific text in the image and get bounding box coordinates:
+MLX prompt text:
+
 ```
-Locate <|ref|>your text here<|/ref|> in the image.
+Multi page parsing.
 ```
 
-Output commonly uses `<|det|>label [x1, y1, x2, y2]<|/det|>` with coordinates normalized to the 0-1000 range.
+For multi-page inputs, the MLX prompt template intentionally inserts **one** literal `<image>` token for all pages, matching upstream `infer_multi` behavior.
+
+### Output markers
+
+Document-parsing outputs commonly contain layout tags such as:
+
+```
+<|det|>title [357, 135, 642, 155]<|/det|>Unlimited OCR Works
+<PAGE>
+```
+
+The box coordinates are normalized to the page coordinate system used by the model, typically the 0-1000 range.
+
+You can still try other DeepSeek-OCR-style prompts by keeping the same image and
+generation settings, changing only `--prompt`, and comparing the outputs against
+the upstream-documented `document parsing.` baseline:
+
+```bash
+for prompt in \
+    "document parsing." \
+    "Free OCR." \
+    "<|grounding|>OCR this image." \
+    "<|grounding|>Convert the document to markdown." \
+    "Parse the figure."; do
+    mlx_vlm.generate \
+        --model baidu/Unlimited-OCR \
+        --image document.png \
+        --prompt "$prompt" \
+        --max-tokens 4096
+done
+
+mlx_vlm.generate \
+    --model baidu/Unlimited-OCR \
+    --image document.png \
+    --prompt "Locate <|ref|>Unlimited OCR Works<|/ref|> in the image." \
+    --max-tokens 512
+```
+
+These prompts are experimental for Unlimited-OCR; use the output comparison to
+decide whether a prompt changes behavior usefully for your document.
 
 ## CLI Examples
 
-### Free OCR (default `gundam` mode)
+### Single image (`gundam` mode, default)
+
+`gundam` is the upstream single-image configuration: `base_size=1024`, `image_size=640`, `crop_mode=True`. In MLX this is the default (`cropping=True`, `image_size=640`, `base_size=1024`).
+
 ```bash
 mlx_vlm.generate \
     --model baidu/Unlimited-OCR \
     --image document.png \
-    --prompt "Free OCR." \
-    --max-tokens 1000
+    --prompt "document parsing." \
+    --max-tokens 32768
 ```
 
-### Document to Markdown
-```bash
-mlx_vlm.generate \
-    --model baidu/Unlimited-OCR \
-    --image paper_page.png \
-    --prompt "<|grounding|>Convert the document to markdown." \
-    --max-tokens 2000
-```
+### Single image in global-view-only `base` mode
 
-### Global-view-only `base` mode
+`base` mode disables local crops and uses a 1024×1024 global view.
+
 ```bash
 mlx_vlm.generate \
     --model baidu/Unlimited-OCR \
     --image document.png \
-    --prompt "Free OCR." \
-    --max-tokens 1000 \
+    --prompt "document parsing." \
+    --max-tokens 32768 \
     --processor-kwargs '{"cropping": false, "image_size": 1024}'
 ```
 
 ### Multi-page OCR from rendered PDF pages
-Render PDF pages to images first, then pass the page images in order. The
-Unlimited-OCR prompt template intentionally inserts a single `<image>` token for
-all pages, matching upstream `infer_multi` behavior.
+
+The documented Unlimited-OCR PDF workflow renders PDF pages to images first, then passes those images in page order. Upstream uses the `base` configuration for multi-page/PDF workflows.
 
 ```bash
 mlx_vlm.generate \
     --model baidu/Unlimited-OCR \
-    --image page-001.png page-002.png page-003.png \
+    --image page_0001.png page_0002.png page_0003.png \
     --prompt "Multi page parsing." \
-    --max-tokens 4000 \
+    --max-tokens 32768 \
     --processor-kwargs '{"cropping": false, "image_size": 1024}'
 ```
 
-### Text Localization
+One way to render a PDF to ordered page images is:
+
 ```bash
+mkdir -p pages
+uv run --with pymupdf python - <<'PY'
+from pathlib import Path
+
+import fitz
+
+pdf_path = Path("document.pdf")
+out_dir = Path("pages")
+out_dir.mkdir(exist_ok=True)
+
+# Upstream examples use 300 DPI. Lower this if you need a quicker smoke test.
+dpi = 300
+matrix = fitz.Matrix(dpi / 72, dpi / 72)
+
+with fitz.open(pdf_path) as doc:
+    for i, page in enumerate(doc):
+        page.get_pixmap(matrix=matrix, alpha=False).save(out_dir / f"page_{i + 1:04d}.png")
+PY
+
 mlx_vlm.generate \
     --model baidu/Unlimited-OCR \
-    --image table.jpeg \
-    --prompt "Locate <|ref|>Total assets<|/ref|> in the image." \
-    --max-tokens 100
+    --image pages/page_*.png \
+    --prompt "Multi page parsing." \
+    --max-tokens 32768 \
+    --processor-kwargs '{"cropping": false, "image_size": 1024}'
 ```
 
 ## Python Script Examples
 
-### Basic OCR
+### Single-image document parsing
+
 ```python
-from mlx_vlm import load, generate
+from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
 model, processor = load("baidu/Unlimited-OCR")
 
-prompt = "Free OCR."
-formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
+prompt = apply_chat_template(
+    processor,
+    model.config,
+    "document parsing.",
+    num_images=1,
+)
 
 result = generate(
     model=model,
     processor=processor,
     image="document.png",
-    prompt=formatted_prompt,
-    max_tokens=1000,
+    prompt=prompt,
+    max_tokens=32768,
     temperature=0.0,
 )
 print(result.text)
 ```
 
-### Document to Markdown
+### Multi-page / rendered-PDF parsing
+
 ```python
-from mlx_vlm import load, generate
+from mlx_vlm import generate, load
 from mlx_vlm.prompt_utils import apply_chat_template
 
 model, processor = load("baidu/Unlimited-OCR")
 
-prompt = "<|grounding|>Convert the document to markdown."
-formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
-
-result = generate(
-    model=model,
-    processor=processor,
-    image="paper_page.png",
-    prompt=formatted_prompt,
-    max_tokens=2000,
-    temperature=0.0,
+page_images = ["page_0001.png", "page_0002.png", "page_0003.png"]
+prompt = apply_chat_template(
+    processor,
+    model.config,
+    "Multi page parsing.",
+    num_images=len(page_images),
 )
-print(result.text)
-```
 
-### Global-view-only `base` mode
-```python
-from mlx_vlm import load, generate
-from mlx_vlm.prompt_utils import apply_chat_template
-
-model, processor = load("baidu/Unlimited-OCR")
-
-prompt = "Free OCR."
-formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
+# Matches upstream infer_multi: one literal <image> token for all pages.
+assert prompt.count("<image>") == 1
+assert prompt.strip() == "<image>Multi page parsing."
 
 result = generate(
     model=model,
     processor=processor,
-    image="document.png",
-    prompt=formatted_prompt,
-    max_tokens=1000,
+    image=page_images,
+    prompt=prompt,
+    max_tokens=32768,
     temperature=0.0,
     cropping=False,
     image_size=1024,
@@ -183,139 +246,109 @@ result = generate(
 print(result.text)
 ```
 
-### Batch Processing
-```python
-from pathlib import Path
-
-from mlx_vlm import load, generate
-from mlx_vlm.prompt_utils import apply_chat_template
-
-model, processor = load("baidu/Unlimited-OCR")
-
-prompt = "<|grounding|>OCR this image."
-formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
-
-image_dir = Path("documents/")
-for image_path in image_dir.glob("*.png"):
-    result = generate(
-        model=model,
-        processor=processor,
-        image=str(image_path),
-        prompt=formatted_prompt,
-        max_tokens=1000,
-        temperature=0.0,
-    )
-    print(f"\n--- {image_path.name} ---")
-    print(result.text)
-```
-
 ## Dynamic Resolution
 
-Unlimited-OCR uses dynamic resolution in its `gundam` mode:
+Unlimited-OCR has two upstream image modes:
 
-**Default configuration:**
-- **Global view**: 1×1024×1024 → 16×16 visual grid with row newlines + view separator
-- **Local patches**: 0-32 patches at 640×640 → 10×10 visual grid per patch with row newlines
-- **Small images**: images with width and height `<= 640` use only the global view
+| Mode | Upstream settings | MLX kwargs | Upstream use |
+|------|-------------------|------------|--------------|
+| `gundam` | `base_size=1024`, `image_size=640`, `crop_mode=True` | `base_size=1024`, `image_size=640`, `cropping=True` | Single-image parsing |
+| `base` | `base_size=1024`, `image_size=1024`, `crop_mode=False` | `base_size=1024`, `image_size=1024`, `cropping=False` | Multi-page/PDF parsing |
 
-**How it works:**
-1. The image aspect ratio is used to select a local patch grid, up to 32 patches
-2. A padded 1024×1024 global view captures page-level context
-3. Local 640×640 crops capture fine text details when the image is large
-4. Features are packed as `[local_patches, global_view, view_separator]` and inserted at `<image>` token positions
+### Token layout
 
-**Token calculation:**
-- Global view at 1024: `(16 image tokens + 1 newline) × 16 rows + 1 view separator = 273 tokens`
-- Each 640 local patch grid contributes 100 image tokens plus row newlines after tiling
-- With local crops: total image tokens grow with the selected patch grid, up to 32 crops
+- In `base` mode, each page is padded to 1024×1024 and represented as a 16×16 visual grid, with one newline embedding per row and one view-separator embedding: `(16 + 1) × 16 + 1 = 273` image-token positions per page.
+- In `gundam` mode, MLX always adds the 1024×1024 global view. For images larger than 640×640, it also creates dynamic 640×640 local crops using the same crop-grid search as DeepSeek-OCR, capped at 32 crops.
+- For small images where both width and height are `<= 640`, `gundam` mode uses only the global view.
 
-### Controlling Dynamic Resolution
+### Controlling the mode
 
 ```python
-from mlx_vlm import load, generate
-from mlx_vlm.prompt_utils import apply_chat_template
-
-model, processor = load("baidu/Unlimited-OCR")
-
-prompt = "Free OCR."
-formatted_prompt = apply_chat_template(processor, model.config, prompt, num_images=1)
-
-# Default upstream-style gundam mode
+# Default upstream single-image mode.
 result = generate(
     model=model,
     processor=processor,
     image="document.png",
-    prompt=formatted_prompt,
-    max_tokens=1000,
+    prompt=prompt,
+    max_tokens=32768,
     cropping=True,
     image_size=640,
     base_size=1024,
 )
 
-# Faster global-view-only base mode
+# Upstream multi-page/PDF mode.
 result = generate(
     model=model,
     processor=processor,
-    image="document.png",
-    prompt=formatted_prompt,
-    max_tokens=1000,
+    image=page_images,
+    prompt=prompt,
+    max_tokens=32768,
     cropping=False,
     image_size=1024,
+    base_size=1024,
 )
 ```
 
-### CLI Examples for Dynamic Resolution
+## Generation Defaults
+
+The upstream examples use a sliding-window no-repeat n-gram processor, and the SGLang path sets `temperature=0`:
+
+| Setting | Upstream single image | Upstream multi-page/PDF | MLX behavior |
+|---------|-----------------------|--------------------------|--------------|
+| Prompt | `<image>document parsing.` | `<image>Multi page parsing.` | Template inserts `<image>` automatically |
+| Image mode | `gundam` | `base` | Same via `processor_kwargs` / `generate` kwargs |
+| `no_repeat_ngram_size` | `35` | `35` | Applied automatically for Unlimited-OCR |
+| `ngram_window` | `128` | `1024` | Auto-selected by image count |
+| Output budget | `max_length=32768` | `max_length=32768` | Use `max_tokens` in MLX |
+
+You can override the no-repeat settings from the CLI:
 
 ```bash
-# Default: gundam mode with dynamic crops
+# Explicitly match the upstream multi-page settings.
 mlx_vlm.generate \
     --model baidu/Unlimited-OCR \
-    --image document.png \
-    --prompt "Free OCR." \
-    --max-tokens 1000
+    --image page_0001.png page_0002.png \
+    --prompt "Multi page parsing." \
+    --processor-kwargs '{"cropping": false, "image_size": 1024}' \
+    --no-repeat-ngram-size 35 \
+    --ngram-window 1024
 
-# Base mode: global view only
+# Disable the automatic Unlimited-OCR no-repeat processor.
 mlx_vlm.generate \
     --model baidu/Unlimited-OCR \
     --image document.png \
-    --prompt "Free OCR." \
-    --max-tokens 1000 \
-    --processor-kwargs '{"cropping": false, "image_size": 1024}'
+    --prompt "document parsing." \
+    --no-repeat-ngram-size 0
 ```
 
-## Special Tokens
+## Special Tokens and Markers
 
-| Token | Description |
-|-------|-------------|
+| Token / marker | Description |
+|----------------|-------------|
 | `<image>` | Image placeholder inserted by the prompt template |
-| `<\|grounding\|>` | Enable grounding/structured output mode |
-| `<\|ref\|>...<\|/ref\|>` | Mark text to locate in the image |
-| `<\|det\|>...<\|/det\|>` | Bounding box output format |
-| `<\|User\|>` | User turn marker |
-| `<\|Assistant\|>` | Assistant turn marker |
+| `<PAGE>` | Page separator commonly emitted in multi-page parsing output |
+| `<\|det\|>...<\|/det\|>` | Layout detection span with a label and normalized box coordinates |
+| `<｜begin▁of▁sentence｜>` / `<｜end▁of▁sentence｜>` | BOS / EOS tokens from the released tokenizer |
+| `<｜▁pad▁｜>` | Pad token from the released tokenizer |
 
 ## Tips
 
-1. Use `temperature=0.0` for deterministic OCR output.
-2. Increase `max_tokens` for full pages or dense documents.
-3. Use `cropping=False, image_size=1024` for faster global-view-only checks.
-4. Use default `cropping=True, image_size=640` for large pages where small text detail matters.
-5. Do not manually include `<image>` in CLI prompts; `mlx_vlm` inserts it for this model family.
+1. Do not manually add `<image>` to `mlx_vlm.generate` prompts; use `document parsing.` or `Multi page parsing.`.
+2. Use `cropping=False, image_size=1024` for multi-page or PDF workflows.
+3. Render PDFs to images before calling MLX-VLM, and keep filenames zero-padded so shell glob order matches page order.
+4. Use a high `max_tokens` value for dense documents or long PDFs; lower it for quick smoke tests.
+5. Use `temperature=0.0` for deterministic OCR output.
 
 ## Limitations
 
-- The current `mlx_vlm` image loader expects image files. For PDFs, render pages to images first before passing them to the CLI.
-- Very dense pages may need high `max_tokens` to avoid truncating the output.
-- Dynamic cropping can be slower and uses more memory than global-view-only mode.
-- Localization coordinates are normalized to 0-1000 and should be scaled to the source image size.
+- The documented MLX workflow expects image files; render PDFs to page images first.
+- Upstream documents `base` mode for multi-page/PDF parsing. Dynamic-crop `gundam` mode is intended for single-image parsing.
+- Very dense or long documents can take substantial time and memory even with R-SWA because the full visual/prompt prefill is retained.
+- This README intentionally avoids documenting generic DeepSeek-OCR prompt variants that are not shown in the Baidu Unlimited-OCR repo.
 
 ## Implementation Notes
 
-Unlimited-OCR uses Hugging Face `model_type: unlimited-ocr`. The MLX module name is `unlimited_ocr`, and `mlx_vlm` remaps the Hugging Face model type automatically.
-
-The processor loads the tokenizer and `processor_config.json` directly to avoid requiring upstream PyTorch remote-code dependencies during MLX inference.
-
-The language model uses Unlimited-OCR's ring sliding-window attention cache for
-generation. Prefill tokens are retained, and generated tokens are kept in a
-fixed-size decode ring, which bounds decode-time KV-cache growth for long OCR
-outputs.
+- Hugging Face uses `model_type: unlimited-ocr`; the MLX module name is `unlimited_ocr`, and `mlx_vlm` remaps the model type automatically.
+- The processor loads `processor_config.json` and the fast tokenizer directly, without requiring upstream PyTorch remote-code execution during MLX inference.
+- `apply_chat_template(..., num_images > 1)` returns one literal `<image>` token for Unlimited-OCR, matching upstream `infer_multi`.
+- `mlx_vlm.generate` automatically attaches Unlimited-OCR's sliding-window no-repeat n-gram processor unless `no_repeat_ngram_size=0` is passed.
