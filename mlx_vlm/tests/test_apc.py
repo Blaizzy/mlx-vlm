@@ -518,6 +518,60 @@ def test_make_warm_batch_kv_cache_single_row_shapes():
     manager.release(blocks)
 
 
+def test_harvest_blocks_accepts_regular_kv_cache_offset():
+    from mlx_lm.models.cache import KVCache
+
+    block_size = 4
+    token_ids = list(range(2 * block_size))
+    kv = KVCache()
+    kv.keys = mx.arange(2 * block_size * 4, dtype=mx.float32).reshape(
+        1, 1, 2 * block_size, 4
+    )
+    kv.values = kv.keys + 100
+    kv.offset = len(token_ids)
+    mx.eval(kv.keys, kv.values)
+
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    stored = harvest_blocks_from_batch_cache(manager, [kv], 0, token_ids)
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+
+    assert len(stored) == 2
+    assert matched_tokens == len(token_ids)
+    manager.release(matched)
+    manager.release(stored)
+
+
+def test_batch_generator_keeps_apc_with_draft_model(monkeypatch):
+    from mlx_vlm.generate import ar
+
+    class DummyStoppingCriteria:
+        def add_eos_token_ids(self, stop_tokens):
+            self.stop_tokens = stop_tokens
+
+    apc_manager = APCManager(num_blocks=4, block_size=4)
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=DummyStoppingCriteria())
+    )
+
+    monkeypatch.setattr(ar._apc, "model_apc_mode", lambda model: "block")
+    monkeypatch.setattr(
+        ar.GenerationBatch,
+        "empty",
+        staticmethod(lambda *args, **kwargs: SimpleNamespace()),
+    )
+
+    generator = ar.BatchGenerator(
+        model=SimpleNamespace(),
+        processor=processor,
+        apc_manager=apc_manager,
+        draft_model=SimpleNamespace(),
+    )
+
+    assert generator.apc_manager is apc_manager
+    assert generator.apc_mode == "block"
+    assert generator.compute_logprobs is False
+
+
 def test_exact_cache_supports_mixed_kv_and_arrays_cache():
     from mlx_lm.models.cache import ArraysCache, KVCache
 

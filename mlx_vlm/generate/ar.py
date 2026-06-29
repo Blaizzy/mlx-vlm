@@ -2095,7 +2095,6 @@ class BatchGenerator:
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
         if self.draft_model is not None:
-            apc_manager = None
             compute_logprobs = False
             top_logprobs_k = 0
             self.compute_logprobs = False
