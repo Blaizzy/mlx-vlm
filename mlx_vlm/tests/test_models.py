@@ -7769,6 +7769,103 @@ class TestRTDetrV2(unittest.TestCase):
         )
 
 
+class TestPPOCRV6(unittest.TestCase):
+    def test_pp_ocrv6_model_remapping(self):
+        from mlx_vlm.utils import get_model_and_args
+
+        arch, model_type = get_model_and_args({"model_type": "pp_ocrv6_medium_det"})
+
+        self.assertEqual(model_type, "pp_ocrv6")
+        self.assertEqual(arch.Model.__name__, "Model")
+
+    def test_pp_ocrv6_small_det_forward(self):
+        from mlx_vlm.models import pp_ocrv6
+
+        backbone_config = pp_ocrv6.BackboneConfig(
+            stem_channels=[3, 16, 16],
+            stem_type="large",
+            out_indices=[1, 2, 3, 4],
+            block_configs=[
+                [[3, 16, 16, 1, False]],
+                [[3, 16, 16, 2, False], [3, 16, 16, 1, False]],
+                [[3, 16, 16, 2, False], [3, 16, 16, 1, False]],
+                [[3, 16, 16, 2, False], [5, 16, 16, 1, False]],
+            ],
+        )
+        model = pp_ocrv6.Model(
+            pp_ocrv6.ModelConfig(
+                backbone_config=backbone_config,
+                model_type="pp_ocrv6_small_det",
+                layer_list_out_channels=[16, 16, 16, 16],
+                neck_out_channels=16,
+                dilated_kernel_size=5,
+            )
+        )
+        model.eval()
+
+        output = model(mx.random.uniform(shape=(2, 3, 128, 128))).last_hidden_state
+        self.assertEqual(output.shape, (2, 1, 128, 128))
+
+    def test_pp_ocrv6_tiny_rec_forward(self):
+        from mlx_vlm.models import pp_ocrv6
+
+        backbone_config = pp_ocrv6.BackboneConfig(
+            stem_channels=[3, 16, 16],
+            stem_type="small",
+            out_indices=[1, 2, 3, 4],
+            block_configs=[
+                [[3, 16, 16, 1, True]],
+                [[3, 16, 16, 1, False]],
+                [[3, 16, 16, [2, 1], False], [3, 16, 16, 1, True]],
+                [[3, 16, 16, [2, 1], False], [3, 16, 16, 1, True]],
+            ],
+        )
+        model = pp_ocrv6.Model(
+            pp_ocrv6.ModelConfig(
+                backbone_config=backbone_config,
+                model_type="pp_ocrv6_tiny_rec",
+                hidden_size=8,
+                head_out_channels=16,
+            )
+        )
+        model.eval()
+
+        output = model(mx.random.uniform(shape=(2, 3, 48, 320))).last_hidden_state
+        self.assertEqual(output.shape, (2, 40, 16))
+
+    def test_pp_ocrv6_text_decode(self):
+        from mlx_vlm.models.pp_ocrv6 import ImageProcessor
+        from mlx_vlm.models.pp_ocrv6.pp_ocrv6 import ModelOutput
+
+        processor = ImageProcessor(character_list=["blank", "a", "b"])
+        logits = mx.array(
+            [[[0.1, 0.8, 0.1], [0.1, 0.7, 0.2], [0.9, 0.05, 0.05], [0.1, 0.1, 0.8]]]
+        )
+
+        result = processor.post_process_text_recognition(ModelOutput(logits))
+        self.assertEqual(result[0]["text"], "ab")
+
+    def test_pp_ocrv6_det_postprocess(self):
+        from mlx_vlm.models.pp_ocrv6 import ImageProcessor
+        from mlx_vlm.models.pp_ocrv6.pp_ocrv6 import ModelOutput
+
+        processor = ImageProcessor(
+            image_processor_type="PPOCRV5ServerDetImageProcessor"
+        )
+        logits = mx.zeros((1, 1, 32, 32))
+        logits[:, :, 8:24, 10:22] = 0.9
+
+        result = processor.post_process_object_detection(
+            ModelOutput(logits),
+            target_sizes=[(64, 64)],
+            threshold=0.5,
+            box_threshold=0.5,
+            min_size=1,
+        )[0]
+        self.assertEqual(len(result["boxes"]), 1)
+        self.assertEqual(len(result["scores"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
 

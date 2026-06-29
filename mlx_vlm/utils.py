@@ -46,6 +46,10 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "pp_ocrv6_small_det": "pp_ocrv6",
+    "pp_ocrv6_medium_det": "pp_ocrv6",
+    "pp_ocrv6_tiny_rec": "pp_ocrv6",
+    "pp_ocrv6_small_rec": "pp_ocrv6",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -935,7 +939,6 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
-
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
