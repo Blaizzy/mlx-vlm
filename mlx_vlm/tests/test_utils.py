@@ -8,10 +8,12 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 from mlx_lm.utils import quantize_model
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.models.base import BaseImageProcessor
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
@@ -403,6 +405,87 @@ def test_prepare_inputs():
     )
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
+
+
+class _DummyBaseImageProcessor(BaseImageProcessor):
+    """BaseImageProcessor subclass that skips the transformers-backed __init__."""
+
+    def __init__(self):
+        pass
+
+    def preprocess(self, images):
+        return [np.zeros((3, 2, 2), dtype=np.float32) for _ in images]
+
+
+class _MockBaseImageProcessorProcessor:
+    """Processor whose ``image_processor`` triggers the BaseImageProcessor path."""
+
+    def __init__(self):
+        self.image_token = "<image>"
+        self.pad_token = "[PAD]"
+        self.pad_token_id = 0
+        self.eos_token = "[EOS]"
+        self.image_processor = _DummyBaseImageProcessor()
+
+    def __call__(self, text=None, **kwargs):
+        # One token per whitespace-delimited word keeps assertions predictable.
+        return SimpleNamespace(input_ids=[1] * len((text or "").split()))
+
+
+def test_prepare_inputs_base_image_processor_interleaves_and_validates():
+    """The BaseImageProcessor branch must keep all text, emit one image token per
+    "<image>" sentinel, and reject a sentinel/image-count mismatch with a clear
+    error instead of silently dropping text or misaligning ``pixel_values``."""
+
+    processor = _MockBaseImageProcessorProcessor()
+    image = mx.zeros((3, 224, 224))
+
+    # Single image: behaviour is unchanged (one image token, one pixel value).
+    inputs = prepare_inputs(
+        processor,
+        prompts="hello <image> world",
+        images=[image],
+        image_token_index=99,
+    )
+    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 99, 1]]))
+    assert inputs["pixel_values"].shape[0] == 1
+
+    # Two sentinels + two images: previously the text after the second "<image>"
+    # was dropped and only one image token was inserted. Now all three text
+    # chunks survive and two image tokens line up with the two pixel values.
+    inputs = prepare_inputs(
+        processor,
+        prompts="a <image> b <image> c",
+        images=[image, image],
+        image_token_index=99,
+    )
+    assert mx.array_equal(inputs["input_ids"], mx.array([[1, 99, 1, 99, 1]]))
+    assert int((inputs["input_ids"] == 99).sum()) == 2
+    assert inputs["pixel_values"].shape[0] == 2
+
+    # Too few images for the sentinels -> clear error (was a silent mismatch).
+    with pytest.raises(
+        ValueError,
+        match="Number of image tokens in prompt_token_ids.*does not match number of images",
+    ):
+        prepare_inputs(
+            processor,
+            prompts="a <image> b <image> c",
+            images=[image],
+            image_token_index=99,
+        )
+
+    # Image supplied but no sentinel -> clear error (was an IndexError).
+    with pytest.raises(
+        ValueError,
+        match="Number of image tokens in prompt_token_ids.*does not match number of images",
+    ):
+        prepare_inputs(
+            processor,
+            prompts="no image token here",
+            images=[image],
+            image_token_index=99,
+        )
 
 
 def test_process_inputs_with_fallback():

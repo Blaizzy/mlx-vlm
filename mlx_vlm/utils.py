@@ -1766,15 +1766,35 @@ def prepare_inputs(
             for prompt in prompts
         ]
 
+        # Each "<image>" sentinel splits the prompt into one extra chunk, so the
+        # number of image tokens a prompt embeds is ``len(chunks) - 1``. Validate
+        # the total against the images provided so a sentinel/image count mismatch
+        # surfaces as a clear error here instead of silently dropping the trailing
+        # text or misaligning ``pixel_values`` further down the model.
+        total_image_tokens = sum(len(chunks) - 1 for chunks in text_chunks)
+        if total_image_tokens != len(images):
+            raise ValueError(
+                f"Number of image tokens in prompt_token_ids ({total_image_tokens}) "
+                f"does not match number of images ({len(images)})"
+            )
+
+        # Interleave every text chunk with an image token so prompts with multiple
+        # "<image>" sentinels keep all of their text and emit one image slot per
+        # image (the previous code only ever inserted a single token between the
+        # first two chunks, discarding any text after the second sentinel).
+        token_id_lists = []
+        for chunks in text_chunks:
+            ids = list(chunks[0])
+            for chunk in chunks[1:]:
+                ids += [image_token_index] + list(chunk)
+            token_id_lists.append(ids)
+
         # Find the maximum length for padding
-        max_length = max(
-            sum(len(chunk) for chunk in chunks) + 1 for chunks in text_chunks
-        )
+        max_length = max(len(ids) for ids in token_id_lists)
 
         # Pad and create input_ids
         input_ids = []
-        for chunks in text_chunks:
-            ids = chunks[0] + [image_token_index] + chunks[1]
+        for ids in token_id_lists:
             padding = [processor.pad_token_id] * (max_length - len(ids))
             input_ids.append(mx.array(ids + padding))
 
