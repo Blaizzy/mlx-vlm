@@ -11,10 +11,7 @@ from ..minimax_m3_vl.config import (
     _sanitize_quantization_config,
 )
 from ..minimax_m3_vl.language import LanguageModel
-from ..minimax_m3_vl.minimax_m3_vl import (
-    _pack_uint8_weight,
-    _sanitize_moe_weights,
-)
+from ..minimax_m3_vl.minimax_m3_vl import _pack_uint8_weight, _sanitize_moe_weights
 
 
 @dataclass

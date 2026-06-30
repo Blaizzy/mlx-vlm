@@ -192,9 +192,7 @@ def _patchify(
 
     pad = (-pixels.shape[0]) % temporal_patch_size
     if pad:
-        pixels = np.concatenate(
-            [pixels, np.repeat(pixels[-1:], pad, axis=0)], axis=0
-        )
+        pixels = np.concatenate([pixels, np.repeat(pixels[-1:], pad, axis=0)], axis=0)
 
     frames, channels, height, width = pixels.shape
     factor = patch_size * merge_size
@@ -386,9 +384,7 @@ class MiniMaxM3VLImageProcessor(ImageProcessingMixin):
 
         pixel_values = []
         grid_thw = []
-        image_kwargs = {
-            k: v for k, v in kwargs.items() if k in _IMAGE_PROCESSOR_KWARGS
-        }
+        image_kwargs = {k: v for k, v in kwargs.items() if k in _IMAGE_PROCESSOR_KWARGS}
         for image in images:
             patches, thw = self._process_one(image, **image_kwargs)
             pixel_values.append(patches)
@@ -411,9 +407,7 @@ class MiniMaxM3VLImageProcessor(ImageProcessingMixin):
         max_long_side_pixel = images_kwargs.get(
             "max_long_side_pixel", self.max_long_side_pixel
         )
-        max_total_pixels = images_kwargs.get(
-            "max_total_pixels", self.max_total_pixels
-        )
+        max_total_pixels = images_kwargs.get("max_total_pixels", self.max_total_pixels)
         height, width = smart_resize(
             height,
             width,
@@ -570,9 +564,7 @@ class MiniMaxM3VLVideoProcessor(BaseVideoProcessor):
                 tensor_type=None,
             )
 
-        video_kwargs = {
-            k: v for k, v in kwargs.items() if k in _VIDEO_PROCESSOR_KWARGS
-        }
+        video_kwargs = {k: v for k, v in kwargs.items() if k in _VIDEO_PROCESSOR_KWARGS}
         pixel_values = []
         grid_thw = []
         for video in videos:
@@ -895,9 +887,7 @@ class MiniMaxM3VLProcessor(ProcessorMixin):
             for i, prompt in enumerate(text):
                 while self.IMAGE_TOKEN in prompt:
                     if image_idx >= num_images:
-                        raise ValueError(
-                            "More image tokens were provided than images."
-                        )
+                        raise ValueError("More image tokens were provided than images.")
                     prompt = prompt.replace(
                         self.IMAGE_TOKEN,
                         self.replace_image_token(image_inputs, image_idx).replace(
@@ -915,9 +905,7 @@ class MiniMaxM3VLProcessor(ProcessorMixin):
             for i, prompt in enumerate(text):
                 while self.VIDEO_TOKEN in prompt:
                     if video_idx >= num_videos:
-                        raise ValueError(
-                            "More video tokens were provided than videos."
-                        )
+                        raise ValueError("More video tokens were provided than videos.")
                     prompt = prompt.replace(
                         self.VIDEO_TOKEN,
                         self.replace_video_token(video_inputs, video_idx).replace(

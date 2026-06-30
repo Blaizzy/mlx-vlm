@@ -80,8 +80,8 @@ def _sanitize_moe_weights(weights: dict, args):
                 if has_all([*down_keys, shared_down_key]):
                     down = pop_stack(down_keys)
                     shared_down = mx.expand_dims(weights.pop(shared_down_key), axis=0)
-                    weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = (
-                        mx.concatenate([down, shared_down], axis=0)
+                    weights[f"{prefix}.switch_mlp.down_proj.{suffix}"] = mx.concatenate(
+                        [down, shared_down], axis=0
                     )
                 continue
 

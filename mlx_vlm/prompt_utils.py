@@ -698,8 +698,7 @@ def get_chat_template(
             if isinstance(template, str) and name in template:
                 return True
             if isinstance(template, dict) and any(
-                isinstance(value, str) and name in value
-                for value in template.values()
+                isinstance(value, str) and name in value for value in template.values()
             ):
                 return True
         return False
