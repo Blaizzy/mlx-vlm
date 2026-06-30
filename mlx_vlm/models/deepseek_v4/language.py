@@ -1014,6 +1014,7 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
         hidden_sink: Optional[list] = None,
+        capture_layer_ids: Optional[List[int]] = None,
         skip_final_norm: bool = False,
     ) -> mx.array:
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
@@ -1043,8 +1044,17 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
-        for layer, layer_cache in zip(self.pipeline_layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for local_idx, (layer, layer_cache) in enumerate(
+            zip(self.pipeline_layers, cache)
+        ):
             h = layer(h, mask, layer_cache, inputs)
+            if hidden_sink is not None and (self.start_idx + local_idx) in capture_set:
+                # DSpark self-speculation conditions on the per-layer residual
+                # reduced over the hc_mult Hyper-Connection copies — the same
+                # `h.mean(dim=2)` the reference Transformer.forward captures at
+                # each dspark_target_layer_id.
+                hidden_sink.append(h.mean(axis=2))
 
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
@@ -1057,7 +1067,9 @@ class DeepseekV4Model(PipelineMixin, nn.Module):
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
-        if hidden_sink is not None:
+        # Capture-style speculation (DSpark) collects per-layer hiddens above;
+        # the last-layer full-hc hidden is only the MTP "last hidden" path.
+        if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
 
         if skip_final_norm:
@@ -1259,8 +1271,9 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         skip_final_norm = kwargs.pop("skip_final_norm", False)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         hidden_sink = kwargs.pop("hidden_sink", None)
-        if return_hidden and hidden_sink is None:
+        if (return_hidden or capture_layer_ids) and hidden_sink is None:
             hidden_sink = []
 
         out = self.model(
@@ -1268,6 +1281,7 @@ class LanguageModel(nn.Module):
             cache=cache,
             inputs_embeds=inputs_embeds,
             hidden_sink=hidden_sink,
+            capture_layer_ids=capture_layer_ids,
             skip_final_norm=skip_final_norm,
         )
         logits = None if skip_logits else self.lm_head(out)

@@ -3056,6 +3056,71 @@ def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     assert logits.shape == (1, 1, cfg.vocab_size)
 
 
+def _tiny_deepseek_v4_capture_config(num_hidden_layers=2):
+    cfg = _tiny_deepseek_v4_config()
+    cfg.num_hidden_layers = num_hidden_layers
+    cfg.compress_ratios = [0] * num_hidden_layers
+    return cfg
+
+
+def test_deepseek_v4_capture_layer_ids_returns_hc_mean_per_layer():
+    cfg = _tiny_deepseek_v4_capture_config(num_hidden_layers=2)
+    lm = deepseek_language.LanguageModel(cfg)
+    inputs = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    out = lm(inputs, cache=lm.make_cache(), capture_layer_ids=[0, 1])
+    mx.eval(out.logits, *out.hidden_states)
+
+    # One reduced hidden per target layer, each [B, L, hidden] (the hc_mult
+    # Hyper-Connection copies are averaged away), not [B, L, hc_mult * hidden].
+    assert len(out.hidden_states) == 2
+    for h in out.hidden_states:
+        assert h.shape == (1, 4, cfg.hidden_size)
+
+    # Capture is additive — it must not perturb the base logits.
+    plain = lm(inputs, cache=lm.make_cache())
+    mx.eval(plain.logits)
+    assert mx.allclose(out.logits, plain.logits, atol=1e-5)
+
+
+def test_deepseek_v4_capture_matches_mtp_last_hidden_mean():
+    # The last layer's capture must equal the MTP full-hc hidden reduced over
+    # the hc_mult copies (reference Transformer.forward: h.mean(dim=2)).
+    cfg = _tiny_deepseek_v4_capture_config(num_hidden_layers=1)
+    lm = deepseek_language.LanguageModel(cfg)
+    inputs = mx.array([[1, 2, 3]], dtype=mx.int32)
+
+    mtp = lm(inputs, cache=lm.make_cache(), return_hidden=True)
+    cap = lm(inputs, cache=lm.make_cache(), capture_layer_ids=[0])
+    mx.eval(mtp.hidden_states[-1], cap.hidden_states[0])
+
+    assert mtp.hidden_states[-1].shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
+    assert cap.hidden_states[0].shape == (1, 3, cfg.hidden_size)
+    assert mx.allclose(
+        mtp.hidden_states[-1].mean(axis=2), cap.hidden_states[0], atol=1e-5
+    )
+
+
+def test_deepseek_v4_capture_preserves_layer_order_and_mtp_path():
+    cfg = _tiny_deepseek_v4_capture_config(num_hidden_layers=2)
+    lm = deepseek_language.LanguageModel(cfg)
+    inputs = mx.array([[5, 6, 7]], dtype=mx.int32)
+
+    both = lm(inputs, cache=lm.make_cache(), capture_layer_ids=[0, 1])
+    last_only = lm(inputs, cache=lm.make_cache(), capture_layer_ids=[1])
+    mx.eval(both.hidden_states[1], last_only.hidden_states[0])
+
+    # Hiddens are emitted in increasing layer-id order, so [0,1][1] == [1][0].
+    assert len(last_only.hidden_states) == 1
+    assert mx.allclose(both.hidden_states[1], last_only.hidden_states[0], atol=1e-5)
+
+    # With no capture requested, the MTP full-hc last-hidden path is intact.
+    mtp = lm(inputs, cache=lm.make_cache(), return_hidden=True)
+    mx.eval(mtp.hidden_states[-1])
+    assert len(mtp.hidden_states) == 1
+    assert mtp.hidden_states[-1].shape == (1, 3, cfg.hc_mult, cfg.hidden_size)
+
+
 def test_deepseek_v4_replay_snapshot_required_only_when_pooling_can_cross_window():
     pool = PoolingCache(4)
     pool.accumulate_windows(mx.array([[[10.0]]]), mx.ones((1, 1, 1)), offset=0)

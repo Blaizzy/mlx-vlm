@@ -4,11 +4,12 @@ from typing import Any, Optional, Tuple
 
 from .qwen3_dflash import DFlashDraftModel
 
-KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
+KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3", "dspark"}
 
 # Drafter HF ``model_type`` → required round-loop kind. Anything not listed
 # here falls back to ``DEFAULT_DRAFTER_KIND`` when the caller didn't pass one.
 DRAFTER_KIND_BY_MODEL_TYPE = {
+    "deepseek_v4_dspark": "dspark",
     "deepseek_v4_mtp": "mtp",
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
@@ -17,6 +18,19 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
 }
 
 DEFAULT_DRAFTER_KIND = "dflash"
+
+
+def _config_is_dspark(config: Any) -> bool:
+    """A DSpark drafter checkpoint, detected from its model type or its distinctive draft
+    hyper-parameters. The DeepSeek-V4 drafter is split out of the base ``mtp.*`` namespace
+    into a ``deepseek_v4_dspark`` folder carrying the ``dspark_block_size`` hyper-parameter.
+    """
+    if config is None:
+        return False
+    if _cfg_get(config, "model_type") == "deepseek_v4_dspark":
+        return True
+    return bool(_cfg_get(config, "dspark_block_size"))
+
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +69,30 @@ def validate_drafter_compatibility(
             f"Got draft_kind={draft_kind!r}."
         )
 
+    if draft_kind == "dspark":
+        # The DSpark drafter projects the concatenated target hidden states, so its
+        # hidden_size must equal the target's; it also needs the speculative hooks.
+        target = getattr(target_model, "language_model", target_model)
+        if not hasattr(target, "rollback_speculative_cache"):
+            raise ValueError(
+                f"Target {type(target).__name__} does not implement "
+                "rollback_speculative_cache; DSpark needs a DeepSeek-V4 "
+                "(or compatible) target."
+            )
+        draft_hidden_size = _cfg_get(draft_cfg, "hidden_size")
+        target_hidden_size = _hidden_size(getattr(target, "config", None))
+        if (
+            draft_hidden_size is not None
+            and target_hidden_size is not None
+            and draft_hidden_size != target_hidden_size
+        ):
+            raise ValueError(
+                "DSpark drafter is incompatible with the target model. "
+                f"Drafter hidden_size={draft_hidden_size!r}, "
+                f"target hidden_size={target_hidden_size!r}."
+            )
+        return
+
     if draft_kind != "mtp":
         return
 
@@ -79,15 +117,22 @@ def validate_drafter_compatibility(
         )
 
 
+def _peek_drafter_config(model_path) -> Optional[dict]:
+    """Read the drafter's HF ``config.json`` without loading weights."""
+    try:
+        with open(model_path / "config.json") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
 def _peek_drafter_model_type(model_path) -> Optional[str]:
     """Read the drafter's HF ``config.json`` ``model_type`` without loading
     weights. Returns ``None`` if the config can't be read."""
-    try:
-        with open(model_path / "config.json") as f:
-            config = json.load(f)
-            return config.get("model_type") or config.get("speculators_model_type")
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    config = _peek_drafter_config(model_path)
+    if config is None:
         return None
+    return config.get("model_type") or config.get("speculators_model_type")
 
 
 def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
@@ -102,7 +147,29 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     but forgets ``--draft-kind mtp``: rather than crashing deep inside
     ``draft_block`` with an opaque error, we pick the right kind for them.
     """
-    model_type = _peek_drafter_model_type(model_path)
+    config = _peek_drafter_config(model_path)
+    model_type = (
+        (config.get("model_type") or config.get("speculators_model_type"))
+        if config
+        else None
+    )
+    # DSpark drafters are detected by model_type / the dspark_* hyper-parameters.
+    if _config_is_dspark(config):
+        if kind is not None and kind != "dspark":
+            logger.warning(
+                "Drafter %r is a DSpark checkpoint which requires --draft-kind='dspark'; "
+                "got --draft-kind=%r. Overriding to 'dspark'.",
+                str(model_path),
+                kind,
+            )
+        else:
+            logger.info(
+                "Auto-detected --draft-kind='dspark' for drafter %r (model_type=%r).",
+                str(model_path),
+                model_type,
+            )
+        return "dspark"
+
     expected = DRAFTER_KIND_BY_MODEL_TYPE.get(model_type)
 
     if kind is None:

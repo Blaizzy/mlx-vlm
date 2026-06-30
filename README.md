@@ -11,6 +11,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash (Qwen3.5)](#dflash-qwen35)
     - [Gemma 4 MTP](#gemma-4-mtp)
+    - [DeepSeek-V4 DSpark](#deepseek-v4-dspark)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
@@ -123,13 +124,14 @@ Requests can override the server defaults with `enable_thinking`, `thinking_budg
 
 ### Speculative Decoding
 
-Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.
+Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Several drafter families are supported.
 
 | Flag | Description |
 |------|-------------|
 | `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4) |
+| `--draft-kind` | Drafter family — `dflash` (default), `dspark` (DeepSeek-V4 self-speculative), `eagle3`, or `mtp` (Gemma 4) |
 | `--draft-block-size` | Override the drafter's configured block size |
+| `--draft-confidence-threshold` | DSpark only — truncate the draft block where the confidence head's `P(accept)` drops below this (0 = off; lossless either way) |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
@@ -229,6 +231,31 @@ mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
 mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
   --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3
 ```
+
+#### DeepSeek-V4 DSpark
+
+[DSpark](https://github.com/deepseek-ai/DeepSpec) is DeepSeek's self-speculative drafter: an EAGLE-style stack that conditions on the target's intermediate hidden states and predicts a block of tokens biased by a low-rank Markov head, plus a confidence head. It ships for DeepSeek-V4 (Flash and Pro), reusing the in-tree MoE and Hyper-Connection primitives and adding a windowed MLA cross-attention; one config drives both sizes. Output is byte-identical to base greedy decoding.
+
+The draft stack lives under the `mtp.*` namespace of the base fp8/fp4 checkpoint, so it is first split into a standalone bf16 drafter (the same pattern as DeepSeek-V4 MTP):
+
+```sh
+# One-time: extract + dequantize the mtp.* draft into a standalone drafter folder
+python -m mlx_vlm.speculative.drafters.deepseek_v4_dspark.split \
+  --model deepseek-ai/DeepSeek-V4-Flash-DSpark \
+  --output ./deepseek-v4-flash-dspark-drafter
+
+# Then decode with --draft-kind dspark (auto-detected from the split folder)
+mlx_vlm.generate --model deepseek-ai/DeepSeek-V4-Flash \
+  --draft-model ./deepseek-v4-flash-dspark-drafter \
+  --prompt "Explain speculative decoding in 3 sentences." \
+  --max-tokens 256 --temperature 0
+
+# Server
+mlx_vlm.server --model deepseek-ai/DeepSeek-V4-Flash \
+  --draft-model ./deepseek-v4-flash-dspark-drafter
+```
+
+The confidence head can adaptively shorten the draft block on the single-sequence path — set `--draft-confidence-threshold` (e.g. `0.5`) to truncate speculation where `P(accept)` falls below the threshold; this only changes how far ahead the drafter speculates, never which tokens are emitted. Batched continuous decoding uses a fixed block (also lossless).
 
 ### Chat UI with Gradio
 
@@ -363,8 +390,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
-- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4)
+- `--draft-kind`: Drafter family — `dflash` (default), `dspark` (DeepSeek-V4 self-speculative), `eagle3`, or `mtp` (Gemma 4)
 - `--draft-block-size`: Override the drafter's configured block size
+- `--draft-confidence-threshold`: DSpark only — truncate the draft block where `P(accept)` falls below this (0 = off; lossless either way)
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
 - `--trust-remote-code`: Trust remote code when loading models from Hugging Face Hub
