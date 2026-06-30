@@ -570,6 +570,16 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
         early_exit_layer = kwargs.pop("early_exit_layer", None)
+        if early_exit_layer is not None:
+            if output_hidden_states:
+                raise ValueError(
+                    "early_exit_layer cannot be used with output_hidden_states"
+                )
+            if early_exit_layer < 0 or early_exit_layer >= len(self.model.layers):
+                raise ValueError(
+                    "early_exit_layer must be in "
+                    f"[0, {len(self.model.layers) - 1}], got {early_exit_layer}"
+                )
 
         out = self.model(
             inputs,
