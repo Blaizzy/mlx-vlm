@@ -874,6 +874,7 @@ class ResponseGenerator:
         self.model_path = model_path
         self.adapter_path = adapter_path
         self.model = None
+        self.language_model = None
         self.processor = None
         self.config = None
         self.stop_tokens = set()
@@ -894,6 +895,24 @@ class ResponseGenerator:
         self._cancel_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def _target_language_model(self):
+        language_model = getattr(self.model, "language_model", None)
+        if language_model is None:
+            model_type = type(self.model).__name__
+            draft_type = type(self.draft_model).__name__ if self.draft_model else None
+            hint = (
+                " The loaded target model is the configured drafter; check that "
+                "the server --model path points at the target checkpoint, not "
+                "--draft-model."
+                if self.model is self.draft_model
+                else ""
+            )
+            raise RuntimeError(
+                "Loaded target model does not expose a language_model "
+                f"attribute (model={model_type}, draft_model={draft_type}).{hint}"
+            )
+        return language_model
 
     def stop_and_join(self):
         self._stop = True
@@ -968,6 +987,7 @@ class ResponseGenerator:
         self.stop_tokens = stop_tokens
         self.draft_model = draft_model
         self.draft_kind = draft_kind
+        self.language_model = self._target_language_model()
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1201,6 +1221,8 @@ class ResponseGenerator:
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
         try:
             self._initialize_model()
+            if getattr(self, "language_model", None) is None:
+                self.language_model = self._target_language_model()
         except Exception as e:
             self._load_error = e
             self._ready.set()
@@ -1268,7 +1290,7 @@ class ResponseGenerator:
                 for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
-                            self.model.language_model,
+                            self.language_model,
                             self.processor,
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
@@ -1565,7 +1587,7 @@ class ResponseGenerator:
 
         generation_stream = mx.default_stream(mx.default_device())
 
-        lm = self.model.language_model
+        lm = getattr(self, "language_model", None) or self._target_language_model()
         drafter = self.draft_model
         draft_kind = self.draft_kind
         is_mtp = draft_kind == "mtp"
