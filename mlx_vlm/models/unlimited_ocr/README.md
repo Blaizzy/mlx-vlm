@@ -1,6 +1,6 @@
 # Unlimited-OCR
 
-Unlimited-OCR is Baidu's OCR/document-parsing model for **one-shot long-horizon parsing**. The upstream project is [baidu/Unlimited-OCR](https://github.com/baidu/Unlimited-OCR), and the Hugging Face checkpoint is `baidu/Unlimited-OCR` with `model_type: unlimited-ocr`.
+Unlimited-OCR is Baidu's OCR/document-parsing model for **one-shot long-horizon parsing**.
 
 This README only documents the prompt formats and settings that are either shown by upstream or verified in the MLX implementation.
 
@@ -355,8 +355,5 @@ result = generate(
 
 ## Implementation Notes
 
-- Hugging Face uses `model_type: unlimited-ocr`; the MLX module name is `unlimited_ocr`, and `mlx_vlm` remaps the model type automatically.
-- The processor loads `processor_config.json` and the fast tokenizer directly, without requiring upstream PyTorch remote-code execution during MLX inference.
-- `apply_chat_template(..., num_images > 1)` returns one literal `<image>` token for Unlimited-OCR, matching upstream `infer_multi`.
 - The upstream repository includes `SlidingWindowNoRepeatNgramProcessor`, but this implementation keeps repetition guards caller-supplied through `logits_processors` rather than adding model-specific sampling code to MLX-VLM.
 - Keep the vision stack in FP32 when using quantized language weights; the no-repeat processor can stop repeated decoding earlier, but it does not fix degraded visual features.
