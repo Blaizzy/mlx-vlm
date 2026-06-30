@@ -2422,6 +2422,49 @@ def _tiny_deepseek_v4_config():
     )
 
 
+def test_deepseek_v4_shared_expert_applies_swiglu_limit():
+    # The shared expert must clamp gate/up pre-activations to swiglu_limit,
+    # exactly like the routed experts (reference inference/model.py MoE.__init__
+    # builds the shared Expert with swiglu_limit). Without the clamp, large
+    # pre-activations -- common with production fp4 weights -- diverge silently.
+    cfg = _tiny_deepseek_v4_config()
+    limit = cfg.swiglu_limit
+    assert limit > 0
+
+    moe = deepseek_language.DeepseekV4MoE(cfg, layer_idx=0)
+    shared = moe.shared_experts
+    assert shared.swiglu_limit == limit
+
+    hidden = cfg.hidden_size
+    inter = cfg.moe_intermediate_size * cfg.n_shared_experts
+
+    # x = ones, so gate_proj(x)[i] == sum of row i. Spread each target evenly
+    # across the input dim to hit exact, known pre-activations.
+    x = mx.ones((1, 1, hidden), dtype=mx.float32)
+    gate_targets = mx.array([limit + 5.0, -3.0, limit + 5.0, -3.0])[:inter]
+    up_targets = mx.array([limit + 5.0, -(limit + 5.0), 2.0, 2.0])[:inter]
+    shared.gate_proj.weight = mx.broadcast_to(
+        (gate_targets / hidden)[:, None], (inter, hidden)
+    )
+    shared.up_proj.weight = mx.broadcast_to(
+        (up_targets / hidden)[:, None], (inter, hidden)
+    )
+
+    gate = shared.gate_proj(x)
+    up = shared.up_proj(x)
+    clamped = shared.down_proj(
+        nn.silu(mx.minimum(gate, limit)) * mx.clip(up, -limit, limit)
+    )
+    unclamped = shared.down_proj(nn.silu(gate) * up)
+    out = shared(x)
+    mx.eval(out, clamped, unclamped)
+
+    assert mx.allclose(out, clamped, atol=1e-5)
+    # The clamp must actually change the result for these pre-activations,
+    # otherwise the test would pass even if the limit were dropped.
+    assert not mx.allclose(clamped, unclamped, atol=1e-3)
+
+
 def test_eagle3_config_uses_speculators_fields():
     cfg = Eagle3Config.from_dict(
         {
