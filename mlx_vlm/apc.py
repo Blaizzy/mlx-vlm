@@ -3711,6 +3711,8 @@ def harvest_blocks_from_batch_cache(
         keys = getattr(c, "keys", None)
         values = getattr(c, "values", None)
         idx = getattr(c, "_idx", None)
+        if idx is None and keys is not None and values is not None:
+            idx = getattr(c, "offset", None)
         left_padding = getattr(c, "left_padding", None)
         if keys is None or values is None or idx is None:
             return []

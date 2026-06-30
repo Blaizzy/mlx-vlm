@@ -813,6 +813,29 @@ def test_harvest_blocks_from_batch_cache_drops_left_padding():
     source_manager.release(full_blocks + short_blocks)
 
 
+def test_harvest_blocks_from_regular_kv_cache_uses_offset():
+    block_size = 16
+    manager = APCManager(num_blocks=8, block_size=block_size)
+    token_ids = list(range(block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+    caches = []
+    for keys, values in zip(layer_keys, layer_values):
+        caches.append(SimpleNamespace(keys=keys, values=values, offset=block_size))
+
+    harvested = harvest_blocks_from_batch_cache(
+        manager,
+        caches,
+        batch_idx=0,
+        full_token_ids=token_ids,
+    )
+
+    assert len(harvested) == 1
+    _assert_allclose(harvested[0].keys[0], layer_keys[0])
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+    assert matched_tokens == block_size
+    manager.release(matched + harvested)
+
+
 def test_disk_metadata_mismatch_is_a_miss(tmp_path):
     block_size = 16
     token_ids = list(range(block_size))

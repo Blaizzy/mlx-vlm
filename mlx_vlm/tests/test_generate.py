@@ -507,6 +507,25 @@ class TestBatchGenerator:
         assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
 
+    def test_initialization_keeps_apc_with_draft_model(
+        self, mock_model, mock_processor
+    ):
+        apc_manager = object()
+        draft_model = object()
+
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            apc_manager=apc_manager,
+            draft_model=draft_model,
+            compute_logprobs=True,
+            top_logprobs_k=5,
+        )
+
+        assert gen.apc_manager is apc_manager
+        assert gen.compute_logprobs is False
+        assert gen.top_logprobs_k == 0
+
     def test_insert_prompts(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
