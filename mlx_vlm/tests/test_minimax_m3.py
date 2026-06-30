@@ -5,6 +5,7 @@ import numpy as np
 from mlx_lm.models.switch_layers import SwitchGLU
 
 import mlx_vlm.models.minimax_m3_vl.language as minimax_language
+from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.minimax_m3_vl.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.minimax_m3_vl.language import (
     LanguageModel,
@@ -27,7 +28,6 @@ from mlx_vlm.models.minimax_m3_vl.vision import (
     MiniMaxVisionTransformer,
     _apply_vision_rope,
 )
-from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.prompt_utils import apply_chat_template
 
 
@@ -117,7 +117,9 @@ def test_minimax_m3_packed_switch_glu_matches_routed_plus_shared_mlp():
     )
 
     def values(shape, offset):
-        return (mx.arange(math.prod(shape), dtype=mx.float32).reshape(shape) + offset) / 50
+        return (
+            mx.arange(math.prod(shape), dtype=mx.float32).reshape(shape) + offset
+        ) / 50
 
     split.gate_proj.weight = values((num_experts, intermediate_size, hidden_size), 1)
     split.up_proj.weight = values((num_experts, intermediate_size, hidden_size), 17)
@@ -432,9 +434,7 @@ def test_minimax_m3_attention_passes_position_ids_to_sparse_selection(monkeypatc
         del self, mask
         captured["q_start"] = q_start
         captured["q_positions"] = q_positions
-        return mx.zeros(
-            (idx_queries.shape[0], idx_queries.shape[2], 1), dtype=mx.int32
-        )
+        return mx.zeros((idx_queries.shape[0], idx_queries.shape[2], 1), dtype=mx.int32)
 
     def fake_sdpa(queries, keys, values, cache, scale, mask):
         del keys, values, cache, scale, mask
@@ -483,9 +483,7 @@ def test_minimax_m3_attention_offsets_sparse_positions_for_batch_cache(monkeypat
         del self, mask
         captured["q_start"] = q_start
         captured["q_positions"] = q_positions
-        return mx.zeros(
-            (idx_queries.shape[0], idx_queries.shape[2], 1), dtype=mx.int32
-        )
+        return mx.zeros((idx_queries.shape[0], idx_queries.shape[2], 1), dtype=mx.int32)
 
     def fake_sdpa(queries, keys, values, cache, scale, mask):
         del keys, values, cache, scale, mask
@@ -535,9 +533,7 @@ def test_minimax_m3_explicit_positions_use_compiled_sparse_indexer(monkeypatch):
         del scale, block_size, sparse_topk_blocks, sparse_init_blocks
         del sparse_local_blocks
         captured["q_positions"] = q_positions
-        return mx.zeros(
-            (idx_queries.shape[0], idx_queries.shape[2], 1), dtype=mx.int32
-        )
+        return mx.zeros((idx_queries.shape[0], idx_queries.shape[2], 1), dtype=mx.int32)
 
     monkeypatch.setattr(
         minimax_language, "_select_sparse_block_indices_compiled", fake_compiled
@@ -1162,10 +1158,11 @@ class _MiniMaxFakeTokenizer:
         encoded = [self._encode(prompt) for prompt in text]
         max_len = max(len(ids) for ids in encoded)
         if padding:
-            encoded = [ids + [self.pad_token_id] * (max_len - len(ids)) for ids in encoded]
+            encoded = [
+                ids + [self.pad_token_id] * (max_len - len(ids)) for ids in encoded
+            ]
         attention_mask = [
-            [0 if token == self.pad_token_id else 1 for token in ids]
-            for ids in encoded
+            [0 if token == self.pad_token_id else 1 for token in ids] for ids in encoded
         ]
         return {"input_ids": encoded, "attention_mask": attention_mask}
 
@@ -1250,7 +1247,9 @@ def test_minimax_m3_processor_expands_video_tokens_with_timestamps():
         + MiniMaxM3VLProcessor.VIDEO_TOKEN
         + MiniMaxM3VLProcessor.VISION_END_TOKEN
     )
-    expected_text = f"]<]0.0 seconds[>[{frame_chunk}]<]1.0 seconds[>[{frame_chunk}Describe."
+    expected_text = (
+        f"]<]0.0 seconds[>[{frame_chunk}]<]1.0 seconds[>[{frame_chunk}Describe."
+    )
     assert processor.tokenizer.seen_text == [expected_text]
     assert outputs["pixel_values_videos"].shape == (8, 24)
     assert outputs["video_grid_thw"].tolist() == [[2, 2, 2]]
@@ -1405,9 +1404,7 @@ def test_minimax_m3_kv_cache_merge_returns_batch_cache():
             mx.ones((1, 1, 3, 4), dtype=mx.float32) * offset,
             mx.ones((1, 1, 3, 5), dtype=mx.float32) * offset,
         )
-        cache.update_index_and_fetch(
-            mx.ones((1, 2, 3, 4), dtype=mx.float32) * offset
-        )
+        cache.update_index_and_fetch(mx.ones((1, 2, 3, 4), dtype=mx.float32) * offset)
         caches.append(cache)
 
     merged = MiniMaxM3KVCache.merge(caches)

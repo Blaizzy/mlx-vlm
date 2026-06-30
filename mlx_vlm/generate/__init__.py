@@ -1,10 +1,10 @@
 """Public generation API."""
 
 from .ar import (
+    DEFAULT_MAX_NUM_BATCHED_TOKENS,
     BatchGenerator,
     BatchResponse,
     BatchStats,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS,
     PromptProcessingBatch,
     batch_generate,
     generate_step,

@@ -505,6 +505,7 @@ def _minimax_m3_sparse_prefill_attention(
         output_dtypes=[queries.dtype],
     )[0]
 
+
 @partial(mx.compile, shapeless=True)
 def _swiglu_oai(
     x_linear,
@@ -728,12 +729,8 @@ class MiniMaxM3BatchKVCache:
     def prepare(self, **kwargs):
         left_padding = kwargs.get("left_padding")
         right_padding = kwargs.get("right_padding")
-        if (
-            left_padding is not None
-            and not self._all_zero_padding(left_padding)
-        ) or (
-            right_padding is not None
-            and not self._all_zero_padding(right_padding)
+        if (left_padding is not None and not self._all_zero_padding(left_padding)) or (
+            right_padding is not None and not self._all_zero_padding(right_padding)
         ):
             self._can_skip_decode_mask = False
         self.kv_cache.prepare(**kwargs)
@@ -829,9 +826,8 @@ class MiniMaxM3BatchKVCache:
 
         out.kv_cache = BatchKVCache.merge([cache.kv_cache for cache in caches])
         lengths = [cache.kv_cache.size() for cache in caches]
-        out._can_skip_decode_mask = (
-            len(set(lengths)) == 1
-            and all(getattr(cache, "_can_skip_decode_mask", True) for cache in caches)
+        out._can_skip_decode_mask = len(set(lengths)) == 1 and all(
+            getattr(cache, "_can_skip_decode_mask", True) for cache in caches
         )
         index_states = [
             (
@@ -1921,9 +1917,7 @@ class LanguageModel(nn.Module):
 
         if attention_mask is not None:
             seen_token = mx.cumsum(attention_mask.astype(mx.int32), axis=-1) > 0
-            left_padding = seq_length - mx.sum(
-                seen_token.astype(mx.int32), axis=-1
-            )
+            left_padding = seq_length - mx.sum(seen_token.astype(mx.int32), axis=-1)
             positions = positions - left_padding.astype(positions.dtype)[:, None]
 
         rope_deltas = mx.zeros((batch_size, 1), dtype=positions.dtype)
@@ -2018,7 +2012,11 @@ class LanguageModel(nn.Module):
             and _can_skip_uniform_batch_decode_mask(cache, inputs.shape[-1])
         )
 
-        if position_ids is None and inputs.shape[0] > 1 and not can_skip_batch_positions:
+        if (
+            position_ids is None
+            and inputs.shape[0] > 1
+            and not can_skip_batch_positions
+        ):
             cache_offset = 0
             cache_offsets = None
             if first_cache is not None:

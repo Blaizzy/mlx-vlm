@@ -98,9 +98,7 @@ def _prepare_rows(model, processor, prompts, ar, prompt_utils, utils):
         **data_kwargs,
     )
     gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
-    return input_ids.tolist(), ar._split_prompt_kwargs_per_row(
-        gen_kwargs, len(prompts)
-    )
+    return input_ids.tolist(), ar._split_prompt_kwargs_per_row(gen_kwargs, len(prompts))
 
 
 def _make_generator(ar, model, processor, decode_rows, args):
@@ -155,9 +153,7 @@ def _drop_pending_prompt(gen, active_uids, mx):
     ]
     if len(gen._generation_batch) > 0:
         keep = [
-            i
-            for i, uid in enumerate(gen._generation_batch.uids)
-            if uid in active_uids
+            i for i, uid in enumerate(gen._generation_batch.uids) if uid in active_uids
         ]
         if len(keep) < len(gen._generation_batch.uids):
             gen._generation_batch.filter(keep)
@@ -375,9 +371,8 @@ def run(args) -> None:
 
     import mlx.core as mx
 
-    from mlx_vlm import load
+    from mlx_vlm import load, prompt_utils, utils
     from mlx_vlm.generate import ar
-    from mlx_vlm import prompt_utils, utils
 
     _clear_mlx(mx)
     commit = _repo_commit(repo)
@@ -474,9 +469,8 @@ def run_stream(args) -> None:
 
     import mlx.core as mx
 
-    from mlx_vlm import load
+    from mlx_vlm import load, prompt_utils, utils
     from mlx_vlm.generate import ar
-    from mlx_vlm import prompt_utils, utils
 
     _clear_mlx(mx)
     commit = _repo_commit(repo)
@@ -608,9 +602,7 @@ def write_csv(rows, path: Path) -> None:
 
 
 def _text(x, y, value, *, size=12, anchor="middle", weight="normal", color="#1f2937"):
-    escaped = (
-        str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    )
+    escaped = str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" font-family="Arial, sans-serif" '
         f'font-size="{size}" font-weight="{weight}" text-anchor="{anchor}" '
@@ -678,7 +670,9 @@ def _panel(rows, metric, title, y_label, x, y, width, height):
                 f'height="{bh:.1f}" fill="{colors[label_idx % len(colors)]}"/>'
             )
             parts.append(_text(bx + (bar_w - 4) / 2, by - 4, f"{value:.1f}", size=9))
-    parts.append(_text(left + plot_w / 2, y + height - 12, "active decode rows", size=11))
+    parts.append(
+        _text(left + plot_w / 2, y + height - 12, "active decode rows", size=11)
+    )
     parts.append(_text(x + 15, top + plot_h / 2, y_label, size=11))
     legend_x = left + plot_w - 170
     legend_y = top + 5
@@ -699,8 +693,20 @@ def write_svg(rows, path: Path) -> None:
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#f8fafc"/>',
-        _text(width / 2, 28, "MiniMax M3 Continuous Batching: Before vs After", size=20, weight="bold"),
-        _text(width / 2, 50, f"Real M3 model, pending prompt {prompt_tokens} tokens, one measured scheduler tick", size=12, color="#475569"),
+        _text(
+            width / 2,
+            28,
+            "MiniMax M3 Continuous Batching: Before vs After",
+            size=20,
+            weight="bold",
+        ),
+        _text(
+            width / 2,
+            50,
+            f"Real M3 model, pending prompt {prompt_tokens} tokens, one measured scheduler tick",
+            size=12,
+            color="#475569",
+        ),
     ]
     parts.extend(
         _panel(
@@ -748,7 +754,9 @@ def build_parser():
     run_parser.add_argument("--model-path", default="~/MiniMax-M3-4bit")
     run_parser.add_argument("--out", required=True)
     run_parser.add_argument("--decode-rows", type=_parse_ints, default=[1])
-    run_parser.add_argument("--modes", nargs="+", default=["decode_only", "decode_with_prefill"])
+    run_parser.add_argument(
+        "--modes", nargs="+", default=["decode_only", "decode_with_prefill"]
+    )
     run_parser.add_argument("--iterations", type=int, default=3)
     run_parser.add_argument("--warmup", type=int, default=1)
     run_parser.add_argument("--prefill-step-size", type=int, default=2048)
@@ -777,9 +785,7 @@ def build_parser():
     stream_parser.add_argument("--model-path", default="~/MiniMax-M3-4bit")
     stream_parser.add_argument("--out", required=True)
     stream_parser.add_argument("--decode-rows", type=_parse_ints, default=[1])
-    stream_parser.add_argument(
-        "--modes", nargs="+", default=["decode_with_prefill"]
-    )
+    stream_parser.add_argument("--modes", nargs="+", default=["decode_with_prefill"])
     stream_parser.add_argument("--prefill-step-size", type=int, default=2048)
     stream_parser.add_argument("--prefill-batch-size", type=int)
     stream_parser.add_argument("--max-num-batched-tokens", type=int, default=64)

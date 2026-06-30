@@ -13,7 +13,6 @@ import argparse
 import csv
 import json
 import math
-import os
 import statistics
 import subprocess
 import sys
@@ -280,13 +279,10 @@ def write_csv(rows: list[dict], path: Path) -> None:
             writer.writerow({field: row.get(field) for field in fields})
 
 
-def _svg_text(x, y, text, *, size=12, anchor="middle", weight="normal", color="#1f2937"):
-    escaped = (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+def _svg_text(
+    x, y, text, *, size=12, anchor="middle", weight="normal", color="#1f2937"
+):
+    escaped = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return (
         f'<text x="{x:.1f}" y="{y:.1f}" font-family="Arial, sans-serif" '
         f'font-size="{size}" font-weight="{weight}" text-anchor="{anchor}" '
@@ -327,7 +323,9 @@ def _draw_bar_panel(
         if label not in labels:
             labels.append(label)
     decode_rows = sorted({int(row["decode_rows"]) for row in rows})
-    by_key = {(row["label"], int(row["decode_rows"])): float(row[metric]) for row in rows}
+    by_key = {
+        (row["label"], int(row["decode_rows"])): float(row[metric]) for row in rows
+    }
     max_value = max(by_key.values()) if by_key else 1.0
     y_max = _nice_max(max_value * 1.15)
     colors = ["#2563eb", "#dc2626", "#059669", "#7c3aed"]
@@ -363,11 +361,13 @@ def _draw_bar_panel(
                 f'<rect x="{bx:.1f}" y="{by:.1f}" width="{bar_w - 4:.1f}" '
                 f'height="{bh:.1f}" fill="{colors[label_idx % len(colors)]}"/>'
             )
-            parts.append(_svg_text(bx + (bar_w - 4) / 2, by - 4, f"{value:.1f}", size=9))
-    parts.append(_svg_text(left + plot_w / 2, y + height - 12, "active decode rows", size=11))
+            parts.append(
+                _svg_text(bx + (bar_w - 4) / 2, by - 4, f"{value:.1f}", size=9)
+            )
     parts.append(
-        _svg_text(x + 15, top + plot_h / 2, y_label, size=11, anchor="middle")
+        _svg_text(left + plot_w / 2, y + height - 12, "active decode rows", size=11)
     )
+    parts.append(_svg_text(x + 15, top + plot_h / 2, y_label, size=11, anchor="middle"))
     legend_x = left + plot_w - 150
     legend_y = top + 4
     for idx, label in enumerate(labels):
@@ -427,12 +427,16 @@ def write_svg(rows: list[dict], path: Path) -> None:
         )
     )
     if decode_only:
-        before_after = sorted(decode_only, key=lambda row: (int(row["decode_rows"]), row["label"]))
+        before_after = sorted(
+            decode_only, key=lambda row: (int(row["decode_rows"]), row["label"])
+        )
         summary = ", ".join(
             f'{row["label"]} {int(row["decode_rows"])} rows: {float(row["median_ms"]):.2f} ms'
             for row in before_after[:4]
         )
-        parts.append(_svg_text(width / 2, 700, f"Decode-only sanity sample: {summary}", size=11))
+        parts.append(
+            _svg_text(width / 2, 700, f"Decode-only sanity sample: {summary}", size=11)
+        )
     parts.append("</svg>")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(parts), encoding="utf-8")
@@ -457,7 +461,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--iterations", type=int, default=30)
     run.add_argument("--warmup", type=int, default=5)
     run.add_argument("--decode-rows", type=_parse_ints, default=[1, 8, 32, 64])
-    run.add_argument("--modes", nargs="+", default=["decode_only", "decode_with_prefill"])
+    run.add_argument(
+        "--modes", nargs="+", default=["decode_only", "decode_with_prefill"]
+    )
     run.add_argument("--max-num-batched-tokens", type=int, default=64)
     run.add_argument("--prefill-step-size", type=int, default=2048)
     run.add_argument("--remaining-prompt-tokens", type=int, default=8192)

@@ -675,8 +675,7 @@ class TestBatchGenerator:
 
             def next(self):
                 return [
-                    GenerationBatch.Response(i, 100 + i, 0.0, None)
-                    for i in range(3)
+                    GenerationBatch.Response(i, 100 + i, 0.0, None) for i in range(3)
                 ]
 
         class FakePromptBatch:
@@ -720,8 +719,7 @@ class TestBatchGenerator:
 
             def next(self):
                 return [
-                    GenerationBatch.Response(i, 100 + i, 0.0, None)
-                    for i in range(4)
+                    GenerationBatch.Response(i, 100 + i, 0.0, None) for i in range(4)
                 ]
 
         class FakePromptBatch:
