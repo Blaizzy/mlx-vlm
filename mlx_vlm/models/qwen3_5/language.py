@@ -72,12 +72,13 @@ def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
     return out.astype(conv_input.dtype)[:, None, :]
 
 
-_TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
-    name="qwen3_5_target_verify_gemv",
-    input_names=["x", "weight"],
-    output_names=["out"],
-    header="#include <metal_simdgroup>\nusing namespace metal;\n",
-    source=r"""
+_TARGET_VERIFY_GEMV = (
+    mx.fast.metal_kernel(
+        name="qwen3_5_target_verify_gemv",
+        input_names=["x", "weight"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=r"""
         uint lane = thread_position_in_grid.x;
         uint out_block = thread_position_in_grid.y;
         uint row = thread_position_in_grid.z;
@@ -145,12 +146,16 @@ _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
             }
         }
     """,
+    )
+    if mx.metal.is_available()
+    else None
 )
 
 
 def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
     return (
-        target_verify
+        _TARGET_VERIFY_GEMV is not None
+        and target_verify
         and x.ndim == 3
         and x.shape[1] > 1
         and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
@@ -1203,6 +1208,10 @@ def _qwen3_5_ragged_decode_attention(
     pads: List[int],
     scale: float,
 ) -> Optional[mx.array]:
+    # Metal-only fast path; on other backends (e.g. CUDA) return None so the
+    # caller falls back to portable per-pad-group scaled_dot_product_attention.
+    if not mx.metal.is_available():
+        return None
     if (
         queries.ndim != 4
         or keys.ndim != 4
@@ -1985,44 +1994,45 @@ class LanguageModel(nn.Module):
                 valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
             return valid_ends_mx
 
-        # Separate trimmable (KV) caches from SSM caches.
+        def _is_ssm_cache(c):
+            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
+
         ssm_caches = []
         for c in caches:
             if c is None:
                 continue
-            if c.is_trimmable():
-                if trim > 0:
-                    c.trim(trim)
-                right_trimmed = False
-                if is_batch and max_a > 0:
-                    extra_trim_list = [max_a - a for a in accepted_list]
-                    if any(extra_trim_list):
-                        prepare = getattr(c, "prepare", None)
-                        finalize = getattr(c, "finalize", None)
-                        if (
-                            c.keys is not None
-                            and callable(prepare)
-                            and callable(finalize)
-                        ):
-                            prepare(right_padding=extra_trim_list)
-                            finalize()
-                            right_trimmed = True
-                if (
-                    is_batch
-                    and not right_trimmed
-                    and hasattr(c, "_idx")
-                    and c.keys is not None
-                    and max_a > 0
-                ):
-                    kv_len = c._idx
-                    verify_start = kv_len - n
-                    for bi, ve in enumerate(valid_ends_list):
-                        start = verify_start + ve
-                        if start < kv_len:
+            if _is_ssm_cache(c):
+                ssm_caches.append(c)
+                continue
+            if c.is_trimmable() and trim > 0:
+                c.trim(trim)
+            right_trimmed = False
+            if is_batch and max_a > 0:
+                extra_trim_list = [max_a - a for a in accepted_list]
+                if any(extra_trim_list):
+                    prepare = getattr(c, "prepare", None)
+                    finalize = getattr(c, "finalize", None)
+                    if c.keys is not None and callable(prepare) and callable(finalize):
+                        prepare(right_padding=extra_trim_list)
+                        finalize()
+                        right_trimmed = True
+            if (
+                is_batch
+                and not right_trimmed
+                and hasattr(c, "_idx")
+                and c.keys is not None
+                and max_a > 0
+            ):
+                kv_len = c._idx
+                verify_start = kv_len - n
+                for bi, ve in enumerate(valid_ends_list):
+                    start = verify_start + ve
+                    if start < kv_len:
+                        if hasattr(c, "zero_row_tail"):
+                            c.zero_row_tail(bi, start, kv_len)
+                        else:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
-            else:
-                ssm_caches.append(c)
 
         if not ssm_caches:
             return max_a
@@ -2352,6 +2362,10 @@ class LanguageModel(nn.Module):
                     t_index = mx.broadcast_to(t_index, (3, text_len))
 
                     llm_pos_ids_list.append(t_index + st_idx)
+
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()

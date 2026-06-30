@@ -1063,6 +1063,11 @@ class GenerationBatch:
         if self_has_processors or other_has_processors:
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
+        else:
+            self.token_context = []
+            other.token_context = []
+            self.logits_processors = []
+            other.logits_processors = []
 
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
@@ -2094,7 +2099,6 @@ class BatchGenerator:
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
         if self.draft_model is not None:
-            apc_manager = None
             compute_logprobs = False
             top_logprobs_k = 0
             self.compute_logprobs = False

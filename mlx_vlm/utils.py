@@ -483,12 +483,25 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    index_file = model_path / "model.safetensors.index.json"
+    weight_files = []
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            weight_files = [
+                str(model_path / shard)
+                for shard in sorted(set(weight_map.values()))
+                if (model_path / shard).exists()
+            ]
+        except (ValueError, OSError):
+            weight_files = []
+    if not weight_files:
+        weight_files = [
+            wf
+            for wf in glob.glob(str(model_path / "*.safetensors"))
+            if not wf.endswith("consolidated.safetensors")
+        ]
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
@@ -1929,7 +1942,7 @@ class StoppingCriteria:
             eos_token_ids = [eos_token_ids]
 
         if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids

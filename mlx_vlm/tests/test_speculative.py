@@ -2864,6 +2864,59 @@ def test_qwen3_5_rollback_speculative_cache_trims_batch_rows_ragged():
     assert cache.left_padding.tolist() == [0, 2]
 
 
+def test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv():
+    cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
+    keys = mx.arange(2 * 1 * 7 * 8, dtype=mx.float32).reshape(2, 1, 7, 8)
+    values = keys + 100
+    cache.update_and_fetch(keys, values)
+
+    qwen_language.LanguageModel.rollback_speculative_cache(
+        None, [cache], [], mx.array([0, 2]), block_size=5
+    )
+
+    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms, cache.offset)
+    assert cache._idx == 5
+    assert cache.offset.tolist() == [5, 5]
+    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
+    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
+    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
+    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+
+def test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
+    cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
+    keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
+    values = keys + 100
+    cache.update_and_fetch(keys, values)
+
+    gemma4_language.LanguageModel.rollback_speculative_cache(
+        None, [cache], [], mx.array([0, 2]), block_size=3
+    )
+
+    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms)
+    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
+    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
+    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
+    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+
+def test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_zero():
+    cache = BatchTurboQuantKVCache([0, 0], bits=3.5)
+    keys = mx.arange(2 * 1 * 5 * 8, dtype=mx.float32).reshape(2, 1, 5, 8)
+    values = keys + 100
+    cache.update_and_fetch(keys, values)
+
+    deepseek_language.LanguageModel.rollback_speculative_cache(
+        None, [cache], [], mx.array([0, 2]), block_size=3
+    )
+
+    mx.eval(cache.keys.norms, cache.keys.indices, cache.values.norms)
+    assert mx.all(cache.keys.norms[0, :, 3:5] == 0).item()
+    assert mx.all(cache.keys.indices[0, :, 3:5, :] == 0).item()
+    assert mx.all(cache.values.norms[0, :, 3:5] == 0).item()
+    assert mx.any(cache.keys.norms[1, :, 3:5] != 0).item()
+
+
 def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
     text_config = _tiny_qwen3_5_text_config()
     text_config.mtp_num_hidden_layers = 1
