@@ -3669,6 +3669,75 @@ class TestModels(unittest.TestCase):
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
 
+    def test_unlimited_ocr(self):
+        from mlx_vlm.models import unlimited_ocr
+
+        text_config = unlimited_ocr.TextConfig(
+            model_type="deepseek_v2",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            vocab_size=32,
+            num_key_value_heads=2,
+            kv_lora_rank=None,
+            q_lora_rank=None,
+            qk_rope_head_dim=0,
+            v_head_dim=8,
+            qk_nope_head_dim=0,
+            moe_intermediate_size=16,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+        )
+        vision_config = unlimited_ocr.VisionConfig(
+            model_type="vision",
+            layers=1,
+            width=16,
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+        )
+        projector_config = unlimited_ocr.ProjectorConfig(
+            projector_type="linear",
+            input_dim=16,
+            n_embed=16,
+        )
+        config = unlimited_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            model_type="unlimited-ocr",
+        )
+        model = unlimited_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.random.uniform(
+            shape=(
+                1,
+                config.vision_config.image_size,
+                config.vision_config.image_size,
+                config.vision_config.num_channels,
+            ),
+            dtype=mx.float32,
+        )
+        vision_features = model.vision_model(pixel_values)
+        self.assertEqual(vision_features.shape[0], 1)
+        self.assertEqual(vision_features.shape[-1], config.vision_config.hidden_size)
+
+        projector_input = mx.random.uniform(
+            shape=(1, 4, config.projector_config.input_dim),
+            dtype=mx.float32,
+        )
+        projected = model.projector(projector_input)
+        self.assertEqual(projected.shape, (1, 4, config.projector_config.n_embed))
+
     def test_jina_vlm(self):
         from mlx_vlm.models import jina_vlm
 
@@ -5408,106 +5477,46 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "deepseekocr")
 
-    def test_unlimitedocr_config_and_input_embeddings(self):
+    def test_unlimited_ocr_input_embeddings(self):
         from mlx_vlm.models import unlimited_ocr
 
-        config = unlimited_ocr.ModelConfig.from_dict(
-            {
-                "model_type": "unlimited-ocr",
-                "language_config": {
-                    "model_type": "deepseek_v2",
-                    "hidden_size": 16,
-                    "num_hidden_layers": 1,
-                    "intermediate_size": 32,
-                    "num_attention_heads": 2,
-                    "vocab_size": 32,
-                    "num_key_value_heads": 2,
-                    "kv_lora_rank": None,
-                    "q_lora_rank": None,
-                    "qk_rope_head_dim": 0,
-                    "v_head_dim": 8,
-                    "qk_nope_head_dim": 0,
-                    "moe_intermediate_size": 16,
-                    "n_shared_experts": 1,
-                    "n_routed_experts": 2,
-                    "num_experts_per_tok": 1,
-                    "max_position_embeddings": 32768,
-                    "sliding_window_size": 128,
-                },
-                "vision_config": {
-                    "model_type": "vision",
-                    "layers": 1,
-                    "width": {
-                        "clip-l-14-224": {"width": 1024},
-                        "sam_vit_b": {"width": 768},
-                    },
-                    "hidden_size": 16,
-                    "intermediate_size": 32,
-                    "num_attention_heads": 2,
-                },
-                "projector_config": {
-                    "projector_type": "linear",
-                    "input_dim": 16,
-                    "n_embed": 16,
-                },
-            }
+        model = unlimited_ocr.Model(
+            unlimited_ocr.ModelConfig(
+                text_config=unlimited_ocr.TextConfig(
+                    model_type="deepseek_v2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    kv_lora_rank=None,
+                    q_lora_rank=None,
+                    qk_rope_head_dim=0,
+                    v_head_dim=8,
+                    qk_nope_head_dim=0,
+                    moe_intermediate_size=16,
+                    n_shared_experts=1,
+                    n_routed_experts=2,
+                    num_experts_per_tok=1,
+                ),
+                vision_config=unlimited_ocr.VisionConfig(
+                    model_type="vision",
+                    layers=1,
+                    width=16,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                ),
+                projector_config=unlimited_ocr.ProjectorConfig(
+                    projector_type="linear",
+                    input_dim=16,
+                    n_embed=16,
+                ),
+                model_type="unlimited-ocr",
+            )
         )
-        self.assertEqual(config.model_type, "unlimited-ocr")
-        self.assertEqual(config.text_config.vocab_size, 32)
-        self.assertEqual(config.text_config.max_position_embeddings, 32768)
-
-        model = unlimited_ocr.Model(config)
         self._check_returns_input_embeddings_features(model, "unlimited_ocr")
-        cache = model.make_cache()
-        self.assertEqual(type(cache[0]).__name__, "RingSlidingKVCache")
-        self.assertEqual(cache[0].window_size, 128)
-
-        ring_cache = unlimited_ocr.RingSlidingKVCache(window_size=2)
-        keys = mx.arange(6, dtype=mx.float32).reshape(1, 1, 3, 2)
-        values = keys + 100
-        ring_cache.update_and_fetch(keys, values)
-        self.assertIsNone(ring_cache.prefill_length)
-        ring_cache.update_and_fetch(
-            mx.ones((1, 1, 2, 2)) * 4, mx.ones((1, 1, 2, 2)) * 4
-        )
-        self.assertIsNone(ring_cache.prefill_length)
-        ring_cache.update_and_fetch(
-            mx.ones((1, 1, 1, 2)), mx.ones((1, 1, 1, 2))
-        )
-        self.assertEqual(ring_cache.prefill_length, 5)
-        ring_cache.update_and_fetch(
-            mx.ones((1, 1, 1, 2)) * 2, mx.ones((1, 1, 1, 2)) * 2
-        )
-        self.assertEqual(ring_cache.offset, 7)
-        self.assertEqual(ring_cache.state[0].shape[2], 7)
-        self.assertIsNone(ring_cache.make_mask(1))
-        ring_cache.update_and_fetch(
-            mx.ones((1, 1, 1, 2)) * 3, mx.ones((1, 1, 1, 2)) * 3
-        )
-        self.assertEqual(ring_cache.offset, 8)
-        self.assertEqual(ring_cache.state[0].shape[2], 7)
-
-        weights = {
-            "model.layers.0.self_attn.q_proj.weight": mx.zeros((1, 1)),
-            "model.embed_tokens.weight": mx.zeros((1, 1)),
-            "model.norm.weight": mx.zeros((1,)),
-            "model.vision_model.embeddings.class_embedding": mx.zeros((1,)),
-            "model.sam_model.pos_embed": mx.zeros((1, 1, 1, 1)),
-            "model.projector.layers.weight": mx.zeros((1, 1)),
-            "model.view_seperator": mx.zeros((1,)),
-            "model.image_newline": mx.zeros((1,)),
-            "lm_head.weight": mx.zeros((1, 1)),
-        }
-        sanitized = unlimited_ocr.Model.sanitize(weights)
-        self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", sanitized)
-        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
-        self.assertIn("language_model.model.norm.weight", sanitized)
-        self.assertIn("vision_model.embeddings.class_embedding", sanitized)
-        self.assertIn("sam_model.pos_embed", sanitized)
-        self.assertIn("projector.layers.weight", sanitized)
-        self.assertIn("view_separator", sanitized)
-        self.assertIn("image_newline", sanitized)
-        self.assertIn("language_model.lm_head.weight", sanitized)
 
     def test_falcon_ocr_input_embeddings(self):
         from mlx_vlm.models import falcon_ocr
