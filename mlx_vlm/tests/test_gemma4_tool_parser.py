@@ -111,6 +111,12 @@ class TestGemma4ToolParser(unittest.TestCase):
         args = json.loads(result["arguments"])
         self.assertEqual(args, {"city": "Austin"})
 
+    def test_bare_namespaced_function_syntax(self):
+        result = parse_tool_call("mcp.calendar:list_events{limit:5}")
+        self.assertEqual(result["name"], "mcp.calendar:list_events")
+        args = json.loads(result["arguments"])
+        self.assertEqual(args, {"limit": 5})
+
     def test_process_tool_calls_handles_raw_diffusion_gemma_output(self):
         result = process_tool_calls(
             _wrap(f"call:get_weather{{city:{_str('Austin')}}}"),
