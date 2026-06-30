@@ -260,13 +260,13 @@ class TestApplyChatTemplateIntegration:
 
         assert result == [{"role": "user", "content": "<im_patch>What do you see?"}]
 
-    def test_unlimited_ocr_uses_single_image_token_without_newline(self):
+    def test_unlimited_ocr_uses_single_shared_image_token(self):
         """Unlimited-OCR reference prompts use one '<image>' token even for PDFs."""
         from mlx_vlm.prompt_utils import apply_chat_template
 
         result = apply_chat_template(
             None,
-            {"model_type": "unlimited-ocr"},
+            {"model_type": "unlimited_ocr"},
             "Multi page parsing.",
             num_images=14,
         )
@@ -274,6 +274,22 @@ class TestApplyChatTemplateIntegration:
         assert result == "<image>Multi page parsing."
         assert result.count("<image>") == 1
         assert "<image>\n" not in result
+
+    def test_image_token_models_default_to_one_token_per_image(self):
+        """Standard image-token models should emit one placeholder per image."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "minicpmo"},
+            "Describe these images.",
+            return_messages=True,
+            num_images=3,
+        )
+
+        assert result == [
+            {"role": "user", "content": "<image><image><image>Describe these images."}
+        ]
 
     def test_tool_call_arguments_json_string_is_normalized(self):
         """OpenAI-style JSON-string tool call arguments should become dicts."""
