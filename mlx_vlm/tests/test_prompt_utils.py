@@ -266,7 +266,7 @@ class TestApplyChatTemplateIntegration:
 
         result = apply_chat_template(
             None,
-            {"model_type": "unlimited_ocr"},
+            {"model_type": "unlimited-ocr"},
             "Multi page parsing.",
             num_images=14,
         )

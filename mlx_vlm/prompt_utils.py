@@ -89,7 +89,7 @@ MODEL_CONFIG = {
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr_2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
-    "unlimited_ocr": MessageFormat.SINGLE_IMAGE_TOKEN,
+    "unlimited-ocr": MessageFormat.SINGLE_IMAGE_TOKEN,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
