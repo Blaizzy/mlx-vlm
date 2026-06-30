@@ -34,7 +34,7 @@ from ..generate import (
 )
 from ..generate.common import generation_stream, wired_limit
 from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
-from ..sample_utils import make_sliding_window_no_repeat_ngram_processor, top_p_sampling
+from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -631,8 +631,6 @@ class GenerationArguments:
     frequency_penalty: Optional[float] = None
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     logit_bias: Optional[dict] = None
-    no_repeat_ngram_size: Optional[int] = None
-    ngram_window: Optional[int] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
@@ -670,10 +668,6 @@ class GenerationArguments:
             kw["frequency_context_size"] = self.frequency_context_size
         if self.logit_bias is not None:
             kw["logit_bias"] = self.logit_bias
-        if self.no_repeat_ngram_size is not None:
-            kw["no_repeat_ngram_size"] = self.no_repeat_ngram_size
-        if self.ngram_window is not None:
-            kw["ngram_window"] = self.ngram_window
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
@@ -1044,10 +1038,7 @@ class ResponseGenerator:
         )
 
     def _make_logits_processors(
-        self,
-        args: GenerationArguments,
-        input_ids: Optional[mx.array] = None,
-        images=None,
+        self, args: GenerationArguments, input_ids: Optional[mx.array] = None
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
         processors = make_logits_processors(
             args.logit_bias,
@@ -1067,14 +1058,6 @@ class ResponseGenerator:
                     args, request_processors
                 )
             processors.extend(request_processors)
-        no_repeat_processor = make_sliding_window_no_repeat_ngram_processor(
-            self.config,
-            media=images,
-            no_repeat_ngram_size=args.no_repeat_ngram_size,
-            ngram_window=args.ngram_window,
-        )
-        if no_repeat_processor is not None:
-            processors.append(no_repeat_processor)
         return processors
 
     def _thinking_token_ids(self, args: GenerationArguments) -> Tuple[int, int]:
@@ -1333,7 +1316,7 @@ class ResponseGenerator:
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
                             logits_processors=[
-                                self._make_logits_processors(args, input_ids, images)
+                                self._make_logits_processors(args, input_ids)
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )

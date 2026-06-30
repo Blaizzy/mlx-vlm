@@ -291,34 +291,40 @@ result = generate(
 
 ## Generation Defaults
 
-The upstream examples use a sliding-window no-repeat n-gram processor, and the SGLang path sets `temperature=0`:
+The upstream examples use deterministic sampling. Baidu's reference code also ships a `SlidingWindowNoRepeatNgramProcessor`, but treats it as opt-in: `infer` / `infer_multi` default `no_repeat_ngram_size=0`, while example calls may pass size `35` with a window of `128` for single images or `1024` for multi-page/PDF inputs.
+
+MLX-VLM follows the same opt-in behavior. To keep this model consistent with the rest of the repository, it does not implement or attach an Unlimited-OCR-specific logits processor automatically; if you want this repetition guard, pass your own callable through the existing `logits_processors` argument.
 
 | Setting | Upstream single image | Upstream multi-page/PDF | MLX behavior |
 |---------|-----------------------|--------------------------|--------------|
 | Prompt | `<image>document parsing.` | `<image>Multi page parsing.` | Template inserts `<image>` automatically |
 | Image mode | `gundam` | `base` | Same via `processor_kwargs` / `generate` kwargs |
-| `no_repeat_ngram_size` | `35` | `35` | Applied automatically for Unlimited-OCR |
-| `ngram_window` | `128` | `1024` | Auto-selected by image count |
+| Optional n-gram size | `35` in examples | `35` in examples | Caller-supplied via `logits_processors` |
+| Optional n-gram window | `128` in examples | `1024` in examples | Caller-supplied via `logits_processors` |
 | Output budget | `max_length=32768` | `max_length=32768` | Use `max_tokens` in MLX |
 
-You can override the no-repeat settings from the CLI:
+### Optional sliding-window no-repeat n-gram processor
 
-```bash
-# Explicitly match the upstream multi-page settings.
-mlx_vlm.generate \
-    --model baidu/Unlimited-OCR \
-    --image page_0001.png page_0002.png \
-    --prompt "Multi page parsing." \
-    --processor-kwargs '{"cropping": false, "image_size": 1024}' \
-    --no-repeat-ngram-size 35 \
-    --ngram-window 1024
+For long OCR runs, especially multi-page PDFs, Baidu's examples may opt in to a sliding-window no-repeat n-gram logits processor. MLX-VLM does not enable this automatically. If your application uses that guard, pass it explicitly through `logits_processors`:
 
-# Disable the automatic Unlimited-OCR no-repeat processor.
-mlx_vlm.generate \
-    --model baidu/Unlimited-OCR \
-    --image document.png \
-    --prompt "document parsing." \
-    --no-repeat-ngram-size 0
+```python
+# Define or import a callable logits processor yourself; MLX-VLM does not
+# provide an Unlimited-OCR-specific one. A local port of upstream
+# SlidingWindowNoRepeatNgramProcessor can use ngram_size=35 and window=1024
+# for multi-page/PDF parsing, or window=128 for single-image parsing.
+no_repeat_ngram_processor = ...
+
+result = generate(
+    model=model,
+    processor=processor,
+    image=page_images,
+    prompt=prompt,
+    max_tokens=32768,
+    temperature=0.0,
+    cropping=False,
+    image_size=1024,
+    logits_processors=[no_repeat_ngram_processor],
+)
 ```
 
 ## Special Tokens and Markers
@@ -338,6 +344,7 @@ mlx_vlm.generate \
 3. Render PDFs to images before calling MLX-VLM, and keep filenames zero-padded so shell glob order matches page order.
 4. Use a high `max_tokens` value for dense documents or long PDFs; lower it for quick smoke tests.
 5. Use `temperature=0.0` for deterministic OCR output.
+6. For 4-bit language-model quantization, keep the vision encoder in `float32`; lowering vision precision can hurt OCR quality or make repetition loops much more likely, while a 4-bit LLM can still work with FP32 vision features.
 
 ## Limitations
 
@@ -351,4 +358,5 @@ mlx_vlm.generate \
 - Hugging Face uses `model_type: unlimited-ocr`; the MLX module name is `unlimited_ocr`, and `mlx_vlm` remaps the model type automatically.
 - The processor loads `processor_config.json` and the fast tokenizer directly, without requiring upstream PyTorch remote-code execution during MLX inference.
 - `apply_chat_template(..., num_images > 1)` returns one literal `<image>` token for Unlimited-OCR, matching upstream `infer_multi`.
-- `mlx_vlm.generate` automatically attaches Unlimited-OCR's sliding-window no-repeat n-gram processor unless `no_repeat_ngram_size=0` is passed.
+- The upstream repository includes `SlidingWindowNoRepeatNgramProcessor`, but this implementation keeps repetition guards caller-supplied through `logits_processors` rather than adding model-specific sampling code to MLX-VLM.
+- Keep the vision stack in FP32 when using quantized language weights; the no-repeat processor can stop repeated decoding earlier, but it does not fix degraded visual features.

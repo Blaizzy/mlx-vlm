@@ -216,8 +216,6 @@ def _build_gen_args(
             DEFAULT_REPETITION_CONTEXT_SIZE,
         ),
         logit_bias=logit_bias,
-        no_repeat_ngram_size=getattr(request, "no_repeat_ngram_size", None),
-        ngram_window=getattr(request, "ngram_window", None),
         enable_thinking=enable_thinking,
         thinking_budget=_request_field_or_default(
             request, "thinking_budget", get_server_thinking_budget()

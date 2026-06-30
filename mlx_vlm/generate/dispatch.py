@@ -17,7 +17,6 @@ from transformers import PreTrainedTokenizer
 from .. import apc as _apc
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import make_sliding_window_no_repeat_ngram_processor
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
@@ -54,28 +53,6 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
-
-
-def _apply_no_repeat_ngram_processors(
-    model: nn.Module,
-    kwargs: Dict[str, Any],
-    *,
-    image=None,
-) -> None:
-    no_repeat_ngram_size = kwargs.pop("no_repeat_ngram_size", None)
-    ngram_window = kwargs.pop("ngram_window", None)
-    processor = make_sliding_window_no_repeat_ngram_processor(
-        model,
-        media=image,
-        no_repeat_ngram_size=no_repeat_ngram_size,
-        ngram_window=ngram_window,
-    )
-    if processor is None:
-        return
-
-    processors = list(kwargs.get("logits_processors") or [])
-    processors.append(processor)
-    kwargs["logits_processors"] = processors
 
 
 def parse_arguments():
@@ -349,24 +326,6 @@ def parse_arguments():
         type=int,
         default=DEFAULT_REPETITION_CONTEXT_SIZE,
         help="Number of recent generated tokens used for frequency penalty.",
-    )
-    parser.add_argument(
-        "--no-repeat-ngram-size",
-        type=int,
-        default=None,
-        help=(
-            "Block tokens that would repeat an n-gram. Unlimited-OCR defaults "
-            "to 35, matching its reference inference. Use 0 to disable."
-        ),
-    )
-    parser.add_argument(
-        "--ngram-window",
-        type=int,
-        default=None,
-        help=(
-            "Recent-token window for --no-repeat-ngram-size. Unlimited-OCR "
-            "defaults to 128 for one image and 1024 for multi-page inputs."
-        ),
     )
     parser.add_argument("--chat", action="store_true", help="Chat in multi-turn style.")
     parser.add_argument(
@@ -803,7 +762,6 @@ def stream_generate(
     image = image or None
     audio = audio or None
     video = video or None
-    _apply_no_repeat_ngram_processors(model, kwargs, image=image)
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -1591,8 +1549,6 @@ def main():
                 "frequency_penalty": args.frequency_penalty,
                 "frequency_context_size": args.frequency_context_size,
                 "vision_cache": vision_cache,
-                "no_repeat_ngram_size": getattr(args, "no_repeat_ngram_size", None),
-                "ngram_window": getattr(args, "ngram_window", None),
                 **kwargs,
             }
             if args.resize_shape is not None:
@@ -1655,8 +1611,6 @@ def main():
             "presence_context_size": args.presence_context_size,
             "frequency_penalty": args.frequency_penalty,
             "frequency_context_size": args.frequency_context_size,
-            "no_repeat_ngram_size": getattr(args, "no_repeat_ngram_size", None),
-            "ngram_window": getattr(args, "ngram_window", None),
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
