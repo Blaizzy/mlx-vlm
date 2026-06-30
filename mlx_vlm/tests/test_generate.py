@@ -507,6 +507,29 @@ class TestBatchGenerator:
         assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
 
+    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    def test_speculative_initialization_keeps_apc_manager(
+        self, mock_model, mock_processor, draft_kind
+    ):
+        manager = apc_module.APCManager(num_blocks=4, block_size=16)
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            apc_manager=manager,
+            draft_model=SimpleNamespace(),
+            draft_kind=draft_kind,
+            compute_logprobs=True,
+            top_logprobs_k=4,
+        )
+
+        try:
+            assert gen.apc_manager is manager
+            assert gen.apc_mode == "block"
+            assert gen.compute_logprobs is False
+            assert gen.top_logprobs_k == 0
+        finally:
+            gen.close()
+
     def test_insert_prompts(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,

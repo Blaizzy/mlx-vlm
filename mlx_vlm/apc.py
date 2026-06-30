@@ -3710,10 +3710,13 @@ def harvest_blocks_from_batch_cache(
     for c in batch_caches:
         keys = getattr(c, "keys", None)
         values = getattr(c, "values", None)
-        idx = getattr(c, "_idx", None)
         left_padding = getattr(c, "left_padding", None)
-        if keys is None or values is None or idx is None:
+        if keys is None or values is None:
             return []
+
+        if batch_idx < 0 or batch_idx >= keys.shape[0]:
+            return []
+
         # Pull this batch row, dropping any left-padding for this seq.
         if left_padding is not None:
             try:
@@ -3722,6 +3725,27 @@ def harvest_blocks_from_batch_cache(
                 lp = 0
         else:
             lp = 0
+
+        idx = getattr(c, "_idx", None)
+        if idx is None:
+            # Regular KVCache (non-batch), e.g. singleton speculative prefill,
+            # carries ``offset`` instead of ``_idx``.
+            offset = getattr(c, "offset", None)
+            if offset is None:
+                return []
+            try:
+                if isinstance(offset, mx.array) and offset.ndim > 0:
+                    idx = lp + int(offset[batch_idx].item())
+                else:
+                    idx = int(offset.item()) if hasattr(offset, "item") else int(offset)
+            except Exception:
+                return []
+        elif isinstance(idx, mx.array):
+            try:
+                idx = int(idx.item()) if idx.ndim == 0 else int(idx[batch_idx].item())
+            except Exception:
+                return []
+
         # shape after slicing: [1, H, idx-lp, D]
         layer_keys.append(keys[batch_idx : batch_idx + 1, :, lp:idx, :])
         layer_values.append(values[batch_idx : batch_idx + 1, :, lp:idx, :])

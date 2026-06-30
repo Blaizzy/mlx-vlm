@@ -1217,10 +1217,6 @@ class ResponseGenerator:
             self._run_diffusion(diffusion_family)
             return
 
-        if self.draft_model is not None and self.draft_kind != "mtp":
-            self._run_speculative()
-            return
-
         generation_stream = mx.default_stream(mx.default_device())
 
         batch_gen = None
@@ -1237,7 +1233,7 @@ class ResponseGenerator:
                     if (
                         not active_batch
                         and self.draft_model is not None
-                        and self.draft_kind == "mtp"
+                        and self.draft_kind is not None
                     )
                     else 0.0
                 )

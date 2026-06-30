@@ -3878,9 +3878,13 @@ class TestResponseGenerator:
                 (str(uid * 10 + 1), "length"),
             ]
 
-    def test_run_routes_mtp_through_batch_generator(self, monkeypatch):
+    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
+    def test_run_routes_speculative_through_batch_generator(
+        self, monkeypatch, draft_kind
+    ):
         batch_state = {}
         draft_model = object()
+        apc_manager = object()
 
         class FakeDetokenizer:
             def __init__(self):
@@ -3964,7 +3968,7 @@ class TestResponseGenerator:
         gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
-        gen.apc_manager = None
+        gen.apc_manager = apc_manager
         gen.tokenizer = SimpleNamespace()
         gen.requests = Queue()
         gen._stop = False
@@ -3979,11 +3983,13 @@ class TestResponseGenerator:
             gen.config = SimpleNamespace()
             gen.stop_tokens = set()
             gen.draft_model = draft_model
-            gen.draft_kind = "mtp"
+            gen.draft_kind = draft_kind
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
+        gen._run_speculative = lambda: pytest.fail(
+            "Speculative decoding should use BatchGenerator"
+        )
         gen._gpu_embed = lambda raw_inputs, images=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
@@ -4020,13 +4026,14 @@ class TestResponseGenerator:
 
         kwargs = batch_state["kwargs"]
         assert kwargs["draft_model"] is draft_model
-        assert kwargs["draft_kind"] == "mtp"
+        assert kwargs["draft_kind"] == draft_kind
+        assert kwargs["apc_manager"] is apc_manager
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
         assert batch_state["instance"].next_active_sizes == [2]
 
-    def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
+    def test_run_coalesces_idle_speculative_batch_generator(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
         calls = []
         draft_model = object()
@@ -4044,7 +4051,7 @@ class TestResponseGenerator:
             gen.config = SimpleNamespace()
             gen.stop_tokens = set()
             gen.draft_model = draft_model
-            gen.draft_kind = "mtp"
+            gen.draft_kind = "dflash"
             gen.tokenizer = SimpleNamespace()
 
         def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
@@ -4053,7 +4060,9 @@ class TestResponseGenerator:
             return [], True
 
         gen._initialize_model = fake_initialize_model
-        gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
+        gen._run_speculative = lambda: pytest.fail(
+            "Speculative decoding should use BatchGenerator"
+        )
         gen._collect_pending_requests = fake_collect_pending_requests
 
         gen._run()
