@@ -696,6 +696,10 @@ def _make_cache(
         )
 
     def to_batch_cache(c, quantize=True):
+        # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
+        # index-key side cache) know how to build the correct batch cache.
+        if hasattr(c, "to_batch") and not isinstance(c, cache.KVCache):
+            return c.to_batch(left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
