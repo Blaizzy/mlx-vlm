@@ -308,6 +308,9 @@ class LanguageModel(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+    def make_cache(self):
+        return [KVCache() for _ in self.layers]
+
     def get_rope_index(
         self,
         input_ids: mx.array,
