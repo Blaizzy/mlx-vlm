@@ -5,6 +5,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -103,6 +104,12 @@ class TinyDiffusionGemma4Tokenizer:
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(self):
+        self.additional_special_tokens = []
+        self.stc_token = None
+        self.etc_token = None
+        self.escape_token = None
+        self.soc_token = None
+        self.eoc_token = None
         self.special_tokens = {
             self.image_token: self.image_token_id,
             self.video_token: self.video_token_id,
@@ -111,6 +118,25 @@ class TinyDiffusionGemma4Tokenizer:
             self.pad_token: self.pad_token_id,
             self.eos_token: self.eos_token_id,
         }
+
+    @property
+    def all_special_ids(self):
+        additional_ids = [
+            self.convert_tokens_to_ids(token)
+            for token in self.additional_special_tokens
+        ]
+        attr_ids = [
+            self.convert_tokens_to_ids(token)
+            for token in (
+                self.stc_token,
+                self.etc_token,
+                self.escape_token,
+                self.soc_token,
+                self.eoc_token,
+            )
+            if token is not None
+        ]
+        return additional_ids + attr_ids
 
     def convert_tokens_to_ids(self, token):
         return self.special_tokens.get(token, self.unk_token_id)
@@ -1165,6 +1191,45 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertIs(processor, sentinel)
         from_pretrained.assert_called_once()
+
+    def test_processor_demotes_tool_parser_tokens_from_specials(self):
+        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _TOOL_PARSER_TOKENS,
+        )
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        tokenizer = TinyDiffusionGemma4Tokenizer()
+        tokenizer.special_tokens.update(
+            {token: 70 + i for i, token in enumerate(_TOOL_PARSER_TOKENS)}
+        )
+        tokenizer.special_tokens["<extra_special>"] = 90
+        tokenizer.stc_token = "<|tool_call>"
+        tokenizer.etc_token = "<tool_call|>"
+        tokenizer.escape_token = '<|"|>'
+        tokenizer.soc_token = "<|channel>"
+        tokenizer.eoc_token = "<channel|>"
+        tokenizer.additional_special_tokens = ["<extra_special>"]
+
+        with patch.object(
+            Gemma4Processor,
+            "from_pretrained",
+            return_value=SimpleNamespace(tokenizer=tokenizer),
+        ):
+            processor = DiffusionGemma4Processor.from_pretrained("demo")
+
+        self.assertIs(processor.tokenizer, tokenizer)
+        self.assertEqual(tokenizer.additional_special_tokens, ["<extra_special>"])
+        self.assertEqual(tokenizer.all_special_ids, [90])
+        self.assertIsNone(tokenizer.stc_token)
+        self.assertIsNone(tokenizer.etc_token)
+        self.assertIsNone(tokenizer.escape_token)
+        self.assertIsNone(tokenizer.soc_token)
+        self.assertIsNone(tokenizer.eoc_token)
+        for token in _TOOL_PARSER_TOKENS:
+            self.assertNotEqual(
+                tokenizer.convert_tokens_to_ids(token), tokenizer.unk_token_id
+            )
 
     def test_processor_returns_video_frames_as_pixel_values(self):
         processor = tiny_diffusion_gemma_processor()
