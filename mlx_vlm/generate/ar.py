@@ -2638,7 +2638,6 @@ class BatchGenerator:
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 self._prompt_tokens_counter += n
                 return prompt_responses, generation_responses
 
@@ -2684,7 +2683,6 @@ class BatchGenerator:
                     elapsed = time.perf_counter() - tic
                     self._prompt_time_counter += elapsed
                     self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                    prompt_responses = self._prompt_batch_progress(self._prompt_batch)
                 else:
                     tic = time.perf_counter()
                     gen_batch = self._prompt_batch.generate(
@@ -2750,7 +2748,6 @@ class BatchGenerator:
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
-                prompt_responses = self._prompt_batch_progress(self._prompt_batch)
             else:
                 tic = time.perf_counter()
                 gen_batch = self._prompt_batch.generate(

@@ -3401,29 +3401,6 @@ class TestResponseGenerator:
 
         assert cancelled == ["req-1"]
 
-    def test_token_iterator_skips_prefill_progress_heartbeat(self):
-        cancelled = []
-        rqueue = Queue()
-        token = server.StreamingToken(
-            text="hi", token=1, logprobs=0.0, finish_reason=None
-        )
-        rqueue.put(
-            server_generation._PrefillProgress(
-                uid="req-1", prompt_tps=12.5, cached_tokens=4
-            )
-        )
-        rqueue.put(token)
-
-        token_iter = server_generation._TokenIterator(
-            rqueue,
-            "req-1",
-            cancelled.append,
-            0.01,
-        )
-
-        assert next(token_iter) is token
-        assert cancelled == []
-
     def test_token_iterator_close_cancels_while_next_blocks(self):
         cancelled = []
         result = []
@@ -4270,26 +4247,6 @@ class TestResponseGenerator:
         assert item.prompt_tps == pytest.approx(184.431)
         assert item.cached_tokens == 7
         assert rqueue.get() is None
-
-    def test_step_emits_private_prefill_progress_when_no_token_is_ready(self):
-        class PromptProgressBatch:
-            def next(self, **kwargs):
-                return (
-                    [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)],
-                    [],
-                )
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        rqueue = Queue()
-        active = {1: {"rqueue": rqueue, "prompt_tps": None, "cached_tokens": 0}}
-
-        gen._step(PromptProgressBatch(), active)
-
-        item = rqueue.get()
-        assert isinstance(item, server_generation._PrefillProgress)
-        assert item.prompt_tps == pytest.approx(184.431)
-        assert item.cached_tokens == 7
-        assert rqueue.empty()
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
