@@ -232,9 +232,7 @@ def _fast_mrope_apply(
         q, k, position_ids, inv_freq, position_selector = primals
         _, (dq, dk) = mx.vjp(
             lambda q, k: list(
-                _mrope_apply(
-                    q, k, position_ids, inv_freq, position_selector, pairing
-                )
+                _mrope_apply(q, k, position_ids, inv_freq, position_selector, pairing)
             ),
             [q, k],
             list(cotangents),
