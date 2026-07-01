@@ -18,6 +18,7 @@ from ..sam3.generate import (
     SimpleTracker,
     _filter_by_regions,
     _resize_masks,
+    _sigmoid,
     draw_frame,
     nms,
     run_image,
@@ -109,25 +110,49 @@ def predict_multi(
         pred_logits = all_logits[-1].squeeze(-1)
         presence = presence_logits[-1]
 
-        last_hs = hs[-1]
+        # Score first — evaluate scores without mask decoder
+        mx.eval(pred_logits, pred_boxes_xyxy, presence)
+
+        pred_logits_b = pred_logits if pred_logits.ndim == 2 else pred_logits[None]
+        scores_np = _sigmoid(np.array(pred_logits_b[0]).squeeze())
+        if presence is not None:
+            presence_b = presence if presence.ndim == 2 else presence[None]
+            scores_np = scores_np * _sigmoid(np.array(presence_b[0]))
+        keep = scores_np > threshold
+        if not keep.any():
+            continue
+
+        # Only generate masks for kept detections
+        keep_indices = mx.array(np.where(keep)[0].astype(np.int32))
+        last_hs_kept = hs[-1][:, keep_indices]
         seg_out = det.mask_decoder(
-            last_hs,
+            last_hs_kept,
             list(fpn_trimmed),
             encoder_hidden_states=encoded,
             prompt_features=inputs_embeds,
             prompt_mask=attention_mask,
         )
-        mx.eval(pred_logits, pred_boxes_xyxy, seg_out, presence)
+        mx.eval(seg_out)
 
-        outputs = {
-            "pred_logits": pred_logits if pred_logits.ndim == 2 else pred_logits[None],
-            "pred_boxes": (
-                pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None]
-            ),
-            "pred_masks": seg_out["pred_masks"],
-            "presence_logits": presence if presence.ndim == 2 else presence[None],
-        }
-        result = predictor._postprocess(outputs, image_size, threshold)
+        # Build result directly (skip _postprocess)
+        pred_boxes_b = (
+            pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None]
+        )
+        boxes_np = np.array(pred_boxes_b[0])[keep]
+        if isinstance(image_size, tuple) and len(image_size) == 2:
+            W_img, H_img = image_size
+        else:
+            H_img, W_img = image_size
+        boxes_np[:, [0, 2]] *= W_img
+        boxes_np[:, [1, 3]] *= H_img
+        boxes_np = np.clip(boxes_np, 0, max(H_img, W_img))
+        masks_resized = _resize_masks(
+            np.array(seg_out["pred_masks"][0]), (H_img, W_img)
+        )
+        masks_binary = (masks_resized > 0).astype(np.uint8)
+        result = DetectionResult(
+            boxes=boxes_np, masks=masks_binary, scores=scores_np[keep]
+        )
         if len(result.scores) > 0:
             result = nms(result)
             all_boxes.append(result.boxes)
@@ -301,27 +326,42 @@ def _detect_with_backbone(
         pred_logits = all_logits[-1].squeeze(-1)
         presence = presence_logits[-1]
 
-        # Mask decoder
-        last_hs = hs[-1]
+        # Score first — evaluate scores and boxes without mask decoder
+        W, H = (
+            image_size
+            if isinstance(image_size, tuple)
+            else (image_size[1], image_size[0])
+        )
+        scores = mx.sigmoid(pred_logits[0].squeeze())
+        if presence is not None:
+            scores = scores * mx.sigmoid(presence[0])
+        boxes = pred_boxes_xyxy[0] * mx.array([W, H, W, H], dtype=pred_boxes_xyxy.dtype)
+        boxes = mx.clip(boxes, 0, max(H, W))
+        mx.eval(scores, boxes)
+
+        scores_np = np.array(scores)
+        keep = scores_np > threshold
+        if not keep.any():
+            continue
+
+        # Only generate masks for kept detections
+        keep_indices = mx.array(np.where(keep)[0].astype(np.int32))
+        last_hs_kept = hs[-1][:, keep_indices]
         seg_out = det.mask_decoder(
-            last_hs,
+            last_hs_kept,
             list(det_features),
             encoder_hidden_states=encoded,
             prompt_features=inputs_embeds,
             prompt_mask=attention_mask,
         )
+        mx.eval(seg_out)
 
-        # Single eval for all outputs
-        mx.eval(pred_logits, pred_boxes_xyxy, seg_out, presence)
-
-        # Postprocess — MLX until final conversion
-        result = _postprocess_mlx(
-            pred_logits if pred_logits.ndim == 2 else pred_logits[None],
-            pred_boxes_xyxy if pred_boxes_xyxy.ndim == 3 else pred_boxes_xyxy[None],
-            seg_out["pred_masks"],
-            presence if presence.ndim == 2 else presence[None],
-            image_size,
-            threshold,
+        boxes_np = np.array(boxes)[keep]
+        masks_np = np.array(seg_out["pred_masks"][0])
+        masks_resized = _resize_masks(masks_np, (H, W))
+        masks_binary = (masks_resized > 0).astype(np.uint8)
+        result = DetectionResult(
+            boxes=boxes_np, masks=masks_binary, scores=scores_np[keep]
         )
         if len(result.scores) > 0:
             result = nms(result)
