@@ -21,6 +21,8 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
+_logger = logging.getLogger(__name__)
+
 from .models.base import BaseImageProcessor
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
@@ -459,7 +461,71 @@ def get_model_path(
     return model_path
 
 
-def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
+def _deep_merge(base: dict, overrides: dict) -> None:
+    """Recursively merge ``overrides`` into ``base`` in place.
+
+    Nested dicts are merged key-by-key; non-dict values replace. Lists replace
+    wholesale (intentional for config fields like ``layer_types``). The caller
+    owns ``base``; ``overrides`` is not mutated.
+    """
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+
+
+def _sync_processor_to_model_config(model: nn.Module, processor) -> None:
+    """Sync processor image-token budget to the model's vision config.
+
+    Some VLMs (Gemma 4 is the only example in mlx-vlm 0.5.0) store the image
+    token budget in both the vision config (model side, drives
+    ``VisionModel.max_patches`` at construction) and the preprocessor config
+    (processor side, drives ``Gemma4ImageProcessor``'s resize math). When these
+    disagree:
+
+    * processor > model: the processor emits more soft tokens than the vision
+      tower can absorb, causing a shape mismatch or silent truncation.
+    * processor < model: the model carries unused vision capacity (safe, but
+      wasteful).
+
+    Making the model side the source of truth fixes both directions. This
+    helper is defensive: a no-op when the processor does not expose
+    ``max_soft_tokens`` (i.e. every non-Gemma4 processor in the repo today) and
+    a no-op when the values already agree.
+
+    The helper deliberately does NOT also write ``processor.image_seq_length``.
+    The image-bearing path uses dynamic ``num_soft_tokens`` from the
+    processor's per-image return; the only consumer of the precomputed
+    ``Gemma4Processor.full_image_sequence`` is the no-image text fallback,
+    which remains internally consistent at construction time.
+    """
+    vision_config = getattr(getattr(model, "config", None), "vision_config", None)
+    image_processor = getattr(processor, "image_processor", None)
+    if vision_config is None or image_processor is None:
+        return
+
+    budget = getattr(vision_config, "default_output_length", None)
+    if budget is None or not hasattr(image_processor, "max_soft_tokens"):
+        return
+
+    current = image_processor.max_soft_tokens
+    if current != budget:
+        _logger.warning(
+            "Syncing processor image-token budget %d -> %d to match model "
+            "vision_config.default_output_length",
+            current,
+            budget,
+        )
+        image_processor.max_soft_tokens = budget
+
+
+def load_model(
+    model_path: Path,
+    lazy: bool = False,
+    config_overrides: Optional[dict] = None,
+    **kwargs,
+) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -483,6 +549,8 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
+    if config_overrides:
+        _deep_merge(config, config_overrides)
 
     index_file = model_path / "model.safetensors.index.json"
     weight_files = []
@@ -762,6 +830,7 @@ def load(
     lazy: bool = False,
     revision: Optional[str] = None,
     strict: bool = True,
+    config_overrides: Optional[dict] = None,
     **kwargs,
 ) -> Tuple[nn.Module, ProcessorMixin]:
     """
@@ -780,6 +849,16 @@ def load(
             a tag, or a commit hash. Default: ``None``.
         strict (bool): Whether or not to raise an exception if weights don't
             match. Default: ``True``.
+        config_overrides (dict, optional): Nested dict of values to deep-merge
+            into the model config before construction. Useful for tuning
+            per-model knobs at load time without editing the on-disk config.
+            For example, to raise Gemma 4's image-token budget for OCR/document
+            workloads::
+
+                load(model_id, config_overrides={"vision_config":
+                    {"default_output_length": 1120}})
+
+            Default: ``None`` (no override).
         quantize_activations (bool, optional): If True, convert QuantizedLinear layers
             to QQLinear layers for activation quantization. Only supported for models
             quantized with 'nvfp4' or 'mxfp8' modes. Default: ``False``.
@@ -795,7 +874,9 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, strict=strict, **kwargs)
+    model = load_model(
+        model_path, lazy, strict=strict, config_overrides=config_overrides, **kwargs
+    )
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -809,6 +890,8 @@ def load(
 
     if image_processor is not None:
         processor.image_processor = image_processor
+
+    _sync_processor_to_model_config(model, processor)
 
     return model, processor
 
