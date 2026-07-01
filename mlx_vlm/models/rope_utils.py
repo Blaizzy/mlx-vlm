@@ -379,7 +379,7 @@ def _rotary_apply_kernel(
     )
 
 
-def _precomputed_rotary_mlx(
+def _precomputed_rotary(
     q,
     k,
     cos,
