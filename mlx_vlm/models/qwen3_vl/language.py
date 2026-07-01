@@ -201,6 +201,8 @@ class Qwen3VLModel(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        output_hidden_states: bool = False,
+        capture_layer_ids: Optional[list[int]] = None,
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
@@ -217,6 +219,9 @@ class Qwen3VLModel(nn.Module):
             mask = create_attention_mask(
                 h, cache[0] if cache and cache[0] is not None else cache
             )
+        all_hidden_states = [h] if output_hidden_states else None
+        captured_hidden_states = [] if capture_layer_ids is not None else None
+        capture_ids = set(capture_layer_ids or [])
         position_embeddings = None
         if (
             position_ids is not None
@@ -237,8 +242,18 @@ class Qwen3VLModel(nn.Module):
                     visual_pos_masks,
                     deepstack_visual_embeds[layer_idx],
                 )
+            if output_hidden_states:
+                all_hidden_states.append(h)
+            if captured_hidden_states is not None and layer_idx in capture_ids:
+                captured_hidden_states.append(h)
 
-        return self.norm(h)
+        h = self.norm(h)
+        if output_hidden_states:
+            all_hidden_states[-1] = h
+            return h, all_hidden_states
+        if captured_hidden_states is not None:
+            return h, captured_hidden_states
+        return h
 
     def _deepstack_process(
         self,
@@ -486,6 +501,7 @@ class LanguageModel(nn.Module):
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        output_hidden_states: bool = False,
         **kwargs,
     ):
         position_ids = kwargs.pop("position_ids", None)
@@ -493,6 +509,7 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
@@ -633,14 +650,19 @@ class LanguageModel(nn.Module):
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            output_hidden_states=output_hidden_states,
+            capture_layer_ids=capture_layer_ids,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+        hidden_states = None
+        if output_hidden_states or capture_layer_ids is not None:
+            out, hidden_states = out
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(logits=out, hidden_states=hidden_states)
 
     @property
     def layers(self):

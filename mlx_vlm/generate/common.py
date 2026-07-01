@@ -173,6 +173,13 @@ class GenerationResult:
     diffusion_block_complete: bool = False
 
 
+@dataclass
+class AudioGenerationResult(GenerationResult):
+    audio_tokens: Optional[mx.array] = None
+    audio: Optional[bytes] = None
+    output_audio_path: Optional[str] = None
+
+
 class PromptCacheState:
     """Holds KV cache and token history across conversation turns."""
 

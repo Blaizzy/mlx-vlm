@@ -68,15 +68,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image"),
+        choices=("text", "image", "audio"),
         default="text",
-        help="Generate text with a VLM or generate an image with a supported image model.",
+        help=(
+            "Generate text with a VLM, an image with a supported image model, "
+            "or audio with a supported omni model."
+        ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image generation.",
+        help="Output path for image or audio generation.",
     )
     parser.add_argument(
         "--task",
@@ -480,6 +483,12 @@ def parse_arguments():
         default=DEFAULT_THINKING_END_TOKEN,
         help="Token that marks the end of a thinking block (default: %(default)s).",
     )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference / prompt audio for audio generation.",
+    )
 
     return parser.parse_args()
 
@@ -638,7 +647,12 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import (
+    AudioGenerationResult,
+    GenerationResult,
+    generation_stream,
+    wired_limit,
+)
 from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -1404,12 +1418,204 @@ def generate(
     )
 
 
+def generate_audio(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    prompt: str,
+    image: Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
+    verbose: bool = False,
+    output_audio_path: Optional[str] = None,
+    ref_audio_path: Optional[str] = None,
+    **kwargs,
+) -> AudioGenerationResult:
+    if not hasattr(model, "generate_audio"):
+        raise ValueError(f"{type(model).__name__} does not support audio generation.")
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    eos_tokens = kwargs.get("eos_tokens", None)
+    stopping_criteria = kwargs.get("stopping_criteria", None)
+
+    if eos_tokens is not None:
+        tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+    elif stopping_criteria is not None:
+        if isinstance(stopping_criteria, StoppingCriteria) or callable(
+            stopping_criteria
+        ):
+            tokenizer.stopping_criteria = stopping_criteria
+        else:
+            raise ValueError(
+                "stopping_criteria must be an instance of StoppingCriteria or a callable"
+            )
+    else:
+        tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+
+    add_special_tokens = (
+        getattr(processor, "chat_template", None) is None
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
+        else True
+    )
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    image_token_index = getattr(model.config, "image_token_index", None)
+
+    inputs = prepare_inputs(
+        processor,
+        images=image or None,
+        audio=audio or None,
+        videos=video or None,
+        prompts=prompt,
+        image_token_index=image_token_index,
+        resize_shape=resize_shape,
+        add_special_tokens=add_special_tokens,
+        **kwargs,
+    )
+    input_ids = inputs.get("input_ids", None)
+    pixel_values = inputs.get("pixel_values", None)
+    mask = inputs.get("attention_mask", None)
+    data_kwargs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+
+    stream_kwargs = dict(kwargs)
+    stream_kwargs.update(data_kwargs)
+    stream_kwargs.update(
+        {
+            "input_ids": input_ids,
+            "pixel_values": pixel_values,
+            "mask": mask,
+            "verbose": verbose,
+        }
+    )
+
+    if verbose:
+        print("=" * 10)
+        files = []
+        if image is not None:
+            files.extend(image if isinstance(image, list) else [image])
+        if audio is not None:
+            files.extend(audio if isinstance(audio, list) else [audio])
+        if video is not None:
+            files.extend(video if isinstance(video, list) else [video])
+        print(f"Files: {files}", "\n")
+        print("Prompt:", prompt)
+
+    text = ""
+    generated_tokens: List[int] = []
+    last_response = None
+    diffusion_output = DiffusionOutputHandler(model, stream_kwargs, verbose)
+
+    for response in stream_generate(
+        model,
+        processor,
+        prompt,
+        image,
+        audio,
+        video,
+        **stream_kwargs,
+    ):
+        if response.token is not None and response.generation_tokens > len(
+            generated_tokens
+        ):
+            token_value = (
+                response.token.item()
+                if hasattr(response.token, "item")
+                else response.token
+            )
+            generated_tokens.append(int(token_value))
+
+        if response.is_draft:
+            diffusion_output.handle_draft(response)
+            last_response = response
+            continue
+
+        if (
+            verbose
+            and not response.text_already_printed
+            and not diffusion_output.handle_text(response.text)
+        ):
+            print(response.text, end="", flush=True)
+        text += response.text
+        last_response = response
+
+    if last_response is None:
+        last_response = GenerationResult(
+            text=text,
+            prompt_tokens=input_ids.size if input_ids is not None else 0,
+            peak_memory=mx.get_peak_memory() / 1e9,
+        )
+
+    if verbose:
+        diffusion_output.finish(text)
+        print("\n" + "=" * 10)
+        if len(text) == 0:
+            print("No text generated for this prompt")
+        print(
+            f"Prompt: {last_response.prompt_tokens} tokens, "
+            f"{last_response.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"Generation: {last_response.generation_tokens} tokens, "
+            f"{last_response.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {last_response.peak_memory:.3f} GB")
+
+    audio_generation_kwargs = dict(kwargs)
+    audio_generation_kwargs.update(data_kwargs)
+    audio_output = model.generate_audio(
+        input_ids=input_ids,
+        generated_tokens=generated_tokens,
+        tokenizer=tokenizer,
+        pixel_values=pixel_values,
+        mask=mask,
+        audio=audio,
+        output_audio_path=output_audio_path,
+        ref_audio_path=ref_audio_path,
+        **audio_generation_kwargs,
+    )
+
+    return AudioGenerationResult(
+        text=text,
+        token=last_response.token,
+        logprobs=last_response.logprobs,
+        prompt_tokens=last_response.prompt_tokens,
+        generation_tokens=last_response.generation_tokens,
+        total_tokens=last_response.total_tokens,
+        prompt_tps=last_response.prompt_tps,
+        generation_tps=last_response.generation_tps,
+        peak_memory=last_response.peak_memory,
+        cached_tokens=last_response.cached_tokens,
+        finish_reason=last_response.finish_reason,
+        diffusion_canvas_tokens=last_response.diffusion_canvas_tokens,
+        diffusion_denoising_steps=last_response.diffusion_denoising_steps,
+        diffusion_work_tokens=last_response.diffusion_work_tokens,
+        diffusion_canvas_tps=last_response.diffusion_canvas_tps,
+        diffusion_work_tps=last_response.diffusion_work_tps,
+        audio_tokens=audio_output.audio_tokens,
+        audio=audio_output.audio,
+        output_audio_path=audio_output.output_audio_path,
+    )
+
+
 def main():
     args = parse_arguments()
+    output_modality = getattr(args, "output_modality", "text")
 
-    if getattr(args, "output_modality", "text") == "image":
+    if output_modality == "image":
         run_image_generation_cli(args)
         return
+
+    should_generate_audio = output_modality == "audio"
+    output_audio_path = getattr(args, "output", None) if should_generate_audio else None
+    ref_audio_path = getattr(args, "ref_audio", None)
+    if should_generate_audio and output_audio_path is None:
+        raise ValueError(
+            "--output is required when --output-modality audio is selected"
+        )
+    if should_generate_audio and getattr(args, "chat", False):
+        raise ValueError("--output-modality audio does not support --chat")
 
     if getattr(args, "seed", None) is not None:
         mx.random.seed(args.seed)
@@ -1487,6 +1693,8 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if should_generate_audio:
+        chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
     if args.video:
@@ -1665,14 +1873,28 @@ def main():
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
-        result = generate(
-            model,
-            processor,
-            prompt,
-            **gen_kwargs,
-        )
+        if should_generate_audio:
+            result = generate_audio(
+                model,
+                processor,
+                prompt,
+                output_audio_path=output_audio_path,
+                ref_audio_path=ref_audio_path,
+                **gen_kwargs,
+            )
+            if args.verbose and output_audio_path:
+                print(f"\nAudio written to {output_audio_path}")
+        else:
+            result = generate(
+                model,
+                processor,
+                prompt,
+                **gen_kwargs,
+            )
         if not args.verbose:
             print(result.text)
+            if should_generate_audio and output_audio_path:
+                print(f"Audio written to {output_audio_path}")
 
         if draft_model is not None:
             stats = format_speculative_stats(draft_model)
