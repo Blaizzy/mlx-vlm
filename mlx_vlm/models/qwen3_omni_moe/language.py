@@ -564,6 +564,9 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
 
+        if position_ids is not None:
+            mx.eval(position_ids)
+
         out = self.model(
             inputs,
             cache=cache,

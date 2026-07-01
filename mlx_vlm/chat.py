@@ -47,6 +47,13 @@ class MLXVisionChat:
         self.image_paths: List[str] = []
         self.vision_cache = VisionFeatureCache()
         self.prompt_cache_state = PromptCacheState()
+        thinking_mode = kwargs.pop("thinking_mode", None)
+        enable_thinking = kwargs.get("enable_thinking", False)
+        self.chat_template_kwargs = {
+            "enable_thinking": enable_thinking,
+        }
+        if thinking_mode is not None:
+            self.chat_template_kwargs["thinking_mode"] = thinking_mode
         self.stream_kwargs = kwargs
 
         with self.console.status("[bold green]Loading model..."):
@@ -93,10 +100,6 @@ class MLXVisionChat:
 
     def generate_response(self) -> str:
         """Generate a response from the model based on the conversation history."""
-        chat_template_kwargs = {
-            "enable_thinking": self.stream_kwargs.get("enable_thinking", False),
-        }
-
         num_images = 1 if self.current_image_path else 0
         image = [self.current_image_path] if self.current_image_path else None
 
@@ -105,7 +108,7 @@ class MLXVisionChat:
             self.model.config,
             self.history,
             num_images=num_images,
-            **chat_template_kwargs,
+            **self.chat_template_kwargs,
         )
 
         rprint("[bold green]Assistant:[/bold green]", end=" ", flush=True)
@@ -268,7 +271,19 @@ def main():
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
-        help="Enable thinking mode in the chat template.",
+        help=(
+            "Enable thinking in the chat template. Templates that use "
+            "thinking_mode receive thinking_mode='enabled'."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        choices=("enabled", "disabled", "adaptive"),
+        default=None,
+        help=(
+            "Set the chat-template thinking mode when supported. "
+            "Choices: enabled, disabled, adaptive."
+        ),
     )
     parser.add_argument(
         "--thinking-budget",
@@ -309,6 +324,8 @@ def main():
 
     # Thinking kwargs
     kwargs["enable_thinking"] = args.enable_thinking
+    if args.thinking_mode is not None:
+        kwargs["thinking_mode"] = args.thinking_mode
     if args.thinking_budget is not None:
         kwargs["thinking_budget"] = args.thinking_budget
         kwargs["thinking_end_token"] = args.thinking_end_token

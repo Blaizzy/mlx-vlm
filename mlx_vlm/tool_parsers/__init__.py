@@ -13,15 +13,13 @@ from mlx_lm.tokenizer_utils import _infer_tool_parser as _mlx_lm_infer_tool_pars
 _EXTRA_PATTERNS = [
     ("<|tool_call>", "gemma4"),
     ("<|START_ACTION|>", "cohere2_moe"),
+    ("]<]minimax[>[<tool_call>", "minimax_m3"),
+    ("<mm:think>", "minimax_m3"),
 ]
 
 
 def _infer_tool_parser(chat_template):
-    """Infer tool parser type, checking mlx_lm patterns first then extras."""
-    result = _mlx_lm_infer_tool_parser(chat_template)
-    if result is not None:
-        return result
-
+    """Infer tool parser type, preferring explicit mlx-vlm patterns."""
     if not isinstance(chat_template, str):
         return None
 
@@ -29,7 +27,7 @@ def _infer_tool_parser(chat_template):
         if marker in chat_template:
             return parser_type
 
-    return None
+    return _mlx_lm_infer_tool_parser(chat_template)
 
 
 def _infer_tool_parser_from_processor(processor):

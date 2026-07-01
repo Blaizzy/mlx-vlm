@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "unlimited-ocr": "unlimited_ocr",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -336,6 +337,7 @@ def skip_multimodal_module(path: str) -> bool:
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
+        "patch_merge_mlp",
     )
     return any(module in path for module in multimodal_modules)
 

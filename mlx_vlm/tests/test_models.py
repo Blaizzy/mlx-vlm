@@ -3669,6 +3669,75 @@ class TestModels(unittest.TestCase):
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
 
+    def test_unlimited_ocr(self):
+        from mlx_vlm.models import unlimited_ocr
+
+        text_config = unlimited_ocr.TextConfig(
+            model_type="deepseek_v2",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            vocab_size=32,
+            num_key_value_heads=2,
+            kv_lora_rank=None,
+            q_lora_rank=None,
+            qk_rope_head_dim=0,
+            v_head_dim=8,
+            qk_nope_head_dim=0,
+            moe_intermediate_size=16,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+        )
+        vision_config = unlimited_ocr.VisionConfig(
+            model_type="vision",
+            layers=1,
+            width=16,
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+        )
+        projector_config = unlimited_ocr.ProjectorConfig(
+            projector_type="linear",
+            input_dim=16,
+            n_embed=16,
+        )
+        config = unlimited_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            model_type="unlimited-ocr",
+        )
+        model = unlimited_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.random.uniform(
+            shape=(
+                1,
+                config.vision_config.image_size,
+                config.vision_config.image_size,
+                config.vision_config.num_channels,
+            ),
+            dtype=mx.float32,
+        )
+        vision_features = model.vision_model(pixel_values)
+        self.assertEqual(vision_features.shape[0], 1)
+        self.assertEqual(vision_features.shape[-1], config.vision_config.hidden_size)
+
+        projector_input = mx.random.uniform(
+            shape=(1, 4, config.projector_config.input_dim),
+            dtype=mx.float32,
+        )
+        projected = model.projector(projector_input)
+        self.assertEqual(projected.shape, (1, 4, config.projector_config.n_embed))
+
     def test_jina_vlm(self):
         from mlx_vlm.models import jina_vlm
 
@@ -5408,6 +5477,47 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "deepseekocr")
 
+    def test_unlimited_ocr_input_embeddings(self):
+        from mlx_vlm.models import unlimited_ocr
+
+        model = unlimited_ocr.Model(
+            unlimited_ocr.ModelConfig(
+                text_config=unlimited_ocr.TextConfig(
+                    model_type="deepseek_v2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    kv_lora_rank=None,
+                    q_lora_rank=None,
+                    qk_rope_head_dim=0,
+                    v_head_dim=8,
+                    qk_nope_head_dim=0,
+                    moe_intermediate_size=16,
+                    n_shared_experts=1,
+                    n_routed_experts=2,
+                    num_experts_per_tok=1,
+                ),
+                vision_config=unlimited_ocr.VisionConfig(
+                    model_type="vision",
+                    layers=1,
+                    width=16,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                ),
+                projector_config=unlimited_ocr.ProjectorConfig(
+                    projector_type="linear",
+                    input_dim=16,
+                    n_embed=16,
+                ),
+                model_type="unlimited-ocr",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "unlimited_ocr")
+
     def test_falcon_ocr_input_embeddings(self):
         from mlx_vlm.models import falcon_ocr
 
@@ -6967,6 +7077,149 @@ class TestMultiImageMRoPE(unittest.TestCase):
                 self.assertEqual(
                     int(deltas.reshape(-1)[0].item()), self._EXPECTED_DELTA
                 )
+
+
+class TestMRoPETrainingVJP(unittest.TestCase):
+    """Regression tests for issue #1474: LoRA/fine-tuning any M-RoPE VL model
+    crashed on the first backward with ``[Primitive::vjp] Not implemented for
+    CustomKernel`` because the M-RoPE apply used a raw ``metal_kernel`` (which
+    has no VJP). The kernel forward is now wrapped in ``mx.custom_function`` with
+    a VJP routed through the pure-MLX equivalent, so ``value_and_grad`` works
+    while inference stays byte-identical.
+    """
+
+    _DIM = 64
+    _HEADS = 2
+    _SEQ = 8
+    _BSZ = 1
+
+    def _qk(self):
+        mx.random.seed(0)
+        q = mx.random.normal((self._BSZ, self._HEADS, self._SEQ, self._DIM))
+        k = mx.random.normal((self._BSZ, self._HEADS, self._SEQ, self._DIM))
+        return q, k
+
+    @staticmethod
+    def _sum_loss(fn):
+        def loss(q, k):
+            qo, ko = fn(q, k)
+            return qo.astype(mx.float32).sum() + ko.astype(mx.float32).sum()
+
+        return loss
+
+    def _grads(self, fn, q, k):
+        return mx.value_and_grad(self._sum_loss(fn), argnums=(0, 1))(q, k)
+
+    def test_fused_apply_rotary_vjp(self):
+        """Fused MRoPE apply (``MRoPERotaryEmbedding.apply_rotary``) is
+        differentiable and matches the known-good pure-MLX gradient."""
+        from mlx_vlm.models import rope_utils
+
+        pos_2d = mx.arange(self._SEQ, dtype=mx.int32)[None, :]
+        pos_3d = mx.broadcast_to(
+            mx.arange(self._SEQ, dtype=mx.int32)[None, None, :],
+            (3, self._BSZ, self._SEQ),
+        )
+
+        for style in ("interleaved", "chunked"):
+            for pos in (pos_2d, pos_3d):
+                with self.subTest(style=style, pos_ndim=pos.ndim):
+                    q, k = self._qk()
+
+                    rope = rope_utils.MRoPERotaryEmbedding(dim=self._DIM, style=style)
+                    _, (dq, dk) = self._grads(
+                        lambda q, k: rope.apply_rotary(q, k, pos), q, k
+                    )
+                    mx.eval(dq, dk)
+                    self.assertTrue(bool(mx.all(mx.isfinite(dq))))
+                    self.assertTrue(bool(mx.all(mx.isfinite(dk))))
+
+                    saved = rope_utils._HAS_METAL
+                    try:
+                        rope_utils._HAS_METAL = False
+                        ref = rope_utils.MRoPERotaryEmbedding(
+                            dim=self._DIM, style=style
+                        )
+                        _, (dq2, dk2) = self._grads(
+                            lambda q, k: ref.apply_rotary(q, k, pos), q, k
+                        )
+                        mx.eval(dq2, dk2)
+                    finally:
+                        rope_utils._HAS_METAL = saved
+
+                    self.assertTrue(bool(mx.allclose(dq, dq2, atol=1e-4, rtol=1e-4)))
+                    self.assertTrue(bool(mx.allclose(dk, dk2, atol=1e-4, rtol=1e-4)))
+
+    def test_precomputed_rotary_vjp_matches_pure_mlx(self):
+        """Precomputed-cos/sin apply (even/odd and sectioned kernel paths) is
+        differentiable and matches the known-good pure-MLX gradient."""
+        from mlx_vlm.models import rope_utils
+
+        mx.random.seed(1)
+        rotary_dim = self._DIM
+        ang3 = mx.random.normal((self._BSZ, self._SEQ, rotary_dim))
+        cos3, sin3 = mx.cos(ang3), mx.sin(ang3)
+        ang4 = mx.random.normal((3, self._BSZ, self._SEQ, rotary_dim))
+        cos4, sin4 = mx.cos(ang4), mx.sin(ang4)
+        mrope_section = [4, 6, 6]  # sums to rotary_dim // 2 == 32
+
+        cases = [
+            (
+                "even_odd_half",
+                lambda q, k: rope_utils.apply_rotary_pos_emb_even_odd(
+                    q, k, cos3, sin3, cos_layout="half"
+                ),
+            ),
+            (
+                "even_odd_full",
+                lambda q, k: rope_utils.apply_rotary_pos_emb_even_odd(
+                    q, k, cos3, sin3, cos_layout="full"
+                ),
+            ),
+            (
+                "sectioned_half_split",
+                lambda q, k: rope_utils.apply_multimodal_rotary_pos_emb(
+                    q,
+                    k,
+                    cos4,
+                    sin4,
+                    mrope_section=mrope_section,
+                    style="sectioned_half_split",
+                ),
+            ),
+            (
+                "sectioned_even_odd",
+                lambda q, k: rope_utils.apply_multimodal_rotary_pos_emb(
+                    q,
+                    k,
+                    cos4,
+                    sin4,
+                    mrope_section=mrope_section,
+                    style="sectioned_even_odd",
+                ),
+            ),
+        ]
+
+        for name, fn in cases:
+            with self.subTest(case=name):
+                q, k = self._qk()
+                _, (dq, dk) = self._grads(fn, q, k)
+                mx.eval(dq, dk)
+                self.assertTrue(bool(mx.all(mx.isfinite(dq))))
+                self.assertTrue(bool(mx.all(mx.isfinite(dk))))
+
+                saved = rope_utils._HAS_METAL
+                try:
+                    rope_utils._HAS_METAL = False
+                    rope_utils._compiled_rotary_apply.cache_clear()
+                    _, (dq2, dk2) = self._grads(fn, q, k)
+                    mx.eval(dq2, dk2)
+                finally:
+                    rope_utils._HAS_METAL = saved
+                    rope_utils._compiled_rotary_apply.cache_clear()
+
+                self.assertTrue(bool(mx.allclose(dq, dq2, atol=1e-4, rtol=1e-4)))
+                self.assertTrue(bool(mx.allclose(dk, dk2, atol=1e-4, rtol=1e-4)))
 
 
 class TestMiniCPMV4_6(unittest.TestCase):
