@@ -708,12 +708,21 @@ class Sam3VideoPredictor:
             points = mx.array(prompt["points"])[None]
             labels = mx.array(prompt["labels"])[None]
 
-            tracker_fpn = self.model.tracker_neck(features)
-            track_features = tracker_fpn[2]
+            # Interactive clicks use the INTERACTIVE FPN, not the propagation FPN
+            # (the interactive decoder + its conv_s0/conv_s1 skips were trained on it).
+            _, inter_fpn, _ = self.model.detector_model.vision_encoder.neck(
+                features,
+                need_det=False,
+                need_interactive=True,
+                need_propagation=False,
+            )
+            track_features = inter_fpn[2]
+            high_res = [inter_fpn[0], inter_fpn[1]] if len(inter_fpn) > 1 else None
 
             result = self.model.tracker_model.track_step(
                 current_features=track_features,
                 prompt_points=(points, labels),
+                high_res_features=high_res,
             )
             mx.eval(result)
 
@@ -725,12 +734,19 @@ class Sam3VideoPredictor:
         elif prompt["type"] == "box":
             box = mx.array(prompt["box"])[None, None]  # (1, 1, 4)
 
-            tracker_fpn = self.model.tracker_neck(features)
-            track_features = tracker_fpn[2]
+            _, inter_fpn, _ = self.model.detector_model.vision_encoder.neck(
+                features,
+                need_det=False,
+                need_interactive=True,
+                need_propagation=False,
+            )
+            track_features = inter_fpn[2]
+            high_res = [inter_fpn[0], inter_fpn[1]] if len(inter_fpn) > 1 else None
 
             result = self.model.tracker_model.track_step(
                 current_features=track_features,
                 prompt_boxes=box,
+                high_res_features=high_res,
             )
             mx.eval(result)
 

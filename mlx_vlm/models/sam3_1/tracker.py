@@ -167,14 +167,33 @@ class MultiplexTrackerModel(nn.Module):
         multimask_output: bool = False,
         high_res_features: Optional[List[mx.array]] = None,
     ) -> Dict[str, mx.array]:
-        """Run one tracking step."""
+        """Run one tracking step.
+
+        Two distinct paths share this method:
+          * INTERACTIVE (a point/box/mask prompt is given): a cold single-object
+            click that must use the SAM2-style single-object
+            ``interactive_sam_mask_decoder`` and ``interactive_obj_ptr_proj``.
+          * PROPAGATION (memory_bank, no prompt): the 16-slot multiplex
+            ``sam_mask_decoder`` used for memory-conditioned tracking.
+        """
         B, H, W, D = current_features.shape
+
+        is_interactive = (
+            prompt_points is not None
+            or prompt_boxes is not None
+            or prompt_masks is not None
+        )
+
         src = current_features.reshape(B, H * W, D)
 
-        # Memory attention
+        # Memory attention (propagation). For a COLD interactive prompt there is
+        # no memory; instead add the learned interactivity_no_mem_embed (matches
+        # the reference's directly-add-no-mem-embed on the first frame).
         if memory_bank and len(memory_bank) > 0:
             memory = mx.concatenate(memory_bank, axis=1)
             src = self.memory_attention(src, memory)
+        elif is_interactive:
+            src = src + self.interactivity_no_mem_embed  # (1,1,D) broadcasts over (B,HW,D)
 
         # Image positional encoding (resize if resolution differs from training)
         image_pe = self.interactive_sam_prompt_encoder.get_dense_pe()
@@ -200,24 +219,51 @@ class MultiplexTrackerModel(nn.Module):
             masks=prompt_masks,
         )
 
-        # Predict masks
-        masks, iou_pred, sam_tokens, obj_score = self.sam_mask_decoder(
-            image_embeddings=src,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_emb,
-            dense_prompt_embeddings=dense_emb,
-            multimask_output=multimask_output,
-            high_res_features=high_res_features,
-        )
+        if is_interactive:
+            # Callers pass high_res as [fpn0=288, fpn1=144]; the decoder applies
+            # conv_s1 at the 1st upscale (expects 144) and conv_s0 at the 2nd
+            # (expects 288). Reorder to [144, 288] so both skips actually apply
+            # instead of being silently dropped by the shape guard.
+            hrf = high_res_features
+            if hrf is not None and len(hrf) >= 2:
+                hrf = [hrf[1], hrf[0]]
+            masks, iou_pred, sam_tokens, obj_score = self.interactive_sam_mask_decoder(
+                image_embeddings=src,
+                image_pe=image_pe,
+                sparse_prompt_embeddings=sparse_emb,
+                dense_prompt_embeddings=dense_emb,
+                multimask_output=True,  # single click -> 3 candidates, pick best IoU
+                high_res_features=hrf,
+            )
+            # Object pointer = first MASK-token output (canonical sam_output_token).
+            # In the [iou(1), mask(4), obj(1), sparse...] layout that is hs[:, 1].
+            obj_ptr = self.interactive_obj_ptr_proj(sam_tokens[:, 1])
+        else:
+            masks, iou_pred, sam_tokens, obj_score = self.sam_mask_decoder(
+                image_embeddings=src,
+                image_pe=image_pe,
+                sparse_prompt_embeddings=sparse_emb,
+                dense_prompt_embeddings=dense_emb,
+                multimask_output=multimask_output,
+                high_res_features=high_res_features,
+            )
+            obj_ptr = self.obj_ptr_proj(sam_tokens[:, 0])
 
-        # Object pointer
-        obj_ptr = self.obj_ptr_proj(sam_tokens[:, 0])
-
-        # Simplified: return first multiplex slot for single-object tracking
+        # Collapse the multiplex slot for single-object output -> (B, N, H, W)
         if masks.ndim == 5:
-            masks = masks[:, 0]  # (B, num_masks, H, W)
+            masks = masks[:, 0]
             iou_pred = iou_pred[:, 0]
             obj_score = obj_score[:, 0]
+
+        # Interactive best-mask selection: the interactive decoder emits 4 masks
+        # where index 0 is the dedicated single-output token (canonical SAM2);
+        # for a multimask click drop it and argmax over the 3 candidates.
+        if is_interactive and masks.shape[1] > 1:
+            cand_masks = masks[:, 1:]
+            cand_iou = iou_pred[:, 1:]
+            best = int(mx.argmax(cand_iou[0]).item())
+            masks = cand_masks[:, best : best + 1]
+            iou_pred = cand_iou[:, best : best + 1]
 
         return {
             "pred_masks": masks,

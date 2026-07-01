@@ -604,24 +604,23 @@ class SAMMaskDecoder(nn.Module):
         H = W = int(HW**0.5)
         src = src.reshape(B, H, W, d)
 
+        # Stage 1 (144): add the conv_s1 high-res skip BEFORE LayerNorm+GELU
+        # (reference SAM2 order: upscaled = act1(ln1(dc1(src) + feat_s1))).
         upscaled = self.upscale_conv1(src)  # (B, 2H, 2W, D/4)
-        upscaled = self.upscale_layer_norm(upscaled)
-        upscaled = nn.gelu(upscaled)
-
-        # Add s1 high-res skip (144x144 level, D/4=64 channels)
         if high_res_features is not None and len(high_res_features) >= 1:
             s1_feat = self.conv_s1(high_res_features[0])  # (B, 144, 144, 64)
             if s1_feat.shape[1:3] == upscaled.shape[1:3]:
                 upscaled = upscaled + s1_feat
-
-        upscaled = self.upscale_conv2(upscaled)  # (B, 4H, 4W, D/8)
+        upscaled = self.upscale_layer_norm(upscaled)
         upscaled = nn.gelu(upscaled)
 
-        # Add s0 high-res skip (288x288 level, D/8=32 channels)
+        # Stage 2 (288): add the conv_s0 high-res skip BEFORE the final GELU.
+        upscaled = self.upscale_conv2(upscaled)  # (B, 4H, 4W, D/8)
         if high_res_features is not None and len(high_res_features) >= 2:
             s0_feat = self.conv_s0(high_res_features[1])  # (B, 288, 288, 32)
             if s0_feat.shape[1:3] == upscaled.shape[1:3]:
                 upscaled = upscaled + s0_feat
+        upscaled = nn.gelu(upscaled)
 
         B, H_up, W_up, C_up = upscaled.shape
         upscaled_flat = upscaled.reshape(B, H_up * W_up, C_up)
