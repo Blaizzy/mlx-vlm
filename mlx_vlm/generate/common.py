@@ -150,6 +150,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
 class GenerationResult:
     text: str = ""
     token: Optional[int] = None
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[List[float]] = None
     prompt_tokens: int = 0
     generation_tokens: int = 0

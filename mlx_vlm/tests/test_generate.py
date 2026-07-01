@@ -1932,6 +1932,79 @@ def test_generate_audio_cli_requires_output():
     mock_load.assert_not_called()
 
 
+def test_generate_audio_reuses_text_generate_path():
+    input_ids = mx.array([[1, 2]], dtype=mx.int32)
+    pixel_values = mx.zeros((1, 1))
+    mask = mx.array([[1, 1]], dtype=mx.int32)
+    audio_tokens = mx.zeros((1, 1, 1), dtype=mx.int32)
+    tokenizer = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="minicpmo", image_token_index=None),
+        generate_audio=MagicMock(
+            return_value=SimpleNamespace(
+                audio_tokens=audio_tokens,
+                audio=b"wav",
+                output_audio_path="out.wav",
+            )
+        ),
+    )
+
+    with (
+        patch.object(
+            dispatch_module,
+            "prepare_inputs",
+            return_value={
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "attention_mask": mask,
+                "audio_bounds": mx.array([[0, 1]], dtype=mx.int32),
+            },
+        ) as mock_prepare_inputs,
+        patch.object(
+            dispatch_module,
+            "generate",
+            return_value=GenerationResult(
+                text="spoken",
+                token=4,
+                token_ids=[3, 4],
+                prompt_tokens=2,
+                generation_tokens=2,
+                total_tokens=4,
+            ),
+        ) as mock_generate,
+    ):
+        result = dispatch_module.generate_audio(
+            model,
+            processor,
+            "prompt",
+            audio=["speaker.wav"],
+            output_audio_path="out.wav",
+            max_tokens=2,
+        )
+
+    mock_prepare_inputs.assert_called_once()
+    assert mock_generate.call_args.args[:6] == (
+        model,
+        processor,
+        "prompt",
+        None,
+        ["speaker.wav"],
+        None,
+    )
+    assert mock_generate.call_args.kwargs["input_ids"] is input_ids
+    assert mock_generate.call_args.kwargs["pixel_values"] is pixel_values
+    assert mock_generate.call_args.kwargs["mask"] is mask
+    assert mock_generate.call_args.kwargs["audio_bounds"].shape == (1, 2)
+    model.generate_audio.assert_called_once()
+    assert model.generate_audio.call_args.kwargs["input_ids"] is input_ids
+    assert model.generate_audio.call_args.kwargs["generated_tokens"] == [3, 4]
+    assert model.generate_audio.call_args.kwargs["audio"] == ["speaker.wav"]
+    assert result.text == "spoken"
+    assert result.audio_tokens is audio_tokens
+    assert result.output_audio_path == "out.wav"
+
+
 def test_generate_image_cli_routes_before_vlm_load():
     args = Namespace(
         model="bonsai-ternary",
