@@ -500,33 +500,6 @@ class LanguageModel(nn.Module):
                 )
             return position_ids, mrope_position_deltas
 
-    def hidden_state_at_layer(
-        self,
-        inputs: mx.array,
-        target_layer_idx: int,
-        inputs_embeds: Optional[mx.array] = None,
-        image_grid_thw: Optional[mx.array] = None,
-        video_grid_thw: Optional[mx.array] = None,
-    ):
-        early_exit_layer = target_layer_idx - 1
-        if early_exit_layer < 0 or early_exit_layer >= len(self.model.layers):
-            raise ValueError(
-                "target_layer_idx must be in "
-                f"[1, {len(self.model.layers)}], got {target_layer_idx}"
-            )
-
-        position_ids, rope_deltas = self.get_rope_index(
-            inputs, image_grid_thw, video_grid_thw, None
-        )
-        self._rope_deltas = rope_deltas
-
-        return self.model(
-            inputs,
-            inputs_embeds=inputs_embeds,
-            position_ids=position_ids,
-            early_exit_layer=early_exit_layer,
-        )
-
     def __call__(
         self,
         inputs: mx.array,

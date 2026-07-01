@@ -135,15 +135,22 @@ class Model(nn.Module):
         )
         inputs_embeds = input_embedding_features.inputs_embeds
 
-        lm_kwargs = {
-            k: v for k, v in kwargs.items() if k in ["image_grid_thw", "video_grid_thw"]
-        }
-
-        hidden_states = self.thinker.language_model.hidden_state_at_layer(
+        # Transformers prepends input embeddings as hidden_states[0].
+        early_exit_layer = target_layer_idx - 1
+        language_model = self.thinker.language_model
+        position_ids, rope_deltas = language_model.get_rope_index(
             input_ids,
-            target_layer_idx,
+            kwargs.get("image_grid_thw"),
+            kwargs.get("video_grid_thw"),
+            None,
+        )
+        language_model._rope_deltas = rope_deltas
+
+        hidden_states = language_model.model(
+            input_ids,
             inputs_embeds=inputs_embeds,
-            **lm_kwargs,
+            position_ids=position_ids,
+            early_exit_layer=early_exit_layer,
         )
 
         return hidden_states, inputs_embeds
