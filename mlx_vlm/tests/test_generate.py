@@ -616,6 +616,36 @@ class TestBatchGenerator:
         assert [p.prompt_tokens for p in progress] == [5, 3]
         assert [p.cached_tokens for p in progress] == [3, 0]
 
+    def test_singleton_prompt_batch_uses_plain_kv_cache(self):
+        model = SimpleNamespace(layers=[object(), object()])
+
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1],
+            input_ids=[[4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 2, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+        )
+
+        assert all(isinstance(c, KVCache) for c in batch.prompt_cache)
+
+    def test_multirow_prompt_batch_uses_batch_kv_cache(self):
+        model = SimpleNamespace(layers=[object(), object()])
+
+        batch = PromptProcessingBatch(
+            model=model,
+            uids=[1, 2],
+            input_ids=[[4, 5], [6]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 2, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+        )
+
+        assert all(isinstance(c, BatchKVCache) for c in batch.prompt_cache)
+
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"

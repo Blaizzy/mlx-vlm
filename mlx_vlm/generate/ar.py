@@ -1579,12 +1579,10 @@ class PromptProcessingBatch:
                     kv_quant_scheme=kv_quant_scheme,
                 ),
             )
-        elif (
-            len(input_ids) == 1
-            and right_pad_per_row is None
-            and kv_bits is None
-            and hasattr(model, "make_cache")
-        ):
+        elif len(input_ids) == 1 and right_pad_per_row is None and kv_bits is None:
+            # A singleton cold prefill does not need the batch cache.  Plain
+            # KVCache keeps the symbolic causal-mask path, avoiding a large
+            # materialized BatchKVCache mask for long prompts.
             self.prompt_cache = cache.make_prompt_cache(model)
         else:
             self.prompt_cache = _make_cache(
