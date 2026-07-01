@@ -139,21 +139,12 @@ class Model(nn.Module):
             k: v for k, v in kwargs.items() if k in ["image_grid_thw", "video_grid_thw"]
         }
 
-        early_exit_layer = target_layer_idx - 1
-        if early_exit_layer < 0:
-            raise ValueError(
-                f"target_layer_idx must be greater than 0, got {target_layer_idx}"
-            )
-
-        # Transformers prepends input embeddings as hidden_states[0].
-        outputs = self.thinker.language_model(
+        hidden_states = self.thinker.language_model.hidden_state_at_layer(
             input_ids,
+            target_layer_idx,
             inputs_embeds=inputs_embeds,
-            early_exit_layer=early_exit_layer,
             **lm_kwargs,
         )
-
-        hidden_states = outputs.hidden_states[0]
 
         return hidden_states, inputs_embeds
 

@@ -247,6 +247,13 @@ class Qwen3VLMoEModel(nn.Module):
             mask = create_attention_mask(
                 h, cache[0] if cache and cache[0] is not None else cache
             )
+        if early_exit_layer is not None and (
+            early_exit_layer < 0 or early_exit_layer >= len(self.layers)
+        ):
+            raise ValueError(
+                "early_exit_layer must be in "
+                f"[0, {len(self.layers) - 1}], got {early_exit_layer}"
+            )
 
         all_hidden_states = [] if output_hidden_states else None
         position_embeddings = None
@@ -493,6 +500,33 @@ class LanguageModel(nn.Module):
                 )
             return position_ids, mrope_position_deltas
 
+    def hidden_state_at_layer(
+        self,
+        inputs: mx.array,
+        target_layer_idx: int,
+        inputs_embeds: Optional[mx.array] = None,
+        image_grid_thw: Optional[mx.array] = None,
+        video_grid_thw: Optional[mx.array] = None,
+    ):
+        early_exit_layer = target_layer_idx - 1
+        if early_exit_layer < 0 or early_exit_layer >= len(self.model.layers):
+            raise ValueError(
+                "target_layer_idx must be in "
+                f"[1, {len(self.model.layers)}], got {target_layer_idx}"
+            )
+
+        position_ids, rope_deltas = self.get_rope_index(
+            inputs, image_grid_thw, video_grid_thw, None
+        )
+        self._rope_deltas = rope_deltas
+
+        return self.model(
+            inputs,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            early_exit_layer=early_exit_layer,
+        )
+
     def __call__(
         self,
         inputs: mx.array,
@@ -569,17 +603,6 @@ class LanguageModel(nn.Module):
         visual_pos_masks = kwargs.get("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
-        early_exit_layer = kwargs.pop("early_exit_layer", None)
-        if early_exit_layer is not None:
-            if output_hidden_states:
-                raise ValueError(
-                    "early_exit_layer cannot be used with output_hidden_states"
-                )
-            if early_exit_layer < 0 or early_exit_layer >= len(self.model.layers):
-                raise ValueError(
-                    "early_exit_layer must be in "
-                    f"[0, {len(self.model.layers) - 1}], got {early_exit_layer}"
-                )
 
         out = self.model(
             inputs,
@@ -589,14 +612,7 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             output_hidden_states=output_hidden_states,
-            early_exit_layer=early_exit_layer,
         )
-
-        # Early-exit path: ``out`` is the raw hidden state of ``early_exit_layer``
-        # (no norm, no lm_head, so no logits). Return it as a 1-element
-        # hidden_states list to match the LanguageModelOutput contract.
-        if early_exit_layer is not None:
-            return LanguageModelOutput(logits=None, hidden_states=[out])
 
         if output_hidden_states:
             hidden_states, all_hidden_states = out
