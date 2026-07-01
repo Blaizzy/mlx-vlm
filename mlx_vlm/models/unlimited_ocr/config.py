@@ -9,9 +9,9 @@ from ..deepseekocr.config import (
     MLPConfig,
     ProjectorConfig,
     SAMViTConfig,
-    VLChatProcessorOutput,
-    VisionConfig as DeepseekOCRVisionConfig,
 )
+from ..deepseekocr.config import VisionConfig as DeepseekOCRVisionConfig
+from ..deepseekocr.config import VLChatProcessorOutput
 
 
 @dataclass

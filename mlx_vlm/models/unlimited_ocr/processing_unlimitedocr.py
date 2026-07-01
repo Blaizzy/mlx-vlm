@@ -1,5 +1,5 @@
-import math
 import json
+import math
 from pathlib import Path
 from typing import List
 
@@ -144,9 +144,10 @@ class UnlimitedOCRProcessor(DeepseekOCRProcessor):
         ratio = 1 - ((max(w, h) - min(w, h)) / (max(w, h)))
 
         image_token_count = conversation.count(self.image_token)
-        assert conversation.count(self.image_token) == len(
-            images
-        ) or image_token_count == 1, f"The number of image tokens in the prompt does not match the number of images: {image_token_count} != {len(images)}"
+        assert (
+            conversation.count(self.image_token) == len(images)
+            or image_token_count == 1
+        ), f"The number of image tokens in the prompt does not match the number of images: {image_token_count} != {len(images)}"
         text_splits = conversation.split(self.image_token)
 
         images_list, images_crop_list, images_seq_mask = [], [], []

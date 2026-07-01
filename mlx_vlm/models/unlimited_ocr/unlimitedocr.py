@@ -6,7 +6,8 @@ from transformers import AutoProcessor
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 
-from ..deepseekocr.deepseekocr import MlpProjector, Model as DeepseekOCRModel
+from ..deepseekocr.deepseekocr import MlpProjector
+from ..deepseekocr.deepseekocr import Model as DeepseekOCRModel
 from ..deepseekocr.sam import SAMEncoder
 from ..deepseekocr.vision import VisionModel
 from .config import ModelConfig

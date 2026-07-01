@@ -3,7 +3,8 @@ from typing import Any, Optional
 import mlx.core as mx
 
 from ..cache import KVCache
-from ..deepseekocr.language import DeepseekV2Model, LanguageModel as DeepseekLanguageModel
+from ..deepseekocr.language import DeepseekV2Model
+from ..deepseekocr.language import LanguageModel as DeepseekLanguageModel
 from .config import TextConfig
 
 
