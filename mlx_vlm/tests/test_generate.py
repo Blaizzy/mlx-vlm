@@ -1789,7 +1789,8 @@ def test_generate_cli_smoke(capsys):
         quantize_activations=False,
         processor_kwargs={},
         prefill_step_size=128,
-        enable_thinking=False,
+        enable_thinking=True,
+        thinking_mode=None,
         thinking_budget=None,
         thinking_start_token="<think>",
         thinking_end_token="</think>",
@@ -1814,8 +1815,10 @@ def test_generate_cli_smoke(capsys):
     ):
         dispatch_module.main()
 
-    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
-    assert mock_generate.call_args.kwargs["enable_thinking"] is False
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_apply_chat_template.call_args.kwargs
+    assert mock_generate.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_generate.call_args.kwargs
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128

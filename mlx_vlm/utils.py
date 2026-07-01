@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "unlimited-ocr": "unlimited_ocr",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -336,6 +337,7 @@ def skip_multimodal_module(path: str) -> bool:
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
+        "patch_merge_mlp",
     )
     return any(module in path for module in multimodal_modules)
 
@@ -482,12 +484,25 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    index_file = model_path / "model.safetensors.index.json"
+    weight_files = []
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            weight_files = [
+                str(model_path / shard)
+                for shard in sorted(set(weight_map.values()))
+                if (model_path / shard).exists()
+            ]
+        except (ValueError, OSError):
+            weight_files = []
+    if not weight_files:
+        weight_files = [
+            wf
+            for wf in glob.glob(str(model_path / "*.safetensors"))
+            if not wf.endswith("consolidated.safetensors")
+        ]
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")

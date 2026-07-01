@@ -405,6 +405,7 @@ class DeepseekV4MoE(nn.Module):
         self.shared_experts = DeepseekV4MLP(
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
+            swiglu_limit=config.swiglu_limit,
         )
         self.sharding_group = None
 
