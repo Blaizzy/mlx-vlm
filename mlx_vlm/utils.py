@@ -382,8 +382,13 @@ def get_model_and_args(config: dict):
 
     model_type = MODEL_REMAPPING.get(model_type, model_type)
 
+    # DSpark drafters declare a generic model_type (e.g. ``gemma4_text``) and are
+    # identified by their architecture tag (see speculative.drafters._config_is_dspark).
+    is_dspark = "Gemma4DSparkModel" in (config.get("architectures") or [])
     is_dflash = config.get("dflash_config", None) is not None
-    if is_dflash:
+    if is_dspark:
+        model_type = "gemma4_dspark"
+    elif is_dflash:
         model_type += "_dflash"
 
     last_err: Optional[ImportError] = None
