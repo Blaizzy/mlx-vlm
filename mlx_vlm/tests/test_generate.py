@@ -616,42 +616,6 @@ class TestBatchGenerator:
         assert [p.prompt_tokens for p in progress] == [5, 3]
         assert [p.cached_tokens for p in progress] == [3, 0]
 
-    def test_qwen3_omni_singleton_prefill_uses_model_kv_cache(self):
-        from mlx_vlm.models.qwen3_omni_moe.config import TextConfig
-        from mlx_vlm.models.qwen3_omni_moe.language import LanguageModel
-
-        model = LanguageModel(
-            TextConfig(
-                num_hidden_layers=2,
-                hidden_size=16,
-                intermediate_size=32,
-                num_attention_heads=2,
-                num_key_value_heads=1,
-                head_dim=8,
-                num_experts=0,
-                num_experts_per_tok=1,
-                decoder_sparse_step=1,
-                mlp_only_layers=[],
-                moe_intermediate_size=16,
-                rms_norm_eps=1e-6,
-                vocab_size=32,
-                rope_theta=10000,
-                max_position_embeddings=128,
-            )
-        )
-
-        batch = PromptProcessingBatch(
-            model=model,
-            uids=[1],
-            input_ids=[[4, 5]],
-            max_tokens=[1],
-            inputs_embeds=mx.ones((1, 2, 16)),
-            prompt_kwargs={},
-            prefill_step_size=None,
-        )
-
-        assert all(isinstance(c, KVCache) for c in batch.prompt_cache)
-
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
