@@ -337,6 +337,7 @@ def skip_multimodal_module(path: str) -> bool:
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
+        "patch_merge_mlp",
     )
     return any(module in path for module in multimodal_modules)
 
