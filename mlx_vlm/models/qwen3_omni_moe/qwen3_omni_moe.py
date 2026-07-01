@@ -69,8 +69,11 @@ class Model(nn.Module):
         **kwargs,
     ):
         # prepare_inputs passes the audio mask as `feature_attention_mask`.
+        thinker_kwargs = dict(kwargs)
         if input_features_mask is None:
-            input_features_mask = kwargs.get("feature_attention_mask")
+            input_features_mask = thinker_kwargs.pop("feature_attention_mask", None)
+        else:
+            thinker_kwargs.pop("feature_attention_mask", None)
         return self.thinker.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -80,6 +83,7 @@ class Model(nn.Module):
             input_features=input_features,
             feature_attention_mask=input_features_mask,
             audio_feature_lengths=audio_feature_lengths,
+            **thinker_kwargs,
         )
 
     def get_audio_features(
