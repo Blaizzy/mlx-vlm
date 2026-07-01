@@ -158,6 +158,44 @@ def _mrope_apply_kernel(
     )
 
 
+def _mrope_apply_cos_sin(x, position_ids, inv_freq, position_selector, pairing):
+    """Pure-MLX cos/sin matching the fused MRoPE kernel's angle computation.
+
+    Mirrors ``_mrope_apply_kernel``: ``angle = pos * inv_freq[freq_idx]`` with
+    ``pos`` selected per-axis (via ``position_selector``) for 3D position ids.
+    Returns cos/sin already laid out for the pairing so a plain rotate matches
+    the kernel's element-wise pair rotation.
+    """
+    half_dim = inv_freq.shape[0]
+    if position_ids.ndim == 2:
+        # (b, t, half) angles; the same scalar position feeds every freq.
+        angle = position_ids.astype(mx.float32)[..., None] * inv_freq
+    else:
+        # (axis, b, t) -> select the axis feeding each freq, giving (b, t, half).
+        positions = mx.take(position_ids, position_selector, axis=0)
+        angle = positions.transpose(1, 2, 0).astype(mx.float32) * inv_freq
+    cos = mx.cos(angle)[:, None, :, :]
+    sin = mx.sin(angle)[:, None, :, :]
+    if pairing == _EVEN_ODD:
+        cos = mx.repeat(cos, repeats=2, axis=-1)
+        sin = mx.repeat(sin, repeats=2, axis=-1)
+    else:
+        cos = mx.concatenate([cos, cos], axis=-1)
+        sin = mx.concatenate([sin, sin], axis=-1)
+    return cos, sin, half_dim
+
+
+def _mrope_apply_mlx(q, k, position_ids, inv_freq, position_selector, pairing):
+    """Differentiable pure-MLX equivalent of the fused MRoPE kernel apply."""
+    cos, sin, _ = _mrope_apply_cos_sin(
+        q, position_ids, inv_freq, position_selector, pairing
+    )
+    rotate_fn = rotate_half_even_odd if pairing == _EVEN_ODD else rotate_half
+    return _apply_rotary_embedding(
+        q, k, cos, sin, rotate_fn, cast_output=True, compute_dtype=mx.float32
+    )
+
+
 def _fast_mrope_apply(
     kernel,
     q,
@@ -165,6 +203,7 @@ def _fast_mrope_apply(
     position_ids,
     inv_freq,
     position_selector,
+    pairing=_HALF_SPLIT,
 ):
     def apply_one(x):
         half_dim = inv_freq.shape[0]
@@ -180,7 +219,35 @@ def _fast_mrope_apply(
         )
         return out
 
-    return apply_one(q), apply_one(k)
+    # Wrap the kernel forward in a custom_function so value_and_grad (training)
+    # can differentiate through it: a raw CustomKernel has no VJP, so route the
+    # gradient through the pure-MLX equivalent. position_ids/inv_freq/
+    # position_selector are position constants (zero cotangent).
+    @mx.custom_function
+    def apply(q, k, position_ids, inv_freq, position_selector):
+        return apply_one(q), apply_one(k)
+
+    @apply.vjp
+    def apply_vjp(primals, cotangents, _output):
+        q, k, position_ids, inv_freq, position_selector = primals
+        _, (dq, dk) = mx.vjp(
+            lambda q, k: list(
+                _mrope_apply_mlx(
+                    q, k, position_ids, inv_freq, position_selector, pairing
+                )
+            ),
+            [q, k],
+            list(cotangents),
+        )
+        return (
+            dq,
+            dk,
+            mx.zeros_like(position_ids),
+            mx.zeros_like(inv_freq),
+            mx.zeros_like(position_selector),
+        )
+
+    return apply(q, k, position_ids, inv_freq, position_selector)
 
 
 @lru_cache(maxsize=None)
@@ -312,7 +379,55 @@ def _rotary_apply_kernel(
     )
 
 
-def _fast_rotary_apply(kernel, q, k, cos, sin, position_selector=None):
+def _precomputed_rotary_mlx(
+    q,
+    k,
+    cos,
+    sin,
+    *,
+    pairing,
+    cos_layout,
+    sectioned,
+    mrope_section,
+):
+    """Differentiable pure-MLX equivalent of ``_fast_rotary_apply``.
+
+    Reproduces the fallback layout applied to cos/sin (half->full expansion for
+    even/odd, sectioning for sectioned styles) before the element-wise rotation
+    so the gradient matches the kernel forward.
+    """
+    if sectioned:
+        cos, sin = _section_cos_sin(cos, sin, mrope_section)
+    else:
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
+
+    if pairing == _EVEN_ODD:
+        if cos_layout == _HALF_COS:
+            cos = mx.repeat(cos[..., : cos.shape[-1] // 2], repeats=2, axis=-1)
+            sin = mx.repeat(sin[..., : sin.shape[-1] // 2], repeats=2, axis=-1)
+        rotate_fn = rotate_half_even_odd
+    else:
+        rotate_fn = rotate_half
+
+    return _apply_rotary_embedding(
+        q, k, cos, sin, rotate_fn, cast_output=True, compute_dtype=mx.float32
+    )
+
+
+def _fast_rotary_apply(
+    kernel,
+    q,
+    k,
+    cos,
+    sin,
+    position_selector=None,
+    *,
+    pairing=_HALF_SPLIT,
+    cos_layout=_HALF_COS,
+    sectioned=False,
+    mrope_section=None,
+):
     def apply_one(x):
         rotary_dim = cos.shape[-1]
         slots = rotary_dim // 2 + x.shape[-1] - rotary_dim
@@ -330,7 +445,35 @@ def _fast_rotary_apply(kernel, q, k, cos, sin, position_selector=None):
         )
         return out
 
-    return apply_one(q), apply_one(k)
+    # As with _fast_mrope_apply: the CustomKernel has no VJP, so wrap the forward
+    # in a custom_function whose vjp routes through the pure-MLX equivalent.
+    # cos/sin are position constants (zero cotangent); q/k are differentiated.
+    @mx.custom_function
+    def apply(q, k, cos, sin):
+        return apply_one(q), apply_one(k)
+
+    @apply.vjp
+    def apply_vjp(primals, cotangents, _output):
+        q, k, cos, sin = primals
+        _, (dq, dk) = mx.vjp(
+            lambda q, k: list(
+                _precomputed_rotary_mlx(
+                    q,
+                    k,
+                    cos,
+                    sin,
+                    pairing=pairing,
+                    cos_layout=cos_layout,
+                    sectioned=sectioned,
+                    mrope_section=mrope_section,
+                )
+            ),
+            [q, k],
+            list(cotangents),
+        )
+        return (dq, dk, mx.zeros_like(cos), mx.zeros_like(sin))
+
+    return apply(q, k, cos, sin)
 
 
 @lru_cache(maxsize=None)
@@ -340,6 +483,7 @@ def _compiled_rotary_apply(
     cos_ndim: int,
     sectioned: bool,
     cos_layout: str,
+    mrope_section: tuple = (),
 ):
     kernel = _rotary_apply_kernel(
         rotary_dim,
@@ -351,9 +495,22 @@ def _compiled_rotary_apply(
     if kernel is None:
         return None
 
+    section = list(mrope_section) if mrope_section else None
+
     @mx.compile
     def apply(q, k, cos, sin, position_selector):
-        return _fast_rotary_apply(kernel, q, k, cos, sin, position_selector)
+        return _fast_rotary_apply(
+            kernel,
+            q,
+            k,
+            cos,
+            sin,
+            position_selector,
+            pairing=pairing,
+            cos_layout=cos_layout,
+            sectioned=sectioned,
+            mrope_section=section,
+        )
 
     return apply
 
@@ -373,6 +530,7 @@ def _compiled_mrope_apply(rotary_dim: int, position_ndim: int, pairing: str):
             position_ids,
             inv_freq,
             position_selector,
+            pairing,
         )
 
     return apply
@@ -770,6 +928,7 @@ def _maybe_fast_precomputed_rotary(
         cos.ndim,
         sectioned,
         cos_layout,
+        tuple(mrope_section) if sectioned else (),
     )
     if compiled_apply is None:
         return None
