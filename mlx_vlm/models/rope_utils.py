@@ -445,9 +445,6 @@ def _fast_rotary_apply(
         )
         return out
 
-    # As with _fast_mrope_apply: the CustomKernel has no VJP, so wrap the forward
-    # in a custom_function whose vjp routes through the pure-MLX equivalent.
-    # cos/sin are position constants (zero cotangent); q/k are differentiated.
     @mx.custom_function
     def apply(q, k, cos, sin):
         return apply_one(q), apply_one(k)
