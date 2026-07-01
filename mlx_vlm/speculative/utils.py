@@ -17,6 +17,7 @@ from .dflash import (
     _dflash_rounds,
     _dflash_rounds_batch,
 )
+from .dspark import _dspark_rounds, _dspark_rounds_batch
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
 from .mtp import (
     _buffer_mtp_target_cache,
@@ -75,8 +76,11 @@ def get_speculative_rounds_batch(draft_kind: str):
         return _mtp_rounds_batch
     if draft_kind == "dflash":
         return _dflash_rounds_batch
+    if draft_kind == "dspark":
+        return _dspark_rounds_batch
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. "
+        "Supported: ['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
@@ -85,20 +89,22 @@ def speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
         return {"return_hidden": True, "return_shared_kv": True}
     if draft_kind == "eagle3":
         return {"capture_layer_ids": _eagle3_capture_layer_ids(drafter)}
-    if draft_kind == "dflash":
+    if draft_kind in ("dflash", "dspark"):
         return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. "
+        "Supported: ['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
 def speculative_hidden_state(draft_kind: str, outputs):
     if draft_kind == "mtp":
         return outputs.hidden_states[-1]
-    if draft_kind in ("dflash", "eagle3"):
+    if draft_kind in ("dflash", "dspark", "eagle3"):
         return mx.concatenate(outputs.hidden_states, axis=-1)
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. "
+        "Supported: ['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
@@ -192,8 +198,11 @@ def run_speculative_server_rounds(
         )
         return
 
-    if draft_kind == "dflash":
-        yield from _dflash_rounds_batch(
+    if draft_kind in ("dflash", "dspark"):
+        rounds_batch = (
+            _dspark_rounds_batch if draft_kind == "dspark" else _dflash_rounds_batch
+        )
+        yield from rounds_batch(
             model,
             draft_model,
             prompt_cache,
@@ -208,7 +217,8 @@ def run_speculative_server_rounds(
         return
 
     raise ValueError(
-        f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+        f"Unknown draft_kind {draft_kind!r}. "
+        "Supported: ['dflash', 'dspark', 'eagle3', 'mtp']"
     )
 
 
@@ -326,17 +336,22 @@ def run_speculative_rounds(
             )
         return
 
-    if draft_kind != "dflash":
+    if draft_kind not in ("dflash", "dspark"):
         raise ValueError(
-            f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
+            f"Unknown draft_kind {draft_kind!r}. "
+            "Supported: ['dflash', 'dspark', 'eagle3', 'mtp']"
         )
 
+    rounds = _dspark_rounds if draft_kind == "dspark" else _dflash_rounds
+    rounds_batch = (
+        _dspark_rounds_batch if draft_kind == "dspark" else _dflash_rounds_batch
+    )
     hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
     if B == 1:
         mx.eval(first_token)
         bonus = first_token.item()
         yield bonus, logprobs
-        yield from _dflash_rounds(
+        yield from rounds(
             model,
             draft_model,
             prompt_cache,
@@ -351,7 +366,7 @@ def run_speculative_rounds(
         mx.eval(first_token)
         first_bonus = first_token.squeeze(-1)
         yield first_bonus.tolist(), logprobs
-        yield from _dflash_rounds_batch(
+        yield from rounds_batch(
             model,
             draft_model,
             prompt_cache,

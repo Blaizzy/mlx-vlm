@@ -173,8 +173,9 @@ def main():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
+        choices=["dflash", "dspark", "eagle3", "mtp"],
+        help="Drafter family -- 'dflash', 'dspark' (DeepSeek-V4 "
+        "self-speculative), 'eagle3', or 'mtp' (Gemma 4). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
@@ -182,6 +183,14 @@ def main():
         type=int,
         default=None,
         help="Override the drafter's configured block size.",
+    )
+    parser.add_argument(
+        "--draft-confidence-threshold",
+        type=float,
+        default=None,
+        help="DSpark only: truncate the draft block where the confidence head's "
+        "P(accept) drops below this threshold (0 = off, lossless either way). "
+        "Maps to the MLX_VLM_DRAFT_CONFIDENCE_THRESHOLD env var.",
     )
     parser.add_argument(
         "--top-logprobs-k",
@@ -235,6 +244,10 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.draft_confidence_threshold is not None:
+        os.environ["MLX_VLM_DRAFT_CONFIDENCE_THRESHOLD"] = str(
+            args.draft_confidence_threshold
+        )
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
