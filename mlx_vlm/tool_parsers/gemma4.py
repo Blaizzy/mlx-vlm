@@ -152,7 +152,7 @@ def parse_tool_call(text, tools=None):
     )
     if text.startswith(":"):
         text = f"call{text}"
-    elif not text.startswith("call:") and re.match(r"^[\w-]+\{", text):
+    elif not text.startswith("call:") and re.match(r"^[\w.:-]+\{", text):
         text = f"call:{text}"
 
     # Try recursive-group regex first for well-formed calls
