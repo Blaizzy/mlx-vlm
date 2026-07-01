@@ -716,6 +716,20 @@ def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
     )
 
 
+def _restore_batch_padding_metadata(cache_entry, offsets, steps: int):
+    if offsets is None:
+        return cache_entry
+    if not (
+        hasattr(cache_entry, "offset")
+        and hasattr(cache_entry, "left_padding")
+        and hasattr(cache_entry, "_idx")
+    ):
+        return cache_entry
+    cache_entry.offset = offsets + steps
+    cache_entry.left_padding = cache_entry._idx - cache_entry.offset
+    return cache_entry
+
+
 def _qwen3_5_left_padding_info(cache):
     left_padding = getattr(cache, "left_padding", None)
     if not (
@@ -1852,8 +1866,31 @@ class Qwen3_5Model(nn.Module):
             if has_left_padding or int(query_left_padding.max().item()) > 0:
                 row_outputs = []
                 row_caches = [[] for _ in cache]
+                batch_offsets = []
+                for cache_entry in cache:
+                    offsets = getattr(cache_entry, "offset", None)
+                    if (
+                        isinstance(offsets, mx.array)
+                        and offsets.ndim > 0
+                        and offsets.size >= h.shape[0]
+                    ):
+                        batch_offsets.append(offsets[: h.shape[0]])
+                    else:
+                        batch_offsets.append(None)
                 for row, pad in enumerate(query_left_padding.tolist()):
                     pad = min(max(int(pad), 0), h.shape[1])
+                    current_cache = []
+                    for cache_entry in cache:
+                        if cache_entry is None:
+                            current_cache.append(None)
+                        else:
+                            current_cache.append(_extract_row_cache(cache_entry, row))
+                    if pad == h.shape[1]:
+                        row_outputs.append(mx.zeros_like(h[row : row + 1]))
+                        for i, cache_entry in enumerate(current_cache):
+                            row_caches[i].append(cache_entry)
+                        continue
+
                     row_inputs = inputs[row : row + 1, pad:]
                     row_embeds = h[row : row + 1, pad:]
                     row_position_ids = None
@@ -1862,12 +1899,6 @@ class Qwen3_5Model(nn.Module):
                             row_position_ids = position_ids[row : row + 1, pad:]
                         else:
                             row_position_ids = position_ids[:, row : row + 1, pad:]
-                    current_cache = []
-                    for cache_entry in cache:
-                        if cache_entry is None:
-                            current_cache.append(None)
-                        else:
-                            current_cache.append(_extract_row_cache(cache_entry, row))
 
                     row_out = self(
                         row_inputs,
@@ -1885,7 +1916,11 @@ class Qwen3_5Model(nn.Module):
                     if cache[i] is None:
                         continue
                     if hasattr(cache[i].__class__, "merge"):
-                        cache[i] = cache[i].__class__.merge(entries)
+                        cache[i] = _restore_batch_padding_metadata(
+                            cache[i].__class__.merge(entries),
+                            batch_offsets[i],
+                            h.shape[1],
+                        )
                 return mx.concatenate(row_outputs, axis=0)
 
         fa_mask = _create_qwen3_5_attention_mask(h, cache[self.fa_idx])
