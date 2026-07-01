@@ -2913,11 +2913,12 @@ def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
         float sq = val * val;
         float sg_sum = simd_sum(sq);
 
-        threadgroup float sg_norms[8];
+        constexpr int n_sg = (Dim + 31) / 32;
+        threadgroup float sg_norms[32];
         if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        float total_sq = (sg_id == 0 && sg_lid < n_sg) ? sg_norms[sg_lid] : 0.0f;
         total_sq = simd_sum(total_sq);
         // Broadcast norm to all threads
         if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;
@@ -4106,6 +4107,21 @@ def _filter_state(state, batch_indices: mx.array):
     return _map_state(state, lambda a, ndim: a[batch_indices])
 
 
+def _zero_state_row_tail(state, batch_index: int, start: int, end: int):
+    """Zero a single batch row over the token range [start, end)."""
+    if state is None or start >= end:
+        return state
+
+    def _zero(a, ndim):
+        if ndim == 3:
+            a[batch_index, :, start:end] = 0
+        else:
+            a[batch_index, :, start:end, :] = 0
+        return a
+
+    return _map_state(state, _zero)
+
+
 def _pad_state_tokens(state, left: int, right: int):
     """Pad along the token dimension (index 2)."""
     if left == 0 and right == 0:
@@ -4204,8 +4220,7 @@ class _TurboQuantMSECodec:
         return self._rotate_inverse(rotated)
 
     def quantize(self, vectors: mx.array) -> TurboQuantMSEState:
-        # Fast path for single-token decode: Hadamard rotation + fused quantize
-        if vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht:
+        if self.bits > 0:
             D = self.dim
             flat = vectors.reshape(-1, D).astype(mx.float32)
             BH = flat.shape[0]
@@ -6062,6 +6077,12 @@ class TurboQuantKVCache(_BaseCache):
         self._cached_state_offset = -1
         return n
 
+    def zero_row_tail(self, batch_index: int, start: int, end: int):
+        self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
+        self.values = _zero_state_row_tail(self.values, batch_index, start, end)
+        self._cached_state = None
+        self._cached_state_offset = -1
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
@@ -6159,6 +6180,22 @@ class BatchTurboQuantKVCache(_BaseCache):
             _QuantizedStateProxy(vs, self._idx, n_heads),
         )
 
+    def zero_row_tail(self, bi: int, start: int, end: int):
+        if start >= end:
+            return
+
+        def _z(arr, ndim):
+            if ndim == 3:
+                arr[bi, :, start:end] = 0
+            else:
+                arr[bi, :, start:end, :] = 0
+            return arr
+
+        if self.keys is not None:
+            self.keys = _map_state(self.keys, _z)
+        if self.values is not None:
+            self.values = _map_state(self.values, _z)
+
     # ------------------------------------------------------------------
     # Batch operations for Batch.filter / Batch.extend
     # ------------------------------------------------------------------
@@ -6183,6 +6220,10 @@ class BatchTurboQuantKVCache(_BaseCache):
                 self.values = _map_state(self.values, _trim)
             self._idx -= min_lp
             self.left_padding -= min_lp
+
+    def zero_row_tail(self, batch_index: int, start: int, end: int):
+        self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
+        self.values = _zero_state_row_tail(self.values, batch_index, start, end)
 
     def extend(self, other: "BatchTurboQuantKVCache"):
         if self.keys is None and other.keys is None:
@@ -6280,10 +6321,13 @@ class BatchTurboQuantKVCache(_BaseCache):
         self.seed = int(v[2])
 
     def is_trimmable(self):
-        return False
+        return True
 
     def trim(self, n):
-        return 0
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
 
     def empty(self):
         return self.keys is None

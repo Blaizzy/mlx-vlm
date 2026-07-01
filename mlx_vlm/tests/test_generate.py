@@ -945,6 +945,37 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
 
+    def test_generation_batch_extend_discards_inactive_stale_processor_state(self):
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        finished_structured = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[None],
+        )
+        plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        finished_structured.extend(plain)
+
+        assert finished_structured.token_context == []
+        assert finished_structured.logits_processors == []
+        finished_structured.filter([1])
+        assert finished_structured.uids == [1]
+
     def test_generation_batch_extend_promotes_singleton_kv_cache(self):
         def make_kv_cache(value):
             c = KVCache()
@@ -1956,7 +1987,8 @@ def test_generate_cli_smoke(capsys):
         quantize_activations=False,
         processor_kwargs={},
         prefill_step_size=128,
-        enable_thinking=False,
+        enable_thinking=True,
+        thinking_mode=None,
         thinking_budget=None,
         thinking_start_token="<think>",
         thinking_end_token="</think>",
@@ -1981,8 +2013,10 @@ def test_generate_cli_smoke(capsys):
     ):
         dispatch_module.main()
 
-    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
-    assert mock_generate.call_args.kwargs["enable_thinking"] is False
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_apply_chat_template.call_args.kwargs
+    assert mock_generate.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_generate.call_args.kwargs
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128

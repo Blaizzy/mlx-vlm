@@ -261,8 +261,12 @@ def parse_arguments():
     parser.add_argument(
         "--diffusion-sampler",
         choices=["entropy-bound", "confidence-threshold"],
-        default="entropy-bound",
-        help="Canvas update sampler for diffusion generation.",
+        default="confidence-threshold",
+        help=(
+            "Canvas update sampler for diffusion generation. Use entropy-bound "
+            "for reference-style denoising; confidence-threshold is faster for "
+            "quantized block-diffusion checkpoints."
+        ),
     )
     parser.add_argument(
         "--threshold",
@@ -270,8 +274,9 @@ def parse_arguments():
         default=None,
         help=(
             "Token probability threshold for diffusion confidence transfer. "
-            "Default: 0.9 for confidence-threshold sampling; masked-diffusion "
-            "models use their checkpoint reference defaults."
+            f"Default: {DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD:g} for "
+            "confidence-threshold sampling; "
+            "masked-diffusion models use their checkpoint reference defaults."
         ),
     )
     parser.add_argument(
@@ -443,7 +448,19 @@ def parse_arguments():
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
-        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+        help=(
+            "Enable thinking in the chat template. Templates that use "
+            "thinking_mode receive thinking_mode='enabled'."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        choices=("enabled", "disabled", "adaptive"),
+        default=None,
+        help=(
+            "Set the chat-template thinking mode when supported. "
+            "Choices: enabled, disabled, adaptive."
+        ),
     )
     parser.add_argument(
         "--thinking-budget",
@@ -623,6 +640,7 @@ class PromptCacheState:
 
 from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
+    DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
@@ -1401,7 +1419,7 @@ def main():
         "diffusion_full_canvas": False,
         "diffusion_min_canvas_length": None,
         "diffusion_max_canvas_length": None,
-        "diffusion_sampler": "entropy-bound",
+        "diffusion_sampler": "confidence-threshold",
         "threshold": None,
         "min_threshold": None,
         "block_length": None,
@@ -1469,6 +1487,8 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.thinking_mode is not None:
+        chat_template_kwargs["thinking_mode"] = args.thinking_mode
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps

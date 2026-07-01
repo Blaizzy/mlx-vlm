@@ -738,6 +738,10 @@ def _make_cache(
         )
 
     def to_batch_cache(c, quantize=True):
+        # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
+        # index-key side cache) know how to build the correct batch cache.
+        if hasattr(c, "to_batch") and not isinstance(c, cache.KVCache):
+            return c.to_batch(left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
@@ -1101,6 +1105,11 @@ class GenerationBatch:
         if self_has_processors or other_has_processors:
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
+        else:
+            self.token_context = []
+            other.token_context = []
+            self.logits_processors = []
+            other.logits_processors = []
 
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
@@ -2101,7 +2110,6 @@ class BatchGenerator:
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
         if self.draft_model is not None:
-            apc_manager = None
             compute_logprobs = False
             top_logprobs_k = 0
             self.compute_logprobs = False

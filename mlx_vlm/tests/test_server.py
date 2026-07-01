@@ -1548,6 +1548,37 @@ def test_responses_endpoint_returns_function_call_items(client):
     )
 
 
+def test_responses_endpoint_returns_reasoning_items(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="<think>Check briefly.</think>\n\nDone.",
+        prompt_tokens=8,
+        generation_tokens=4,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/responses", json={"model": "demo", "input": "hello"}
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item["type"] for item in payload["output"]] == ["reasoning", "message"]
+    assert payload["output"][0]["summary"][0]["text"] == "Check briefly."
+    assert payload["output"][1]["content"][0]["text"] == "Done."
+    assert payload["output_text"] == "Done."
+
+
 def test_responses_endpoint_returns_native_shell_call_items(client):
     server.response_store.clear()
     server.response_store_order.clear()
@@ -1587,6 +1618,21 @@ def test_responses_endpoint_returns_native_shell_call_items(client):
     payload = response.json()
     assert payload["output"][0]["type"] == "shell_call"
     assert payload["output"][0]["action"] == {"type": "exec", "command": "pwd"}
+
+
+def _sse_events(body):
+    events = []
+    for block in body.split("\n\n"):
+        event_type = None
+        data = None
+        for line in block.splitlines():
+            if line.startswith("event: "):
+                event_type = line.removeprefix("event: ")
+            elif line.startswith("data: "):
+                data = json.loads(line.removeprefix("data: "))
+        if event_type and data:
+            events.append((event_type, data))
+    return events
 
 
 def test_responses_streaming_emits_native_tool_call_items(client):
@@ -1636,6 +1682,121 @@ def test_responses_streaming_emits_native_tool_call_items(client):
     assert '"type": "shell_call"' in body
     assert '"command": "pwd"' in body
     assert "<tool_call>" not in body
+
+
+def test_responses_streaming_emits_reasoning_events(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        GenerationResult(text="<think>Check", prompt_tokens=8, generation_tokens=1),
+        GenerationResult(
+            text=" briefly.</think>\n\nDone.",
+            prompt_tokens=8,
+            generation_tokens=4,
+            finish_reason="stop",
+        ),
+    ]
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+        patch.object(server.runtime, "response_generator", None),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "demo", "input": "hello", "stream": True},
+        )
+
+    assert response.status_code == 200
+    events = _sse_events(response.text)
+    reasoning = [
+        data["delta"]
+        for event_type, data in events
+        if event_type == "response.reasoning_text.delta"
+    ]
+    text_deltas = [
+        data["delta"]
+        for event_type, data in events
+        if event_type == "response.output_text.delta"
+    ]
+    completed = next(
+        data["response"]
+        for event_type, data in events
+        if event_type == "response.completed"
+    )
+
+    assert "".join(reasoning) == "Check briefly."
+    assert "".join(text_deltas) == "Done."
+    assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
+    assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
+    assert completed["output_text"] == "Done."
+
+
+def test_responses_streaming_emits_function_call_arguments_done(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    chunks = [
+        GenerationResult(
+            text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+            prompt_tokens=8,
+            generation_tokens=4,
+            finish_reason="stop",
+        )
+    ]
+    tool_module = SimpleNamespace(
+        tool_call_start="<tool_call>",
+        tool_call_end="</tool_call>",
+        parse_tool_call=lambda call, tools: json.loads(call),
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
+        patch.object(server, "load_tool_module", return_value=tool_module),
+        patch.object(server.runtime, "response_generator", None),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "demo",
+                "input": "weather?",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    events = _sse_events(response.text)
+    done = next(
+        data
+        for event_type, data in events
+        if event_type == "response.function_call_arguments.done"
+    )
+    assert done["item_id"].startswith("fc_")
+    assert done["name"] == "get_weather"
+    assert done["arguments"] == '{"location": "SF"}'
 
 
 @pytest.mark.parametrize(

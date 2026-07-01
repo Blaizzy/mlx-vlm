@@ -427,6 +427,10 @@ class LanguageModel(nn.Module):
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()
                 padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
@@ -559,6 +563,9 @@ class LanguageModel(nn.Module):
         visual_pos_masks = kwargs.get("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
+
+        if position_ids is not None:
+            mx.eval(position_ids)
 
         out = self.model(
             inputs,
