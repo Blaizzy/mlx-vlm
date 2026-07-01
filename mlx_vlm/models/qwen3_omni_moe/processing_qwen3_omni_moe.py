@@ -14,7 +14,14 @@ from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import TextInput
 
-from ..base import to_mlx
+from ..base import install_auto_processor_patch, load_chat_template, to_mlx
+from ..qwen3_vl.processing_qwen3_vl import (
+    Qwen3VLImageProcessor,
+    Qwen3VLVideoProcessor,
+    _load_qwen_vl_json,
+    _qwen_vl_image_kwargs,
+    _qwen_vl_video_kwargs,
+)
 
 
 def _get_feat_extract_output_lengths(input_lengths):
@@ -38,7 +45,12 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
     ]
     valid_kwargs = ["chat_template"]
     image_processor_class = "AutoImageProcessor"
+    video_processor_class = "AutoVideoProcessor"
+    feature_extractor_class = "AutoFeatureExtractor"
     tokenizer_class = "AutoTokenizer"
+
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
 
     def __init__(
         self,
@@ -294,5 +306,50 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
             )
         )
 
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from transformers import AutoFeatureExtractor, AutoTokenizer
+
+        kwargs.pop("use_fast", None)
+        tokenizer = AutoTokenizer.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        load_chat_template(tokenizer, pretrained_model_name_or_path)
+
+        feature_extractor = AutoFeatureExtractor.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
+        image_processor = Qwen3VLImageProcessor(
+            **_qwen_vl_image_kwargs(
+                pretrained_model_name_or_path, default_patch_size=16
+            )
+        )
+        video_processor = Qwen3VLVideoProcessor(
+            **_qwen_vl_video_kwargs(
+                pretrained_model_name_or_path, default_patch_size=16
+            )
+        )
+
+        proc_cfg = (
+            _load_qwen_vl_json(pretrained_model_name_or_path, "processor_config.json")
+            or _load_qwen_vl_json(
+                pretrained_model_name_or_path, "preprocessor_config.json"
+            )
+            or {}
+        )
+        chat_template = proc_cfg.get(
+            "chat_template", getattr(tokenizer, "chat_template", None)
+        )
+
+        return cls(
+            image_processor=image_processor,
+            video_processor=video_processor,
+            feature_extractor=feature_extractor,
+            tokenizer=tokenizer,
+            chat_template=chat_template,
+        )
+
 
 __all__ = ["Qwen3OmniMoeProcessor"]
+
+install_auto_processor_patch("qwen3_omni_moe", Qwen3OmniMoeProcessor)
