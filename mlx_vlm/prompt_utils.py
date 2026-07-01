@@ -78,6 +78,7 @@ MODEL_CONFIG = {
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
+    "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -102,6 +103,7 @@ MODEL_CONFIG = {
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.TEXT_ONLY,
     "hrm_text": MessageFormat.TEXT_ONLY,
+    "minimax_m3": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -270,6 +272,7 @@ class MessageFormatter:
             "gemma4",
             "gemma4_unified",
             "minicpmv4_6",
+            "minimax_m3_vl",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, role, **kwargs)
 
@@ -680,6 +683,26 @@ def get_chat_template(
             for parameter in signature.parameters.values()
         )
 
+    def _template_references_kw(template_processor: Any, name: str) -> bool:
+        templates = [
+            chat_template_override,
+            getattr(template_processor, "chat_template", None),
+            getattr(
+                getattr(template_processor, "tokenizer", None),
+                "chat_template",
+                None,
+            ),
+        ]
+
+        for template in templates:
+            if isinstance(template, str) and name in template:
+                return True
+            if isinstance(template, dict) and any(
+                isinstance(value, str) and name in value for value in template.values()
+            ):
+                return True
+        return False
+
     try:
         template_processor = None
         if (
@@ -717,6 +740,12 @@ def get_chat_template(
             template_processor, "enable_thinking"
         ):
             template_kwargs["enable_thinking"] = False
+        if (
+            "thinking_mode" not in template_kwargs
+            and template_kwargs.get("enable_thinking") is True
+            and _template_references_kw(template_processor, "thinking_mode")
+        ):
+            template_kwargs["thinking_mode"] = "enabled"
 
         try:
             return template_processor.apply_chat_template(
