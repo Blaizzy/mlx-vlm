@@ -564,9 +564,6 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
 
-        # `generate_step` only force-evals the sampled token/logprobs, so lazy mRoPE
-        # `position_ids` can survive across calls and be reused with stale values.
-        # `position_ids` is small (3 x batch x seq_len), so materialize it before forward.
         if position_ids is not None:
             mx.eval(position_ids)
 
