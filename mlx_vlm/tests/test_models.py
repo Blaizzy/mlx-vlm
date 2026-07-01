@@ -7000,7 +7000,7 @@ class TestMRoPETrainingVJP(unittest.TestCase):
     def _grads(self, fn, q, k):
         return mx.value_and_grad(self._sum_loss(fn), argnums=(0, 1))(q, k)
 
-    def test_fused_apply_rotary_vjp_matches_pure_mlx(self):
+    def test_fused_apply_rotary_vjp(self):
         """Fused MRoPE apply (``MRoPERotaryEmbedding.apply_rotary``) is
         differentiable and matches the known-good pure-MLX gradient."""
         from mlx_vlm.models import rope_utils
