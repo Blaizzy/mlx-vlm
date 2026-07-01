@@ -701,6 +701,15 @@ class GenerationContext:
 
 
 @dataclass
+class _PrefillProgress:
+    """Private queue heartbeat emitted while a long prompt is being prefilled."""
+
+    uid: int
+    prompt_tps: Optional[float] = None
+    cached_tokens: int = 0
+
+
+@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -807,31 +816,34 @@ class _TokenIterator:
     def __next__(self):
         if self._ended:
             raise StopIteration
-        try:
-            item = self._rqueue.get(timeout=self._queue_timeout)
-        except QueueEmpty as exc:
-            # Consumer is stalled or upstream is wedged — treat as cancel.
-            self.close()
-            label = (
-                "without a timeout"
-                if self._queue_timeout is None
-                else f"for {self._queue_timeout:g}s"
-            )
-            raise RuntimeError(
-                "Timed out waiting "
-                f"{label} for the next generated token. "
-                "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
-                "prefills, or reduce the prompt size."
-            ) from exc
-        if item is None:
-            self._ended = True
-            raise StopIteration
-        if isinstance(item, Exception):
-            self._ended = True
-            raise item
-        if getattr(item, "finish_reason", None):
-            self._ended = True
-        return item
+        while True:
+            try:
+                item = self._rqueue.get(timeout=self._queue_timeout)
+            except QueueEmpty as exc:
+                # Consumer is stalled or upstream is wedged — treat as cancel.
+                self.close()
+                label = (
+                    "without a timeout"
+                    if self._queue_timeout is None
+                    else f"for {self._queue_timeout:g}s"
+                )
+                raise RuntimeError(
+                    "Timed out waiting "
+                    f"{label} for the next generated token. "
+                    "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
+                    "prefills, or reduce the prompt size."
+                ) from exc
+            if isinstance(item, _PrefillProgress):
+                continue
+            if item is None:
+                self._ended = True
+                raise StopIteration
+            if isinstance(item, Exception):
+                self._ended = True
+                raise item
+            if getattr(item, "finish_reason", None):
+                self._ended = True
+            return item
 
     def close(self):
         with self._lock:
@@ -1820,12 +1832,20 @@ class ResponseGenerator:
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
         prompt_responses, responses = batch_gen.next(**kwargs)
+        emit_prefill_progress = not responses
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
-                active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
-                active[prompt_response.uid]["cached_tokens"] = getattr(
-                    prompt_response, "cached_tokens", 0
-                )
+                info = active[prompt_response.uid]
+                info["prompt_tps"] = prompt_response.prompt_tps
+                info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
+                if emit_prefill_progress:
+                    info["rqueue"].put(
+                        _PrefillProgress(
+                            uid=prompt_response.uid,
+                            prompt_tps=prompt_response.prompt_tps,
+                            cached_tokens=info["cached_tokens"],
+                        )
+                    )
         if not responses:
             return
 
