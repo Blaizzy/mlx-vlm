@@ -232,7 +232,7 @@ def _fast_mrope_apply(
         q, k, position_ids, inv_freq, position_selector = primals
         _, (dq, dk) = mx.vjp(
             lambda q, k: list(
-                _mrope_apply_mlx(
+                _mrope_apply(
                     q, k, position_ids, inv_freq, position_selector, pairing
                 )
             ),
@@ -454,7 +454,7 @@ def _fast_rotary_apply(
         q, k, cos, sin = primals
         _, (dq, dk) = mx.vjp(
             lambda q, k: list(
-                _precomputed_rotary_mlx(
+                _precomputed_rotary(
                     q,
                     k,
                     cos,
