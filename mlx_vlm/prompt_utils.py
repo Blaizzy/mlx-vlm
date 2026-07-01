@@ -19,6 +19,7 @@ class MessageFormat(Enum):
     IMAGE_PATCH_TOKEN = "image_patch_token"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
+    SINGLE_IMAGE_TOKEN = "single_image_token"
     IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
@@ -89,6 +90,7 @@ MODEL_CONFIG = {
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr_2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "unlimited-ocr": MessageFormat.SINGLE_IMAGE_TOKEN,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -309,6 +311,9 @@ class MessageFormatter:
             MessageFormat.IMAGE_TOKEN_NEWLINE: partial(
                 self._format_with_token, token="<image>\n"
             ),
+            MessageFormat.SINGLE_IMAGE_TOKEN: partial(
+                self._format_with_token, token="<image>", repeat_image_token=False
+            ),
             MessageFormat.IMAGE_TOKEN_WRAPPED: partial(
                 self._format_with_token, token="(<image>./</image>)\n"
             ),
@@ -426,13 +431,14 @@ class MessageFormatter:
         num_audios: int,
         token: str,
         image_first: bool = True,
+        repeat_image_token: bool = True,
         **kwargs,
     ) -> Dict[str, Any]:
         """Format with image tokens in the text."""
         content = prompt
 
         if role == "user" and not skip_image_token and num_images > 0:
-            prefix = token * num_images
+            prefix = token * num_images if repeat_image_token else token
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
         if role == "user" and not skip_audio_token and num_audios > 0:
