@@ -3669,6 +3669,75 @@ class TestModels(unittest.TestCase):
 
         # TODO: Add test for vision model. Ensure I can pass input type and shapes.
 
+    def test_unlimited_ocr(self):
+        from mlx_vlm.models import unlimited_ocr
+
+        text_config = unlimited_ocr.TextConfig(
+            model_type="deepseek_v2",
+            hidden_size=16,
+            num_hidden_layers=1,
+            intermediate_size=32,
+            num_attention_heads=2,
+            vocab_size=32,
+            num_key_value_heads=2,
+            kv_lora_rank=None,
+            q_lora_rank=None,
+            qk_rope_head_dim=0,
+            v_head_dim=8,
+            qk_nope_head_dim=0,
+            moe_intermediate_size=16,
+            n_shared_experts=1,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+        )
+        vision_config = unlimited_ocr.VisionConfig(
+            model_type="vision",
+            layers=1,
+            width=16,
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+        )
+        projector_config = unlimited_ocr.ProjectorConfig(
+            projector_type="linear",
+            input_dim=16,
+            n_embed=16,
+        )
+        config = unlimited_ocr.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            model_type="unlimited-ocr",
+        )
+        model = unlimited_ocr.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.random.uniform(
+            shape=(
+                1,
+                config.vision_config.image_size,
+                config.vision_config.image_size,
+                config.vision_config.num_channels,
+            ),
+            dtype=mx.float32,
+        )
+        vision_features = model.vision_model(pixel_values)
+        self.assertEqual(vision_features.shape[0], 1)
+        self.assertEqual(vision_features.shape[-1], config.vision_config.hidden_size)
+
+        projector_input = mx.random.uniform(
+            shape=(1, 4, config.projector_config.input_dim),
+            dtype=mx.float32,
+        )
+        projected = model.projector(projector_input)
+        self.assertEqual(projected.shape, (1, 4, config.projector_config.n_embed))
+
     def test_jina_vlm(self):
         from mlx_vlm.models import jina_vlm
 
@@ -5407,6 +5476,47 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "deepseekocr")
+
+    def test_unlimited_ocr_input_embeddings(self):
+        from mlx_vlm.models import unlimited_ocr
+
+        model = unlimited_ocr.Model(
+            unlimited_ocr.ModelConfig(
+                text_config=unlimited_ocr.TextConfig(
+                    model_type="deepseek_v2",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    kv_lora_rank=None,
+                    q_lora_rank=None,
+                    qk_rope_head_dim=0,
+                    v_head_dim=8,
+                    qk_nope_head_dim=0,
+                    moe_intermediate_size=16,
+                    n_shared_experts=1,
+                    n_routed_experts=2,
+                    num_experts_per_tok=1,
+                ),
+                vision_config=unlimited_ocr.VisionConfig(
+                    model_type="vision",
+                    layers=1,
+                    width=16,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                ),
+                projector_config=unlimited_ocr.ProjectorConfig(
+                    projector_type="linear",
+                    input_dim=16,
+                    n_embed=16,
+                ),
+                model_type="unlimited-ocr",
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "unlimited_ocr")
 
     def test_falcon_ocr_input_embeddings(self):
         from mlx_vlm.models import falcon_ocr
