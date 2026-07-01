@@ -185,7 +185,7 @@ def _mrope_apply_cos_sin(x, position_ids, inv_freq, position_selector, pairing):
     return cos, sin, half_dim
 
 
-def _mrope_apply_mlx(q, k, position_ids, inv_freq, position_selector, pairing):
+def _mrope_apply(q, k, position_ids, inv_freq, position_selector, pairing):
     """Differentiable pure-MLX equivalent of the fused MRoPE kernel apply."""
     cos, sin, _ = _mrope_apply_cos_sin(
         q, position_ids, inv_freq, position_selector, pairing
