@@ -68,15 +68,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image"),
+        choices=("text", "image", "audio"),
         default="text",
-        help="Generate text with a VLM or generate an image with a supported image model.",
+        help=(
+            "Generate text with a VLM, an image with a supported image model, "
+            "or audio with a supported omni model."
+        ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image generation.",
+        help="Output path for image or audio generation.",
     )
     parser.add_argument(
         "--task",
@@ -480,6 +483,12 @@ def parse_arguments():
         default=DEFAULT_THINKING_END_TOKEN,
         help="Token that marks the end of a thinking block (default: %(default)s).",
     )
+    parser.add_argument(
+        "--ref-audio",
+        type=str,
+        default=None,
+        help="Reference / prompt audio for audio generation.",
+    )
 
     return parser.parse_args()
 
@@ -497,6 +506,53 @@ def normalize_resize_shape(
     ):
         raise ValueError("resize_shape must contain 1 or 2 integers")
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
+
+
+def _add_special_tokens_for_model(model: nn.Module, processor: PreTrainedTokenizer):
+    return (
+        getattr(processor, "chat_template", None) is None
+        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
+        else True
+    )
+
+
+def _prepare_generation_inputs(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    prompt: str,
+    image: Union[str, List[str]],
+    audio: Union[str, List[str]],
+    video: Union[str, List[str]],
+    kwargs: Dict[str, Any],
+):
+    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
+    image_token_index = getattr(model.config, "image_token_index", None)
+    inputs = prepare_inputs(
+        processor,
+        images=image,
+        audio=audio,
+        videos=video,
+        prompts=prompt,
+        image_token_index=image_token_index,
+        resize_shape=resize_shape,
+        add_special_tokens=_add_special_tokens_for_model(model, processor),
+        **kwargs,
+    )
+    input_ids = inputs.get("input_ids", None)
+    pixel_values = inputs.get("pixel_values", None)
+    mask = inputs.get("attention_mask", None)
+    data_kwargs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+    kwargs.update(data_kwargs)
+    return input_ids, pixel_values, mask, data_kwargs
+
+
+def _response_token_to_int(token) -> int:
+    token_value = token.item() if hasattr(token, "item") else token
+    return int(token_value)
 
 
 # A stream on the default device just for generation
@@ -638,7 +694,12 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import (
+    AudioGenerationResult,
+    GenerationResult,
+    generation_stream,
+    wired_limit,
+)
 from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -759,14 +820,6 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-        else True
-    )
-
-    resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
-    image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
@@ -780,26 +833,15 @@ def stream_generate(
         pixel_values = kwargs.pop("pixel_values", None)
         mask = kwargs.pop("mask", None)
     else:
-        inputs = prepare_inputs(
+        input_ids, pixel_values, mask, _ = _prepare_generation_inputs(
+            model,
             processor,
-            images=image,
-            audio=audio,
-            videos=video,
-            prompts=prompt,
-            image_token_index=image_token_index,
-            resize_shape=resize_shape,
-            add_special_tokens=add_special_tokens,
-            **kwargs,
+            prompt,
+            image,
+            audio,
+            video,
+            kwargs,
         )
-        input_ids = inputs.get("input_ids", None)
-        pixel_values = inputs.get("pixel_values", None)
-        mask = inputs.get("attention_mask", None)
-        data_kwargs = {
-            k: v
-            for k, v in inputs.items()
-            if k not in ["input_ids", "pixel_values", "attention_mask"]
-        }
-        kwargs.update(data_kwargs)
 
     if _use_masked_diffusion_text_path(model, kwargs):
         if image is not None or audio is not None or video is not None:
@@ -1324,6 +1366,7 @@ def generate(
 
     text = ""
     last_response = None
+    generated_token_ids: List[int] = []
 
     eos_tokens = kwargs.get("eos_tokens", None)
     stopping_criteria = kwargs.get("stopping_criteria", None)
@@ -1358,6 +1401,12 @@ def generate(
             continue
 
         if (
+            response.token is not None
+            and response.generation_tokens == len(generated_token_ids) + 1
+        ):
+            generated_token_ids.append(_response_token_to_int(response.token))
+
+        if (
             verbose
             and not response.text_already_printed
             and not diffusion_output.handle_text(response.text)
@@ -1367,7 +1416,11 @@ def generate(
         last_response = response
 
     if last_response is None:
-        return GenerationResult(text=text, peak_memory=mx.get_peak_memory() / 1e9)
+        return GenerationResult(
+            text=text,
+            token_ids=generated_token_ids,
+            peak_memory=mx.get_peak_memory() / 1e9,
+        )
 
     if verbose:
         diffusion_output.finish(text)
@@ -1387,6 +1440,7 @@ def generate(
     return GenerationResult(
         text=text,
         token=last_response.token,
+        token_ids=generated_token_ids,
         logprobs=last_response.logprobs,
         prompt_tokens=last_response.prompt_tokens,
         generation_tokens=last_response.generation_tokens,
@@ -1404,12 +1458,109 @@ def generate(
     )
 
 
+def generate_audio(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    prompt: str,
+    image: Union[str, List[str]] = None,
+    audio: Union[str, List[str]] = None,
+    video: Union[str, List[str]] = None,
+    verbose: bool = False,
+    output_audio_path: Optional[str] = None,
+    ref_audio_path: Optional[str] = None,
+    **kwargs,
+) -> AudioGenerationResult:
+    if not hasattr(model, "generate_audio"):
+        raise ValueError(f"{type(model).__name__} does not support audio generation.")
+
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    generation_kwargs = dict(kwargs)
+    image = image or None
+    audio = audio or None
+    video = video or None
+    input_ids, pixel_values, mask, data_kwargs = _prepare_generation_inputs(
+        model,
+        processor,
+        prompt,
+        image,
+        audio,
+        video,
+        generation_kwargs,
+    )
+
+    text_result = generate(
+        model,
+        processor,
+        prompt,
+        image,
+        audio,
+        video,
+        verbose=verbose,
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        mask=mask,
+        **generation_kwargs,
+    )
+
+    audio_generation_kwargs = dict(generation_kwargs)
+    audio_generation_kwargs.update(data_kwargs)
+    audio_output = model.generate_audio(
+        input_ids=input_ids,
+        generated_tokens=text_result.token_ids or [],
+        tokenizer=tokenizer,
+        pixel_values=pixel_values,
+        mask=mask,
+        audio=audio,
+        output_audio_path=output_audio_path,
+        ref_audio_path=ref_audio_path,
+        **audio_generation_kwargs,
+    )
+
+    return AudioGenerationResult(
+        text=text_result.text,
+        token=text_result.token,
+        token_ids=text_result.token_ids,
+        logprobs=text_result.logprobs,
+        prompt_tokens=text_result.prompt_tokens,
+        generation_tokens=text_result.generation_tokens,
+        total_tokens=text_result.total_tokens,
+        prompt_tps=text_result.prompt_tps,
+        generation_tps=text_result.generation_tps,
+        peak_memory=text_result.peak_memory,
+        cached_tokens=text_result.cached_tokens,
+        finish_reason=text_result.finish_reason,
+        diffusion_canvas_tokens=text_result.diffusion_canvas_tokens,
+        diffusion_denoising_steps=text_result.diffusion_denoising_steps,
+        diffusion_work_tokens=text_result.diffusion_work_tokens,
+        diffusion_canvas_tps=text_result.diffusion_canvas_tps,
+        diffusion_work_tps=text_result.diffusion_work_tps,
+        audio_tokens=audio_output.audio_tokens,
+        audio=audio_output.audio,
+        output_audio_path=audio_output.output_audio_path,
+    )
+
+
 def main():
     args = parse_arguments()
+    output_modality = getattr(args, "output_modality", "text")
 
-    if getattr(args, "output_modality", "text") == "image":
+    if output_modality == "image":
         run_image_generation_cli(args)
         return
+    elif output_modality == "audio":
+        output_audio_path = getattr(args, "output", None)
+        ref_audio_path = getattr(args, "ref_audio", None)
+        if output_audio_path is None:
+            raise ValueError(
+                "--output is required when --output-modality audio is selected"
+            )
+        if getattr(args, "chat", False):
+            raise ValueError("--output-modality audio does not support --chat")
+    elif output_modality == "text":
+        output_audio_path = None
+        ref_audio_path = None
+    else:
+        raise ValueError(f"Unsupported output modality: {output_modality!r}")
 
     if getattr(args, "seed", None) is not None:
         mx.random.seed(args.seed)
@@ -1487,6 +1638,8 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if output_modality == "audio":
+        chat_template_kwargs["use_tts_template"] = True
     if args.thinking_mode is not None:
         chat_template_kwargs["thinking_mode"] = args.thinking_mode
     if args.video:
@@ -1665,14 +1818,30 @@ def main():
             if args.draft_block_size is not None:
                 gen_kwargs["draft_block_size"] = args.draft_block_size
 
-        result = generate(
-            model,
-            processor,
-            prompt,
-            **gen_kwargs,
-        )
+        if output_modality == "audio":
+            result = generate_audio(
+                model,
+                processor,
+                prompt,
+                output_audio_path=output_audio_path,
+                ref_audio_path=ref_audio_path,
+                **gen_kwargs,
+            )
+            if args.verbose and output_audio_path:
+                print(f"\nAudio written to {output_audio_path}")
+        elif output_modality == "text":
+            result = generate(
+                model,
+                processor,
+                prompt,
+                **gen_kwargs,
+            )
+        else:
+            raise ValueError(f"Unsupported output modality: {output_modality!r}")
         if not args.verbose:
             print(result.text)
+            if output_modality == "audio" and output_audio_path:
+                print(f"Audio written to {output_audio_path}")
 
         if draft_model is not None:
             stats = format_speculative_stats(draft_model)

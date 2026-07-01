@@ -150,6 +150,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
 class GenerationResult:
     text: str = ""
     token: Optional[int] = None
+    token_ids: Optional[List[int]] = None
     logprobs: Optional[List[float]] = None
     prompt_tokens: int = 0
     generation_tokens: int = 0
@@ -171,6 +172,13 @@ class GenerationResult:
     diffusion_total_steps: int = 0
     diffusion_canvas_index: int = 0
     diffusion_block_complete: bool = False
+
+
+@dataclass
+class AudioGenerationResult(GenerationResult):
+    audio_tokens: Optional[mx.array] = None
+    audio: Optional[bytes] = None
+    output_audio_path: Optional[str] = None
 
 
 class PromptCacheState:

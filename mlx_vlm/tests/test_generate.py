@@ -1825,6 +1825,186 @@ def test_generate_cli_smoke(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
+def test_generate_audio_cli_uses_output_modality_and_output(capsys):
+    args = Namespace(
+        model="demo",
+        output_modality="audio",
+        output="out.wav",
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
+        adapter_path=None,
+        image=None,
+        audio=["speaker.wav"],
+        video=None,
+        fps=2.0,
+        resize_shape=None,
+        prompt=["Say hello."],
+        system=None,
+        max_tokens=12,
+        temperature=0.7,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision="main",
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        gen_kwargs={},
+        prefill_step_size=128,
+        enable_thinking=False,
+        thinking_mode=None,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+        ref_audio=None,
+        draft_model=None,
+        draft_kind="dflash",
+        draft_block_size=None,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="minicpmo"))
+    processor = SimpleNamespace()
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
+        patch.object(
+            dispatch_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            dispatch_module,
+            "generate_audio",
+            return_value=SimpleNamespace(text="spoken"),
+        ) as mock_generate_audio,
+        patch.object(dispatch_module, "generate") as mock_generate,
+    ):
+        dispatch_module.main()
+
+    assert mock_apply_chat_template.call_args.kwargs["use_tts_template"] is True
+    mock_generate.assert_not_called()
+    assert mock_generate_audio.call_args.kwargs["output_audio_path"] == "out.wav"
+    assert mock_generate_audio.call_args.kwargs["audio"] == ["speaker.wav"]
+    assert capsys.readouterr().out.strip() == "spoken\nAudio written to out.wav"
+
+
+def test_generate_audio_cli_requires_output():
+    args = Namespace(
+        model="demo",
+        output_modality="audio",
+        output=None,
+        adapter_path=None,
+        image=None,
+        audio=None,
+        video=None,
+        fps=2.0,
+        prompt=["Say hello."],
+        system=None,
+        chat=False,
+        revision="main",
+        trust_remote_code=False,
+        quantize_activations=False,
+        draft_model=None,
+        draft_kind="dflash",
+    )
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load") as mock_load,
+        pytest.raises(
+            ValueError,
+            match="--output is required when --output-modality audio is selected",
+        ),
+    ):
+        dispatch_module.main()
+
+    mock_load.assert_not_called()
+
+
+def test_generate_audio_reuses_text_generate_path():
+    input_ids = mx.array([[1, 2]], dtype=mx.int32)
+    pixel_values = mx.zeros((1, 1))
+    mask = mx.array([[1, 1]], dtype=mx.int32)
+    audio_tokens = mx.zeros((1, 1, 1), dtype=mx.int32)
+    tokenizer = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="minicpmo", image_token_index=None),
+        generate_audio=MagicMock(
+            return_value=SimpleNamespace(
+                audio_tokens=audio_tokens,
+                audio=b"wav",
+                output_audio_path="out.wav",
+            )
+        ),
+    )
+
+    with (
+        patch.object(
+            dispatch_module,
+            "prepare_inputs",
+            return_value={
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "attention_mask": mask,
+                "audio_bounds": mx.array([[0, 1]], dtype=mx.int32),
+            },
+        ) as mock_prepare_inputs,
+        patch.object(
+            dispatch_module,
+            "generate",
+            return_value=GenerationResult(
+                text="spoken",
+                token=4,
+                token_ids=[3, 4],
+                prompt_tokens=2,
+                generation_tokens=2,
+                total_tokens=4,
+            ),
+        ) as mock_generate,
+    ):
+        result = dispatch_module.generate_audio(
+            model,
+            processor,
+            "prompt",
+            audio=["speaker.wav"],
+            output_audio_path="out.wav",
+            max_tokens=2,
+        )
+
+    mock_prepare_inputs.assert_called_once()
+    assert mock_generate.call_args.args[:6] == (
+        model,
+        processor,
+        "prompt",
+        None,
+        ["speaker.wav"],
+        None,
+    )
+    assert mock_generate.call_args.kwargs["input_ids"] is input_ids
+    assert mock_generate.call_args.kwargs["pixel_values"] is pixel_values
+    assert mock_generate.call_args.kwargs["mask"] is mask
+    assert mock_generate.call_args.kwargs["audio_bounds"].shape == (1, 2)
+    model.generate_audio.assert_called_once()
+    assert model.generate_audio.call_args.kwargs["input_ids"] is input_ids
+    assert model.generate_audio.call_args.kwargs["generated_tokens"] == [3, 4]
+    assert model.generate_audio.call_args.kwargs["audio"] == ["speaker.wav"]
+    assert result.text == "spoken"
+    assert result.audio_tokens is audio_tokens
+    assert result.output_audio_path == "out.wav"
+
+
 def test_generate_image_cli_routes_before_vlm_load():
     args = Namespace(
         model="bonsai-ternary",
@@ -1896,6 +2076,26 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.output_modality == "text"
     assert args.task == "generate"
     assert args.size is None
+    assert not hasattr(args, "output_audio")
+
+
+def test_parse_arguments_accepts_audio_output_modality(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "mlx_vlm.generate",
+            "--output-modality",
+            "audio",
+            "--output",
+            "out.wav",
+        ],
+    )
+
+    args = generate_module.parse_arguments()
+
+    assert args.output_modality == "audio"
+    assert args.output == "out.wav"
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):

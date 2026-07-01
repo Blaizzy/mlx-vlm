@@ -10,13 +10,14 @@ from .ar import (
 )
 from .cli import main, parse_arguments
 from .common import (
+    AudioGenerationResult,
     GenerationResult,
     PromptCacheState,
     generation_stream,
     maybe_quantize_kv_cache,
     wired_limit,
 )
-from .dispatch import generate, stream_generate
+from .dispatch import generate, generate_audio, stream_generate
 from .edit_image import (
     ImageEditModel,
     ImageEditRequest,
@@ -43,6 +44,7 @@ __all__ = [
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
+    "AudioGenerationResult",
     "GenerationResult",
     "ImageEditModel",
     "ImageEditRequest",
@@ -55,6 +57,7 @@ __all__ = [
     "batch_generate",
     "edit_image",
     "generate",
+    "generate_audio",
     "generate_image",
     "generate_step",
     "generation_stream",
