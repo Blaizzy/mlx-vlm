@@ -10,6 +10,10 @@ import numpy as np
 from mlx.utils import tree_map
 
 
+def _max_diff(a, b):
+    return mx.max(mx.abs(a.astype(mx.float32) - b.astype(mx.float32))).item()
+
+
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
@@ -1708,6 +1712,83 @@ class TestModels(unittest.TestCase):
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
 
+    def test_qwen3_5_model_config_accepts_yarn_rope_parameters(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        rope_parameters = {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 262144,
+            "mrope_section": [11, 11, 10],
+            "rope_theta": 1000000.0,
+            "partial_rotary_factor": 0.25,
+        }
+        qwen3_5_text_config = {
+            "model_type": "qwen3_5",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 256,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 1010000,
+            "head_dim": 64,
+            "rope_parameters": dict(rope_parameters),
+        }
+        qwen3_5_moe_text_config = {
+            "model_type": "qwen3_5_moe",
+            "hidden_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "shared_expert_intermediate_size": 64,
+            "moe_intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 256,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 1010000,
+            "head_dim": 64,
+            "rope_parameters": dict(rope_parameters),
+        }
+
+        for model_module, text_config in (
+            (qwen3_5, qwen3_5_text_config),
+            (qwen3_5_moe, qwen3_5_moe_text_config),
+        ):
+            with self.subTest(model_type=model_module.__name__):
+                config = model_module.ModelConfig.from_dict(
+                    {
+                        "model_type": model_module.__name__.rsplit(".", 1)[-1],
+                        "text_config": text_config,
+                        "vision_config": {},
+                    }
+                )
+
+                self.assertEqual(config.text_config.rope_parameters["type"], "yarn")
+                self.assertEqual(config.text_config.rope_parameters["factor"], 4.0)
+                self.assertEqual(
+                    config.text_config.rope_parameters[
+                        "original_max_position_embeddings"
+                    ],
+                    262144,
+                )
+                self.assertEqual(
+                    config.text_config.rope_parameters["mrope_section"],
+                    [11, 11, 10],
+                )
+
     def test_qwen3_5_sanitize_key_routes_nested_visual_weights(self):
         from mlx_vlm.models.qwen3_5.qwen3_5 import sanitize_key
 
@@ -1752,6 +1833,37 @@ class TestModels(unittest.TestCase):
         thread.join()
 
         self.assertEqual(errors, [])
+
+    def test_qwen3_5_rotary_embedding_forwards_yarn_parameters(self):
+        from mlx_vlm.models.qwen3_5.language import Qwen3_5RotaryEmbedding
+        from mlx_vlm.models.rope_utils import compute_yarn_inv_freq
+
+        rope_parameters = {
+            "type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 262144,
+            "mrope_section": [2, 3, 3],
+        }
+
+        rotary = Qwen3_5RotaryEmbedding(
+            dim=16,
+            max_position_embeddings=1010000,
+            base=1000000.0,
+            mrope_section=rope_parameters["mrope_section"],
+            rope_parameters=rope_parameters,
+        )
+        expected_inv_freq, expected_attention_scaling = compute_yarn_inv_freq(
+            16,
+            1000000.0,
+            scaling_factor=rope_parameters["factor"],
+            original_max_position_embeddings=rope_parameters[
+                "original_max_position_embeddings"
+            ],
+        )
+
+        mx.eval(rotary.inv_freq, expected_inv_freq)
+        self.assertLess(_max_diff(rotary.inv_freq, expected_inv_freq), 1e-7)
+        self.assertEqual(rotary.attention_scaling, expected_attention_scaling)
 
     def test_qwen3_5_model_config_promotes_text_eos_token_id(self):
         from mlx_vlm.models import qwen3_5, qwen3_5_moe
