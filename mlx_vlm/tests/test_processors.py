@@ -2217,6 +2217,67 @@ class TestQwen3_5MoePatch(unittest.TestCase):
         )
 
 
+class TestQwen3OmniMoePatch(unittest.TestCase):
+    def test_patch_intercepts_without_hf_video_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+            Qwen3OmniMoeProcessor,
+        )
+
+        tokenizer = _mock_tokenizer(
+            image_token="<|image_pad|>",
+            audio_token="<|audio_pad|>",
+            video_token="<|video_pad|>",
+            vision_bos_token="<|vision_start|>",
+            vision_eos_token="<|vision_end|>",
+            audio_bos_token="<|audio_bos|>",
+            audio_eos_token="<|audio_eos|>",
+        )
+        feature_extractor = type(
+            "FE",
+            (),
+            {"model_input_names": ["input_features"], "sampling_rate": 16000},
+        )()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "qwen3_omni_moe"}),
+                encoding="utf-8",
+            )
+            (Path(tmpdir) / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "feature_extractor_type": "WhisperFeatureExtractor",
+                        "image_processor_type": "Qwen2VLImageProcessor",
+                        "processor_class": "Qwen3OmniMoeProcessor",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=tokenizer,
+                ),
+                patch(
+                    "transformers.AutoFeatureExtractor.from_pretrained",
+                    return_value=feature_extractor,
+                ),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor, Qwen3OmniMoeProcessor)
+        self.assertEqual(
+            type(processor.video_processor).__name__, "Qwen3VLVideoProcessor"
+        )
+
+
 class TestDotsVLPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(
