@@ -1,4 +1,5 @@
 from functools import lru_cache
+import math
 from typing import Optional, Sequence
 
 import mlx.core as mx
@@ -550,6 +551,60 @@ def compute_inv_freq(dim: int, base: float):
     return 1.0 / (base ** (mx.arange(0, dim, 2).astype(mx.float32) / dim))
 
 
+def _rope_type(config: Optional[dict]) -> str:
+    if not config:
+        return "default"
+    return config.get("type") or config.get("rope_type", "default")
+
+
+def compute_yarn_inv_freq(
+    dim: int,
+    base: float,
+    *,
+    scaling_factor: float = 1.0,
+    original_max_position_embeddings: int = 4096,
+    beta_fast: float = 32,
+    beta_slow: float = 1,
+    mscale: float = 1,
+    mscale_all_dim: float = 0,
+):
+    def yarn_find_correction_dim(num_rotations):
+        return (
+            dim
+            * math.log(original_max_position_embeddings / (num_rotations * 2 * math.pi))
+        ) / (2 * math.log(base))
+
+    def yarn_find_correction_range():
+        low = math.floor(yarn_find_correction_dim(beta_fast))
+        high = math.ceil(yarn_find_correction_dim(beta_slow))
+        return max(low, 0), min(high, dim - 1)
+
+    def yarn_get_mscale(scale=1, multiplier=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * multiplier * math.log(scale) + 1.0
+
+    def yarn_linear_ramp_mask(min_val, max_val, half_dim):
+        if min_val == max_val:
+            max_val += 0.001
+        linear_func = (mx.arange(half_dim, dtype=mx.float32) - min_val) / (
+            max_val - min_val
+        )
+        return mx.clip(linear_func, 0, 1)
+
+    freq_extra = base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim)
+    freq_inter = scaling_factor * freq_extra
+    low, high = yarn_find_correction_range()
+    freq_mask = 1.0 - yarn_linear_ramp_mask(low, high, dim // 2)
+    freqs = (freq_inter * freq_extra) / (
+        freq_inter * freq_mask + freq_extra * (1 - freq_mask)
+    )
+    attention_scaling = yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(
+        scaling_factor, mscale_all_dim
+    )
+    return 1.0 / freqs, attention_scaling
+
+
 @mx.compile
 def _apply_selected_mrope_frequency_layout(freqs, position_selector):
     indices = mx.broadcast_to(
@@ -687,8 +742,24 @@ class MRoPERotaryEmbedding(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.style = style
-        self._inv_freq = compute_inv_freq(dim, base)
-        self.attention_scaling = attention_scaling
+        rope_config = rope_parameters or rope_scaling or {}
+        if _rope_type(rope_config) in ("yarn", "deepseek_yarn", "telechat3-yarn"):
+            self._inv_freq, yarn_attention_scaling = compute_yarn_inv_freq(
+                dim,
+                base,
+                scaling_factor=rope_config["factor"],
+                original_max_position_embeddings=rope_config.get(
+                    "original_max_position_embeddings", max_position_embeddings
+                ),
+                beta_fast=rope_config.get("beta_fast", 32),
+                beta_slow=rope_config.get("beta_slow", 1),
+                mscale=rope_config.get("mscale", 1),
+                mscale_all_dim=rope_config.get("mscale_all_dim", 0),
+            )
+            self.attention_scaling = attention_scaling * yarn_attention_scaling
+        else:
+            self._inv_freq = compute_inv_freq(dim, base)
+            self.attention_scaling = attention_scaling
         self.cast_output = cast_output
         self._mrope_section = list(
             mrope_section

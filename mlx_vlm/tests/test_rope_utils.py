@@ -1,6 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx_lm.models.rope_utils import YarnRoPE
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
@@ -65,6 +66,64 @@ def test_mrope_rotary_embedding_evals_private_helper_arrays_on_init(monkeypatch)
     assert len(eval_args) == 1
     assert eval_args[0][0] is eager_arrays[0]
     assert eval_args[0][1] is eager_arrays[1]
+
+
+def test_mrope_yarn_inv_freq_matches_mlx_lm_yarn_rope():
+    dim = 16
+    base = 1_000_000.0
+    factor = 4.0
+    original_max_position_embeddings = 262_144
+
+    inv_freq, attention_scaling = rope_utils.compute_yarn_inv_freq(
+        dim,
+        base,
+        scaling_factor=factor,
+        original_max_position_embeddings=original_max_position_embeddings,
+    )
+    reference = YarnRoPE(
+        dim,
+        traditional=False,
+        base=base,
+        scaling_factor=factor,
+        original_max_position_embeddings=original_max_position_embeddings,
+    )
+
+    mx.eval(inv_freq, reference._freqs)
+    assert _max_diff(inv_freq, 1.0 / reference._freqs) < 1e-7
+    assert attention_scaling == reference.mscale
+
+
+def test_mrope_rotary_embedding_uses_yarn_rope_parameters():
+    dim = 16
+    base = 1_000_000.0
+    rope_parameters = {
+        "rope_type": "yarn",
+        "factor": 4.0,
+        "original_max_position_embeddings": 262_144,
+        "mrope_section": [2, 3, 3],
+    }
+
+    rotary = MRoPERotaryEmbedding(
+        dim=dim,
+        base=base,
+        max_position_embeddings=1_010_000,
+        rope_parameters=rope_parameters,
+        style="interleaved",
+    )
+    reference = YarnRoPE(
+        dim,
+        traditional=False,
+        base=base,
+        scaling_factor=rope_parameters["factor"],
+        original_max_position_embeddings=rope_parameters[
+            "original_max_position_embeddings"
+        ],
+    )
+
+    mx.eval(rotary.inv_freq, reference._freqs)
+    assert _max_diff(rotary.inv_freq, 1.0 / reference._freqs) < 1e-7
+    assert rotary.attention_scaling == reference.mscale
+    assert rotary.mrope_section == rope_parameters["mrope_section"]
 
 
 def test_proportional_rope_evals_private_helper_arrays_on_init(monkeypatch):

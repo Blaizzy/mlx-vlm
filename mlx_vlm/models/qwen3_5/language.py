@@ -29,12 +29,14 @@ class Qwen3_5RotaryEmbedding(MRoPERotaryEmbedding):
         max_position_embeddings=2048,
         base=10000,
         mrope_section=[11, 11, 0],
+        rope_parameters=None,
     ):
         super().__init__(
             dim,
             max_position_embeddings=max_position_embeddings,
             base=base,
             mrope_section=mrope_section,
+            rope_parameters=rope_parameters,
             style="interleaved",
         )
         mx.eval(self.inv_freq)
@@ -1400,6 +1402,7 @@ class Qwen3_5Attention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
             base=args.rope_parameters["rope_theta"],
             mrope_section=args.rope_parameters["mrope_section"],
+            rope_parameters=args.rope_parameters,
         )
 
     def __call__(
