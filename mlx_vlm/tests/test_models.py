@@ -8233,3 +8233,82 @@ class TestDeepseekV4HISA(unittest.TestCase):
         flat = (mx.maximum(q @ pooled[:, None].swapaxes(-1, -2), 0) * wk_h).sum(1)
         ftk = mx.argpartition(-flat, kth=k - 1, axis=-1)[..., :k]
         self.assertTrue(bool(mx.array_equal(mx.sort(out, -1), mx.sort(ftk, -1))))
+
+
+class TestGenerateStepPrefillEval(unittest.TestCase):
+    """Regression test for #1480: prefill must be evaluated synchronously."""
+
+    def _tiny_qwen3_vl(self):
+        from mlx_vlm.models import qwen3_vl
+
+        text_config = qwen3_vl.TextConfig(
+            model_type="qwen3_vl_text",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=16,
+            vocab_size=1000,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            rope_scaling={"rope_type": "mrope", "mrope_section": [4, 2, 2]},
+        )
+        vision_config = qwen3_vl.VisionConfig(
+            model_type="qwen3_vl",
+            depth=1,
+            hidden_size=64,
+            intermediate_size=128,
+            out_hidden_size=64,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=144,
+            deepstack_visual_indexes=[],
+        )
+        config = qwen3_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_vl",
+            image_token_id=151655,
+            video_token_id=151656,
+            vocab_size=1000,
+        )
+        return qwen3_vl.Model(config)
+
+    def test_prefill_outputs_evaluated_synchronously(self):
+        from mlx_vlm.generate.ar import generate_step
+
+        model = self._tiny_qwen3_vl()
+        input_ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+
+        events = []
+        real_eval, real_async_eval = mx.eval, mx.async_eval
+
+        def spy_eval(*args, **kwargs):
+            events.append("eval")
+            return real_eval(*args, **kwargs)
+
+        def spy_async_eval(*args, **kwargs):
+            events.append("async_eval")
+            return real_async_eval(*args, **kwargs)
+
+        mx.eval, mx.async_eval = spy_eval, spy_async_eval
+        try:
+            gen = generate_step(input_ids, model, None, None, max_tokens=3)
+            first_token, _ = next(gen)
+            prefill_events = list(events)
+            rest = list(gen)
+        finally:
+            mx.eval, mx.async_eval = real_eval, real_async_eval
+
+        self.assertTrue(prefill_events)
+        self.assertEqual(prefill_events[0], "eval")
+        self.assertIn("async_eval", prefill_events)
+        self.assertIsInstance(first_token, int)
+        self.assertEqual(len(rest), 2)
