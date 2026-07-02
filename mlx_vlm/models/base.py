@@ -14,6 +14,7 @@ from mlx_lm.models.base import (
 from PIL import Image
 
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+from ..turboquant import _state_length as _turboquant_state_length
 
 
 def load_chat_template(tokenizer, model_path):
@@ -188,6 +189,23 @@ class BaseImageProcessor:
     @abstractmethod
     def preprocess(self, images):
         pass
+
+
+def kv_sequence_length(keys) -> int:
+    """Sequence length of ``keys`` as returned by ``cache.update_and_fetch``.
+
+    Unquantized caches return a plain ``[B, H, S, D]`` array. Uniform
+    quantized caches (``QuantizedKVCache``/``BatchQuantizedKVCache``) return
+    a ``(packed, scales, biases)`` tuple and TurboQuant caches return
+    codec-state named tuples.
+    """
+    if isinstance(keys, mx.array):
+        return keys.shape[-2]
+    # Plain tuple/list only: TurboQuant states are NamedTuples with a
+    # different layout and get measured by their own helper.
+    if type(keys) in (tuple, list):
+        return keys[0].shape[-2]
+    return _turboquant_state_length(keys)
 
 
 def scaled_dot_product_attention(
