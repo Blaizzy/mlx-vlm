@@ -500,6 +500,13 @@ def test_get_model_and_args_routes_text_only_configs():
     assert model_type == "text_only"
 
 
+def test_get_model_and_args_routes_glm_moe_dsa_module():
+    model_class, model_type = get_model_and_args({"model_type": "glm_moe_dsa"})
+
+    assert model_class.__name__ == "mlx_vlm.models.glm_moe_dsa"
+    assert model_type == "glm_moe_dsa"
+
+
 def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
     with pytest.raises(ValueError):
         get_model_and_args(
