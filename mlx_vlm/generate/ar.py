@@ -449,7 +449,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.async_eval(y, logprobs)
+    mx.eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
