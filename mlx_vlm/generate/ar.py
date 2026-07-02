@@ -1010,6 +1010,22 @@ class GenerationBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
+        # Fast path: single-sequence greedy decode (most common in local serving)
+        if (
+            len(self.uids) == 1
+            and not (self.logits_processors and any(self.logits_processors))
+            and not self.compute_logprobs
+            and self.top_logprobs_k == 0
+            and self.greedy_sampling
+        ):
+            sampled = mx.argmax(logits, axis=-1)
+            self._next_tokens = sampled
+            mx.async_eval(self._next_tokens)
+            mx.eval(inputs)
+            tok = inputs.item()
+            self._num_tokens[0] += 1
+            return [tok], None, None, None
+
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         sampled = _sample_with_positions(
             self.sampler,
