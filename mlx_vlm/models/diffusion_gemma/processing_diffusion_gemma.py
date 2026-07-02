@@ -15,9 +15,51 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..gemma4.processing_gemma4 import Gemma4Processor
 
+_TOOL_PARSER_TOKENS = {
+    "<|tool_call>",
+    "<tool_call|>",
+    '<|"|>',
+    "<|channel>",
+    "<channel|>",
+}
+
+_TOOL_PARSER_TOKEN_ATTRIBUTES = (
+    "stc_token",
+    "etc_token",
+    "escape_token",
+    "soc_token",
+    "eoc_token",
+)
+
+
+def _token_text(token):
+    return getattr(token, "content", token)
+
+
+def _make_tool_parser_tokens_non_special(tokenizer):
+    for attr in _TOOL_PARSER_TOKEN_ATTRIBUTES:
+        if _token_text(getattr(tokenizer, attr, None)) in _TOOL_PARSER_TOKENS:
+            try:
+                setattr(tokenizer, attr, None)
+            except AttributeError:
+                pass
+
+    additional_tokens = getattr(tokenizer, "additional_special_tokens", None)
+    if not additional_tokens:
+        return
+    tokenizer.additional_special_tokens = [
+        token
+        for token in additional_tokens
+        if _token_text(token) not in _TOOL_PARSER_TOKENS
+    ]
+
 
 class DiffusionGemma4Processor(Gemma4Processor):
     model_type = "diffusion_gemma"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _make_tool_parser_tokens_non_special(self.tokenizer)
 
     @staticmethod
     def _flatten_visual_items(values):
@@ -127,7 +169,9 @@ class DiffusionGemma4Processor(Gemma4Processor):
         # rejected by this processor, so the warning is pure noise.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*mel filter.*")
-            return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+            processor = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        _make_tool_parser_tokens_non_special(processor.tokenizer)
+        return processor
 
 
 __all__ = ["DiffusionGemma4Processor"]
