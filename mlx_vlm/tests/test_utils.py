@@ -601,6 +601,91 @@ def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     assert restored["weight"]["dtype"] == "F8_E8M0"
 
 
+def _run_load_model_with_mlx_format(model_cls, weights):
+    """Drive load_model() against a fake format="mlx" checkpoint and return
+    the loaded model (whose .loaded_weights records what reached load_weights)."""
+    safe_open = MagicMock()
+    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
+
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=model_cls)
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "fake"),
+        ),
+    ):
+        return load_model(Path("/tmp/model"), lazy=True)
+
+
+def test_load_model_sanitizes_mlx_format_when_model_opts_in():
+    """Regression for #1367: a model that sets sanitize_mlx_format must have
+    its top-level sanitize() run for format="mlx" checkpoints, so checkpoint
+    keys get remapped onto the parameter tree instead of failing to load."""
+
+    class OptInModel(nn.Module):
+        sanitize_mlx_format = True
+
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+        def sanitize(self, weights):
+            return {
+                k.replace("encoder.", "language_model.model."): v
+                for k, v in weights.items()
+            }
+
+        def load_weights(self, weights, **kwargs):
+            self.loaded_weights = dict(weights)
+
+    model = _run_load_model_with_mlx_format(
+        OptInModel, {"encoder.embed_tokens.weight": mx.zeros((2, 2))}
+    )
+
+    assert "language_model.model.embed_tokens.weight" in model.loaded_weights
+    assert "encoder.embed_tokens.weight" not in model.loaded_weights
+
+
+def test_load_model_skips_sanitize_for_mlx_format_without_opt_in():
+    """Models that do not opt in must keep the old behavior: top-level
+    sanitize() is skipped for format="mlx" checkpoints. This protects models
+    whose sanitize() applies non-idempotent layout transforms (e.g. conv
+    transposes) from corrupting already-converted MLX weights."""
+
+    class NonIdempotentModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+        def sanitize(self, weights):
+            # Re-running this on already-converted weights would corrupt them.
+            return {
+                k: (v.transpose(0, 2, 3, 1) if v.ndim == 4 else v)
+                for k, v in weights.items()
+            }
+
+        def load_weights(self, weights, **kwargs):
+            self.loaded_weights = dict(weights)
+
+    conv = mx.zeros((8, 3, 3, 3))  # already in MLX [O, H, W, I] layout
+    model = _run_load_model_with_mlx_format(
+        NonIdempotentModel, {"patch.weight": conv}
+    )
+
+    # sanitize was skipped -> shape untouched.
+    assert model.loaded_weights["patch.weight"].shape == (8, 3, 3, 3)
+
+
 def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     safe_open = MagicMock()
     safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}

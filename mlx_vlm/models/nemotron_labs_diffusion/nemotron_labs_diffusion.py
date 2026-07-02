@@ -9,6 +9,13 @@ from .language import LanguageModel
 
 
 class Model(nn.Module):
+    # MLX-format checkpoints ship encoder.* / diffusion_head.* keys that
+    # sanitize() remaps onto the parameter tree. That remap is pure key
+    # renaming (idempotent), so it is safe to run even for format="mlx",
+    # and must run or load_weights() fails with unrecognised parameters.
+    # See https://github.com/Blaizzy/mlx-vlm/issues/1367.
+    sanitize_mlx_format = True
+
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
