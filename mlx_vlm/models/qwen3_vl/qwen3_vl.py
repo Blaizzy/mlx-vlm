@@ -11,6 +11,16 @@ from .language import LanguageModel
 from .vision import VisionModel
 
 
+def _prompt_position_ids(position_ids: Optional[mx.array]) -> Optional[mx.array]:
+    if (
+        position_ids is not None
+        and position_ids.ndim == 3
+        and position_ids.shape[0] == 3
+    ):
+        return position_ids.transpose(1, 2, 0)
+    return position_ids
+
+
 def masked_scatter(
     final_embedding: mx.array,
     image_mask_expanded: mx.array,
@@ -56,9 +66,13 @@ class Model(nn.Module):
             pixel_values = kwargs.get("pixel_values_videos", None)
 
         if pixel_values is None:
-            self.language_model._position_ids = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, attention_mask=mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=_prompt_position_ids(position_ids),
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -92,18 +106,16 @@ class Model(nn.Module):
         visual_pos_masks = image_mask
         mx.eval(deepstack_visual_embeds)
 
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
+            position_ids=_prompt_position_ids(position_ids),
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod

@@ -4821,6 +4821,35 @@ class TestResponseGenerator:
             pixel_values=pixel_values
         )
 
+    def test_gpu_embed_drops_none_embedding_fields(self):
+        class Embed:
+            def to_dict(self):
+                return {
+                    "inputs_embeds": mx.zeros((1, 2, 4)),
+                    "position_ids": None,
+                    "rope_deltas": None,
+                }
+
+        class Model:
+            def get_input_embeddings(
+                self, input_ids, pixel_values, mask=None, **kwargs
+            ):
+                return Embed()
+
+        response_generator = SimpleNamespace(model=Model(), vision_cache=None)
+
+        _, gen_kwargs = server.ResponseGenerator._gpu_embed(
+            response_generator,
+            {
+                "input_ids": mx.array([[1, 2]]),
+                "attention_mask": mx.array([[1, 1]]),
+            },
+            images=None,
+        )
+
+        assert "position_ids" not in gen_kwargs
+        assert "rope_deltas" not in gen_kwargs
+
     def test_gpu_embed_prefers_image_ref_for_apc_hash(self):
         class Embed:
             def to_dict(self):

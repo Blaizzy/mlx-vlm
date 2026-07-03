@@ -38,6 +38,16 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     return _apply_mrope(q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim)
 
 
+def _language_position_ids(
+    position_ids: Optional[mx.array], inputs: mx.array
+) -> Optional[mx.array]:
+    if position_ids is not None and position_ids.ndim == 3:
+        batch_size, seq_length = inputs.shape
+        if position_ids.shape == (batch_size, seq_length, 3):
+            return position_ids.transpose(2, 0, 1)
+    return position_ids
+
+
 class Attention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -533,6 +543,7 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        position_ids = _language_position_ids(position_ids, inputs)
         # reset rope_deltas when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
@@ -653,7 +664,11 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)
-                if self._position_ids is not None and self._position_ids.ndim == 3:
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
                     position_ids = position_ids[None, ...]
                     position_ids = mx.broadcast_to(
                         position_ids, (3, batch_size, seq_length)

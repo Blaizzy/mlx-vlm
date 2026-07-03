@@ -44,6 +44,16 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     return _apply_mrope(q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim)
 
 
+def _language_position_ids(
+    position_ids: Optional[mx.array], inputs: mx.array
+) -> Optional[mx.array]:
+    if position_ids is not None and position_ids.ndim == 3:
+        batch_size, seq_length = inputs.shape
+        if position_ids.shape == (batch_size, seq_length, 3):
+            return position_ids.transpose(2, 0, 1)
+    return position_ids
+
+
 class Qwen3_5RMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -2438,6 +2448,7 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
+        position_ids = _language_position_ids(position_ids, inputs)
         if (
             mask is None
             and attention_mask is not None
@@ -2548,6 +2559,15 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
+                    position_ids = position_ids[None, ...]
+                    position_ids = mx.broadcast_to(
+                        position_ids, (3, batch_size, seq_length)
+                    )
 
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
