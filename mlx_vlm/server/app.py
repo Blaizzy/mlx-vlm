@@ -266,18 +266,20 @@ async def _preflight_stream_context_budget(
     prompt: str,
     images: Optional[List] = None,
     audio: Optional[List] = None,
+    videos: Optional[List] = None,
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
     if runtime.response_generator is None:
         return
     try:
+        validate_kwargs = {"images": images, "audio": audio, "args": args}
+        if videos is not None:
+            validate_kwargs["videos"] = videos
         await asyncio.to_thread(
             runtime.response_generator.validate_context_budget,
             prompt,
-            images,
-            audio,
-            args,
+            **validate_kwargs,
         )
     except PromptTooLongError as e:
         runtime.metrics.record_failure(

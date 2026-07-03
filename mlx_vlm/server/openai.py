@@ -149,6 +149,19 @@ def _decode_input_audio_data(input_audio: InputAudio):
         return data
 
 
+def _extract_video_reference(item):
+    item_type = item.get("type")
+    if item_type == "video":
+        return item.get("video")
+    if item_type == "input_video":
+        video = item.get("video") or item.get("video_url")
+    elif item_type == "video_url":
+        video = item.get("video_url")
+    else:
+        return None
+    return video.get("url") if isinstance(video, dict) else video
+
+
 def _final_chat_chunk(
     request_id: str,
     model: str,
@@ -1412,6 +1425,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         images = []
         audio = []
+        videos = []
         processed_messages = []
         for message in request.messages:
             msg = {"role": message.role}
@@ -1430,6 +1444,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             images.append(item["image_url"]["url"])
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
+                        elif item_type in ("input_video", "video_url", "video"):
+                            video = _extract_video_reference(item)
+                            if video:
+                                videos.append(video)
                 msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
@@ -1482,16 +1500,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            video=videos or None,
             tools=tools,
             **gen_args.to_template_kwargs(),
         )
 
         logger.debug(
-            "chat/completions request: model=%s images=%d audio=%d "
+            "chat/completions request: model=%s images=%d audio=%d videos=%d "
             "max_tokens=%s temp=%s stream=%s",
             request.model,
             len(images),
             len(audio),
+            len(videos),
             gen_args.max_tokens,
             gen_args.temperature,
             request.stream,
@@ -1510,6 +1530,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 prompt=formatted_prompt,
                 images=images if images else None,
                 audio=audio if audio else None,
+                videos=videos if videos else None,
                 args=gen_args,
             )
 
@@ -1532,12 +1553,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
                         # generate() does blocking Queue.get — run off event loop
+                        generate_kwargs = {"args": gen_args}
+                        if videos:
+                            generate_kwargs["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
                             audio if audio else None,
-                            gen_args,
+                            **generate_kwargs,
                         )
 
                         output_tokens = 0
@@ -1671,6 +1695,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             prompt=formatted_prompt,
                             image=images,
                             audio=audio,
+                            video=videos,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             **gen_args.to_generate_kwargs(),
@@ -1860,6 +1885,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             images=images if images else None,
                             audio=audio if audio else None,
                             args=gen_args,
+                            **({"videos": videos} if videos else {}),
                         )
                         pt = ctx.prompt_tokens
                         for token in token_iter:
@@ -1894,6 +1920,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
+                        video=videos,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,
