@@ -340,7 +340,6 @@ def scaled_dot_product_attention(
     )
 
 
-
 def expand2square(pil_img, background_color):
     width, height = pil_img.size
     if width == height:

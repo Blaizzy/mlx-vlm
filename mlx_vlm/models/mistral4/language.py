@@ -2,10 +2,10 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import create_attention_mask, scaled_dot_product_attention
+from ..rope_utils import initialize_rope
 
 
 def _get_llama_4_attn_scale(
