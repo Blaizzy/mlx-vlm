@@ -3,7 +3,6 @@ import os
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-
 from .convert import convert
 from .generate import (
     BatchResponse,
