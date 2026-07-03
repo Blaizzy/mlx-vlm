@@ -4,7 +4,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
 from ..base import (
     LanguageModelOutput,
@@ -16,6 +15,7 @@ from ..gemma4.gemma4 import MultimodalEmbedder, masked_scatter
 from ..gemma4.language import RMSNormNoScale
 from ..gemma4.rope_utils import initialize_rope
 from ..gemma4.vision import VisionModel
+from ..switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 from .config import ModelConfig, TextConfig
 
 

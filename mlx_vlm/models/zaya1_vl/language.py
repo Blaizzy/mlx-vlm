@@ -3,7 +3,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchLinear
 
 from ..base import (
     LanguageModelOutput,
@@ -12,6 +11,7 @@ from ..base import (
 )
 from ..cache import ArraysCache, CacheList, KVCache
 from ..rope_utils import initialize_rope
+from ..switch_layers import SwitchLinear
 from .config import ModelConfig, TextConfig
 
 

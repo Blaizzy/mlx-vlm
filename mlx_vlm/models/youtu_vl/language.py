@@ -5,7 +5,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.activations import swiglu
 from mlx_lm.models.mla import MultiLinear
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -13,6 +12,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..rope_utils import initialize_rope
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
 
