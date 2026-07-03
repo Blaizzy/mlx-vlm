@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import BatchKVCache, KVCache
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -26,6 +25,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]

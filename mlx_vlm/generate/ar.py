@@ -13,13 +13,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 
 from .. import apc as _apc
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import top_p_sampling
+from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,

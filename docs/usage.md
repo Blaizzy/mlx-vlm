@@ -125,7 +125,7 @@ from mlx_vlm.generate import (
 )
 from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_lm.sample_utils import make_sampler
+from mlx_vlm.sample_utils import make_sampler
 
 model, processor = load("Qwen/Qwen3.5-4B")
 drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")

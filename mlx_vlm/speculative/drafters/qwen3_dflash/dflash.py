@@ -2,11 +2,10 @@ from typing import List
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
 from mlx_lm.models.qwen3 import MLP as Qwen3MLP
 from mlx_lm.models.rope_utils import initialize_rope
 
-from ....models.cache import BufferedRotatingKVCache, RotatingKVCache
+from ....models.cache import BufferedRotatingKVCache, KVCache, RotatingKVCache
 from .config import DFlashConfig
 
 

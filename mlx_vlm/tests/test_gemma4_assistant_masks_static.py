@@ -27,20 +27,29 @@ def _load_masks_module(monkeypatch):
     )
     fake_mlx = types.ModuleType("mlx")
     fake_mlx.core = fake_mx
-    fake_cache = types.ModuleType("mlx_lm.models.cache")
+    fake_cache = types.ModuleType("mlx_vlm.models.cache")
     fake_cache.dynamic_roll = lambda tensor, *_args, **_kwargs: tensor
     monkeypatch.setitem(sys.modules, "mlx", fake_mlx)
     monkeypatch.setitem(sys.modules, "mlx.core", fake_mx)
-    monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
-    monkeypatch.setitem(sys.modules, "mlx_lm.models", types.ModuleType("mlx_lm.models"))
-    monkeypatch.setitem(sys.modules, "mlx_lm.models.cache", fake_cache)
+    for package_name in (
+        "mlx_vlm",
+        "mlx_vlm.models",
+        "mlx_vlm.speculative",
+        "mlx_vlm.speculative.drafters",
+        "mlx_vlm.speculative.drafters.gemma4_assistant",
+    ):
+        package = types.ModuleType(package_name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, package_name, package)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.cache", fake_cache)
 
     path = (
         Path(__file__).resolve().parents[1]
         / "speculative/drafters/gemma4_assistant/masks.py"
     )
-    loader = importlib.machinery.SourceFileLoader("gemma4_masks_under_test", str(path))
-    spec = importlib.util.spec_from_loader("gemma4_masks_under_test", loader)
+    module_name = "mlx_vlm.speculative.drafters.gemma4_assistant.masks"
+    loader = importlib.machinery.SourceFileLoader(module_name, str(path))
+    spec = importlib.util.spec_from_loader(module_name, loader)
     assert spec is not None
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)

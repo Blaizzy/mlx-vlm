@@ -4,7 +4,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.switch_layers import SwitchLinear, _gather_sort, _scatter_unsort
 
 from ..base import (
@@ -12,7 +11,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import StaticPrefixKVCache
+from ..cache import KVCache, RotatingKVCache, StaticPrefixKVCache
 from ..gemma4.gemma4 import MultimodalEmbedder, masked_scatter
 from ..gemma4.language import RMSNormNoScale
 from ..gemma4.rope_utils import initialize_rope

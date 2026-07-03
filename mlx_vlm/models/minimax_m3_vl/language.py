@@ -4,7 +4,6 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
-from mlx_lm.models.cache import BatchKVCache, dynamic_roll
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.models.switch_layers import SwitchGLU, SwitchLinear
 
@@ -13,7 +12,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache
+from ..cache import BatchKVCache, KVCache, dynamic_roll
 from .config import ModelConfig, TextConfig
 
 

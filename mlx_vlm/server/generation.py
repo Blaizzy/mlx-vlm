@@ -12,7 +12,6 @@ from typing import Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
-from mlx_lm.sample_utils import make_logits_processors
 
 from .. import apc as _apc
 from ..generate import (
@@ -34,7 +33,7 @@ from ..generate import (
 )
 from ..generate.common import generation_stream, wired_limit
 from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
-from ..sample_utils import top_p_sampling
+from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -1564,8 +1563,6 @@ class ResponseGenerator:
         Finished sequences are filtered out automatically by the round-loop's
         ``stop_check`` callback.
         """
-        from mlx_lm.sample_utils import make_sampler as _make_sampler
-
         generation_stream = mx.default_stream(mx.default_device())
 
         lm = self.model.language_model
@@ -1574,7 +1571,7 @@ class ResponseGenerator:
         is_mtp = draft_kind == "mtp"
         prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
-        sampler = _make_sampler(temp=0)
+        sampler = make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
@@ -1624,7 +1621,7 @@ class ResponseGenerator:
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    sampler = self._make_sampler(args) or _make_sampler(temp=0)
+                    sampler = self._make_sampler(args) or make_sampler(temp=0)
 
                 B = len(uids)
                 max_len = max(len(ids) for ids in all_input_ids)
