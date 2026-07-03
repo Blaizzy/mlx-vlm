@@ -3,7 +3,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import InputEmbeddingsFeatures, _prompt_position_ids
+from ..base import InputEmbeddingsFeatures, prompt_position_ids
 from . import processing_qwen2_5_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
@@ -37,7 +37,7 @@ class Model(nn.Module):
             )
             return InputEmbeddingsFeatures(
                 inputs_embeds=self.language_model.model.embed_tokens(input_ids),
-                position_ids=_prompt_position_ids(position_ids),
+                position_ids=prompt_position_ids(position_ids),
                 rope_deltas=rope_deltas,
             )
 
@@ -71,7 +71,7 @@ class Model(nn.Module):
 
         return InputEmbeddingsFeatures(
             inputs_embeds=final_inputs_embeds,
-            position_ids=_prompt_position_ids(position_ids),
+            position_ids=prompt_position_ids(position_ids),
             rope_deltas=rope_deltas,
         )
 

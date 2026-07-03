@@ -7,8 +7,8 @@ from mlx_lm.models.activations import swiglu
 
 from ..base import (
     LanguageModelOutput,
-    _language_position_ids,
     create_attention_mask,
+    language_position_ids,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
@@ -2439,7 +2439,7 @@ class LanguageModel(nn.Module):
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
-        position_ids = _language_position_ids(position_ids, inputs)
+        position_ids = language_position_ids(position_ids, inputs)
         if (
             mask is None
             and attention_mask is not None

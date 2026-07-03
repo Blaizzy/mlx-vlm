@@ -96,7 +96,7 @@ class InputEmbeddingsFeatures:
         }
 
 
-def _prompt_position_ids(position_ids: Optional[mx.array]) -> Optional[mx.array]:
+def prompt_position_ids(position_ids: Optional[mx.array]) -> Optional[mx.array]:
     if position_ids is None:
         return None
     if position_ids.ndim == 3 and position_ids.shape[0] == 3:
@@ -106,7 +106,7 @@ def _prompt_position_ids(position_ids: Optional[mx.array]) -> Optional[mx.array]
     return position_ids
 
 
-def _language_position_ids(
+def language_position_ids(
     position_ids: Optional[mx.array], inputs: mx.array
 ) -> Optional[mx.array]:
     if position_ids is not None and position_ids.ndim == 3:
