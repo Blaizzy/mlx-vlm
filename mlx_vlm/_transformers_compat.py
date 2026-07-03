@@ -60,9 +60,7 @@ def install_transformers_legacy_registration_shims():
     if not getattr(AutoProcessor.register, "_mlx_vlm_legacy_shim", False):
         original_register_processor = AutoProcessor.register
 
-        def register_processor_compat(
-            config_class, processor_class, exist_ok=False
-        ):
+        def register_processor_compat(config_class, processor_class, exist_ok=False):
             if isinstance(config_class, str):
                 for registered_processor in PROCESSOR_MAPPING._extra_content.values():
                     if registered_processor is processor_class:

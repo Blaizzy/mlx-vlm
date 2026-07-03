@@ -8,7 +8,9 @@ from transformers.models.auto.tokenization_auto import REGISTERED_TOKENIZER_CLAS
 
 def _load_compat_module():
     module_path = Path(__file__).resolve().parents[1] / "_transformers_compat.py"
-    spec = importlib.util.spec_from_file_location("mlx_vlm_transformers_compat", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "mlx_vlm_transformers_compat", module_path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
