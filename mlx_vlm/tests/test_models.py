@@ -8247,9 +8247,7 @@ class TestQuantizedKVCacheMask(unittest.TestCase):
         quantized = mx.quantize(keys, group_size=64, bits=8)
         self.assertEqual(kv_sequence_length(quantized), 5)
 
-    def test_gemma3_generation_with_quantized_cache(self):
-        from mlx_vlm.models import gemma3
-        from mlx_vlm.models.cache import KVCache, QuantizedKVCache
+
 
         config = gemma3.TextConfig(
             model_type="gemma3",
