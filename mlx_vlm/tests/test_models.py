@@ -8240,7 +8240,9 @@ class TestQuantizedKVCacheMask(unittest.TestCase):
     ``update_and_fetch`` returns packed tuples instead of arrays (#1481)."""
 
     def test_kv_sequence_length(self):
+        from mlx_vlm.models import gemma3
         from mlx_vlm.models.base import kv_sequence_length
+        from mlx_vlm.models.cache import KVCache, QuantizedKVCache
 
         keys = mx.zeros((1, 2, 5, 64))
         self.assertEqual(kv_sequence_length(keys), 5)
