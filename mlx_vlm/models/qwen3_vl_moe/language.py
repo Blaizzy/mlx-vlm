@@ -8,6 +8,7 @@ from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
+    _language_position_ids,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -36,16 +37,6 @@ class Qwen3VLMoERotaryEmbedding(MRoPERotaryEmbedding):
 
 def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     return _apply_mrope(q, k, cos, sin, style="interleaved", unsqueeze_dim=unqueeze_dim)
-
-
-def _language_position_ids(
-    position_ids: Optional[mx.array], inputs: mx.array
-) -> Optional[mx.array]:
-    if position_ids is not None and position_ids.ndim == 3:
-        batch_size, seq_length = inputs.shape
-        if position_ids.shape == (batch_size, seq_length, 3):
-            return position_ids.transpose(2, 0, 1)
-    return position_ids
 
 
 class Attention(nn.Module):

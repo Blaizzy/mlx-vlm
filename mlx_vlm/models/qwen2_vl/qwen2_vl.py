@@ -3,21 +3,11 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import InputEmbeddingsFeatures
+from ..base import InputEmbeddingsFeatures, _prompt_position_ids
 from . import processing_qwen2_vl  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
-
-
-def _prompt_position_ids(position_ids: Optional[mx.array]) -> Optional[mx.array]:
-    if position_ids is None:
-        return None
-    if position_ids.ndim == 3 and position_ids.shape[0] == 3:
-        return position_ids.transpose(1, 2, 0)
-    if position_ids.ndim == 2:
-        return mx.broadcast_to(position_ids[:, :, None], (*position_ids.shape, 3))
-    return position_ids
 
 
 class Model(nn.Module):
