@@ -4963,10 +4963,8 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         self.assertIsNotNone(result.position_ids)
         self.assertIsNotNone(result.rope_deltas)
-        self.assertEqual(result.position_ids.shape, (1, 3, 3))
-        self.assertEqual(result.position_ids[:, :, 0].tolist(), [[0, 1, 2]])
-        self.assertEqual(result.position_ids[:, :, 1].tolist(), [[0, 1, 2]])
-        self.assertEqual(result.position_ids[:, :, 2].tolist(), [[0, 1, 2]])
+        self.assertEqual(result.position_ids.shape, (1, 3))
+        self.assertEqual(result.position_ids.tolist(), [[0, 1, 2]])
         self.assertEqual(result.rope_deltas.tolist(), [[0]])
         self.assertTrue(
             mx.array_equal(

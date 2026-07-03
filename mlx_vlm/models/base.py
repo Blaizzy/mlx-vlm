@@ -96,26 +96,6 @@ class InputEmbeddingsFeatures:
         }
 
 
-def prompt_position_ids(position_ids: Optional[mx.array]) -> Optional[mx.array]:
-    if position_ids is None:
-        return None
-    if position_ids.ndim == 3 and position_ids.shape[0] == 3:
-        return position_ids.transpose(1, 2, 0)
-    if position_ids.ndim == 2:
-        return mx.broadcast_to(position_ids[:, :, None], (*position_ids.shape, 3))
-    return position_ids
-
-
-def language_position_ids(
-    position_ids: Optional[mx.array], inputs: mx.array
-) -> Optional[mx.array]:
-    if position_ids is not None and position_ids.ndim == 3:
-        batch_size, seq_length = inputs.shape
-        if position_ids.shape == (batch_size, seq_length, 3):
-            return position_ids.transpose(2, 0, 1)
-    return position_ids
-
-
 @dataclass
 class BaseModelConfig:
     @classmethod

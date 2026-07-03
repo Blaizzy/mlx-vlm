@@ -7,7 +7,6 @@ import numpy as np
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
-    language_position_ids,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -494,7 +493,6 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
-        position_ids = language_position_ids(position_ids, inputs)
         # reset rope_deltas and position_ids when processing a new image/video
         if pixel_values is not None:
             self._rope_deltas = None
