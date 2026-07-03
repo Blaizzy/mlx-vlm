@@ -4,21 +4,6 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 
-try:
-    from transformers.models.auto import auto_factory as _hf_auto_factory
-
-    _hf_orig_register = _hf_auto_factory._LazyAutoMapping.register
-
-    def _hf_safe_register(self, key, value, exist_ok=False):
-        if isinstance(key, str):
-            self._extra_content[key] = value
-            return
-        return _hf_orig_register(self, key, value, exist_ok=exist_ok)
-
-    _hf_auto_factory._LazyAutoMapping.register = _hf_safe_register
-except Exception:  # pragma: no cover - never block import on a shim failure
-    pass
-
 from .convert import convert
 from .generate import (
     BatchResponse,
