@@ -3,6 +3,10 @@ import os
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
+from ._transformers_compat import install_transformers_legacy_registration_shims
+
+install_transformers_legacy_registration_shims()
+
 from .convert import convert
 from .generate import (
     BatchResponse,
