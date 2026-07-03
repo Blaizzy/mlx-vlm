@@ -1662,6 +1662,9 @@ class TestModels(unittest.TestCase):
         self._assert_mrope_decode_uses_cache_idx(
             model.language_model, config.text_config.hidden_size
         )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
+            model.language_model, config.text_config.hidden_size
+        )
 
     def test_qwen3_5_model_config(self):
         from mlx_vlm.models import qwen3_5, qwen3_5_moe
@@ -1707,6 +1710,42 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
+        from mlx_vlm.models import qwen3_5
+
+        text_config = qwen3_5.TextConfig(
+            model_type="qwen3_5",
+            hidden_size=16,
+            intermediate_size=32,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=3,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            head_dim=8,
+        )
+        config = qwen3_5.ModelConfig(
+            text_config=text_config,
+            vision_config=qwen3_5.VisionConfig(
+                model_type="qwen3_5",
+                depth=1,
+                hidden_size=16,
+                intermediate_size=32,
+                out_hidden_size=16,
+                num_heads=2,
+            ),
+            model_type="qwen3_5",
+        )
+        language_model = qwen3_5.LanguageModel(text_config, config)
+
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(language_model, 16)
 
     def test_qwen3_5_sanitize_key_routes_nested_visual_weights(self):
         from mlx_vlm.models.qwen3_5.qwen3_5 import sanitize_key
@@ -1956,6 +1995,9 @@ class TestModels(unittest.TestCase):
 
         # Decode-step RoPE offset must come from cache._idx, not offset.item().
         self._assert_mrope_decode_uses_cache_idx(
+            model.language_model, config.text_config.hidden_size
+        )
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(
             model.language_model, config.text_config.hidden_size
         )
 
@@ -2332,13 +2374,10 @@ class TestModels(unittest.TestCase):
 
         position_ids = captured["position_ids"]
         self.assertIsNotNone(position_ids)
-        self.assertIn(tuple(position_ids.shape), {(1, 1), (3, 1, 1)})
+        self.assertEqual(tuple(position_ids.shape), (3, 1, 1))
         # Position == cache._idx (10) + kwarg delta (5) == 15.
         # Pre-fix behavior would have read self._rope_deltas (99) -> 109.
-        if position_ids.ndim == 3:
-            self.assertEqual(position_ids[0, 0, 0].item(), 15)
-        else:
-            self.assertEqual(position_ids[0, 0].item(), 15)
+        self.assertEqual(position_ids[0, 0, 0].item(), 15)
 
     def test_glm4v_moe(self):
         from mlx_vlm.models import glm4v_moe
@@ -4912,6 +4951,30 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self.assertIsNotNone(result.inputs_embeds)
 
+    def _assert_qwen_request_owned_mrope_kwargs(self, model):
+        stale_position_ids = mx.array([[[9, 9, 9]]], dtype=mx.int32)
+        stale_rope_deltas = mx.array([[99]], dtype=mx.int32)
+        model.language_model._position_ids = stale_position_ids
+        model.language_model._rope_deltas = stale_rope_deltas
+
+        result = model.get_input_embeddings(
+            input_ids=mx.array([[1, 2, 3]], dtype=mx.int32)
+        )
+
+        self.assertIsNotNone(result.position_ids)
+        self.assertIsNotNone(result.rope_deltas)
+        self.assertEqual(result.position_ids.shape, (1, 3))
+        self.assertEqual(result.position_ids.tolist(), [[0, 1, 2]])
+        self.assertEqual(result.rope_deltas.tolist(), [[0]])
+        self.assertTrue(
+            mx.array_equal(
+                model.language_model._position_ids, stale_position_ids
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(model.language_model._rope_deltas, stale_rope_deltas).item()
+        )
+
     def test_llava_input_embeddings(self):
         from mlx_vlm.models import llava
 
@@ -5048,6 +5111,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "qwen2_vl")
+        self._assert_qwen_request_owned_mrope_kwargs(model)
 
     def test_qwen2_5_vl_input_embeddings(self):
         from mlx_vlm.models import qwen2_5_vl
@@ -5083,6 +5147,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "qwen2_5_vl")
+        self._assert_qwen_request_owned_mrope_kwargs(model)
 
     def test_qwen3_vl_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl
@@ -5120,6 +5185,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "qwen3_vl")
+        self._assert_qwen_request_owned_mrope_kwargs(model)
 
     def test_paligemma_input_embeddings(self):
         from mlx_vlm.models import paligemma
@@ -6411,6 +6477,42 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "qwen3_vl_moe")
+        self._assert_qwen_request_owned_mrope_kwargs(model)
+
+    def test_qwen3_5_input_embeddings_owns_mrope_kwargs(self):
+        from mlx_vlm.models import qwen3_5
+
+        model = qwen3_5.Model(
+            qwen3_5.ModelConfig(
+                text_config=qwen3_5.TextConfig(
+                    model_type="qwen3_5",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    linear_num_value_heads=2,
+                    linear_num_key_heads=2,
+                    linear_key_head_dim=8,
+                    linear_value_head_dim=8,
+                    linear_conv_kernel_dim=3,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    rms_norm_eps=1e-5,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    max_position_embeddings=128,
+                    head_dim=8,
+                ),
+                vision_config=qwen3_5.VisionConfig(
+                    model_type="qwen3_5",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    out_hidden_size=16,
+                    num_heads=2,
+                ),
+                model_type="qwen3_5",
+            )
+        )
+        self._assert_qwen_request_owned_mrope_kwargs(model)
 
     def test_qwen3_omni_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_omni_moe
