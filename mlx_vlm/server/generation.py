@@ -701,6 +701,18 @@ class GenerationContext:
 
 
 @dataclass
+class QueuedGenerationRequest:
+    """Preprocessed generation request waiting for the GPU worker."""
+
+    rqueue: Queue
+    raw_inputs: dict
+    prompt_tokens: int
+    args: GenerationArguments
+    images: Optional[List] = None
+    videos: Optional[List] = None
+
+
+@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -998,7 +1010,16 @@ class ResponseGenerator:
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images, videos))
+        self.requests.put(
+            QueuedGenerationRequest(
+                rqueue=rqueue,
+                raw_inputs=raw_inputs,
+                prompt_tokens=prompt_tokens,
+                args=args,
+                images=images,
+                videos=videos,
+            )
+        )
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -1169,15 +1190,6 @@ class ResponseGenerator:
             )
         return input_ids, gen_kwargs
 
-    @staticmethod
-    def _normalize_request_item(item):
-        if not isinstance(item, tuple):
-            return item
-        if len(item) == 5:
-            rqueue, raw_inputs, prompt_tokens, args, images = item
-            return rqueue, raw_inputs, prompt_tokens, args, images, None
-        return item
-
     def _collect_pending_requests(
         self,
         *,
@@ -1195,7 +1207,7 @@ class ResponseGenerator:
                 if self._stop and not pending:
                     should_stop = True
                 return
-            pending.append(self._normalize_request_item(item))
+            pending.append(item)
 
         try:
             if active:
@@ -1284,15 +1296,12 @@ class ResponseGenerator:
                         batch_gen.close()
                         batch_gen = None
 
-                for item in new_items:
-                    (
-                        rqueue,
-                        raw_inputs,
-                        prompt_tokens,
-                        args,
-                        images,
-                        _videos,
-                    ) = self._normalize_request_item(item)
+                for request in new_items:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
+                    images = request.images
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -1405,15 +1414,11 @@ class ResponseGenerator:
                 if should_stop:
                     break
                 cancelled |= self._drain_cancellations()
-                for item in new_items:
-                    (
-                        rqueue,
-                        raw_inputs,
-                        prompt_tokens,
-                        args,
-                        _images,
-                        _videos,
-                    ) = self._normalize_request_item(item)
+                for request in new_items:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
                     uid_counter += 1
                     uid = uid_counter
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -1639,15 +1644,12 @@ class ResponseGenerator:
                 if hasattr(lm, "_rope_deltas"):
                     lm._rope_deltas = None
 
-                for item in pending:
-                    (
-                        rqueue,
-                        raw_inputs,
-                        prompt_tokens,
-                        args,
-                        images,
-                        _videos,
-                    ) = self._normalize_request_item(item)
+                for request in pending:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
+                    images = request.images
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -1783,8 +1785,7 @@ class ResponseGenerator:
                     token_dtype=mx.int32,
                     stop_check=stop_check,
                     greedy_sampling=all(
-                        self._normalize_request_item(item)[3].temperature == 0
-                        for item in pending
+                        request.args.temperature == 0 for request in pending
                     ),
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
@@ -1854,7 +1855,9 @@ class ResponseGenerator:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
-                error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
+                error_queues.update(
+                    {id(request.rqueue): request.rqueue for request in pending}
+                )
                 _notify_queues(error_queues.values(), e, None)
                 mx.clear_cache()
                 gc.collect()
