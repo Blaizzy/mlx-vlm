@@ -434,6 +434,16 @@ class TestGenerationBatch:
             [7],
         ]
 
+    def test_capture_rope_deltas_prefers_prompt_kwargs(self):
+        from mlx_vlm.generate import PromptProcessingBatch
+
+        captured = PromptProcessingBatch._capture_rope_deltas_from_prompt_kwargs(
+            {"rope_deltas": mx.array([[5], [7]], dtype=mx.int32)},
+            SimpleNamespace(_rope_deltas=mx.array([[99], [99]], dtype=mx.int32)),
+            2,
+        )
+        assert captured.tolist() == [[5], [7]]
+
 
 # ============================================================================
 # Tests for Helper Functions
@@ -1976,6 +1986,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "inputs_embeds": mx.ones((1, length, 3)) * (i + 1),
                 "per_layer_inputs": mx.ones((1, length, 2, 5)) * (i + 1),
                 "attention_mask": mx.ones((1, length), dtype=mx.int32),
+                "position_ids": mx.ones((1, length, 3), dtype=mx.int32) * (i + 1),
                 "pixel_values": mx.ones((1, 3, 2, 2)) * (i + 1),
                 "keep_tensor": mx.array([[i + 1]], dtype=mx.int32),
                 "rope_deltas": mx.array([[i + 10]], dtype=mx.int32),
@@ -2004,12 +2015,15 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     assert captured["inputs_embeds"].shape == (4, 4, 3)
     assert prompt_kwargs["per_layer_inputs"].shape == (4, 4, 2, 5)
     assert prompt_kwargs["attention_mask"].shape == (4, 4)
+    assert prompt_kwargs["position_ids"].shape == (4, 4, 3)
     assert prompt_kwargs["pixel_values"].shape == (4, 3, 2, 2)
     assert prompt_kwargs["keep_tensor"].shape == (4, 1)
     assert prompt_kwargs["rope_deltas"].shape == (4, 1)
     assert "_apc_tenant" not in prompt_kwargs
     assert prompt_kwargs["per_layer_inputs"][0, :, 0, 0].tolist() == [0, 0, 1, 1]
     assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
+    assert prompt_kwargs["position_ids"][0, :, 0].tolist() == [0, 0, 1, 1]
+    assert prompt_kwargs["position_ids"][3, :, 0].tolist() == [0, 0, 0, 4]
 
 
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():

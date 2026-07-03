@@ -1913,38 +1913,10 @@ class PromptProcessingBatch:
             gen_batch._next_top_lp = top_lp
 
         language_model = getattr(self.model, "language_model", self.model)
-        rope_deltas = self._capture_rope_deltas(language_model, len(gen_batch.uids))
+        rope_deltas = self._capture_rope_deltas_from_prompt_kwargs(
+            call_kwargs, language_model, len(gen_batch.uids)
+        )
         if rope_deltas is not None:
-            # Normalize to shape (B, 1) so extend/filter stay consistent.
-            if rope_deltas.ndim == 0:
-                rope_deltas = rope_deltas.reshape(1, 1)
-            elif rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas[:, None]
-            # When a warm-start batch reuses the model's cached _rope_deltas
-            # (computed during a previous prefill with a smaller batch), the
-            # batch dim won't match this prompt batch's row count. Realign
-            # so extend()/filter() down the line stay consistent with the
-            # generation batch's row count.
-            target_b = first_tokens.shape[0]
-            if rope_deltas.shape[0] != target_b:
-                if rope_deltas.shape[0] == 1:
-                    rope_deltas = mx.broadcast_to(
-                        rope_deltas, (target_b, rope_deltas.shape[1])
-                    )
-                elif rope_deltas.shape[0] < target_b:
-                    pad = target_b - rope_deltas.shape[0]
-                    rope_deltas = mx.concatenate(
-                        [
-                            rope_deltas,
-                            mx.broadcast_to(
-                                rope_deltas[-1:],
-                                (pad, rope_deltas.shape[1]),
-                            ),
-                        ],
-                        axis=0,
-                    )
-                else:
-                    rope_deltas = rope_deltas[:target_b]
             gen_batch._rope_deltas = rope_deltas
 
         # Final prefill produces the first generated token and mutates the
@@ -2025,6 +1997,19 @@ class PromptProcessingBatch:
         rope_deltas = language_model._rope_deltas
         if rope_deltas is None:
             return mx.zeros((B, 1), dtype=mx.int32)
+        return PromptProcessingBatch._normalize_rope_deltas(rope_deltas, B)
+
+    @staticmethod
+    def _capture_rope_deltas_from_prompt_kwargs(
+        prompt_kwargs: dict, language_model, B: int
+    ):
+        rope_deltas = (prompt_kwargs or {}).get("rope_deltas")
+        if isinstance(rope_deltas, mx.array):
+            return PromptProcessingBatch._normalize_rope_deltas(rope_deltas, B)
+        return PromptProcessingBatch._capture_rope_deltas(language_model, B)
+
+    @staticmethod
+    def _normalize_rope_deltas(rope_deltas: mx.array, B: int):
         if rope_deltas.ndim == 0:
             rope_deltas = rope_deltas.reshape(1, 1)
         elif rope_deltas.ndim == 1:
@@ -3056,7 +3041,10 @@ def _generate_batch(
         input_ids, pixel_values, mask=mask, **data_kwargs
     )
 
-    gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
+    gen_kwargs = {
+        **data_kwargs,
+        **{k: v for k, v in embedding_output.to_dict().items() if v is not None},
+    }
 
     if kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE) is not None:
         policy_kwargs = dict(gen_kwargs)
