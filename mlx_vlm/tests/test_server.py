@@ -87,6 +87,49 @@ def test_chat_completions_endpoint_requires_model(client):
     assert any(err.get("loc") == ["body", "model"] for err in detail)
 
 
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [],
+        [{"role": "user", "content": ""}],
+        [{"role": "user", "content": " \n\t "}],
+        [{"role": "user", "content": [{"type": "text", "text": " "}]}],
+    ],
+)
+def test_chat_completions_endpoint_rejects_empty_effective_input(client, messages):
+    with patch.object(server_openai, "get_cached_model") as mock_get_cached_model:
+        response = client.post(
+            "/chat/completions",
+            json={"model": "demo", "messages": messages},
+        )
+
+    assert response.status_code == 400
+    assert "non-empty message content" in response.json()["detail"]
+    mock_get_cached_model.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "input_value",
+    [
+        "",
+        " \n\t ",
+        [],
+        [{"role": "user", "content": ""}],
+        [{"role": "user", "content": [{"type": "input_text", "text": " "}]}],
+    ],
+)
+def test_responses_endpoint_rejects_empty_effective_input(client, input_value):
+    with patch.object(server_openai, "get_cached_model") as mock_get_cached_model:
+        response = client.post(
+            "/v1/responses",
+            json={"model": "demo", "input": input_value},
+        )
+
+    assert response.status_code == 400
+    assert "non-empty message content" in response.json()["detail"]
+    mock_get_cached_model.assert_not_called()
+
+
 def test_chat_request_schema_requires_model():
     assert "model" in server.ChatRequest.model_json_schema()["required"]
 
