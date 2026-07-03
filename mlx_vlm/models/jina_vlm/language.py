@@ -4,9 +4,12 @@ from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
 
-from ..base import LanguageModelOutput
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..cache import KVCache
 from .config import TextConfig
 

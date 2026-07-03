@@ -4,11 +4,11 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
-from mlx_lm.models.base import create_causal_mask
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    create_causal_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache

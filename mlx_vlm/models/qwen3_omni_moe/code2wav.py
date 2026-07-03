@@ -4,9 +4,9 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.base import scaled_dot_product_attention
 
 from mlx_vlm.models.qwen3_omni_moe.config import Code2WavConfig
+from ..base import scaled_dot_product_attention
 
 
 class SnakeBeta(nn.Module):

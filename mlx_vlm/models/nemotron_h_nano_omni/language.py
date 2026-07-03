@@ -2,11 +2,10 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.nemotron_h import Model as NemotronHForCausalLM
 from mlx_lm.models.nemotron_h import ModelArgs, NemotronHModel
 
-from ..base import LanguageModelOutput
+from ..base import LanguageModelOutput, create_attention_mask, create_ssm_mask
 from ..cache import ArraysCache, KVCache
 
 
