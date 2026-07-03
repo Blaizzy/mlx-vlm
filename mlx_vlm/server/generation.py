@@ -1150,7 +1150,10 @@ class ResponseGenerator:
         # Remove cache kwargs before passing to BatchGenerator
         data_kwargs.pop("vision_cache", None)
         data_kwargs.pop("_image_key", None)
-        gen_kwargs = {**data_kwargs, **embed.to_dict()}
+        gen_kwargs = {
+            **data_kwargs,
+            **{k: v for k, v in embed.to_dict().items() if v is not None},
+        }
         if images is not None:
             gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
         elif pixel_values is not None:

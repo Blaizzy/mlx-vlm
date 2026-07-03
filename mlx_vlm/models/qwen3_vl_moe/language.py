@@ -653,7 +653,11 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)
-                if self._position_ids is not None and self._position_ids.ndim == 3:
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
                     position_ids = position_ids[None, ...]
                     position_ids = mx.broadcast_to(
                         position_ids, (3, batch_size, seq_length)

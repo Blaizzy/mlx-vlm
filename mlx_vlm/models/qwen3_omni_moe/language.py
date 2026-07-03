@@ -303,9 +303,13 @@ class LanguageModel(nn.Module):
         self.model_type = args.model_type
         self.model = Qwen3VLMoEModel(args)
         self._rope_deltas = None
+        self._position_ids = None
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def make_cache(self):
+        return [KVCache() for _ in self.layers]
 
     def get_rope_index(
         self,
@@ -503,8 +507,10 @@ class LanguageModel(nn.Module):
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
         rope_deltas_kw = kwargs.pop("rope_deltas", None)
-        if pixel_values is not None:
+        pixel_values_videos = kwargs.pop("pixel_values_videos", None)
+        if pixel_values is not None or pixel_values_videos is not None:
             self._rope_deltas = None
+            self._position_ids = None
 
         # Use ``cache._idx`` — the Python-int token counter — instead of
         # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
@@ -520,17 +526,51 @@ class LanguageModel(nn.Module):
             ):
                 cache_offsets = c0.offset
 
-        if position_ids is None and (mask is None or mask.ndim == 2):
-            is_prefill = (
-                cache is None
-                or cache[0] is None
-                or (cache_offsets is None and cache_offset == 0)
-            )
-            if is_prefill or self._rope_deltas is None:
-                position_ids, rope_deltas = self.get_rope_index(
-                    inputs, image_grid_thw, video_grid_thw, mask
+        rope_mask = mask
+        if mask is not None and mask.shape[-1] != inputs.shape[-1]:
+            rope_mask = None
+
+        if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+            recalc_condition = (
+                (
+                    cache is not None
+                    and cache[0] is not None
+                    and (cache_offsets is None and cache_offset == 0)
                 )
-                self._rope_deltas = rope_deltas
+                or (self._rope_deltas is None and rope_deltas_kw is None)
+                or cache is None
+            )
+            if recalc_condition:
+                if self._position_ids is not None:
+                    batch_size, seq_length = inputs.shape
+                    if (
+                        self._position_ids.ndim == 3
+                        and self._position_ids.shape[1] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, :, cache_offset : cache_offset + seq_length
+                        ]
+                    elif (
+                        self._position_ids.ndim == 2
+                        and self._position_ids.shape[0] == batch_size
+                        and self._position_ids.shape[-1] >= cache_offset + seq_length
+                    ):
+                        position_ids = self._position_ids[
+                            :, cache_offset : cache_offset + seq_length
+                        ]
+                    else:
+                        position_ids, rope_deltas = self.get_rope_index(
+                            inputs, image_grid_thw, video_grid_thw, rope_mask
+                        )
+                        self._rope_deltas = rope_deltas
+                        self._position_ids = position_ids
+                else:
+                    position_ids, rope_deltas = self.get_rope_index(
+                        inputs, image_grid_thw, video_grid_thw, rope_mask
+                    )
+                    self._rope_deltas = rope_deltas
+                    self._position_ids = position_ids
             else:
                 batch_size, seq_length = inputs.shape
                 rope_deltas_src = (
@@ -560,9 +600,15 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
+        if position_ids is not None:
+            mx.eval(position_ids)
+
         visual_pos_masks = kwargs.get("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
+
+        if position_ids is not None:
+            mx.eval(position_ids)
 
         out = self.model(
             inputs,

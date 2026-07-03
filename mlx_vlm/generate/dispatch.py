@@ -448,7 +448,19 @@ def parse_arguments():
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
-        help="Enable thinking mode in the chat template (e.g. for Qwen3.5).",
+        help=(
+            "Enable thinking in the chat template. Templates that use "
+            "thinking_mode receive thinking_mode='enabled'."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-mode",
+        choices=("enabled", "disabled", "adaptive"),
+        default=None,
+        help=(
+            "Set the chat-template thinking mode when supported. "
+            "Choices: enabled, disabled, adaptive."
+        ),
     )
     parser.add_argument(
         "--thinking-budget",
@@ -1475,6 +1487,8 @@ def main():
     num_audios = len(args.audio) if args.audio is not None else 0
 
     chat_template_kwargs = {"enable_thinking": args.enable_thinking}
+    if args.thinking_mode is not None:
+        chat_template_kwargs["thinking_mode"] = args.thinking_mode
     if args.video:
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
