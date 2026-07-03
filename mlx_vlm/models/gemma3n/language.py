@@ -8,6 +8,7 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
@@ -154,8 +155,10 @@ class Gemma3nAttention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
-        if isinstance(mask, mx.array) and mask.shape[-1] != keys.shape[-2]:
-            mask = mask[:, : keys.shape[-2]]
+        if isinstance(mask, mx.array):
+            key_len = kv_sequence_length(keys)
+            if mask.shape[-1] != key_len:
+                mask = mask[:, :key_len]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask

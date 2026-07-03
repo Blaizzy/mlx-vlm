@@ -7,6 +7,7 @@ from mlx_lm.models.switch_layers import SwitchGLU
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
@@ -144,7 +145,7 @@ class Glm4vMoeAttention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
