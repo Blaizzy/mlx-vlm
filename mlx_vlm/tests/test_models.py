@@ -8335,3 +8335,51 @@ class TestDeepseekV4HISA(unittest.TestCase):
         flat = (mx.maximum(q @ pooled[:, None].swapaxes(-1, -2), 0) * wk_h).sum(1)
         ftk = mx.argpartition(-flat, kth=k - 1, axis=-1)[..., :k]
         self.assertTrue(bool(mx.array_equal(mx.sort(out, -1), mx.sort(ftk, -1))))
+
+
+class TestQuantizedKVCacheMask(unittest.TestCase):
+    """Mask-length checks must handle quantized KV caches, whose
+    ``update_and_fetch`` returns packed tuples instead of arrays (#1481)."""
+
+    def test_kv_sequence_length(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.base import kv_sequence_length
+        from mlx_vlm.models.cache import KVCache, QuantizedKVCache
+
+        keys = mx.zeros((1, 2, 5, 64))
+        self.assertEqual(kv_sequence_length(keys), 5)
+        quantized = mx.quantize(keys, group_size=64, bits=8)
+        self.assertEqual(kv_sequence_length(quantized), 5)
+
+        config = gemma3.TextConfig(
+            model_type="gemma3",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=64,
+            vocab_size=64,
+            sliding_window=8,
+            sliding_window_pattern=2,
+        )
+        model = gemma3.LanguageModel(config)
+
+        # With --kv-bits the server quantizes global-attention layers from
+        # token 0; sliding layers keep their RotatingKVCache.
+        cache = [
+            QuantizedKVCache(group_size=64, bits=8) if isinstance(c, KVCache) else c
+            for c in model.make_cache()
+        ]
+
+        prompt = mx.arange(12)[None]  # longer than the sliding window
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 12, config.vocab_size))
+
+        decode = model(mx.array([[3]]), cache=cache).logits
+        chunk = model(mx.arange(4)[None], cache=cache).logits  # chunked prefill
+        mx.eval(logits, decode, chunk)
+        self.assertTrue(mx.isfinite(chunk).all().item())
+
+        # The quantized path must actually have been exercised.
+        self.assertIsInstance(cache[1].keys, tuple)
