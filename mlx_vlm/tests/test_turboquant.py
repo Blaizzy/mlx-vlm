@@ -165,6 +165,25 @@ def test_batch_turboquant_filter_supports_uniform_single_item_offsets():
     assert cache.left_padding.tolist() == [0]
 
 
+def test_batch_turboquant_cache_supports_uniform_right_trim():
+    cache = BatchTurboQuantKVCache([0, 1], bits=3.5)
+    keys = mx.ones((2, 2, 5, 8), dtype=mx.float16)
+    values = mx.ones((2, 2, 5, 8), dtype=mx.float16)
+
+    cache.update_and_fetch(keys, values)
+    trimmed = cache.trim(2)
+
+    assert trimmed == 2
+    assert cache.is_trimmable()
+    assert cache._idx == 3
+    assert cache.offset.tolist() == [3, 2]
+    state_keys, state_values, offset, left_padding = cache.state
+    assert state_keys.norms.shape[2] == 3
+    assert state_values.norms.shape[2] == 3
+    assert offset.tolist() == [3, 2]
+    assert left_padding.tolist() == [0, 1]
+
+
 def test_batch_turboquant_extend_pads_shorter_uniform_batch():
     longer = BatchTurboQuantKVCache([0], bits=3.5)
     shorter = BatchTurboQuantKVCache([0], bits=3.5)

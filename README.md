@@ -11,6 +11,8 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash (Qwen3.5)](#dflash-qwen35)
     - [Gemma 4 MTP](#gemma-4-mtp)
+    - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
+    - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
@@ -35,6 +37,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | DOTS-MOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | ERNIE 4.5 VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
@@ -45,8 +48,10 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Phi-4 Multimodal | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/phi4mm/README.md) |
 | MolmoPoint | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/molmo_point/README.md) |
 | LocateAnything | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/locateanything/README.md) |
+| Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
+| MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
@@ -127,7 +132,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 | Flag | Description |
 |------|-------------|
 | `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4) |
+| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
 | `--draft-block-size` | Override the drafter's configured block size |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
@@ -228,6 +233,41 @@ mlx_vlm.generate --model mlx-community/gemma-4-31B-it-bf16 \
 mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
   --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3
 ```
+
+#### MiniMax M3 EAGLE-3
+
+MiniMax M3 supports the released `Inferact/MiniMax-M3-EAGLE3` drafter. Convert
+the target with `mlx_vlm.convert` because `mlx_lm.convert` does not know the
+`minimax_m3_vl` model type.
+
+```sh
+mlx_vlm.convert \
+  --hf-path MiniMaxAI/MiniMax-M3 \
+  --mlx-path ~/MiniMax-M3-4bit \
+  --quantize --q-bits 4 \
+  --trust-remote-code
+
+mlx_vlm.convert \
+  --hf-path Inferact/MiniMax-M3-EAGLE3 \
+  --mlx-path ~/MiniMax-M3-EAGLE3
+
+mlx_vlm.generate \
+  --model ~/MiniMax-M3-4bit \
+  --draft-model ~/MiniMax-M3-EAGLE3 \
+  --draft-kind eagle3 \
+  --draft-block-size 3 \
+  --prompt "Explain MiniMax Sparse Attention in one paragraph." \
+  --max-tokens 256 --temperature 0
+```
+
+The public MiniMax M3 BF16 checkpoint advertises MTP metadata but does not
+publish `mtp` or `nextn` tensors, so use the released EAGLE-3 drafter for that
+checkpoint.
+
+MiniMax M3 also supports image/video prompts, MiniMax thinking tags, MiniMax
+tool-call parsing, MSA index caches, and MXFP8 config loading. See
+[`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
+for model-specific conversion and runtime notes.
 
 ### Chat UI with Gradio
 
@@ -331,6 +371,12 @@ mlx_vlm.server --port 8080
 # Preload a model at startup (Hugging Face repo or local path)
 mlx_vlm.server --model <hf_repo_or_local_path>
 
+# Preload separate model kinds at startup
+mlx_vlm.server --model <language_model> \
+  --image-model <image_generation_model> \
+  --tts-model <text_to_speech_model> \
+  --stt-model <speech_to_text_model>
+
 # Preload a model with adapter
 mlx_vlm.server --model <hf_repo_or_local_path> --adapter-path <adapter_path>
 
@@ -350,10 +396,13 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 #### Server Options
 
-- `--model`: Preload a model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--model`: Preload a language model at server startup, accepts a Hugging Face repo ID or local path (optional, loads lazily on first request if omitted)
+- `--image-model`: Preload an image generation model at server startup
+- `--tts-model`: Preload a text-to-speech model at server startup
+- `--stt-model`: Preload a speech-to-text model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
-- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4)
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
@@ -1139,6 +1188,7 @@ The following models support video chat:
 2. Qwen2.5-VL
 3. Idefics3
 4. LLaVA
+5. MiniMax M3
 
 With more coming soon.
 
@@ -1146,9 +1196,8 @@ With more coming soon.
 
 #### Command Line
 ```sh
-mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
 ```
-
 
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
 

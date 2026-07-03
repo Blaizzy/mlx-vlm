@@ -9,6 +9,7 @@ from mlx_lm.models.switch_layers import SwitchGLU
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -170,7 +171,7 @@ class Attention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -538,6 +539,13 @@ class LanguageModel(nn.Module):
                     text_pos = mx.arange(text_len) + st_idx
                     text_pos_3d = mx.stack([text_pos, text_pos, text_pos], axis=0)
                     llm_pos_ids_list.append(text_pos_3d)
+
+                if not llm_pos_ids_list:
+                    batch_position_ids.append(
+                        mx.zeros((seq_length, 3), dtype=input_ids.dtype)
+                    )
+                    mrope_position_deltas.append(0)
+                    continue
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1)  # [3, seq_len]
                 batch_position_ids.append(llm_positions.T)  # [seq_len, 3]

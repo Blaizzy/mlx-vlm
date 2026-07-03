@@ -7,6 +7,7 @@ import numpy as np
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..rope_utils import (
@@ -144,7 +145,7 @@ class GlmOcrAttention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if mask is not None and isinstance(mask, mx.array):
-            mask = mask[..., : keys.shape[-2]]
+            mask = mask[..., : kv_sequence_length(keys)]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -399,6 +400,10 @@ class LanguageModel(nn.Module):
                     current_pos += max(int(grid_thw[1]), int(grid_thw[2])) // (
                         spatial_merge_size
                     )
+
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
 
                 llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 position_ids_np[:, batch_idx, valid_indices] = llm_positions

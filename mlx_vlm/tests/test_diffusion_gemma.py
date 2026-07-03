@@ -5,6 +5,7 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -56,6 +57,7 @@ def tiny_config_dict():
 
 class FakeTokenizer:
     all_special_ids = []
+    eos_token_ids = [999999]
 
     def __init__(self):
         self.stopping_criteria = StoppingCriteria([999999], self)
@@ -102,6 +104,12 @@ class TinyDiffusionGemma4Tokenizer:
     model_input_names = ["input_ids", "attention_mask"]
 
     def __init__(self):
+        self.additional_special_tokens = []
+        self.stc_token = None
+        self.etc_token = None
+        self.escape_token = None
+        self.soc_token = None
+        self.eoc_token = None
         self.special_tokens = {
             self.image_token: self.image_token_id,
             self.video_token: self.video_token_id,
@@ -110,6 +118,25 @@ class TinyDiffusionGemma4Tokenizer:
             self.pad_token: self.pad_token_id,
             self.eos_token: self.eos_token_id,
         }
+
+    @property
+    def all_special_ids(self):
+        additional_ids = [
+            self.convert_tokens_to_ids(token)
+            for token in self.additional_special_tokens
+        ]
+        attr_ids = [
+            self.convert_tokens_to_ids(token)
+            for token in (
+                self.stc_token,
+                self.etc_token,
+                self.escape_token,
+                self.soc_token,
+                self.eoc_token,
+            )
+            if token is not None
+        ]
+        return additional_ids + attr_ids
 
     def convert_tokens_to_ids(self, token):
         return self.special_tokens.get(token, self.unk_token_id)
@@ -277,14 +304,12 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertLess(float(max_diff.item()), 1e-6)
 
     def test_precomputed_self_conditioning_embeddings_match_logits_path(self):
-        from mlx_vlm.generate.diffusion import (
-            _diffusion_entropy_and_soft_embeddings,
-            _diffusion_token_entropy,
-        )
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
         config = ModelConfig.from_dict(tiny_config_dict())
         model = Model(config)
+        decoder = model.model.decoder
+        decoder.embed_tokens.weight = decoder.embed_tokens.weight.astype(mx.bfloat16)
         input_ids = mx.array([[2, 3, 4, 5]], dtype=mx.int32)
         canvas_ids = mx.array([[6, 7, 8]], dtype=mx.int32)
         self_conditioning_logits = mx.linspace(
@@ -292,17 +317,18 @@ class TestDiffusionGemma4(unittest.TestCase):
             0.5,
             config.text_config.vocab_size * canvas_ids.shape[-1],
         ).reshape(1, canvas_ids.shape[-1], -1)
-
-        entropy, self_conditioning_embeddings = _diffusion_entropy_and_soft_embeddings(
-            self_conditioning_logits,
-            model.model.decoder.embed_tokens.weight,
-            model.model.decoder.embed_scale,
+        stored_self_conditioning_logits = self_conditioning_logits.astype(
+            decoder.embed_tokens.weight.dtype
         )
-        expected_entropy = _diffusion_token_entropy(self_conditioning_logits)
+
+        self_conditioning_embeddings = model.diffusion_self_conditioning(
+            self_conditioning_logits,
+            model.diffusion_prepare_self_conditioning(),
+        ).astype(decoder.embed_tokens.weight.dtype)
         logits_output = model(
             input_ids=input_ids,
             canvas_ids=canvas_ids,
-            self_conditioning_logits=self_conditioning_logits,
+            self_conditioning_logits=stored_self_conditioning_logits,
         ).logits
         embeddings_output = model(
             input_ids=input_ids,
@@ -310,11 +336,9 @@ class TestDiffusionGemma4(unittest.TestCase):
             self_conditioning_embeddings=self_conditioning_embeddings,
         ).logits
         max_diff = mx.max(mx.abs(logits_output - embeddings_output))
-        entropy_diff = mx.max(mx.abs(entropy - expected_entropy))
-        mx.eval(max_diff, entropy_diff)
+        mx.eval(max_diff)
 
         self.assertLess(float(max_diff.item()), 1e-5)
-        self.assertLess(float(entropy_diff.item()), 1e-5)
 
     def test_transformers_58_logits_and_denoising_step_parity_if_available(self):
         try:
@@ -566,6 +590,33 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
 
+    def test_generate_verbose_omits_diffusion_work_stats(self):
+        from mlx_vlm.generate import generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            generate(
+                model,
+                FakeProcessor(),
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+                max_denoising_steps=1,
+                verbose=True,
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Prompt:", output)
+        self.assertIn("Generation:", output)
+        self.assertIn("Peak memory:", output)
+        self.assertNotIn("Diffusion:", output)
+        self.assertNotIn("work tokens", output)
+        self.assertNotIn("work-tokens-per-sec", output)
+
     def test_stream_generate_chunks_diffusion_prefill(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -645,6 +696,44 @@ class TestDiffusionGemma4(unittest.TestCase):
             return [r.token for r in responses if r.token is not None]
 
         self.assertEqual(generated_tokens(None), generated_tokens(2))
+
+    def test_full_precision_generation_uses_model_self_conditioning(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        processor = FakeProcessor()
+
+        self.assertFalse(model.prefers_logits_self_conditioning)
+
+        with (
+            patch.object(
+                model,
+                "diffusion_prepare_self_conditioning",
+                wraps=model.diffusion_prepare_self_conditioning,
+            ) as prepare,
+            patch.object(
+                model,
+                "diffusion_self_conditioning",
+                wraps=model.diffusion_self_conditioning,
+            ) as self_conditioning,
+        ):
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=2,
+                    max_denoising_steps=2,
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 2)
+        prepare.assert_called_once()
+        self_conditioning.assert_called()
 
     def test_stream_generate_keeps_padded_diffusion_prefill_unchunked(self):
         from mlx_vlm.generate import stream_generate
@@ -760,7 +849,7 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].generation_tokens, 4)
         self.assertGreaterEqual(responses[-1].diffusion_canvas_tokens, 3)
 
-    def test_confidence_threshold_sampler_can_exit_after_one_step(self):
+    def test_default_confidence_threshold_sampler_can_exit_after_one_step(self):
         from mlx_vlm.generate import stream_generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -777,7 +866,6 @@ class TestDiffusionGemma4(unittest.TestCase):
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
                 max_denoising_steps=4,
-                diffusion_sampler="confidence-threshold",
                 diffusion_threshold=0.0,
             )
         )
@@ -808,6 +896,7 @@ class TestDiffusionGemma4(unittest.TestCase):
                 "",
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
+                diffusion_sampler="entropy-bound",
             )
         )
 
@@ -833,6 +922,7 @@ class TestDiffusionGemma4(unittest.TestCase):
                 "",
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
+                diffusion_sampler="entropy-bound",
             )
         )
 
@@ -858,6 +948,7 @@ class TestDiffusionGemma4(unittest.TestCase):
                 input_ids=mx.array([[2, 3]], dtype=mx.int32),
                 max_tokens=2,
                 max_denoising_steps=48,
+                diffusion_sampler="entropy-bound",
             )
         )
 
@@ -1100,6 +1191,45 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertIs(processor, sentinel)
         from_pretrained.assert_called_once()
+
+    def test_processor_demotes_tool_parser_tokens_from_specials(self):
+        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+        from mlx_vlm.models.diffusion_gemma.processing_diffusion_gemma import (
+            _TOOL_PARSER_TOKENS,
+        )
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        tokenizer = TinyDiffusionGemma4Tokenizer()
+        tokenizer.special_tokens.update(
+            {token: 70 + i for i, token in enumerate(_TOOL_PARSER_TOKENS)}
+        )
+        tokenizer.special_tokens["<extra_special>"] = 90
+        tokenizer.stc_token = "<|tool_call>"
+        tokenizer.etc_token = "<tool_call|>"
+        tokenizer.escape_token = '<|"|>'
+        tokenizer.soc_token = "<|channel>"
+        tokenizer.eoc_token = "<channel|>"
+        tokenizer.additional_special_tokens = ["<extra_special>"]
+
+        with patch.object(
+            Gemma4Processor,
+            "from_pretrained",
+            return_value=SimpleNamespace(tokenizer=tokenizer),
+        ):
+            processor = DiffusionGemma4Processor.from_pretrained("demo")
+
+        self.assertIs(processor.tokenizer, tokenizer)
+        self.assertEqual(tokenizer.additional_special_tokens, ["<extra_special>"])
+        self.assertEqual(tokenizer.all_special_ids, [90])
+        self.assertIsNone(tokenizer.stc_token)
+        self.assertIsNone(tokenizer.etc_token)
+        self.assertIsNone(tokenizer.escape_token)
+        self.assertIsNone(tokenizer.soc_token)
+        self.assertIsNone(tokenizer.eoc_token)
+        for token in _TOOL_PARSER_TOKENS:
+            self.assertNotEqual(
+                tokenizer.convert_tokens_to_ids(token), tokenizer.unk_token_id
+            )
 
     def test_processor_returns_video_frames_as_pixel_values(self):
         processor = tiny_diffusion_gemma_processor()
@@ -1382,6 +1512,76 @@ class TestDiffusionBlockStreaming(unittest.TestCase):
 
 
 class TestDiffusionGemma4Quantized(unittest.TestCase):
+    def test_quant_predicate_uses_8bit_for_embeddings_and_attention(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        predicate = model.quant_predicate
+        decoder = model.model.decoder
+
+        self.assertEqual(
+            predicate("model.decoder.embed_tokens", decoder.embed_tokens),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertEqual(
+            predicate(
+                "model.decoder.layers.0.self_attn.q_proj",
+                decoder.layers[0].self_attn.q_proj,
+            ),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertEqual(
+            predicate(
+                "model.decoder.layers.0.router.proj",
+                decoder.layers[0].router.proj,
+            ),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertEqual(
+            predicate(
+                "model.decoder.layers.0.mlp.gate_proj",
+                decoder.layers[0].mlp.gate_proj,
+            ),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(
+            predicate(
+                "model.decoder.layers.0.experts.gate_up_proj",
+                decoder.layers[0].experts.gate_up_proj,
+            ),
+            True,
+        )
+
+    def test_diffusion_kwargs_omits_default_confidence_threshold_sampler(self):
+        from types import SimpleNamespace
+
+        from mlx_vlm.generate.diffusion import diffusion_kwargs_from_args
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        args = SimpleNamespace(
+            max_denoising_steps=None,
+            diffusion_full_canvas=False,
+            diffusion_min_canvas_length=None,
+            diffusion_max_canvas_length=None,
+            diffusion_sampler="confidence-threshold",
+            threshold=None,
+        )
+
+        self.assertEqual(diffusion_kwargs_from_args(args, model.config), {})
+
+        args.diffusion_sampler = "entropy-bound"
+        self.assertEqual(
+            diffusion_kwargs_from_args(args, model.config),
+            {"diffusion_sampler": "entropy-bound"},
+        )
+
+        args.threshold = 0.7
+        self.assertEqual(
+            diffusion_kwargs_from_args(args, model.config),
+            {"diffusion_sampler": "entropy-bound", "diffusion_threshold": 0.7},
+        )
+
     def test_stream_generate_with_quantized_embeddings(self):
         import mlx.nn as nn
 
@@ -1391,8 +1591,8 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         mx.random.seed(0)
         config_dict = tiny_config_dict()
         config_dict["text_config"]["hidden_size"] = 32
-        # Several denoising steps so the self-conditioning soft-embedding
-        # path (probs @ embedding table) runs against the quantized table.
+        # Several denoising steps so quantized self-conditioning reuses logits
+        # and avoids materializing a dequantized embedding table.
         config_dict["generation_config"]["max_denoising_steps"] = 3
         config = ModelConfig.from_dict(config_dict)
         model = Model(config)
@@ -1403,20 +1603,35 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
             class_predicate=lambda path, module: isinstance(module, nn.Embedding),
         )
         self.assertIsInstance(model.model.decoder.embed_tokens, nn.QuantizedEmbedding)
+        self.assertTrue(model.prefers_logits_self_conditioning)
 
         processor = FakeProcessor()
-        responses = list(
-            stream_generate(
+        with (
+            patch.object(
                 model,
-                processor,
-                "",
-                input_ids=mx.array([[2, 3]], dtype=mx.int32),
-                max_tokens=2,
+                "diffusion_prepare_self_conditioning",
+                wraps=model.diffusion_prepare_self_conditioning,
+            ) as prepare,
+            patch.object(
+                model,
+                "diffusion_self_conditioning",
+                wraps=model.diffusion_self_conditioning,
+            ) as self_conditioning,
+        ):
+            responses = list(
+                stream_generate(
+                    model,
+                    processor,
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=2,
+                )
             )
-        )
 
         self.assertEqual(responses[-1].generation_tokens, 2)
         self.assertGreater(responses[-1].diffusion_work_tokens, 0)
+        prepare.assert_called_once()
+        self_conditioning.assert_called()
 
     def test_stream_generate_with_mxfp4_quantized_embeddings(self):
         import mlx.nn as nn

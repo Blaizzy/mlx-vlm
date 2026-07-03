@@ -32,9 +32,13 @@ class Model(nn.Module):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            self.language_model._position_ids = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, attention_mask=mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=position_ids,
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -61,15 +65,15 @@ class Model(nn.Module):
             input_ids,
         )
 
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
 
-        return InputEmbeddingsFeatures(inputs_embeds=final_inputs_embeds)
+        return InputEmbeddingsFeatures(
+            inputs_embeds=final_inputs_embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+        )
 
     @staticmethod
     def merge_input_ids_with_image_features(

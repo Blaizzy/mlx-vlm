@@ -449,7 +449,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.async_eval(y, logprobs)
+    mx.eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
@@ -549,7 +549,21 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
 APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
 
 
-def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
+def _is_mrope_position_ids_prompt_kwarg(key: str, v: mx.array) -> bool:
+    return key == "position_ids" and v.ndim == 3 and v.shape[0] == 3
+
+
+def _prompt_kwarg_batch_size(key: str, v: mx.array) -> int:
+    if _is_mrope_position_ids_prompt_kwarg(key, v):
+        return v.shape[1]
+    return v.shape[0] if v.ndim > 0 else 0
+
+
+def _prompt_kwarg_row(key: str, v: mx.array, row_idx: int, batch_size: int) -> mx.array:
+    if _is_mrope_position_ids_prompt_kwarg(key, v):
+        if v.shape[1] == batch_size:
+            return v[:, row_idx : row_idx + 1, :]
+        return v[:, :1, :]
     if v.shape[0] == batch_size:
         return v[row_idx : row_idx + 1]
     return v[:1]
@@ -569,9 +583,9 @@ def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[d
 
     rows = [{} for _ in range(batch_size)]
     for k, v in (prompt_kwargs or {}).items():
-        if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+        if isinstance(v, mx.array) and _prompt_kwarg_batch_size(k, v) >= 1:
             for i in range(batch_size):
-                rows[i][k] = _prompt_kwarg_row(v, i, batch_size)
+                rows[i][k] = _prompt_kwarg_row(k, v, i, batch_size)
         else:
             for row in rows:
                 row[k] = v
@@ -581,23 +595,51 @@ def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[d
 def _is_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, sequence_length: int
 ) -> bool:
-    return (
-        key in _SEQUENCE_ALIGNED_PROMPT_KWARGS
-        and v.ndim >= 2
-        and v.shape[1] == sequence_length
-    )
+    if key not in _SEQUENCE_ALIGNED_PROMPT_KWARGS:
+        return False
+    if _is_mrope_position_ids_prompt_kwarg(key, v):
+        return v.shape[2] == sequence_length
+    return v.ndim >= 2 and v.shape[1] == sequence_length
 
 
 def _pad_sequence_aligned_prompt_kwarg(
-    v: mx.array, target_length: int, *, left: bool
+    key: str, v: mx.array, target_length: int, *, left: bool
 ) -> mx.array:
-    pad = target_length - v.shape[1]
+    sequence_axis = 2 if _is_mrope_position_ids_prompt_kwarg(key, v) else 1
+    pad = target_length - v.shape[sequence_axis]
     if pad <= 0:
         return v
-    pad_shape = (v.shape[0], pad) + tuple(v.shape[2:])
+    pad_shape = tuple(
+        pad if axis == sequence_axis else size for axis, size in enumerate(v.shape)
+    )
     pad_v = mx.zeros(pad_shape, dtype=v.dtype)
     parts = [pad_v, v] if left else [v, pad_v]
-    return mx.concatenate(parts, axis=1)
+    return mx.concatenate(parts, axis=sequence_axis)
+
+
+def _slice_sequence_aligned_prompt_kwarg(
+    key: str, v: mx.array, start: Optional[int] = None, stop: Optional[int] = None
+) -> mx.array:
+    sequence_axis = 2 if _is_mrope_position_ids_prompt_kwarg(key, v) else 1
+    slices = [slice(None)] * v.ndim
+    slices[sequence_axis] = slice(start, stop)
+    return v[tuple(slices)]
+
+
+def _mrope_position_ids_row(v: mx.array) -> mx.array:
+    if _is_mrope_position_ids_prompt_kwarg("position_ids", v):
+        return v
+    if v.ndim == 2:
+        return mx.broadcast_to(v[None, :, :], (3, v.shape[0], v.shape[1]))
+    return v
+
+
+def _concat_prompt_kwarg_rows(key: str, rows: List[mx.array]) -> mx.array:
+    if key == "position_ids" and any(
+        _is_mrope_position_ids_prompt_kwarg(key, row) for row in rows
+    ):
+        return mx.concatenate([_mrope_position_ids_row(row) for row in rows], axis=1)
+    return mx.concatenate(rows, axis=0)
 
 
 def _merge_prefill_prompt_kwargs(
@@ -635,17 +677,17 @@ def _merge_prefill_prompt_kwargs(
         for k, v in kw.items():
             if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
                 continue
-            if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                row_v = _prompt_kwarg_row(v, i, batch_size)
+            if isinstance(v, mx.array) and _prompt_kwarg_batch_size(k, v) >= 1:
+                row_v = _prompt_kwarg_row(k, v, i, batch_size)
                 if _is_sequence_aligned_prompt_kwarg(k, row_v, length):
                     row_v = _pad_sequence_aligned_prompt_kwarg(
-                        row_v, max_length, left=True
+                        k, row_v, max_length, left=True
                     )
                 per_row_keys.setdefault(k, []).append(row_v)
             elif k not in merged_kwargs:
                 merged_kwargs[k] = v
     for k, vs in per_row_keys.items():
-        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+        merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
     return inputs_embeds, merged_kwargs
 
@@ -696,6 +738,10 @@ def _make_cache(
         )
 
     def to_batch_cache(c, quantize=True):
+        # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
+        # index-key side cache) know how to build the correct batch cache.
+        if hasattr(c, "to_batch") and not isinstance(c, cache.KVCache):
+            return c.to_batch(left_padding)
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
@@ -1059,6 +1105,11 @@ class GenerationBatch:
         if self_has_processors or other_has_processors:
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
+        else:
+            self.token_context = []
+            other.token_context = []
+            self.logits_processors = []
+            other.logits_processors = []
 
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
@@ -1529,9 +1580,8 @@ class PromptProcessingBatch:
             for k, v in self._prompt_kwargs.items():
                 if (
                     isinstance(v, mx.array)
-                    and v.ndim >= 2
-                    and v.shape[0] == prompt_batch
-                    and v.shape[1] == prompt_len
+                    and _prompt_kwarg_batch_size(k, v) == prompt_batch
+                    and _is_sequence_aligned_prompt_kwarg(k, v, prompt_len)
                 ):
                     self._prompt_length_aware_keys.append(k)
 
@@ -1722,7 +1772,7 @@ class PromptProcessingBatch:
             return self._prompt_kwargs
         out = dict(self._prompt_kwargs)
         for k in self._prompt_length_aware_keys:
-            out[k] = out[k][:, :n, ...]
+            out[k] = _slice_sequence_aligned_prompt_kwarg(k, out[k], stop=n)
         return out
 
     def prompt_step(self) -> int:
@@ -1751,7 +1801,9 @@ class PromptProcessingBatch:
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         for k in self._prompt_length_aware_keys:
-            self._prompt_kwargs[k] = self._prompt_kwargs[k][:, n:, ...]
+            self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
+                k, self._prompt_kwargs[k], start=n
+            )
         mx.clear_cache()
         return n
 
@@ -1904,38 +1956,10 @@ class PromptProcessingBatch:
             gen_batch._next_top_lp = top_lp
 
         language_model = getattr(self.model, "language_model", self.model)
-        rope_deltas = self._capture_rope_deltas(language_model, len(gen_batch.uids))
+        rope_deltas = self._capture_rope_deltas_from_prompt_kwargs(
+            call_kwargs, language_model, len(gen_batch.uids)
+        )
         if rope_deltas is not None:
-            # Normalize to shape (B, 1) so extend/filter stay consistent.
-            if rope_deltas.ndim == 0:
-                rope_deltas = rope_deltas.reshape(1, 1)
-            elif rope_deltas.ndim == 1:
-                rope_deltas = rope_deltas[:, None]
-            # When a warm-start batch reuses the model's cached _rope_deltas
-            # (computed during a previous prefill with a smaller batch), the
-            # batch dim won't match this prompt batch's row count. Realign
-            # so extend()/filter() down the line stay consistent with the
-            # generation batch's row count.
-            target_b = first_tokens.shape[0]
-            if rope_deltas.shape[0] != target_b:
-                if rope_deltas.shape[0] == 1:
-                    rope_deltas = mx.broadcast_to(
-                        rope_deltas, (target_b, rope_deltas.shape[1])
-                    )
-                elif rope_deltas.shape[0] < target_b:
-                    pad = target_b - rope_deltas.shape[0]
-                    rope_deltas = mx.concatenate(
-                        [
-                            rope_deltas,
-                            mx.broadcast_to(
-                                rope_deltas[-1:],
-                                (pad, rope_deltas.shape[1]),
-                            ),
-                        ],
-                        axis=0,
-                    )
-                else:
-                    rope_deltas = rope_deltas[:target_b]
             gen_batch._rope_deltas = rope_deltas
 
         # Final prefill produces the first generated token and mutates the
@@ -2016,6 +2040,19 @@ class PromptProcessingBatch:
         rope_deltas = language_model._rope_deltas
         if rope_deltas is None:
             return mx.zeros((B, 1), dtype=mx.int32)
+        return PromptProcessingBatch._normalize_rope_deltas(rope_deltas, B)
+
+    @staticmethod
+    def _capture_rope_deltas_from_prompt_kwargs(
+        prompt_kwargs: dict, language_model, B: int
+    ):
+        rope_deltas = (prompt_kwargs or {}).get("rope_deltas")
+        if isinstance(rope_deltas, mx.array):
+            return PromptProcessingBatch._normalize_rope_deltas(rope_deltas, B)
+        return PromptProcessingBatch._capture_rope_deltas(language_model, B)
+
+    @staticmethod
+    def _normalize_rope_deltas(rope_deltas: mx.array, B: int):
         if rope_deltas.ndim == 0:
             rope_deltas = rope_deltas.reshape(1, 1)
         elif rope_deltas.ndim == 1:
@@ -2090,7 +2127,6 @@ class BatchGenerator:
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
         if self.draft_model is not None:
-            apc_manager = None
             compute_logprobs = False
             top_logprobs_k = 0
             self.compute_logprobs = False
@@ -2356,11 +2392,14 @@ class BatchGenerator:
             for k, v in kw.items():
                 if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
-                if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                    row_v = _prompt_kwarg_row(v, i, batch_size)
+                if isinstance(v, mx.array) and _prompt_kwarg_batch_size(k, v) >= 1:
+                    row_v = _prompt_kwarg_row(k, v, i, batch_size)
                     if _is_sequence_aligned_prompt_kwarg(k, row_v, full_len):
-                        row_v = row_v[:, prefix_len:, ...]
+                        row_v = _slice_sequence_aligned_prompt_kwarg(
+                            k, row_v, start=prefix_len
+                        )
                         row_v = _pad_sequence_aligned_prompt_kwarg(
+                            k,
                             row_v,
                             max_suffix_len,
                             left=False,
@@ -2369,7 +2408,7 @@ class BatchGenerator:
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
-            merged_kwargs[k] = mx.concatenate(vs, axis=0)
+            merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
         if apc_mode == "exact":
@@ -3048,7 +3087,10 @@ def _generate_batch(
         input_ids, pixel_values, mask=mask, **data_kwargs
     )
 
-    gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
+    gen_kwargs = {
+        **data_kwargs,
+        **{k: v for k, v in embedding_output.to_dict().items() if v is not None},
+    }
 
     if kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE) is not None:
         policy_kwargs = dict(gen_kwargs)

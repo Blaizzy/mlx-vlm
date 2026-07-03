@@ -303,10 +303,12 @@ def _response_output_items_from_text(
     tool_registry: Dict[str, str],
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    reasoning_item_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text, thinking_start_token, thinking_end_token
     )
+    reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
         tc = process_tool_calls(full_text, tool_module, chat_tools)
         if tc["calls"]:
@@ -319,7 +321,7 @@ def _response_output_items_from_text(
                 thinking_end_token,
             )
             remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
-            return items, remaining, reasoning, "tool_calls"
+            return reasoning_items + items, remaining, reasoning, "tool_calls"
     item = {
         "id": message_id,
         "type": "message",
@@ -329,7 +331,22 @@ def _response_output_items_from_text(
     }
     if reasoning:
         item["reasoning"] = reasoning
-    return [item], content, reasoning, "stop"
+    return reasoning_items + [item], content, reasoning, "stop"
+
+
+def _reasoning_output_items(
+    reasoning: Optional[str],
+    item_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not reasoning:
+        return []
+    return [
+        {
+            "id": item_id or f"rs_{uuid.uuid4().hex}",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }
+    ]
 
 
 def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:

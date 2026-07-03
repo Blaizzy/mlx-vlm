@@ -434,6 +434,16 @@ class TestGenerationBatch:
             [7],
         ]
 
+    def test_capture_rope_deltas_prefers_prompt_kwargs(self):
+        from mlx_vlm.generate import PromptProcessingBatch
+
+        captured = PromptProcessingBatch._capture_rope_deltas_from_prompt_kwargs(
+            {"rope_deltas": mx.array([[5], [7]], dtype=mx.int32)},
+            SimpleNamespace(_rope_deltas=mx.array([[99], [99]], dtype=mx.int32)),
+            2,
+        )
+        assert captured.tolist() == [[5], [7]]
+
 
 # ============================================================================
 # Tests for Helper Functions
@@ -816,6 +826,37 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
 
+    def test_generation_batch_extend_discards_inactive_stale_processor_state(self):
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        finished_structured = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[None],
+        )
+        plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        finished_structured.extend(plain)
+
+        assert finished_structured.token_context == []
+        assert finished_structured.logits_processors == []
+        finished_structured.filter([1])
+        assert finished_structured.uids == [1]
+
     def test_generation_batch_extend_promotes_singleton_kv_cache(self):
         def make_kv_cache(value):
             c = KVCache()
@@ -985,6 +1026,23 @@ class TestBatchGenerate:
                     prompts=["alpha", "beta", "gamma"],
                     max_tokens=5,
                 )
+
+    def test_split_prompt_kwargs_handles_native_mrope_position_ids(self):
+        batch_size = 2
+        seq_len = 4
+        position_ids = mx.arange(3 * batch_size * seq_len, dtype=mx.int32).reshape(
+            3, batch_size, seq_len
+        )
+
+        rows = ar_module._split_prompt_kwargs_per_row(
+            {"position_ids": position_ids}, batch_size
+        )
+
+        assert len(rows) == batch_size
+        assert rows[0]["position_ids"].shape == (3, 1, seq_len)
+        assert rows[1]["position_ids"].shape == (3, 1, seq_len)
+        assert rows[0]["position_ids"].tolist() == position_ids[:, :1, :].tolist()
+        assert rows[1]["position_ids"].tolist() == position_ids[:, 1:2, :].tolist()
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -1758,7 +1816,8 @@ def test_generate_cli_smoke(capsys):
         quantize_activations=False,
         processor_kwargs={},
         prefill_step_size=128,
-        enable_thinking=False,
+        enable_thinking=True,
+        thinking_mode=None,
         thinking_budget=None,
         thinking_start_token="<think>",
         thinking_end_token="</think>",
@@ -1783,8 +1842,10 @@ def test_generate_cli_smoke(capsys):
     ):
         dispatch_module.main()
 
-    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is False
-    assert mock_generate.call_args.kwargs["enable_thinking"] is False
+    assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_apply_chat_template.call_args.kwargs
+    assert mock_generate.call_args.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in mock_generate.call_args.kwargs
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
@@ -1942,6 +2003,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "inputs_embeds": mx.ones((1, length, 3)) * (i + 1),
                 "per_layer_inputs": mx.ones((1, length, 2, 5)) * (i + 1),
                 "attention_mask": mx.ones((1, length), dtype=mx.int32),
+                "position_ids": mx.ones((3, 1, length), dtype=mx.int32) * (i + 1),
                 "pixel_values": mx.ones((1, 3, 2, 2)) * (i + 1),
                 "keep_tensor": mx.array([[i + 1]], dtype=mx.int32),
                 "rope_deltas": mx.array([[i + 10]], dtype=mx.int32),
@@ -1970,12 +2032,50 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     assert captured["inputs_embeds"].shape == (4, 4, 3)
     assert prompt_kwargs["per_layer_inputs"].shape == (4, 4, 2, 5)
     assert prompt_kwargs["attention_mask"].shape == (4, 4)
+    assert prompt_kwargs["position_ids"].shape == (3, 4, 4)
     assert prompt_kwargs["pixel_values"].shape == (4, 3, 2, 2)
     assert prompt_kwargs["keep_tensor"].shape == (4, 1)
     assert prompt_kwargs["rope_deltas"].shape == (4, 1)
     assert "_apc_tenant" not in prompt_kwargs
     assert prompt_kwargs["per_layer_inputs"][0, :, 0, 0].tolist() == [0, 0, 1, 1]
     assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
+    assert prompt_kwargs["position_ids"][0, 0].tolist() == [0, 0, 1, 1]
+    assert prompt_kwargs["position_ids"][0, 3].tolist() == [0, 0, 0, 4]
+
+
+def test_cold_batch_merges_mixed_text_and_mrope_position_ids():
+    inputs_embeds, prompt_kwargs = ar_module._merge_prefill_prompt_kwargs(
+        [
+            {
+                "inputs_embeds": mx.ones((1, 2, 3)),
+                "position_ids": mx.array([[4, 5]], dtype=mx.int32),
+            },
+            {
+                "inputs_embeds": mx.ones((1, 3, 3)) * 2,
+                "position_ids": mx.ones((3, 1, 3), dtype=mx.int32) * 7,
+            },
+        ],
+        [[1, 2], [3, 4, 5]],
+    )
+
+    assert inputs_embeds.shape == (2, 3, 3)
+    assert prompt_kwargs["position_ids"].shape == (3, 2, 3)
+    assert prompt_kwargs["position_ids"][0, 0].tolist() == [0, 4, 5]
+    assert prompt_kwargs["position_ids"][1, 0].tolist() == [0, 4, 5]
+    assert prompt_kwargs["position_ids"][2, 0].tolist() == [0, 4, 5]
+    assert prompt_kwargs["position_ids"][0, 1].tolist() == [7, 7, 7]
+
+
+def test_prompt_processing_batch_slices_native_mrope_position_ids():
+    batch = object.__new__(PromptProcessingBatch)
+    position_ids = mx.arange(3 * 2 * 5, dtype=mx.int32).reshape(3, 2, 5)
+    batch._prompt_kwargs = {"position_ids": position_ids}
+    batch._prompt_length_aware_keys = ["position_ids"]
+
+    step_kwargs = batch._prompt_kwargs_for_step(2)
+
+    assert step_kwargs["position_ids"].shape == (3, 2, 2)
+    assert step_kwargs["position_ids"].tolist() == position_ids[:, :, :2].tolist()
 
 
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
