@@ -3,11 +3,7 @@ import os
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
-# transformers >= 5.13 tightened AutoTokenizer.register to require a config
-# *class* (it reads ``key.__module__``); mlx_lm still registers a custom
-# tokenizer by string model_type, which raises at import time. Tolerate string
-# keys here — before mlx_lm is imported below — so mlx-vlm works across the
-# transformers 5.5–5.13 range without pinning the dependency down.
+
 try:
     from transformers.models.auto import auto_factory as _hf_auto_factory
 
