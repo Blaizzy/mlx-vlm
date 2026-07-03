@@ -56,6 +56,9 @@ def _make_tool_parser_tokens_non_special(tokenizer):
 
 class DiffusionGemma4Processor(Gemma4Processor):
     model_type = "diffusion_gemma"
+    image_processor_class = "Gemma4ImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+    video_processor_class = "Gemma4VideoProcessor"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

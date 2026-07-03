@@ -259,6 +259,71 @@ class TestDiffusionGemma4(unittest.TestCase):
             generation_config,
         )
 
+    def test_auto_processor_loads_multimodal_processor(self):
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+        from mlx_vlm.models.gemma4.processing_gemma4 import (
+            Gemma4ImageProcessor,
+            Gemma4VideoProcessor,
+        )
+
+        tokenizer = TinyDiffusionGemma4Tokenizer()
+        tokenizer.chat_template = None
+
+        with TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / "config.json").write_text(
+                json.dumps({"model_type": "diffusion_gemma"}),
+                encoding="utf-8",
+            )
+            (model_dir / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "audio_ms_per_token": 40,
+                        "audio_seq_length": 750,
+                        "image_processor": {
+                            "do_normalize": False,
+                            "image_processor_type": "Gemma4ImageProcessor",
+                            "max_soft_tokens": 140,
+                            "patch_size": 16,
+                            "pooling_kernel_size": 3,
+                        },
+                        "image_seq_length": 140,
+                        "processor_class": "DiffusionGemma4Processor",
+                        "video_processor": {
+                            "max_soft_tokens": 70,
+                            "num_frames": 8,
+                            "video_processor_type": "Gemma4VideoProcessor",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=tokenizer,
+                ),
+                patch(
+                    "transformers.processing_utils.ProcessorMixin."
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor, DiffusionGemma4Processor)
+        self.assertIsInstance(processor.image_processor, Gemma4ImageProcessor)
+        self.assertIsInstance(processor.video_processor, Gemma4VideoProcessor)
+        self.assertEqual(processor.image_processor.max_soft_tokens, 140)
+        self.assertEqual(processor.video_processor.num_frames, 8)
+        self.assertEqual(
+            DiffusionGemma4Processor.get_attributes(),
+            ["image_processor", "tokenizer", "video_processor"],
+        )
+
     def test_forward_shape(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
