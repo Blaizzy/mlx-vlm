@@ -4,8 +4,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
 
+from ..activations import swiglu
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, StaticPrefixKVCache
 from ..diffusion_visualizer import DiffusionUnmaskingVisualizer

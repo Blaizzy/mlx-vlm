@@ -3,9 +3,9 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
 from mlx_lm.models.mla import MultiLinear
 
+from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
