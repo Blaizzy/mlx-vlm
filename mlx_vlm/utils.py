@@ -1415,11 +1415,6 @@ def load_audio(
     return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
-def normalize_audio_features(features: mx.array) -> mx.array:
-    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
-    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
-
-
 def load_video(
     video_path: str,
     fps: float = 2.0,
@@ -1666,16 +1661,9 @@ def prepare_inputs(
                 images = padded_images
 
     # Process audio
-    is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
-
-        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
-        lossy_extensions = {".mp3", ".m4a"}
-        is_lossy_audio = any(
-            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
-        )
 
         if len(audio) > 1:
             print(
@@ -1777,15 +1765,6 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
-
-    if is_lossy_audio and "input_features" in model_inputs:
-        f = model_inputs["input_features"]
-        if isinstance(f, list):
-            model_inputs["input_features"] = [
-                normalize_audio_features(mx.array(x)) for x in f
-            ]
-        else:
-            model_inputs["input_features"] = normalize_audio_features(f)
 
     return model_inputs
 
