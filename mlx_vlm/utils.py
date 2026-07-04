@@ -564,23 +564,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     # Sanitize weights
     weights = sanitize_weights(model, weights)
 
-    if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
-        weights = sanitize_weights(model.thinker, weights)
-        weights = sanitize_weights(model.thinker.vision_tower, weights)
-        weights = sanitize_weights(model.thinker.audio_tower, weights)
-        weights = sanitize_weights(model.thinker.language_model, weights)
-        weights = sanitize_weights(model.code2wav, weights)
-        weights = sanitize_weights(model.talker, weights)
-    else:
-        if hasattr(model_class, "VisionModel"):
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
             weights = sanitize_weights(
                 model_class.VisionModel, weights, model_config.vision_config
             )
-        if hasattr(model_class, "LanguageModel"):
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
             weights = sanitize_weights(
                 model_class.LanguageModel, weights, model_config.text_config
             )
-        if hasattr(model_class, "AudioModel"):
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
             weights = sanitize_weights(
                 model_class.AudioModel, weights, model_config.audio_config
             )
