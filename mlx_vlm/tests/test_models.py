@@ -2804,6 +2804,23 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_molmo_point_config_accepts_eos_token_id(self):
+        from mlx_vlm.models import molmo_point
+        from mlx_vlm.utils import apply_generation_config_defaults
+
+        config = molmo_point.ModelConfig.from_dict(
+            {
+                "model_type": "molmo_point",
+                "eos_token_id": 151645,
+            }
+        )
+
+        self.assertEqual(config.eos_token_id, 151645)
+
+        apply_generation_config_defaults(config, {"eos_token_id": [151645, 151646]})
+
+        self.assertEqual(config.eos_token_id, [151645, 151646])
+
     def test_molmo2_sanitizes_non_finite_image_features(self):
         from mlx_vlm.models.molmo2.molmo2 import (
             MAX_FLOAT16_IMAGE_FEATURE,
