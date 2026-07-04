@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from mlx_lm.utils import quantize_model
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
@@ -228,6 +227,8 @@ def test_update_module_configs():
 
 
 def test_quantize_module():
+    from mlx_lm.utils import quantize_model
+
     class DummyModule(nn.Module):
         def __init__(self, shape):
             super().__init__()

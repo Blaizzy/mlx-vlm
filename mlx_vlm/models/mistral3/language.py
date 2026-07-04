@@ -2,7 +2,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.rope_utils import initialize_rope
 
 from ..base import (
     LanguageModelOutput,
@@ -12,6 +11,7 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mistral4.language import Mistral4Model, _get_llama_4_attn_scale
 from ..pixtral.language import Mistral
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 

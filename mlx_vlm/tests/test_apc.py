@@ -50,7 +50,7 @@ def _assert_allclose(a: mx.array, b: mx.array) -> None:
 
 
 def _make_exact_row_cache(prefix_len: int):
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache
 
     arrays = ArraysCache(size=2)
     arrays.cache = [
@@ -256,7 +256,7 @@ def test_layer_major_memory_threshold_skips_block_pool(monkeypatch):
 
 
 def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
-    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
 
     warm = _make_exact_row_cache(12)
     cold = _make_exact_row_cache(0)
@@ -293,9 +293,8 @@ def test_exact_batch_cache_merge_and_extract_supports_arrays_and_kv():
 
 
 def test_single_row_prompt_batch_exact_checkpoint_stores_without_extract():
-    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
-
     from mlx_vlm.generate.ar import PromptProcessingBatch
+    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
     token_ids = list(range(12))
     arrays = ArraysCache(size=1)
@@ -519,7 +518,7 @@ def test_make_warm_batch_kv_cache_single_row_shapes():
 
 
 def test_exact_cache_supports_mixed_kv_and_arrays_cache():
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache
 
     block_size = 16
     manager = APCManager(num_blocks=4, block_size=block_size)
@@ -559,7 +558,7 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
 
 
 def test_exact_cache_supports_rotating_and_chunked_kv_cache():
-    from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
+    from mlx_vlm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
 
     block_size = 16
     manager = APCManager(num_blocks=4, block_size=block_size)
@@ -610,7 +609,7 @@ def test_exact_cache_supports_rotating_and_chunked_kv_cache():
 
 
 def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
-    from mlx_lm.models.cache import ArraysCache, KVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache
 
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
 
@@ -650,7 +649,7 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
 
 
 def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
-    from mlx_lm.models.cache import KVCache, RotatingKVCache
+    from mlx_vlm.models.cache import KVCache, RotatingKVCache
 
     monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "0")
 
@@ -692,7 +691,7 @@ def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
 
 
 def test_model_apc_mode_distinguishes_block_and_exact_custom_cache():
-    from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
+    from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
     assert model_apc_mode(object()) == "block"
 
@@ -901,7 +900,7 @@ def test_adjust_prefix_returns_zero_when_no_text_suffix_remains():
 def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
     """After a disk restore, the entry is written to _exact_cache so the next
     identical request is served from memory (disk_hits stays unchanged)."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(40))
     kv = KVCache()
@@ -946,7 +945,7 @@ def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
 
 def test_exact_disk_hit_promotion_skipped_when_memory_disabled(tmp_path, monkeypatch):
     """When _exact_cache_max == 0 the disk hit still works; no promotion attempted."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(20))
     kv = KVCache()
@@ -983,7 +982,7 @@ def test_exact_disk_hit_promotion_lru_eviction(tmp_path, monkeypatch):
     """When _exact_cache_max=1 and a second distinct prefix is promoted, the
     first promoted entry is evicted from memory and subsequent requests for it
     go back to disk."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     def _make_kv(val, n):
         kv = KVCache()
@@ -1038,7 +1037,7 @@ def test_exact_lookup_memory_takes_priority_over_disk(tmp_path, monkeypatch):
     (skip insert if key already present) is implicitly exercised: because
     store_exact_cache writes to both memory and disk, any subsequent lookup
     hits memory first and never triggers a disk read."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(30))
 
@@ -1086,7 +1085,7 @@ def test_exact_disk_hit_promotion_clone_is_independent_of_returned_cache(
     """The clone stored in _exact_cache must be a separate object from the
     cache returned to the caller.  Simulating token-generation mutations on the
     returned cache (advancing offset) must not corrupt the stored entry."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(25))
     kv = KVCache()
@@ -1130,7 +1129,7 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     """Promotion must use the correct key when extra_hash != 0, so the
     promoted entry is found on subsequent lookups with the same extra_hash and
     not accidentally served for a different extra_hash."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     token_ids = list(range(30))
     kv = KVCache()

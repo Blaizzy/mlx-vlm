@@ -3,10 +3,10 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.rope_utils import SuScaledRoPE
 
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
+from ..rope_utils import SuScaledRoPE
 
 # Import processor to register it with AutoProcessor
 from . import processing_phi3_v  # noqa: F401

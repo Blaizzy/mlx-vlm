@@ -2,7 +2,6 @@ import math
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.switch_layers import SwitchGLU
 
 import mlx_vlm.models.minimax_m3_vl.language as minimax_language
 from mlx_vlm.models.minimax_m3_vl.config import ModelConfig, TextConfig, VisionConfig
@@ -27,6 +26,7 @@ from mlx_vlm.models.minimax_m3_vl.vision import (
     MiniMaxVisionTransformer,
     _apply_vision_rope,
 )
+from mlx_vlm.models.switch_layers import SwitchGLU
 from mlx_vlm.prompt_utils import apply_chat_template
 
 

@@ -3,8 +3,8 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
 
+from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,

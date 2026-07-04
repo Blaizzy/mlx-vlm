@@ -8,7 +8,6 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_flatten
 from mlx_lm.models.mla import MultiLinear
 from mlx_lm.models.pipeline import PipelineMixin
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -16,6 +15,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import CacheList, PoolingCache, RotatingKVCache
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
