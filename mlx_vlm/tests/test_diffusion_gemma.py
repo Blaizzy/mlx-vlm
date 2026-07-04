@@ -4,7 +4,9 @@ import io
 import json
 import unittest
 from pathlib import Path
+from queue import Queue
 from tempfile import TemporaryDirectory
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1347,6 +1349,55 @@ class TestDiffusionGemma4(unittest.TestCase):
             int(mx.sum(result["mm_token_type_ids"] == 2).item()),
             2,
         )
+
+    def test_processor_video_outputs_can_cross_thread_boundary(self):
+        raw_queue = Queue()
+        result_queue = Queue()
+
+        def run_thread(fn):
+            errors = Queue()
+
+            def wrapped():
+                try:
+                    fn()
+                except BaseException as exc:
+                    errors.put(exc)
+
+            thread = Thread(target=wrapped)
+            thread.start()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+            if not errors.empty():
+                raise errors.get()
+
+        def producer():
+            processor = tiny_diffusion_gemma_processor()
+            raw_queue.put(
+                processor(
+                    text="<video> describe",
+                    videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+                )
+            )
+
+        def consumer():
+            result = raw_queue.get(timeout=5)
+            mx.eval(
+                result["input_ids"],
+                result["attention_mask"],
+                result["mm_token_type_ids"],
+                result["pixel_values"],
+            )
+            result_queue.put(
+                (
+                    result["pixel_values"].shape,
+                    int(mx.sum(result["mm_token_type_ids"] == 2).item()),
+                )
+            )
+
+        run_thread(producer)
+        run_thread(consumer)
+
+        self.assertEqual(result_queue.get(timeout=5), ((2, 3, 4, 4), 2))
 
     def test_apply_chat_template_includes_video_token_for_video_inputs(self):
         from mlx_vlm.prompt_utils import apply_chat_template

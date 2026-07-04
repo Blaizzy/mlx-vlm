@@ -6,7 +6,7 @@ token expansion + ``mm_token_type_ids``), so no torch/torchvision is pulled in.
 Audio inputs are rejected: this model port supports text, images, and videos.
 """
 
-from typing import List, Optional, Union
+from typing import Any, List, Optional, Union
 
 import mlx.core as mx
 import numpy as np
@@ -52,6 +52,31 @@ def _make_tool_parser_tokens_non_special(tokenizer):
         for token in additional_tokens
         if _token_text(token) not in _TOOL_PARSER_TOKENS
     ]
+
+
+def _collect_mx_arrays(value: Any):
+    if isinstance(value, mx.array):
+        return [value]
+    if isinstance(value, BatchFeature):
+        value = value.data
+    if isinstance(value, dict):
+        arrays = []
+        for item in value.values():
+            arrays.extend(_collect_mx_arrays(item))
+        return arrays
+    if isinstance(value, (list, tuple)):
+        arrays = []
+        for item in value:
+            arrays.extend(_collect_mx_arrays(item))
+        return arrays
+    return []
+
+
+def _materialize_mx_arrays(value: Any):
+    arrays = _collect_mx_arrays(value)
+    if arrays:
+        mx.eval(*arrays)
+    return value
 
 
 class DiffusionGemma4Processor(Gemma4Processor):
@@ -161,7 +186,7 @@ class DiffusionGemma4Processor(Gemma4Processor):
                 "Provide `text`, `images`, and/or `videos` for DiffusionGemma4Processor."
             )
         inputs = super().__call__(images=images, text=text, videos=videos, **kwargs)
-        return self._merge_video_pixel_values(inputs)
+        return _materialize_mx_arrays(self._merge_video_pixel_values(inputs))
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):

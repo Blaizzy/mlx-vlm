@@ -62,49 +62,6 @@ def _gemma_thinking_channel_chunks():
     ]
 
 
-def test_materialize_mx_arrays_allows_cross_thread_eval():
-    raw_queue = Queue()
-    result_queue = Queue()
-
-    def run_thread(fn):
-        errors = Queue()
-
-        def wrapped():
-            try:
-                fn()
-            except BaseException as exc:
-                errors.put(exc)
-
-        thread = Thread(target=wrapped)
-        thread.start()
-        thread.join(timeout=5)
-        assert not thread.is_alive()
-        if not errors.empty():
-            raise errors.get()
-
-    def producer():
-        raw_inputs = {
-            "input_ids": mx.array([1, 2, 3]) + 1,
-            "nested": [mx.array([4]) + 2],
-        }
-        raw_queue.put(server_generation._materialize_mx_arrays(raw_inputs))
-
-    def consumer():
-        raw_inputs = raw_queue.get(timeout=5)
-        mx.eval(raw_inputs["input_ids"], raw_inputs["nested"][0])
-        result_queue.put(
-            (
-                raw_inputs["input_ids"].tolist(),
-                raw_inputs["nested"][0].tolist(),
-            )
-        )
-
-    run_thread(producer)
-    run_thread(consumer)
-
-    assert result_queue.get(timeout=5) == ([2, 3, 4], [6])
-
-
 @pytest.mark.parametrize("value", [224, "22", [1.0], [1.5], [True], [1, 2, 3]])
 def test_chat_completions_endpoint_rejects_invalid_resize_shape(client, value):
     response = client.post(
