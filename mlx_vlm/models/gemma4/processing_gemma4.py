@@ -500,10 +500,15 @@ class Gemma4Processor(ProcessorMixin):
             )
 
         # ── Process images ──────────────────────────────────────────────
+        image_kwargs = dict(kwargs.pop("images_kwargs", None) or {})
+        for _k in ("max_soft_tokens", "patch_size", "pooling_kernel_size"):
+            if _k in kwargs:
+                image_kwargs[_k] = kwargs.pop(_k)
+
         image_inputs = {}
         if images is not None:
             images = self.image_processor.fetch_images(images)
-            image_data, num_soft_tokens = self.image_processor(images)
+            image_data, num_soft_tokens = self.image_processor(images, **image_kwargs)
             image_inputs = image_data
 
             if text is not None and num_soft_tokens is not None:
