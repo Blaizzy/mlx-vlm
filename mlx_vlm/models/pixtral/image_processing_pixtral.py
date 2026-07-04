@@ -1,5 +1,3 @@
-"""Torch-free image processor for Pixtral-style vision towers."""
-
 import json
 import math
 from pathlib import Path
