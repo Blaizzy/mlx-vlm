@@ -4,7 +4,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -14,6 +13,7 @@ from ..base import (
 from ..cache import KVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
 

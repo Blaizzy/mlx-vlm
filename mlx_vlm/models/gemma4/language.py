@@ -4,11 +4,11 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
-from mlx_lm.models.base import create_causal_mask
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    create_causal_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
@@ -106,11 +106,11 @@ class GeGLU(nn.Module):
 
 
 class Experts(nn.Module):
-    """Sparse MoE using mlx_lm SwitchGLU with gather_mm."""
+    """Sparse MoE using SwitchGLU with gather_mm."""
 
     def __init__(self, config: TextConfig):
         super().__init__()
-        from mlx_lm.models.switch_layers import SwitchGLU
+        from ..switch_layers import SwitchGLU
 
         self.switch_glu = SwitchGLU(
             input_dims=config.hidden_size,

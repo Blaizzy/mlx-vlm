@@ -5,9 +5,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
-from mlx_lm.models.rope_utils import initialize_rope
 
+from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -15,6 +14,7 @@ from ..base import (
 )
 from ..cache import KVCache
 from ..diffusion_visualizer import DiffusionUnmaskingVisualizer
+from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
 _HAS_METAL = mx.metal.is_available()
