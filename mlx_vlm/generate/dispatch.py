@@ -11,7 +11,6 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
@@ -547,12 +546,15 @@ def maybe_quantize_kv_cache(
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    for index, layer_cache in enumerate(prompt_cache):
+        if (
+            hasattr(layer_cache, "to_quantized")
+            and layer_cache.offset >= quantized_kv_start
+        ):
+            prompt_cache[index] = layer_cache.to_quantized(
+                group_size=kv_group_size,
+                bits=int(kv_bits),
+            )
 
 
 @contextlib.contextmanager

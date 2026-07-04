@@ -2,7 +2,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -11,6 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
 

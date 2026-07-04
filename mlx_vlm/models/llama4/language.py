@@ -2,8 +2,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.rope_utils import initialize_rope
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -12,6 +10,8 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ChunkedKVCache, KVCache
+from ..rope_utils import initialize_rope
+from ..switch_layers import SwitchGLU
 from .config import TextConfig
 
 

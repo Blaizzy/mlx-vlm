@@ -132,7 +132,7 @@ def _clone_cache_entry_for_apc(
     eval_targets: List[mx.array],
 ) -> Optional[Any]:
     """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
-    from mlx_lm.models import cache as lm_cache
+    from .models import cache as lm_cache
 
     if isinstance(c, lm_cache.KVCache):
         out = type(c)()
@@ -251,7 +251,7 @@ def _clone_layer_major_kv_cache_for_apc(
     prefix_len: int,
 ) -> Optional[List[Any]]:
     """Deep-copy layer-major K/V tensors into compact ``KVCache`` entries."""
-    from mlx_lm.models.cache import KVCache
+    from .models.cache import KVCache
 
     if prefix_len <= 0 or len(layer_keys) != len(layer_values):
         return None
@@ -270,7 +270,7 @@ def _clone_layer_major_kv_cache_for_apc(
 
 
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    from mlx_lm.models import cache as lm_cache
+    from .models import cache as lm_cache
 
     if isinstance(
         c,
@@ -290,7 +290,7 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
 
 
 def _cache_entry_supports_block_apc(c: Any) -> bool:
-    from mlx_lm.models import cache as lm_cache
+    from .models import cache as lm_cache
 
     return isinstance(c, lm_cache.KVCache)
 
@@ -1318,7 +1318,7 @@ class DiskBlockStore:
         min_capacity_tokens: Optional[int],
         eval_targets: List[mx.array],
     ) -> Optional[Any]:
-        from mlx_lm.models import cache as lm_cache
+        from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
         if kind == "kv":
@@ -2476,7 +2476,7 @@ class DiskBlockStore:
         arrays: dict[str, mx.array],
         metadata: dict[str, str],
     ) -> bool:
-        from mlx_lm.models import cache as lm_cache
+        from .models import cache as lm_cache
 
         if isinstance(c, lm_cache.KVCache):
             off = int(getattr(c, "offset", 0) or 0)
@@ -3391,7 +3391,7 @@ def make_warm_kv_cache(
     with the cached prefix's K/V state. Used by the single-stream
     ``stream_generate`` path.
     """
-    from mlx_lm.models.cache import KVCache
+    from .models.cache import KVCache
 
     if not matched_blocks:
         return []
@@ -3434,7 +3434,7 @@ def make_warm_kv_cache_from_layers(
     prefix_len: int,
 ) -> List[Any]:
     """Build ``KVCache`` objects from already-concatenated disk-restored K/V."""
-    from mlx_lm.models.cache import KVCache
+    from .models.cache import KVCache
 
     out: List[Any] = []
     for k, v in zip(layer_keys, layer_values):
@@ -3455,7 +3455,7 @@ def make_warm_batch_kv_cache(
     batched continuous-batching path; the resulting cache list can be
     ``extend()``-ed into a running batch.
     """
-    from mlx_lm.models.cache import BatchKVCache
+    from .models.cache import BatchKVCache
 
     if not matched_blocks:
         return []
@@ -3496,7 +3496,7 @@ def make_warm_batch_kv_cache_multi(
       * keys[i, :, left_padding[i]:max_prefix, :] = concatenated block K
       * keys[i, :, :left_padding[i], :] = zeros (will be hidden by mask)
     """
-    from mlx_lm.models.cache import BatchKVCache
+    from .models.cache import BatchKVCache
 
     B = len(picks)
     prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3575,7 +3575,7 @@ def _merge_arrays_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from mlx_lm.models import cache as lm_cache
+    from .models import cache as lm_cache
 
     size = len(entries[0].cache)
     out = lm_cache.ArraysCache(size)
@@ -3601,7 +3601,7 @@ def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from mlx_lm.models import cache as lm_cache
+    from .models import cache as lm_cache
 
     if not entries:
         return None

@@ -56,6 +56,17 @@ class Model(nn.Module):
             self.code2wav = None
             self.has_talker = False
 
+    def sanitize(self, weights):
+        weights = self.thinker.sanitize(weights)
+        weights = self.thinker.vision_tower.sanitize(weights)
+        weights = self.thinker.audio_tower.sanitize(weights)
+        weights = self.thinker.language_model.sanitize(weights)
+        if self.code2wav is not None:
+            weights = self.code2wav.sanitize(weights)
+        if self.talker is not None:
+            weights = self.talker.sanitize(weights)
+        return weights
+
     def get_input_embeddings(
         self,
         input_ids: Optional[mx.array] = None,

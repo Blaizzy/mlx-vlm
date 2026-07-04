@@ -6,7 +6,8 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
+
+from .models.cache import _BaseCache, create_attention_mask, create_causal_mask
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6

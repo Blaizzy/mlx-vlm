@@ -362,6 +362,34 @@ class TestModels(unittest.TestCase):
         )
         self.assertNotIn(f"language_model.{prefix}.experts.0.w1.weight", sanitized)
 
+    def test_lfm2_vl_projector_creates_layernorm_only_when_enabled(self):
+        from mlx_vlm.models import lfm2_vl
+        from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
+
+        def make_projector(use_layernorm):
+            config = lfm2_vl.ModelConfig(
+                model_type="lfm2-vl",
+                text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+                vision_config=lfm2_vl.VisionConfig(),
+                projector_use_layernorm=use_layernorm,
+            )
+            return config, Lfm2VlMultiModalProjector(config)
+
+        in_channels = 768 * (2**2)
+        x = mx.zeros((1, 4, in_channels))
+
+        # LFM2-VL checkpoints omit the flag (defaults True) and ship
+        # layer_norm weights, so the module must exist.
+        config, projector = make_projector(True)
+        self.assertIn("layer_norm", projector.parameters())
+        self.assertEqual(projector(x).shape, (1, 4, config.text_config.hidden_size))
+
+        # LFM2.5-VL checkpoints set the flag to False and ship no
+        # layer_norm weights; strict loading must not require them.
+        config, projector = make_projector(False)
+        self.assertNotIn("layer_norm", projector.parameters())
+        self.assertEqual(projector(x).shape, (1, 4, config.text_config.hidden_size))
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
@@ -2582,10 +2610,11 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
         self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
+        # LFM2.5-VL checkpoints ship no projector layer_norm weights, so the
+        # module must not exist or strict loading would require them.
         parameters = model.multi_modal_projector.parameters()
-        self.assertIn("layer_norm", parameters)
+        self.assertNotIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
@@ -2774,6 +2803,23 @@ class TestModels(unittest.TestCase):
             config.text_config.vocab_size,
             config.text_config.num_hidden_layers,
         )
+
+    def test_molmo_point_config_accepts_eos_token_id(self):
+        from mlx_vlm.models import molmo_point
+        from mlx_vlm.utils import apply_generation_config_defaults
+
+        config = molmo_point.ModelConfig.from_dict(
+            {
+                "model_type": "molmo_point",
+                "eos_token_id": 151645,
+            }
+        )
+
+        self.assertEqual(config.eos_token_id, 151645)
+
+        apply_generation_config_defaults(config, {"eos_token_id": [151645, 151646]})
+
+        self.assertEqual(config.eos_token_id, [151645, 151646])
 
     def test_molmo2_sanitizes_non_finite_image_features(self):
         from mlx_vlm.models.molmo2.molmo2 import (
@@ -6174,19 +6220,30 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
 
-        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
         self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
 
+        # Real LFM2.5-VL checkpoints ship no projector layer_norm weights.
         model.multi_modal_projector.load_weights(
             [
-                ("layer_norm.weight", mx.ones((64,))),
-                ("layer_norm.bias", mx.zeros((64,))),
                 ("linear_1.weight", mx.ones((16, 64))),
                 ("linear_1.bias", mx.zeros((16,))),
                 ("linear_2.weight", mx.ones((16, 16))),
                 ("linear_2.bias", mx.zeros((16,))),
             ]
         )
+
+        # Conversions from when the projector always created the layer_norm
+        # can carry stale weights; sanitize must drop them when disabled.
+        sanitized = model.sanitize(
+            {
+                "model.multi_modal_projector.layer_norm.weight": mx.ones((64,)),
+                "model.multi_modal_projector.layer_norm.bias": mx.zeros((64,)),
+                "model.multi_modal_projector.linear_1.weight": mx.ones((16, 64)),
+            }
+        )
+        self.assertNotIn("multi_modal_projector.layer_norm.weight", sanitized)
+        self.assertNotIn("multi_modal_projector.layer_norm.bias", sanitized)
+        self.assertIn("multi_modal_projector.linear_1.weight", sanitized)
 
     def test_molmo2_input_embeddings(self):
         from mlx_vlm.models import molmo2

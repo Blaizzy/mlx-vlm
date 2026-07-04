@@ -7,7 +7,6 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 
 from ..models import cache
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
@@ -106,12 +105,15 @@ def maybe_quantize_kv_cache(
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    for index, layer_cache in enumerate(prompt_cache):
+        if (
+            hasattr(layer_cache, "to_quantized")
+            and layer_cache.offset >= quantized_kv_start
+        ):
+            prompt_cache[index] = layer_cache.to_quantized(
+                group_size=kv_group_size,
+                bits=int(kv_bits),
+            )
 
 
 @contextlib.contextmanager
