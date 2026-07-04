@@ -439,7 +439,11 @@ class Model(nn.Module):
                 key = key.replace("model.", "", 1)
 
             mapped_key = None
-            if key.startswith("language_model."):
+            if key.startswith("language_model.model."):
+                mapped_key = key
+            elif key.startswith("language_model.lm_head."):
+                mapped_key = key
+            elif key.startswith("language_model."):
                 mapped_key = key.replace("language_model.", "language_model.model.", 1)
             elif key.startswith("lm_head."):
                 mapped_key = key.replace("lm_head.", "language_model.lm_head.", 1)
@@ -452,6 +456,10 @@ class Model(nn.Module):
             elif key.startswith("vit_merger.") or key.startswith("merger."):
                 mapped_key = key
             # Backward compatibility with older naming schemes.
+            elif key.startswith("llm.model."):
+                mapped_key = key.replace("llm.model.", "language_model.model.", 1)
+            elif key.startswith("llm.lm_head."):
+                mapped_key = key.replace("llm.", "language_model.", 1)
             elif key.startswith("llm."):
                 mapped_key = key.replace("llm.", "language_model.model.", 1)
             elif key.startswith("visual."):
