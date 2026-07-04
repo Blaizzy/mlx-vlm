@@ -25,6 +25,7 @@ from transformers.image_utils import (
 )
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
+from transformers.video_processing_utils import BaseVideoProcessor
 
 from ..base import load_chat_template, to_mlx
 
@@ -210,7 +211,7 @@ class Gemma4ImageProcessor(HFBaseImageProcessor):
         return self.preprocess(images, **kwargs)
 
 
-class Gemma4VideoProcessor:
+class Gemma4VideoProcessor(BaseVideoProcessor):
     """Video processor for Gemma 4.
 
     Samples frames, applies the same aspect-ratio preserving resize as images
@@ -372,22 +373,30 @@ class Gemma4Processor(ProcessorMixin):
     """Combined processor for Gemma 4 (image + text + audio + video)."""
 
     model_type = "gemma4"
-    attributes = ["image_processor", "tokenizer"]
+    attributes = ["image_processor", "tokenizer", "video_processor"]
     image_processor_class = "Gemma4ImageProcessor"
     tokenizer_class = "AutoTokenizer"
+    video_processor_class = "Gemma4VideoProcessor"
     valid_kwargs = ["chat_template", "image_seq_length", "audio_seq_length"]
+
+    # Transformers resolves expected processor base classes at runtime. In
+    # torch-free environments, `transformers.BaseVideoProcessor` can point to a
+    # dummy torchvision object even though `video_processing_utils` exposes the
+    # real base class our numpy processor subclasses.
+    def check_argument_for_proper_class(self, argument_name, argument):
+        return type(argument)
 
     def __init__(
         self,
         image_processor=None,
         tokenizer=None,
+        video_processor=None,
         chat_template=None,
         image_seq_length: int = 280,
         audio_seq_length: int = 750,
         **kwargs,
     ):
         feature_extractor = kwargs.pop("feature_extractor", None)
-        video_processor = kwargs.pop("video_processor", None)
 
         if image_processor is None:
             image_processor = Gemma4ImageProcessor()
@@ -439,12 +448,12 @@ class Gemma4Processor(ProcessorMixin):
         super().__init__(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            video_processor=video_processor,
             chat_template=chat_template,
             **kwargs,
         )
 
         self.feature_extractor = feature_extractor
-        self.video_processor = video_processor
 
     def _compute_audio_num_tokens(self, audio_waveform, sampling_rate: int) -> int:
         """Compute number of audio soft tokens from waveform duration.
@@ -845,6 +854,7 @@ class Gemma4Processor(ProcessorMixin):
         proc_config = {}
         ip_config = {}
         fe_config = {}
+        vp_config = {}
 
         def _load_json(path):
             if path.exists():
@@ -888,7 +898,7 @@ class Gemma4Processor(ProcessorMixin):
         if "image_processor" in proc_config and isinstance(
             proc_config["image_processor"], dict
         ):
-            ip_config = proc_config["image_processor"]
+            ip_config = dict(proc_config["image_processor"])
             ip_config.pop("image_processor_type", None)
         elif "image_processor_type" not in proc_config and any(
             k in proc_config
@@ -916,10 +926,17 @@ class Gemma4Processor(ProcessorMixin):
         if "feature_extractor" in proc_config and isinstance(
             proc_config["feature_extractor"], dict
         ):
-            fe_config = proc_config["feature_extractor"]
+            fe_config = dict(proc_config["feature_extractor"])
             fe_config.pop("feature_extractor_type", None)
 
+        if "video_processor" in proc_config and isinstance(
+            proc_config["video_processor"], dict
+        ):
+            vp_config = dict(proc_config["video_processor"])
+            vp_config.pop("video_processor_type", None)
+
         image_processor = Gemma4ImageProcessor(**ip_config)
+        video_processor = Gemma4VideoProcessor(**vp_config)
 
         # Load audio feature extractor.
         # The standard HF checkpoint does not include a "feature_extractor" key
@@ -945,6 +962,7 @@ class Gemma4Processor(ProcessorMixin):
         return cls(
             image_processor=image_processor,
             tokenizer=tokenizer,
+            video_processor=video_processor,
             image_seq_length=image_seq_length,
             audio_seq_length=audio_seq_length,
             audio_ms_per_token=audio_ms_per_token,
@@ -953,7 +971,7 @@ class Gemma4Processor(ProcessorMixin):
         )
 
 
-__all__ = ["Gemma4ImageProcessor", "Gemma4Processor"]
+__all__ = ["Gemma4ImageProcessor", "Gemma4Processor", "Gemma4VideoProcessor"]
 
 from ..base import install_auto_processor_patch
 

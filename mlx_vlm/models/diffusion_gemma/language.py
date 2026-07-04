@@ -627,15 +627,24 @@ class EncoderModel(nn.Module):
             )
         return self.embed_vision(self.vision_tower(pixel_values))
 
-    def _embed_inputs(self, input_ids, pixel_values=None):
-        image_mask = input_ids == self.config.image_token_id
+    def _embed_inputs(self, input_ids, pixel_values=None, mm_token_type_ids=None):
+        image_token_id = getattr(self.config, "image_token_id", None)
+        image_mask = (
+            input_ids == image_token_id
+            if image_token_id is not None
+            else mx.zeros(input_ids.shape, dtype=mx.bool_)
+        )
         video_token_id = getattr(self.config, "video_token_id", None)
         video_mask = (
             input_ids == video_token_id
             if video_token_id is not None
-            else mx.zeros_like(image_mask)
+            else mx.zeros(input_ids.shape, dtype=mx.bool_)
         )
         vision_mask = image_mask | video_mask
+        if mm_token_type_ids is not None and mm_token_type_ids.shape == input_ids.shape:
+            vision_mask = vision_mask | (
+                (mm_token_type_ids == 1) | (mm_token_type_ids == 2)
+            )
         llm_input_ids = mx.where(
             vision_mask,
             self.text_config.pad_token_id,
@@ -742,6 +751,7 @@ class EncoderModel(nn.Module):
         h = self._embed_inputs(
             input_ids,
             pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
         )
         if cache is None:
             cache = self.make_cache()

@@ -4,7 +4,9 @@ import io
 import json
 import unittest
 from pathlib import Path
+from queue import Queue
 from tempfile import TemporaryDirectory
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -259,6 +261,71 @@ class TestDiffusionGemma4(unittest.TestCase):
             generation_config,
         )
 
+    def test_auto_processor_loads_multimodal_processor(self):
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.diffusion_gemma import DiffusionGemma4Processor
+        from mlx_vlm.models.gemma4.processing_gemma4 import (
+            Gemma4ImageProcessor,
+            Gemma4VideoProcessor,
+        )
+
+        tokenizer = TinyDiffusionGemma4Tokenizer()
+        tokenizer.chat_template = None
+
+        with TemporaryDirectory() as tmpdir:
+            model_dir = Path(tmpdir)
+            (model_dir / "config.json").write_text(
+                json.dumps({"model_type": "diffusion_gemma"}),
+                encoding="utf-8",
+            )
+            (model_dir / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "audio_ms_per_token": 40,
+                        "audio_seq_length": 750,
+                        "image_processor": {
+                            "do_normalize": False,
+                            "image_processor_type": "Gemma4ImageProcessor",
+                            "max_soft_tokens": 140,
+                            "patch_size": 16,
+                            "pooling_kernel_size": 3,
+                        },
+                        "image_seq_length": 140,
+                        "processor_class": "DiffusionGemma4Processor",
+                        "video_processor": {
+                            "max_soft_tokens": 70,
+                            "num_frames": 8,
+                            "video_processor_type": "Gemma4VideoProcessor",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=tokenizer,
+                ),
+                patch(
+                    "transformers.processing_utils.ProcessorMixin."
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor, DiffusionGemma4Processor)
+        self.assertIsInstance(processor.image_processor, Gemma4ImageProcessor)
+        self.assertIsInstance(processor.video_processor, Gemma4VideoProcessor)
+        self.assertEqual(processor.image_processor.max_soft_tokens, 140)
+        self.assertEqual(processor.video_processor.num_frames, 8)
+        self.assertEqual(
+            DiffusionGemma4Processor.get_attributes(),
+            ["image_processor", "tokenizer", "video_processor"],
+        )
+
     def test_forward_shape(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -273,6 +340,40 @@ class TestDiffusionGemma4(unittest.TestCase):
 
         self.assertEqual(out.logits.shape, (1, 3, 64))
         self.assertEqual(len(model.make_cache()), 2)
+
+    def test_video_token_type_ids_drive_vision_embeddings_without_video_token_id(self):
+        from mlx_vlm.models.diffusion_gemma.language import EncoderModel
+
+        class DummyDecoder:
+            embed_scale = 1.0
+
+            def embed_tokens(self, input_ids):
+                ids = input_ids.astype(mx.float32)
+                return mx.stack([ids, ids + 1000], axis=-1)
+
+        class DummyEncoder:
+            config = SimpleNamespace(image_token_id=60, video_token_id=None)
+            text_config = SimpleNamespace(pad_token_id=0)
+            decoder = DummyDecoder()
+
+            def get_image_features(self, pixel_values):
+                del pixel_values
+                return mx.array([[[101.0, 102.0], [201.0, 202.0]]])
+
+        input_ids = mx.array([[10, 61, 61, 11]], dtype=mx.int32)
+        mm_token_type_ids = mx.array([[0, 2, 2, 0]], dtype=mx.int32)
+        pixel_values = mx.zeros((2, 3, 4, 4), dtype=mx.float32)
+
+        embeddings = EncoderModel._embed_inputs(
+            DummyEncoder(),
+            input_ids,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        mx.eval(embeddings)
+
+        self.assertEqual(embeddings[0, 1].tolist(), [101.0, 102.0])
+        self.assertEqual(embeddings[0, 2].tolist(), [201.0, 202.0])
 
     def test_self_conditioning_soft_embeddings_use_embedding_scale(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -1249,6 +1350,77 @@ class TestDiffusionGemma4(unittest.TestCase):
             2,
         )
 
+    def test_processor_video_outputs_can_cross_thread_boundary(self):
+        raw_queue = Queue()
+        result_queue = Queue()
+
+        def run_thread(fn):
+            errors = Queue()
+
+            def wrapped():
+                try:
+                    fn()
+                except BaseException as exc:
+                    errors.put(exc)
+
+            thread = Thread(target=wrapped)
+            thread.start()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
+            if not errors.empty():
+                raise errors.get()
+
+        def producer():
+            processor = tiny_diffusion_gemma_processor()
+            raw_queue.put(
+                processor(
+                    text="<video> describe",
+                    videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+                )
+            )
+
+        def consumer():
+            result = raw_queue.get(timeout=5)
+            mx.eval(
+                result["input_ids"],
+                result["attention_mask"],
+                result["mm_token_type_ids"],
+                result["pixel_values"],
+            )
+            result_queue.put(
+                (
+                    result["pixel_values"].shape,
+                    int(mx.sum(result["mm_token_type_ids"] == 2).item()),
+                )
+            )
+
+        run_thread(producer)
+        run_thread(consumer)
+
+        self.assertEqual(result_queue.get(timeout=5), ((2, 3, 4, 4), 2))
+
+    def test_apply_chat_template_includes_video_token_for_video_inputs(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = tiny_diffusion_gemma_processor()
+        rendered = apply_chat_template(
+            processor,
+            SimpleNamespace(model_type="diffusion_gemma"),
+            "Describe this video.",
+            video=["clip.mp4"],
+        )
+
+        self.assertIn(processor.video_token, rendered)
+
+        result = processor(
+            text=rendered,
+            videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+        )
+        self.assertEqual(
+            int(mx.sum(result["mm_token_type_ids"] == 2).item()),
+            2,
+        )
+
     def test_processor_orders_mixed_images_and_videos_in_pixel_values(self):
         processor = tiny_diffusion_gemma_processor(image_processor=TinyImageProcessor())
 
@@ -1840,6 +2012,38 @@ class TestDiffusionGemma4Vision(unittest.TestCase):
         with_video = model.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
+        ).inputs_embeds
+
+        self.assertEqual(with_video.shape, text_only.shape)
+        self.assertTrue(bool(mx.allclose(with_video[0, 0], text_only[0, 0]).item()))
+        self.assertTrue(bool(mx.allclose(with_video[0, 2], text_only[0, 2]).item()))
+        self.assertFalse(bool(mx.allclose(with_video[0, 1], text_only[0, 1]).item()))
+
+        expected = model.model.encoder.get_image_features(pixel_values).astype(
+            with_video.dtype
+        )
+        self.assertTrue(
+            bool(mx.allclose(with_video[0, 1], expected[0, 0], atol=1e-5).item())
+        )
+
+    def test_video_features_scattered_from_token_types_without_video_token_id(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config_dict = tiny_vision_config_dict()
+        config_dict["video_token_id"] = None
+        config = ModelConfig.from_dict(config_dict)
+        model = Model(config)
+
+        input_ids = mx.array([[2, 61, 3]])
+        pixel_values = mx.random.uniform(shape=(1, 3, 4, 4))
+        mm_token_type_ids = mx.array([[0, 2, 0]])
+
+        text_only = model.get_input_embeddings(input_ids=input_ids).inputs_embeds
+        with_video = model.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
         ).inputs_embeds
 
         self.assertEqual(with_video.shape, text_only.shape)
