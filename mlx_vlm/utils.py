@@ -14,7 +14,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
