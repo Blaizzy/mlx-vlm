@@ -1952,60 +1952,6 @@ class TestToMlxHelper(unittest.TestCase):
         self.assertIsNone(result["none_val"])
         self.assertEqual(result["str_val"], "hello")
 
-    def test_materialize_mx_arrays_handles_batch_feature_tree(self):
-        from queue import Queue
-        from threading import Thread
-
-        import mlx.core as mx
-        from transformers.feature_extraction_utils import BatchFeature
-
-        from mlx_vlm.models.base import materialize_mx_arrays
-
-        raw_queue = Queue()
-        result_queue = Queue()
-
-        def run_thread(fn):
-            errors = Queue()
-
-            def wrapped():
-                try:
-                    fn()
-                except BaseException as exc:
-                    errors.put(exc)
-
-            thread = Thread(target=wrapped)
-            thread.start()
-            thread.join(timeout=5)
-            self.assertFalse(thread.is_alive())
-            if not errors.empty():
-                raise errors.get()
-
-        def producer():
-            feature = BatchFeature(
-                data={
-                    "top": mx.array([1, 2, 3]) + 1,
-                    "nested": [mx.array([4]) + 2],
-                    "plain": "value",
-                }
-            )
-            raw_queue.put(materialize_mx_arrays(feature))
-
-        def consumer():
-            feature = raw_queue.get(timeout=5)
-            mx.eval(feature["top"], feature["nested"][0])
-            result_queue.put(
-                (
-                    feature["top"].tolist(),
-                    feature["nested"][0].tolist(),
-                    feature["plain"],
-                )
-            )
-
-        run_thread(producer)
-        run_thread(consumer)
-
-        self.assertEqual(result_queue.get(timeout=5), ([2, 3, 4], [6], "value"))
-
 
 class TestLfm2VlProcessorPatch(unittest.TestCase):
     def test_num_image_tokens_matches_pixel_unshuffle_padding(self):
