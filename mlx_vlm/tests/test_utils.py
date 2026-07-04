@@ -755,6 +755,19 @@ def test_load_processor_propagates_auto_processor_errors():
             load_processor(Path("/tmp/model"), eos_token_ids=2)
 
 
+def test_load_processor_gives_install_hint_for_missing_backends():
+    backend_error = ImportError(
+        "PixtralProcessor requires the Torchvision library but it was not found"
+    )
+    with patch(
+        "mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=backend_error
+    ):
+        with pytest.raises(ImportError, match=r"mlx-vlm\[torch\]") as exc_info:
+            load_processor(Path("/tmp/model"), eos_token_ids=2)
+
+    assert exc_info.value.__cause__ is backend_error
+
+
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():
     class TinyInner(nn.Module):
         def __init__(self):

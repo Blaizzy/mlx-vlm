@@ -46,3 +46,6 @@ dependencies = {file = ["requirements.txt"]}
 ui = ["gradio>=5.19.0"]
 cuda = ["mlx-cuda"]
 cpu = ["mlx-cpu"]
+# Some processors (e.g. the Pixtral family) need torch-backed image
+# processing in transformers v5.
+torch = ["torch", "torchvision"]

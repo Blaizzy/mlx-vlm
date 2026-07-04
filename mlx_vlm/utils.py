@@ -938,7 +938,17 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    except ImportError as e:
+        # transformers raises ImportError when a processor needs a backend
+        # that mlx-vlm does not depend on (e.g. Pixtral-family image
+        # processors require torch and torchvision in transformers v5).
+        raise ImportError(
+            f"The processor for {model_path} requires packages that are not "
+            "installed. Install them with `pip install mlx-vlm[torch]` "
+            "(or `pip install torch torchvision`)."
+        ) from e
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
