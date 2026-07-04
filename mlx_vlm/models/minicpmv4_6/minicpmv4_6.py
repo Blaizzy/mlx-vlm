@@ -424,14 +424,6 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         sanitized_weights = {}
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-
         for key, value in weights.items():
             # MiniCPM-V 4.6 checkpoint namespaces are prefixed with `model.`
             # and split across language_model / vision_tower / merger.
@@ -481,9 +473,6 @@ class Model(nn.Module):
                 "embeddings.patch_embedding.weight"
             ) and not check_array_shape(value):
                 value = value.transpose(0, 2, 3, 1)
-            if any(key.endswith(suffix) for suffix in norm_keys) and value.ndim == 1:
-                value = value + 1.0
-
             sanitized_weights[key] = value
 
         if self.config.text_config.tie_word_embeddings:
