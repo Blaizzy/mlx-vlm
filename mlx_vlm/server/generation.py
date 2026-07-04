@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Generator, List, Optional, Tuple
+from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -331,6 +331,29 @@ def get_configured_context_limit():
 def _count_prompt_tokens(raw_inputs: dict) -> int:
     input_ids = raw_inputs["input_ids"]
     return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+
+
+def _collect_mx_arrays(value: Any) -> List[mx.array]:
+    if isinstance(value, mx.array):
+        return [value]
+    if isinstance(value, dict):
+        arrays = []
+        for item in value.values():
+            arrays.extend(_collect_mx_arrays(item))
+        return arrays
+    if isinstance(value, (list, tuple)):
+        arrays = []
+        for item in value:
+            arrays.extend(_collect_mx_arrays(item))
+        return arrays
+    return []
+
+
+def _materialize_mx_arrays(value: Any) -> Any:
+    arrays = _collect_mx_arrays(value)
+    if arrays:
+        mx.eval(*arrays)
+    return value
 
 
 def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
@@ -1003,8 +1026,8 @@ class ResponseGenerator:
             )
         rqueue: Queue = Queue()
 
-        # CPU preprocessing (tokenize, load images) on caller thread.
-        # GPU work (vision encoder) deferred to GPU thread.
+        # Tokenization/media loading happens on the caller thread; vision
+        # encoder work stays deferred to the GPU generation thread.
         raw_inputs = self._preprocess_request(prompt, images, audio, videos)
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
@@ -1030,7 +1053,7 @@ class ResponseGenerator:
         )
 
     def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
-        """CPU-only: tokenize text, load/resize images. Thread-safe."""
+        """Tokenize/load media and materialize tensors before queue handoff."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
             if self.model.config.model_type
@@ -1038,7 +1061,7 @@ class ResponseGenerator:
             else True
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
-        return prepare_inputs(
+        raw_inputs = prepare_inputs(
             self.processor,
             images=images,
             audio=audio,
@@ -1047,6 +1070,7 @@ class ResponseGenerator:
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+        return _materialize_mx_arrays(raw_inputs)
 
     def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
         if videos is None:
