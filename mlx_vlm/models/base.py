@@ -7,7 +7,7 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 from PIL import Image
 
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
@@ -49,6 +49,16 @@ def to_mlx(data: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def materialize_mx_arrays(data):
+    """Evaluate all MLX array leaves in a nested processor output."""
+    feature_data = getattr(data, "data", None)
+    tree = feature_data if isinstance(feature_data, dict) else data
+    arrays = [value for _, value in tree_flatten(tree) if isinstance(value, mx.array)]
+    if arrays:
+        mx.eval(*arrays)
+    return data
 
 
 @dataclass
