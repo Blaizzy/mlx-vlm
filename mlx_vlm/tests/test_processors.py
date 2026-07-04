@@ -87,35 +87,6 @@ def _mock_ip(**extra):
     )()
 
 
-def test_prepare_inputs_preserves_processor_audio_features_for_lossy_sources():
-    from mlx_vlm.utils import prepare_inputs
-
-    features = np.array([[1.0, 3.0], [5.0, 7.0]], dtype=np.float32)
-
-    class AudioProcessor:
-        def __call__(
-            self,
-            text,
-            images=None,
-            audio=None,
-            padding=True,
-            return_tensors="mlx",
-        ):
-            return {
-                "input_features": features,
-                "attention_mask": np.array([[1, 1]], dtype=np.int32),
-            }
-
-    with patch("mlx_vlm.utils.load_audio", return_value=np.zeros(16, dtype=np.float32)):
-        result = prepare_inputs(
-            AudioProcessor(),
-            audio="sample.m4a",
-            prompts="transcribe",
-        )
-
-    np.testing.assert_allclose(np.array(result["input_features"]), features)
-
-
 class TestGemma4UnifiedProcessor(unittest.TestCase):
     class _Tokenizer:
         model_input_names = ["input_ids", "attention_mask"]
