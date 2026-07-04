@@ -411,7 +411,7 @@ def make_streaming_detokenizer(processor):
 
 
 def _match(a, b):
-    if type(a) != type(b):
+    if type(a) is not type(b):
         return False
     if isinstance(a, dict):
         return len(a) == len(b) and all(k in b and _match(a[k], b[k]) for k in a)
@@ -450,6 +450,25 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _has_pretokenizer_type(pretokenizer, pretokenizer_type):
+    if not isinstance(pretokenizer, dict):
+        return False
+    if pretokenizer.get("type") == pretokenizer_type:
+        return True
+    return any(
+        _has_pretokenizer_type(child, pretokenizer_type)
+        for key in ("pretokenizers", "pre_tokenizers")
+        for child in pretokenizer.get(key, [])
+    )
+
+
+def _is_byte_level_bpe_tokenizer(tokenizer_content):
+    model = tokenizer_content.get("model", {})
+    return model.get("type") == "BPE" and _has_pretokenizer_type(
+        tokenizer_content.get("pre_tokenizer"), "ByteLevel"
+    )
+
+
 def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={}):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -469,9 +488,17 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
 
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = SPMStreamingDetokenizer
+                detokenizer_class = (
+                    BPEStreamingDetokenizer
+                    if _is_byte_level_bpe_tokenizer(tokenizer_content)
+                    else SPMStreamingDetokenizer
+                )
             elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
-                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
+                detokenizer_class = (
+                    BPEStreamingDetokenizer
+                    if _is_byte_level_bpe_tokenizer(tokenizer_content)
+                    else partial(SPMStreamingDetokenizer, trim_space=False)
+                )
             elif _is_bpe_decoder(tokenizer_content["decoder"]):
                 detokenizer_class = BPEStreamingDetokenizer
 
