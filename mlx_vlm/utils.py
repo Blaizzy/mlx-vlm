@@ -1666,18 +1666,6 @@ def prepare_inputs(
                 images = padded_images
 
     # Process audio
-    audio_inputs = None
-    audio_feature_lengths = None
-    is_qwen3_omni_moe = False
-    processor_class_name = (
-        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
-    )
-    if (
-        "qwen3" in processor_class_name.lower()
-        and "omni" in processor_class_name.lower()
-    ):
-        is_qwen3_omni_moe = True
-
     is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
@@ -1695,37 +1683,13 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        if is_qwen3_omni_moe:
-            audio_arrays = [
-                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                for audio_file in audio
-            ]
-            audio_arrays = [
-                audio_array.astype(np.float32) for audio_array in audio_arrays
-            ]
-
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is None:
-                raise ValueError("Processor missing feature_extractor for audio prep.")
-
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
-
-            audio_feature_lengths = np.sum(
-                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
-            )
-        else:
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            sr = (
-                getattr(feature_extractor, "sampling_rate", 16000)
-                if feature_extractor is not None
-                else 16000
-            )
-            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        sr = (
+            getattr(feature_extractor, "sampling_rate", 16000)
+            if feature_extractor is not None
+            else 16000
+        )
+        audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
     if has_videos:
@@ -1813,15 +1777,6 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
-
-    if audio_inputs is not None:
-        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
-        model_inputs["feature_attention_mask"] = mx.array(
-            audio_inputs["attention_mask"]
-        ).astype(mx.int32)
-        model_inputs["audio_feature_lengths"] = mx.array(
-            audio_feature_lengths, dtype=mx.int32
-        )
 
     if is_lossy_audio and "input_features" in model_inputs:
         f = model_inputs["input_features"]
