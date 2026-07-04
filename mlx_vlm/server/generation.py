@@ -700,6 +700,18 @@ class GenerationContext:
 
 
 @dataclass
+class QueuedGenerationRequest:
+    """Preprocessed generation request waiting for the GPU worker."""
+
+    rqueue: Queue
+    raw_inputs: dict
+    prompt_tokens: int
+    args: GenerationArguments
+    images: Optional[List] = None
+    videos: Optional[List] = None
+
+
+@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -977,6 +989,7 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        videos: Optional[List] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
@@ -992,11 +1005,20 @@ class ResponseGenerator:
 
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+        self.requests.put(
+            QueuedGenerationRequest(
+                rqueue=rqueue,
+                raw_inputs=raw_inputs,
+                prompt_tokens=prompt_tokens,
+                args=args,
+                images=images,
+                videos=videos,
+            )
+        )
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -1007,7 +1029,7 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
-    def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
+    def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
@@ -1020,10 +1042,16 @@ class ResponseGenerator:
             self.processor,
             images=images,
             audio=audio,
+            videos=videos,
             prompts=prompt,
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+
+    def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
+        if videos is None:
+            return self._cpu_preprocess(prompt, images, audio)
+        return self._cpu_preprocess(prompt, images, audio, videos)
 
     # -- internals --
 
@@ -1267,7 +1295,12 @@ class ResponseGenerator:
                         batch_gen.close()
                         batch_gen = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                for request in new_items:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
+                    images = request.images
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -1380,7 +1413,11 @@ class ResponseGenerator:
                 if should_stop:
                     break
                 cancelled |= self._drain_cancellations()
-                for rqueue, raw_inputs, prompt_tokens, args, _images in new_items:
+                for request in new_items:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
                     uid_counter += 1
                     uid = uid_counter
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -1604,7 +1641,12 @@ class ResponseGenerator:
                 if hasattr(lm, "_rope_deltas"):
                     lm._rope_deltas = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                for request in pending:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
+                    images = request.images
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -1740,8 +1782,7 @@ class ResponseGenerator:
                     token_dtype=mx.int32,
                     stop_check=stop_check,
                     greedy_sampling=all(
-                        pending_args.temperature == 0
-                        for _, _, _, pending_args, _ in pending
+                        request.args.temperature == 0 for request in pending
                     ),
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
@@ -1811,7 +1852,9 @@ class ResponseGenerator:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
-                error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
+                error_queues.update(
+                    {id(request.rqueue): request.rqueue for request in pending}
+                )
                 _notify_queues(error_queues.values(), e, None)
                 mx.clear_cache()
                 gc.collect()
@@ -1880,13 +1923,14 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        videos: Optional[List] = None,
     ):
         """Validate request size before opening a streaming response."""
         if get_configured_context_limit() is None:
             return
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
         _check_configured_context_budget(
             _count_prompt_tokens(raw_inputs), args.max_tokens
         )

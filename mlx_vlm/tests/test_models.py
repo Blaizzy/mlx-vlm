@@ -3171,6 +3171,103 @@ class TestModels(unittest.TestCase):
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
 
+        def image(h, w):
+            return np.zeros((h, w, 3), dtype=np.uint8)
+
+        image_processor = gemma4.Gemma4ImageProcessor()
+        for h, w in ((1125, 1500), (1650, 1275), (480, 640)):
+            counts = []
+            for budget in (280, 560, 1120):
+                _, soft_tokens = image_processor(
+                    image(h, w),
+                    max_soft_tokens=budget,
+                )
+                self.assertLessEqual(soft_tokens[0], budget)
+                counts.append(soft_tokens[0])
+            self.assertTrue(counts[0] < counts[1] < counts[2])
+
+        _, soft_tokens = image_processor(image(1125, 1500))
+        self.assertLessEqual(soft_tokens[0], 280)
+
+        tiny_image_processor = gemma4.Gemma4ImageProcessor(
+            patch_size=vision_config.patch_size,
+            pooling_kernel_size=vision_config.pooling_kernel_size,
+            max_soft_tokens=vision_config.default_output_length,
+        )
+        tiny_tower = gemma4.VisionModel(vision_config)
+        tiny_tower.eval()
+        variable_image = image(256, 256)
+        for budget in (
+            vision_config.default_output_length,
+            vision_config.default_output_length * 4,
+        ):
+            data, soft_tokens = tiny_image_processor(
+                variable_image,
+                max_soft_tokens=budget,
+                patch_size=vision_config.patch_size,
+                pooling_kernel_size=vision_config.pooling_kernel_size,
+            )
+            output = tiny_tower(mx.array(data["pixel_values"]))
+            mx.eval(output)
+            self.assertEqual(output.shape[1], soft_tokens[0])
+
+        image_token, image_token_id = "<image>", 100
+        tokenizer_kwargs = []
+
+        class _Tokenizer:
+            def __call__(self, text=None, **kwargs):
+                tokenizer_kwargs.append(kwargs)
+                return {
+                    "input_ids": [
+                        [image_token_id] * prompt.count(image_token) for prompt in text
+                    ]
+                }
+
+        proc = gemma4.Gemma4Processor.__new__(gemma4.Gemma4Processor)
+        proc.tokenizer = _Tokenizer()
+        proc.image_processor = tiny_image_processor
+        proc.video_processor = None
+        proc.feature_extractor = None
+        proc.image_token = image_token
+        proc.image_token_id = image_token_id
+        proc.boi_token = "<boi>"
+        proc.eoi_token = "<eoi>"
+        proc.image_seq_length = vision_config.default_output_length
+        proc.audio_token = ""
+        proc.boa_token = ""
+        proc.eoa_token = ""
+        proc.audio_token_id = None
+        proc.full_image_sequence = (
+            "<boi>" + image_token * vision_config.default_output_length + "<eoi>"
+        )
+        proc.full_audio_sequence = None
+
+        threaded_counts = []
+        for budget in (
+            vision_config.default_output_length,
+            vision_config.default_output_length * 4,
+        ):
+            output = proc(
+                images=[variable_image],
+                text=[f"{image_token} describe"],
+                images_kwargs={
+                    "max_soft_tokens": budget,
+                    "patch_size": vision_config.patch_size,
+                    "pooling_kernel_size": vision_config.pooling_kernel_size,
+                },
+                return_mm_token_type_ids=False,
+            )
+            ids = np.array(output["input_ids"][0])
+            threaded_counts.append(int((ids == image_token_id).sum()))
+
+        self.assertTrue(threaded_counts[0] < threaded_counts[1])
+        self.assertTrue(
+            all(
+                "images_kwargs" not in kwargs and "max_soft_tokens" not in kwargs
+                for kwargs in tokenizer_kwargs
+            )
+        )
+
         # Quantized save/load regression for per-layer projection.
         quant_model = gemma4.Model(config)
 

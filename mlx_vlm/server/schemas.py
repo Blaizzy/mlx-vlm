@@ -232,6 +232,26 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+class VideoUrl(TypedDict, total=False):
+    url: Required[str]
+
+
+class ResponseInputVideoParam(TypedDict, total=False):
+    type: Required[Literal["input_video"]]
+    video_url: Required[Union[str, VideoUrl]]
+    video: Optional[str]
+
+
+class ResponseVideoUrlParam(TypedDict, total=False):
+    type: Required[Literal["video_url"]]
+    video_url: Required[Union[str, VideoUrl]]
+
+
+class ResponseVideoParam(TypedDict, total=False):
+    type: Required[Literal["video"]]
+    video: Required[str]
+
+
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
 ResponseInputContentParam: TypeAlias = Union[
@@ -239,6 +259,9 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputImageParam,
     ResponseImageUrlParam,
     ResponseInputAudioParam,
+    ResponseInputVideoParam,
+    ResponseVideoUrlParam,
+    ResponseVideoParam,
 ]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
