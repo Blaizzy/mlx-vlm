@@ -42,16 +42,15 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        if any(key.startswith("language_model.") for key in weights):
+            return weights
+
         weights = self.language_model.sanitize(weights)
-
-        def transform_key(key):
-            if key.startswith("language_model."):
-                return key
-            if key.startswith("model.") or key.startswith("lm_head."):
-                return f"language_model.{key}"
-            return key
-
-        return {transform_key(k): v for k, v in weights.items()}
+        language_keys = ("model.", "lm_head.")
+        return {
+            f"language_model.{key}" if key.startswith(language_keys) else key: value
+            for key, value in weights.items()
+        }
 
     @property
     def quant_predicate(self):

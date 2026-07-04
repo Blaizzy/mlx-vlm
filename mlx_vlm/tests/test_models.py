@@ -514,6 +514,18 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(cache[0].caches), 2)
         self.assertEqual(len(cache[1].caches), 1)
 
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((config.vocab_size, 128)),
+                "lm_head.weight": mx.zeros((config.vocab_size, 128)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+
+        prefixed = {"language_model.lm_head.weight": mx.zeros((config.vocab_size, 128))}
+        self.assertIs(model.sanitize(prefixed), prefixed)
+
         prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
         logits = model(prompt, cache=cache).logits
         self.assertEqual(logits.shape, (1, 8, config.vocab_size))

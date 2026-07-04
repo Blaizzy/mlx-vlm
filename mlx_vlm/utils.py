@@ -530,9 +530,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    with safetensors.safe_open(weight_files[0], framework="np") as f:
-        is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
-
     model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
@@ -565,30 +562,29 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    if not is_mlx_format:
-        # Sanitize weights
-        weights = sanitize_weights(model, weights)
+    # Sanitize weights
+    weights = sanitize_weights(model, weights)
 
-        if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
-            weights = sanitize_weights(model.thinker, weights)
-            weights = sanitize_weights(model.thinker.vision_tower, weights)
-            weights = sanitize_weights(model.thinker.audio_tower, weights)
-            weights = sanitize_weights(model.thinker.language_model, weights)
-            weights = sanitize_weights(model.code2wav, weights)
-            weights = sanitize_weights(model.talker, weights)
-        else:
-            if hasattr(model_class, "VisionModel"):
-                weights = sanitize_weights(
-                    model_class.VisionModel, weights, model_config.vision_config
-                )
-            if hasattr(model_class, "LanguageModel"):
-                weights = sanitize_weights(
-                    model_class.LanguageModel, weights, model_config.text_config
-                )
-            if hasattr(model_class, "AudioModel"):
-                weights = sanitize_weights(
-                    model_class.AudioModel, weights, model_config.audio_config
-                )
+    if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
+        weights = sanitize_weights(model.thinker, weights)
+        weights = sanitize_weights(model.thinker.vision_tower, weights)
+        weights = sanitize_weights(model.thinker.audio_tower, weights)
+        weights = sanitize_weights(model.thinker.language_model, weights)
+        weights = sanitize_weights(model.code2wav, weights)
+        weights = sanitize_weights(model.talker, weights)
+    else:
+        if hasattr(model_class, "VisionModel"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+        if hasattr(model_class, "LanguageModel"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+        if hasattr(model_class, "AudioModel"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
