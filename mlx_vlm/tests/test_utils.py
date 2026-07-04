@@ -168,6 +168,29 @@ def test_apply_generation_config_defaults_preserves_model_config_signature():
     assert not hasattr(model_config, "max_new_tokens")
 
 
+def test_apply_generation_config_defaults_extends_model_eos_token_ids():
+    class ModelConfig:
+        eos_token_id = [2, 32000, 32007]  # e.g. phi3_v chat terminators
+
+    model_config = apply_generation_config_defaults(
+        ModelConfig(), {"eos_token_id": [2, 5], "temperature": 0.7}
+    )
+
+    assert model_config.eos_token_id == [2, 32000, 32007, 5]
+    assert model_config.temperature == 0.7
+
+
+def test_apply_generation_config_defaults_sets_eos_when_model_has_none():
+    class ModelConfig:
+        eos_token_id = None
+
+    model_config = apply_generation_config_defaults(
+        ModelConfig(), {"eos_token_id": [1, 106]}
+    )
+
+    assert model_config.eos_token_id == [1, 106]
+
+
 def test_sanitize_weights():
     class DummyModel:
         def __init__(self, config=None):

@@ -64,10 +64,37 @@ GENERATION_CONFIG_DEFAULT_KEYS = (
 )
 
 
+def _merge_eos_token_ids(existing, new):
+    """Union of already-known EOS ids and config-provided ones.
+
+    EOS ids are a set of stop conditions, so the config value must extend
+    what the model config already knows, not replace it. Model configs may
+    compute extra chat terminators at construction time (e.g. phi3_v appends
+    ``PHI3_V_CHAT_EOS_TOKEN_IDS`` in ``__post_init__``) that the raw config
+    does not contain.
+    """
+
+    def _as_list(value):
+        if value is None:
+            return []
+        if isinstance(value, (int, str)):
+            return [value]
+        return list(value)
+
+    merged = _as_list(existing)
+    for token_id in _as_list(new):
+        if token_id not in merged:
+            merged.append(token_id)
+    return merged if merged else None
+
+
 def apply_generation_config_defaults(model_config, config: dict):
     for key in GENERATION_CONFIG_DEFAULT_KEYS:
         if key in config:
-            setattr(model_config, key, config[key])
+            value = config[key]
+            if key == "eos_token_id":
+                value = _merge_eos_token_ids(getattr(model_config, key, None), value)
+            setattr(model_config, key, value)
     return model_config
 
 
