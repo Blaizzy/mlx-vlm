@@ -85,6 +85,7 @@ class ModelConfig(BaseModelConfig):
     subpatch_token_id: int = 151948
     location_token_id: int = 151949
     use_frame_special_tokens: bool = True
+    eos_token_id: Optional[List[int]] = None  # falls back to the tokenizer EOS
 
     # Point prediction config
     patch_location: Optional[str] = "3x3"
@@ -147,7 +148,3 @@ class ModelConfig(BaseModelConfig):
     @property
     def vocab_size(self):
         return self.text_config.vocab_size
-
-    @property
-    def eos_token_id(self):
-        return None  # Let the tokenizer handle EOS

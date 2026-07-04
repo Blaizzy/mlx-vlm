@@ -67,6 +67,11 @@ GENERATION_CONFIG_DEFAULT_KEYS = (
 def apply_generation_config_defaults(model_config, config: dict):
     for key in GENERATION_CONFIG_DEFAULT_KEYS:
         if key in config:
+            # A model config may expose a generation key as a read-only
+            # property; leave it untouched instead of crashing the load.
+            prop = getattr(type(model_config), key, None)
+            if isinstance(prop, property) and prop.fset is None:
+                continue
             setattr(model_config, key, config[key])
     return model_config
 
