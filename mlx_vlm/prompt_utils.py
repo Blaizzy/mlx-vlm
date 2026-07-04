@@ -273,6 +273,7 @@ class MessageFormatter:
             "qwen3_omni_moe",
             "gemma4",
             "gemma4_unified",
+            "diffusion_gemma",
             "minicpmv4_6",
             "minimax_m3_vl",
         ] and kwargs.get("video"):
@@ -579,14 +580,35 @@ def get_chat_template(
 
         return "<image>"
 
-    def _flatten_content(content: Any, image_token: str) -> str:
+    def _get_video_token() -> str:
+        if processor is None:
+            return "<video>"
+
+        video_token = getattr(processor, "video_token", None)
+        if isinstance(video_token, str) and video_token:
+            return video_token
+
+        tokenizer = getattr(processor, "tokenizer", None)
+        video_token = getattr(tokenizer, "video_token", None)
+        if isinstance(video_token, str) and video_token:
+            return video_token
+
+        return "<video>"
+
+    def _flatten_content(content: Any, image_token: str, video_token: str) -> str:
         if isinstance(content, str):
             return content
 
         if isinstance(content, list):
             parts = []
             audio_marker = kwargs.get("audio_token", "<audio>")
-            multimodal_markers = {image_token, audio_marker, "<audio>", "<video>"}
+            multimodal_markers = {
+                image_token,
+                video_token,
+                audio_marker,
+                "<audio>",
+                "<video>",
+            }
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")
@@ -598,8 +620,8 @@ def get_chat_template(
                         parts.append(image_token)
                     elif item_type in ("audio", "input_audio"):
                         parts.append("<audio>")
-                    elif item_type == "video":
-                        parts.append("<video>")
+                    elif item_type in ("video", "input_video", "video_url"):
+                        parts.append(video_token)
                     else:
                         text = item.get("text", "") or item.get("content", "")
                         if text:
@@ -628,6 +650,7 @@ def get_chat_template(
 
     def _messages_to_plain_prompt() -> str:
         image_token = _get_image_token()
+        video_token = _get_video_token()
         normalized = []
 
         for message in messages:
@@ -640,7 +663,7 @@ def get_chat_template(
                     {
                         "role": message.get("role", "user"),
                         "content": _flatten_content(
-                            message.get("content", ""), image_token
+                            message.get("content", ""), image_token, video_token
                         ),
                     }
                 )

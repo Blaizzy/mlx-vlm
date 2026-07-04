@@ -339,6 +339,40 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(out.logits.shape, (1, 3, 64))
         self.assertEqual(len(model.make_cache()), 2)
 
+    def test_video_token_type_ids_drive_vision_embeddings_without_video_token_id(self):
+        from mlx_vlm.models.diffusion_gemma.language import EncoderModel
+
+        class DummyDecoder:
+            embed_scale = 1.0
+
+            def embed_tokens(self, input_ids):
+                ids = input_ids.astype(mx.float32)
+                return mx.stack([ids, ids + 1000], axis=-1)
+
+        class DummyEncoder:
+            config = SimpleNamespace(image_token_id=60, video_token_id=None)
+            text_config = SimpleNamespace(pad_token_id=0)
+            decoder = DummyDecoder()
+
+            def get_image_features(self, pixel_values):
+                del pixel_values
+                return mx.array([[[101.0, 102.0], [201.0, 202.0]]])
+
+        input_ids = mx.array([[10, 61, 61, 11]], dtype=mx.int32)
+        mm_token_type_ids = mx.array([[0, 2, 2, 0]], dtype=mx.int32)
+        pixel_values = mx.zeros((2, 3, 4, 4), dtype=mx.float32)
+
+        embeddings = EncoderModel._embed_inputs(
+            DummyEncoder(),
+            input_ids,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
+        )
+        mx.eval(embeddings)
+
+        self.assertEqual(embeddings[0, 1].tolist(), [101.0, 102.0])
+        self.assertEqual(embeddings[0, 2].tolist(), [201.0, 202.0])
+
     def test_self_conditioning_soft_embeddings_use_embedding_scale(self):
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
 
@@ -1314,6 +1348,28 @@ class TestDiffusionGemma4(unittest.TestCase):
             2,
         )
 
+    def test_apply_chat_template_includes_video_token_for_video_inputs(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = tiny_diffusion_gemma_processor()
+        rendered = apply_chat_template(
+            processor,
+            SimpleNamespace(model_type="diffusion_gemma"),
+            "Describe this video.",
+            video=["clip.mp4"],
+        )
+
+        self.assertIn(processor.video_token, rendered)
+
+        result = processor(
+            text=rendered,
+            videos=[np.zeros((2, 3, 4, 4), dtype=np.uint8)],
+        )
+        self.assertEqual(
+            int(mx.sum(result["mm_token_type_ids"] == 2).item()),
+            2,
+        )
+
     def test_processor_orders_mixed_images_and_videos_in_pixel_values(self):
         processor = tiny_diffusion_gemma_processor(image_processor=TinyImageProcessor())
 
@@ -1905,6 +1961,38 @@ class TestDiffusionGemma4Vision(unittest.TestCase):
         with_video = model.get_input_embeddings(
             input_ids=input_ids,
             pixel_values=pixel_values,
+        ).inputs_embeds
+
+        self.assertEqual(with_video.shape, text_only.shape)
+        self.assertTrue(bool(mx.allclose(with_video[0, 0], text_only[0, 0]).item()))
+        self.assertTrue(bool(mx.allclose(with_video[0, 2], text_only[0, 2]).item()))
+        self.assertFalse(bool(mx.allclose(with_video[0, 1], text_only[0, 1]).item()))
+
+        expected = model.model.encoder.get_image_features(pixel_values).astype(
+            with_video.dtype
+        )
+        self.assertTrue(
+            bool(mx.allclose(with_video[0, 1], expected[0, 0], atol=1e-5).item())
+        )
+
+    def test_video_features_scattered_from_token_types_without_video_token_id(self):
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config_dict = tiny_vision_config_dict()
+        config_dict["video_token_id"] = None
+        config = ModelConfig.from_dict(config_dict)
+        model = Model(config)
+
+        input_ids = mx.array([[2, 61, 3]])
+        pixel_values = mx.random.uniform(shape=(1, 3, 4, 4))
+        mm_token_type_ids = mx.array([[0, 2, 0]])
+
+        text_only = model.get_input_embeddings(input_ids=input_ids).inputs_embeds
+        with_video = model.get_input_embeddings(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            mm_token_type_ids=mm_token_type_ids,
         ).inputs_embeds
 
         self.assertEqual(with_video.shape, text_only.shape)

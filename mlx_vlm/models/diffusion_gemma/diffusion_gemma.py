@@ -208,6 +208,7 @@ class Model(nn.Module):
             inputs_embeds=self.model.encoder._embed_inputs(
                 input_ids,
                 pixel_values=pixel_values,
+                mm_token_type_ids=kwargs.get("mm_token_type_ids"),
             )
         )
 
