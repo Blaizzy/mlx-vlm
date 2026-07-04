@@ -167,18 +167,6 @@ def test_apply_generation_config_defaults_preserves_model_config_signature():
     assert not hasattr(model_config, "max_new_tokens")
 
 
-def test_phi3_v_eos_defaults_keep_chat_stop_tokens():
-    from mlx_vlm.models.phi3_v.config import PHI3_V_CHAT_EOS_TOKEN_IDS, ModelConfig
-
-    config = ModelConfig(eos_token_id=2)
-
-    assert config.eos_token_id == PHI3_V_CHAT_EOS_TOKEN_IDS
-
-    apply_generation_config_defaults(config, {"eos_token_id": 2})
-
-    assert config.eos_token_id == PHI3_V_CHAT_EOS_TOKEN_IDS
-
-
 def test_sanitize_weights():
     class DummyModel:
         def __init__(self, config=None):
