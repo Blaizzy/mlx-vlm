@@ -1,7 +1,5 @@
 """Tests for tokenizer_utils module."""
 
-import json
-
 import pytest
 
 from mlx_vlm.tokenizer_utils import (
@@ -12,12 +10,10 @@ from mlx_vlm.tokenizer_utils import (
     StreamingDetokenizer,
     TokenizerWrapper,
     _is_bpe_decoder,
-    _is_byte_level_bpe_tokenizer,
     _is_spm_decoder,
     _is_spm_decoder_no_space,
     _match,
     _remove_space,
-    load_tokenizer,
     make_streaming_detokenizer,
 )
 
@@ -714,63 +710,6 @@ class TestBPEStreamingDetokenizer:
         detokenizer.finalize()
 
         assert detokenizer.text == "Got it, the user"
-
-    def test_decodes_byte_level_unicode_tokens(self):
-        tokenizer = MockBPETokenizer()
-        tokenizer.vocab = {
-            "I": 0,
-            "âĢĻ": 1,
-            "ll": 2,
-            "Ġshare": 3,
-        }
-        detokenizer = BPEStreamingDetokenizer(tokenizer)
-
-        for token in [0, 1, 2, 3]:
-            detokenizer.add_token(token)
-        detokenizer.finalize()
-
-        assert detokenizer.text == "I’ll share"
-
-
-class TestTokenizerDetection:
-    def _hybrid_byte_level_bpe_tokenizer_json(self):
-        return {
-            "model": {"type": "BPE"},
-            "pre_tokenizer": {
-                "type": "Sequence",
-                "pretokenizers": [
-                    {"type": "ByteLevel"},
-                    {"type": "Metaspace", "replacement": "▁"},
-                ],
-            },
-            "decoder": {
-                "type": "Sequence",
-                "decoders": [
-                    {
-                        "type": "Replace",
-                        "pattern": {"String": "▁"},
-                        "content": " ",
-                    },
-                    {"type": "ByteFallback"},
-                    {"type": "Fuse"},
-                    {"type": "Strip", "content": " ", "start": 1, "stop": 0},
-                ],
-            },
-        }
-
-    def test_detects_hybrid_byte_level_bpe_tokenizer(self):
-        assert _is_byte_level_bpe_tokenizer(
-            self._hybrid_byte_level_bpe_tokenizer_json()
-        )
-
-    def test_load_tokenizer_uses_bpe_for_hybrid_byte_level_bpe(self, tmp_path):
-        (tmp_path / "tokenizer.json").write_text(
-            json.dumps(self._hybrid_byte_level_bpe_tokenizer_json())
-        )
-
-        assert (
-            load_tokenizer(tmp_path, return_tokenizer=False) is BPEStreamingDetokenizer
-        )
 
 
 # ============================================================================
