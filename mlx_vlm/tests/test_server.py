@@ -362,6 +362,17 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
+def test_server_reads_batch_coalesce_env(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_BATCH_COALESCE_MS", raising=False)
+    assert server.get_batch_coalesce_s() == pytest.approx(0.005)
+
+    monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "2.5")
+    assert server.get_batch_coalesce_s() == pytest.approx(0.0025)
+
+    monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "bad")
+    assert server.get_batch_coalesce_s() == pytest.approx(0.005)
+
+
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     class FakeResponseGenerator:
         def __init__(self, model_path, adapter_path=None, **kwargs):
@@ -4102,6 +4113,38 @@ class TestResponseGenerator:
         gen._run()
 
         assert calls == [(False, 0.037)]
+
+    def test_run_coalesces_idle_batch_generator(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_BATCH_COALESCE_MS", "23")
+        calls = []
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen._stop = False
+        gen._ready = Event()
+        gen._load_error = None
+
+        def fake_initialize_model():
+            gen.model = SimpleNamespace(language_model=object())
+            gen.processor = SimpleNamespace()
+            gen.config = SimpleNamespace()
+            gen.stop_tokens = set()
+            gen.draft_model = None
+            gen.draft_kind = None
+            gen.tokenizer = SimpleNamespace()
+
+        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
+            del idle_timeout
+            calls.append((active, coalesce_s))
+            return [], True
+
+        gen._initialize_model = fake_initialize_model
+        gen._collect_pending_requests = fake_collect_pending_requests
+
+        gen._run()
+
+        assert calls == [(False, 0.023)]
 
     def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
         created = []
