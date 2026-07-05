@@ -2,8 +2,6 @@ from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.deepseek_v32 import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,
@@ -11,7 +9,12 @@ from mlx_lm.models.deepseek_v32 import (
 )
 from mlx_lm.models.deepseek_v32 import Model as DSV32Model
 
-from ..base import LanguageModelOutput
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from ..cache import CacheList, KVCache
 from .config import ModelConfig
 
 
