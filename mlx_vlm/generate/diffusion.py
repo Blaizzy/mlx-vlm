@@ -1064,84 +1064,13 @@ def _stream_model_diffusion_generate(
     diffusion_show_unmasking = kwargs.get("diffusion_show_unmasking", False)
 
     generation_stats = {}
-    emitted_text = ""
-    generation_tic = time.perf_counter()
     pending_results: List[GenerationResult] = []
-    model_streamed_results = False
-
-    def make_result(
-        text: str,
-        tokens: List[int],
-        *,
-        diffusion_block_complete: bool = False,
-        finish_reason: Optional[str] = None,
-    ) -> GenerationResult:
-        prompt_time = generation_stats.get("prompt_time") or 0.0
-        generation_time = max(time.perf_counter() - generation_tic - prompt_time, 1e-9)
-        generated_tokens = len(tokens)
-        return GenerationResult(
-            text=text,
-            token=tokens[-1] if tokens else None,
-            logprobs=None,
-            prompt_tokens=input_ids.size,
-            generation_tokens=generated_tokens,
-            total_tokens=input_ids.size + generated_tokens,
-            prompt_tps=input_ids.size / prompt_time if prompt_time > 0 else 0.0,
-            generation_tps=generated_tokens / generation_time,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=finish_reason,
-            diffusion_canvas_tokens=generated_tokens,
-            diffusion_block_complete=diffusion_block_complete,
-            text_already_printed=bool(generation_stats.get("text_already_printed")),
-        )
 
     def emit(result: GenerationResult) -> bool:
         if on_result is not None:
             return bool(on_result(result))
         pending_results.append(result)
         return True
-
-    def emit_model_result(result: GenerationResult) -> bool:
-        nonlocal model_streamed_results
-        model_streamed_results = True
-        return emit(result)
-
-    def flush(
-        tokens: List[int],
-        *,
-        diffusion_block_complete: bool = False,
-        finish_reason: Optional[str] = None,
-    ) -> bool:
-        nonlocal emitted_text
-        text = (
-            tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
-            if tokens
-            else ""
-        )
-        if text.startswith(emitted_text):
-            delta = text[len(emitted_text) :]
-        elif not emitted_text:
-            delta = text
-        else:
-            # Retokenization changed already-emitted text; resync on the final
-            # chunk and keep intermediate streaming conservative.
-            delta = "" if finish_reason is None else text
-
-        result = make_result(
-            delta,
-            tokens,
-            diffusion_block_complete=diffusion_block_complete,
-            finish_reason=finish_reason,
-        )
-        if not delta and not finish_reason and not diffusion_block_complete:
-            return True
-
-        if text.startswith(emitted_text):
-            emitted_text = text
-        return emit(result)
-
-    def on_block(tokens):
-        return flush([int(token) for token in tokens], diffusion_block_complete=True)
 
     top_p_arg = None if top_p is None or top_p >= 1.0 else top_p
     top_k_arg = None if top_k is None or top_k <= 0 else top_k
@@ -1162,26 +1091,16 @@ def _stream_model_diffusion_generate(
         skip_special_tokens=skip_special_tokens,
         skip_special_token_ids=skip_special_token_ids,
         stats=generation_stats,
-        on_block=on_block,
-        on_result=emit_model_result,
+        on_result=emit,
         **tuned_kwargs,
         **kwargs,
     )
     mx.eval(generated)
 
-    if model_streamed_results:
-        yield from pending_results
-        return
-
     if generation_stats.get("text_already_printed"):
         for result in pending_results:
             result.text_already_printed = True
 
-    tokens = [int(token) for token in generated[0].tolist()]
-    finish_reason = (
-        "stop" if tokens and tokenizer.stopping_criteria(tokens[-1]) else "length"
-    )
-    flush(tokens, finish_reason=finish_reason)
     yield from pending_results
 
 

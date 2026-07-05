@@ -1,11 +1,12 @@
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ...generate.common import GenerationResult
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -1099,6 +1100,7 @@ class LanguageModel(nn.Module):
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
         stats: Optional[Dict[str, float]] = None,
+        on_result: Optional[Callable[[GenerationResult], bool]] = None,
         linear_speculative: bool = False,
         **kwargs,
     ) -> mx.array:
@@ -1113,6 +1115,10 @@ class LanguageModel(nn.Module):
 
         eos_id = self.config.eos_token_id if eos_id is None else eos_id
         mask_id = self.config.mask_token_id if mask_id is None else mask_id
+        eos_token_ids = (
+            set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
+        )
+        generation_tic = time.perf_counter()
         if linear_speculative:
             if not self._linear_spec_lora_loaded:
                 model_path = getattr(self, "model_path", None)
@@ -1130,11 +1136,41 @@ class LanguageModel(nn.Module):
                 threshold=0.0,
                 stats=stats,
             )
-            return output[:, inputs.shape[1] :]
+            generated = output[:, inputs.shape[1] :]
+            if on_result is not None:
+                tokens = generated[0].tolist()
+                text = (
+                    tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+                    if tokenizer is not None
+                    else " ".join(str(token_id) for token_id in tokens)
+                )
+                prompt_time = (stats or {}).get("prompt_time") or 0.0
+                generation_time = max(
+                    time.perf_counter() - generation_tic - prompt_time,
+                    1e-9,
+                )
+                finish_reason = (
+                    "stop" if tokens and tokens[-1] in eos_token_ids else "length"
+                )
+                on_result(
+                    GenerationResult(
+                        text=text,
+                        token=tokens[-1] if tokens else None,
+                        logprobs=None,
+                        prompt_tokens=inputs.size,
+                        generation_tokens=len(tokens),
+                        total_tokens=inputs.size + len(tokens),
+                        prompt_tps=(
+                            inputs.size / prompt_time if prompt_time > 0 else 0.0
+                        ),
+                        generation_tps=len(tokens) / generation_time,
+                        peak_memory=mx.get_peak_memory() / 1e9,
+                        finish_reason=finish_reason,
+                        diffusion_canvas_tokens=len(tokens),
+                    )
+                )
+            return generated
 
-        eos_token_ids = (
-            set(eos_id) if isinstance(eos_id, (list, tuple, set)) else {eos_id}
-        )
         if block_length <= 0:
             raise ValueError("block_length must be a positive integer.")
         steps = max(1, int(steps))
@@ -1255,7 +1291,79 @@ class LanguageModel(nn.Module):
         generated_blocks = []
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
+        generation_tic = prompt_tic
+        emitted_text = ""
+        callback_stopped = False
         cache = self.make_cache()
+
+        def decode_generated(tokens: List[int]) -> str:
+            if not tokens:
+                return ""
+            if tokenizer is not None:
+                return tokenizer.decode(
+                    tokens,
+                    skip_special_tokens=skip_special_tokens,
+                )
+            return " ".join(str(token_id) for token_id in tokens)
+
+        def emit_result(
+            tokens: List[int],
+            *,
+            diffusion_block_complete: bool = False,
+            finish_reason: Optional[str] = None,
+        ) -> bool:
+            nonlocal emitted_text
+            if on_result is None:
+                return True
+
+            text = decode_generated(tokens)
+            if text.startswith(emitted_text):
+                delta = text[len(emitted_text) :]
+            elif not emitted_text:
+                delta = text
+            else:
+                delta = "" if finish_reason is None else text
+
+            if not delta and finish_reason is None and not diffusion_block_complete:
+                return True
+
+            if text.startswith(emitted_text):
+                emitted_text = text
+
+            prompt_time = (stats or {}).get("prompt_time") or 0.0
+            generation_time = max(
+                time.perf_counter() - generation_tic - prompt_time,
+                1e-9,
+            )
+            generated_tokens = len(tokens)
+            denoise_steps = int((stats or {}).get("diffusion_denoise_nfe", 0.0))
+            work_tokens = int((stats or {}).get("diffusion_accepted_tokens", 0.0))
+            return bool(
+                on_result(
+                    GenerationResult(
+                        text=delta,
+                        token=tokens[-1] if tokens else None,
+                        logprobs=None,
+                        prompt_tokens=inputs.size,
+                        generation_tokens=generated_tokens,
+                        total_tokens=inputs.size + generated_tokens,
+                        prompt_tps=(
+                            inputs.size / prompt_time if prompt_time > 0 else 0.0
+                        ),
+                        generation_tps=generated_tokens / generation_time,
+                        peak_memory=mx.get_peak_memory() / 1e9,
+                        finish_reason=finish_reason,
+                        diffusion_canvas_tokens=generated_tokens,
+                        diffusion_denoising_steps=denoise_steps,
+                        diffusion_work_tokens=work_tokens,
+                        diffusion_block_complete=diffusion_block_complete,
+                        text_already_printed=bool(
+                            (stats or {}).get("text_already_printed")
+                        ),
+                    )
+                )
+            )
+
         prefill_hidden = self.model(
             inputs,
             cache=cache,
@@ -1498,6 +1606,12 @@ class LanguageModel(nn.Module):
                 eos_index = _first_token_index(generated_block[0], eos_token_ids)
                 if eos_index is not None:
                     end_length = total_generated - current_block_length + eos_index + 1
+            if on_result is not None:
+                so_far = mx.concatenate(generated_blocks, axis=1)[0].tolist()
+                if end_length is not None:
+                    so_far = so_far[:end_length]
+                if not emit_result(so_far, diffusion_block_complete=True):
+                    callback_stopped = True
                     break
             if end_length is not None:
                 break
@@ -1546,6 +1660,14 @@ class LanguageModel(nn.Module):
             print(final_text, end="", flush=True)
             if stats is not None:
                 stats["text_already_printed"] = True
+        if on_result is not None and not callback_stopped:
+            generated_ids = generated[0].tolist()
+            finish_reason = (
+                "stop"
+                if end > 0 and generated_ids[end - 1] in eos_token_ids
+                else "length"
+            )
+            emit_result(generated_ids[:end], finish_reason=finish_reason)
         return generated[:, :end]
 
     def ar_generate(

@@ -4,6 +4,7 @@ import unittest
 import mlx.core as mx
 from mlx.utils import tree_map
 
+from mlx_vlm.generate.common import GenerationResult
 from mlx_vlm.generate.dispatch import stream_generate
 from mlx_vlm.models.cache import StaticPrefixKVCache
 
@@ -95,6 +96,16 @@ class TestDiffusionModels(unittest.TestCase):
         def generate(input_ids, **kwargs):
             generate_kwargs.update(kwargs)
             kwargs["stats"]["prompt_time"] = 1.0
+            kwargs["on_result"](
+                GenerationResult(
+                    text="decoded",
+                    token=3,
+                    prompt_tokens=input_ids.size,
+                    generation_tokens=3,
+                    total_tokens=input_ids.size + 3,
+                    finish_reason="stop",
+                )
+            )
             return mx.array([[1, 2, 3]], dtype=mx.int32)
 
         model.language_model.generate = generate
@@ -432,6 +443,21 @@ class TestDiffusionModels(unittest.TestCase):
         self.assertLessEqual(spec_generated.shape[1], 3)
         self.assertGreaterEqual(spec_nfe, 1)
 
+        spec_results = list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4]], dtype=mx.int32),
+                max_tokens=2,
+                generation_mode="linear_speculative",
+                linear_speculative=True,
+                temperature=0.0,
+            )
+        )
+        self.assertGreaterEqual(len(spec_results), 1)
+        self.assertEqual(spec_results[-1].generation_tokens, 2)
+
         def unexpected_diffusion_generate(*args, **kwargs):
             raise AssertionError("Default Nemotron generation should use AR")
 
@@ -453,6 +479,16 @@ class TestDiffusionModels(unittest.TestCase):
         def diffusion_generate(input_ids, **kwargs):
             diffusion_calls["kwargs"] = kwargs
             kwargs["stats"]["prompt_time"] = 1.0
+            kwargs["on_result"](
+                GenerationResult(
+                    text="decoded",
+                    token=3,
+                    prompt_tokens=input_ids.size,
+                    generation_tokens=2,
+                    total_tokens=input_ids.size + 2,
+                    finish_reason="stop",
+                )
+            )
             return mx.array([[5, 3]], dtype=mx.int32)
 
         model.language_model.generate = diffusion_generate
@@ -499,6 +535,16 @@ class TestDiffusionModels(unittest.TestCase):
         def generate(input_ids, **kwargs):
             linear_calls["kwargs"] = kwargs
             kwargs["stats"]["prompt_time"] = 1.0
+            kwargs["on_result"](
+                GenerationResult(
+                    text="decoded",
+                    token=3,
+                    prompt_tokens=input_ids.size,
+                    generation_tokens=2,
+                    total_tokens=input_ids.size + 2,
+                    finish_reason="stop",
+                )
+            )
             return mx.array([[5, 3]], dtype=mx.int32)
 
         model.language_model.generate = generate
@@ -588,7 +634,33 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
-    def test_stream_generate_keeps_final_result_after_block_callbacks(self):
+    def test_generate_invokes_on_result_with_generation_results(self):
+        mx.random.seed(0)
+        model = self._tiny_llada()
+        results = []
+        blocks = []
+
+        generated = model.language_model.generate(
+            mx.array([[4, 5]], dtype=mx.int32),
+            gen_length=8,
+            block_length=4,
+            steps=4,
+            eos_early_stop=False,
+            eos_id=999,
+            tokenizer=_Tokenizer(),
+            on_block=lambda tokens: blocks.append(tokens) or True,
+            on_result=lambda result: results.append(result) or True,
+        )
+
+        self.assertEqual(generated.shape[0], 1)
+        self.assertFalse(blocks)
+        self.assertTrue(results)
+        self.assertTrue(all(isinstance(result, GenerationResult) for result in results))
+        self.assertTrue(any(result.diffusion_block_complete for result in results))
+        self.assertFalse(results[-1].diffusion_block_complete)
+        self.assertEqual(results[-1].finish_reason, "length")
+
+    def test_stream_generate_yields_llada_model_owned_results(self):
         mx.random.seed(0)
         model = self._tiny_llada()
 
