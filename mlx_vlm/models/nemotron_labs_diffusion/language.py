@@ -1079,22 +1079,22 @@ class LanguageModel(nn.Module):
         self,
         inputs: mx.array,
         temperature: float = 0.0,
-        block_length: Optional[int] = None,
-        steps: Optional[int] = None,
+        block_length: int = 32,
+        steps: int = 32,
         gen_length: int = 2048,
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         eos_early_stop: bool = False,
         minimal_topk: int = 1,
-        threshold: Optional[float] = None,
+        threshold: float = 0.95,
         min_threshold: Optional[float] = None,
-        editing_threshold: Optional[float] = None,
-        max_post_steps: Optional[int] = None,
+        editing_threshold: float = 0.9,
+        max_post_steps: int = 16,
         eos_id: Optional[int] = None,
         mask_id: Optional[int] = None,
-        num_to_transfer: Optional[int] = None,
+        num_to_transfer: int = 1,
         max_transfer_per_step: Optional[int] = None,
-        stability_steps: Optional[int] = None,
+        stability_steps: int = 2,
         visualize: bool = False,
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
@@ -1113,53 +1113,6 @@ class LanguageModel(nn.Module):
 
         eos_id = self.config.eos_token_id if eos_id is None else eos_id
         mask_id = self.config.mask_token_id if mask_id is None else mask_id
-
-        def config_default(name, fallback):
-            value = getattr(self.config, name, None)
-            return fallback if value is None else value
-
-        block_length = int(
-            block_length
-            if block_length is not None
-            else config_default(
-                "default_block_length",
-                config_default("block_size", 32),
-            )
-        )
-        steps = int(
-            steps
-            if steps is not None
-            else config_default("default_diffusion_steps", 32)
-        )
-        threshold = (
-            threshold
-            if threshold is not None
-            else config_default("default_diffusion_threshold", 0.95)
-        )
-        editing_threshold = (
-            editing_threshold
-            if editing_threshold is not None
-            else config_default("default_diffusion_editing_threshold", 0.9)
-        )
-        max_post_steps = int(
-            max_post_steps
-            if max_post_steps is not None
-            else config_default("default_diffusion_max_post_steps", 16)
-        )
-        num_to_transfer = int(
-            num_to_transfer
-            if num_to_transfer is not None
-            else config_default("default_diffusion_num_to_transfer", 1)
-        )
-        if max_transfer_per_step is None:
-            max_transfer_per_step = config_default(
-                "default_diffusion_max_transfer_per_step", None
-            )
-        stability_steps = int(
-            stability_steps
-            if stability_steps is not None
-            else config_default("default_diffusion_stability_steps", 2)
-        )
         if linear_speculative:
             if not self._linear_spec_lora_loaded:
                 model_path = getattr(self, "model_path", None)

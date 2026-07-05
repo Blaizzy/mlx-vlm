@@ -70,7 +70,6 @@ class ModelConfig(BaseModelConfig):
     video_token_id: Optional[int] = None
     initializer_range: float = 0.02
     canvas_length: int = 256
-    diffusion_generation_kind: str = "block"
     eos_token_id: Optional[Union[int, List[int]]] = None
     generation_config: Optional[Dict[str, Any]] = None
     dtype: Optional[str] = None

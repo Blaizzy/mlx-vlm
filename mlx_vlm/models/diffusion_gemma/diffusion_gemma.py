@@ -63,8 +63,6 @@ class _LanguageModelView:
 
 
 class Model(nn.Module):
-    diffusion_generation_kind = "block"
-
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config

@@ -33,16 +33,10 @@ class ModelConfig(BaseModelConfig):
     attn_implementation: str = "sdpa"
     mask_token_id: int = 100
     default_generation_mode: str = "ar"
-    default_block_length: Optional[int] = None
     default_diffusion_sampler: str = "native"
     default_diffusion_steps: int = 32
     default_diffusion_threshold: Optional[float] = 0.9
     default_diffusion_min_threshold: Optional[float] = 0.45
-    default_diffusion_editing_threshold: Optional[float] = 0.9
-    default_diffusion_max_post_steps: int = 16
-    default_diffusion_num_to_transfer: int = 1
-    default_diffusion_max_transfer_per_step: Optional[int] = None
-    default_diffusion_stability_steps: int = 2
     default_diffusion_sampling_scaling_factor: float = 2.0
     dlm_paradigm: str = "bidirectional"
     block_size: int = 32
