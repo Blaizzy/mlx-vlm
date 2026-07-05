@@ -49,7 +49,6 @@ from .runtime import runtime
 logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
-DEFAULT_BATCH_COALESCE_MS = 5.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
@@ -108,14 +107,6 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
-
-
-def get_batch_coalesce_s():
-    raw = os.environ.get("MLX_VLM_BATCH_COALESCE_MS", str(DEFAULT_BATCH_COALESCE_MS))
-    try:
-        return max(0.0, float(raw)) / 1000.0
-    except ValueError:
-        return DEFAULT_BATCH_COALESCE_MS / 1000.0
 
 
 def _sequence_aligned_prefill_keys(
@@ -1251,7 +1242,7 @@ class ResponseGenerator:
                         and self.draft_model is not None
                         and self.draft_kind == "mtp"
                     )
-                    else (get_batch_coalesce_s() if not active_batch else 0.0)
+                    else 0.0
                 )
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
