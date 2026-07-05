@@ -46,6 +46,15 @@ class ModelConfig(BaseModelConfig):
     pad_token_id: int = 156892
     eos_token_id: Optional[int] = None
     mask_token_id: int = 156895
+    default_block_length: int = 32
+    default_diffusion_steps: int = 32
+    default_diffusion_threshold: Optional[float] = 0.95
+    default_diffusion_min_threshold: Optional[float] = None
+    default_diffusion_editing_threshold: Optional[float] = None
+    default_diffusion_max_post_steps: int = 16
+    default_diffusion_num_to_transfer: int = 1
+    default_diffusion_max_transfer_per_step: Optional[int] = None
+    default_diffusion_stability_steps: int = 2
     norm_topk_prob: bool = True
     score_function: str = "sigmoid"
     router_dtype: str = "fp32"

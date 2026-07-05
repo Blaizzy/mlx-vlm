@@ -114,6 +114,8 @@ class TestDiffusionModels(unittest.TestCase):
         # Without explicit overrides the model generate()'s own reference
         # defaults apply; the dispatcher must not force shared tuned values.
         for key in (
+            "block_length",
+            "steps",
             "threshold",
             "min_threshold",
             "editing_threshold",
@@ -123,8 +125,6 @@ class TestDiffusionModels(unittest.TestCase):
             "stability_steps",
         ):
             self.assertNotIn(key, generate_kwargs)
-        self.assertEqual(generate_kwargs["block_length"], 32)
-        self.assertEqual(generate_kwargs["steps"], 32)
         self.assertEqual(result.text, "decoded")
         self.assertEqual(result.generation_tokens, 3)
 
@@ -472,8 +472,8 @@ class TestDiffusionModels(unittest.TestCase):
         )
         self.assertTrue(diffusion_calls["kwargs"])
         self.assertNotIn("linear_speculative", diffusion_calls["kwargs"])
-        self.assertEqual(diffusion_calls["kwargs"]["steps"], 32)
-        self.assertEqual(diffusion_calls["kwargs"]["threshold"], 0.9)
+        self.assertNotIn("steps", diffusion_calls["kwargs"])
+        self.assertNotIn("threshold", diffusion_calls["kwargs"])
         self.assertEqual(diffusion_calls["kwargs"]["sampler"], "native")
         self.assertEqual(diffusion_calls["kwargs"]["sampling_scaling_factor"], 2.0)
         self.assertEqual(diffusion_calls["kwargs"]["head_scoring"], "chunked")
@@ -660,9 +660,17 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         self.assertEqual(drawn[-1], "4\n6")
 
     def test_diffusion_generation_family_routing(self):
-        from mlx_vlm.generate.diffusion import diffusion_generation_family
+        from mlx_vlm.generate.diffusion import (
+            diffusion_generation_family,
+            is_block_diffusion_model,
+            is_diffusion_model,
+            is_masked_diffusion_model,
+        )
 
         model = self._tiny_llada()
+        self.assertTrue(is_diffusion_model(model))
+        self.assertTrue(is_masked_diffusion_model(model))
+        self.assertFalse(is_block_diffusion_model(model))
         self.assertEqual(diffusion_generation_family(model), "masked")
 
         # Mask-token models that default to AR stay on the batch generator.
@@ -674,11 +682,19 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         self.assertIsNone(diffusion_generation_family(model))
 
     def test_diffusion_generation_family_block(self):
-        from mlx_vlm.generate.diffusion import diffusion_generation_family
+        from mlx_vlm.generate.diffusion import (
+            diffusion_generation_family,
+            is_block_diffusion_model,
+            is_diffusion_model,
+            is_masked_diffusion_model,
+        )
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
         from mlx_vlm.tests.test_diffusion_gemma import tiny_config_dict
 
         model = Model(ModelConfig.from_dict(tiny_config_dict()))
+        self.assertTrue(is_diffusion_model(model))
+        self.assertTrue(is_block_diffusion_model(model))
+        self.assertFalse(is_masked_diffusion_model(model))
         self.assertEqual(diffusion_generation_family(model), "block")
 
 

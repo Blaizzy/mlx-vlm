@@ -141,16 +141,16 @@ class _DiffusionRedrawer:
         self.rows = _terminal_rows_for_text(text)
 
 
-def _is_diffusion_config(config: Any) -> bool:
+def _is_block_diffusion_config(config: Any) -> bool:
     # Block-diffusion models declare the canvas length the denoising loop
     # operates on; that trait is what the shared engine drives, so detection
     # is not tied to a hardcoded model type.
     return getattr(config, "canvas_length", None) is not None
 
 
-def is_diffusion_model(model: nn.Module) -> bool:
+def is_block_diffusion_model(model: nn.Module) -> bool:
     """True for block-diffusion canvas models driven by the shared engine."""
-    return _is_diffusion_config(getattr(model, "config", None)) and all(
+    return _is_block_diffusion_config(getattr(model, "config", None)) and all(
         callable(getattr(model, method, None)) for method in BLOCK_DIFFUSION_METHODS
     )
 
@@ -159,6 +159,11 @@ def is_masked_diffusion_model(model: nn.Module) -> bool:
     """True for masked-diffusion text models that own their generate loop."""
     config = getattr(model, "config", None)
     return getattr(config, "mask_token_id", None) is not None
+
+
+def is_diffusion_model(model: nn.Module) -> bool:
+    """True for any model that uses a diffusion generation path."""
+    return is_block_diffusion_model(model) or is_masked_diffusion_model(model)
 
 
 def diffusion_generation_family(model: nn.Module) -> Optional[str]:
@@ -170,7 +175,7 @@ def diffusion_generation_family(model: nn.Module) -> Optional[str]:
     generation, like nemotron), and ``None`` for ordinary autoregressive
     models.
     """
-    if is_diffusion_model(model):
+    if is_block_diffusion_model(model):
         return "block"
     if is_masked_diffusion_model(model):
         config = getattr(model, "config", None)
@@ -180,7 +185,7 @@ def diffusion_generation_family(model: nn.Module) -> Optional[str]:
 
 
 def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
-    if not _is_diffusion_config(config):
+    if not _is_block_diffusion_config(config):
         return {}
 
     kwargs = {}
@@ -203,7 +208,8 @@ class DiffusionOutputHandler:
     def __init__(self, model: nn.Module, kwargs: Dict[str, Any], verbose: bool):
         self.verbose = verbose
         self.live_mode = bool(
-            kwargs.get("diffusion_show_unmasking", False) and is_diffusion_model(model)
+            kwargs.get("diffusion_show_unmasking", False)
+            and is_block_diffusion_model(model)
         )
         self.width = kwargs.get(
             "diffusion_unmasking_width", DEFAULT_DIFFUSION_UNMASKING_WIDTH

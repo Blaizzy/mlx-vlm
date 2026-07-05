@@ -1504,7 +1504,6 @@ class ResponseGenerator:
         if hasattr(tokenizer, "stopping_criteria"):
             tokenizer.stopping_criteria.reset(self.config.eos_token_id)
 
-        config = self.config
         gen_stats: dict = {}
         emitted_text = ""
         emitted_tokens = 0
@@ -1552,37 +1551,23 @@ class ResponseGenerator:
                 return False
             return True
 
-        # Sampler knobs resolve as: config default_diffusion_* attribute >
-        # the model generate()'s own reference defaults (omitted here).
-        tuned_kwargs = {}
-        for key, config_attr in (
-            ("threshold", "default_diffusion_threshold"),
-            ("min_threshold", "default_diffusion_min_threshold"),
-            ("editing_threshold", "default_diffusion_editing_threshold"),
-            ("num_to_transfer", "default_diffusion_num_to_transfer"),
-            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
-            ("max_post_steps", "default_diffusion_max_post_steps"),
-            ("stability_steps", "default_diffusion_stability_steps"),
-        ):
-            value = getattr(config, config_attr, None)
-            if value is not None:
-                tuned_kwargs[key] = value
-
+        model_generate_kwargs = {}
+        if args.top_p is not None and args.top_p < 1.0:
+            model_generate_kwargs["top_p"] = args.top_p
+        if args.top_k is not None and args.top_k > 0:
+            model_generate_kwargs["top_k"] = args.top_k
         with wired_limit(self.model, [generation_stream]):
             generated = self.model.language_model.generate(
                 input_ids,
                 temperature=args.temperature,
-                block_length=getattr(config, "default_block_length", None) or 32,
-                steps=getattr(config, "default_diffusion_steps", None) or 32,
                 gen_length=args.max_tokens,
-                top_p=(None if args.top_p is None or args.top_p >= 1.0 else args.top_p),
                 eos_early_stop=True,
                 visualize=False,
                 tokenizer=tokenizer,
                 skip_special_tokens=args.skip_special_tokens,
                 stats=gen_stats,
                 on_block=on_block,
-                **tuned_kwargs,
+                **model_generate_kwargs,
             )
             mx.eval(generated)
 
