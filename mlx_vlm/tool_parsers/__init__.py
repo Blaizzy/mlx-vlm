@@ -7,7 +7,6 @@ matching parser module from ``mlx_vlm.tool_parsers``.
 
 import importlib
 
-
 _TEMPLATE_MARKERS = [
     (("<|tool_call>",), "gemma4"),
     (("<|START_ACTION|>",), "cohere2_moe"),
