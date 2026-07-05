@@ -793,6 +793,7 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
+    generation_tps: Optional[float] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
     token_count: int = 1
@@ -825,6 +826,7 @@ class _DiffusionBlockEmitter:
                 finish_reason=result.finish_reason,
                 peak_memory=result.peak_memory,
                 prompt_tps=result.prompt_tps,
+                generation_tps=result.generation_tps,
                 token_count=token_count,
             )
             self.block_text = []

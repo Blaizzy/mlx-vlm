@@ -886,6 +886,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     chunk = rqueue.get(timeout=1)
     assert chunk.text == "ok"
     assert chunk.finish_reason == "length"
+    assert chunk.generation_tps == 5.0
     assert captured["input_ids"].tolist() == [[11, 12]]
     assert captured["pixel_values"] == "pixels"
     assert captured["attention_mask"] == "mask"
