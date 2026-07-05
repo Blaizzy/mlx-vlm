@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.nn as nn
-from mlx_lm.tuner.lora import LoRALinear
 
+from mlx_vlm.trainer.lora_layers import LoRALinear
 from mlx_vlm.trainer.utils import (
     apply_lora_layers,
     find_all_linear_names,

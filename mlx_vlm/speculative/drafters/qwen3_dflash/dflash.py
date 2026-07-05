@@ -2,8 +2,8 @@ from typing import List
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.qwen3 import MLP as Qwen3MLP
 
+from ....models.activations import swiglu
 from ....models.cache import BufferedRotatingKVCache, KVCache, RotatingKVCache
 from ....models.rope_utils import initialize_rope
 from .config import DFlashConfig
@@ -87,6 +87,19 @@ class DFlashAttention(nn.Module):
             queries, keys, values, scale=self.scale, mask=mask
         )
         return self.o_proj(o.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
+
+class Qwen3MLP(nn.Module):
+    """Qwen3-style gated MLP (matches mlx_lm.models.qwen3.MLP weights)."""
+
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class DFlashDecoderLayer(nn.Module):
