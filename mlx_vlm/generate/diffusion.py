@@ -4,7 +4,7 @@ import logging
 import os
 import shutil
 import time
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Callable, Dict, Generator, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -148,54 +148,104 @@ def _is_diffusion_config(config: Any) -> bool:
     return getattr(config, "canvas_length", None) is not None
 
 
-def is_diffusion_model(model: nn.Module) -> bool:
-    """True for block-diffusion canvas models driven by the shared engine."""
+def _is_block_diffusion_model(model: nn.Module) -> bool:
+    """True for canvas models driven by the shared diffusion engine."""
     return _is_diffusion_config(getattr(model, "config", None)) and all(
         callable(getattr(model, method, None)) for method in BLOCK_DIFFUSION_METHODS
     )
 
 
-def is_masked_diffusion_model(model: nn.Module) -> bool:
+def _is_masked_diffusion_model(model: nn.Module) -> bool:
     """True for masked-diffusion text models that own their generate loop."""
     config = getattr(model, "config", None)
     return getattr(config, "mask_token_id", None) is not None
 
 
-def diffusion_generation_family(model: nn.Module) -> Optional[str]:
-    """Classify how a model generates, for request routing.
+def _use_masked_diffusion_model(
+    model: nn.Module,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> bool:
+    if not _is_masked_diffusion_model(model):
+        return False
 
-    Returns ``"block"`` for canvas-denoising models the shared engine drives,
-    ``"masked"`` for masked-diffusion text models that run their own
-    ``generate()`` loop (unless the checkpoint defaults to autoregressive
-    generation, like nemotron), and ``None`` for ordinary autoregressive
-    models.
+    config = getattr(model, "config", None)
+    if getattr(config, "default_generation_mode", None) != "ar":
+        return True
+
+    generation_mode = (kwargs or {}).get("generation_mode")
+    if generation_mode is not None:
+        return generation_mode != "ar"
+
+    return False
+
+
+def is_diffusion_model(
+    model: nn.Module,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when this request should use the unified diffusion path."""
+    return _is_block_diffusion_model(model) or _use_masked_diffusion_model(
+        model, kwargs
+    )
+
+
+def is_masked_diffusion_model(model: nn.Module) -> bool:
+    return _is_masked_diffusion_model(model)
+
+
+def diffusion_generation_family(
+    model: nn.Module,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Backward-compatible diffusion router.
+
+    New callers should use :func:`is_diffusion_model` and the unified stream
+    adapter directly.
     """
-    if is_diffusion_model(model):
-        return "block"
-    if is_masked_diffusion_model(model):
-        config = getattr(model, "config", None)
-        if getattr(config, "default_generation_mode", None) != "ar":
-            return "masked"
+    if is_diffusion_model(model, kwargs):
+        return "diffusion"
     return None
 
 
 def diffusion_kwargs_from_args(args: Any, config: Any) -> Dict[str, Any]:
-    if not _is_diffusion_config(config):
+    is_block_config = _is_diffusion_config(config)
+    is_masked_config = getattr(config, "mask_token_id", None) is not None
+    if not is_block_config and not is_masked_config:
         return {}
 
     kwargs = {}
     if args.max_denoising_steps is not None:
         kwargs["max_denoising_steps"] = args.max_denoising_steps
-    if args.diffusion_full_canvas:
-        kwargs["diffusion_full_canvas"] = True
-    if args.diffusion_min_canvas_length is not None:
-        kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
-    if getattr(args, "diffusion_max_canvas_length", None) is not None:
-        kwargs["diffusion_max_canvas_length"] = args.diffusion_max_canvas_length
-    if args.diffusion_sampler != "confidence-threshold":
-        kwargs["diffusion_sampler"] = args.diffusion_sampler
+
+    if is_block_config:
+        if args.diffusion_full_canvas:
+            kwargs["diffusion_full_canvas"] = True
+        if args.diffusion_min_canvas_length is not None:
+            kwargs["diffusion_min_canvas_length"] = args.diffusion_min_canvas_length
+        if getattr(args, "diffusion_max_canvas_length", None) is not None:
+            kwargs["diffusion_max_canvas_length"] = args.diffusion_max_canvas_length
+        if args.diffusion_sampler != "confidence-threshold":
+            kwargs["diffusion_sampler"] = args.diffusion_sampler
+        if args.threshold is not None:
+            kwargs["diffusion_threshold"] = args.threshold
+        return kwargs
+
+    if getattr(args, "block_length", None) is not None:
+        kwargs["block_length"] = args.block_length
+    if getattr(args, "num_to_transfer", None) is not None:
+        kwargs["num_to_transfer"] = args.num_to_transfer
+    if getattr(args, "max_transfer_per_step", None) is not None:
+        kwargs["max_transfer_per_step"] = args.max_transfer_per_step
     if args.threshold is not None:
-        kwargs["diffusion_threshold"] = args.threshold
+        kwargs["threshold"] = args.threshold
+    if getattr(args, "min_threshold", None) is not None:
+        kwargs["min_threshold"] = args.min_threshold
+    if getattr(args, "editing_threshold", None) is not None:
+        kwargs["editing_threshold"] = args.editing_threshold
+    if getattr(args, "max_post_steps", None) is not None:
+        kwargs["max_post_steps"] = args.max_post_steps
+    if getattr(args, "stability_steps", None) is not None:
+        kwargs["stability_steps"] = args.stability_steps
     return kwargs
 
 
@@ -203,7 +253,8 @@ class DiffusionOutputHandler:
     def __init__(self, model: nn.Module, kwargs: Dict[str, Any], verbose: bool):
         self.verbose = verbose
         self.live_mode = bool(
-            kwargs.get("diffusion_show_unmasking", False) and is_diffusion_model(model)
+            kwargs.get("diffusion_show_unmasking", False)
+            and _is_block_diffusion_model(model)
         )
         self.width = kwargs.get(
             "diffusion_unmasking_width", DEFAULT_DIFFUSION_UNMASKING_WIDTH
@@ -975,6 +1026,188 @@ def stream_diffusion_generate(
     yield make_result(detokenizer.last_segment, finish_reason=finish_reason)
 
 
+def stream_masked_diffusion_generate(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizer,
+    input_ids: mx.array,
+    pixel_values: Optional[mx.array],
+    attention_mask: Optional[mx.array],
+    *,
+    max_tokens: int,
+    skip_special_token_ids,
+    skip_special_tokens: bool = False,
+    temperature: float = DEFAULT_TEMPERATURE,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    max_denoising_steps: Optional[int] = None,
+    block_length: Optional[int] = None,
+    verbose: bool = False,
+    on_result: Optional[Callable[[GenerationResult], bool]] = None,
+    **kwargs,
+) -> Generator[GenerationResult, None, None]:
+    del processor, attention_mask, skip_special_token_ids
+    if input_ids.shape[0] != 1:
+        raise ValueError(
+            "Masked diffusion streaming generation only supports batch size 1."
+        )
+    if pixel_values is not None:
+        model_type = getattr(getattr(model, "config", None), "model_type", "This model")
+        raise ValueError(f"{model_type} is a text-only model.")
+
+    config = getattr(model, "config", None)
+    if max_denoising_steps is None:
+        max_denoising_steps = kwargs.pop(
+            "steps", getattr(config, "default_diffusion_steps", 32)
+        )
+    else:
+        kwargs.pop("steps", None)
+
+    block_length = (
+        block_length
+        if block_length is not None
+        else getattr(config, "default_block_length", None) or 32
+    )
+
+    tuned_kwargs = {}
+    for key, config_attr in (
+        ("threshold", "default_diffusion_threshold"),
+        ("min_threshold", "default_diffusion_min_threshold"),
+        ("editing_threshold", "default_diffusion_editing_threshold"),
+        ("num_to_transfer", "default_diffusion_num_to_transfer"),
+        ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
+        ("max_post_steps", "default_diffusion_max_post_steps"),
+        ("stability_steps", "default_diffusion_stability_steps"),
+    ):
+        value = kwargs.pop(key, None)
+        if value is None:
+            value = getattr(config, config_attr, None)
+        if value is not None:
+            tuned_kwargs[key] = value
+
+    diffusion_show_unmasking = kwargs.pop("diffusion_show_unmasking", False)
+    for key in (
+        "diffusion_full_canvas",
+        "diffusion_min_canvas_length",
+        "diffusion_max_canvas_length",
+        "diffusion_static_cache",
+        "diffusion_sampler",
+        "diffusion_threshold",
+        "diffusion_compile",
+        "diffusion_unmasking_interval",
+        "diffusion_unmasking_width",
+        "mm_token_type_ids",
+        "prefill_step_size",
+    ):
+        kwargs.pop(key, None)
+
+    generation_stats = {}
+    emitted_text = ""
+    generation_tic = time.perf_counter()
+    pending_results: List[GenerationResult] = []
+
+    def make_result(
+        text: str,
+        tokens: List[int],
+        *,
+        diffusion_block_complete: bool = False,
+        finish_reason: Optional[str] = None,
+    ) -> GenerationResult:
+        prompt_time = generation_stats.get("prompt_time") or 0.0
+        generation_time = max(time.perf_counter() - generation_tic - prompt_time, 1e-9)
+        generated_tokens = len(tokens)
+        return GenerationResult(
+            text=text,
+            token=tokens[-1] if tokens else None,
+            logprobs=None,
+            prompt_tokens=input_ids.size,
+            generation_tokens=generated_tokens,
+            total_tokens=input_ids.size + generated_tokens,
+            prompt_tps=input_ids.size / prompt_time if prompt_time > 0 else 0.0,
+            generation_tps=generated_tokens / generation_time,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=finish_reason,
+            diffusion_canvas_tokens=generated_tokens,
+            diffusion_block_complete=diffusion_block_complete,
+            text_already_printed=bool(generation_stats.get("text_already_printed")),
+        )
+
+    def emit(result: GenerationResult) -> bool:
+        if on_result is not None:
+            return bool(on_result(result))
+        pending_results.append(result)
+        return True
+
+    def flush(
+        tokens: List[int],
+        *,
+        diffusion_block_complete: bool = False,
+        finish_reason: Optional[str] = None,
+    ) -> bool:
+        nonlocal emitted_text
+        text = (
+            tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+            if tokens
+            else ""
+        )
+        if text.startswith(emitted_text):
+            delta = text[len(emitted_text) :]
+        elif not emitted_text:
+            delta = text
+        else:
+            # Retokenization changed already-emitted text; resync on the final
+            # chunk and keep intermediate streaming conservative.
+            delta = "" if finish_reason is None else text
+
+        result = make_result(
+            delta,
+            tokens,
+            diffusion_block_complete=diffusion_block_complete,
+            finish_reason=finish_reason,
+        )
+        if not delta and not finish_reason and not diffusion_block_complete:
+            return True
+
+        if text.startswith(emitted_text):
+            emitted_text = text
+        return emit(result)
+
+    def on_block(tokens):
+        return flush([int(token) for token in tokens], diffusion_block_complete=True)
+
+    top_p_arg = None if top_p is None or top_p >= 1.0 else top_p
+    top_k_arg = None if top_k is None or top_k <= 0 else top_k
+    generated = model.language_model.generate(
+        input_ids,
+        temperature=temperature,
+        block_length=block_length,
+        steps=max_denoising_steps,
+        gen_length=max_tokens,
+        top_p=top_p_arg,
+        top_k=top_k_arg,
+        eos_early_stop=True,
+        visualize=bool(verbose or diffusion_show_unmasking),
+        tokenizer=tokenizer,
+        skip_special_tokens=skip_special_tokens,
+        stats=generation_stats,
+        on_block=on_block,
+        **tuned_kwargs,
+        **kwargs,
+    )
+    mx.eval(generated)
+
+    if generation_stats.get("text_already_printed"):
+        for result in pending_results:
+            result.text_already_printed = True
+
+    tokens = [int(token) for token in generated[0].tolist()]
+    finish_reason = (
+        "stop" if tokens and tokenizer.stopping_criteria(tokens[-1]) else "length"
+    )
+    flush(tokens, finish_reason=finish_reason)
+    yield from pending_results
+
+
 def stream_diffusion_generate_from_kwargs(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -984,7 +1217,45 @@ def stream_diffusion_generate_from_kwargs(
     attention_mask: Optional[mx.array],
     skip_special_token_ids,
     kwargs: Dict[str, Any],
+    *,
+    skip_special_tokens: bool = False,
+    verbose: bool = False,
+    on_result: Optional[Callable[[GenerationResult], bool]] = None,
 ) -> Generator[GenerationResult, None, None]:
+    if kwargs.get("logits_processors") is not None:
+        raise ValueError(
+            "Structured response_format is not supported with diffusion models."
+        )
+    seed = kwargs.pop("seed", None)
+    if seed is not None:
+        mx.random.seed(seed)
+
+    if _use_masked_diffusion_model(model, kwargs):
+        max_denoising_steps = kwargs.pop("max_denoising_steps", None)
+        block_length = kwargs.pop("block_length", None)
+        with wired_limit(model, [generation_stream]):
+            yield from stream_masked_diffusion_generate(
+                model,
+                processor,
+                tokenizer,
+                input_ids,
+                pixel_values,
+                attention_mask,
+                max_tokens=kwargs.pop("max_tokens", 2048),
+                temperature=kwargs.pop("temperature", DEFAULT_TEMPERATURE),
+                top_p=kwargs.pop("top_p", None),
+                top_k=kwargs.pop("top_k", None),
+                skip_special_token_ids=skip_special_token_ids,
+                skip_special_tokens=skip_special_tokens,
+                max_denoising_steps=max_denoising_steps,
+                block_length=block_length,
+                verbose=verbose,
+                on_result=on_result,
+                **kwargs,
+            )
+            mx.clear_cache()
+        return
+
     max_denoising_steps = kwargs.pop("max_denoising_steps", None)
     diffusion_full_canvas = kwargs.pop("diffusion_full_canvas", False)
     diffusion_min_canvas_length = kwargs.pop("diffusion_min_canvas_length", None)
@@ -1001,7 +1272,7 @@ def stream_diffusion_generate_from_kwargs(
     mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
     prefill_step_size = kwargs.pop("prefill_step_size", None)
     with wired_limit(model, [generation_stream]):
-        yield from stream_diffusion_generate(
+        results = stream_diffusion_generate(
             model,
             processor,
             tokenizer,
@@ -1025,4 +1296,11 @@ def stream_diffusion_generate_from_kwargs(
             mm_token_type_ids=mm_token_type_ids,
             prefill_step_size=prefill_step_size,
         )
+        try:
+            for result in results:
+                if on_result is not None and not on_result(result):
+                    break
+                yield result
+        finally:
+            results.close()
         mx.clear_cache()

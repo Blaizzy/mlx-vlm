@@ -660,17 +660,28 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         self.assertEqual(drawn[-1], "4\n6")
 
     def test_diffusion_generation_family_routing(self):
-        from mlx_vlm.generate.diffusion import diffusion_generation_family
+        from mlx_vlm.generate.diffusion import (
+            diffusion_generation_family,
+            is_diffusion_model,
+        )
 
         model = self._tiny_llada()
-        self.assertEqual(diffusion_generation_family(model), "masked")
+        self.assertTrue(is_diffusion_model(model))
+        self.assertEqual(diffusion_generation_family(model), "diffusion")
 
         # Mask-token models that default to AR stay on the batch generator.
         model.config.default_generation_mode = "ar"
+        self.assertFalse(is_diffusion_model(model))
         self.assertIsNone(diffusion_generation_family(model))
+        self.assertTrue(is_diffusion_model(model, {"generation_mode": "diffusion"}))
+        self.assertEqual(
+            diffusion_generation_family(model, {"generation_mode": "diffusion"}),
+            "diffusion",
+        )
         model.config.default_generation_mode = None
 
         model.config.mask_token_id = None
+        self.assertFalse(is_diffusion_model(model))
         self.assertIsNone(diffusion_generation_family(model))
 
     def test_diffusion_generation_family_block(self):
@@ -679,7 +690,7 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         from mlx_vlm.tests.test_diffusion_gemma import tiny_config_dict
 
         model = Model(ModelConfig.from_dict(tiny_config_dict()))
-        self.assertEqual(diffusion_generation_family(model), "block")
+        self.assertEqual(diffusion_generation_family(model), "diffusion")
 
 
 if __name__ == "__main__":
