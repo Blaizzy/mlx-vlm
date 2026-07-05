@@ -1067,7 +1067,7 @@ def _stream_model_diffusion_generate(
     emitted_text = ""
     generation_tic = time.perf_counter()
     pending_results: List[GenerationResult] = []
-    model_reported_results = False
+    model_streamed_results = False
 
     def make_result(
         text: str,
@@ -1096,12 +1096,15 @@ def _stream_model_diffusion_generate(
         )
 
     def emit(result: GenerationResult) -> bool:
-        nonlocal model_reported_results
-        model_reported_results = True
         if on_result is not None:
             return bool(on_result(result))
         pending_results.append(result)
         return True
+
+    def emit_model_result(result: GenerationResult) -> bool:
+        nonlocal model_streamed_results
+        model_streamed_results = True
+        return emit(result)
 
     def flush(
         tokens: List[int],
@@ -1160,13 +1163,13 @@ def _stream_model_diffusion_generate(
         skip_special_token_ids=skip_special_token_ids,
         stats=generation_stats,
         on_block=on_block,
-        on_result=emit,
+        on_result=emit_model_result,
         **tuned_kwargs,
         **kwargs,
     )
     mx.eval(generated)
 
-    if model_reported_results:
+    if model_streamed_results:
         yield from pending_results
         return
 

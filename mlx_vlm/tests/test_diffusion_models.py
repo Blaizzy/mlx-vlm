@@ -588,6 +588,27 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_stream_generate_keeps_final_result_after_block_callbacks(self):
+        mx.random.seed(0)
+        model = self._tiny_llada()
+
+        responses = list(
+            stream_generate(
+                model,
+                _Processor(),
+                prompt="ignored",
+                input_ids=mx.array([[4, 5]], dtype=mx.int32),
+                max_tokens=8,
+                max_denoising_steps=4,
+                block_length=4,
+                temperature=0.0,
+            )
+        )
+
+        self.assertTrue(any(result.diffusion_block_complete for result in responses))
+        self.assertFalse(responses[-1].diffusion_block_complete)
+        self.assertIsNotNone(responses[-1].finish_reason)
+
     def test_llada_unmasking_visualizes_current_block(self):
         from mlx_vlm.models.llada2_moe import language as llada_language
 
