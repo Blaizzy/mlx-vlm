@@ -1502,6 +1502,9 @@ class ResponseGenerator:
             "top_k": args.top_k,
             "mm_token_type_ids": raw_inputs.get("mm_token_type_ids"),
         }
+        prefill_step_size = get_prefill_step_size()
+        if prefill_step_size > 0:
+            stream_kwargs["prefill_step_size"] = prefill_step_size
         if args.seed is not None:
             stream_kwargs["seed"] = args.seed
         if args.logits_processors is not None:

@@ -847,6 +847,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "stream_diffusion_generate_from_kwargs",
         fake_stream_diffusion_generate_from_kwargs,
     )
+    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
     args = server.GenerationArguments(
         max_tokens=4,
         temperature=0.0,
@@ -896,6 +897,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "top_p": 1.0,
         "top_k": 0,
         "mm_token_type_ids": "types",
+        "prefill_step_size": 2048,
         "seed": 123,
         "max_denoising_steps": 7,
         "block_length": 16,
