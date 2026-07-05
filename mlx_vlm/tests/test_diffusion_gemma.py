@@ -691,6 +691,35 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(responses[-1].diffusion_denoising_steps, 1)
         self.assertEqual(responses[-1].diffusion_work_tokens, 3)
 
+    def test_stream_generate_uses_model_owned_generator(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        mx.random.seed(0)
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        original_generate = model.language_model.generate
+        calls = {"count": 0}
+
+        def counted_generate(*args, **kwargs):
+            calls["count"] += 1
+            return original_generate(*args, **kwargs)
+
+        model.language_model.generate = counted_generate
+        responses = list(
+            stream_generate(
+                model,
+                FakeProcessor(),
+                "",
+                input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                max_tokens=2,
+                max_denoising_steps=1,
+            )
+        )
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(responses[-1].generation_tokens, 2)
+
     def test_generate_verbose_omits_diffusion_work_stats(self):
         from mlx_vlm.generate import generate
         from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
@@ -1751,7 +1780,11 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         args.threshold = 0.7
         self.assertEqual(
             diffusion_kwargs_from_args(args, model.config),
-            {"diffusion_sampler": "entropy-bound", "diffusion_threshold": 0.7},
+            {
+                "diffusion_sampler": "entropy-bound",
+                "diffusion_threshold": 0.7,
+                "threshold": 0.7,
+            },
         )
 
     def test_stream_generate_with_quantized_embeddings(self):

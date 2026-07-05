@@ -795,6 +795,127 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     ) == 1
 
 
+def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace()
+    gen.processor = SimpleNamespace()
+    gen.config = SimpleNamespace(eos_token_id=3)
+    gen.tokenizer = SimpleNamespace(all_special_ids=[0])
+    captured = {}
+
+    def fake_stream_diffusion_generate_from_kwargs(
+        model,
+        processor,
+        tokenizer,
+        input_ids,
+        pixel_values,
+        attention_mask,
+        skip_special_token_ids,
+        kwargs,
+        *,
+        skip_special_tokens=False,
+        on_result=None,
+    ):
+        captured.update(
+            model=model,
+            processor=processor,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            skip_special_token_ids=skip_special_token_ids,
+            kwargs=dict(kwargs),
+            skip_special_tokens=skip_special_tokens,
+        )
+        on_result(
+            GenerationResult(
+                text="ok",
+                token=7,
+                prompt_tokens=2,
+                generation_tokens=1,
+                total_tokens=3,
+                prompt_tps=10.0,
+                generation_tps=5.0,
+                finish_reason="length",
+            )
+        )
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        server_generation,
+        "stream_diffusion_generate_from_kwargs",
+        fake_stream_diffusion_generate_from_kwargs,
+    )
+    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
+    args = server.GenerationArguments(
+        max_tokens=4,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=123,
+        max_denoising_steps=7,
+        block_length=16,
+        num_to_transfer=3,
+        max_transfer_per_step=2,
+        editing_threshold=0.8,
+        max_post_steps=5,
+        stability_steps=1,
+        diffusion_full_canvas=True,
+        diffusion_min_canvas_length=4,
+        diffusion_max_canvas_length=8,
+        diffusion_sampler="entropy-bound",
+        threshold=0.7,
+        min_threshold=0.4,
+    )
+    rqueue = Queue()
+
+    gen._generate_diffusion(
+        uid=1,
+        rqueue=rqueue,
+        raw_inputs={
+            "input_ids": mx.array([[11, 12]], dtype=mx.int32),
+            "pixel_values": "pixels",
+            "attention_mask": "mask",
+            "mm_token_type_ids": "types",
+        },
+        args=args,
+        cancelled=set(),
+    )
+
+    chunk = rqueue.get(timeout=1)
+    assert chunk.text == "ok"
+    assert chunk.finish_reason == "length"
+    assert chunk.generation_tps == 5.0
+    assert captured["input_ids"].tolist() == [[11, 12]]
+    assert captured["pixel_values"] == "pixels"
+    assert captured["attention_mask"] == "mask"
+    assert captured["skip_special_token_ids"] == {0}
+    assert captured["skip_special_tokens"] is True
+    assert captured["kwargs"] == {
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "mm_token_type_ids": "types",
+        "prefill_step_size": 2048,
+        "seed": 123,
+        "max_denoising_steps": 7,
+        "block_length": 16,
+        "num_to_transfer": 3,
+        "max_transfer_per_step": 2,
+        "editing_threshold": 0.8,
+        "max_post_steps": 5,
+        "stability_steps": 1,
+        "diffusion_full_canvas": True,
+        "diffusion_min_canvas_length": 4,
+        "diffusion_max_canvas_length": 8,
+        "diffusion_sampler": "entropy-bound",
+        "threshold": 0.7,
+        "min_threshold": 0.4,
+    }
+
+
 @pytest.mark.parametrize(
     ("method", "path"),
     [
@@ -4566,6 +4687,46 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_preserves_diffusion_options(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            max_denoising_steps=7,
+            block_length=16,
+            num_to_transfer=3,
+            max_transfer_per_step=2,
+            editing_threshold=0.8,
+            max_post_steps=5,
+            stability_steps=1,
+            diffusion_full_canvas=True,
+            diffusion_min_canvas_length=4,
+            diffusion_max_canvas_length=8,
+            diffusion_sampler="entropy-bound",
+            threshold=0.7,
+            min_threshold=0.4,
+        )
+
+        args = server._build_gen_args(req)
+
+        expected = {
+            "max_denoising_steps": 7,
+            "block_length": 16,
+            "num_to_transfer": 3,
+            "max_transfer_per_step": 2,
+            "editing_threshold": 0.8,
+            "max_post_steps": 5,
+            "stability_steps": 1,
+            "diffusion_full_canvas": True,
+            "diffusion_min_canvas_length": 4,
+            "diffusion_max_canvas_length": 8,
+            "diffusion_sampler": "entropy-bound",
+            "threshold": 0.7,
+            "min_threshold": 0.4,
+        }
+        assert args.diffusion_kwargs() == expected
+        for key, value in expected.items():
+            assert args.to_generate_kwargs()[key] == value
 
     def test_build_gen_args_uses_model_generation_config_when_omitted(
         self, monkeypatch
