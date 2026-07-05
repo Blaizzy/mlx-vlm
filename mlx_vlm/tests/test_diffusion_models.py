@@ -1,3 +1,4 @@
+import importlib
 import math
 import unittest
 
@@ -658,6 +659,42 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         visualizer.visualize(mx.array([[4, 5, 6]], dtype=mx.int32), force=True)
 
         self.assertEqual(drawn[-1], "4\n6")
+
+    def test_dispatch_routes_diffusion_models_through_shared_adapter(self):
+        from mlx_vlm.generate.common import GenerationResult
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+        from mlx_vlm.tests.test_diffusion_gemma import tiny_config_dict
+
+        dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
+        models = [
+            self._tiny_llada(),
+            Model(ModelConfig.from_dict(tiny_config_dict())),
+        ]
+        original = dispatch.stream_diffusion_generate_from_kwargs
+        calls = []
+
+        def fake_stream(model, *args, **kwargs):
+            calls.append(model)
+            yield GenerationResult(text="ok", generation_tokens=1)
+
+        dispatch.stream_diffusion_generate_from_kwargs = fake_stream
+        try:
+            for model in models:
+                results = list(
+                    stream_generate(
+                        model,
+                        _Processor(),
+                        prompt="ignored",
+                        input_ids=mx.array([[4]], dtype=mx.int32),
+                        max_tokens=1,
+                        temperature=0.0,
+                    )
+                )
+                self.assertEqual(results[-1].text, "ok")
+        finally:
+            dispatch.stream_diffusion_generate_from_kwargs = original
+
+        self.assertEqual(calls, models)
 
     def test_diffusion_generation_family_routing(self):
         from mlx_vlm.generate.diffusion import (

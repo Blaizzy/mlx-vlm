@@ -166,6 +166,17 @@ def is_diffusion_model(model: nn.Module) -> bool:
     return is_block_diffusion_model(model) or is_masked_diffusion_model(model)
 
 
+def masked_diffusion_generation_enabled(
+    model: nn.Module,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> bool:
+    config = getattr(model, "config", None)
+    generation_mode = (kwargs or {}).get("generation_mode")
+    return getattr(config, "default_generation_mode", None) != "ar" or (
+        generation_mode is not None and generation_mode != "ar"
+    )
+
+
 def diffusion_generation_family(model: nn.Module) -> Optional[str]:
     """Classify how a model generates, for request routing.
 
@@ -177,10 +188,8 @@ def diffusion_generation_family(model: nn.Module) -> Optional[str]:
     """
     if is_block_diffusion_model(model):
         return "block"
-    if is_masked_diffusion_model(model):
-        config = getattr(model, "config", None)
-        if getattr(config, "default_generation_mode", None) != "ar":
-            return "masked"
+    if is_masked_diffusion_model(model) and masked_diffusion_generation_enabled(model):
+        return "masked"
     return None
 
 
@@ -991,6 +1000,16 @@ def stream_diffusion_generate_from_kwargs(
     skip_special_token_ids,
     kwargs: Dict[str, Any],
 ) -> Generator[GenerationResult, None, None]:
+    if is_masked_diffusion_model(model) and not is_block_diffusion_model(model):
+        yield from _stream_masked_diffusion_generate_from_kwargs(
+            model,
+            tokenizer,
+            input_ids,
+            skip_special_token_ids,
+            kwargs,
+        )
+        return
+
     max_denoising_steps = kwargs.pop("max_denoising_steps", None)
     diffusion_full_canvas = kwargs.pop("diffusion_full_canvas", False)
     diffusion_min_canvas_length = kwargs.pop("diffusion_min_canvas_length", None)
@@ -1032,3 +1051,109 @@ def stream_diffusion_generate_from_kwargs(
             prefill_step_size=prefill_step_size,
         )
         mx.clear_cache()
+
+
+def _stream_masked_diffusion_generate_from_kwargs(
+    model: nn.Module,
+    tokenizer: PreTrainedTokenizer,
+    input_ids: mx.array,
+    skip_special_token_ids,
+    kwargs: Dict[str, Any],
+) -> Generator[GenerationResult, None, None]:
+    verbose = kwargs.pop("_diffusion_verbose", False)
+    skip_special_tokens = kwargs.pop(
+        "_diffusion_skip_special_tokens", bool(skip_special_token_ids)
+    )
+    has_media_input = kwargs.pop("_diffusion_text_only_media_provided", False)
+    config = getattr(model, "config", None)
+    if has_media_input:
+        model_type = config.model_type if config else "This model"
+        raise ValueError(f"{model_type} is a text-only model.")
+
+    generation_stats = {}
+    handled_generation_kwargs = {
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "max_denoising_steps",
+        "steps",
+        "block_length",
+        "threshold",
+        "min_threshold",
+        "editing_threshold",
+        "max_post_steps",
+        "num_to_transfer",
+        "max_transfer_per_step",
+        "stability_steps",
+    }
+    model_generate_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in handled_generation_kwargs
+    }
+    if kwargs.get("temperature") is not None:
+        model_generate_kwargs["temperature"] = kwargs["temperature"]
+    if kwargs.get("max_tokens") is not None:
+        model_generate_kwargs["gen_length"] = kwargs["max_tokens"]
+    if kwargs.get("max_denoising_steps") is not None:
+        model_generate_kwargs["steps"] = kwargs["max_denoising_steps"]
+    elif kwargs.get("steps") is not None:
+        model_generate_kwargs["steps"] = kwargs["steps"]
+    if kwargs.get("block_length") is not None:
+        model_generate_kwargs["block_length"] = kwargs["block_length"]
+    for key in (
+        "threshold",
+        "min_threshold",
+        "editing_threshold",
+        "max_post_steps",
+        "num_to_transfer",
+        "max_transfer_per_step",
+        "stability_steps",
+    ):
+        if kwargs.get(key) is not None:
+            model_generate_kwargs[key] = kwargs[key]
+    top_p = kwargs.get("top_p")
+    if top_p is not None and top_p < 1.0:
+        model_generate_kwargs["top_p"] = top_p
+    top_k = kwargs.get("top_k")
+    if top_k is not None and top_k > 0:
+        model_generate_kwargs["top_k"] = top_k
+
+    tic = time.perf_counter()
+    with wired_limit(model, [generation_stream]):
+        generated = model.language_model.generate(
+            input_ids,
+            eos_early_stop=True,
+            visualize=verbose,
+            tokenizer=tokenizer,
+            skip_special_tokens=skip_special_tokens,
+            stats=generation_stats,
+            **model_generate_kwargs,
+        )
+        mx.eval(generated)
+        mx.clear_cache()
+    total_time = time.perf_counter() - tic
+    prompt_time = generation_stats.get("prompt_time", 0.0)
+    prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
+    generation_time = max(total_time - prompt_time, 1e-9)
+    generated_tokens = generated[0].tolist()
+    text = tokenizer.decode(generated_tokens, skip_special_tokens=skip_special_tokens)
+
+    yield GenerationResult(
+        text=text,
+        token=generated_tokens[-1] if generated_tokens else None,
+        logprobs=None,
+        prompt_tokens=input_ids.size,
+        generation_tokens=len(generated_tokens),
+        total_tokens=input_ids.size + len(generated_tokens),
+        prompt_tps=prompt_tps,
+        generation_tps=len(generated_tokens) / generation_time,
+        peak_memory=mx.get_peak_memory() / 1e9,
+        finish_reason=(
+            "stop"
+            if generated_tokens and tokenizer.stopping_criteria(generated_tokens[-1])
+            else "length"
+        ),
+        text_already_printed=bool(generation_stats.get("text_already_printed")),
+    )
