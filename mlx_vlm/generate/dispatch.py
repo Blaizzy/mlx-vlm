@@ -646,14 +646,29 @@ from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
-    is_block_diffusion_model,
     is_diffusion_model,
+    is_masked_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
 
 
 def is_masked_diffusion_text_model(model: nn.Module) -> bool:
-    return is_diffusion_model(model)
+    return is_masked_diffusion_model(model)
+
+
+def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
+    if not is_masked_diffusion_text_model(model):
+        return False
+
+    config = getattr(model, "config", None)
+    if getattr(config, "default_generation_mode", None) != "ar":
+        return True
+
+    generation_mode = kwargs.get("generation_mode")
+    if generation_mode is not None:
+        return generation_mode != "ar"
+
+    return False
 
 
 def _prime_cached_prefix_rope_state(
@@ -788,106 +803,109 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    if is_diffusion_model(model):
+    if _use_masked_diffusion_text_path(model, kwargs):
         config = getattr(model, "config", None)
-        generation_mode = kwargs.get("generation_mode")
-        if getattr(config, "default_generation_mode", None) != "ar" or (
-            generation_mode is not None and generation_mode != "ar"
+        if image is not None or audio is not None or video is not None:
+            model_type = config.model_type if config else "This model"
+            raise ValueError(f"{model_type} is a text-only model.")
+
+        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
+        temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
+        top_p = kwargs.get("top_p", DEFAULT_TOP_P)
+        top_k = kwargs.get("top_k", DEFAULT_TOP_K)
+        max_denoising_steps = kwargs.get("max_denoising_steps")
+        if max_denoising_steps is None:
+            max_denoising_steps = kwargs.get(
+                "steps", getattr(config, "default_diffusion_steps", 32)
+            )
+        # Sampler knobs resolve as: explicit kwarg > config default_diffusion_*
+        # attribute > the model generate()'s own reference defaults (omitted
+        # here). Forcing shared defaults broke checkpoints whose reference
+        # generation differs (e.g. LLaDA2.0 corrupts with editing enabled).
+        tuned_kwargs = {}
+        for key, config_attr in (
+            ("threshold", "default_diffusion_threshold"),
+            ("min_threshold", "default_diffusion_min_threshold"),
+            ("editing_threshold", "default_diffusion_editing_threshold"),
+            ("num_to_transfer", "default_diffusion_num_to_transfer"),
+            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
+            ("max_post_steps", "default_diffusion_max_post_steps"),
+            ("stability_steps", "default_diffusion_stability_steps"),
         ):
-            if image is not None or audio is not None or video is not None:
-                model_type = config.model_type if config else "This model"
-                raise ValueError(f"{model_type} is a text-only model.")
+            value = kwargs.get(key)
+            if value is None:
+                value = getattr(config, config_attr, None)
+            if value is not None:
+                tuned_kwargs[key] = value
 
-            generation_stats = {}
-            handled_generation_kwargs = {
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "top_k",
-                "max_denoising_steps",
-                "steps",
-                "block_length",
-                "threshold",
-                "min_threshold",
-                "editing_threshold",
-                "max_post_steps",
-                "num_to_transfer",
-                "max_transfer_per_step",
-                "stability_steps",
-            }
-            model_generate_kwargs = {
-                key: value
-                for key, value in kwargs.items()
-                if key not in handled_generation_kwargs
-            }
-            if kwargs.get("temperature") is not None:
-                model_generate_kwargs["temperature"] = kwargs["temperature"]
-            model_generate_kwargs["gen_length"] = kwargs.get(
-                "max_tokens", DEFAULT_MAX_TOKENS
-            )
-            if kwargs.get("max_denoising_steps") is not None:
-                model_generate_kwargs["steps"] = kwargs["max_denoising_steps"]
-            elif kwargs.get("steps") is not None:
-                model_generate_kwargs["steps"] = kwargs["steps"]
-            if kwargs.get("block_length") is not None:
-                model_generate_kwargs["block_length"] = kwargs["block_length"]
-            for key in (
-                "threshold",
-                "min_threshold",
-                "editing_threshold",
-                "max_post_steps",
-                "num_to_transfer",
-                "max_transfer_per_step",
-                "stability_steps",
-            ):
-                if kwargs.get(key) is not None:
-                    model_generate_kwargs[key] = kwargs[key]
-            top_p = kwargs.get("top_p")
-            if top_p is not None and top_p < 1.0:
-                model_generate_kwargs["top_p"] = top_p
-            top_k = kwargs.get("top_k")
-            if top_k is not None and top_k > 0:
-                model_generate_kwargs["top_k"] = top_k
+        generation_stats = {}
+        handled_generation_kwargs = {
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "max_denoising_steps",
+            "steps",
+            "block_length",
+            "threshold",
+            "min_threshold",
+            "editing_threshold",
+            "max_post_steps",
+            "num_to_transfer",
+            "max_transfer_per_step",
+            "stability_steps",
+        }
+        model_generate_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in handled_generation_kwargs
+        }
+        tic = time.perf_counter()
+        generated = model.language_model.generate(
+            input_ids,
+            temperature=temperature,
+            block_length=kwargs.get("block_length", 32),
+            steps=max_denoising_steps,
+            gen_length=max_tokens,
+            top_p=None if top_p is None or top_p >= 1.0 else top_p,
+            top_k=None if top_k is None or top_k <= 0 else top_k,
+            eos_early_stop=True,
+            visualize=verbose,
+            tokenizer=tokenizer,
+            skip_special_tokens=skip_special_tokens,
+            stats=generation_stats,
+            **tuned_kwargs,
+            **model_generate_kwargs,
+        )
+        mx.eval(generated)
+        total_time = time.perf_counter() - tic
+        prompt_time = generation_stats.get("prompt_time", 0.0)
+        prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
+        generation_time = max(total_time - prompt_time, 1e-9)
+        generated_tokens = generated[0].tolist()
+        text = tokenizer.decode(
+            generated_tokens, skip_special_tokens=skip_special_tokens
+        )
 
-            tic = time.perf_counter()
-            generated = model.language_model.generate(
-                input_ids,
-                eos_early_stop=True,
-                visualize=verbose,
-                tokenizer=tokenizer,
-                skip_special_tokens=skip_special_tokens,
-                stats=generation_stats,
-                **model_generate_kwargs,
-            )
-            mx.eval(generated)
-            total_time = time.perf_counter() - tic
-            prompt_time = generation_stats.get("prompt_time", 0.0)
-            prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
-            generation_time = max(total_time - prompt_time, 1e-9)
-            generated_tokens = generated[0].tolist()
-            text = tokenizer.decode(
-                generated_tokens, skip_special_tokens=skip_special_tokens
-            )
-
-            yield GenerationResult(
-                text=text,
-                token=generated_tokens[-1] if generated_tokens else None,
-                logprobs=None,
-                prompt_tokens=input_ids.size,
-                generation_tokens=len(generated_tokens),
-                total_tokens=input_ids.size + len(generated_tokens),
-                prompt_tps=prompt_tps,
-                generation_tps=len(generated_tokens) / generation_time,
-                peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=(
-                    "stop"
-                    if generated_tokens
-                    and tokenizer.stopping_criteria(generated_tokens[-1])
-                    else "length"
-                ),
-                text_already_printed=bool(generation_stats.get("text_already_printed")),
-            )
-            return
+        yield GenerationResult(
+            text=text,
+            token=generated_tokens[-1] if generated_tokens else None,
+            logprobs=None,
+            prompt_tokens=input_ids.size,
+            generation_tokens=len(generated_tokens),
+            total_tokens=input_ids.size + len(generated_tokens),
+            prompt_tps=prompt_tps,
+            generation_tps=len(generated_tokens) / generation_time,
+            peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason=(
+                "stop"
+                if generated_tokens
+                and tokenizer.stopping_criteria(generated_tokens[-1])
+                else "length"
+            ),
+            text_already_printed=bool(generation_stats.get("text_already_printed")),
+        )
+        return
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
@@ -928,7 +946,7 @@ def stream_generate(
             multimodal_token_ids,
         )
 
-    if is_block_diffusion_model(model):
+    if is_diffusion_model(model):
         yield from stream_diffusion_generate_from_kwargs(
             model,
             processor,
