@@ -1751,7 +1751,11 @@ class TestDiffusionGemma4Quantized(unittest.TestCase):
         args.threshold = 0.7
         self.assertEqual(
             diffusion_kwargs_from_args(args, model.config),
-            {"diffusion_sampler": "entropy-bound", "diffusion_threshold": 0.7},
+            {
+                "diffusion_sampler": "entropy-bound",
+                "diffusion_threshold": 0.7,
+                "threshold": 0.7,
+            },
         )
 
     def test_stream_generate_with_quantized_embeddings(self):
