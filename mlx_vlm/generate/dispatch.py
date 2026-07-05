@@ -647,7 +647,6 @@ from .diffusion import (
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_block_diffusion_model,
-    is_diffusion_model,
     is_masked_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
@@ -800,26 +799,25 @@ def stream_generate(
             vision_cache.put(image, features)
             kwargs["cached_image_features"] = features
 
-    if is_diffusion_model(model):
-        if is_block_diffusion_model(model):
-            yield from stream_diffusion_generate_from_kwargs(
-                model,
-                processor,
-                tokenizer,
-                input_ids,
-                pixel_values,
-                mask,
-                skip_special_token_ids,
-                kwargs,
-            )
-            return
+    if is_block_diffusion_model(model):
+        yield from stream_diffusion_generate_from_kwargs(
+            model,
+            processor,
+            tokenizer,
+            input_ids,
+            pixel_values,
+            mask,
+            skip_special_token_ids,
+            kwargs,
+        )
+        return
 
+    if is_masked_diffusion_model(model):
         config = getattr(model, "config", None)
         generation_mode = kwargs.get("generation_mode")
-        use_masked_diffusion = is_masked_diffusion_model(model) and (
-            getattr(config, "default_generation_mode", None) != "ar"
-            or (generation_mode is not None and generation_mode != "ar")
-        )
+        use_masked_diffusion = getattr(
+            config, "default_generation_mode", None
+        ) != "ar" or (generation_mode is not None and generation_mode != "ar")
         if use_masked_diffusion:
             if image is not None or audio is not None or video is not None:
                 model_type = config.model_type if config else "This model"
