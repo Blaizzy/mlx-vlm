@@ -13,13 +13,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 
 from .. import apc as _apc
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import top_p_sampling
+from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -692,16 +691,6 @@ def _merge_prefill_prompt_kwargs(
     return inputs_embeds, merged_kwargs
 
 
-def _is_batch_cache(c):
-    if hasattr(c, "left_padding"):
-        return True
-    if isinstance(c, cache.CacheList):
-        return any(_is_batch_cache(sub_c) for sub_c in c.caches)
-    if isinstance(c, tuple):
-        return any(_is_batch_cache(sub_c) for sub_c in c)
-    return False
-
-
 def _extend_cache(cache_a, cache_b):
     """Extend cache_a with cache_b along the batch dimension."""
     if not cache_a:
@@ -710,9 +699,9 @@ def _extend_cache(cache_a, cache_b):
         return cache_a
     extended = []
     for ca, cb in zip(cache_a, cache_b):
-        if not _is_batch_cache(ca) and hasattr(ca.__class__, "merge"):
+        if not hasattr(ca, "left_padding") and hasattr(ca.__class__, "merge"):
             ca = ca.__class__.merge([ca])
-        if not _is_batch_cache(cb) and hasattr(cb.__class__, "merge"):
+        if not hasattr(cb, "left_padding") and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
         ca.extend(cb)
         extended.append(ca)
@@ -1021,49 +1010,37 @@ class GenerationBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampled = _sample_with_positions(
+            self.sampler,
+            logprobs,
+            row_ids=[0] * len(self.uids),
+            positions=[n + 1 for n in self._num_tokens],
+        )
+
+        self._next_tokens = sampled
         prev_top_idx = self._next_top_idx
         prev_top_lp = self._next_top_lp
 
-        if (
-            self.greedy_sampling
-            and not self.compute_logprobs
-            and self.top_logprobs_k == 0
-        ):
-            self._next_tokens = mx.argmax(logits, axis=-1)
+        eval_targets = [self._next_tokens]
+        if self.compute_logprobs:
+            self._next_lps = logprobs[mx.arange(sampled.shape[0]), sampled]
+            eval_targets.append(self._next_lps)
+        else:
             self._next_lps = None
+
+        k = self.top_logprobs_k
+        if k > 0:
+            # argsort ascending; take last K columns and reverse for descending.
+            sort_idx = mx.argsort(logprobs, axis=-1)
+            top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
+            top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
+            self._next_top_idx = top_idx
+            self._next_top_lp = top_lp
+            eval_targets.extend([top_idx, top_lp])
+        else:
             self._next_top_idx = None
             self._next_top_lp = None
-            eval_targets = [self._next_tokens]
-        else:
-            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            sampled = _sample_with_positions(
-                self.sampler,
-                logprobs,
-                row_ids=[0] * len(self.uids),
-                positions=[n + 1 for n in self._num_tokens],
-            )
-
-            self._next_tokens = sampled
-
-            eval_targets = [self._next_tokens]
-            if self.compute_logprobs:
-                self._next_lps = logprobs[mx.arange(sampled.shape[0]), sampled]
-                eval_targets.append(self._next_lps)
-            else:
-                self._next_lps = None
-
-            k = self.top_logprobs_k
-            if k > 0:
-                # argsort ascending; take last K columns and reverse for descending.
-                sort_idx = mx.argsort(logprobs, axis=-1)
-                top_idx = sort_idx[..., -k:][..., ::-1].astype(mx.int32)
-                top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
-                self._next_top_idx = top_idx
-                self._next_top_lp = top_lp
-                eval_targets.extend([top_idx, top_lp])
-            else:
-                self._next_top_idx = None
-                self._next_top_lp = None
 
         mx.async_eval(*eval_targets)
 
@@ -1889,17 +1866,13 @@ class PromptProcessingBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = None
-        if self.greedy_sampling and not compute_logprobs and top_logprobs_k == 0:
-            first_tokens = mx.argmax(logits, axis=-1)
-        else:
-            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            first_tokens = _sample_with_positions(
-                sampler,
-                logprobs,
-                row_ids=[0] * len(self.uids),
-                positions=[0] * len(self.uids),
-            )
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        first_tokens = _sample_with_positions(
+            sampler,
+            logprobs,
+            row_ids=[0] * len(self.uids),
+            positions=[0] * len(self.uids),
+        )
 
         mx.async_eval(first_tokens)
 
@@ -1967,11 +1940,7 @@ class PromptProcessingBatch:
             )
         gen_batch.compute_logprobs = compute_logprobs
 
-        if (
-            compute_logprobs
-            and logprobs is not None
-            and isinstance(gen_batch, GenerationBatch)
-        ):
+        if compute_logprobs and isinstance(gen_batch, GenerationBatch):
             gen_batch._next_lps = logprobs[
                 mx.arange(first_tokens.shape[0]), first_tokens
             ]
