@@ -7,11 +7,7 @@ matching parser module from ``mlx_vlm.tool_parsers``.
 
 import importlib
 
-# Ordered (markers, parser_type) table: an entry matches when every marker
-# appears in the chat template, and earlier entries win. The mlx-vlm-specific
-# patterns come first to keep their precedence over the rules vendored from
-# mlx-lm 0.31.3 (its two-marker gemma4 rule is subsumed by the single-marker
-# rule below).
+
 _TEMPLATE_MARKERS = [
     (("<|tool_call>",), "gemma4"),
     (("<|START_ACTION|>",), "cohere2_moe"),
@@ -58,8 +54,6 @@ def load_tool_module(tool_parser_type):
     try:
         return importlib.import_module(module_name)
     except ModuleNotFoundError as e:
-        # Only translate "the parser module itself does not exist"; a missing
-        # dependency inside an existing parser module must propagate as-is.
         if e.name == module_name:
             raise ValueError(f"Unknown tool parser type: {tool_parser_type!r}") from e
         raise
