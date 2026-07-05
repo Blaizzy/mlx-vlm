@@ -215,6 +215,29 @@ def _build_gen_args(
             "frequency_context_size",
             DEFAULT_REPETITION_CONTEXT_SIZE,
         ),
+        max_denoising_steps=_request_field_or_default(
+            request, "max_denoising_steps", None
+        ),
+        block_length=_request_field_or_default(request, "block_length", None),
+        num_to_transfer=_request_field_or_default(request, "num_to_transfer", None),
+        max_transfer_per_step=_request_field_or_default(
+            request, "max_transfer_per_step", None
+        ),
+        editing_threshold=_request_field_or_default(request, "editing_threshold", None),
+        max_post_steps=_request_field_or_default(request, "max_post_steps", None),
+        stability_steps=_request_field_or_default(request, "stability_steps", None),
+        diffusion_full_canvas=_request_field_or_default(
+            request, "diffusion_full_canvas", None
+        ),
+        diffusion_min_canvas_length=_request_field_or_default(
+            request, "diffusion_min_canvas_length", None
+        ),
+        diffusion_max_canvas_length=_request_field_or_default(
+            request, "diffusion_max_canvas_length", None
+        ),
+        diffusion_sampler=_request_field_or_default(request, "diffusion_sampler", None),
+        threshold=_request_field_or_default(request, "threshold", None),
+        min_threshold=_request_field_or_default(request, "min_threshold", None),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
         thinking_budget=_request_field_or_default(
@@ -266,18 +289,20 @@ async def _preflight_stream_context_budget(
     prompt: str,
     images: Optional[List] = None,
     audio: Optional[List] = None,
+    videos: Optional[List] = None,
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
     if runtime.response_generator is None:
         return
     try:
+        validate_kwargs = {"images": images, "audio": audio, "args": args}
+        if videos is not None:
+            validate_kwargs["videos"] = videos
         await asyncio.to_thread(
             runtime.response_generator.validate_context_budget,
             prompt,
-            images,
-            audio,
-            args,
+            **validate_kwargs,
         )
     except PromptTooLongError as e:
         runtime.metrics.record_failure(

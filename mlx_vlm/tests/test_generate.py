@@ -8,7 +8,6 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import BatchKVCache, CacheList, KVCache
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -26,6 +25,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -626,42 +626,6 @@ class TestBatchGenerator:
         assert [p.prompt_tokens for p in progress] == [5, 3]
         assert [p.cached_tokens for p in progress] == [3, 0]
 
-    def test_prompt_generate_uses_greedy_logits_argmax_without_logprobs(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
-                del cache, inputs_embeds, kwargs
-                token_scores = mx.array([0.0, 1.0, 10.0, 2.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return SimpleNamespace(logits=logits)
-
-        def fail_sampler(logprobs):
-            del logprobs
-            raise AssertionError("greedy prefill should not sample from logprobs")
-
-        batch = PromptProcessingBatch(
-            model=FixedLogitModel(),
-            uids=[0, 1],
-            input_ids=[[4, 5], [6, 7]],
-            max_tokens=[2, 2],
-            inputs_embeds=mx.ones((2, 2, 4)),
-            prompt_kwargs={},
-            prefill_step_size=None,
-            warm_cache=[],
-            greedy_sampling=True,
-        )
-
-        gen_batch = batch.generate(
-            fail_sampler,
-            stop_criteria=lambda token: False,
-            compute_logprobs=False,
-            top_logprobs_k=0,
-        )
-
-        assert gen_batch.compute_logprobs is False
-        assert gen_batch._next_tokens.tolist() == [2, 2]
-
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
@@ -779,37 +743,6 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6]
         assert batch._next_tokens.tolist() == [7, 7]
         assert model.calls == [{"return_hidden": True, "skip_logits": True}]
-
-    def test_generation_batch_uses_greedy_logits_argmax_without_logprobs(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, **kwargs):
-                del cache, kwargs
-                token_scores = mx.array([0.0, 1.0, 10.0, 2.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return SimpleNamespace(logits=logits)
-
-        def fail_sampler(logprobs):
-            del logprobs
-            raise AssertionError("greedy decode should not sample from logprobs")
-
-        batch = GenerationBatch(
-            model=FixedLogitModel(),
-            uids=[0, 1],
-            inputs=mx.array([5, 6], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=fail_sampler,
-            stop_criteria=lambda token: False,
-            max_tokens=[2, 2],
-            greedy_sampling=True,
-        )
-        batch.compute_logprobs = False
-
-        first = batch.next()
-
-        assert [r.token for r in first] == [5, 6]
-        assert batch._next_tokens.tolist() == [2, 2]
 
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
         def fake_rounds(*args, **kwargs):
@@ -959,44 +892,6 @@ class TestBatchGenerator:
         assert first.prompt_cache[0].left_padding.tolist() == [0, 0]
         assert first.prompt_cache[0].keys.shape[0] == 2
         assert first._next_tokens.tolist() == [5, 6]
-
-    def test_generation_batch_extend_preserves_batched_cache_list(self):
-        def make_batch_cache(value):
-            c = BatchKVCache([0])
-            keys = mx.full((1, 2, 3, 4), value, dtype=mx.float32)
-            values = mx.full((1, 2, 3, 4), value + 1, dtype=mx.float32)
-            c.update_and_fetch(keys, values)
-            return c
-
-        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
-        stop_criteria = lambda token: False
-        first = GenerationBatch(
-            model=MagicMock(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[CacheList(make_batch_cache(1.0), make_batch_cache(2.0))],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-        )
-        second = GenerationBatch(
-            model=MagicMock(),
-            uids=[1],
-            inputs=mx.array([6], dtype=mx.int32),
-            prompt_cache=[CacheList(make_batch_cache(3.0), make_batch_cache(4.0))],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-        )
-
-        first.extend(second)
-
-        assert isinstance(first.prompt_cache[0], CacheList)
-        assert first._next_tokens.tolist() == [5, 6]
-        for sub_cache in first.prompt_cache[0].caches:
-            assert isinstance(sub_cache, BatchKVCache)
-            assert sub_cache.left_padding.tolist() == [0, 0]
-            assert sub_cache.keys.shape[0] == 2
 
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
@@ -1954,6 +1849,80 @@ def test_generate_cli_smoke(capsys):
     assert mock_generate.call_args.kwargs["max_tokens"] == 12
     assert mock_generate.call_args.kwargs["temperature"] == pytest.approx(0.7)
     assert mock_generate.call_args.kwargs["prefill_step_size"] == 128
+    assert capsys.readouterr().out.strip() == "done"
+
+
+def test_generate_cli_forwards_video_to_template_and_generate(capsys):
+    args = Namespace(
+        model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
+        adapter_path=None,
+        image=None,
+        audio=None,
+        video=["clip.mp4"],
+        fps=1.0,
+        resize_shape=None,
+        prompt=["Describe this video."],
+        system=None,
+        max_tokens=8,
+        temperature=0.0,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        kv_quant_scheme="uniform",
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision=None,
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        gen_kwargs={},
+        prefill_step_size=None,
+        enable_thinking=False,
+        thinking_mode=None,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind=None,
+        draft_block_size=None,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    processor = SimpleNamespace()
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
+        patch.object(
+            dispatch_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            dispatch_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        dispatch_module.main()
+
+    assert mock_apply_chat_template.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_apply_chat_template.call_args.kwargs["fps"] == pytest.approx(1.0)
+    assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
 
 

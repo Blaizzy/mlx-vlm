@@ -2,10 +2,10 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.switch_layers import SwitchLinear
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
+from ..switch_layers import SwitchLinear
 from .config import TextConfig
 
 

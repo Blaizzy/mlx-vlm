@@ -525,12 +525,11 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
 
     rqueue = Queue()
     gen.requests.put(
-        (
-            rqueue,
-            {"token": 1},
-            1,
-            server.GenerationArguments(max_tokens=1),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"token": 1},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=1),
         )
     )
     worker = Thread(target=gen._run, daemon=True)
@@ -564,12 +563,11 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
 
     rqueue = Queue()
     pending = [
-        (
-            rqueue,
-            {"input_ids": mx.array([[1]], dtype=mx.int32)},
-            1,
-            server.GenerationArguments(max_tokens=2),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
         )
     ]
     calls = {"count": 0}
@@ -610,19 +608,17 @@ def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
 
     good_queue = Queue()
     pending = [
-        (
-            BrokenQueue(),
-            {"input_ids": mx.array([[1]], dtype=mx.int32)},
-            1,
-            server.GenerationArguments(max_tokens=2),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=BrokenQueue(),
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
         ),
-        (
-            good_queue,
-            {"input_ids": mx.array([[1]], dtype=mx.int32)},
-            1,
-            server.GenerationArguments(max_tokens=2),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=good_queue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
         ),
     ]
     calls = {"count": 0}
@@ -662,12 +658,11 @@ def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
         if collect_calls["count"] > 1:
             return [], True
         return [
-            (
-                rqueue,
-                {"input_ids": mx.array([[1]], dtype=mx.int32)},
-                1,
-                server.GenerationArguments(max_tokens=2),
-                None,
+            server_generation.QueuedGenerationRequest(
+                rqueue=rqueue,
+                raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+                prompt_tokens=1,
+                args=server.GenerationArguments(max_tokens=2),
             )
         ], False
 
@@ -798,6 +793,127 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     assert [model["id"] for model in response.json()["data"]].count(
         "local/sharded-model"
     ) == 1
+
+
+def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
+    gen = _unstarted_response_generator()
+    gen.model = SimpleNamespace()
+    gen.processor = SimpleNamespace()
+    gen.config = SimpleNamespace(eos_token_id=3)
+    gen.tokenizer = SimpleNamespace(all_special_ids=[0])
+    captured = {}
+
+    def fake_stream_diffusion_generate_from_kwargs(
+        model,
+        processor,
+        tokenizer,
+        input_ids,
+        pixel_values,
+        attention_mask,
+        skip_special_token_ids,
+        kwargs,
+        *,
+        skip_special_tokens=False,
+        on_result=None,
+    ):
+        captured.update(
+            model=model,
+            processor=processor,
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            skip_special_token_ids=skip_special_token_ids,
+            kwargs=dict(kwargs),
+            skip_special_tokens=skip_special_tokens,
+        )
+        on_result(
+            GenerationResult(
+                text="ok",
+                token=7,
+                prompt_tokens=2,
+                generation_tokens=1,
+                total_tokens=3,
+                prompt_tps=10.0,
+                generation_tps=5.0,
+                finish_reason="length",
+            )
+        )
+        if False:
+            yield None
+
+    monkeypatch.setattr(
+        server_generation,
+        "stream_diffusion_generate_from_kwargs",
+        fake_stream_diffusion_generate_from_kwargs,
+    )
+    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
+    args = server.GenerationArguments(
+        max_tokens=4,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        seed=123,
+        max_denoising_steps=7,
+        block_length=16,
+        num_to_transfer=3,
+        max_transfer_per_step=2,
+        editing_threshold=0.8,
+        max_post_steps=5,
+        stability_steps=1,
+        diffusion_full_canvas=True,
+        diffusion_min_canvas_length=4,
+        diffusion_max_canvas_length=8,
+        diffusion_sampler="entropy-bound",
+        threshold=0.7,
+        min_threshold=0.4,
+    )
+    rqueue = Queue()
+
+    gen._generate_diffusion(
+        uid=1,
+        rqueue=rqueue,
+        raw_inputs={
+            "input_ids": mx.array([[11, 12]], dtype=mx.int32),
+            "pixel_values": "pixels",
+            "attention_mask": "mask",
+            "mm_token_type_ids": "types",
+        },
+        args=args,
+        cancelled=set(),
+    )
+
+    chunk = rqueue.get(timeout=1)
+    assert chunk.text == "ok"
+    assert chunk.finish_reason == "length"
+    assert chunk.generation_tps == 5.0
+    assert captured["input_ids"].tolist() == [[11, 12]]
+    assert captured["pixel_values"] == "pixels"
+    assert captured["attention_mask"] == "mask"
+    assert captured["skip_special_token_ids"] == {0}
+    assert captured["skip_special_tokens"] is True
+    assert captured["kwargs"] == {
+        "max_tokens": 4,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "mm_token_type_ids": "types",
+        "prefill_step_size": 2048,
+        "seed": 123,
+        "max_denoising_steps": 7,
+        "block_length": 16,
+        "num_to_transfer": 3,
+        "max_transfer_per_step": 2,
+        "editing_threshold": 0.8,
+        "max_post_steps": 5,
+        "stability_steps": 1,
+        "diffusion_full_canvas": True,
+        "diffusion_min_canvas_length": 4,
+        "diffusion_max_canvas_length": 8,
+        "diffusion_sampler": "entropy-bound",
+        "threshold": 0.7,
+        "min_threshold": 0.4,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1190,12 +1306,11 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     args = server.GenerationArguments(max_tokens=2, temperature=0)
     for spec in request_specs:
         gen.requests.put(
-            (
-                Queue(),
-                {"input_ids": spec["input_ids"]},
-                int(spec["input_ids"].shape[1]),
-                args,
-                None,
+            server_generation.QueuedGenerationRequest(
+                rqueue=Queue(),
+                raw_inputs={"input_ids": spec["input_ids"]},
+                prompt_tokens=int(spec["input_ids"].shape[1]),
+                args=args,
             )
         )
 
@@ -2568,6 +2683,53 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
+def test_chat_completions_endpoint_forwards_video_content(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+                            {"type": "text", "text": "Describe this video."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_template.call_args.args[2] == [
+        {"role": "user", "content": "Describe this video."}
+    ]
+    assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
+
+
 def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -3430,7 +3592,7 @@ class TestResponseGenerator:
 
         class Requests:
             def put(self, item):
-                rqueue = item[0]
+                rqueue = item.rqueue
                 rqueue.put(SimpleNamespace(uid="req-1"))
 
         gen.requests = Requests()
@@ -3495,7 +3657,7 @@ class TestResponseGenerator:
 
         class Requests:
             def put(self, item):
-                rqueue: Queue = item[0]
+                rqueue: Queue = item.rqueue
                 rqueue.put(SimpleNamespace(uid="req-1"))
 
                 def deliver():
@@ -3880,12 +4042,11 @@ class TestResponseGenerator:
             rqueue = Queue()
             request_queues.append(rqueue)
             gen.requests.put(
-                (
-                    rqueue,
-                    {"request_id": request_id},
-                    1,
-                    server.GenerationArguments(max_tokens=2),
-                    None,
+                server_generation.QueuedGenerationRequest(
+                    rqueue=rqueue,
+                    raw_inputs={"request_id": request_id},
+                    prompt_tokens=1,
+                    args=server.GenerationArguments(max_tokens=2),
                 )
             )
 
@@ -4037,12 +4198,11 @@ class TestResponseGenerator:
             rqueue = Queue()
             request_queues.append(rqueue)
             gen.requests.put(
-                (
-                    rqueue,
-                    {"request_id": request_id},
-                    1,
-                    server.GenerationArguments(max_tokens=1, temperature=0),
-                    None,
+                server_generation.QueuedGenerationRequest(
+                    rqueue=rqueue,
+                    raw_inputs={"request_id": request_id},
+                    prompt_tokens=1,
+                    args=server.GenerationArguments(max_tokens=1, temperature=0),
                 )
             )
 
@@ -4220,12 +4380,13 @@ class TestResponseGenerator:
         def run_request(request_id, temperature):
             rqueue = Queue()
             gen.requests.put(
-                (
-                    rqueue,
-                    {"request_id": request_id},
-                    1,
-                    server.GenerationArguments(max_tokens=1, temperature=temperature),
-                    None,
+                server_generation.QueuedGenerationRequest(
+                    rqueue=rqueue,
+                    raw_inputs={"request_id": request_id},
+                    prompt_tokens=1,
+                    args=server.GenerationArguments(
+                        max_tokens=1, temperature=temperature
+                    ),
                 )
             )
             ctx = rqueue.get(timeout=1)
@@ -4526,6 +4687,46 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_preserves_diffusion_options(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            max_denoising_steps=7,
+            block_length=16,
+            num_to_transfer=3,
+            max_transfer_per_step=2,
+            editing_threshold=0.8,
+            max_post_steps=5,
+            stability_steps=1,
+            diffusion_full_canvas=True,
+            diffusion_min_canvas_length=4,
+            diffusion_max_canvas_length=8,
+            diffusion_sampler="entropy-bound",
+            threshold=0.7,
+            min_threshold=0.4,
+        )
+
+        args = server._build_gen_args(req)
+
+        expected = {
+            "max_denoising_steps": 7,
+            "block_length": 16,
+            "num_to_transfer": 3,
+            "max_transfer_per_step": 2,
+            "editing_threshold": 0.8,
+            "max_post_steps": 5,
+            "stability_steps": 1,
+            "diffusion_full_canvas": True,
+            "diffusion_min_canvas_length": 4,
+            "diffusion_max_canvas_length": 8,
+            "diffusion_sampler": "entropy-bound",
+            "threshold": 0.7,
+            "min_threshold": 0.4,
+        }
+        assert args.diffusion_kwargs() == expected
+        for key, value in expected.items():
+            assert args.to_generate_kwargs()[key] == value
 
     def test_build_gen_args_uses_model_generation_config_when_omitted(
         self, monkeypatch

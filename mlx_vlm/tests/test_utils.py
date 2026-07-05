@@ -509,9 +509,6 @@ def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
 
 
 def test_load_model_routes_text_models_through_existing_loader():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
     class FakeArgs:
         @classmethod
         def from_dict(cls, config):
@@ -529,7 +526,6 @@ def test_load_model_routes_text_models_through_existing_loader():
         patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
         patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),
     ):
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
@@ -538,9 +534,6 @@ def test_load_model_routes_text_models_through_existing_loader():
 
 
 def test_load_model_forwards_strict_to_load_weights():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
     class FakeConfig:
         @classmethod
         def from_dict(cls, config):
@@ -562,7 +555,6 @@ def test_load_model_forwards_strict_to_load_weights():
         patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils._load_safetensors", return_value=weights),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
         patch(
             "mlx_vlm.utils.get_model_and_args",
             return_value=(fake_model_class, "fake"),
@@ -603,9 +595,6 @@ def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
 
 
 def test_load_model_uses_deepseek_v4_fp8_quantization_config():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
     class FakeConfig:
         @classmethod
         def from_dict(cls, config):
@@ -641,7 +630,6 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
         ),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils._load_safetensors", return_value={}),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
         patch(
             "mlx_vlm.utils.get_model_and_args",
             return_value=(fake_model_class, "deepseek_v4"),
@@ -662,9 +650,6 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
     class FakeConfig:
         @classmethod
         def from_dict(cls, config):
@@ -717,7 +702,6 @@ def test_load_model_quantizes_projector_with_scales_when_skip_vision():
         ),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils._load_safetensors", return_value=weights),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
         patch(
             "mlx_vlm.utils.get_model_and_args",
             return_value=(fake_model_class, "kimi_vl"),

@@ -44,6 +44,9 @@ class _LanguageModelView:
         logits = self._parent._softcap(logits)
         return LanguageModelOutput(logits=logits, hidden_states=[hidden_states])
 
+    def generate(self, input_ids: mx.array, **kwargs):
+        return self._parent.generate(input_ids, **kwargs)
+
     @property
     def quant_predicate(self):
         def predicate(path, m):
@@ -198,6 +201,133 @@ class Model(nn.Module):
         logits = self.model.decoder.embed_tokens.as_linear(hidden_states)
         return self._softcap(logits)
 
+    def generate(
+        self,
+        input_ids: mx.array,
+        temperature: float = 0.0,
+        block_length: int = None,
+        steps: int = None,
+        gen_length: int = 2048,
+        top_p=None,
+        top_k=None,
+        eos_early_stop: bool = True,
+        visualize: bool = False,
+        processor=None,
+        tokenizer=None,
+        attention_mask: mx.array = None,
+        pixel_values: mx.array = None,
+        mm_token_type_ids: mx.array = None,
+        skip_special_tokens: bool = False,
+        skip_special_token_ids=None,
+        stats: dict = None,
+        on_block=None,
+        on_result=None,
+        **kwargs,
+    ) -> mx.array:
+        del top_p, top_k, eos_early_stop
+        from ...generate.diffusion import stream_diffusion_generate
+
+        tokenizer = tokenizer or processor
+        processor = processor or tokenizer
+        if tokenizer is None:
+            raise ValueError("A tokenizer is required for DiffusionGemma generation.")
+
+        max_denoising_steps = kwargs.pop("max_denoising_steps", steps)
+        diffusion_threshold = kwargs.pop("diffusion_threshold", None)
+        if diffusion_threshold is None:
+            diffusion_threshold = kwargs.pop("threshold", None)
+        else:
+            kwargs.pop("threshold", None)
+
+        # ``block_length`` is the masked-diffusion spelling. Treat it as a
+        # canvas cap only when the caller did not use the canvas-specific name.
+        if (
+            block_length is not None
+            and kwargs.get("diffusion_max_canvas_length") is None
+        ):
+            kwargs["diffusion_max_canvas_length"] = block_length
+
+        if mm_token_type_ids is None:
+            mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+        else:
+            kwargs.pop("mm_token_type_ids", None)
+
+        results = stream_diffusion_generate(
+            self,
+            processor,
+            tokenizer,
+            input_ids,
+            pixel_values,
+            attention_mask,
+            max_tokens=gen_length,
+            temperature=temperature,
+            skip_special_token_ids=skip_special_token_ids or [],
+            max_denoising_steps=max_denoising_steps,
+            diffusion_full_canvas=kwargs.pop("diffusion_full_canvas", False),
+            diffusion_min_canvas_length=kwargs.pop("diffusion_min_canvas_length", None),
+            diffusion_max_canvas_length=kwargs.pop("diffusion_max_canvas_length", None),
+            diffusion_static_cache=kwargs.pop("diffusion_static_cache", False),
+            diffusion_sampler=kwargs.pop("diffusion_sampler", "confidence-threshold"),
+            diffusion_threshold=diffusion_threshold,
+            diffusion_compile=kwargs.pop("diffusion_compile", False),
+            diffusion_show_unmasking=(
+                visualize or kwargs.pop("diffusion_show_unmasking", False)
+            ),
+            diffusion_unmasking_interval=kwargs.pop("diffusion_unmasking_interval", 1),
+            diffusion_unmasking_width=kwargs.pop("diffusion_unmasking_width", 0),
+            mm_token_type_ids=mm_token_type_ids,
+            prefill_step_size=kwargs.pop("prefill_step_size", None),
+        )
+
+        generated_tokens = []
+        terminal_result = None
+        try:
+            for result in results:
+                terminal_result = result
+                if on_result is not None and not on_result(result):
+                    break
+                if (
+                    result.token is not None
+                    and not result.is_draft
+                    and not result.diffusion_block_complete
+                    and result.finish_reason is None
+                ):
+                    generated_tokens.append(int(result.token))
+                if (
+                    result.diffusion_block_complete
+                    and on_result is None
+                    and on_block is not None
+                ):
+                    if not on_block(generated_tokens):
+                        break
+        finally:
+            results.close()
+
+        if (
+            terminal_result is not None
+            and terminal_result.finish_reason == "stop"
+            and terminal_result.token is not None
+            and (not generated_tokens or generated_tokens[-1] != terminal_result.token)
+        ):
+            generated_tokens.append(int(terminal_result.token))
+
+        if stats is not None and terminal_result is not None:
+            if terminal_result.prompt_tps:
+                stats["prompt_time"] = terminal_result.prompt_tokens / max(
+                    terminal_result.prompt_tps, 1e-9
+                )
+            stats["diffusion_canvas_tokens"] = float(
+                terminal_result.diffusion_canvas_tokens
+            )
+            stats["diffusion_denoising_steps"] = float(
+                terminal_result.diffusion_denoising_steps
+            )
+            stats["diffusion_work_tokens"] = float(
+                terminal_result.diffusion_work_tokens
+            )
+
+        return mx.array([generated_tokens], dtype=input_ids.dtype)
+
     # Model-owned live unmasking view, like the nemotron/llada visualizers.
     make_unmasking_visualizer = staticmethod(make_unmasking_visualizer)
 
@@ -208,6 +338,7 @@ class Model(nn.Module):
             inputs_embeds=self.model.encoder._embed_inputs(
                 input_ids,
                 pixel_values=pixel_values,
+                mm_token_type_ids=kwargs.get("mm_token_type_ids"),
             )
         )
 

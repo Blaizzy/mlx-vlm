@@ -11,7 +11,6 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
@@ -547,12 +546,15 @@ def maybe_quantize_kv_cache(
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    for index, layer_cache in enumerate(prompt_cache):
+        if (
+            hasattr(layer_cache, "to_quantized")
+            and layer_cache.offset >= quantized_kv_start
+        ):
+            prompt_cache[index] = layer_cache.to_quantized(
+                group_size=kv_group_size,
+                bits=int(kv_bits),
+            )
 
 
 @contextlib.contextmanager
@@ -645,28 +647,8 @@ from .diffusion import (
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,
     is_diffusion_model,
-    is_masked_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-
-
-def is_masked_diffusion_text_model(model: nn.Module) -> bool:
-    return is_masked_diffusion_model(model)
-
-
-def _use_masked_diffusion_text_path(model: nn.Module, kwargs: Dict[str, Any]) -> bool:
-    if not is_masked_diffusion_text_model(model):
-        return False
-
-    config = getattr(model, "config", None)
-    if getattr(config, "default_generation_mode", None) != "ar":
-        return True
-
-    generation_mode = kwargs.get("generation_mode")
-    if generation_mode is not None:
-        return generation_mode != "ar"
-
-    return False
 
 
 def _prime_cached_prefix_rope_state(
@@ -801,107 +783,18 @@ def stream_generate(
         }
         kwargs.update(data_kwargs)
 
-    if _use_masked_diffusion_text_path(model, kwargs):
-        if image is not None or audio is not None or video is not None:
-            raise ValueError("Diffusion text generation models are text-only.")
-
-        max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-        temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
-        top_p = kwargs.get("top_p", DEFAULT_TOP_P)
-        top_k = kwargs.get("top_k", DEFAULT_TOP_K)
-        max_denoising_steps = kwargs.get("max_denoising_steps")
-        if max_denoising_steps is None:
-            config = getattr(model, "config", None)
-            max_denoising_steps = kwargs.get(
-                "steps", getattr(config, "default_diffusion_steps", 32)
-            )
-        config = getattr(model, "config", None)
-        # Sampler knobs resolve as: explicit kwarg > config default_diffusion_*
-        # attribute > the model generate()'s own reference defaults (omitted
-        # here). Forcing shared defaults broke checkpoints whose reference
-        # generation differs (e.g. LLaDA2.0 corrupts with editing enabled).
-        tuned_kwargs = {}
-        for key, config_attr in (
-            ("threshold", "default_diffusion_threshold"),
-            ("min_threshold", "default_diffusion_min_threshold"),
-            ("editing_threshold", "default_diffusion_editing_threshold"),
-            ("num_to_transfer", "default_diffusion_num_to_transfer"),
-            ("max_transfer_per_step", "default_diffusion_max_transfer_per_step"),
-            ("max_post_steps", "default_diffusion_max_post_steps"),
-            ("stability_steps", "default_diffusion_stability_steps"),
-        ):
-            value = kwargs.get(key)
-            if value is None:
-                value = getattr(config, config_attr, None)
-            if value is not None:
-                tuned_kwargs[key] = value
-
-        generation_stats = {}
-        handled_generation_kwargs = {
-            "max_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
-            "max_denoising_steps",
-            "steps",
-            "block_length",
-            "threshold",
-            "min_threshold",
-            "editing_threshold",
-            "max_post_steps",
-            "num_to_transfer",
-            "max_transfer_per_step",
-            "stability_steps",
-        }
-        model_generate_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key not in handled_generation_kwargs
-        }
-        tic = time.perf_counter()
-        generated = model.language_model.generate(
+    if is_diffusion_model(model, kwargs):
+        yield from stream_diffusion_generate_from_kwargs(
+            model,
+            processor,
+            tokenizer,
             input_ids,
-            temperature=temperature,
-            block_length=kwargs.get("block_length", 32),
-            steps=max_denoising_steps,
-            gen_length=max_tokens,
-            top_p=None if top_p is None or top_p >= 1.0 else top_p,
-            top_k=None if top_k is None or top_k <= 0 else top_k,
-            eos_early_stop=True,
-            visualize=verbose,
-            tokenizer=tokenizer,
+            pixel_values,
+            mask,
+            skip_special_token_ids,
+            kwargs,
             skip_special_tokens=skip_special_tokens,
-            stats=generation_stats,
-            **tuned_kwargs,
-            **model_generate_kwargs,
-        )
-        mx.eval(generated)
-        total_time = time.perf_counter() - tic
-        prompt_time = generation_stats.get("prompt_time", 0.0)
-        prompt_tps = input_ids.size / prompt_time if prompt_time > 0 else 0.0
-        generation_time = max(total_time - prompt_time, 1e-9)
-        generated_tokens = generated[0].tolist()
-        text = tokenizer.decode(
-            generated_tokens, skip_special_tokens=skip_special_tokens
-        )
-
-        yield GenerationResult(
-            text=text,
-            token=generated_tokens[-1] if generated_tokens else None,
-            logprobs=None,
-            prompt_tokens=input_ids.size,
-            generation_tokens=len(generated_tokens),
-            total_tokens=input_ids.size + len(generated_tokens),
-            prompt_tps=prompt_tps,
-            generation_tps=len(generated_tokens) / generation_time,
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason=(
-                "stop"
-                if generated_tokens
-                and tokenizer.stopping_criteria(generated_tokens[-1])
-                else "length"
-            ),
-            text_already_printed=bool(generation_stats.get("text_already_printed")),
+            verbose=verbose,
         )
         return
 
@@ -943,19 +836,6 @@ def stream_generate(
             prefix_len,
             multimodal_token_ids,
         )
-
-    if is_diffusion_model(model):
-        yield from stream_diffusion_generate_from_kwargs(
-            model,
-            processor,
-            tokenizer,
-            input_ids,
-            pixel_values,
-            mask,
-            skip_special_token_ids,
-            kwargs,
-        )
-        return
 
     if apc_manager is not None:
         apc_mode = _apc.model_apc_mode(model.language_model)
@@ -1537,7 +1417,6 @@ def main():
         from ..vision_cache import VisionFeatureCache
 
         vision_cache = VisionFeatureCache()
-        is_masked_text_diffusion = is_masked_diffusion_text_model(model)
         chat = []
         if args.system:
             chat.append({"role": "system", "content": args.system})
@@ -1569,25 +1448,6 @@ def main():
                 stream_kwargs["resize_shape"] = args.resize_shape
             if args.prefill_step_size is not None:
                 stream_kwargs["prefill_step_size"] = args.prefill_step_size
-            if is_masked_text_diffusion:
-                if args.max_denoising_steps is not None:
-                    stream_kwargs["max_denoising_steps"] = args.max_denoising_steps
-                if args.block_length is not None:
-                    stream_kwargs["block_length"] = args.block_length
-                if args.num_to_transfer is not None:
-                    stream_kwargs["num_to_transfer"] = args.num_to_transfer
-                if args.max_transfer_per_step is not None:
-                    stream_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
-                if args.threshold is not None:
-                    stream_kwargs["threshold"] = args.threshold
-                if args.min_threshold is not None:
-                    stream_kwargs["min_threshold"] = args.min_threshold
-                if args.editing_threshold is not None:
-                    stream_kwargs["editing_threshold"] = args.editing_threshold
-                if args.max_post_steps is not None:
-                    stream_kwargs["max_post_steps"] = args.max_post_steps
-                if args.stability_steps is not None:
-                    stream_kwargs["stability_steps"] = args.stability_steps
             stream_kwargs.update(diffusion_kwargs_from_args(args, config))
 
             diffusion_output = DiffusionOutputHandler(model, stream_kwargs, True)
@@ -1639,25 +1499,6 @@ def main():
             gen_kwargs["resize_shape"] = args.resize_shape
         if args.prefill_step_size is not None:
             gen_kwargs["prefill_step_size"] = args.prefill_step_size
-        if is_masked_diffusion_text_model(model):
-            if args.max_denoising_steps is not None:
-                gen_kwargs["max_denoising_steps"] = args.max_denoising_steps
-            if args.block_length is not None:
-                gen_kwargs["block_length"] = args.block_length
-            if args.num_to_transfer is not None:
-                gen_kwargs["num_to_transfer"] = args.num_to_transfer
-            if args.max_transfer_per_step is not None:
-                gen_kwargs["max_transfer_per_step"] = args.max_transfer_per_step
-            if args.threshold is not None:
-                gen_kwargs["threshold"] = args.threshold
-            if args.min_threshold is not None:
-                gen_kwargs["min_threshold"] = args.min_threshold
-            if args.editing_threshold is not None:
-                gen_kwargs["editing_threshold"] = args.editing_threshold
-            if args.max_post_steps is not None:
-                gen_kwargs["max_post_steps"] = args.max_post_steps
-            if args.stability_steps is not None:
-                gen_kwargs["stability_steps"] = args.stability_steps
         gen_kwargs.update(diffusion_kwargs_from_args(args, config))
         if draft_model is not None:
             gen_kwargs["draft_model"] = draft_model
