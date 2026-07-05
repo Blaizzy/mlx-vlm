@@ -482,6 +482,88 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(converted[wkey] == weight.view(mx.uint32)))
         self.assertEqual(converted[skey].shape, (128, 4))
 
+    def test_glm_moe_dsa_language_model(self):
+        from mlx_vlm.models import glm_moe_dsa
+
+        config = glm_moe_dsa.ModelConfig(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern="FSFSFS",
+        )
+        self.assertEqual(
+            config.indexer_types,
+            ["full", "shared", "full", "shared", "full", "shared"],
+        )
+
+        model = glm_moe_dsa.Model(config)
+        has_indexer = [
+            layer.self_attn.indexer is not None
+            for layer in model.language_model.model.layers
+        ]
+        self.assertEqual(has_indexer, [True, False, True, False, True, False])
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache[0].caches), 2)
+        self.assertEqual(len(cache[1].caches), 1)
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((config.vocab_size, 128)),
+                "lm_head.weight": mx.zeros((config.vocab_size, 128)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+
+        prefixed = {"language_model.lm_head.weight": mx.zeros((config.vocab_size, 128))}
+        self.assertIs(model.sanitize(prefixed), prefixed)
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 8, config.vocab_size))
+
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        mx.eval([c.state for c in cache])
+
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
 
