@@ -31,8 +31,10 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
-from ..generate.common import generation_stream, wired_limit
-from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
+from ..generate.diffusion import (
+    diffusion_generation_family,
+    stream_diffusion_generate_from_kwargs,
+)
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
@@ -773,17 +775,23 @@ def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
     for result in results:
         if result.is_draft:
             continue
-        if result.text:
+        text_already_printed = bool(getattr(result, "text_already_printed", False))
+        if result.text and not text_already_printed:
             block_text.append(result.text)
         if result.token is not None:
             last_token = int(result.token)
         if not result.diffusion_block_complete and not result.finish_reason:
             continue
         if result.finish_reason or block_text:
-            token_count = max(result.generation_tokens - emitted_tokens, 0)
-            emitted_tokens = result.generation_tokens
+            if text_already_printed:
+                token_count = 0
+                text = ""
+            else:
+                token_count = max(result.generation_tokens - emitted_tokens, 0)
+                text = "".join(block_text)
+            emitted_tokens = max(emitted_tokens, result.generation_tokens)
             yield StreamingToken(
-                text="".join(block_text),
+                text=text,
                 token=last_token,
                 logprobs=None,
                 finish_reason=result.finish_reason,
@@ -1244,7 +1252,7 @@ class ResponseGenerator:
         # family gets its own per-request generator in the diffusion lane.
         diffusion_family = diffusion_generation_family(self.model)
         if diffusion_family is not None:
-            self._run_diffusion(diffusion_family)
+            self._run_diffusion()
             return
 
         if self.draft_model is not None and self.draft_kind != "mtp":
@@ -1392,7 +1400,7 @@ class ResponseGenerator:
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
 
-    def _run_diffusion(self, family: str):
+    def _run_diffusion(self):
         """GPU thread loop for diffusion models.
 
         Diffusion generation runs one request at a time (batch size 1).
@@ -1400,11 +1408,6 @@ class ResponseGenerator:
         block, plus a final item carrying the finish reason. Non-streaming
         endpoints aggregate the same items into a single response.
         """
-        generate_request = (
-            self._generate_diffusion
-            if family == "block"
-            else self._generate_masked_diffusion
-        )
         uid_counter = 0
         cancelled: set = set()
         while not self._stop:
@@ -1422,7 +1425,9 @@ class ResponseGenerator:
                     uid = uid_counter
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     try:
-                        generate_request(uid, rqueue, raw_inputs, args, cancelled)
+                        self._generate_diffusion(
+                            uid, rqueue, raw_inputs, args, cancelled
+                        )
                         rqueue.put(None)
                     except Exception as e:
                         logger.exception("Error in diffusion generation")
@@ -1438,6 +1443,7 @@ class ResponseGenerator:
                 gc.collect()
 
     def _generate_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+        """Generate any diffusion request through the shared diffusion adapter."""
         if args.logits_processors is not None:
             raise ValueError(
                 "Structured response_format is not supported with diffusion models."
@@ -1456,53 +1462,6 @@ class ResponseGenerator:
             if args.skip_special_tokens
             else set()
         )
-
-        results = stream_diffusion_generate(
-            self.model,
-            self.processor,
-            tokenizer,
-            input_ids,
-            raw_inputs.get("pixel_values"),
-            raw_inputs.get("attention_mask"),
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-            skip_special_token_ids=skip_special_token_ids,
-            mm_token_type_ids=raw_inputs.get("mm_token_type_ids"),
-        )
-        try:
-            with wired_limit(self.model, [generation_stream]):
-                for chunk in _diffusion_block_chunks(results):
-                    rqueue.put(chunk)
-                    if chunk.finish_reason:
-                        break
-                    cancelled |= self._drain_cancellations()
-                    if uid in cancelled:
-                        cancelled.discard(uid)
-                        break
-        finally:
-            results.close()
-
-    def _generate_masked_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
-        """Generate with a masked-diffusion text model (llada, nemotron).
-
-        The model's own blocking generate loop runs the diffusion; an
-        ``on_block`` callback streams each completed block back as one
-        StreamingToken (models without the hook fall back to a single final
-        chunk).
-        """
-        if args.logits_processors is not None:
-            raise ValueError(
-                "Structured response_format is not supported with diffusion models."
-            )
-        if args.seed is not None:
-            mx.random.seed(args.seed)
-
-        input_ids = raw_inputs.get("input_ids")
-        if input_ids is not None and input_ids.ndim == 1:
-            input_ids = input_ids[None]
-        tokenizer = self.tokenizer
-        if hasattr(tokenizer, "stopping_criteria"):
-            tokenizer.stopping_criteria.reset(self.config.eos_token_id)
 
         gen_stats: dict = {}
         emitted_text = ""
@@ -1551,31 +1510,44 @@ class ResponseGenerator:
                 return False
             return True
 
-        model_generate_kwargs = {}
+        diffusion_kwargs = {
+            "max_tokens": args.max_tokens,
+            "temperature": args.temperature,
+            "_diffusion_skip_special_tokens": args.skip_special_tokens,
+            "_diffusion_verbose": False,
+            "_diffusion_text_only_media_provided": raw_inputs.get("pixel_values")
+            is not None,
+            "_diffusion_on_block": on_block,
+            "_diffusion_stats": gen_stats,
+        }
+        if raw_inputs.get("mm_token_type_ids") is not None:
+            diffusion_kwargs["mm_token_type_ids"] = raw_inputs.get("mm_token_type_ids")
         if args.top_p is not None and args.top_p < 1.0:
-            model_generate_kwargs["top_p"] = args.top_p
+            diffusion_kwargs["top_p"] = args.top_p
         if args.top_k is not None and args.top_k > 0:
-            model_generate_kwargs["top_k"] = args.top_k
-        with wired_limit(self.model, [generation_stream]):
-            generated = self.model.language_model.generate(
-                input_ids,
-                temperature=args.temperature,
-                gen_length=args.max_tokens,
-                eos_early_stop=True,
-                visualize=False,
-                tokenizer=tokenizer,
-                skip_special_tokens=args.skip_special_tokens,
-                stats=gen_stats,
-                on_block=on_block,
-                **model_generate_kwargs,
-            )
-            mx.eval(generated)
+            diffusion_kwargs["top_k"] = args.top_k
 
-        tokens = generated[0].tolist()
-        finish_reason = (
-            "stop" if tokens and tokenizer.stopping_criteria(tokens[-1]) else "length"
+        results = stream_diffusion_generate_from_kwargs(
+            self.model,
+            self.processor,
+            tokenizer,
+            input_ids,
+            raw_inputs.get("pixel_values"),
+            raw_inputs.get("attention_mask"),
+            skip_special_token_ids,
+            diffusion_kwargs,
         )
-        flush(tokens, finish_reason=finish_reason)
+        try:
+            for chunk in _diffusion_block_chunks(results):
+                rqueue.put(chunk)
+                if chunk.finish_reason:
+                    break
+                cancelled |= self._drain_cancellations()
+                if uid in cancelled:
+                    cancelled.discard(uid)
+                    break
+        finally:
+            results.close()
 
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.

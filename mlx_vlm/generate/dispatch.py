@@ -645,10 +645,9 @@ from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
+    diffusion_generation_family,
     diffusion_kwargs_from_args,
-    is_block_diffusion_model,
     is_masked_diffusion_model,
-    masked_diffusion_generation_enabled,
     stream_diffusion_generate_from_kwargs,
 )
 
@@ -800,10 +799,7 @@ def stream_generate(
             vision_cache.put(image, features)
             kwargs["cached_image_features"] = features
 
-    if is_block_diffusion_model(model) or (
-        is_masked_diffusion_model(model)
-        and masked_diffusion_generation_enabled(model, kwargs)
-    ):
+    if diffusion_generation_family(model, kwargs) is not None:
         kwargs["_diffusion_verbose"] = verbose
         kwargs["_diffusion_skip_special_tokens"] = skip_special_tokens
         kwargs["_diffusion_text_only_media_provided"] = (

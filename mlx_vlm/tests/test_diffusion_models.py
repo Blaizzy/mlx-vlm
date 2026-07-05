@@ -734,6 +734,35 @@ class TestMaskedDiffusionServerLane(unittest.TestCase):
         self.assertFalse(is_masked_diffusion_model(model))
         self.assertEqual(diffusion_generation_family(model), "block")
 
+    def test_block_diffusion_requires_backend_marker(self):
+        from mlx_vlm.generate.diffusion import is_block_diffusion_model
+
+        class Config:
+            canvas_length = 4
+
+        class Model:
+            config = Config()
+
+            def diffusion_decoder_logits(self):
+                pass
+
+            def diffusion_decoder_masks(self):
+                pass
+
+            def diffusion_prefill_cache(self):
+                pass
+
+            def diffusion_prepare_self_conditioning(self):
+                pass
+
+            def diffusion_self_conditioning(self):
+                pass
+
+            def diffusion_update_cache(self):
+                pass
+
+        self.assertFalse(is_block_diffusion_model(Model()))
+
 
 if __name__ == "__main__":
     unittest.main()

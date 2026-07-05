@@ -30,6 +30,8 @@ DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 DEFAULT_DIFFUSION_UNMASKING_WIDTH = 0
 DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD = 0.9
+BLOCK_DIFFUSION_KIND = "block"
+MASKED_DIFFUSION_KIND = "masked"
 
 BLOCK_DIFFUSION_METHODS = (
     "diffusion_decoder_logits",
@@ -142,17 +144,35 @@ class _DiffusionRedrawer:
 
 
 def _is_block_diffusion_config(config: Any) -> bool:
-    # Block-diffusion models declare the canvas length the denoising loop
-    # operates on; that trait is what the shared engine drives, so detection
-    # is not tied to a hardcoded model type.
     return getattr(config, "canvas_length", None) is not None
+
+
+def _diffusion_generation_kind(model: nn.Module) -> Optional[str]:
+    config = getattr(model, "config", None)
+    return getattr(model, "diffusion_generation_kind", None) or getattr(
+        config, "diffusion_generation_kind", None
+    )
+
+
+def _validate_block_diffusion_model(model: nn.Module) -> None:
+    missing = [
+        method
+        for method in BLOCK_DIFFUSION_METHODS
+        if not callable(getattr(model, method, None))
+    ]
+    if missing:
+        model_type = getattr(getattr(model, "config", None), "model_type", "model")
+        raise ValueError(
+            f"{model_type} declares block diffusion but is missing: "
+            + ", ".join(missing)
+        )
 
 
 def is_block_diffusion_model(model: nn.Module) -> bool:
     """True for block-diffusion canvas models driven by the shared engine."""
-    return _is_block_diffusion_config(getattr(model, "config", None)) and all(
-        callable(getattr(model, method, None)) for method in BLOCK_DIFFUSION_METHODS
-    )
+    kind = _diffusion_generation_kind(model)
+    config = getattr(model, "config", None)
+    return kind == BLOCK_DIFFUSION_KIND and _is_block_diffusion_config(config)
 
 
 def is_masked_diffusion_model(model: nn.Module) -> bool:
@@ -177,7 +197,10 @@ def masked_diffusion_generation_enabled(
     )
 
 
-def diffusion_generation_family(model: nn.Module) -> Optional[str]:
+def diffusion_generation_family(
+    model: nn.Module,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Classify how a model generates, for request routing.
 
     Returns ``"block"`` for canvas-denoising models the shared engine drives,
@@ -187,9 +210,11 @@ def diffusion_generation_family(model: nn.Module) -> Optional[str]:
     models.
     """
     if is_block_diffusion_model(model):
-        return "block"
-    if is_masked_diffusion_model(model) and masked_diffusion_generation_enabled(model):
-        return "masked"
+        return BLOCK_DIFFUSION_KIND
+    if is_masked_diffusion_model(model) and masked_diffusion_generation_enabled(
+        model, kwargs
+    ):
+        return MASKED_DIFFUSION_KIND
     return None
 
 
@@ -1000,16 +1025,52 @@ def stream_diffusion_generate_from_kwargs(
     skip_special_token_ids,
     kwargs: Dict[str, Any],
 ) -> Generator[GenerationResult, None, None]:
-    if is_masked_diffusion_model(model) and not is_block_diffusion_model(model):
+    family = diffusion_generation_family(model, kwargs)
+    if family == MASKED_DIFFUSION_KIND:
         yield from _stream_masked_diffusion_generate_from_kwargs(
             model,
+            processor,
             tokenizer,
             input_ids,
+            pixel_values,
+            attention_mask,
+            skip_special_token_ids,
+            kwargs,
+        )
+        return
+    if family == BLOCK_DIFFUSION_KIND:
+        yield from _stream_block_diffusion_generate_from_kwargs(
+            model,
+            processor,
+            tokenizer,
+            input_ids,
+            pixel_values,
+            attention_mask,
             skip_special_token_ids,
             kwargs,
         )
         return
 
+    model_type = getattr(getattr(model, "config", None), "model_type", "model")
+    raise ValueError(f"{model_type} is not configured for diffusion generation.")
+
+
+def _stream_block_diffusion_generate_from_kwargs(
+    model: nn.Module,
+    processor: PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizer,
+    input_ids: mx.array,
+    pixel_values: Optional[mx.array],
+    attention_mask: Optional[mx.array],
+    skip_special_token_ids,
+    kwargs: Dict[str, Any],
+) -> Generator[GenerationResult, None, None]:
+    _validate_block_diffusion_model(model)
+    kwargs.pop("_diffusion_verbose", None)
+    kwargs.pop("_diffusion_skip_special_tokens", None)
+    kwargs.pop("_diffusion_text_only_media_provided", None)
+    kwargs.pop("_diffusion_on_block", None)
+    kwargs.pop("_diffusion_stats", None)
     max_denoising_steps = kwargs.pop("max_denoising_steps", None)
     diffusion_full_canvas = kwargs.pop("diffusion_full_canvas", False)
     diffusion_min_canvas_length = kwargs.pop("diffusion_min_canvas_length", None)
@@ -1055,22 +1116,27 @@ def stream_diffusion_generate_from_kwargs(
 
 def _stream_masked_diffusion_generate_from_kwargs(
     model: nn.Module,
+    processor: PreTrainedTokenizer,
     tokenizer: PreTrainedTokenizer,
     input_ids: mx.array,
+    pixel_values: Optional[mx.array],
+    attention_mask: Optional[mx.array],
     skip_special_token_ids,
     kwargs: Dict[str, Any],
 ) -> Generator[GenerationResult, None, None]:
+    del processor, pixel_values, attention_mask
     verbose = kwargs.pop("_diffusion_verbose", False)
     skip_special_tokens = kwargs.pop(
         "_diffusion_skip_special_tokens", bool(skip_special_token_ids)
     )
     has_media_input = kwargs.pop("_diffusion_text_only_media_provided", False)
+    external_on_block = kwargs.pop("_diffusion_on_block", None)
     config = getattr(model, "config", None)
     if has_media_input:
         model_type = config.model_type if config else "This model"
         raise ValueError(f"{model_type} is a text-only model.")
 
-    generation_stats = {}
+    generation_stats = kwargs.pop("_diffusion_stats", None) or {}
     handled_generation_kwargs = {
         "max_tokens",
         "temperature",
@@ -1119,6 +1185,15 @@ def _stream_masked_diffusion_generate_from_kwargs(
     top_k = kwargs.get("top_k")
     if top_k is not None and top_k > 0:
         model_generate_kwargs["top_k"] = top_k
+    block_streamed = False
+    if external_on_block is not None:
+
+        def on_block(tokens):
+            nonlocal block_streamed
+            block_streamed = True
+            return external_on_block(tokens)
+
+        model_generate_kwargs["on_block"] = on_block
 
     tic = time.perf_counter()
     with wired_limit(model, [generation_stream]):
@@ -1155,5 +1230,6 @@ def _stream_masked_diffusion_generate_from_kwargs(
             if generated_tokens and tokenizer.stopping_criteria(generated_tokens[-1])
             else "length"
         ),
-        text_already_printed=bool(generation_stats.get("text_already_printed")),
+        text_already_printed=block_streamed
+        or bool(generation_stats.get("text_already_printed")),
     )
