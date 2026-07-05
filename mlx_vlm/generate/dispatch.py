@@ -804,8 +804,10 @@ def stream_generate(
         kwargs.update(data_kwargs)
 
     if _use_masked_diffusion_text_path(model, kwargs):
+        config = getattr(model, "config", None)
         if image is not None or audio is not None or video is not None:
-            raise ValueError("Diffusion text generation models are text-only.")
+            model_type = config.model_type if config else "This model"
+            raise ValueError(f"{model_type} is a text-only model.")
 
         max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
         temperature = kwargs.get("temperature", DEFAULT_TEMPERATURE)
@@ -813,11 +815,9 @@ def stream_generate(
         top_k = kwargs.get("top_k", DEFAULT_TOP_K)
         max_denoising_steps = kwargs.get("max_denoising_steps")
         if max_denoising_steps is None:
-            config = getattr(model, "config", None)
             max_denoising_steps = kwargs.get(
                 "steps", getattr(config, "default_diffusion_steps", 32)
             )
-        config = getattr(model, "config", None)
         # Sampler knobs resolve as: explicit kwarg > config default_diffusion_*
         # attribute > the model generate()'s own reference defaults (omitted
         # here). Forcing shared defaults broke checkpoints whose reference
