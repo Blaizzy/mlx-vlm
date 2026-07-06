@@ -11,6 +11,7 @@ import numpy as np
 import pyautogui
 import sounddevice as sd
 import soundfile as sf
+from action_parser import parse_action_response
 from PIL import ImageGrab
 from pynput.mouse import Controller as MouseController
 from rich import print
@@ -529,7 +530,7 @@ def process_command(model, processor, gui_agent, gui_processor, query, past_acti
 
     print("GUI Agent Response:\n", response)
 
-    response = eval(response)
+    response = parse_action_response(response)
     if "position" in response and response["position"] is not None:
         # normalize the values
         response["position"] = [
