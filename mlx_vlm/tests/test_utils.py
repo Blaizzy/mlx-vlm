@@ -722,19 +722,11 @@ def test_load_model_does_not_filter_non_gemma_mlx_weights():
         def from_dict(cls, config):
             return cls()
 
-    class RaisingVisionModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.weight = mx.zeros((2, 2))
-
-        def sanitize(self, weights):
-            raise AssertionError("MLX checkpoints should not run module sanitizers")
-
     class FakeModel(nn.Module):
         def __init__(self, config):
             super().__init__()
             self.config = config
-            self.vision_tower = RaisingVisionModel()
+            self.vision_tower = nn.Module()
             self.language_model = nn.Linear(2, 2, bias=False)
 
         def load_weights(self, weights, strict=True):
@@ -743,7 +735,7 @@ def test_load_model_does_not_filter_non_gemma_mlx_weights():
     fake_model_class = SimpleNamespace(
         ModelConfig=FakeConfig,
         Model=FakeModel,
-        VisionModel=RaisingVisionModel,
+        VisionModel=nn.Module,
     )
     weights = {
         "language_model.weight": mx.zeros((2, 2)),

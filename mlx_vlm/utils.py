@@ -530,11 +530,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
+    is_mlx_format = False
     try:
         with safetensors.safe_open(weight_files[0], framework="np") as f:
-            is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
-    except Exception:
-        is_mlx_format = False
+            metadata = f.metadata()
+            is_mlx_format = bool(metadata and metadata.get("format") == "mlx")
+    except (FileNotFoundError, OSError, ValueError):
+        pass
 
     model_class, model_type = get_model_and_args(config=config)
 
@@ -668,11 +670,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    if is_mlx_format and model_type == "gemma4":
+    if is_mlx_format and model_type in ("gemma4", "gemma4_dflash"):
         # Gemma4 MLX checkpoints may contain legacy shared-KV weights that no
         # longer exist in the final model. Filter after quantization so the
         # allowed set matches the parameters load_weights expects.
         model_keys = {k for k, _ in tree_flatten(model.parameters())}
+        dropped_keys = [k for k in weights.keys() if k not in model_keys]
+        if dropped_keys:
+            logging.warning(
+                f"Filtering out {len(dropped_keys)} legacy/unused keys from Gemma4 MLX checkpoint: {dropped_keys}"
+            )
         weights = {k: v for k, v in weights.items() if k in model_keys}
 
     model.load_weights(list(weights.items()), strict=strict)
