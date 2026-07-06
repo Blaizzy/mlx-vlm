@@ -1,9 +1,8 @@
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Dict, Optional
 
-from mlx_lm.models.nemotron_h import ModelArgs as TextConfig
-
 from ..base import BaseModelConfig
+from ..nemotron_h.config import ModelConfig as TextConfig
 
 
 @dataclass
