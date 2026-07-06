@@ -530,8 +530,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    with safetensors.safe_open(weight_files[0], framework="np") as f:
-        is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
+    try:
+        with safetensors.safe_open(weight_files[0], framework="np") as f:
+            is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
+    except Exception:
+        is_mlx_format = False
 
     model_class, model_type = get_model_and_args(config=config)
 

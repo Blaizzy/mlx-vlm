@@ -737,7 +737,7 @@ def test_load_model_does_not_filter_non_gemma_mlx_weights():
             self.vision_tower = RaisingVisionModel()
             self.language_model = nn.Linear(2, 2, bias=False)
 
-        def load_weights(self, weights):
+        def load_weights(self, weights, strict=True):
             self.loaded_weights = dict(weights)
 
     fake_model_class = SimpleNamespace(
