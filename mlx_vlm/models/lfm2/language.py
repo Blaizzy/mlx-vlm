@@ -4,8 +4,15 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..activations import swiglu
-from ..base import create_attention_mask, create_ssm_mask, scaled_dot_product_attention
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
+from ..cache import ArraysCache, KVCache
 from ..switch_layers import SwitchGLU
+from .config import ModelConfig
 
 
 class Attention(nn.Module):
@@ -286,3 +293,65 @@ class Lfm2Model(nn.Module):
             h = layer(h, mask, cache=c)
 
         return self.embedding_norm(h)
+
+
+class LanguageModel(nn.Module):
+    def __init__(self, args: ModelConfig):
+        super().__init__()
+        self.args = args
+        self.config = args
+        self.model_type = args.model_type
+        self.model = Lfm2Model(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: Optional[mx.array] = None,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+        inputs_embeds: Optional[mx.array] = None,
+        **kwargs,
+    ) -> LanguageModelOutput:
+        if inputs is None:
+            inputs = kwargs.get("input_ids")
+        if inputs_embeds is None:
+            inputs_embeds = input_embeddings
+
+        out = self.model(inputs, cache, inputs_embeds)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return LanguageModelOutput(logits=out)
+
+    def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
+        sanitized_weights = {}
+        for name, param in weights.items():
+            if "conv.weight" in name and param.shape[-1] > param.shape[1]:
+                param = param.transpose(0, 2, 1)
+
+            sanitized_weights[name] = param
+
+        return sanitized_weights
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    @property
+    def head_dim(self):
+        return self.args.hidden_size // self.args.num_attention_heads
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads
+
+    def make_cache(self):
+        return [
+            KVCache() if layer.is_attention_layer else ArraysCache(size=1)
+            for layer in self.layers
+        ]

@@ -5,7 +5,7 @@ import mlx.nn as nn
 
 from ..base import LanguageModelOutput
 from ..cache import ArraysCache, KVCache
-from ..components.lfm2 import Lfm2Model
+from ..lfm2.language import Lfm2Model
 from .config import TextConfig
 
 
