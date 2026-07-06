@@ -6,6 +6,7 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
@@ -67,7 +68,7 @@ class Attention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if self.use_sliding_window and mask is not None and isinstance(mask, mx.array):
-            key_len = keys.shape[-2]
+            key_len = kv_sequence_length(keys)
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 

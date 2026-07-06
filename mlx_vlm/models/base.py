@@ -7,13 +7,12 @@ from typing import Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models.base import create_attention_mask, create_ssm_mask
-from mlx_lm.models.base import (
-    scaled_dot_product_attention as mlx_scaled_dot_product_attention,
-)
+from mlx.utils import tree_map
 from PIL import Image
 
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+from ..turboquant import _state_length as _turboquant_state_length
+from .cache import create_causal_mask
 
 
 def load_chat_template(tokenizer, model_path):
@@ -190,6 +189,86 @@ class BaseImageProcessor:
         pass
 
 
+def kv_sequence_length(keys) -> int:
+    """Sequence length of ``keys`` as returned by ``cache.update_and_fetch``.
+
+    Unquantized caches return a plain ``[B, H, S, D]`` array. Uniform
+    quantized caches (``QuantizedKVCache``/``BatchQuantizedKVCache``) return
+    a ``(packed, scales, biases)`` tuple and TurboQuant caches return
+    codec-state named tuples.
+    """
+    if isinstance(keys, mx.array):
+        return keys.shape[-2]
+    # Plain tuple/list only: TurboQuant states are NamedTuples with a
+    # different layout and get measured by their own helper.
+    if type(keys) in (tuple, list):
+        return keys[0].shape[-2]
+    return _turboquant_state_length(keys)
+
+
+def create_attention_mask(
+    h, cache=None, window_size: Optional[int] = None, return_array: bool = False
+):
+    N = h.shape[1]
+    if cache and hasattr(cache, "make_mask"):
+        return cache.make_mask(N, return_array=return_array, window_size=window_size)
+    if N == 1:
+        return None
+    if return_array or (window_size and N > window_size):
+        return create_causal_mask(N, window_size=window_size)
+    return "causal"
+
+
+def create_ssm_mask(h, cache=None):
+    if cache and hasattr(cache, "make_mask"):
+        return cache.make_mask(h.shape[1])
+    return None
+
+
+def quantized_scaled_dot_product_attention(
+    queries: mx.array,
+    q_keys: tuple[mx.array, mx.array, mx.array],
+    q_values: tuple[mx.array, mx.array, mx.array],
+    scale: float,
+    mask: Optional[mx.array],
+    group_size: int = 64,
+    bits: int = 8,
+) -> mx.array:
+    B, n_q_heads, L, D = queries.shape
+    n_kv_heads = q_keys[0].shape[-3]
+    n_repeats = n_q_heads // n_kv_heads
+
+    queries *= scale
+
+    if n_repeats > 1:
+        queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
+        q_keys = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_keys)
+        q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
+
+    scores = mx.quantized_matmul(
+        queries, *q_keys, transpose=True, group_size=group_size, bits=bits
+    )
+    if mask is not None:
+        if isinstance(mask, str):
+            qL, kL = scores.shape[-2:]
+            q_indices = mx.arange(kL - qL, kL)
+            k_indices = mx.arange(kL)
+            mask = q_indices[:, None] >= k_indices[None]
+        if mask.dtype == mx.bool_:
+            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+        else:
+            scores += mask
+    scores = mx.softmax(scores, axis=-1, precise=True)
+    out = mx.quantized_matmul(
+        scores, *q_values, transpose=False, group_size=group_size, bits=bits
+    )
+
+    if n_repeats > 1:
+        out = mx.reshape(out, (B, n_q_heads, L, D))
+
+    return out
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -238,11 +317,23 @@ def scaled_dot_product_attention(
             mask=mask,
         )
 
-    return mlx_scaled_dot_product_attention(
+    if hasattr(cache, "bits"):
+        if sinks is not None:
+            raise ValueError("Quantized SDPA does not support attention sinks.")
+        return quantized_scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            group_size=cache.group_size,
+            bits=cache.bits,
+        )
+
+    return mx.fast.scaled_dot_product_attention(
         queries,
         keys,
         values,
-        cache=cache,
         scale=scale,
         mask=mask,
         sinks=sinks,

@@ -1448,6 +1448,40 @@ class TestPixtralProcessor(_ProcessorTestBase, unittest.TestCase):
         return {"text": ["[IMG]Describe"], "images": [[_make_image()]]}
 
 
+class TestPixtralImageProcessor(unittest.TestCase):
+    def test_preprocess_resizes_to_patch_multiple_and_pads(self):
+        from mlx_vlm.models.pixtral.image_processing_pixtral import (
+            PixtralImageProcessor,
+        )
+
+        image_processor = PixtralImageProcessor(
+            size={"longest_edge": 40},
+            patch_size=14,
+            image_mean=[0, 0, 0],
+            image_std=[1, 1, 1],
+        )
+        wide = Image.fromarray(np.zeros((31, 55, 3), dtype=np.uint8))
+        square = Image.fromarray(np.zeros((20, 20, 3), dtype=np.uint8))
+
+        output = image_processor([[wide, square]])
+
+        self.assertEqual(output["image_sizes"], [(28, 42), (28, 28)])
+        self.assertEqual(output["pixel_values"].shape, (2, 3, 28, 42))
+
+    def test_split_image_sizes_by_sample_handles_flat_sizes(self):
+        from mlx_vlm.models.pixtral.image_processing_pixtral import (
+            split_image_sizes_by_sample,
+        )
+
+        images = [[_make_image(), _make_image()], [_make_image()]]
+        sizes = [(28, 42), (28, 28), (56, 56)]
+
+        self.assertEqual(
+            split_image_sizes_by_sample(sizes, images),
+            [[(28, 42), (28, 28)], [(56, 56)]],
+        )
+
+
 class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
         from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
@@ -1549,6 +1583,92 @@ class TestMistral3Processor(_ProcessorTestBase, unittest.TestCase):
         self.assertEqual(processor.image_token, "[IMG]")
         self.assertEqual(processor.image_break_token, "[IMG_BREAK]")
         self.assertEqual(processor.image_end_token, "[IMG_END]")
+
+    def test_from_pretrained_uses_torch_free_pixtral_image_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        from mlx_vlm.models.mistral3.processing_mistral3 import Mistral3Processor
+        from mlx_vlm.models.pixtral.image_processing_pixtral import (
+            PixtralImageProcessor,
+        )
+
+        def _fake_init(
+            self,
+            image_processor=None,
+            tokenizer=None,
+            patch_size=16,
+            spatial_merge_size=1,
+            image_token="[IMG]",
+            image_break_token="[IMG_BREAK]",
+            image_end_token="[IMG_END]",
+            chat_template=None,
+            **kwargs,
+        ):
+            self.image_processor = image_processor
+            self.tokenizer = tokenizer
+            self.patch_size = patch_size
+            self.spatial_merge_size = spatial_merge_size
+            self.image_token = image_token
+            self.image_break_token = image_break_token
+            self.image_end_token = image_end_token
+            self.image_token_id = tokenizer.convert_tokens_to_ids(image_token)
+            self.image_break_token_id = tokenizer.convert_tokens_to_ids(
+                image_break_token
+            )
+            self.image_end_token_id = tokenizer.convert_tokens_to_ids(image_end_token)
+            self.chat_template = chat_template
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "patch_size": 16,
+                        "spatial_merge_size": 1,
+                        "image_token": "[IMG]",
+                        "image_break_token": "[IMG_BREAK]",
+                        "image_end_token": "[IMG_END]",
+                        "image_processor": {
+                            "image_processor_type": "PixtralImageProcessorFast",
+                            "patch_size": 14,
+                            "size": {"longest_edge": 64},
+                        },
+                    }
+                )
+            )
+            (path / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "mistral3",
+                        "spatial_merge_size": 2,
+                        "vision_config": {"patch_size": 14},
+                    }
+                )
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=_mock_tokenizer(),
+                ),
+                patch.object(Mistral3Processor, "__init__", _fake_init),
+            ):
+                processor = Mistral3Processor.from_pretrained(
+                    tmpdir, trust_remote_code=True
+                )
+
+        self.assertIsInstance(processor.image_processor, PixtralImageProcessor)
+        self.assertEqual(processor.patch_size, 14)
+        self.assertEqual(processor.spatial_merge_size, 2)
+
+        output = processor(text=["[IMG]Describe"], images=[[_make_image()]])
+        self.assertEqual(output["pixel_values"].shape[0], 1)
+        self.assertEqual(output["pixel_values"].shape[1], 3)
+        self.assertEqual(int(output["image_sizes"][0, 0].item()) % 28, 0)
+        self.assertEqual(int(output["image_sizes"][0, 1].item()) % 28, 0)
 
 
 class TestStep3VLProcessor(unittest.TestCase):
@@ -2214,6 +2334,67 @@ class TestQwen3_5MoePatch(unittest.TestCase):
             "qwen3_5_moe",
             "mlx_vlm.models.qwen3_vl.processing_qwen3_vl",
             "Qwen3VLProcessor",
+        )
+
+
+class TestQwen3OmniMoePatch(unittest.TestCase):
+    def test_patch_intercepts_without_hf_video_processor(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+            Qwen3OmniMoeProcessor,
+        )
+
+        tokenizer = _mock_tokenizer(
+            image_token="<|image_pad|>",
+            audio_token="<|audio_pad|>",
+            video_token="<|video_pad|>",
+            vision_bos_token="<|vision_start|>",
+            vision_eos_token="<|vision_end|>",
+            audio_bos_token="<|audio_bos|>",
+            audio_eos_token="<|audio_eos|>",
+        )
+        feature_extractor = type(
+            "FE",
+            (),
+            {"model_input_names": ["input_features"], "sampling_rate": 16000},
+        )()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "qwen3_omni_moe"}),
+                encoding="utf-8",
+            )
+            (Path(tmpdir) / "preprocessor_config.json").write_text(
+                json.dumps(
+                    {
+                        "feature_extractor_type": "WhisperFeatureExtractor",
+                        "image_processor_type": "Qwen2VLImageProcessor",
+                        "processor_class": "Qwen3OmniMoeProcessor",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=tokenizer,
+                ),
+                patch(
+                    "transformers.AutoFeatureExtractor.from_pretrained",
+                    return_value=feature_extractor,
+                ),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIsInstance(processor, Qwen3OmniMoeProcessor)
+        self.assertEqual(
+            type(processor.video_processor).__name__, "Qwen3VLVideoProcessor"
         )
 
 

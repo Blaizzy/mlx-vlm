@@ -94,7 +94,7 @@ def _linear_layer_key(model_key: str, language_key: str) -> str:
 def _to_lora(layer, lora_parameters, use_dora=False):
     if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
         if use_dora:
-            from mlx_lm.tuner.dora import DoRALinear
+            from .dora_layers import DoRALinear
 
             return DoRALinear.from_base(
                 layer,
@@ -103,7 +103,7 @@ def _to_lora(layer, lora_parameters, use_dora=False):
                 dropout=lora_parameters["dropout"],
             )
 
-        from mlx_lm.tuner.lora import LoRALinear
+        from .lora_layers import LoRALinear
 
         return LoRALinear.from_base(
             layer,
@@ -139,7 +139,7 @@ def _apply_lora_layers(model, config):
         return model
 
     if "keys" not in lora_parameters:
-        from mlx_lm.tuner.utils import linear_to_lora_layers
+        from .adapter_utils import linear_to_lora_layers
 
         linear_to_lora_layers(
             model,

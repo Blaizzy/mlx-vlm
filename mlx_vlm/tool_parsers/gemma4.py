@@ -140,19 +140,26 @@ def _parse_array(text):
 
 # Regex that captures the function name and uses a recursive pattern to
 # match the balanced outer braces (handles arbitrary nesting).
-# Function name uses ``[\w-]+`` (alphanumerics, underscore, hyphen) per the
-# OpenAI tool name spec.
+# Function name accepts common namespaced tool ids used by MCP and agents.
 _tool_call_regex = re.compile(
-    r"call:([\w-]+)(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
+    r"call:([\w.:-]+)(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})"
 )
 
 
 def parse_tool_call(text, tools=None):
+    text = (
+        text.strip().removeprefix(tool_call_start).removesuffix(tool_call_end).strip()
+    )
+    if text.startswith(":"):
+        text = f"call{text}"
+    elif not text.startswith("call:") and re.match(r"^[\w.:-]+\{", text):
+        text = f"call:{text}"
+
     # Try recursive-group regex first for well-formed calls
     match = _tool_call_regex.search(text)
     if not match:
         # Fallback: find 'call:<name>{' and then balance braces manually
-        m = re.search(r"call:([\w-]+)\{", text)
+        m = re.search(r"call:([\w.:-]+)\{", text)
         if not m:
             raise ValueError("No function call found in tool call text.")
         func_name = m.group(1)

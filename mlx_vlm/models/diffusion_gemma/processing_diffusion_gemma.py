@@ -10,14 +10,69 @@ from typing import List, Optional, Union
 
 import mlx.core as mx
 import numpy as np
+from mlx.utils import tree_flatten
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
 from ..gemma4.processing_gemma4 import Gemma4Processor
 
+_TOOL_PARSER_TOKENS = {
+    "<|tool_call>",
+    "<tool_call|>",
+    '<|"|>',
+    "<|channel>",
+    "<channel|>",
+}
+
+_TOOL_PARSER_TOKEN_ATTRIBUTES = (
+    "stc_token",
+    "etc_token",
+    "escape_token",
+    "soc_token",
+    "eoc_token",
+)
+
+
+def _token_text(token):
+    return getattr(token, "content", token)
+
+
+def _make_tool_parser_tokens_non_special(tokenizer):
+    for attr in _TOOL_PARSER_TOKEN_ATTRIBUTES:
+        if _token_text(getattr(tokenizer, attr, None)) in _TOOL_PARSER_TOKENS:
+            try:
+                setattr(tokenizer, attr, None)
+            except AttributeError:
+                pass
+
+    additional_tokens = getattr(tokenizer, "additional_special_tokens", None)
+    if not additional_tokens:
+        return
+    tokenizer.additional_special_tokens = [
+        token
+        for token in additional_tokens
+        if _token_text(token) not in _TOOL_PARSER_TOKENS
+    ]
+
+
+def _materialize_mx_arrays(inputs: BatchFeature) -> BatchFeature:
+    arrays = [
+        value for _, value in tree_flatten(inputs.data) if isinstance(value, mx.array)
+    ]
+    if arrays:
+        mx.eval(*arrays)
+    return inputs
+
 
 class DiffusionGemma4Processor(Gemma4Processor):
     model_type = "diffusion_gemma"
+    image_processor_class = "Gemma4ImageProcessor"
+    tokenizer_class = "AutoTokenizer"
+    video_processor_class = "Gemma4VideoProcessor"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _make_tool_parser_tokens_non_special(self.tokenizer)
 
     @staticmethod
     def _flatten_visual_items(values):
@@ -116,7 +171,7 @@ class DiffusionGemma4Processor(Gemma4Processor):
                 "Provide `text`, `images`, and/or `videos` for DiffusionGemma4Processor."
             )
         inputs = super().__call__(images=images, text=text, videos=videos, **kwargs)
-        return self._merge_video_pixel_values(inputs)
+        return _materialize_mx_arrays(self._merge_video_pixel_values(inputs))
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -127,7 +182,9 @@ class DiffusionGemma4Processor(Gemma4Processor):
         # rejected by this processor, so the warning is pure noise.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*mel filter.*")
-            return super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+            processor = super().from_pretrained(pretrained_model_name_or_path, **kwargs)
+        _make_tool_parser_tokens_non_special(processor.tokenizer)
+        return processor
 
 
 __all__ = ["DiffusionGemma4Processor"]

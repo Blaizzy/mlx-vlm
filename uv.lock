@@ -1252,7 +1252,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.31.0" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tqdm", specifier = ">=4.66.2" },
-    { name = "transformers", specifier = ">=5.5.0" },
+    { name = "transformers", specifier = ">=5.5.0,<5.13.0" },
     { name = "uvicorn" },
 ]
 provides-extras = ["ui", "cuda", "cpu"]

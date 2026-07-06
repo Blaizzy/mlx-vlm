@@ -484,6 +484,8 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
         except Exception as e:
             return _anthropic_error_response(400, str(e))
+        if tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         template_kwargs = gen_args.to_template_kwargs()
         if tool_choice is not None:

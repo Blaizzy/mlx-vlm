@@ -10,11 +10,11 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import safetensors
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -46,6 +46,7 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "unlimited-ocr": "unlimited_ocr",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -336,6 +337,7 @@ def skip_multimodal_module(path: str) -> bool:
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
+        "patch_merge_mlp",
     )
     return any(module in path for module in multimodal_modules)
 
@@ -479,14 +481,28 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+    strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    index_file = model_path / "model.safetensors.index.json"
+    weight_files = []
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            weight_files = [
+                str(model_path / shard)
+                for shard in sorted(set(weight_map.values()))
+                if (model_path / shard).exists()
+            ]
+        except (ValueError, OSError):
+            weight_files = []
+    if not weight_files:
+        weight_files = [
+            wf
+            for wf in glob.glob(str(model_path / "*.safetensors"))
+            if not wf.endswith("consolidated.safetensors")
+        ]
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
@@ -549,30 +565,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    if not is_mlx_format:
-        # Sanitize weights
-        weights = sanitize_weights(model, weights)
+    # Sanitize weights
+    weights = sanitize_weights(model, weights)
 
-        if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
-            weights = sanitize_weights(model.thinker, weights)
-            weights = sanitize_weights(model.thinker.vision_tower, weights)
-            weights = sanitize_weights(model.thinker.audio_tower, weights)
-            weights = sanitize_weights(model.thinker.language_model, weights)
-            weights = sanitize_weights(model.code2wav, weights)
-            weights = sanitize_weights(model.talker, weights)
-        else:
-            if hasattr(model_class, "VisionModel"):
-                weights = sanitize_weights(
-                    model_class.VisionModel, weights, model_config.vision_config
-                )
-            if hasattr(model_class, "LanguageModel"):
-                weights = sanitize_weights(
-                    model_class.LanguageModel, weights, model_config.text_config
-                )
-            if hasattr(model_class, "AudioModel"):
-                weights = sanitize_weights(
-                    model_class.AudioModel, weights, model_config.audio_config
-                )
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -662,7 +672,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model_keys = {k for k, _ in tree_flatten(model.parameters())}
         weights = {k: v for k, v in weights.items() if k in model_keys}
 
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
@@ -1416,11 +1426,6 @@ def load_audio(
     return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
-def normalize_audio_features(features: mx.array) -> mx.array:
-    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
-    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
-
-
 def load_video(
     video_path: str,
     fps: float = 2.0,
@@ -1667,28 +1672,9 @@ def prepare_inputs(
                 images = padded_images
 
     # Process audio
-    audio_inputs = None
-    audio_feature_lengths = None
-    is_qwen3_omni_moe = False
-    processor_class_name = (
-        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
-    )
-    if (
-        "qwen3" in processor_class_name.lower()
-        and "omni" in processor_class_name.lower()
-    ):
-        is_qwen3_omni_moe = True
-
-    is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
-
-        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
-        lossy_extensions = {".mp3", ".m4a"}
-        is_lossy_audio = any(
-            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
-        )
 
         if len(audio) > 1:
             print(
@@ -1696,37 +1682,13 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        if is_qwen3_omni_moe:
-            audio_arrays = [
-                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                for audio_file in audio
-            ]
-            audio_arrays = [
-                audio_array.astype(np.float32) for audio_array in audio_arrays
-            ]
-
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is None:
-                raise ValueError("Processor missing feature_extractor for audio prep.")
-
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
-
-            audio_feature_lengths = np.sum(
-                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
-            )
-        else:
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            sr = (
-                getattr(feature_extractor, "sampling_rate", 16000)
-                if feature_extractor is not None
-                else 16000
-            )
-            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        sr = (
+            getattr(feature_extractor, "sampling_rate", 16000)
+            if feature_extractor is not None
+            else 16000
+        )
+        audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
     if has_videos:
@@ -1815,24 +1777,6 @@ def prepare_inputs(
                 else:
                     model_inputs[key] = mx.array(value)
 
-    if audio_inputs is not None:
-        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
-        model_inputs["feature_attention_mask"] = mx.array(
-            audio_inputs["attention_mask"]
-        ).astype(mx.int32)
-        model_inputs["audio_feature_lengths"] = mx.array(
-            audio_feature_lengths, dtype=mx.int32
-        )
-
-    if is_lossy_audio and "input_features" in model_inputs:
-        f = model_inputs["input_features"]
-        if isinstance(f, list):
-            model_inputs["input_features"] = [
-                normalize_audio_features(mx.array(x)) for x in f
-            ]
-        else:
-            model_inputs["input_features"] = normalize_audio_features(f)
-
     return model_inputs
 
 
@@ -1894,7 +1838,7 @@ class StoppingCriteria:
         if isinstance(eos_token_ids, int):
             self.eos_token_ids = [eos_token_ids]
         else:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
         self.tokenizer = tokenizer
 
@@ -1934,7 +1878,7 @@ class StoppingCriteria:
             eos_token_ids = [eos_token_ids]
 
         if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids

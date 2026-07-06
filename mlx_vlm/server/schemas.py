@@ -1,7 +1,7 @@
 import os
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Required, TypeAlias, TypedDict
 
 if TYPE_CHECKING:
@@ -232,6 +232,26 @@ class ResponseImageUrlParam(TypedDict, total=False):
     image_url: Required[ImageUrl]
 
 
+class VideoUrl(TypedDict, total=False):
+    url: Required[str]
+
+
+class ResponseInputVideoParam(TypedDict, total=False):
+    type: Required[Literal["input_video"]]
+    video_url: Required[Union[str, VideoUrl]]
+    video: Optional[str]
+
+
+class ResponseVideoUrlParam(TypedDict, total=False):
+    type: Required[Literal["video_url"]]
+    video_url: Required[Union[str, VideoUrl]]
+
+
+class ResponseVideoParam(TypedDict, total=False):
+    type: Required[Literal["video"]]
+    video: Required[str]
+
+
 ResizeShapeInput: TypeAlias = Union[Tuple[int], Tuple[int, int]]
 
 ResponseInputContentParam: TypeAlias = Union[
@@ -239,6 +259,9 @@ ResponseInputContentParam: TypeAlias = Union[
     ResponseInputImageParam,
     ResponseImageUrlParam,
     ResponseInputAudioParam,
+    ResponseInputVideoParam,
+    ResponseVideoUrlParam,
+    ResponseVideoParam,
 ]
 
 ResponseInputMessageContentListParam: TypeAlias = List[ResponseInputContentParam]
@@ -265,8 +288,15 @@ class ChatMessage(FlexibleBaseModel):
         ResponseInputMessageContentListParam,
         ResponseOutputMessageContentList,
     ] = Field(None, description="Content of the message.")
+    reasoning_content: Optional[str] = Field(
+        None,
+        description="Thinking/reasoning content (when thinking is enabled).",
+    )
     reasoning: Optional[str] = Field(
-        None, description="Thinking/reasoning content (when thinking is enabled)."
+        None,
+        description=(
+            "Deprecated alias for reasoning_content, kept for backward compatibility."
+        ),
     )
     tool_calls: Optional[List[Any]] = Field(
         None, description="Tool calls made by the assistant."
@@ -275,6 +305,14 @@ class ChatMessage(FlexibleBaseModel):
         None, description="ID of the tool call this message is a response to."
     )
     name: Optional[str] = Field(None, description="Name of the tool/function.")
+
+    @model_validator(mode="after")
+    def sync_reasoning_aliases(self):
+        if self.reasoning_content is None and self.reasoning is not None:
+            self.reasoning_content = self.reasoning
+        elif self.reasoning is None and self.reasoning_content is not None:
+            self.reasoning = self.reasoning_content
+        return self
 
 
 class OpenAIRequest(FlexibleBaseModel):
@@ -601,6 +639,60 @@ class VLMRequest(FlexibleBaseModel):
     max_tokens: int = Field(
         default_factory=get_server_max_tokens,
         description="Maximum number of tokens to generate.",
+    )
+    max_denoising_steps: Optional[int] = Field(
+        None,
+        description="Maximum denoising steps for diffusion generation.",
+    )
+    block_length: Optional[int] = Field(
+        None,
+        description="Block length for masked diffusion text generation.",
+    )
+    num_to_transfer: Optional[int] = Field(
+        None,
+        description="Target number of masked tokens to transfer per diffusion step.",
+    )
+    max_transfer_per_step: Optional[int] = Field(
+        None,
+        description="Maximum masked tokens to transfer per diffusion step.",
+    )
+    editing_threshold: Optional[float] = Field(
+        None,
+        description="Confidence threshold for masked diffusion post-fill edits.",
+    )
+    max_post_steps: Optional[int] = Field(
+        None,
+        description="Maximum masked diffusion post-fill editing steps per block.",
+    )
+    stability_steps: Optional[int] = Field(
+        None,
+        description="Stop masked diffusion post-fill refinement after stable steps.",
+    )
+    diffusion_full_canvas: Optional[bool] = Field(
+        None,
+        description="Use the checkpoint canvas length for diffusion generation.",
+    )
+    diffusion_min_canvas_length: Optional[int] = Field(
+        None,
+        description="Minimum active canvas length for diffusion generation.",
+    )
+    diffusion_max_canvas_length: Optional[int] = Field(
+        None,
+        description="Maximum active canvas length for diffusion generation.",
+    )
+    diffusion_sampler: Optional[Literal["entropy-bound", "confidence-threshold"]] = (
+        Field(
+            None,
+            description="Canvas update sampler for diffusion generation.",
+        )
+    )
+    threshold: Optional[float] = Field(
+        None,
+        description="Token probability threshold for diffusion confidence transfer.",
+    )
+    min_threshold: Optional[float] = Field(
+        None,
+        description="Lowest token probability threshold for masked diffusion transfer.",
     )
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."

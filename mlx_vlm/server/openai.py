@@ -12,7 +12,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException, Request
@@ -94,6 +94,67 @@ _count_thinking_tag_tokens = None
 _make_logprob_content = None
 _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
 _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
+_MISSING_INPUT_DETAIL = (
+    "Request must include at least one non-empty message content or media input."
+)
+
+
+def _has_non_empty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _content_has_effective_input(content: Any) -> bool:
+    if _has_non_empty_text(content):
+        return True
+    if content is None:
+        return False
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in ("text", "input_text", "output_text"):
+                if _has_non_empty_text(item.get("text")) or _has_non_empty_text(
+                    item.get("content")
+                ):
+                    return True
+            elif item_type in ("image_url", "input_image"):
+                image = item.get("image_url") or item.get("file_id")
+                if isinstance(image, dict):
+                    image = image.get("url")
+                if image:
+                    return True
+            elif item_type == "input_audio":
+                input_audio = item.get("input_audio")
+                if isinstance(input_audio, dict) and input_audio.get("data"):
+                    return True
+            elif _content_has_effective_input(item.get("content")):
+                return True
+        return False
+    if isinstance(content, dict):
+        return _content_has_effective_input([content])
+    return bool(str(content).strip())
+
+
+def _message_has_effective_input(message: Any) -> bool:
+    if hasattr(message, "model_dump"):
+        message = message.model_dump(exclude_none=True)
+    if not isinstance(message, dict):
+        return False
+    return (
+        _content_has_effective_input(message.get("content"))
+        or bool(message.get("tool_calls"))
+        or _has_non_empty_text(message.get("reasoning_content"))
+        or _has_non_empty_text(message.get("reasoning"))
+    )
+
+
+def _ensure_effective_input(messages, *, images=None, audio=None):
+    if any(image for image in (images or [])) or any(item for item in (audio or [])):
+        return
+    if any(_message_has_effective_input(message) for message in messages or []):
+        return
+    raise HTTPException(status_code=400, detail=_MISSING_INPUT_DETAIL)
 
 
 def _runtime_cache_get(key, default=None, *, kind=None):
@@ -147,6 +208,19 @@ def _decode_input_audio_data(input_audio: InputAudio):
         return BytesIO(base64.b64decode(stripped, validate=True))
     except (binascii.Error, ValueError):
         return data
+
+
+def _extract_video_reference(item):
+    item_type = item.get("type")
+    if item_type == "video":
+        return item.get("video")
+    if item_type == "input_video":
+        video = item.get("video") or item.get("video_url")
+    elif item_type == "video_url":
+        video = item.get("video_url")
+    else:
+        return None
+    return video.get("url") if isinstance(video, dict) else video
 
 
 def _final_chat_chunk(
@@ -596,10 +670,6 @@ async def responses_input_tokens_endpoint(request: Request):
     body = await request.json()
     openai_request = OpenAIRequest(**body)
     try:
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
-        )
-        del model
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
             _response_chain_items(openai_request.previous_response_id)
@@ -610,6 +680,12 @@ async def responses_input_tokens_endpoint(request: Request):
             chat_messages.insert(
                 0, {"role": "system", "content": openai_request.instructions}
             )
+        _ensure_effective_input(chat_messages, images=images)
+
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
+        del model
         chat_tools, _ = _response_tool_registry(openai_request.tools)
         gen_args = _build_gen_args(
             openai_request, processor, tenant_id=_read_tenant_id(request)
@@ -749,11 +825,6 @@ async def responses_endpoint(request: Request):
     openai_request = OpenAIRequest(**body)
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
-        )
-
         kwargs = {}
 
         if openai_request.input is None:
@@ -771,6 +842,12 @@ async def responses_endpoint(request: Request):
             chat_messages.insert(0, {"role": "system", "content": instructions})
         elif chat_messages and chat_messages[0].get("role") in ("system", "developer"):
             instructions = chat_messages[0].get("content")
+        _ensure_effective_input(chat_messages, images=images)
+
+        # Get model, processor, config - loading if necessary
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
         tool_parser_type = _infer_tool_parser_from_processor(processor)
@@ -782,6 +859,8 @@ async def responses_endpoint(request: Request):
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if chat_tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -885,6 +964,13 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
+                    thinking_state = ThinkingStreamState(
+                        gen_args.enable_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    )
+                    reasoning_item_id = f"rs_{uuid.uuid4().hex}"
+                    streamed_reasoning = ""
 
                     if runtime.response_generator is not None:
                         # generate() blocks on _cpu_preprocess + queue.get;
@@ -911,8 +997,23 @@ async def responses_endpoint(request: Request):
                             if token is None:
                                 break
                             output_tokens += getattr(token, "token_count", 1)
-                            delta = token.text
-                            full_text += delta
+                            raw_delta = token.text
+                            full_text += raw_delta
+                            thinking_delta = thinking_state.feed(raw_delta)
+                            if thinking_delta.reasoning:
+                                streamed_reasoning += thinking_delta.reasoning
+                                yield _response_sse_event(
+                                    "response.reasoning_text.delta",
+                                    {
+                                        "type": "response.reasoning_text.delta",
+                                        "response_id": response_id,
+                                        "item_id": reasoning_item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": thinking_delta.reasoning,
+                                    },
+                                )
+                            delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
@@ -946,8 +1047,23 @@ async def responses_endpoint(request: Request):
                             if chunk is None or not hasattr(chunk, "text"):
                                 continue
 
-                            delta = chunk.text
-                            full_text += delta
+                            raw_delta = chunk.text
+                            full_text += raw_delta
+                            thinking_delta = thinking_state.feed(raw_delta)
+                            if thinking_delta.reasoning:
+                                streamed_reasoning += thinking_delta.reasoning
+                                yield _response_sse_event(
+                                    "response.reasoning_text.delta",
+                                    {
+                                        "type": "response.reasoning_text.delta",
+                                        "response_id": response_id,
+                                        "item_id": reasoning_item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "delta": thinking_delta.reasoning,
+                                    },
+                                )
+                            delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
@@ -973,11 +1089,29 @@ async def responses_endpoint(request: Request):
                             tool_registry,
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            reasoning_item_id,
                         )
                     )
                     tool_output_items = [
-                        item for item in output_items if item.get("type") != "message"
+                        item
+                        for item in output_items
+                        if item.get("type") not in ("message", "reasoning")
                     ]
+                    reasoning_output_items = [
+                        item for item in output_items if item.get("type") == "reasoning"
+                    ]
+                    if streamed_reasoning:
+                        yield _response_sse_event(
+                            "response.reasoning_text.done",
+                            {
+                                "type": "response.reasoning_text.done",
+                                "response_id": response_id,
+                                "item_id": reasoning_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "text": streamed_reasoning,
+                            },
+                        )
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -996,14 +1130,26 @@ async def responses_endpoint(request: Request):
                         role="assistant",
                         content=[final_content_part] if clean_text else [],
                     )
-                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_item).model_dump_json()}\n\n"
+                    message_output_items = [
+                        item for item in output_items if item.get("type") == "message"
+                    ]
+                    final_message_payload = (
+                        message_output_items[0]
+                        if message_output_items
+                        else final_message_item.model_dump()
+                    )
+                    yield f"event: response.output_item.done\ndata: {ResponseOutputItemDoneEvent(type='response.output_item.done', output_index=0, item=final_message_payload).model_dump_json()}\n\n"
 
                     completed_output = []
-                    if clean_text:
+                    completed_output.extend(reasoning_output_items)
+                    if message_output_items:
+                        completed_output.extend(message_output_items)
+                    elif clean_text:
                         completed_output.append(final_message_item.model_dump())
+                    tool_start_index = len(completed_output)
                     completed_output.extend(tool_output_items)
                     for output_index, tool_item in enumerate(
-                        tool_output_items, start=1
+                        tool_output_items, start=tool_start_index
                     ):
                         yield _response_sse_event(
                             "response.output_item.added",
@@ -1013,6 +1159,21 @@ async def responses_endpoint(request: Request):
                                 "item": tool_item,
                             },
                         )
+                        if tool_item.get("type") == "function_call":
+                            yield _response_sse_event(
+                                "response.function_call_arguments.done",
+                                {
+                                    "type": "response.function_call_arguments.done",
+                                    "response_id": response_id,
+                                    "item_id": tool_item.get("id")
+                                    or tool_item.get("call_id"),
+                                    "output_index": output_index,
+                                    "call_id": tool_item.get("call_id"),
+                                    "name": tool_item.get("name"),
+                                    "arguments": tool_item.get("arguments") or "{}",
+                                    "item": tool_item,
+                                },
+                            )
                         yield _response_sse_event(
                             "response.output_item.done",
                             {
@@ -1100,9 +1261,7 @@ async def responses_endpoint(request: Request):
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1312,7 +1471,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if "adapter_path" in request.model_fields_set
             else _INHERIT_ADAPTER
         )
-        model, processor, config = get_cached_model(request.model, adapter_path)
 
         kwargs = {}
 
@@ -1330,6 +1488,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         images = []
         audio = []
+        videos = []
         processed_messages = []
         for message in request.messages:
             msg = {"role": message.role}
@@ -1348,6 +1507,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             images.append(item["image_url"]["url"])
                         elif item_type == "input_audio":
                             audio.append(_decode_input_audio_data(item["input_audio"]))
+                        elif item_type in ("input_video", "video_url", "video"):
+                            video = _extract_video_reference(item)
+                            if video:
+                                videos.append(video)
                 msg["content"] = extract_text_from_content(message.content)
             else:
                 msg["content"] = message.content
@@ -1374,8 +1537,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["tool_call_id"] = message.tool_call_id
             if message.name is not None:
                 msg["name"] = message.name
+            if message.reasoning_content is not None:
+                msg["reasoning_content"] = message.reasoning_content
+                msg["reasoning"] = message.reasoning_content
 
             processed_messages.append(msg)
+
+        _ensure_effective_input(processed_messages, images=images, audio=audio)
+
+        model, processor, config = get_cached_model(request.model, adapter_path)
 
         # Detect tool parser from chat template
         tools = getattr(request, "tools", None)
@@ -1388,6 +1558,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -1395,16 +1567,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             processed_messages,
             num_images=len(images),
             num_audios=len(audio),
+            video=videos or None,
             tools=tools,
             **gen_args.to_template_kwargs(),
         )
 
         logger.debug(
-            "chat/completions request: model=%s images=%d audio=%d "
+            "chat/completions request: model=%s images=%d audio=%d videos=%d "
             "max_tokens=%s temp=%s stream=%s",
             request.model,
             len(images),
             len(audio),
+            len(videos),
             gen_args.max_tokens,
             gen_args.temperature,
             request.stream,
@@ -1423,6 +1597,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 prompt=formatted_prompt,
                 images=images if images else None,
                 audio=audio if audio else None,
+                videos=videos if videos else None,
                 args=gen_args,
             )
 
@@ -1445,12 +1620,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
                         # generate() does blocking Queue.get — run off event loop
+                        generate_kwargs = {"args": gen_args}
+                        if videos:
+                            generate_kwargs["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
                             runtime.response_generator.generate,
                             formatted_prompt,
                             images if images else None,
                             audio if audio else None,
-                            gen_args,
+                            **generate_kwargs,
                         )
 
                         output_tokens = 0
@@ -1584,6 +1762,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             prompt=formatted_prompt,
                             image=images,
                             audio=audio,
+                            video=videos,
                             vision_cache=runtime.model_cache.get("vision_cache"),
                             apc_manager=runtime.apc_manager,
                             **gen_args.to_generate_kwargs(),
@@ -1728,9 +1907,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    mx.clear_cache()
-                    gc.collect()
-                    print("Stream finished, cleared cache.")
+                    print("Stream finished.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1775,6 +1952,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             images=images if images else None,
                             audio=audio if audio else None,
                             args=gen_args,
+                            **({"videos": videos} if videos else {}),
                         )
                         pt = ctx.prompt_tokens
                         for token in token_iter:
@@ -1809,6 +1987,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         prompt=formatted_prompt,
                         image=images,
                         audio=audio,
+                        video=videos,
                         verbose=logger.isEnabledFor(logging.DEBUG),
                         vision_cache=runtime.model_cache.get("vision_cache"),
                         apc_manager=runtime.apc_manager,

@@ -26,15 +26,29 @@ class Model(Qwen3_5Model):
 
         for l in range(self.config.text_config.num_hidden_layers):
             prefix = f"model.language_model.layers.{l}.mlp"
-            # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
-            gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-            gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-            weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-            weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
-            # down_proj
-            weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
-                f"{prefix}.experts.down_proj"
-            )
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            if gate_up_key in weights:
+                # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
+                gate_up_weight = weights.pop(gate_up_key)
+                mid = gate_up_weight.shape[-2] // 2
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
+                    ..., :mid, :
+                ]
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
+                    ..., mid:, :
+                ]
+                # down_proj
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
+                    f"{prefix}.experts.down_proj"
+                )
+            elif f"{prefix}.experts.0.up_proj.weight" in weights:
+                for name in ["up_proj", "down_proj", "gate_proj"]:
+                    weights[f"{prefix}.switch_mlp.{name}.weight"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.{name}.weight")
+                            for e in range(self.config.text_config.num_experts)
+                        ]
+                    )
 
         norm_keys = (
             ".input_layernorm.weight",

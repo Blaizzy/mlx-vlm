@@ -4,7 +4,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
-from mlx_lm.models.switch_layers import SwitchGLU
 
 from ..base import (
     LanguageModelOutput,
@@ -14,6 +13,7 @@ from ..base import (
 from ..cache import KVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
 
 
@@ -460,6 +460,10 @@ class LanguageModel(nn.Module):
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()
                 padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
@@ -649,7 +653,11 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)
-                if self._position_ids is not None and self._position_ids.ndim == 3:
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
                     position_ids = position_ids[None, ...]
                     position_ids = mx.broadcast_to(
                         position_ids, (3, batch_size, seq_length)

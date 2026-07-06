@@ -233,8 +233,8 @@ class Flux2ImageEditModel(ImageEditModel):
             force_download=kwargs.pop("force_download", False),
             evict_text_encoder=kwargs.pop("evict_text_encoder", True),
             evict_transformer=kwargs.pop("evict_transformer", False),
-            bucketed_seq_len=kwargs.pop("bucketed_seq_len", True),
-            tiled_vae=kwargs.pop("tiled_vae", "auto"),
+            bucketed_seq_len=kwargs.pop("bucketed_seq_len", False),
+            tiled_vae=kwargs.pop("tiled_vae", "off"),
             max_sequence_length=kwargs.pop("max_sequence_length", 512),
         )
         return cls(pipeline=pipeline, model_id=str(model))
