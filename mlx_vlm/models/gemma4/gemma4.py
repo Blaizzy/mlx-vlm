@@ -236,16 +236,27 @@ class Model(nn.Module):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
-            # Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]
+            # Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in].
+            # Some converted checkpoints already store the MLX layout.
             if (
                 "subsample_conv_projection" in new_key
                 and "conv.weight" in new_key
                 and v.ndim == 4
             ):
-                v = v.transpose(0, 2, 3, 1)
-            # Conv1d: PyTorch [out, in, kW] -> MLX [out, kW, in]
+                expected_in = None
+                audio_config = getattr(self.config, "audio_config", None)
+                if audio_config is not None:
+                    if ".layer0." in new_key:
+                        expected_in = 1
+                    elif ".layer1." in new_key:
+                        expected_in = audio_config.subsampling_conv_channels[0]
+                if expected_in is None or v.shape[-1] != expected_in:
+                    v = v.transpose(0, 2, 3, 1)
+            # Conv1d: PyTorch [out, in, kW] -> MLX [out, kW, in].
+            # Converted checkpoints may already use the MLX layout.
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
-                v = v.transpose(0, 2, 1)
+                if v.shape[-1] != 1:
+                    v = v.transpose(0, 2, 1)
 
             # MoE: experts.down_proj -> experts.switch_glu.down_proj.weight
             # experts.gate_up_proj -> split into switch_glu.gate_proj + switch_glu.up_proj

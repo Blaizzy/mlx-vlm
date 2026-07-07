@@ -3430,6 +3430,70 @@ class TestModels(unittest.TestCase):
             (1, 6, config_with_audio.text_config.vocab_size),
         )
 
+        torch_audio_weights = model_audio.sanitize(
+            {
+                "audio_tower.subsample_conv_projection.layer0.conv.weight": mx.zeros(
+                    (8, 1, 3, 3)
+                ),
+                "audio_tower.subsample_conv_projection.layer1.conv.weight": mx.zeros(
+                    (4, 8, 3, 3)
+                ),
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight": mx.zeros(
+                    (32, 1, 3)
+                ),
+            }
+        )
+        self.assertEqual(
+            torch_audio_weights[
+                "audio_tower.subsample_conv_projection.layer0.conv.weight"
+            ].shape,
+            (8, 3, 3, 1),
+        )
+        self.assertEqual(
+            torch_audio_weights[
+                "audio_tower.subsample_conv_projection.layer1.conv.weight"
+            ].shape,
+            (4, 3, 3, 8),
+        )
+        self.assertEqual(
+            torch_audio_weights[
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+            ].shape,
+            (32, 3, 1),
+        )
+
+        mlx_audio_weights = model_audio.sanitize(
+            {
+                "audio_tower.subsample_conv_projection.layer0.conv.weight": mx.zeros(
+                    (8, 3, 3, 1)
+                ),
+                "audio_tower.subsample_conv_projection.layer1.conv.weight": mx.zeros(
+                    (4, 3, 3, 8)
+                ),
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight": mx.zeros(
+                    (32, 3, 1)
+                ),
+            }
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.subsample_conv_projection.layer0.conv.weight"
+            ].shape,
+            (8, 3, 3, 1),
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.subsample_conv_projection.layer1.conv.weight"
+            ].shape,
+            (4, 3, 3, 8),
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+            ].shape,
+            (32, 3, 1),
+        )
+
         shared_text_config = gemma4.TextConfig(
             model_type="gemma4_text",
             hidden_size=16,
