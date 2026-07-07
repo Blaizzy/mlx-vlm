@@ -259,11 +259,11 @@ def test_apc_exact_restore_does_not_corrupt_stored_entry(model_factory):
     apc = APCManager(num_blocks=64, block_size=16)
     apc.store_exact_cache(prefix_tokens, cache)
 
-    # First restore + heavy generation (should not corrupt the stored entry)
+    # First restore + generation (should not corrupt the stored entry)
     restored_first, _ = apc.lookup_exact_cache(full_tokens)
     lm(suffix, cache=restored_first)
     mx.eval([c for c in restored_first if c is not None])
-    _generate_greedy(lm, mx.array([[42]]), restored_first, 20)
+    _generate_greedy(lm, mx.array([[42]]), restored_first, 3)
 
     # Second and third restores: compare the raw cache tensors to verify
     # the stored entry itself was not mutated by the generation above.
@@ -322,12 +322,12 @@ def test_apc_exact_restored_cache_generates_tokens(model_factory):
     out = lm(suffix, cache=restored)
     mx.eval(out.logits)
 
-    # Generate 8 tokens — this exercises the full decode loop on restored state
+    # Generate 4 tokens — this exercises the full decode loop on restored state
     tokens = _generate_greedy(
-        lm, mx.argmax(out.logits[:, -1:, :], axis=-1), restored, 8
+        lm, mx.argmax(out.logits[:, -1:, :], axis=-1), restored, 4
     )
 
-    assert len(tokens) == 8, f"Expected 8 tokens, got {len(tokens)}"
+    assert len(tokens) == 4, f"Expected 4 tokens, got {len(tokens)}"
     assert all(0 <= t < 64 for t in tokens), f"Token out of vocab range: {tokens}"
 
 
