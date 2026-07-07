@@ -3427,6 +3427,33 @@ class TestModels(unittest.TestCase):
         )
         model = gemma4.Model(config)
 
+        sanitize_model = gemma4.Model(config)
+        sanitized = sanitize_model.sanitize(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight": mx.zeros(
+                    (32, 32), dtype=mx.bfloat16
+                ),
+                "model.language_model.layers.0.self_attn.q_proj.scales": mx.zeros(
+                    (32,), dtype=mx.bfloat16
+                ),
+                "model.vision_tower.layers.0.self_attn.q_proj.weight": mx.zeros(
+                    (32, 32), dtype=mx.bfloat16
+                ),
+            }
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.q_proj.weight"].dtype,
+            mx.float32,
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.q_proj.scales"].dtype,
+            mx.bfloat16,
+        )
+        self.assertEqual(
+            sanitized["vision_tower.layers.0.self_attn.q_proj.weight"].dtype,
+            mx.bfloat16,
+        )
+
         self.language_test_runner(
             model.language_model,
             config.text_config.model_type,
@@ -3495,6 +3522,19 @@ class TestModels(unittest.TestCase):
             output = tiny_tower(mx.array(data["pixel_values"]))
             mx.eval(output)
             self.assertEqual(output.shape[1], soft_tokens[0])
+
+        patch_dim = 3 * vision_config.patch_size**2
+        patch_positions = mx.array([[[0, 0], [1, 0], [0, 1], [1, 1]]])
+        patch_values = mx.ones((1, 4, patch_dim)) * 0.5
+        output = tiny_tower(patch_values, patch_positions)
+        mx.eval(output)
+        self.assertEqual(output.shape, (1, 1, vision_config.hidden_size))
+
+        video_patch_values = mx.ones((1, 2, 4, patch_dim)) * 0.5
+        video_patch_positions = mx.array([[[[0, 0], [1, 0], [0, 1], [1, 1]]] * 2])
+        output = tiny_tower(video_patch_values, video_patch_positions)
+        mx.eval(output)
+        self.assertEqual(output.shape, (1, 2, vision_config.hidden_size))
 
         image_token, image_token_id = "<image>", 100
         tokenizer_kwargs = []
@@ -3631,6 +3671,70 @@ class TestModels(unittest.TestCase):
         self.assertEqual(
             output.logits.shape,
             (1, 6, config_with_audio.text_config.vocab_size),
+        )
+
+        hf_audio_weights = model_audio.sanitize(
+            {
+                "audio_tower.subsample_conv_projection.layer0.conv.weight": mx.zeros(
+                    (8, 1, 3, 3)
+                ),
+                "audio_tower.subsample_conv_projection.layer1.conv.weight": mx.zeros(
+                    (4, 8, 3, 3)
+                ),
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight": mx.zeros(
+                    (32, 1, 3)
+                ),
+            }
+        )
+        self.assertEqual(
+            hf_audio_weights[
+                "audio_tower.subsample_conv_projection.layer0.conv.weight"
+            ].shape,
+            (8, 3, 3, 1),
+        )
+        self.assertEqual(
+            hf_audio_weights[
+                "audio_tower.subsample_conv_projection.layer1.conv.weight"
+            ].shape,
+            (4, 3, 3, 8),
+        )
+        self.assertEqual(
+            hf_audio_weights[
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+            ].shape,
+            (32, 3, 1),
+        )
+
+        mlx_audio_weights = model_audio.sanitize(
+            {
+                "audio_tower.subsample_conv_projection.layer0.conv.weight": mx.zeros(
+                    (8, 3, 3, 1)
+                ),
+                "audio_tower.subsample_conv_projection.layer1.conv.weight": mx.zeros(
+                    (4, 3, 3, 8)
+                ),
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight": mx.zeros(
+                    (32, 3, 1)
+                ),
+            }
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.subsample_conv_projection.layer0.conv.weight"
+            ].shape,
+            (8, 3, 3, 1),
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.subsample_conv_projection.layer1.conv.weight"
+            ].shape,
+            (4, 3, 3, 8),
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+            ].shape,
+            (32, 3, 1),
         )
 
         shared_text_config = gemma4.TextConfig(
