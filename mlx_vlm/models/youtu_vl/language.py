@@ -3,7 +3,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.mla import MultiLinear
 
 from ..activations import swiglu
 from ..base import (
@@ -11,6 +10,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
+from ..mla import MultiLinear
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig, TextConfig
