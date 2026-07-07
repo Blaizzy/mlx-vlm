@@ -71,7 +71,9 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        image_position_ids: Optional[mx.array] = None,
         pixel_values_videos: Optional[mx.array] = None,
+        video_position_ids: Optional[mx.array] = None,
         audio_features: Optional[mx.array] = None,
         audio_mask: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
@@ -123,20 +125,26 @@ class Model(nn.Module):
             )
             return masked_scatter(inputs_embeds, mask_expanded, features)
 
-        def _encode_vision(pixels):
-            return self.embed_vision(self.vision_tower(pixels))
+        def _encode_vision(pixels, position_ids=None):
+            return self.embed_vision(self.vision_tower(pixels, position_ids))
+
+        def _encode_image(pixels):
+            return _encode_vision(pixels, image_position_ids)
+
+        def _encode_video(pixels):
+            return _encode_vision(pixels, video_position_ids)
 
         inputs_embeds = _scatter(
             pixel_values,
             self.config.image_token_id,
-            _encode_vision,
+            _encode_image,
             "cached_image_features",
             "_image_key",
         )
         inputs_embeds = _scatter(
             pixel_values_videos,
             video_token_id,
-            _encode_vision,
+            _encode_video,
             "cached_video_features",
             "_video_key",
         )
@@ -162,13 +170,15 @@ class Model(nn.Module):
             inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
         )
 
-    def encode_image(self, pixel_values: mx.array) -> mx.array:
+    def encode_image(
+        self, pixel_values: mx.array, image_position_ids: Optional[mx.array] = None
+    ) -> mx.array:
         """Encode pixel_values through vision_tower + embed_vision.
 
         Returns projected image features suitable for passing as
         cached_image_features to get_input_embeddings.
         """
-        image_features = self.vision_tower(pixel_values)
+        image_features = self.vision_tower(pixel_values, image_position_ids)
         image_features = self.embed_vision(image_features)
         return image_features
 

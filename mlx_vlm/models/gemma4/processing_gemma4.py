@@ -50,6 +50,57 @@ def _to_channel_first(image, input_format):
     return image
 
 
+def _convert_video_to_patches(video: np.ndarray, patch_size: int):
+    num_frames, channels, height, width = video.shape
+    patch_height = height // patch_size
+    patch_width = width // patch_size
+    patches = video.reshape(
+        num_frames,
+        channels,
+        patch_height,
+        patch_size,
+        patch_width,
+        patch_size,
+    )
+    patches = patches.transpose(0, 2, 4, 3, 5, 1)
+    patches = patches.reshape(
+        num_frames,
+        patch_height * patch_width,
+        patch_size * patch_size * channels,
+    )
+
+    grid = np.meshgrid(
+        np.arange(patch_width, dtype=np.int64),
+        np.arange(patch_height, dtype=np.int64),
+        indexing="xy",
+    )
+    positions = np.stack(grid, axis=-1).reshape(-1, 2)
+    positions = np.repeat(positions[None], num_frames, axis=0)
+    return patches.astype(np.float32), positions
+
+
+def _pad_video_patches(patches: np.ndarray, positions: np.ndarray, target_length: int):
+    current_length = patches.shape[1]
+    if current_length > target_length:
+        return patches[:, :target_length], positions[:, :target_length]
+    padding_length = target_length - current_length
+    if padding_length == 0:
+        return patches, positions
+    patches = np.pad(
+        patches,
+        ((0, 0), (0, padding_length), (0, 0)),
+        mode="constant",
+        constant_values=0,
+    )
+    positions = np.pad(
+        positions,
+        ((0, 0), (0, padding_length), (0, 0)),
+        mode="constant",
+        constant_values=-1,
+    )
+    return patches, positions
+
+
 class Gemma4ImageProcessor(HFBaseImageProcessor):
     """Image processor for Gemma 4.
 
@@ -216,12 +267,11 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
 
     Samples frames, applies the same aspect-ratio preserving resize as images
     (with a smaller per-frame token budget), rescales to [0, 1], and returns
-    channel-first pixel tensors stacked across frames. The existing
-    ``vision_tower`` internally patchifies each frame, so we output regular
-    (N_frames, C, H, W) tensors rather than pre-patched ones.
+    padded model patches plus per-patch position IDs. This matches the
+    Transformers Gemma 4 video preprocessing contract.
     """
 
-    model_input_names = ["pixel_values_videos"]
+    model_input_names = ["pixel_values_videos", "video_position_ids"]
 
     def __init__(
         self,
@@ -229,6 +279,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
         max_soft_tokens: int = 70,
         pooling_kernel_size: int = 3,
         num_frames: int = 32,
+        do_resize: bool = True,
         do_rescale: bool = True,
         rescale_factor: float = 1 / 255,
         do_normalize: bool = False,
@@ -247,6 +298,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
         self.max_soft_tokens = max_soft_tokens
         self.pooling_kernel_size = pooling_kernel_size
         self.num_frames = num_frames
+        self.do_resize = do_resize
         self.do_rescale = do_rescale
         self.rescale_factor = rescale_factor
         self.do_normalize = do_normalize
@@ -302,10 +354,11 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
 
         Returns:
             dict with:
-              - pixel_values_videos: np.ndarray (N_total_frames, C, H, W)
-                where all frames share the same H/W (one video at a time
-                preserves sizes; cross-video sizes may differ so we return a
-                list in that case)
+              - pixel_values_videos: np.ndarray (N_videos, N_frames,
+                max_patches, patch_size * patch_size * C), or a list when
+                videos have different frame counts
+              - video_position_ids: np.ndarray (N_videos, N_frames,
+                max_patches, 2), or a list matching pixel_values_videos
               - num_frames_per_video: list[int]
               - num_soft_tokens_per_frame: list[int] (one per video)
               - frame_timestamps: list[list[float]] seconds per frame
@@ -321,6 +374,7 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
             fps = [fps] * len(videos)
 
         processed = []
+        processed_positions = []
         num_frames_per_video = []
         num_soft_tokens_per_frame = []
         frame_timestamps = []
@@ -334,7 +388,8 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
                 )
 
             video = self._sample_frames(video, self.num_frames)
-            video = self._resize_frames(video, max_patches)
+            if self.do_resize:
+                video = self._resize_frames(video, max_patches)
 
             video_f = video.astype(np.float32)
             if self.do_rescale and video.dtype == np.uint8:
@@ -345,26 +400,34 @@ class Gemma4VideoProcessor(BaseVideoProcessor):
                 std = np.array(self.image_std, dtype=np.float32)[:, None, None]
                 video_f = (video_f - mean) / std
 
-            T, _, H, W = video_f.shape
-            num_patches = (H // self.patch_size) * (W // self.patch_size)
-            tokens_per_frame = num_patches // (self.pooling_kernel_size**2)
+            patches, positions = _convert_video_to_patches(video_f, self.patch_size)
+            real_patches = min(patches.shape[1], max_patches)
+            tokens_per_frame = real_patches // (self.pooling_kernel_size**2)
+            patches, positions = _pad_video_patches(patches, positions, max_patches)
 
-            processed.append(video_f)
-            num_frames_per_video.append(T)
+            processed.append(patches)
+            processed_positions.append(positions)
+            num_frames_per_video.append(video_f.shape[0])
             num_soft_tokens_per_frame.append(int(tokens_per_frame))
             sr = fps[i] if fps[i] and fps[i] > 0 else self.default_fps
-            frame_timestamps.append([float(j) / float(sr) for j in range(T)])
+            frame_timestamps.append(
+                [float(j) / float(sr) for j in range(video_f.shape[0])]
+            )
 
-        shapes = {v.shape[1:] for v in processed}
+        shapes = {v.shape for v in processed}
         if len(shapes) == 1:
-            pixel_values_videos = np.concatenate(processed, axis=0)
+            pixel_values_videos = np.stack(processed)
+            video_position_ids = np.stack(processed_positions)
         else:
             pixel_values_videos = processed
+            video_position_ids = processed_positions
 
         return {
             "pixel_values_videos": pixel_values_videos,
+            "video_position_ids": video_position_ids,
             "num_frames_per_video": num_frames_per_video,
             "num_soft_tokens_per_frame": num_soft_tokens_per_frame,
+            "num_soft_tokens_per_video": num_soft_tokens_per_frame,
             "frame_timestamps": frame_timestamps,
         }
 

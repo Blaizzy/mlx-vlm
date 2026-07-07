@@ -276,6 +276,40 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
         self.assertTrue(np.all(data["video_position_ids"][0, 2:] == -1))
 
+    def test_gemma4_video_processor_outputs_padded_patches_and_positions(self):
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
+
+        processor = Gemma4VideoProcessor(
+            patch_size=2,
+            pooling_kernel_size=2,
+            max_soft_tokens=70,
+            do_resize=False,
+            do_rescale=False,
+        )
+        video = np.zeros((2, 3, 4, 8), dtype=np.uint8)
+
+        data = processor([video], fps=[1.0])
+
+        self.assertEqual(data["pixel_values_videos"].shape, (1, 2, 280, 12))
+        self.assertEqual(data["video_position_ids"].shape, (1, 2, 280, 2))
+        self.assertEqual(data["num_frames_per_video"], [2])
+        self.assertEqual(data["num_soft_tokens_per_frame"], [2])
+        self.assertEqual(data["frame_timestamps"], [[0.0, 1.0]])
+        self.assertEqual(
+            data["video_position_ids"][0, 0, :8].tolist(),
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+                [3, 0],
+                [0, 1],
+                [1, 1],
+                [2, 1],
+                [3, 1],
+            ],
+        )
+        self.assertTrue(np.all(data["video_position_ids"][0, 0, 8:] == -1))
+
     def test_video_processor_tolerates_extra_hf_config_keys(self):
         # Regression: extra HF config keys must be ignored, not rejected.
         from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor

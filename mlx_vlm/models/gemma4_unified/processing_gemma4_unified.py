@@ -171,8 +171,8 @@ class Gemma4UnifiedVideoProcessor(Gemma4VideoProcessor):
     ):
         if num_soft_tokens is not None and "max_soft_tokens" not in kwargs:
             kwargs["max_soft_tokens"] = num_soft_tokens
-        self.do_resize = kwargs.pop("do_resize", True)
-        super().__init__(**kwargs)
+        do_resize = kwargs.pop("do_resize", True)
+        super().__init__(do_resize=do_resize, **kwargs)
         self.model_patch_size = model_patch_size or (
             self.patch_size * self.pooling_kernel_size
         )
