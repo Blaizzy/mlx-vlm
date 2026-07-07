@@ -305,6 +305,29 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             self.assertEqual(processor.max_soft_tokens, 70)
             self.assertEqual(processor.num_frames, 32)
 
+    def test_processor_init_declares_video_processor_attribute(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+            Gemma4UnifiedProcessor,
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        self.assertIn("video_processor", Gemma4UnifiedProcessor.get_attributes())
+
+        processor = Gemma4UnifiedProcessor(
+            image_processor=Gemma4UnifiedImageProcessor(
+                patch_size=2,
+                pooling_kernel_size=2,
+                max_soft_tokens=4,
+                do_resize=False,
+                do_rescale=False,
+            ),
+            tokenizer=self._Tokenizer(),
+            image_seq_length=4,
+        )
+
+        self.assertIsInstance(processor.video_processor, Gemma4UnifiedVideoProcessor)
+
     def test_audio_feature_extractor_chunks_waveforms(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedAudioFeatureExtractor,

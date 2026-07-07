@@ -329,9 +329,15 @@ class Gemma4UnifiedAudioFeatureExtractor:
 class Gemma4UnifiedProcessor(Gemma4Processor):
     model_type = "gemma4_unified"
     image_processor_class = "Gemma4UnifiedImageProcessor"
+    video_processor_class = "Gemma4UnifiedVideoProcessor"
 
-    def __init__(self, image_processor=None, tokenizer=None, **kwargs):
-        video_processor = kwargs.pop("video_processor", None)
+    def __init__(
+        self,
+        image_processor=None,
+        tokenizer=None,
+        video_processor=None,
+        **kwargs,
+    ):
         if image_processor is None:
             image_processor = Gemma4UnifiedImageProcessor()
         if video_processor is None:
