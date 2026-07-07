@@ -305,6 +305,32 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             self.assertEqual(processor.max_soft_tokens, 70)
             self.assertEqual(processor.num_frames, 32)
 
+    def test_processor_retains_video_processor_when_hf_rejects_kwarg(self):
+        from transformers.processing_utils import ProcessorMixin
+
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4Processor
+
+        calls = []
+        video_processor = object()
+
+        def fake_processor_init(processor, **kwargs):
+            calls.append(kwargs)
+            if "video_processor" in kwargs:
+                raise TypeError("Unexpected keyword argument video_processor.")
+            for key, value in kwargs.items():
+                setattr(processor, key, value)
+
+        with patch.object(ProcessorMixin, "__init__", fake_processor_init):
+            processor = Gemma4Processor(
+                image_processor=object(),
+                tokenizer=self._Tokenizer(),
+                video_processor=video_processor,
+            )
+
+        self.assertIn("video_processor", calls[0])
+        self.assertNotIn("video_processor", calls[1])
+        self.assertIs(processor.video_processor, video_processor)
+
     def test_audio_feature_extractor_chunks_waveforms(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedAudioFeatureExtractor,

@@ -562,19 +562,21 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization_config"] = transformed_quantization
 
     # Sanitize weights
-    weights = sanitize_weights(model, weights)
+    is_mlx_format = _is_mlx_safetensors_format(weight_files)
+    if not is_mlx_format:
+        weights = sanitize_weights(model, weights)
 
-    if hasattr(model_class, "VisionModel"):
+    if not is_mlx_format and hasattr(model_class, "VisionModel"):
         if hasattr(model_config, "vision_config"):
             weights = sanitize_weights(
                 model_class.VisionModel, weights, model_config.vision_config
             )
-    if hasattr(model_class, "LanguageModel"):
+    if not is_mlx_format and hasattr(model_class, "LanguageModel"):
         if hasattr(model_config, "text_config"):
             weights = sanitize_weights(
                 model_class.LanguageModel, weights, model_config.text_config
             )
-    if hasattr(model_class, "AudioModel"):
+    if not is_mlx_format and hasattr(model_class, "AudioModel"):
         if hasattr(model_config, "audio_config"):
             weights = sanitize_weights(
                 model_class.AudioModel, weights, model_config.audio_config
@@ -713,6 +715,21 @@ def _load_safetensors(path: str) -> dict:
             f.seek(8)
             f.write(original_header)
             f.flush()
+
+
+def _is_mlx_safetensors_format(weight_files: List[str]) -> bool:
+    """Return True when any safetensors file declares MLX-converted weights."""
+    for path in weight_files:
+        try:
+            with open(path, "rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            metadata = header.get("__metadata__") or {}
+            if metadata.get("format") == "mlx":
+                return True
+        except (OSError, struct.error, json.JSONDecodeError, UnicodeDecodeError):
+            continue
+    return False
 
 
 def sanitize_weights(model_obj, weights, config=None):

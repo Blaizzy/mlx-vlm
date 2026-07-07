@@ -531,37 +531,34 @@ def install_auto_processor_patch(target_model_types, processor_cls):
         import json as _json
         from pathlib import Path
 
-        try:
-            model_path = Path(pretrained_model_name_or_path)
-            is_local = model_path.exists() and model_path.is_dir()
+        model_path = Path(pretrained_model_name_or_path)
+        is_local = model_path.exists() and model_path.is_dir()
 
-            cfg = {}
-            if is_local:
-                config_path = model_path / "config.json"
-                if config_path.exists():
+        cfg = {}
+        if is_local:
+            config_path = model_path / "config.json"
+            if config_path.exists():
+                try:
                     with open(config_path, "r", encoding="utf-8") as f:
                         cfg = _json.load(f)
-            else:
-                try:
-                    from huggingface_hub import hf_hub_download
-
-                    cfg_path = hf_hub_download(
-                        pretrained_model_name_or_path, "config.json"
-                    )
-                    with open(cfg_path, "r", encoding="utf-8") as f:
-                        cfg = _json.load(f)
-                except Exception:
+                except (OSError, ValueError):
                     cfg = {}
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
 
-            model_type = str(cfg.get("model_type", "")).lower()
-            if model_type in target_model_types:
-                kwargs.setdefault("trust_remote_code", True)
-                return processor_cls.from_pretrained(
-                    pretrained_model_name_or_path, **kwargs
-                )
-        except Exception:
-            # On any failure, fall back to previous behavior
-            pass
+                cfg_path = hf_hub_download(pretrained_model_name_or_path, "config.json")
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = _json.load(f)
+            except Exception:
+                cfg = {}
+
+        model_type = str(cfg.get("model_type", "")).lower()
+        if model_type in target_model_types:
+            kwargs.setdefault("trust_remote_code", True)
+            return processor_cls.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
 
         # Chain to the prior from_pretrained
         return previous_from_pretrained.__func__(

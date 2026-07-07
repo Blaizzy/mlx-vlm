@@ -445,13 +445,24 @@ class Gemma4Processor(ProcessorMixin):
         else:
             self.full_audio_sequence = None
 
-        super().__init__(
-            image_processor=image_processor,
-            tokenizer=tokenizer,
-            video_processor=video_processor,
-            chat_template=chat_template,
-            **kwargs,
-        )
+        try:
+            super().__init__(
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+                video_processor=video_processor,
+                chat_template=chat_template,
+                **kwargs,
+            )
+        except TypeError as e:
+            if "Unexpected keyword argument video_processor" not in str(e):
+                raise
+            super().__init__(
+                image_processor=image_processor,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                **kwargs,
+            )
+            self.video_processor = video_processor
 
         self.feature_extractor = feature_extractor
 

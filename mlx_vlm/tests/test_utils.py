@@ -14,6 +14,7 @@ from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _is_mlx_safetensors_format,
     _load_safetensors,
     apply_generation_config_defaults,
     get_model_and_args,
@@ -566,6 +567,54 @@ def test_load_model_forwards_strict_to_load_weights():
     assert model.loaded_strict is False
 
 
+def test_is_mlx_safetensors_format_detects_metadata(tmp_path):
+    path = tmp_path / "model.safetensors"
+    header = {
+        "__metadata__": {"format": "mlx"},
+        "weight": {"dtype": "F16", "shape": [0], "data_offsets": [0, 0]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes)
+
+    assert _is_mlx_safetensors_format([str(path)]) is True
+    assert _is_mlx_safetensors_format([str(tmp_path / "missing.safetensors")]) is False
+
+
+def test_load_model_skips_sanitize_for_mlx_format_safetensors():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+
+        def sanitize(self, weights):
+            raise AssertionError("MLX-format safetensors must not be sanitized")
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+    weights = {"weight": mx.zeros((1,), dtype=mx.float16)}
+
+    with (
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch("mlx_vlm.utils._is_mlx_safetensors_format", return_value=True),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "fake"),
+        ),
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+
+    assert model.loaded_weights == list(weights.items())
+
+
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
     path = tmp_path / "model.safetensors"
     header = {
@@ -737,6 +786,30 @@ def test_load_processor_propagates_auto_processor_errors():
     with patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError):
         with pytest.raises(ValueError):
             load_processor(Path("/tmp/model"), eos_token_ids=2)
+
+
+def test_auto_processor_patch_propagates_matched_processor_errors(tmp_path):
+    from transformers import AutoProcessor
+
+    from mlx_vlm.models.base import install_auto_processor_patch
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "matched_model"}),
+        encoding="utf-8",
+    )
+    previous_from_pretrained = AutoProcessor.from_pretrained
+
+    class BrokenProcessor:
+        @classmethod
+        def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+            raise RuntimeError("real processor failure")
+
+    try:
+        install_auto_processor_patch("matched_model", BrokenProcessor)
+        with pytest.raises(RuntimeError, match="real processor failure"):
+            AutoProcessor.from_pretrained(tmp_path)
+    finally:
+        AutoProcessor.from_pretrained = previous_from_pretrained
 
 
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():
