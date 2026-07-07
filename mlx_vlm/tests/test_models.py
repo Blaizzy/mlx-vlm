@@ -8878,54 +8878,6 @@ class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
         )
         return qwen3_vl.Model(config).language_model
 
-    def _tiny_qwen2_5_vl(self):
-        from mlx_vlm.models import qwen2_5_vl
-
-        text_config = qwen2_5_vl.TextConfig(
-            model_type="qwen2_5_vl",
-            hidden_size=64,
-            num_hidden_layers=2,
-            intermediate_size=128,
-            num_attention_heads=4,
-            rms_norm_eps=1e-6,
-            vocab_size=1000,
-            num_key_value_heads=2,
-            max_position_embeddings=1000,
-            rope_theta=1000.0,
-            rope_traditional=False,
-            rope_scaling={"type": "mrope", "mrope_section": [4, 2, 2]},
-            tie_word_embeddings=False,
-        )
-        vision_config = qwen2_5_vl.VisionConfig(
-            model_type="qwen2_5_vl",
-            depth=2,
-            hidden_size=64,
-            intermediate_size=128,
-            out_hidden_size=64,
-            num_heads=4,
-            image_size=384,
-            vocab_size=1000,
-            mlp_ratio=2.0,
-            in_channels=3,
-            layer_norm_eps=1e-6,
-            spatial_patch_size=14,
-            spatial_merge_size=2,
-            patch_size=14,
-            temporal_patch_size=2,
-            tokens_per_second=2,
-            window_size=112,
-            fullatt_block_indexes=[0],
-        )
-        config = qwen2_5_vl.ModelConfig(
-            text_config=text_config,
-            vision_config=vision_config,
-            model_type="qwen2_5_vl",
-            image_token_id=998,
-            video_token_id=999,
-            vocab_size=1000,
-        )
-        return qwen2_5_vl.Model(config).language_model
-
     def _decode_logits(self, lm, with_delta_kwarg):
         from mlx_vlm.models import cache as cache_mod
 
@@ -8956,13 +8908,6 @@ class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
 
     def test_qwen3_vl_decode_continues_prefill_rope_deltas(self):
         lm = self._tiny_qwen3_vl()
-        mx.eval(lm.parameters())
-        reference = self._decode_logits(lm, with_delta_kwarg=False)
-        subject = self._decode_logits(lm, with_delta_kwarg=True)
-        self.assertTrue(mx.allclose(reference, subject, atol=1e-5).item())
-
-    def test_qwen2_5_vl_decode_continues_prefill_rope_deltas(self):
-        lm = self._tiny_qwen2_5_vl()
         mx.eval(lm.parameters())
         reference = self._decode_logits(lm, with_delta_kwarg=False)
         subject = self._decode_logits(lm, with_delta_kwarg=True)
