@@ -88,6 +88,8 @@ def _mock_ip(**extra):
 
 
 class TestGemma4UnifiedProcessor(unittest.TestCase):
+    # Test fixtures
+
     class _Tokenizer:
         model_input_names = ["input_ids", "attention_mask"]
         bos_token = "<bos>"
@@ -183,6 +185,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
                 "attention_mask": attention_mask,
             }
 
+    # Processor helpers
+
     def _make_gemma4_unified_processor(
         self, image_processor=None, video_processor=None
     ):
@@ -225,6 +229,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             tokenizer.boa_token + tokenizer.audio_token * 750 + tokenizer.eoa_token
         )
         return processor, tokenizer
+
+    # Image and video patch processors
 
     def test_image_processor_outputs_merged_patches_and_positions(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
@@ -276,6 +282,40 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
         self.assertTrue(np.all(data["video_position_ids"][0, 2:] == -1))
 
+    def test_gemma4_video_processor_outputs_padded_patches_and_positions(self):
+        from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
+
+        processor = Gemma4VideoProcessor(
+            patch_size=2,
+            pooling_kernel_size=2,
+            max_soft_tokens=70,
+            do_resize=False,
+            do_rescale=False,
+        )
+        video = np.zeros((2, 3, 4, 8), dtype=np.uint8)
+
+        data = processor([video], fps=[1.0])
+
+        self.assertEqual(data["pixel_values_videos"].shape, (1, 2, 280, 12))
+        self.assertEqual(data["video_position_ids"].shape, (1, 2, 280, 2))
+        self.assertEqual(data["num_frames_per_video"], [2])
+        self.assertEqual(data["num_soft_tokens_per_frame"], [2])
+        self.assertEqual(data["frame_timestamps"], [[0.0, 1.0]])
+        self.assertEqual(
+            data["video_position_ids"][0, 0, :8].tolist(),
+            [
+                [0, 0],
+                [1, 0],
+                [2, 0],
+                [3, 0],
+                [0, 1],
+                [1, 1],
+                [2, 1],
+                [3, 1],
+            ],
+        )
+        self.assertTrue(np.all(data["video_position_ids"][0, 0, 8:] == -1))
+
     def test_video_processor_tolerates_extra_hf_config_keys(self):
         # Regression: extra HF config keys must be ignored, not rejected.
         from mlx_vlm.models.gemma4.processing_gemma4 import Gemma4VideoProcessor
@@ -305,6 +345,31 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             self.assertEqual(processor.max_soft_tokens, 70)
             self.assertEqual(processor.num_frames, 32)
 
+    # Processor construction and audio feature extraction
+
+    def test_processor_init_declares_video_processor_attribute(self):
+        from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
+            Gemma4UnifiedImageProcessor,
+            Gemma4UnifiedProcessor,
+            Gemma4UnifiedVideoProcessor,
+        )
+
+        self.assertIn("video_processor", Gemma4UnifiedProcessor.get_attributes())
+
+        processor = Gemma4UnifiedProcessor(
+            image_processor=Gemma4UnifiedImageProcessor(
+                patch_size=2,
+                pooling_kernel_size=2,
+                max_soft_tokens=4,
+                do_resize=False,
+                do_rescale=False,
+            ),
+            tokenizer=self._Tokenizer(),
+            image_seq_length=4,
+        )
+
+        self.assertIsInstance(processor.video_processor, Gemma4UnifiedVideoProcessor)
+
     def test_audio_feature_extractor_chunks_waveforms(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedAudioFeatureExtractor,
@@ -327,6 +392,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             result["input_features_mask"].tolist(),
             [[True, True, False], [True, True, True]],
         )
+
+    # Multimodal chat/template integration
 
     def test_apply_chat_template_returns_multimodal_mlx_inputs(self):
         import mlx.core as mx
@@ -453,6 +520,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
 
         self.assertEqual(result["mm_token_type_ids"].tolist()[0][:3], [1, 2, 3])
+
+    # Utility integration
 
     def test_prepare_inputs_respects_mm_token_type_ids_override(self):
         from mlx_vlm.utils import prepare_inputs

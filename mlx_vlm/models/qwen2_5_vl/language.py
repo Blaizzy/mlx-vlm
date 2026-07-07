@@ -431,6 +431,9 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
+
         # Use ``_idx`` — the Python-int token counter maintained by
         # ``BatchKVCache`` — instead of syncing on ``cache[0].offset`` every
         # decode step. Rope positions count across the full (possibly padded)
