@@ -12,8 +12,8 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
-from .rope_utils import initialize_rope
 
 
 @partial(mx.compile, shapeless=True)

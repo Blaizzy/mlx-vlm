@@ -4,9 +4,9 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
-from mlx_vlm.models.gemma4.rope_utils import ProportionalRoPE
 from mlx_vlm.models.rope_utils import (
     MRoPERotaryEmbedding,
+    ProportionalRoPE,
     apply_mrope_frequency_layout,
     apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_even_odd,
