@@ -604,6 +604,80 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
 
+    def test_nemotron_h_language_model(self):
+        from mlx_vlm.models import nemotron_h
+
+        config = nemotron_h.ModelConfig(
+            model_type="nemotron_h",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            mamba_num_heads=4,
+            mamba_head_dim=16,
+            mamba_proj_bias=False,
+            ssm_state_size=32,
+            conv_kernel=4,
+            n_groups=2,
+            mlp_bias=False,
+            layer_norm_epsilon=1e-5,
+            use_bias=False,
+            use_conv_bias=True,
+            hybrid_override_pattern=["M", "*", "-", "E"],
+            moe_intermediate_size=32,
+            n_group=1,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            moe_shared_expert_intermediate_size=32,
+            topk_group=1,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
+        )
+
+        model = nemotron_h.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(type(cache[0]).__name__, "ArraysCache")
+        self.assertEqual(type(cache[1]).__name__, "KVCache")
+
+        sanitized = model.sanitize(
+            {"backbone.embeddings.weight": mx.zeros((config.vocab_size, 64))}
+        )
+        self.assertIn("language_model.backbone.embeddings.weight", sanitized)
+
+        prefixed = {
+            "language_model.backbone.embeddings.weight": mx.zeros(
+                (config.vocab_size, 64)
+            )
+        }
+        self.assertIs(model.sanitize(prefixed), prefixed)
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 8, config.vocab_size))
+
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
     def test_deepseek_v3_language_model(self):
         from mlx_vlm.models import deepseek_v3
 
@@ -9007,6 +9081,52 @@ class TestQuantizedKVCacheMask(unittest.TestCase):
 
         # The quantized path must actually have been exercised.
         self.assertIsInstance(cache[1].keys, tuple)
+
+
+class TestQwen35NormSanitization(unittest.TestCase):
+    _HF_VL_KEY = "model.language_model.layers.0.input_layernorm.weight"
+    _HF_TEXT_KEY = "model.layers.0.input_layernorm.weight"
+    _MLX_KEY = "language_model.model.layers.0.input_layernorm.weight"
+
+    def _sanitize(self, module, key):
+        stub = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(
+                    tie_word_embeddings=False, num_hidden_layers=0
+                )
+            ),
+        )
+        return module.Model.sanitize(stub, {key: mx.zeros(4)})
+
+    def test_qwen3_5_shifts_hf_vl_norm_weights(self):
+        from mlx_vlm.models import qwen3_5
+
+        out = self._sanitize(qwen3_5, self._HF_VL_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.ones(4)).item())
+
+    def test_qwen3_5_shifts_hf_text_norm_weights(self):
+        from mlx_vlm.models import qwen3_5
+
+        out = self._sanitize(qwen3_5, self._HF_TEXT_KEY)
+        self.assertTrue(mx.allclose(out[self._HF_TEXT_KEY], mx.ones(4)).item())
+
+    def test_qwen3_5_preserves_mlx_norm_weights(self):
+        from mlx_vlm.models import qwen3_5
+
+        out = self._sanitize(qwen3_5, self._MLX_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
+
+    def test_qwen3_5_moe_shifts_hf_vl_norm_weights(self):
+        from mlx_vlm.models import qwen3_5_moe
+
+        out = self._sanitize(qwen3_5_moe, self._HF_VL_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.ones(4)).item())
+
+    def test_qwen3_5_moe_preserves_mlx_norm_weights(self):
+        from mlx_vlm.models import qwen3_5_moe
+
+        out = self._sanitize(qwen3_5_moe, self._MLX_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
 
 
 class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
