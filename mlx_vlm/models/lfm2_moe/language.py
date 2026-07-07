@@ -2,10 +2,10 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.lfm2_moe import Lfm2Model
 
 from ..base import LanguageModelOutput
 from ..cache import ArraysCache, KVCache
+from ..lfm2.language import Lfm2Model
 from .config import ModelConfig
 
 
