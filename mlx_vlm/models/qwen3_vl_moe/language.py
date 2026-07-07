@@ -537,12 +537,7 @@ class LanguageModel(nn.Module):
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
-
-        # Plain `generate()` passes `rope_deltas` (computed by
-        # `get_input_embeddings`) only with the prefill call; decode steps
-        # arrive with no kwargs. Persist it so the decode-step position
-        # calculation below continues from the prefill deltas instead of
-        # recalculating positions from a single token.
+            
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
