@@ -90,6 +90,7 @@ def test_proportional_rope_evals_private_helper_arrays_on_init(monkeypatch):
     assert eval_args[0][0] is eager_arrays[0]
 
 
+# TODO: Refactor this file into separate test classes for each RoPE variant.
 def test_proportional_rope_matches_zero_padded_rotate_half_layout():
     x = (mx.arange(2 * 3 * 8).reshape(1, 2, 3, 8) / 10).astype(mx.float32)
     rope = ProportionalRoPE(
