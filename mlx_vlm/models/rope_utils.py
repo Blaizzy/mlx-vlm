@@ -205,27 +205,56 @@ class ProportionalRoPE(nn.Module):
     def __init__(
         self,
         dims: int,
-        rotated_dims: int,
+        rotated_dims: Optional[int] = None,
         traditional: bool = False,
         base: float = 10000.0,
-        factor: float = 1.0,
+        factor: Optional[float] = None,
+        scaling_config: Optional[dict] = None,
     ):
         super().__init__()
         self.dims = dims
         self.traditional = traditional
 
+        scaling_config = scaling_config or {}
+        factor = scaling_config.get("factor", 1.0) if factor is None else factor
+        if rotated_dims is None:
+            partial_rotary_factor = scaling_config.get("partial_rotary_factor", 1.0)
+            rotated_dims = 2 * int(partial_rotary_factor * dims // 2)
+
         if rotated_dims > dims:
             raise ValueError("rotated_dims should be smaller than dims")
 
-        exponents = mx.arange(0, rotated_dims, 2, dtype=mx.float32) / dims
-        self._freqs = mx.concatenate(
-            [
-                factor * (base**exponents),
-                mx.full(((dims - rotated_dims) // 2,), mx.inf),
-            ]
-        )
+        self.rope_angles = rotated_dims // 2
+        nope_angles = dims // 2 - self.rope_angles
+
+        if self.rope_angles > 0:
+            exponents = mx.arange(0, 2 * self.rope_angles, 2, dtype=mx.float32) / dims
+            freqs = factor * mx.power(base, exponents)
+            if nope_angles > 0:
+                freqs = mx.concatenate(
+                    [freqs, mx.full((nope_angles,), mx.inf, dtype=mx.float32)]
+                )
+            self._freqs = freqs
+        else:
+            self._freqs = mx.full((dims // 2,), mx.inf, dtype=mx.float32)
+        self.eval_cached_arrays()
+
+    @property
+    def freqs(self):
+        return self._freqs
+
+    def eager_eval_arrays(self):
+        return [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset=0):
+        if self.rope_angles <= 0:
+            return x
+
         return mx.fast.rope(
             x,
             self.dims,
@@ -301,10 +330,9 @@ def initialize_rope(
     if rope_type == "proportional":
         return ProportionalRoPE(
             dims=dims,
-            rotated_dims=int(dims * scaling_config.get("partial_rotary_factor", 1.0)),
             traditional=traditional,
             base=base,
-            factor=scaling_config.get("factor", 1.0),
+            scaling_config=scaling_config,
         )
 
     if rope_type == "mrope":

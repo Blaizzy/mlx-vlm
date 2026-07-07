@@ -3501,6 +3501,33 @@ class TestModels(unittest.TestCase):
         )
         model = gemma4.Model(config)
 
+        sanitize_model = gemma4.Model(config)
+        sanitized = sanitize_model.sanitize(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight": mx.zeros(
+                    (32, 32), dtype=mx.bfloat16
+                ),
+                "model.language_model.layers.0.self_attn.q_proj.scales": mx.zeros(
+                    (32,), dtype=mx.bfloat16
+                ),
+                "model.vision_tower.layers.0.self_attn.q_proj.weight": mx.zeros(
+                    (32, 32), dtype=mx.bfloat16
+                ),
+            }
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.q_proj.weight"].dtype,
+            mx.float32,
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.q_proj.scales"].dtype,
+            mx.bfloat16,
+        )
+        self.assertEqual(
+            sanitized["vision_tower.layers.0.self_attn.q_proj.weight"].dtype,
+            mx.bfloat16,
+        )
+
         self.language_test_runner(
             model.language_model,
             config.text_config.model_type,
@@ -3569,6 +3596,19 @@ class TestModels(unittest.TestCase):
             output = tiny_tower(mx.array(data["pixel_values"]))
             mx.eval(output)
             self.assertEqual(output.shape[1], soft_tokens[0])
+
+        patch_dim = 3 * vision_config.patch_size**2
+        patch_positions = mx.array([[[0, 0], [1, 0], [0, 1], [1, 1]]])
+        patch_values = mx.ones((1, 4, patch_dim)) * 0.5
+        output = tiny_tower(patch_values, patch_positions)
+        mx.eval(output)
+        self.assertEqual(output.shape, (1, 1, vision_config.hidden_size))
+
+        video_patch_values = mx.ones((1, 2, 4, patch_dim)) * 0.5
+        video_patch_positions = mx.array([[[[0, 0], [1, 0], [0, 1], [1, 1]]] * 2])
+        output = tiny_tower(video_patch_values, video_patch_positions)
+        mx.eval(output)
+        self.assertEqual(output.shape, (1, 2, vision_config.hidden_size))
 
         image_token, image_token_id = "<image>", 100
         tokenizer_kwargs = []
@@ -3705,6 +3745,70 @@ class TestModels(unittest.TestCase):
         self.assertEqual(
             output.logits.shape,
             (1, 6, config_with_audio.text_config.vocab_size),
+        )
+
+        hf_audio_weights = model_audio.sanitize(
+            {
+                "audio_tower.subsample_conv_projection.layer0.conv.weight": mx.zeros(
+                    (8, 1, 3, 3)
+                ),
+                "audio_tower.subsample_conv_projection.layer1.conv.weight": mx.zeros(
+                    (4, 8, 3, 3)
+                ),
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight": mx.zeros(
+                    (32, 1, 3)
+                ),
+            }
+        )
+        self.assertEqual(
+            hf_audio_weights[
+                "audio_tower.subsample_conv_projection.layer0.conv.weight"
+            ].shape,
+            (8, 3, 3, 1),
+        )
+        self.assertEqual(
+            hf_audio_weights[
+                "audio_tower.subsample_conv_projection.layer1.conv.weight"
+            ].shape,
+            (4, 3, 3, 8),
+        )
+        self.assertEqual(
+            hf_audio_weights[
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+            ].shape,
+            (32, 3, 1),
+        )
+
+        mlx_audio_weights = model_audio.sanitize(
+            {
+                "audio_tower.subsample_conv_projection.layer0.conv.weight": mx.zeros(
+                    (8, 3, 3, 1)
+                ),
+                "audio_tower.subsample_conv_projection.layer1.conv.weight": mx.zeros(
+                    (4, 3, 3, 8)
+                ),
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight": mx.zeros(
+                    (32, 3, 1)
+                ),
+            }
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.subsample_conv_projection.layer0.conv.weight"
+            ].shape,
+            (8, 3, 3, 1),
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.subsample_conv_projection.layer1.conv.weight"
+            ].shape,
+            (4, 3, 3, 8),
+        )
+        self.assertEqual(
+            mlx_audio_weights[
+                "audio_tower.layers.0.lconv1d.depthwise_conv1d.weight"
+            ].shape,
+            (32, 3, 1),
         )
 
         shared_text_config = gemma4.TextConfig(
@@ -8896,3 +9000,93 @@ class TestQuantizedKVCacheMask(unittest.TestCase):
 
         # The quantized path must actually have been exercised.
         self.assertIsInstance(cache[1].keys, tuple)
+
+
+class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
+    """Regression tests for MRoPE decode positions in plain generation.
+
+    ``generate()`` forwards ``position_ids``/``rope_deltas`` (computed by
+    ``get_input_embeddings``) only with the prefill call; decode steps reach
+    the language model with no position kwargs. The language model must
+    persist the prefill ``rope_deltas`` so decode positions continue in the
+    compressed MRoPE space instead of restarting from a single-token
+    recalculation (#1505, #1526).
+    """
+
+    def _tiny_qwen3_vl(self):
+        from mlx_vlm.models import qwen3_vl
+
+        text_config = qwen3_vl.TextConfig(
+            model_type="qwen3_vl_text",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=16,
+            vocab_size=1000,
+            rope_theta=1000,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+            rope_scaling={"rope_type": "mrope", "mrope_section": [4, 2, 2]},
+        )
+        vision_config = qwen3_vl.VisionConfig(
+            model_type="qwen3_vl",
+            depth=2,
+            hidden_size=64,
+            intermediate_size=128,
+            out_hidden_size=64,
+            num_heads=4,
+            patch_size=14,
+            in_channels=3,
+            spatial_merge_size=2,
+            temporal_patch_size=2,
+            num_position_embeddings=144,
+            deepstack_visual_indexes=[],
+        )
+        config = qwen3_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="qwen3_vl",
+            image_token_id=998,
+            video_token_id=999,
+            vocab_size=1000,
+        )
+        return qwen3_vl.Model(config).language_model
+
+    def _decode_logits(self, lm, with_delta_kwarg):
+        from mlx_vlm.models import cache as cache_mod
+
+        lm._rope_deltas = None
+        lm._position_ids = None
+        prompt_cache = cache_mod.make_prompt_cache(lm)
+
+        ids = mx.array([[3, 5, 7, 11, 13, 17]])
+        # Vision-compressed prompt positions: max position 2 for 6 tokens,
+        # so rope_delta = (2 + 1) - 6 = -3.
+        pos_row = mx.array([0, 1, 1, 2, 2, 2])
+        positions = mx.broadcast_to(pos_row[None, None, :], (3, 1, 6))
+        delta = mx.array([[-3]])
+
+        prefill_kwargs = {"rope_deltas": delta} if with_delta_kwarg else {}
+        lm(ids, cache=prompt_cache, position_ids=positions, **prefill_kwargs)
+
+        step = mx.array([[19]])
+        if with_delta_kwarg:
+            # The generate() decode flow: no position kwargs at all.
+            out = lm(step, cache=prompt_cache)
+        else:
+            # Ground truth: cache offset (6) + delta (-3) = position 3.
+            decode_positions = mx.full((3, 1, 1), 3, dtype=positions.dtype)
+            out = lm(step, cache=prompt_cache, position_ids=decode_positions)
+        mx.eval(out.logits)
+        return out.logits
+
+    def test_qwen3_vl_decode_continues_prefill_rope_deltas(self):
+        lm = self._tiny_qwen3_vl()
+        mx.eval(lm.parameters())
+        reference = self._decode_logits(lm, with_delta_kwarg=False)
+        subject = self._decode_logits(lm, with_delta_kwarg=True)
+        self.assertTrue(mx.allclose(reference, subject, atol=1e-5).item())
