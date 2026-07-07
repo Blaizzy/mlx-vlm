@@ -87,7 +87,7 @@ def _mock_ip(**extra):
     )()
 
 
-class TestGemma4Processor(unittest.TestCase):
+class TestGemma4UnifiedProcessor(unittest.TestCase):
     # Test fixtures
 
     class _Tokenizer:
