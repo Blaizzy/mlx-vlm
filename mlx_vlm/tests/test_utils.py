@@ -501,6 +501,13 @@ def test_get_model_and_args_routes_text_only_configs():
     assert model_type == "text_only"
 
 
+def test_get_model_and_args_remaps_mistral_to_llama():
+    model_class, model_type = get_model_and_args({"model_type": "mistral"})
+
+    assert model_class.__name__ == "mlx_vlm.models.llama"
+    assert model_type == "llama"
+
+
 def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
     with pytest.raises(ValueError):
         get_model_and_args(
