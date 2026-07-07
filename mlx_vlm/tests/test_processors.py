@@ -87,7 +87,9 @@ def _mock_ip(**extra):
     )()
 
 
-class TestGemma4UnifiedProcessor(unittest.TestCase):
+class TestGemma4Processor(unittest.TestCase):
+    # Test fixtures
+
     class _Tokenizer:
         model_input_names = ["input_ids", "attention_mask"]
         bos_token = "<bos>"
@@ -183,6 +185,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
                 "attention_mask": attention_mask,
             }
 
+    # Processor helpers
+
     def _make_gemma4_unified_processor(
         self, image_processor=None, video_processor=None
     ):
@@ -225,6 +229,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             tokenizer.boa_token + tokenizer.audio_token * 750 + tokenizer.eoa_token
         )
         return processor, tokenizer
+
+    # Image and video patch processors
 
     def test_image_processor_outputs_merged_patches_and_positions(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
@@ -339,6 +345,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             self.assertEqual(processor.max_soft_tokens, 70)
             self.assertEqual(processor.num_frames, 32)
 
+    # Processor construction and audio feature extraction
+
     def test_processor_init_declares_video_processor_attribute(self):
         from mlx_vlm.models.gemma4_unified.processing_gemma4_unified import (
             Gemma4UnifiedImageProcessor,
@@ -384,6 +392,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
             result["input_features_mask"].tolist(),
             [[True, True, False], [True, True, True]],
         )
+
+    # Multimodal chat/template integration
 
     def test_apply_chat_template_returns_multimodal_mlx_inputs(self):
         import mlx.core as mx
@@ -510,6 +520,8 @@ class TestGemma4UnifiedProcessor(unittest.TestCase):
         )
 
         self.assertEqual(result["mm_token_type_ids"].tolist()[0][:3], [1, 2, 3])
+
+    # Utility integration
 
     def test_prepare_inputs_respects_mm_token_type_ids_override(self):
         from mlx_vlm.utils import prepare_inputs
