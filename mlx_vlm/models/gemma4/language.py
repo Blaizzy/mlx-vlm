@@ -3,7 +3,6 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn import RMSNorm
 
 from ..base import (
     LanguageModelOutput,
@@ -21,6 +20,23 @@ def geglu(gate, x):
     return nn.gelu_approx(gate) * x
 
 
+class RMSNorm(nn.Module):
+    """Gemma4 RMSNorm matching HF's float32 pow-based implementation."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = mx.ones((dim,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        mean_squared = mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps
+        normed = x * mx.power(mean_squared, -0.5)
+        normed = normed * self.weight.astype(mx.float32)
+        return normed.astype(dtype)
+
+
 class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale (with_scale=False, scale_shift=0.0)."""
 
@@ -29,7 +45,11 @@ class RMSNormNoScale(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, None, self.eps)
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        mean_squared = mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps
+        normed = x * mx.power(mean_squared, -0.5)
+        return normed.astype(dtype)
 
 
 class RMSNormZeroShift(nn.Module):
@@ -41,7 +61,12 @@ class RMSNormZeroShift(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
+        dtype = x.dtype
+        x = x.astype(mx.float32)
+        mean_squared = mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps
+        normed = x * mx.power(mean_squared, -0.5)
+        normed = normed * self.weight.astype(mx.float32)
+        return normed.astype(dtype)
 
 
 @partial(mx.compile, shapeless=True)
@@ -666,6 +691,9 @@ class LanguageModel(nn.Module):
         logits = self.model.embed_tokens.as_linear(hidden)
         if self.final_logit_softcapping is not None:
             logits = logit_softcap(self.final_logit_softcapping, logits)
+        output_dtype = getattr(self, "output_logits_dtype", None)
+        if output_dtype is not None:
+            logits = logits.astype(output_dtype)
         return logits
 
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:

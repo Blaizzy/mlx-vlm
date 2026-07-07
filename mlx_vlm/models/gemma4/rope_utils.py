@@ -9,9 +9,9 @@ import mlx.nn as nn
 class ProportionalRoPE(nn.Module):
     """Proportional RoPE for Gemma 4 full-attention layers.
 
-    Frequencies are computed relative to the full head dimension (not just the
-    rotated portion), and rotation is applied to the first rotated_dims//2
-    elements of each half of the head — matching HF's rotate_half convention.
+    Frequencies are computed relative to the full head dimension. HF then pads
+    the non-rotary frequency slots with zeros and applies rotate_half over the
+    whole head, so only the matching prefix in each half rotates.
     """
 
     def __init__(
@@ -29,22 +29,27 @@ class ProportionalRoPE(nn.Module):
         factor = scaling_config.get("factor", 1.0)
         partial_rotary_factor = scaling_config.get("partial_rotary_factor", 1.0)
 
-        rope_angles = int(partial_rotary_factor * dims // 2)
-        self.rotated_dims = 2 * rope_angles
+        self.rope_angles = int(partial_rotary_factor * dims // 2)
+        nope_angles = dims // 2 - self.rope_angles
 
-        if self.rotated_dims > 0:
-            exponents = mx.arange(0, self.rotated_dims, 2, dtype=mx.float32) / dims
-            self._freqs = factor * (base**exponents)
+        if self.rope_angles > 0:
+            exponents = mx.arange(0, 2 * self.rope_angles, 2, dtype=mx.float32) / dims
+            inv_freq = 1.0 / mx.power(base, exponents)
+            if nope_angles > 0:
+                inv_freq = mx.concatenate(
+                    [inv_freq, mx.zeros((nope_angles,), dtype=mx.float32)]
+                )
+            self._inv_freq = inv_freq / factor
         else:
-            self._freqs = None
+            self._inv_freq = mx.zeros((dims // 2,), dtype=mx.float32)
         self.eval_cached_arrays()
 
     @property
     def freqs(self):
-        return self._freqs
+        return self._inv_freq
 
     def eager_eval_arrays(self):
-        return [] if self._freqs is None else [self._freqs]
+        return [self._inv_freq]
 
     def eval_cached_arrays(self):
         arrays = self.eager_eval_arrays()
@@ -52,44 +57,23 @@ class ProportionalRoPE(nn.Module):
             mx.eval(*arrays)
 
     def __call__(self, x, offset=0):
-        if self.rotated_dims <= 0:
+        if self.rope_angles <= 0:
             return x
 
         head = x[..., : self.dims]
         tail = x[..., self.dims :]
         half = self.dims // 2
 
-        left = head[..., :half]
-        right = head[..., half:]
-        rotated = mx.concatenate(
-            [left[..., : self.rotated_dims // 2], right[..., : self.rotated_dims // 2]],
-            axis=-1,
-        )
-        rotated = mx.fast.rope(
-            rotated,
-            self.rotated_dims,
-            traditional=self.traditional,
-            base=None,
-            scale=1.0,
-            offset=offset,
-            freqs=self._freqs,
-        )
+        positions = mx.arange(head.shape[-2], dtype=mx.float32) + offset
+        freqs = positions[..., None] * self._inv_freq
+        emb = mx.concatenate([freqs, freqs], axis=-1)
+        cos = mx.cos(emb).astype(head.dtype)
+        sin = mx.sin(emb).astype(head.dtype)
+        cos = cos.reshape((1,) * (head.ndim - 2) + cos.shape)
+        sin = sin.reshape((1,) * (head.ndim - 2) + sin.shape)
 
-        left = mx.concatenate(
-            [
-                rotated[..., : self.rotated_dims // 2],
-                left[..., self.rotated_dims // 2 :],
-            ],
-            axis=-1,
-        )
-        right = mx.concatenate(
-            [
-                rotated[..., self.rotated_dims // 2 :],
-                right[..., self.rotated_dims // 2 :],
-            ],
-            axis=-1,
-        )
-        head = mx.concatenate([left, right], axis=-1)
+        rotated = mx.concatenate([-head[..., half:], head[..., :half]], axis=-1)
+        head = (head * cos) + (rotated * sin)
 
         if tail.shape[-1] == 0:
             return head
