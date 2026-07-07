@@ -292,17 +292,14 @@ class Model(nn.Module):
                 gate_value = v[..., :mid_dim].swapaxes(-1, -2)
                 up_value = v[..., mid_dim:].swapaxes(-1, -2)
                 if self._needs_float32_language_weight(gate_key, gate_value):
-                    self.language_model.output_logits_dtype = gate_value.dtype
                     gate_value = gate_value.astype(mx.float32)
                 if self._needs_float32_language_weight(up_key, up_value):
-                    self.language_model.output_logits_dtype = up_value.dtype
                     up_value = up_value.astype(mx.float32)
                 sanitized[gate_key] = gate_value
                 sanitized[up_key] = up_value
                 continue
 
             if self._needs_float32_language_weight(new_key, v):
-                self.language_model.output_logits_dtype = v.dtype
                 v = v.astype(mx.float32)
 
             sanitized[new_key] = v

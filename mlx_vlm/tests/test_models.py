@@ -3250,10 +3250,6 @@ class TestModels(unittest.TestCase):
             sanitized["vision_tower.layers.0.self_attn.q_proj.weight"].dtype,
             mx.bfloat16,
         )
-        self.assertEqual(
-            sanitize_model.language_model.output_logits_dtype,
-            mx.bfloat16,
-        )
 
         self.language_test_runner(
             model.language_model,
