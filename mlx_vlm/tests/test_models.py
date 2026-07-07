@@ -236,6 +236,46 @@ class TestModels(unittest.TestCase):
             (64, 32),
         )
 
+    def test_lfm2_language_model(self):
+        from mlx_vlm.models import lfm2
+
+        config = lfm2.ModelConfig(
+            model_type="lfm2",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            block_dim=64,
+            block_ff_dim=128,
+            block_multiple_of=16,
+            block_ffn_dim_multiplier=1.0,
+            block_auto_adjust_ff_dim=True,
+            layer_types=["conv", "full_attention"],
+            tie_word_embeddings=True,
+        )
+
+        model = lfm2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "ArraysCache")
+        self.assertEqual(type(cache[1]).__name__, "KVCache")
+
     def test_lfm2_moe_language_model(self):
         from mlx_vlm.models import lfm2_moe
 
@@ -563,6 +603,169 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
+
+    def test_deepseek_v3_language_model(self):
+        from mlx_vlm.models import deepseek_v3
+
+        config = deepseek_v3.ModelConfig(
+            model_type="deepseek_v3",
+            vocab_size=1024,
+            hidden_size=128,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_scaling=None,
+            attention_bias=False,
+        )
+
+        model = deepseek_v3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((config.vocab_size, 128)),
+                "lm_head.weight": mx.zeros((config.vocab_size, 128)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+
+        prefixed = {"language_model.lm_head.weight": mx.zeros((config.vocab_size, 128))}
+        self.assertIs(model.sanitize(prefixed), prefixed)
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = model(prompt).logits
+        self.assertEqual(logits.shape, (1, 8, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_deepseek_v32_language_model(self):
+        from mlx_vlm.models import deepseek_v32
+
+        config = deepseek_v32.ModelConfig(
+            model_type="deepseek_v32",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_scaling=None,
+            attention_bias=False,
+        )
+
+        model = deepseek_v32.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.num_hidden_layers)
+        self.assertEqual(len(cache[0].caches), 2)
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        logits = model(prompt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 8, config.vocab_size))
+
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_qwen2_language_model(self):
+        from mlx_vlm.models import qwen2
+
+        config = qwen2.ModelConfig(
+            model_type="qwen2",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            num_key_value_heads=2,
+            tie_word_embeddings=True,
+        )
+
+        model = qwen2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        sanitized = model.sanitize(
+            {"model.embed_tokens.weight": mx.zeros((config.vocab_size, 64))}
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+
+        prefixed = {
+            "language_model.model.embed_tokens.weight": mx.zeros(
+                (config.vocab_size, 64)
+            )
+        }
+        self.assertIs(model.sanitize(prefixed), prefixed)
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
