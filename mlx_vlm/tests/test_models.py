@@ -604,6 +604,50 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
         mx.eval([c.state for c in cache])
 
+    def test_qwen2_language_model(self):
+        from mlx_vlm.models import qwen2
+
+        config = qwen2.ModelConfig(
+            model_type="qwen2",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            num_key_value_heads=2,
+            tie_word_embeddings=True,
+        )
+
+        model = qwen2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        sanitized = model.sanitize(
+            {"model.embed_tokens.weight": mx.zeros((config.vocab_size, 64))}
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+
+        prefixed = {
+            "language_model.model.embed_tokens.weight": mx.zeros(
+                (config.vocab_size, 64)
+            )
+        }
+        self.assertIs(model.sanitize(prefixed), prefixed)
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
     def test_llava_bunny(self):
         from mlx_vlm.models import llava_bunny
 
