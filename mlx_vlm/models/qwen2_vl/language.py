@@ -430,7 +430,6 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
-       
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
