@@ -637,9 +637,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
-            stripped = p.removeprefix("language_model.")
-            if stripped != p and stripped in config["quantization"]:
-                return config["quantization"][stripped]
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64
