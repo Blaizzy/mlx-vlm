@@ -8822,3 +8822,49 @@ class TestQuantizedKVCacheMask(unittest.TestCase):
 
         # The quantized path must actually have been exercised.
         self.assertIsInstance(cache[1].keys, tuple)
+
+
+class TestQwen35NormSanitization(unittest.TestCase):
+    _HF_VL_KEY = "model.language_model.layers.0.input_layernorm.weight"
+    _HF_TEXT_KEY = "model.layers.0.input_layernorm.weight"
+    _MLX_KEY = "language_model.model.layers.0.input_layernorm.weight"
+
+    def _sanitize(self, module, key):
+        stub = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(
+                    tie_word_embeddings=False, num_hidden_layers=0
+                )
+            ),
+        )
+        return module.Model.sanitize(stub, {key: mx.zeros(4)})
+
+    def test_qwen3_5_shifts_hf_vl_norm_weights(self):
+        from mlx_vlm.models import qwen3_5
+
+        out = self._sanitize(qwen3_5, self._HF_VL_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.ones(4)).item())
+
+    def test_qwen3_5_shifts_hf_text_norm_weights(self):
+        from mlx_vlm.models import qwen3_5
+
+        out = self._sanitize(qwen3_5, self._HF_TEXT_KEY)
+        self.assertTrue(mx.allclose(out[self._HF_TEXT_KEY], mx.ones(4)).item())
+
+    def test_qwen3_5_preserves_mlx_norm_weights(self):
+        from mlx_vlm.models import qwen3_5
+
+        out = self._sanitize(qwen3_5, self._MLX_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
+
+    def test_qwen3_5_moe_shifts_hf_vl_norm_weights(self):
+        from mlx_vlm.models import qwen3_5_moe
+
+        out = self._sanitize(qwen3_5_moe, self._HF_VL_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.ones(4)).item())
+
+    def test_qwen3_5_moe_preserves_mlx_norm_weights(self):
+        from mlx_vlm.models import qwen3_5_moe
+
+        out = self._sanitize(qwen3_5_moe, self._MLX_KEY)
+        self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
