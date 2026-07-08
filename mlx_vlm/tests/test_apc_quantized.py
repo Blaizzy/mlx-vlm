@@ -687,3 +687,212 @@ class TestProductionPathQuantConfig:
         assert warm[0].bits == 8
         assert warm[0].group_size == 32
         manager.release(matched)
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Multi-row batch with mixed warm/cold rows
+# ---------------------------------------------------------------------------
+
+
+class TestMultiRowMixedWarmCold:
+    def test_mixed_picks_produces_correct_types_and_shapes(self):
+        """make_warm_batch_kv_cache_multi with some None picks (cold) works.
+
+        This is the exact production scenario: some rows hit APC (warm),
+        others miss (cold, get zero-padded). All rows must produce the
+        same cache type so extend() works.
+        """
+        from mlx_vlm.apc import make_warm_batch_kv_cache_multi
+
+        manager = APCManager(num_blocks=16, block_size=BLOCK_SIZE)
+        seq_len = 2 * BLOCK_SIZE
+        num_layers = 2
+
+        lk = [_rand_kv(seq_len=seq_len)[0] for _ in range(num_layers)]
+        lv = [_rand_kv(seq_len=seq_len)[1] for _ in range(num_layers)]
+        mx.eval(lk + lv)
+
+        token_ids = list(range(seq_len))
+        blocks = manager.store_kv_blocks(token_ids, lk, lv)
+        manager.release(blocks)
+
+        matched, _ = manager.lookup_prefix(token_ids)
+
+        # Row 0 = warm (APC hit), Row 1 = cold (miss)
+        picks = [
+            {"matched_blocks": matched, "prefix_len": seq_len},
+            None,
+        ]
+
+        quant_config = {"bits": BITS, "group_size": GROUP_SIZE}
+        warm, max_prefix = make_warm_batch_kv_cache_multi(
+            picks, num_layers=num_layers, kv_quant_config=quant_config
+        )
+
+        assert max_prefix == seq_len
+        assert len(warm) == num_layers
+        for c in warm:
+            assert isinstance(c, BatchQuantizedKVCache)
+            # _idx covers the full max_prefix (warm row content + cold row zeros)
+            assert c._idx == max_prefix
+            # left_padding: row 0 has 0 (full hit), row 1 has max_prefix (all cold)
+            lp = c.left_padding.tolist()
+            assert lp[0] == 0
+            assert lp[1] == max_prefix
+        manager.release(matched)
+
+    def test_mixed_picks_without_quant_produces_batch_kv_cache(self):
+        """Without quant config, mixed warm/cold still produces BatchKVCache."""
+        from mlx_vlm.apc import make_warm_batch_kv_cache_multi
+        from mlx_vlm.models.cache import BatchKVCache
+
+        manager = APCManager(num_blocks=16, block_size=BLOCK_SIZE)
+        seq_len = 2 * BLOCK_SIZE
+
+        lk = [_rand_kv(seq_len=seq_len)[0] for _ in range(2)]
+        lv = [_rand_kv(seq_len=seq_len)[1] for _ in range(2)]
+        mx.eval(lk + lv)
+
+        token_ids = list(range(seq_len))
+        blocks = manager.store_kv_blocks(token_ids, lk, lv)
+        manager.release(blocks)
+
+        matched, _ = manager.lookup_prefix(token_ids)
+        picks = [{"matched_blocks": matched, "prefix_len": seq_len}, None]
+
+        warm, _ = make_warm_batch_kv_cache_multi(
+            picks, num_layers=2, kv_quant_config=None
+        )
+
+        for c in warm:
+            assert isinstance(c, BatchKVCache)
+        manager.release(matched)
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Harvest from batch_idx > 0
+# ---------------------------------------------------------------------------
+
+
+class TestHarvestNonZeroBatchIdx:
+    def test_harvest_batch_idx_1(self):
+        """harvest_blocks_from_batch_cache correctly extracts row 1 from multi-row cache."""
+        manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
+        seq_len = BLOCK_SIZE
+        num_layers = 2
+
+        # Create a 2-row batch cache with different values per row
+        row0_k, row0_v = _rand_kv(batch=1, seq_len=seq_len)
+        row1_k, row1_v = _rand_kv(batch=1, seq_len=seq_len)
+        batch_k = mx.concatenate([row0_k, row1_k], axis=0)  # [2, H, seq_len, D]
+        batch_v = mx.concatenate([row0_v, row1_v], axis=0)
+        mx.eval(batch_k, batch_v)
+
+        batch_caches = []
+        for _ in range(num_layers):
+            c = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+            c.update_and_fetch(batch_k, batch_v)
+            mx.eval(c.keys)
+            batch_caches.append(c)
+
+        # Harvest row 1 (not row 0)
+        token_ids = list(range(seq_len))
+        blocks = harvest_blocks_from_batch_cache(
+            manager, batch_caches, batch_idx=1, full_token_ids=token_ids
+        )
+
+        assert len(blocks) == 1
+        # Block should contain row 1's data, not row 0's
+        harvested_k = blocks[0].keys[0]
+        mx.eval(harvested_k)
+        # Verify it's closer to row1 than row0
+        error_vs_row1 = _max_abs_error(harvested_k, row1_k)
+        error_vs_row0 = _max_abs_error(harvested_k, row0_k)
+        assert error_vs_row1 < 0.1  # should match row1 within quant tolerance
+        assert error_vs_row0 > error_vs_row1  # should NOT match row0
+        manager.release(blocks)
+
+    def test_harvest_batch_idx_1_with_left_padding(self):
+        """Harvest row 1 with different left-padding per row."""
+        manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
+        content_len = BLOCK_SIZE
+        num_layers = 2
+
+        # Row 0: left_pad=0, Row 1: left_pad=5
+        left_padding = [0, 5]
+        total_len = content_len + 5  # both rows same buffer length
+
+        batch_k = mx.random.normal((2, H, total_len, D))
+        batch_v = mx.random.normal((2, H, total_len, D))
+        mx.eval(batch_k, batch_v)
+
+        batch_caches = []
+        for _ in range(num_layers):
+            c = BatchQuantizedKVCache(left_padding, group_size=GROUP_SIZE, bits=BITS)
+            c.update_and_fetch(batch_k, batch_v)
+            mx.eval(c.keys)
+            batch_caches.append(c)
+
+        # Harvest row 1 — should skip 5 left-padding tokens
+        token_ids = list(range(content_len))
+        blocks = harvest_blocks_from_batch_cache(
+            manager, batch_caches, batch_idx=1, full_token_ids=token_ids
+        )
+
+        assert len(blocks) == 1
+        # Row 1 has content_len tokens after skipping left_pad=5
+        assert blocks[0].keys[0].shape[2] == BLOCK_SIZE
+        manager.release(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Type homogeneity — warm and cold caches are same type for extend()
+# ---------------------------------------------------------------------------
+
+
+class TestCacheTypeHomogeneity:
+    def test_warm_quantized_matches_cold_quantized_type(self):
+        """Warm APC cache (with kv_quant_config) is same type as cold cache from _make_cache.
+
+        This ensures extend() won't crash when merging warm and cold batches.
+        """
+        from mlx_vlm.apc import make_warm_batch_kv_cache_multi
+        from mlx_vlm.generate.ar import _make_cache
+        from mlx_vlm.models.cache import BatchQuantizedKVCache
+
+        manager = APCManager(num_blocks=16, block_size=BLOCK_SIZE)
+        seq_len = 2 * BLOCK_SIZE
+
+        lk = [_rand_kv(seq_len=seq_len)[0] for _ in range(2)]
+        lv = [_rand_kv(seq_len=seq_len)[1] for _ in range(2)]
+        mx.eval(lk + lv)
+
+        token_ids = list(range(seq_len))
+        blocks = manager.store_kv_blocks(token_ids, lk, lv)
+        manager.release(blocks)
+
+        matched, _ = manager.lookup_prefix(token_ids)
+        picks = [{"matched_blocks": matched, "prefix_len": seq_len}]
+
+        quant_config = {"bits": BITS, "group_size": GROUP_SIZE}
+        warm, _ = make_warm_batch_kv_cache_multi(
+            picks, num_layers=2, kv_quant_config=quant_config
+        )
+
+        # Simulate what cold path produces
+        class FakeModel:
+            class layers:
+                pass
+
+            layers = [None, None]
+
+        cold = _make_cache(FakeModel(), [0], kv_bits=BITS, kv_group_size=GROUP_SIZE)
+
+        # Both should be the same type
+        for warm_layer, cold_layer in zip(warm, cold):
+            assert type(warm_layer) == type(cold_layer), (
+                f"Type mismatch: warm={type(warm_layer).__name__}, "
+                f"cold={type(cold_layer).__name__}"
+            )
+            assert isinstance(warm_layer, BatchQuantizedKVCache)
+        manager.release(matched)
