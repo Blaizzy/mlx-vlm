@@ -122,7 +122,10 @@ def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     """Dequantize uniform-quantized K/V tuples to raw float arrays.
 
     Shared by QuantizedKVCache and BatchQuantizedKVCache for APC storage.
+    Returns None, None if the cache is empty.
     """
+    if keys_tuple is None or values_tuple is None or length == 0:
+        return None, None
     keys = mx.dequantize(
         keys_tuple[0][..., :length, :],
         keys_tuple[1][..., :length, :],
@@ -223,7 +226,12 @@ class QuantizedKVCache(_BaseCache):
         return n
 
     def dequantize_for_apc(self):
-        """Return raw float (keys, values) sliced to current offset for APC storage."""
+        """Return raw float (keys, values) sliced to current offset for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self.offset == 0:
+            return None, None
         return _dequantize_uniform(
             self.keys, self.values, self.offset, self.group_size, self.bits
         )
@@ -1655,7 +1663,12 @@ class BatchQuantizedKVCache(_BaseCache):
         )
 
     def dequantize_for_apc(self):
-        """Return raw float (keys, values) sliced to current _idx for APC storage."""
+        """Return raw float (keys, values) sliced to current _idx for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self._idx == 0:
+            return None, None
         return _dequantize_uniform(
             self.keys, self.values, self._idx, self.group_size, self.bits
         )

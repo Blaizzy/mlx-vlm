@@ -551,3 +551,125 @@ class TestBlockDecoupling:
         # Block should be unchanged
         assert _max_abs_error(blocks[0].keys[0], block_k_snapshot) == 0.0
         manager.release(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Empty-cache guard (regression for review finding #2)
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyCacheGuard:
+    def test_dequantize_for_apc_returns_none_when_empty(self):
+        """dequantize_for_apc() returns (None, None) on an empty cache."""
+        cache = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
+        dk, dv = cache.dequantize_for_apc()
+        assert dk is None
+        assert dv is None
+
+    def test_batch_dequantize_for_apc_returns_none_when_empty(self):
+        """BatchQuantizedKVCache.dequantize_for_apc() returns (None, None) when empty."""
+        cache = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        dk, dv = cache.dequantize_for_apc()
+        assert dk is None
+        assert dv is None
+
+    def test_harvest_handles_empty_quantized_cache(self):
+        """harvest_blocks_from_batch_cache returns [] for empty quantized caches."""
+        manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
+        empty_cache = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        token_ids = list(range(BLOCK_SIZE))
+        blocks = harvest_blocks_from_batch_cache(
+            manager, [empty_cache], batch_idx=0, full_token_ids=token_ids
+        )
+        assert blocks == []
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Production path wires kv_quant_config (regression for review finding #1)
+# ---------------------------------------------------------------------------
+
+
+class TestProductionPathQuantConfig:
+    def test_make_warm_batch_kv_cache_multi_with_quant_config(self):
+        """make_warm_batch_kv_cache_multi creates BatchQuantizedKVCache when config is passed."""
+        from mlx_vlm.apc import make_warm_batch_kv_cache_multi
+
+        manager = APCManager(num_blocks=16, block_size=BLOCK_SIZE)
+        seq_len = 2 * BLOCK_SIZE
+
+        # Store blocks
+        lk = [_rand_kv(seq_len=seq_len)[0] for _ in range(2)]
+        lv = [_rand_kv(seq_len=seq_len)[1] for _ in range(2)]
+        mx.eval(lk + lv)
+
+        token_ids = list(range(seq_len))
+        blocks = manager.store_kv_blocks(token_ids, lk, lv)
+        manager.release(blocks)
+
+        matched, _ = manager.lookup_prefix(token_ids)
+        picks = [{"matched_blocks": matched, "prefix_len": seq_len}]
+
+        quant_config = {"bits": BITS, "group_size": GROUP_SIZE}
+        warm, max_prefix = make_warm_batch_kv_cache_multi(
+            picks, num_layers=2, kv_quant_config=quant_config
+        )
+
+        assert max_prefix == seq_len
+        assert len(warm) == 2
+        for c in warm:
+            assert isinstance(c, BatchQuantizedKVCache)
+            assert c._idx == seq_len
+            assert c.bits == BITS
+        manager.release(matched)
+
+    def test_make_warm_batch_kv_cache_multi_without_quant_stays_plain(self):
+        """Without kv_quant_config, make_warm_batch_kv_cache_multi returns BatchKVCache."""
+        from mlx_vlm.apc import make_warm_batch_kv_cache_multi
+        from mlx_vlm.models.cache import BatchKVCache
+
+        manager = APCManager(num_blocks=16, block_size=BLOCK_SIZE)
+        seq_len = 2 * BLOCK_SIZE
+
+        lk = [_rand_kv(seq_len=seq_len)[0] for _ in range(2)]
+        lv = [_rand_kv(seq_len=seq_len)[1] for _ in range(2)]
+        mx.eval(lk + lv)
+
+        token_ids = list(range(seq_len))
+        blocks = manager.store_kv_blocks(token_ids, lk, lv)
+        manager.release(blocks)
+
+        matched, _ = manager.lookup_prefix(token_ids)
+        picks = [{"matched_blocks": matched, "prefix_len": seq_len}]
+
+        warm, max_prefix = make_warm_batch_kv_cache_multi(
+            picks, num_layers=2, kv_quant_config=None
+        )
+
+        assert len(warm) == 2
+        for c in warm:
+            assert isinstance(c, BatchKVCache)
+        manager.release(matched)
+
+    def test_int_coercion_on_float_bits(self):
+        """Float bits value (e.g. 8.0 from JSON) doesn't crash."""
+        manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
+        seq_len = BLOCK_SIZE
+
+        lk = [_rand_kv(seq_len=seq_len)[0]]
+        lv = [_rand_kv(seq_len=seq_len)[1]]
+        mx.eval(lk + lv)
+
+        token_ids = list(range(seq_len))
+        blocks = manager.store_kv_blocks(token_ids, lk, lv)
+        manager.release(blocks)
+
+        matched, _ = manager.lookup_prefix(token_ids)
+        # Simulate JSON-parsed config with float values
+        quant_config = {"bits": 8.0, "group_size": 32.0}
+        warm = make_warm_kv_cache(matched, kv_quant_config=quant_config)
+
+        assert len(warm) == 1
+        assert isinstance(warm[0], QuantizedKVCache)
+        assert warm[0].bits == 8
+        assert warm[0].group_size == 32
+        manager.release(matched)

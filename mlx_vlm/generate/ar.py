@@ -2426,8 +2426,13 @@ class BatchGenerator:
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
             )
+            _quant_cfg = (
+                {"bits": self.kv_bits, "group_size": self.kv_group_size}
+                if self.kv_bits is not None
+                else None
+            )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
-                picks, num_layers=num_layers
+                picks, num_layers=num_layers, kv_quant_config=_quant_cfg
             )
 
         apc_meta = [

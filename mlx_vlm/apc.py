@@ -225,6 +225,8 @@ def _clone_cache_entry_for_apc(
     # is cloned by dequantizing into a plain KVCache for exact-mode storage.
     if hasattr(c, "dequantize_for_apc"):
         dk, dv = c.dequantize_for_apc()
+        if dk is None or dv is None:
+            return lm_cache.KVCache()
         out = lm_cache.KVCache()
         out.keys = _copy_mlx_array(dk)
         out.values = _copy_mlx_array(dv)
@@ -3422,15 +3424,14 @@ def make_warm_kv_cache(
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
 
     if kv_quant_config is not None:
+        qbits = int(kv_quant_config["bits"])
+        qgroup = int(kv_quant_config["group_size"])
         for layer_idx in range(num_layers):
             ks = [b.keys[layer_idx] for b in matched_blocks]
             vs = [b.values[layer_idx] for b in matched_blocks]
             merged_k = mx.concatenate(ks, axis=2)
             merged_v = mx.concatenate(vs, axis=2)
-            c = QuantizedKVCache(
-                group_size=kv_quant_config["group_size"],
-                bits=kv_quant_config["bits"],
-            )
+            c = QuantizedKVCache(group_size=qgroup, bits=qbits)
             c.update_and_fetch(merged_k, merged_v)
             out.append(c)
         return out
@@ -3469,17 +3470,29 @@ def make_warm_kv_cache_from_layers(
     layer_keys: List[mx.array],
     layer_values: List[mx.array],
     prefix_len: int,
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Build ``KVCache`` objects from already-concatenated disk-restored K/V."""
-    from .models.cache import KVCache
+    """Build cache objects from already-concatenated disk-restored K/V.
+
+    When *kv_quant_config* is provided, returns ``QuantizedKVCache`` instances.
+    """
+    from .models.cache import KVCache, QuantizedKVCache
 
     out: List[Any] = []
-    for k, v in zip(layer_keys, layer_values):
-        c = KVCache()
-        c.keys = k
-        c.values = v
-        c.offset = prefix_len
-        out.append(c)
+    if kv_quant_config is not None:
+        qbits = int(kv_quant_config["bits"])
+        qgroup = int(kv_quant_config["group_size"])
+        for k, v in zip(layer_keys, layer_values):
+            c = QuantizedKVCache(group_size=qgroup, bits=qbits)
+            c.update_and_fetch(k, v)
+            out.append(c)
+    else:
+        for k, v in zip(layer_keys, layer_values):
+            c = KVCache()
+            c.keys = k
+            c.values = v
+            c.offset = prefix_len
+            out.append(c)
     mx.clear_cache()
     return out
 
@@ -3512,8 +3525,8 @@ def make_warm_batch_kv_cache(
         if kv_quant_config is not None:
             c = BatchQuantizedKVCache(
                 [0],
-                group_size=kv_quant_config["group_size"],
-                bits=kv_quant_config["bits"],
+                group_size=int(kv_quant_config["group_size"]),
+                bits=int(kv_quant_config["bits"]),
             )
             c.update_and_fetch(merged_k, merged_v)
         else:
@@ -3531,11 +3544,16 @@ def make_warm_batch_kv_cache(
 def make_warm_batch_kv_cache_multi(
     picks: List[Optional[dict]],
     num_layers: int,
+    kv_quant_config: Optional[dict] = None,
 ) -> Tuple[List[Any], int]:
-    """Build a multi-row ``BatchKVCache`` list for mixed warm / cold prefill.
+    """Build a multi-row batch cache list for mixed warm / cold prefill.
 
     ``picks`` is per-row, with each entry being ``None`` (cold) or a dict
     with key ``matched_blocks`` (list of APCBlock) and ``prefix_len``.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    returns ``BatchQuantizedKVCache`` instances that re-quantize the raw float
+    blocks via ``update_and_fetch``.
 
     Returns ``(cache_list, max_prefix)`` where ``max_prefix`` is the cache's
     ``_idx`` after warm-init (= max prefix_len across rows).
@@ -3545,7 +3563,7 @@ def make_warm_batch_kv_cache_multi(
       * keys[i, :, left_padding[i]:max_prefix, :] = concatenated block K
       * keys[i, :, :left_padding[i], :] = zeros (will be hidden by mask)
     """
-    from .models.cache import BatchKVCache
+    from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     B = len(picks)
     prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3601,13 +3619,21 @@ def make_warm_batch_kv_cache_multi(
 
         left_padding = [max_prefix - pl for pl in prefix_lens]
         offset = [pl for pl in prefix_lens]
-        c = BatchKVCache(left_padding=[0] * B)  # placeholder; state setter overrides
-        c.state = (
-            merged_k,
-            merged_v,
-            mx.array(offset),
-            mx.array(left_padding),
-        )
+        if kv_quant_config is not None:
+            c = BatchQuantizedKVCache(
+                left_padding,
+                group_size=int(kv_quant_config["group_size"]),
+                bits=int(kv_quant_config["bits"]),
+            )
+            c.update_and_fetch(merged_k, merged_v)
+        else:
+            c = BatchKVCache(left_padding=[0] * B)
+            c.state = (
+                merged_k,
+                merged_v,
+                mx.array(offset),
+                mx.array(left_padding),
+            )
         out.append(c)
     return out, max_prefix
 
@@ -3761,6 +3787,8 @@ def harvest_blocks_from_batch_cache(
         # which returns raw float arrays suitable for direct slicing.
         if hasattr(c, "dequantize_for_apc"):
             dk, dv = c.dequantize_for_apc()
+            if dk is None or dv is None:
+                return []
             idx = dk.shape[-2]
             left_padding = getattr(c, "left_padding", None)
             if left_padding is not None:
