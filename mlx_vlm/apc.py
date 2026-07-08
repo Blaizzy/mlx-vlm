@@ -221,6 +221,17 @@ def _clone_cache_entry_for_apc(
             return None
         return tuple(copied)
 
+    # Protocol fallback: any cache with dequantize_for_apc (e.g. QuantizedKVCache)
+    # is cloned by dequantizing into a plain KVCache for exact-mode storage.
+    if hasattr(c, "dequantize_for_apc"):
+        dk, dv = c.dequantize_for_apc()
+        out = lm_cache.KVCache()
+        out.keys = _copy_mlx_array(dk)
+        out.values = _copy_mlx_array(dv)
+        out.offset = dk.shape[-2]
+        eval_targets.extend([out.keys, out.values])
+        return out
+
     return None
 
 
@@ -282,6 +293,8 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
         ),
     ):
         return True
+    if hasattr(c, "dequantize_for_apc"):
+        return True
     if isinstance(c, lm_cache.CacheList):
         return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
     if isinstance(c, tuple):
@@ -292,7 +305,11 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
 def _cache_entry_supports_block_apc(c: Any) -> bool:
     from .models import cache as lm_cache
 
-    return isinstance(c, lm_cache.KVCache)
+    if isinstance(c, lm_cache.KVCache):
+        return True
+    if hasattr(c, "dequantize_for_apc"):
+        return True
+    return False
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
@@ -3386,18 +3403,38 @@ class APCManager:
 def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
     min_capacity_tokens: Optional[int] = None,
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Stitch matched blocks into per-layer ``KVCache`` instances pre-filled
+    """Stitch matched blocks into per-layer cache instances pre-filled
     with the cached prefix's K/V state. Used by the single-stream
     ``stream_generate`` path.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    returns ``QuantizedKVCache`` instances that re-quantize the raw float
+    blocks via ``update_and_fetch``.
     """
-    from .models.cache import KVCache
+    from .models.cache import KVCache, QuantizedKVCache
 
     if not matched_blocks:
         return []
     num_layers = len(matched_blocks[0].keys)
     out: List[Any] = []
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
+
+    if kv_quant_config is not None:
+        for layer_idx in range(num_layers):
+            ks = [b.keys[layer_idx] for b in matched_blocks]
+            vs = [b.values[layer_idx] for b in matched_blocks]
+            merged_k = mx.concatenate(ks, axis=2)
+            merged_v = mx.concatenate(vs, axis=2)
+            c = QuantizedKVCache(
+                group_size=kv_quant_config["group_size"],
+                bits=kv_quant_config["bits"],
+            )
+            c.update_and_fetch(merged_k, merged_v)
+            out.append(c)
+        return out
+
     step_probe = KVCache()
     kv_step = int(getattr(step_probe, "step", getattr(KVCache, "step", 256)))
     capacity = prefix_len
@@ -3449,13 +3486,18 @@ def make_warm_kv_cache_from_layers(
 
 def make_warm_batch_kv_cache(
     matched_blocks: List[APCBlock],
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Stitch matched blocks into per-layer single-row ``BatchKVCache``
-    instances pre-filled with the cached prefix's K/V state. Used by the
-    batched continuous-batching path; the resulting cache list can be
+    """Stitch matched blocks into per-layer single-row batch cache instances
+    pre-filled with the cached prefix's K/V state. Used by the batched
+    continuous-batching path; the resulting cache list can be
     ``extend()``-ed into a running batch.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    returns ``BatchQuantizedKVCache`` instances that re-quantize the raw float
+    blocks via ``update_and_fetch``.
     """
-    from .models.cache import BatchKVCache
+    from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     if not matched_blocks:
         return []
@@ -3467,14 +3509,21 @@ def make_warm_batch_kv_cache(
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
         merged_v = mx.concatenate(vs, axis=2)
-        c = BatchKVCache(left_padding=[0])
-        # state setter: (keys, values, offset, left_padding) → also sets _idx
-        c.state = (
-            merged_k,
-            merged_v,
-            mx.array([prefix_len]),
-            mx.array([0]),
-        )
+        if kv_quant_config is not None:
+            c = BatchQuantizedKVCache(
+                [0],
+                group_size=kv_quant_config["group_size"],
+                bits=kv_quant_config["bits"],
+            )
+            c.update_and_fetch(merged_k, merged_v)
+        else:
+            c = BatchKVCache(left_padding=[0])
+            c.state = (
+                merged_k,
+                merged_v,
+                mx.array([prefix_len]),
+                mx.array([0]),
+            )
         out.append(c)
     return out
 
@@ -3708,6 +3757,23 @@ def harvest_blocks_from_batch_cache(
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
     for c in batch_caches:
+        # Protocol dispatch: quantized caches expose dequantize_for_apc()
+        # which returns raw float arrays suitable for direct slicing.
+        if hasattr(c, "dequantize_for_apc"):
+            dk, dv = c.dequantize_for_apc()
+            idx = dk.shape[-2]
+            left_padding = getattr(c, "left_padding", None)
+            if left_padding is not None:
+                try:
+                    lp = int(left_padding[batch_idx].item())
+                except Exception:
+                    lp = 0
+            else:
+                lp = 0
+            layer_keys.append(dk[batch_idx : batch_idx + 1, :, lp:, :])
+            layer_values.append(dv[batch_idx : batch_idx + 1, :, lp:, :])
+            continue
+
         keys = getattr(c, "keys", None)
         values = getattr(c, "values", None)
         idx = getattr(c, "_idx", None)

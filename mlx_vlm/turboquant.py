@@ -5116,6 +5116,10 @@ class TurboQuantKVCache(_BaseCache):
         values = self.value_codec.dequantize(values_state).astype(mx.float32)
         return keys, values
 
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage."""
+        return self.dequantize()
+
     def _apply_attention_mask(
         self,
         scores: mx.array,
@@ -6292,6 +6296,10 @@ class BatchTurboQuantKVCache(_BaseCache):
         k = self.key_codec.dequantize(keys_state).astype(mx.float32)
         v = self.value_codec.dequantize(values_state).astype(mx.float32)
         return k, v
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage."""
+        return self.dequantize()
 
     # ------------------------------------------------------------------
     # State / introspection

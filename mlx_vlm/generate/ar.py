@@ -2130,11 +2130,9 @@ class BatchGenerator:
             top_logprobs_k = 0
             self.compute_logprobs = False
             self.top_logprobs_k = 0
-        # APC: opt-out for KV-quantized caches. Plain KV models use block APC;
+        # APC mode detection: plain KV models use block APC;
         # mixed/custom cache models use exact prompt-cache snapshots.
         self.apc_mode = None
-        if apc_manager is not None and kv_bits is not None:
-            apc_manager = None
         if apc_manager is not None:
             self.apc_mode = _apc.model_apc_mode(model)
             if self.apc_mode is None:

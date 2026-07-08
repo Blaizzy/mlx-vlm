@@ -118,6 +118,28 @@ class _BaseCache:
         return obj
 
 
+def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
+    """Dequantize uniform-quantized K/V tuples to raw float arrays.
+
+    Shared by QuantizedKVCache and BatchQuantizedKVCache for APC storage.
+    """
+    keys = mx.dequantize(
+        keys_tuple[0][..., :length, :],
+        keys_tuple[1][..., :length, :],
+        keys_tuple[2][..., :length, :],
+        group_size=group_size,
+        bits=bits,
+    )
+    values = mx.dequantize(
+        values_tuple[0][..., :length, :],
+        values_tuple[1][..., :length, :],
+        values_tuple[2][..., :length, :],
+        group_size=group_size,
+        bits=bits,
+    )
+    return keys, values
+
+
 class QuantizedKVCache(_BaseCache):
     step = 256
 
@@ -199,6 +221,12 @@ class QuantizedKVCache(_BaseCache):
         n = min(self.offset, n)
         self.offset -= n
         return n
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) sliced to current offset for APC storage."""
+        return _dequantize_uniform(
+            self.keys, self.values, self.offset, self.group_size, self.bits
+        )
 
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
@@ -1624,6 +1652,12 @@ class BatchQuantizedKVCache(_BaseCache):
         return (
             tuple(k[..., : self._idx, :] for k in self.keys),
             tuple(v[..., : self._idx, :] for v in self.values),
+        )
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) sliced to current _idx for APC storage."""
+        return _dequantize_uniform(
+            self.keys, self.values, self._idx, self.group_size, self.bits
         )
 
     def filter(self, batch_indices: mx.array):
