@@ -2588,6 +2588,7 @@ class PromptProcessingBatch:
         right_pad_per_row: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
+        left_padding_override: Optional[List[int]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -2610,6 +2611,20 @@ class PromptProcessingBatch:
             # right-pad and need to be rolled into left-pad by finalize()).
             left_padding = [0] * len(input_ids)
             self._input_ids = _right_pad_prompts(input_ids, max_length=max_length)
+        elif left_padding_override is not None:
+            # The caller supplied AUTHORITATIVE per-row left-padding. This is for callers that pre-pad the
+            # prompts to a uniform length BEFORE insert (e.g. batch_generate's text-only path, which
+            # tokenizes with padding=True) — there the rows are already equal length, so the length-derived
+            # value below would be all-zero and silently lose the real padding. The rows are already
+            # max_length so _left_pad_prompts is a no-op. Honored only OUTSIDE the APC right-pad branch, so
+            # existing behavior is unchanged for every caller that does not pass it.
+            if len(left_padding_override) != len(input_ids):
+                raise ValueError(
+                    f"left_padding_override has {len(left_padding_override)} entries "
+                    f"but there are {len(input_ids)} rows"
+                )
+            left_padding = list(left_padding_override)
+            self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
         else:
             left_padding = [max_length - l for l in lengths]
             self._input_ids = _left_pad_prompts(input_ids, max_length=max_length)
@@ -3078,6 +3093,11 @@ class BatchGenerator:
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
+        # Optional authoritative per-row left-padding, keyed by uid so it is immune to the length-sort
+        # (and any reorder) of _unprocessed_sequences and requires no change to that queue tuple. Set in
+        # insert(), popped when a row is drained into a prompt batch or removed. Empty for all existing
+        # callers -> behavior unchanged.
+        self._pending_left_padding: dict = {}
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -3410,6 +3430,7 @@ class BatchGenerator:
         logits_processors: Optional[
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
+        left_padding: Optional[List[int]] = None,
     ):
         uids = []
 
@@ -3422,9 +3443,21 @@ class BatchGenerator:
             logits_processors = [self.logits_processors] * len(prompts)
         elif len(logits_processors) != len(prompts):
             raise ValueError("Insufficient number of logits_processors provided")
+        # Optional per-row left-padding. Authoritative when the caller has pre-padded the prompts to a
+        # uniform length (so the length-derived value in PromptProcessingBatch would be all-zero and lose
+        # the real padding). Each row's value rides WITH its row inside the tuple through the length-sort
+        # below, so it can never desync from its sequence. Default None -> unchanged length-derivation.
+        if left_padding is None:
+            left_padding = [None] * len(prompts)
+        elif len(left_padding) != len(prompts):
+            raise ValueError("Insufficient number of left_padding entries provided")
 
-        for p, m, kw, lp in zip(prompts, max_tokens, prompt_kwargs, logits_processors):
+        for p, m, kw, lp, lpad in zip(
+            prompts, max_tokens, prompt_kwargs, logits_processors, left_padding
+        ):
             self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp))
+            if lpad is not None:
+                self._pending_left_padding[self.uid_count] = lpad
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -3440,6 +3473,7 @@ class BatchGenerator:
             for i, (seq_uid, _, _, _, _) in enumerate(self._unprocessed_sequences):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
+                    self._pending_left_padding.pop(uid, None)
                     return True
 
             # Being prefilled
@@ -3538,6 +3572,11 @@ class BatchGenerator:
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
             sequences = self._unprocessed_sequences[:n]
+            # Pop any authoritative per-row left-padding for the drained uids (covers BOTH the APC and the
+            # cold paths, so nothing lingers in _pending_left_padding). Only the cold path consumes it.
+            drained_left_padding = {
+                s[0]: self._pending_left_padding.pop(s[0], None) for s in sequences
+            }
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
@@ -3574,6 +3613,14 @@ class BatchGenerator:
             max_tokens_list = [s[2] for s in sequences]
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
+            # Per-row left-padding override (popped by uid above). Only forward it when at least one row
+            # supplied one; otherwise pass None so the length-derived behavior is unchanged.
+            left_padding_list = [drained_left_padding.get(s[0]) for s in sequences]
+            left_padding_override = (
+                left_padding_list
+                if any(v is not None for v in left_padding_list)
+                else None
+            )
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
@@ -3597,6 +3644,7 @@ class BatchGenerator:
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
                 apc_mode=self.apc_mode,
+                left_padding_override=left_padding_override,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 
@@ -3898,11 +3946,29 @@ def _generate_batch(
             for _ in range(batch_size)
         ]
 
+    # Derive per-row left-padding from the tokenizer's attention_mask so the batched cache is pad-aware.
+    # The text-only path pre-pads the prompts to a uniform length (padding_side="left"); the rows are then
+    # equal length, so PromptProcessingBatch's length-derived left_padding is all-zero and the real padding
+    # is lost — the model attends over the pad tokens and the more-padded rows decode incorrectly. When
+    # there is no image and a 2D mask is present, the per-row leading-zero count IS the true left_padding
+    # (left padding => contiguous leading zeros). Model-agnostic: this only makes the correct padding
+    # available; each model's forward decides how to use it. Multimodal paths handle their own padding, so
+    # pass None there (behavior unchanged).
+    left_padding = None
+    if (
+        pixel_values is None
+        and mask is not None
+        and isinstance(mask, mx.array)
+        and mask.ndim == 2
+    ):
+        left_padding = (mask.shape[1] - mask.sum(axis=1)).astype(mx.int32).tolist()
+
     uids = gen.insert(
         input_ids.tolist(),
         max_tokens,
         prompt_kwargs=_split_prompt_kwargs_per_row(gen_kwargs, batch_size),
         logits_processors=logits_processors,
+        left_padding=left_padding,
     )
     results = {uid: [] for uid in uids}
 
