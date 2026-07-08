@@ -12,6 +12,31 @@ from ..cache import KVCache
 from .config import ModelConfig, TextConfig
 
 
+# --- Pad-aware helpers for left-padded batched text-only decode ---
+# When a batch of different-length text-only prompts is left-padded to a common length, the model must be
+# told which leading columns are padding — otherwise rope positions and causal attention treat the pad
+# tokens as real content and the more-padded rows decode incorrectly (or empty). These helpers, plus the
+# `_was_padded`-gated branches below, add that awareness while staying byte-identical to the stock forward
+# whenever there is no real padding (single / equal-length batches, where left_padding is all-zero).
+def _has_actual_padding(left_padding) -> bool:
+    """True iff any row carries REAL left-padding (>0). BatchGenerator sets left_padding=[0] even for a
+    single or equal-length batch, so `left_padding is not None` alone would fire the pad-aware path at
+    width-1 and perturb the sub-argmax numerics vs the unpadded stock forward. Type-guarded so a non-array
+    can never raise inside the hot forward; call at PREFILL only (where left_padding is authoritative)."""
+    return (
+        left_padding is not None
+        and hasattr(left_padding, "shape")
+        and bool((left_padding > 0).any().item())
+    )
+
+
+def _mask2d_from_left_padding(left_padding, length):
+    """2D [B, length] int key-padding mask: 0 at left-pad columns, 1 at real tokens — the layout
+    get_rope_index's mask-aware cumsum branch consumes."""
+    col = mx.arange(length)[None, :]
+    return (col >= left_padding[:, None]).astype(mx.int32)
+
+
 class Qwen2RotaryEmbedding:
     def __init__(
         self, dim, max_position_embeddings=2048, base=10000, rope_scaling=None
@@ -161,7 +186,12 @@ class Attention(nn.Module):
 
         cos, sin = self.rotary_emb(values, position_ids)
 
-        if mask is not None and isinstance(mask, mx.array):
+        # On a genuinely left-padded batch the mask slice must happen AFTER cache.update_and_fetch (full
+        # key length), else a [B,1,1,idx+1] decode mask truncates to width-1. Off the padded path
+        # (_vlm_was_padded False) keep the stock ordering (slice before update) so single / equal-length /
+        # image decode is byte-identical to the stock forward.
+        _was_padded = getattr(cache, "_vlm_was_padded", False)
+        if mask is not None and isinstance(mask, mx.array) and not _was_padded:
             mask = mask[..., : keys.shape[-2]]
         queries, keys = apply_multimodal_rotary_pos_emb(
             queries, keys, cos, sin, unqueeze_dim=1
@@ -169,6 +199,9 @@ class Attention(nn.Module):
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+
+        if mask is not None and isinstance(mask, mx.array) and _was_padded:
+            mask = mask[..., : keys.shape[-2]]
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache, scale=self.scale, mask=mask
@@ -243,6 +276,19 @@ class Qwen2Model(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        # On a left-padded batch, build the mask from the cache's pad-aware make_mask instead of the
+        # pad-blind create_attention_mask (which receives `cache` as a LIST and produces a plain causal
+        # mask, blind to the left-padding). Off the padded path this is skipped -> stock
+        # create_attention_mask -> byte-identical.
+        if (
+            mask is None
+            and cache
+            and cache[0] is not None
+            and getattr(cache[0], "_vlm_was_padded", False)
+            and hasattr(cache[0], "make_mask")
+        ):
+            mask = cache[0].make_mask(int(h.shape[1]))
 
         if mask is None:
             mask = create_attention_mask(h, cache)
@@ -460,6 +506,33 @@ class LanguageModel(nn.Module):
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
+
+        # Left-padded batched text-only decode: gate on the sticky `_vlm_was_padded` flag. At PREFILL,
+        # decide + persist the flag ONCE (where left_padding is authoritative) and supply a 2D key-padding
+        # mask so get_rope_index takes the mask-aware cumsum branch; at DECODE, set per-row position_ids
+        # from max(offset, 0) so left-padded rows are positioned correctly. Off the padded path
+        # (single / equal-length / image) this is entirely skipped -> byte-identical to the stock forward.
+        if mask is None and cache and cache[0] is not None and inputs is not None:
+            _c0 = cache[0]
+            _lp = getattr(_c0, "left_padding", None)
+            _idx = getattr(_c0, "_idx", None)
+            if _lp is not None:
+                _L = int(inputs.shape[1])
+                if _L > 1 and _idx in (0, None):  # batched PREFILL: decide + stamp the flag
+                    _was_padded = getattr(_c0, "_vlm_was_padded", False) or _has_actual_padding(_lp)
+                    for _c in cache:  # stamp EVERY cache entry (the Attention gate reads it per-layer)
+                        if _c is not None:
+                            _c._vlm_was_padded = _was_padded
+                    if _was_padded:
+                        self._position_ids = None
+                        self._rope_deltas = None
+                        mask = _mask2d_from_left_padding(_lp, _L)
+                elif _L == 1 and _idx not in (0, None):  # batched DECODE: per-row position
+                    if getattr(_c0, "_vlm_was_padded", False):
+                        _off = getattr(_c0, "offset", None)
+                        if _off is not None and getattr(_off, "ndim", 0) > 0:
+                            _pos = mx.maximum(_off, 0).reshape(1, -1, 1)
+                            position_ids = mx.broadcast_to(_pos, (3, _pos.shape[1], 1))
 
         # Use ``_idx`` — the Python-int token counter maintained by
         # ``BatchKVCache`` — instead of syncing on ``cache[0].offset`` every
