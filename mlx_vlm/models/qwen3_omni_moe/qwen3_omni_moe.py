@@ -3,12 +3,12 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx_lm.models import cache as kv_cache
-from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
+from mlx_vlm.models import cache as kv_cache
 from mlx_vlm.models.qwen3_omni_moe.code2wav import Code2WavModel
 from mlx_vlm.models.qwen3_omni_moe.talker import Talker
 from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
+from mlx_vlm.sample_utils import make_logits_processors, make_sampler
 
 from . import processing_qwen3_omni_moe  # noqa: F401
 from .config import ModelConfig
