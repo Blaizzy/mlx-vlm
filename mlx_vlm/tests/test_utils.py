@@ -495,10 +495,17 @@ def test_load_passes_revision():
 
 
 def test_get_model_and_args_routes_text_only_configs():
-    model_class, model_type = get_model_and_args({"model_type": "llama"})
+    model_class, model_type = get_model_and_args({"model_type": "unvendored_text_arch"})
 
     assert model_class.__name__ == "mlx_vlm.models.text_only"
     assert model_type == "text_only"
+
+
+def test_get_model_and_args_remaps_mistral_to_llama():
+    model_class, model_type = get_model_and_args({"model_type": "mistral"})
+
+    assert model_class.__name__ == "mlx_vlm.models.llama"
+    assert model_type == "llama"
 
 
 def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
@@ -523,7 +530,10 @@ def test_load_model_routes_text_models_through_existing_loader():
             return self.model(inputs)
 
     with (
-        patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={"model_type": "unvendored_text_arch"},
+        ),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
         patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),
