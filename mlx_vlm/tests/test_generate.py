@@ -643,7 +643,12 @@ class TestBatchGenerate:
         embedding_output = _EmbeddingOutput(inputs_embeds, position_ids)
 
         def fake_insert(
-            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+            self,
+            prompts,
+            max_tokens,
+            prompt_kwargs=None,
+            logits_processors=None,
+            left_padding=None,
         ):
             assert len(prompts) == batch_size
             assert len(prompt_kwargs) == batch_size
@@ -1325,6 +1330,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     bg = object.__new__(BatchGenerator)
     bg._generation_batch = EmptyGenerationBatch()
     bg._prompt_batch = None
+    bg._pending_left_padding = {}
     bg._prompt_tokens_counter = 0
     bg._prompt_time_counter = 0
     bg._gen_tokens_counter = 0
