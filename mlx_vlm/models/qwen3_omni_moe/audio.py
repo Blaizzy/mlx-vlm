@@ -307,10 +307,24 @@ class AudioModel(nn.Module):
         return hidden_states
 
     def sanitize(self, weights):
+        conv2d_shapes = {
+            "conv2d1.weight": tuple(self.conv2d1.weight.shape),
+            "conv2d2.weight": tuple(self.conv2d2.weight.shape),
+            "conv2d3.weight": tuple(self.conv2d3.weight.shape),
+        }
         sanitized_weights = {}
         for k, v in weights.items():
-            if "audio_tower.conv2d" in k and "weight" in k:
-                sanitized_weights[k] = v.transpose(0, 2, 3, 1)
+            local_key = k
+            for prefix in ("thinker.audio_tower.", "audio_tower."):
+                if local_key.startswith(prefix):
+                    local_key = local_key[len(prefix) :]
+                    break
+
+            if local_key in conv2d_shapes:
+                if tuple(v.shape) == conv2d_shapes[local_key]:
+                    sanitized_weights[k] = v
+                else:
+                    sanitized_weights[k] = v.transpose(0, 2, 3, 1)
             else:
                 sanitized_weights[k] = v
 
