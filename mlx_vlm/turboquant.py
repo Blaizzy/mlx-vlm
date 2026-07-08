@@ -5117,7 +5117,12 @@ class TurboQuantKVCache(_BaseCache):
         return keys, values
 
     def dequantize_for_apc(self):
-        """Return raw float (keys, values) for APC storage."""
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self.offset == 0:
+            return None, None
         return self.dequantize()
 
     def _apply_attention_mask(
@@ -6298,7 +6303,12 @@ class BatchTurboQuantKVCache(_BaseCache):
         return k, v
 
     def dequantize_for_apc(self):
-        """Return raw float (keys, values) for APC storage."""
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self._idx == 0:
+            return None, None
         return self.dequantize()
 
     # ------------------------------------------------------------------

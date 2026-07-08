@@ -573,6 +573,20 @@ class TestEmptyCacheGuard:
         assert dk is None
         assert dv is None
 
+    def test_turboquant_dequantize_for_apc_returns_none_when_empty(self):
+        """TurboQuantKVCache.dequantize_for_apc() returns (None, None) when empty."""
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+        cache = TurboQuantKVCache(bits=4)
+        dk, dv = cache.dequantize_for_apc()
+        assert dk is None
+        assert dv is None
+
+        batch_cache = BatchTurboQuantKVCache([0], bits=4)
+        dk, dv = batch_cache.dequantize_for_apc()
+        assert dk is None
+        assert dv is None
+
     def test_harvest_handles_empty_quantized_cache(self):
         """harvest_blocks_from_batch_cache returns [] for empty quantized caches."""
         manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
