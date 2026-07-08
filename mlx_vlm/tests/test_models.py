@@ -841,6 +841,66 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 4, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_gemma3_text_language_model(self):
+        from mlx_vlm.models import gemma3_text
+
+        config = gemma3_text.ModelConfig.from_dict(
+            {
+                "model_type": "gemma3_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 6,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 128,
+                "num_key_value_heads": 2,
+                "rope_global_base_freq": 1000000.0,
+                "rope_local_base_freq": 10000.0,
+                "query_pre_attn_scalar": 16,
+                "sliding_window": 8,
+                "sliding_window_pattern": 3,
+                "max_position_embeddings": 256,
+            }
+        )
+
+        model = gemma3_text.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        cache = model.language_model.make_cache()
+        self.assertEqual(len(cache), config.num_hidden_layers)
+        self.assertEqual(type(cache[0]).__name__, "RotatingKVCache")
+        self.assertEqual(type(cache[2]).__name__, "KVCache")
+        self.assertEqual(type(cache[5]).__name__, "KVCache")
+
+        inputs = mx.array([[1, 2, 3]])
+        embeddings = model.get_input_embeddings(inputs)
+        self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, config.hidden_size))
+
+        sanitized = model.sanitize(
+            {"model.embed_tokens.weight": mx.zeros((config.vocab_size, 64))}
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+
+        resanitized = model.sanitize(dict(sanitized))
+        self.assertEqual(set(resanitized), set(sanitized))
+
+        logits = model(mx.array([[1, 2, 3, 4] * 4]), cache=cache).logits
+        self.assertEqual(logits.shape, (1, 16, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        nxt = mx.argmax(logits[:, -1:, :], axis=-1)
+        logits = model(nxt, cache=cache).logits
+        self.assertEqual(logits.shape, (1, 1, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
     def test_llama_language_model(self):
         from mlx_vlm.models import llama
 
