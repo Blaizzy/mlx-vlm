@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 
 class TestModels(unittest.TestCase):
@@ -7849,6 +7849,102 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "qwen3_omni_moe")
+
+    def test_qwen3_omni_audio_sanitize_is_idempotent_for_conv2d_weights(self):
+        from mlx_vlm.models import qwen3_omni_moe
+
+        model = qwen3_omni_moe.AudioModel(
+            qwen3_omni_moe.AudioConfig(
+                d_model=16,
+                encoder_layers=1,
+                encoder_attention_heads=2,
+                encoder_ffn_dim=32,
+                num_hidden_layers=1,
+                downsample_hidden_size=4,
+                output_dim=16,
+            )
+        )
+
+        for local_key in ("conv2d1.weight", "conv2d2.weight", "conv2d3.weight"):
+            module_name = local_key.split(".", 1)[0]
+            target_shape = tuple(getattr(model, module_name).weight.shape)
+            source_shape = (
+                target_shape[0],
+                target_shape[3],
+                target_shape[1],
+                target_shape[2],
+            )
+            key = f"thinker.audio_tower.{local_key}"
+
+            sanitized = model.sanitize({key: mx.zeros(source_shape)})
+            self.assertEqual(sanitized[key].shape, target_shape)
+
+            resanitized = model.sanitize(dict(sanitized))
+            self.assertEqual(resanitized[key].shape, target_shape)
+
+            already_mlx = model.sanitize({key: mx.zeros(target_shape)})
+            self.assertEqual(already_mlx[key].shape, target_shape)
+
+    def test_qwen3_omni_code2wav_sanitize_is_idempotent_for_conv_weights(self):
+        from mlx_vlm.models.qwen3_omni_moe.code2wav import Code2WavModel
+        from mlx_vlm.models.qwen3_omni_moe.config import Code2WavConfig
+
+        model = Code2WavModel(
+            Code2WavConfig(
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+                decoder_dim=8,
+                codebook_size=16,
+                num_quantizers=2,
+                upsample_rates=[2],
+                upsampling_ratios=[2],
+            )
+        )
+
+        checked = 0
+        for local_key, value in tree_flatten(model.parameters()):
+            if not local_key.endswith("conv.weight"):
+                continue
+
+            target_shape = tuple(value.shape)
+            if (
+                "upsample" in local_key
+                and "dwconv" not in local_key
+                or "decoder" in local_key
+                and "block" in local_key
+                and "conv1" not in local_key
+                and "conv2" not in local_key
+            ):
+                source_shape = (target_shape[2], target_shape[0], target_shape[1])
+            elif (
+                "dwconv.conv.weight" in local_key
+                or "decoder" in local_key
+                and "block" not in local_key
+                or "decoder" in local_key
+                and "block" in local_key
+                and (
+                    "conv1.conv.weight" in local_key or "conv2.conv.weight" in local_key
+                )
+            ):
+                source_shape = (target_shape[0], target_shape[2], target_shape[1])
+            else:
+                continue
+
+            key = f"code2wav.{local_key}"
+            sanitized = model.sanitize({key: mx.zeros(source_shape)})
+            self.assertEqual(sanitized[key].shape, target_shape)
+
+            resanitized = model.sanitize(dict(sanitized))
+            self.assertEqual(resanitized[key].shape, target_shape)
+
+            already_mlx = model.sanitize({key: mx.zeros(target_shape)})
+            self.assertEqual(already_mlx[key].shape, target_shape)
+            checked += 1
+
+        self.assertGreater(checked, 0)
 
     def test_internvl_chat_input_embeddings(self):
         from mlx_vlm.models import internvl_chat
