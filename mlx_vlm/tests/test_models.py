@@ -5624,6 +5624,7 @@ class TestModels(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_llada2_moe_language_model(self):
+        # Config source: mlx_vlm/models/llada2_moe/config.py
         from mlx_vlm.models import llada2_moe
 
         config = llada2_moe.ModelConfig(
@@ -5659,6 +5660,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def test_nemotron_labs_diffusion_language_model(self):
+        # Config source: mlx_vlm/models/nemotron_labs_diffusion/config.py
         from mlx_vlm.models import nemotron_labs_diffusion
 
         config = nemotron_labs_diffusion.ModelConfig(
@@ -5691,6 +5693,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def test_step3p7_language_model(self):
+        # Config source: mlx_vlm/models/step3p7/config.py
         from mlx_vlm.models import step3p7
 
         text_config = step3p7.TextConfig(
@@ -5736,6 +5739,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def test_deepseekocr_2_language_model(self):
+        # Config source: mlx_vlm/models/deepseekocr_2/config.py
         from mlx_vlm.models import deepseekocr_2
 
         text_config = deepseekocr_2.TextConfig(
@@ -5805,6 +5809,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def test_minimax_m3_vl_language_model(self):
+        # Config source: mlx_vlm/models/minimax_m3_vl/config.py
         from mlx_vlm.models import minimax_m3_vl
 
         text_config = minimax_m3_vl.TextConfig(
@@ -5859,6 +5864,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
     def test_rfdetr_forward(self):
+        # Config source: mlx_vlm/models/rfdetr/config.py
         from mlx_vlm.models import rfdetr
 
         config = rfdetr.ModelConfig(
@@ -5892,6 +5898,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(out["pred_boxes"])).item())
 
     def test_sam3_1_config_and_model(self):
+        # Config source: mlx_vlm/models/sam3_1/config.py
         from mlx_vlm.models.sam3_1 import Model, ModelConfig
 
         config = ModelConfig(model_type="sam3.1_video")
@@ -5908,6 +5915,7 @@ class TestModels(unittest.TestCase):
         self.assertIsNotNone(config.vision_config)
 
     def test_sam3d_body_model(self):
+        # Config source: mlx_vlm/models/sam3d_body/config.py
         from mlx_vlm.models.sam3d_body import Model
         from mlx_vlm.models.sam3d_body.config import SAM3DConfig
 
