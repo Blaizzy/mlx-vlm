@@ -7133,6 +7133,64 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "paddleocr_vl")
 
+    def test_paddleocr_vl_sanitize_idempotent(self):
+        from mlx_vlm.models import paddleocr_vl
+
+        model = paddleocr_vl.Model(
+            paddleocr_vl.ModelConfig(
+                text_config=paddleocr_vl.TextConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    head_dim=8,
+                ),
+                vision_config=paddleocr_vl.VisionConfig(
+                    model_type="paddleocr_vl",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                ),
+                model_type="paddleocr_vl",
+            )
+        )
+
+        hf_weights = {
+            "model.embed_tokens.weight": mx.zeros((32, 16)),
+            "model.layers.0.input_layernorm.weight": mx.zeros((16,)),
+            "lm_head.weight": mx.zeros((32, 16)),
+            "mlp_AR.0.weight": mx.zeros((16, 16)),
+            "visual.vision_model.encoder.layers.0.self_attn.q_proj.weight": mx.zeros(
+                (16, 16)
+            ),
+            "visual.vision_model.encoder.layers.0.self_attn.k_proj.weight": mx.zeros(
+                (16, 16)
+            ),
+            "visual.vision_model.encoder.layers.0.self_attn.v_proj.weight": mx.zeros(
+                (16, 16)
+            ),
+        }
+
+        sanitized = model.sanitize(dict(hf_weights))
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.model.layers.0.input_layernorm.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("visual.projector.0.weight", sanitized)
+        self.assertIn("visual.layers.0.self_attn.qkv.weight", sanitized)
+        self.assertNotIn("visual.layers.0.self_attn.k_proj.weight", sanitized)
+        self.assertEqual(
+            sanitized["visual.layers.0.self_attn.qkv.weight"].shape, (48, 16)
+        )
+
+        self.assertIs(model.sanitize(sanitized), sanitized)
+
+        for key in sanitized:
+            self.assertNotIn("language_language_model", key)
+
     def test_paddleocr_vl_text_only_clears_mrope_state(self):
         from mlx_vlm.models import paddleocr_vl
 
