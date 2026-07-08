@@ -5619,6 +5619,340 @@ class TestModels(unittest.TestCase):
         mx.eval(query, expected_query)
         self.assertTrue(mx.allclose(query, expected_query, rtol=1e-5).item())
 
+    # ------------------------------------------------------------------
+    # Structural tests for models with zero prior test coverage
+    # ------------------------------------------------------------------
+
+    def test_llada2_moe_language_model(self):
+        from mlx_vlm.models import llada2_moe
+
+        config = llada2_moe.ModelConfig(
+            model_type="llada2_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            num_experts=4,
+            num_shared_experts=1,
+            num_experts_per_tok=2,
+            n_group=2,
+            topk_group=1,
+            moe_intermediate_size=32,
+            first_k_dense_replace=1,
+            tie_word_embeddings=False,
+        )
+
+        model = llada2_moe.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_nemotron_labs_diffusion_language_model(self):
+        from mlx_vlm.models import nemotron_labs_diffusion
+
+        config = nemotron_labs_diffusion.ModelConfig(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            mask_token_id=100,
+            dlm_paradigm="autoregressive",
+        )
+
+        model = nemotron_labs_diffusion.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.model_type,
+            config.vocab_size,
+            config.num_hidden_layers,
+        )
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_step3p7_language_model(self):
+        from mlx_vlm.models import step3p7
+
+        text_config = step3p7.TextConfig(
+            model_type="step3p5",
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            num_hidden_layers=2,
+            vocab_size=128,
+            rms_norm_eps=1e-5,
+            moe_intermediate_size=32,
+            moe_num_experts=4,
+            moe_top_k=2,
+            head_dim=16,
+            share_expert_dim=32,
+            moe_layers_enum=[1],
+            tie_word_embeddings=False,
+        )
+
+        vision_config = step3p7.VisionConfig(
+            model_type="perception_encoder",
+            width=64,
+            layers=2,
+            heads=4,
+            patch_size=14,
+            image_size=56,
+        )
+
+        config = step3p7.ModelConfig(
+            model_type="step3p7",
+            text_config=text_config,
+            vision_config=vision_config,
+            vocab_size=128,
+        )
+
+        model = step3p7.Model(config)
+
+        # step3p7 LanguageModel does not expose model_type, so we skip
+        # language_test_runner and test the forward pass directly.
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_deepseekocr_2_language_model(self):
+        from mlx_vlm.models import deepseekocr_2
+
+        text_config = deepseekocr_2.TextConfig(
+            model_type="deepseek_v2",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-6,
+            first_k_dense_replace=0,
+        )
+
+        vision_config = deepseekocr_2.VisionConfig(
+            model_type="vision",
+            layers=2,
+            width=64,
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            image_size=56,
+            patch_size=14,
+            params={
+                "qwen2": {
+                    "dim": 64,
+                    "layers": 2,
+                    "heads": 4,
+                    "kv_heads": 2,
+                    "intermediate_size": 128,
+                    "rms_norm_eps": 1e-6,
+                },
+                "sam": {},
+            },
+        )
+
+        projector_config = deepseekocr_2.ProjectorConfig(
+            input_dim=64,
+            n_embed=64,
+            depth=2,
+            mlp_ratio=1,
+        )
+
+        config = deepseekocr_2.ModelConfig(
+            model_type="deepseekocr_2",
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_config=projector_config,
+            vocab_size=128,
+        )
+
+        model = deepseekocr_2.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            text_config.model_type,
+            text_config.vocab_size,
+            text_config.num_hidden_layers,
+        )
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_minimax_m3_vl_language_model(self):
+        from mlx_vlm.models import minimax_m3_vl
+
+        text_config = minimax_m3_vl.TextConfig(
+            model_type="minimax_m3",
+            hidden_size=64,
+            intermediate_size=32,
+            dense_intermediate_size=128,
+            shared_intermediate_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            tie_word_embeddings=False,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            moe_layer_freq=[0, 1],
+            layer_types=["minimax_m3_dense", "minimax_m3_sparse"],
+        )
+
+        vision_config = minimax_m3_vl.VisionConfig(
+            model_type="clip_vision_model",
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            image_size=56,
+            patch_size=14,
+        )
+
+        config = minimax_m3_vl.ModelConfig(
+            model_type="minimax_m3_vl",
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_hidden_size=64,
+            vocab_size=128,
+        )
+
+        model = minimax_m3_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            text_config.model_type,
+            text_config.vocab_size,
+            text_config.num_hidden_layers,
+        )
+
+        logits = model(mx.array([[1, 2, 3, 4]])).logits
+        self.assertEqual(logits.shape, (1, 4, text_config.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_rfdetr_forward(self):
+        from mlx_vlm.models import rfdetr
+
+        config = rfdetr.ModelConfig(
+            model_type="rf-detr",
+            resolution=56,
+            hidden_dim=256,
+            num_classes=10,
+            num_queries=4,
+            dec_layers=1,
+            sa_nheads=4,
+            ca_nheads=4,
+            dec_n_points=2,
+            group_detr=1,
+            patch_size=14,
+            num_windows=1,
+            out_feature_indexes=[2, 5, 8, 11],
+            projector_scale=["P4"],
+        )
+
+        model = rfdetr.Model(config)
+        model.eval()
+
+        pixel = mx.random.normal((1, 56, 56, 3))
+        out = model(pixel)
+        mx.eval(out["pred_logits"], out["pred_boxes"])
+
+        # num_classes + 1 for background
+        self.assertEqual(out["pred_logits"].shape, (1, 4, 11))
+        self.assertEqual(out["pred_boxes"].shape, (1, 4, 4))
+        self.assertTrue(mx.all(mx.isfinite(out["pred_logits"])).item())
+        self.assertTrue(mx.all(mx.isfinite(out["pred_boxes"])).item())
+
+    def test_sam3_1_config_and_model(self):
+        from mlx_vlm.models.sam3_1 import Model, ModelConfig
+
+        config = ModelConfig(model_type="sam3.1_video")
+        model = Model(config)
+
+        # Verify structure
+        self.assertEqual(config.model_type, "sam3.1_video")
+        self.assertIsNotNone(model.detector_model)
+        self.assertIsNotNone(model.tracker_model)
+        # Verify sub-configs were populated
+        self.assertIsNotNone(config.detector_config)
+        self.assertIsNotNone(config.tracker_config)
+        self.assertIsNotNone(config.text_config)
+        self.assertIsNotNone(config.vision_config)
+
+    def test_sam3d_body_model(self):
+        from mlx_vlm.models.sam3d_body import Model
+        from mlx_vlm.models.sam3d_body.config import SAM3DConfig
+
+        config = SAM3DConfig(
+            embed_dim=64,
+            depth=2,
+            num_heads=4,
+            head_dim=16,
+            patch_size=16,
+            image_size=(64, 48),
+            ffn_ratio=2.0,
+            num_storage_tokens=2,
+            decoder_dim=32,
+            decoder_depth=2,
+            decoder_heads=4,
+            decoder_head_dim=8,
+            decoder_mlp_dim=64,
+            num_joints=127,
+            num_vertices=18439,
+            num_faces=36874,
+            num_shape_comps=45,
+            num_face_comps=72,
+            pose_output_dim=519,
+            camera_output_dim=3,
+            num_point_embeddings=70,
+            prompt_embed_dim=64,
+        )
+
+        model = Model(config)
+        model.eval()
+
+        # Verify model construction and backbone forward pass
+        self.assertEqual(config.model_type, "sam3d_body")
+        self.assertIsNotNone(model.backbone)
+        self.assertIsNotNone(model.decoder)
+        self.assertIsNotNone(model.head_pose)
+        self.assertIsNotNone(model.head_camera)
+
+        image = mx.random.normal((1, 64, 48, 3))
+        features = model.backbone(image)
+        mx.eval(features)
+        # patch grid: 64/16=4 height, 48/16=3 width
+        self.assertEqual(features.shape, (1, 4, 3, config.embed_dim))
+        self.assertTrue(mx.all(mx.isfinite(features)).item())
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
