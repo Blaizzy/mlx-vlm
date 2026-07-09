@@ -365,7 +365,22 @@ class Model(nn.Module):
         Main conversions:
         1. Conv2d: PyTorch [out, in, H, W] -> MLX [out, H, W, in]
         2. ConvTranspose2d: PyTorch [in, out, H, W] -> MLX [out, H, W, in]
+
+        Conv transposes are skipped for checkpoints already in MLX layout
+        (e.g. pre-converted ``mlx-community/sam3-*``), so sanitize is idempotent
+        and does not double-transpose (see #1545).
         """
+        # Detect layout once via the image patch-embed conv, whose in_channels
+        # is unambiguously 3 (RGB): MLX layout ends in 3, PyTorch layout has it
+        # at axis 1. If already MLX, the whole checkpoint is pre-converted.
+        already_mlx = any(
+            k.endswith("patch_embeddings.projection.weight")
+            and v.ndim == 4
+            and v.shape[-1] == 3
+            and v.shape[1] != 3
+            for k, v in weights.items()
+        )
+
         sanitized = {}
 
         # Patterns for ConvTranspose2d weights (need transpose(1,2,3,0))
@@ -405,6 +420,11 @@ class Model(nn.Module):
             if value.ndim == 4:
                 # Skip non-conv 4D parameters
                 if any(p in key for p in skip_transpose_patterns):
+                    sanitized[key] = value
+                    continue
+
+                # Pre-converted MLX checkpoint: already in MLX layout.
+                if already_mlx:
                     sanitized[key] = value
                     continue
 
