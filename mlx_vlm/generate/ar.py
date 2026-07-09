@@ -1104,6 +1104,14 @@ class GenerationBatch:
         if self_has_processors or other_has_processors:
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
+            if len(self.logits_processors) < len(self.uids):
+                self.logits_processors.extend(
+                    [None] * (len(self.uids) - len(self.logits_processors))
+                )
+            if len(other.logits_processors) < len(other.uids):
+                other.logits_processors.extend(
+                    [None] * (len(other.uids) - len(other.logits_processors))
+                )
         else:
             self.token_context = []
             other.token_context = []

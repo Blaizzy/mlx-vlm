@@ -857,6 +857,49 @@ class TestBatchGenerator:
         finished_structured.filter([1])
         assert finished_structured.uids == [1]
 
+    def test_generation_batch_extend_restores_plain_processor_slots(self):
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+        second_plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+        processor = lambda tokens, logits: logits
+        structured = GenerationBatch(
+            model=MagicMock(),
+            uids=[2],
+            inputs=mx.array([7], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[[processor]],
+        )
+
+        plain.extend(second_plain)
+        assert plain.logits_processors == []
+
+        plain.extend(structured)
+
+        assert plain.uids == [0, 1, 2]
+        assert plain.logits_processors == [None, None, [processor]]
+        assert plain.token_context == [[], [], [30]]
+
     def test_generation_batch_extend_promotes_singleton_kv_cache(self):
         def make_kv_cache(value):
             c = KVCache()
