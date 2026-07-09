@@ -60,12 +60,13 @@ class Model(Qwen3_5Model):
 
         sanitized_weights = {}
         for key, value in weights.items():
+            original_key = key
             key = sanitize_key(key)
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
             if any(key.endswith(sfx) for sfx in norm_keys):
-                if value.ndim == 1:
+                if value.ndim == 1 and not original_key.startswith("language_model."):
                     value += 1.0
 
             sanitized_weights[key] = value
