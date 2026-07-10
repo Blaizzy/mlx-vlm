@@ -1,16 +1,7 @@
-"""TDD tests for APC adapter boundary + batch/SWA kv-bits coverage (#1559).
+"""Tests for APC adapters over batch / quantized / SWA cache layouts.
 
-Follow-up to #1534. These tests define the contract before / alongside
-implementation:
-
-1. Clear batch cache APIs (``batch_size``, ``is_single_row``, ``empty``)
-2. ``BatchQuantizedKVCache.extract`` (multi-row exact path)
-3. Always row-normalize via ``snapshot_prompt_cache_row`` (no B=1 special case)
-4. Gemma-like hybrid: BatchRotating + BatchQuantized + BatchKV
-5. Reject observability (stats + reason codes)
-6. Post-decode / block harvest handles quantized ``keys`` tuples
-
-No mocking of cache behavior — same production types as server/BatchGenerator.
+Covers row snapshot, extract, hybrid exact store/lookup, reject stats, and
+dequant-aware block harvest. Uses real cache types with small dimensions.
 """
 
 from __future__ import annotations
@@ -79,13 +70,8 @@ def _fill_batch_rotating(left_padding, seq_len, max_size=SWA_MAX):
     return cache, k, v
 
 
-# ---------------------------------------------------------------------------
-# A — Cache API clarity (Lucas nit)
-# ---------------------------------------------------------------------------
-
-
 class TestBatchCacheIntrospection:
-    """batch_size / is_single_row / empty — no poking at _idx or keys.shape[0]."""
+    """batch_size, is_single_row, and empty on batch cache types."""
 
     def test_batch_kv_empty_and_single_row(self):
         empty = BatchKVCache([0])
@@ -124,8 +110,7 @@ class TestBatchCacheIntrospection:
         assert filled.batch_size == 1
         assert filled.is_single_row() is True
 
-    def test_clone_uses_empty_not_private_fields(self):
-        """_clone_cache_entry_for_apc should not require poking _idx for empty."""
+    def test_clone_empty_batch_kv(self):
         empty_bk = BatchKVCache([0])
         eval_targets: list = []
         cloned = _clone_cache_entry_for_apc(
@@ -133,11 +118,6 @@ class TestBatchCacheIntrospection:
         )
         assert isinstance(cloned, KVCache)
         assert cloned.keys is None or int(getattr(cloned, "offset", 0) or 0) == 0
-
-
-# ---------------------------------------------------------------------------
-# A — BatchQuantizedKVCache.extract (multi-row exact)
-# ---------------------------------------------------------------------------
 
 
 class TestBatchQuantizedExtract:
@@ -194,13 +174,7 @@ class TestBatchQuantizedExtract:
         assert isinstance(row1[2], QuantizedKVCache)
 
 
-# ---------------------------------------------------------------------------
-# A — Always row-normalize (snapshot adapter)
-# ---------------------------------------------------------------------------
-
-
 class TestSnapshotPromptCacheRow:
-    """snapshot_prompt_cache_row is the single inbound adapter for APC stores."""
 
     def test_api_exists(self):
         from mlx_vlm.apc import snapshot_prompt_cache_row
@@ -220,7 +194,7 @@ class TestSnapshotPromptCacheRow:
         assert not isinstance(snap[0], BatchKVCache)
         assert not isinstance(snap[1], BatchQuantizedKVCache)
         assert isinstance(snap[0], KVCache)
-        assert isinstance(snap[1], KVCache)  # dequant at harvest
+        assert isinstance(snap[1], KVCache)
         assert snap[0].offset == seq_len
         assert snap[1].offset == seq_len
 
@@ -273,18 +247,9 @@ class TestSnapshotPromptCacheRow:
         assert warm0 is not None and warm1 is not None
 
 
-# ---------------------------------------------------------------------------
-# A — Gemma-like SWA hybrid (BatchRotating + quant + full attn)
-# ---------------------------------------------------------------------------
-
-
 class TestGemmaLikeHybridExact:
     def _gemma_like_layout(self, batch_size: int, seq_len: int):
-        """Approximate Gemma 4 hybrid serving layout under --kv-bits.
-
-        Typical pattern: SWA rotating layers + quantized full-attn layers +
-        possibly a dense last layer. Arrays not required for pure gemma SWA.
-        """
+        """SWA rotating + quantized full-attn + dense last layer."""
         pads = [0] * batch_size
         rotating, _, _ = _fill_batch_rotating(pads, seq_len=seq_len, max_size=SWA_MAX)
         quant, _, _ = _fill_batch_quant(pads, seq_len=seq_len)
@@ -307,19 +272,16 @@ class TestGemmaLikeHybridExact:
         assert isinstance(cloned, RotatingKVCache)
 
     def test_b1_gemma_like_exact_store_and_lookup(self):
-        """#1559 success criterion: Gemma batch path B=1 exact store + hit."""
         from mlx_vlm.apc import snapshot_prompt_cache_row
 
         seq_len = 2 * BLOCK_SIZE
         token_ids = list(range(seq_len))
         prompt_cache = self._gemma_like_layout(batch_size=1, seq_len=seq_len)
 
-        # Layout must be recognized as exact-capable
         assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
 
         snap = snapshot_prompt_cache_row(prompt_cache, batch_idx=0)
         assert snap is not None
-        # No Batch* types in APC storage
         for c in snap:
             assert not type(c).__name__.startswith("Batch")
 
@@ -367,11 +329,6 @@ class TestGemmaLikeHybridExact:
         assert model_apc_mode(FakeGemmaLang()) == "exact"
 
 
-# ---------------------------------------------------------------------------
-# C — Reject observability
-# ---------------------------------------------------------------------------
-
-
 class TestRejectObservability:
     def test_stats_include_rejects_keys(self):
         manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
@@ -406,11 +363,6 @@ class TestRejectObservability:
         assert "unclonable" in snap["rejects_by_reason"]
 
 
-# ---------------------------------------------------------------------------
-# D — Block harvest / post-decode path with quantized keys
-# ---------------------------------------------------------------------------
-
-
 class TestQuantizedBlockHarvest:
     def test_harvest_single_row_batch_quantized(self):
         manager = APCManager(num_blocks=8, block_size=BLOCK_SIZE)
@@ -424,14 +376,8 @@ class TestQuantizedBlockHarvest:
         manager.release(blocks)
 
     def test_layer_kv_float_helper_handles_quantized_tuple_keys(self):
-        """dispatch post-decode harvest must not slice quantized tuple keys.
-
-        ``layer_kv_for_apc`` (or equivalent) returns float K/V for any supported
-        cache dialect so callers never do ``keys[..., :off, :]`` on a tuple.
-        """
         from mlx_vlm.apc import layer_kv_for_apc
 
-        # Plain KV
         plain = KVCache()
         k, v = _rand_kv(batch=1, seq_len=12)
         plain.update_and_fetch(k, v)
@@ -439,7 +385,6 @@ class TestQuantizedBlockHarvest:
         assert pk is not None and pv is not None
         assert pk.shape[-2] == 12
 
-        # Quantized single-row
         q = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
         k, v = _rand_kv(batch=1, seq_len=12)
         q.update_and_fetch(k, v)
@@ -448,7 +393,6 @@ class TestQuantizedBlockHarvest:
         assert qk.shape == (1, H, 12, D)
         assert not isinstance(qk, tuple)
 
-        # Batch quantized row
         bq, _, _ = _fill_batch_quant([0, 0], seq_len=12)
         bk, bv = layer_kv_for_apc(bq, batch_idx=1)
         mx.eval(bk, bv)
@@ -459,21 +403,14 @@ class TestQuantizedBlockHarvest:
         from mlx_vlm.apc import layer_kv_for_apc
 
         class Bogus:
-            keys = (1, 2, 3)  # tuple like quantized but no dequantize_for_apc
+            keys = (1, 2, 3)
             values = (4, 5, 6)
             offset = 3
 
         assert layer_kv_for_apc(Bogus()) == (None, None)
 
 
-# ---------------------------------------------------------------------------
-# A — No B=1 special case residual in extract path
-# ---------------------------------------------------------------------------
-
-
 class TestAlwaysExtractSemantics:
-    """BatchGenerator must not short-circuit B=1; extract works for B=1 Batch*."""
-
     def test_extract_b1_batch_rotating_equals_clone_after_extract(self):
         cache, _, _ = _fill_batch_rotating([0], seq_len=16)
         row = extract_prompt_cache_from_batch([cache], 0)
@@ -491,7 +428,6 @@ class TestAlwaysExtractSemantics:
         assert isinstance(cloned[0], KVCache)
 
     def test_snapshot_equivalent_for_b1_whether_or_not_batch(self):
-        """snapshot of BatchKV B=1 matches snapshot of equivalent KVCache content."""
         from mlx_vlm.apc import snapshot_prompt_cache_row
 
         seq_len = 16
@@ -510,23 +446,8 @@ class TestAlwaysExtractSemantics:
         assert _max_abs_error(snap_b[0].keys, snap_p[0].keys) < 1e-5
 
 
-# ---------------------------------------------------------------------------
-# Integration: store_exact_cache accepts batch caches if snapshot is used
-# (document expected call pattern for BatchGenerator refactor)
-# ---------------------------------------------------------------------------
-
-
 class TestStoreExactCallPattern:
-    def test_direct_store_of_batch_rotating_without_snapshot_may_reject_or_adapt(
-        self,
-    ):
-        """Preferred path is snapshot_prompt_cache_row first.
-
-        Direct store_exact_cache on Batch* may either:
-        - succeed by adapting internally, or
-        - reject with stats — both OK as long as snapshot path works.
-        The snapshot path is the supported contract.
-        """
+    def test_store_hybrid_layout_via_snapshot(self):
         from mlx_vlm.apc import snapshot_prompt_cache_row
 
         seq_len = BLOCK_SIZE
@@ -541,44 +462,28 @@ class TestStoreExactCallPattern:
         assert manager.store_exact_cache(token_ids, snap) is True
 
 
-# ---------------------------------------------------------------------------
-# A — TurboQuant batch parity (same extract / snapshot protocol)
-# ---------------------------------------------------------------------------
-
-
 def _fill_batch_turbo(left_padding, seq_len, bits=4.0):
     from mlx_vlm.turboquant import BatchTurboQuantKVCache
 
     cache = BatchTurboQuantKVCache(list(left_padding), bits=bits)
     k, v = _rand_kv(batch=len(left_padding), seq_len=seq_len)
-    # TurboQuant prefers float16-ish traffic; random float32 is fine.
     cache.update_and_fetch(k, v)
     mx.eval(cache.keys)
     return cache, k, v
 
 
 class TestBatchRotatingRightPadPrefill:
-    """S=1 prefill while right-pad bookkeeping is active must not crash.
-
-    APC multi-row warm paths with unequal suffix lengths call prepare(right_padding=…)
-    then may issue a final single-token prefill before finalize().
-    """
-
     def test_single_token_update_while_lengths_pending(self):
         cache = BatchRotatingKVCache(32, [0, 0])
-        # Prefill a few tokens
         k, v = _rand_kv(batch=2, seq_len=4)
         cache.update_and_fetch(k, v)
-        # Simulate APC mixed-prefill right-pad bookkeeping
         cache.prepare(right_padding=[1, 0], lengths=[2, 3])
         assert cache._lengths is not None
-        # Final prefill step is often S=1
         k1, v1 = _rand_kv(batch=2, seq_len=1)
         out_k, out_v = cache.update_and_fetch(k1, v1)
         assert out_k is not None
         cache.finalize()
         assert cache._lengths is None
-        # Decode path after finalize
         k2, v2 = _rand_kv(batch=2, seq_len=1)
         cache.update_and_fetch(k2, v2)
 

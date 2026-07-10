@@ -154,9 +154,8 @@ def _clone_cache_entry_for_apc(
             eval_targets.extend([keys, values])
         return out
 
-    # Batch* caches: collapse single-row via extract, then clone the row type.
-    # Multi-row must go through snapshot_prompt_cache_row first.
-    # Includes BatchTurboQuantKVCache (turboquant module; duck-typed via extract).
+    # Batch caches expose extract + is_single_row; collapse to a single-row
+    # entry before cloning. Multi-row stores should call snapshot_prompt_cache_row.
     if callable(getattr(c, "extract", None)) and callable(
         getattr(c, "is_single_row", None)
     ):
@@ -165,7 +164,6 @@ def _clone_cache_entry_for_apc(
         if c.empty():
             if isinstance(c, lm_cache.BatchRotatingKVCache):
                 return lm_cache.RotatingKVCache(max_size=int(c.max_size))
-            # BatchTurboQuant / BatchQuantized / BatchKV → empty float row
             return lm_cache.KVCache()
         return _clone_cache_entry_for_apc(
             c.extract(0),
@@ -564,7 +562,6 @@ class APCStats:
     disk_writes: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
-    # Additive only — do not remove existing /v1/cache/stats keys.
     rejects: int = 0
     rejects_by_reason: Dict[str, int] = field(default_factory=dict)
     last_reject: Optional[Dict[str, Any]] = None
@@ -3830,10 +3827,9 @@ def snapshot_prompt_cache_row(
 ) -> Optional[List[Any]]:
     """Row-normalize a prompt cache for APC store/lookup.
 
-    Batch-shaped layouts (every entry has ``extract``) are extracted first so
-    multi-row and B=1 Batch* caches share one path. Already single-row caches
-    are cloned in place. Result never contains Batch* types; quantized layers
-    are dequantized into float KVCache (dequant-at-harvest).
+    Batch-shaped layouts (every entry has ``extract``) are extracted first.
+    Single-row caches are cloned in place. Quantized layers are dequantized
+    into float ``KVCache`` entries.
     """
     if not caches:
         return []

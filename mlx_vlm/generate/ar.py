@@ -1739,8 +1739,6 @@ class PromptProcessingBatch:
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
     def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
-        # Always row-normalize so exact store never sees Batch* dialects
-        # (including B=1 under --kv-bits). Single-row caches clone in place.
         return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
 
     def _store_apc_exact_checkpoints(self) -> None:
