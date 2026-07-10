@@ -4,9 +4,11 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from mlx_vlm.models import cache as kv_cache
 from mlx_vlm.models.qwen3_omni_moe.code2wav import Code2WavModel
 from mlx_vlm.models.qwen3_omni_moe.talker import Talker
 from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
+from mlx_vlm.sample_utils import make_logits_processors, make_sampler
 
 from . import processing_qwen3_omni_moe  # noqa: F401
 from .config import ModelConfig
@@ -164,6 +166,139 @@ class Model(nn.Module):
         hidden_states = outputs.hidden_states[target_layer_idx + 1]
 
         return hidden_states, inputs_embeds
+
+    def _generate_thinker_with_hidden_states(
+        self,
+        input_ids: mx.array,
+        *,
+        target_layer_idx: int,
+        thinker_max_new_tokens: int,
+        thinker_eos_token_id: int,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        min_p: float = 0.0,
+        top_k: int = 0,
+        logit_bias: Optional[dict[int, float]] = None,
+        repetition_penalty: Optional[float] = None,
+        repetition_context_size: Optional[int] = 20,
+        presence_penalty: Optional[float] = None,
+        presence_context_size: Optional[int] = 20,
+        frequency_penalty: Optional[float] = None,
+        frequency_context_size: Optional[int] = 20,
+        **kwargs,
+    ):
+        """Generate Thinker tokens while retaining the Talker accept-layer hidden.
+
+        The audio-output path needs both the final Thinker token sequence and the
+        hidden states from ``accept_hidden_layer``.  The previous implementation
+        generated tokens first and then ran a second full forward pass over the
+        completed sequence to recover those hidden states.  This helper captures
+        the same layer during prefill/decode and avoids that second pass.
+        """
+        embed_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k
+            in [
+                "pixel_values",
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+                "input_features",
+                "feature_attention_mask",
+                "audio_feature_lengths",
+            ]
+        }
+        input_embedding_features = self.thinker.get_input_embeddings(
+            input_ids, **embed_kwargs
+        )
+        inputs_embeds = input_embedding_features.inputs_embeds
+
+        lm_kwargs = {
+            k: v
+            for k, v in input_embedding_features.to_dict().items()
+            if k != "inputs_embeds" and v is not None
+        }
+        lm_kwargs.update(
+            {
+                k: v
+                for k, v in kwargs.items()
+                if k in ["image_grid_thw", "video_grid_thw"]
+            }
+        )
+
+        prompt_cache = kv_cache.make_prompt_cache(self.thinker.language_model)
+        outputs = self.thinker.language_model(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            cache=prompt_cache,
+            output_hidden_state_idx=target_layer_idx + 1,
+            **lm_kwargs,
+        )
+        hidden_states = [outputs.hidden_states]
+        sequences = [input_ids]
+
+        logits = outputs.logits[:, -1, :]
+        sampler = make_sampler(
+            temp=temperature,
+            top_p=top_p,
+            min_p=min_p,
+            top_k=top_k,
+        )
+        processors = make_logits_processors(
+            logit_bias,
+            repetition_penalty,
+            repetition_context_size,
+            presence_penalty,
+            presence_context_size,
+            frequency_penalty,
+            frequency_context_size,
+        )
+        processed_tokens = mx.array([], dtype=input_ids.dtype)
+
+        def _sample_next(logits, step_tokens):
+            nonlocal processed_tokens
+            if processors:
+                processed_tokens = mx.concat([processed_tokens, step_tokens.flatten()])
+                for processor in processors:
+                    logits = processor(processed_tokens, logits)
+            return sampler(logits)
+
+        token = _sample_next(logits, input_ids)
+        if token.ndim == 2:
+            token = token[:, 0]
+
+        for _ in range(thinker_max_new_tokens):
+            token_id = int(token.item())
+            sequences.append(token[:, None].astype(input_ids.dtype))
+
+            step_outputs = self.thinker.language_model(
+                token[:, None],
+                cache=prompt_cache,
+                output_hidden_state_idx=target_layer_idx + 1,
+                **lm_kwargs,
+            )
+            hidden_states.append(step_outputs.hidden_states)
+            if token_id == thinker_eos_token_id:
+                break
+
+            logits = step_outputs.logits[:, -1, :]
+            token = _sample_next(logits, token[:, None])
+            if token.ndim == 2:
+                token = token[:, 0]
+
+        if len(sequences) > 1:
+            generated_ids = mx.concatenate(sequences[1:], axis=1)
+            generated_embeds = self.thinker.language_model.model.embed_tokens(
+                generated_ids
+            )
+            inputs_embeds = mx.concatenate([inputs_embeds, generated_embeds], axis=1)
+
+        return (
+            mx.concatenate(sequences, axis=1),
+            mx.concatenate(hidden_states, axis=1),
+            inputs_embeds,
+        )
 
     def _get_talker_user_parts(
         self,
@@ -370,13 +505,7 @@ class Model(nn.Module):
         if speaker_id is None:
             raise NotImplementedError(f"Speaker {speaker} not implemented")
 
-        from mlx_vlm.generate import generate_step
-
-        thinker_kwargs = {
-            "max_tokens": thinker_max_new_tokens,
-            "eos_tokens": [thinker_eos_token_id],
-            "output_hidden_states": True,
-        }
+        thinker_kwargs = {}
         for key, value in kwargs.items():
             if key.startswith("thinker_"):
                 thinker_kwargs[key[len("thinker_") :]] = value
@@ -391,30 +520,18 @@ class Model(nn.Module):
             ):
                 thinker_kwargs[key] = value
 
-        generator = generate_step(
-            input_ids,
-            self.thinker,
-            thinker_kwargs.get("pixel_values"),
-            kwargs.get("mask"),
-            **{
-                k: v
-                for k, v in thinker_kwargs.items()
-                if k not in ("pixel_values", "mask", "output_hidden_states")
-            },
-        )
-        sequences = [input_ids]
-        hidden_states_list = []
-        for token, _ in generator:
-            sequences.append(mx.array([[token]]))
-            if token == thinker_eos_token_id:
-                break
-
-        thinker_result_sequences = mx.concatenate(sequences, axis=1)
-
-        thinker_hidden_all, thinker_embed_all = self.extract_thinker_hidden_states(
-            thinker_result_sequences,
-            target_layer_idx=self.config.talker_config.accept_hidden_layer,
-            **kwargs,
+        thinker_result_sequences, thinker_hidden_all, thinker_embed_all = (
+            self._generate_thinker_with_hidden_states(
+                input_ids,
+                target_layer_idx=self.config.talker_config.accept_hidden_layer,
+                thinker_max_new_tokens=thinker_max_new_tokens,
+                thinker_eos_token_id=thinker_eos_token_id,
+                temperature=float(thinker_kwargs.pop("temperature", 0.0)),
+                top_p=float(thinker_kwargs.pop("top_p", 1.0)),
+                min_p=float(thinker_kwargs.pop("min_p", 0.0)),
+                top_k=int(thinker_kwargs.pop("top_k", 0)),
+                **thinker_kwargs,
+            )
         )
 
         im_start_indexes = mx.concatenate(
@@ -569,8 +686,6 @@ class Model(nn.Module):
         if speaker_id is None:
             raise NotImplementedError(f"Speaker {speaker} not implemented")
 
-        from mlx_vlm.generate import generate_step
-
         thinker_kwargs = {
             "max_tokens": thinker_max_new_tokens,
             "eos_tokens": [thinker_eos_token_id],
@@ -589,28 +704,22 @@ class Model(nn.Module):
             ):
                 thinker_kwargs[key] = value
 
-        generator = generate_step(
-            input_ids,
-            self.thinker,
-            thinker_kwargs.get("pixel_values"),
-            kwargs.get("mask"),
-            **{
-                k: v
-                for k, v in thinker_kwargs.items()
-                if k not in ("pixel_values", "mask")
-            },
-        )
-        sequences = [input_ids]
-        for token, _ in generator:
-            sequences.append(mx.array([[token]]))
-            if token == thinker_eos_token_id:
-                break
-
-        thinker_result_sequences = mx.concatenate(sequences, axis=1)
-        thinker_hidden_all, thinker_embed_all = self.extract_thinker_hidden_states(
-            thinker_result_sequences,
-            target_layer_idx=self.config.talker_config.accept_hidden_layer,
-            **kwargs,
+        thinker_result_sequences, thinker_hidden_all, thinker_embed_all = (
+            self._generate_thinker_with_hidden_states(
+                input_ids,
+                target_layer_idx=self.config.talker_config.accept_hidden_layer,
+                thinker_max_new_tokens=thinker_max_new_tokens,
+                thinker_eos_token_id=thinker_eos_token_id,
+                temperature=float(thinker_kwargs.pop("temperature", 0.0)),
+                top_p=float(thinker_kwargs.pop("top_p", 1.0)),
+                min_p=float(thinker_kwargs.pop("min_p", 0.0)),
+                top_k=int(thinker_kwargs.pop("top_k", 0)),
+                **{
+                    k: v
+                    for k, v in thinker_kwargs.items()
+                    if k not in ("max_tokens", "eos_tokens")
+                },
+            )
         )
 
         im_start_indexes = mx.concatenate(

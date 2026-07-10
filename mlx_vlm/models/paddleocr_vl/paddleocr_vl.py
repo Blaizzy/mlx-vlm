@@ -168,6 +168,9 @@ class Model(nn.Module):
         return logits
 
     def sanitize(self, weights):
+        if any(k.startswith("language_model.") for k in weights):
+            return weights
+
         _keys_to_ignore_on_load_unexpected = [
             "packing_position_embedding",
             "vision_model.head",
@@ -181,10 +184,10 @@ class Model(nn.Module):
                     key = key.replace("visual.vision_model.encoder", "visual")
             elif "mlp_AR" in key:
                 key = key.replace("mlp_AR", "visual.projector")
-            elif "model" in key:
-                key = key.replace("model", "language_model.model")
-            elif "lm_head" in key:
-                key = key.replace("lm_head", "language_model.lm_head")
+            elif key.startswith("model."):
+                key = f"language_model.{key}"
+            elif key.startswith("lm_head"):
+                key = f"language_model.{key}"
 
             return key
 
