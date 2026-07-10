@@ -539,3 +539,110 @@ class TestStoreExactCallPattern:
         manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
         assert snap is not None
         assert manager.store_exact_cache(token_ids, snap) is True
+
+
+# ---------------------------------------------------------------------------
+# A — TurboQuant batch parity (same extract / snapshot protocol)
+# ---------------------------------------------------------------------------
+
+
+def _fill_batch_turbo(left_padding, seq_len, bits=4.0):
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+    cache = BatchTurboQuantKVCache(list(left_padding), bits=bits)
+    k, v = _rand_kv(batch=len(left_padding), seq_len=seq_len)
+    # TurboQuant prefers float16-ish traffic; random float32 is fine.
+    cache.update_and_fetch(k, v)
+    mx.eval(cache.keys)
+    return cache, k, v
+
+
+class TestBatchTurboQuantParity:
+    def test_batch_size_and_is_single_row(self):
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+        empty = BatchTurboQuantKVCache([0, 0], bits=4.0)
+        assert empty.empty() is True
+        assert empty.batch_size == 2
+        assert empty.is_single_row() is False
+
+        filled, _, _ = _fill_batch_turbo([0], seq_len=8)
+        assert filled.empty() is False
+        assert filled.batch_size == 1
+        assert filled.is_single_row() is True
+
+    def test_extract_returns_turboquant_kv_cache(self):
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        cache, k, _ = _fill_batch_turbo([0, 0], seq_len=24)
+        row = cache.extract(1)
+        assert isinstance(row, TurboQuantKVCache)
+        assert row.offset == 24
+        dk, dv = row.dequantize_for_apc()
+        mx.eval(dk, dv)
+        assert dk.shape == (1, H, 24, D)
+        # TurboQuant is lossy; keep a loose bound
+        assert _max_abs_error(dk, k[1:2]) < 2.0
+
+    def test_extract_respects_left_padding(self):
+        cache, _, _ = _fill_batch_turbo([2, 0], seq_len=10)
+        row0 = cache.extract(0)
+        row1 = cache.extract(1)
+        assert row0.offset == cache._idx - 2
+        assert row1.offset == cache._idx
+
+    def test_extract_empty(self):
+        from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+        cache = BatchTurboQuantKVCache([0, 0], bits=4.0)
+        row = cache.extract(0)
+        assert isinstance(row, TurboQuantKVCache)
+        assert row.keys is None or row.offset == 0
+
+    def test_snapshot_and_exact_store_multi_row(self):
+        from mlx_vlm.apc import snapshot_prompt_cache_row
+
+        seq_len = 2 * BLOCK_SIZE
+        token_ids = list(range(seq_len))
+        turbo, _, _ = _fill_batch_turbo([0, 0], seq_len=seq_len)
+        batch_kv, _, _ = _fill_batch_kv([0, 0], seq_len=seq_len)
+        prompt_cache = [turbo, batch_kv]
+
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        for bi in (0, 1):
+            snap = snapshot_prompt_cache_row(prompt_cache, batch_idx=bi)
+            assert snap is not None
+            for c in snap:
+                assert not type(c).__name__.startswith("Batch")
+            assert manager.store_exact_cache(token_ids, snap, extra_hash=bi + 1)
+
+        warm0, m0 = manager.lookup_exact_cache(token_ids + [9], extra_hash=1)
+        warm1, m1 = manager.lookup_exact_cache(token_ids + [9], extra_hash=2)
+        assert m0 == seq_len and m1 == seq_len
+        assert warm0 is not None and warm1 is not None
+
+    def test_extract_prompt_cache_from_batch(self):
+        from mlx_vlm.turboquant import TurboQuantKVCache
+
+        turbo, _, _ = _fill_batch_turbo([0, 0], seq_len=16)
+        row = extract_prompt_cache_from_batch([turbo], 1)
+        assert row is not None
+        assert isinstance(row[0], TurboQuantKVCache)
+        cloned = _clone_prompt_cache_for_apc(row)
+        assert cloned is not None
+        assert isinstance(cloned[0], KVCache)
+
+    def test_layer_kv_for_apc_batch_turbo(self):
+        from mlx_vlm.apc import layer_kv_for_apc
+
+        cache, _, _ = _fill_batch_turbo([0, 0], seq_len=12)
+        k, v = layer_kv_for_apc(cache, batch_idx=1)
+        mx.eval(k, v)
+        assert k is not None and v is not None
+        assert k.shape[0] == 1
+        assert k.shape[-2] <= 12
+        assert not isinstance(k, tuple)
+
+    def test_supports_exact_apc(self):
+        cache, _, _ = _fill_batch_turbo([0], seq_len=8)
+        assert _cache_entry_supports_exact_apc(cache) is True

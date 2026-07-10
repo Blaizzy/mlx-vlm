@@ -156,19 +156,16 @@ def _clone_cache_entry_for_apc(
 
     # Batch* caches: collapse single-row via extract, then clone the row type.
     # Multi-row must go through snapshot_prompt_cache_row first.
-    if isinstance(
-        c,
-        (
-            lm_cache.BatchKVCache,
-            lm_cache.BatchRotatingKVCache,
-            lm_cache.BatchQuantizedKVCache,
-        ),
+    # Includes BatchTurboQuantKVCache (turboquant module; duck-typed via extract).
+    if callable(getattr(c, "extract", None)) and callable(
+        getattr(c, "is_single_row", None)
     ):
         if not c.is_single_row():
             return None
         if c.empty():
             if isinstance(c, lm_cache.BatchRotatingKVCache):
                 return lm_cache.RotatingKVCache(max_size=int(c.max_size))
+            # BatchTurboQuant / BatchQuantized / BatchKV → empty float row
             return lm_cache.KVCache()
         return _clone_cache_entry_for_apc(
             c.extract(0),
