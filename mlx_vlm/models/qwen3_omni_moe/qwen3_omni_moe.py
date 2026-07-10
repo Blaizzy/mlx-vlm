@@ -664,6 +664,63 @@ class Model(nn.Module):
 
         return thinker_result, talker_wavs.astype(mx.float32)
 
+    @staticmethod
+    def _stream_decode_bounds(
+        codes_count: int,
+        decoded_len: int,
+        chunk_size: int,
+        left_context_size: int,
+    ) -> Optional[tuple[int, int, int]]:
+        context_len = min(left_context_size, decoded_len)
+        new_tokens = chunk_size - context_len
+        if codes_count - decoded_len < new_tokens:
+            return None
+        end = decoded_len + new_tokens
+        return decoded_len - context_len, end, context_len
+
+    def _decode_stream_window(
+        self,
+        codes_list: list[mx.array],
+        decoded_len: int,
+        chunk_size: int,
+        left_context_size: int,
+    ):
+        bounds = self._stream_decode_bounds(
+            len(codes_list), decoded_len, chunk_size, left_context_size
+        )
+        if bounds is None:
+            return None, decoded_len
+
+        context_start, end, context_len = bounds
+        codes_window = mx.stack(codes_list[context_start:end], axis=1).transpose(
+            0, 2, 1
+        )
+        wav_chunk, _ = self.code2wav.stream_decode(
+            codes_window,
+            chunk_size,
+            left_context_size,
+            decoded_len=context_len,
+        )
+        return wav_chunk, end
+
+    def _flush_stream_window(
+        self,
+        codes_list: list[mx.array],
+        decoded_len: int,
+        left_context_size: int,
+    ):
+        if decoded_len >= len(codes_list):
+            return None
+
+        context_start = max(0, decoded_len - left_context_size)
+        context_len = decoded_len - context_start
+        codes_window = mx.stack(codes_list[context_start:], axis=1).transpose(0, 2, 1)
+        return self.code2wav.flush_decode(
+            codes_window,
+            left_context_size,
+            decoded_len=context_len,
+        )
+
     def generate_stream(
         self,
         input_ids: mx.array,
@@ -681,6 +738,12 @@ class Model(nn.Module):
             raise ValueError("Cannot stream audio without talker module")
         if input_ids.shape[0] != 1:
             raise NotImplementedError("Streaming does not support batched inference")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if left_context_size < 0 or left_context_size >= chunk_size:
+            raise ValueError(
+                "left_context_size must be non-negative and smaller than chunk_size"
+            )
 
         speaker_id = self.config.talker_config.speaker_id.get(speaker.lower())
         if speaker_id is None:
@@ -821,19 +884,19 @@ class Model(nn.Module):
             top_p=talker_top_p,
         ):
             codes_list.append(residual_codes)
-            if len(codes_list) >= chunk_size:
-                codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
-                wav_chunk, decoded_len = self.code2wav.stream_decode(
-                    codes_buffer, chunk_size, left_context_size, decoded_len
+            if self._stream_decode_bounds(
+                len(codes_list), decoded_len, chunk_size, left_context_size
+            ):
+                wav_chunk, decoded_len = self._decode_stream_window(
+                    codes_list, decoded_len, chunk_size, left_context_size
                 )
                 if wav_chunk is not None:
                     mx.eval(wav_chunk)
                     yield ("audio", wav_chunk.astype(mx.float32))
 
         if codes_list:
-            codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
-            wav_chunk = self.code2wav.flush_decode(
-                codes_buffer, left_context_size, decoded_len
+            wav_chunk = self._flush_stream_window(
+                codes_list, decoded_len, left_context_size
             )
             if wav_chunk is not None:
                 mx.eval(wav_chunk)

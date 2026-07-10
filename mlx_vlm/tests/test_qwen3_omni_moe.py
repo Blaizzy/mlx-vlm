@@ -36,7 +36,7 @@ def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
     )
 
 
-def _tiny_model():
+def _tiny_model(enable_audio_output=False):
     text_config = _tiny_text_config()
     thinker_config = ThinkerConfig(
         text_config=text_config,
@@ -103,7 +103,7 @@ def _tiny_model():
             thinker_config=thinker_config,
             talker_config=talker_config,
             code2wav_config=code2wav_config,
-            enable_audio_output=False,
+            enable_audio_output=enable_audio_output,
             im_start_token_id=10,
             im_end_token_id=11,
             system_token_id=12,
@@ -160,6 +160,71 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                     atol=1e-6,
                 ).item()
             )
+        )
+
+    def test_stream_decode_bounds_wait_for_the_next_window(self):
+        model = _tiny_model(enable_audio_output=True)
+
+        self.assertEqual(model._stream_decode_bounds(6, 0, 6, 2), (0, 6, 0))
+        self.assertIsNone(model._stream_decode_bounds(9, 6, 6, 2))
+        self.assertEqual(model._stream_decode_bounds(10, 6, 6, 2), (4, 10, 2))
+
+    def test_generate_stream_validates_window_sizes(self):
+        model = _tiny_model(enable_audio_output=True)
+        input_ids = mx.array([[10, 13, 20, 11, 10, 14]], dtype=mx.int32)
+
+        with self.assertRaises(ValueError):
+            next(model.generate_stream(input_ids, chunk_size=0))
+        with self.assertRaises(ValueError):
+            next(model.generate_stream(input_ids, chunk_size=4, left_context_size=4))
+        with self.assertRaises(ValueError):
+            next(model.generate_stream(input_ids, chunk_size=4, left_context_size=-1))
+
+    def test_stream_window_matches_full_history_decode(self):
+        model = _tiny_model(enable_audio_output=True)
+        codes_list = [
+            mx.array([[idx % 8, (idx + 1) % 8]], dtype=mx.int32) for idx in range(12)
+        ]
+        codes_buffer = mx.stack(codes_list, axis=1).transpose(0, 2, 1)
+        chunk_size = 6
+        left_context_size = 2
+
+        decoded_len = 0
+        for _ in range(2):
+            expected, expected_len = model.code2wav.stream_decode(
+                codes_buffer,
+                chunk_size,
+                left_context_size,
+                decoded_len=decoded_len,
+            )
+            actual, actual_len = model._decode_stream_window(
+                codes_list,
+                decoded_len=decoded_len,
+                chunk_size=chunk_size,
+                left_context_size=left_context_size,
+            )
+            mx.eval(expected, actual)
+
+            self.assertEqual(actual_len, expected_len)
+            self.assertTrue(
+                bool(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item())
+            )
+            decoded_len = actual_len
+
+        expected = model.code2wav.flush_decode(
+            codes_buffer,
+            left_context_size,
+            decoded_len=decoded_len,
+        )
+        actual = model._flush_stream_window(
+            codes_list,
+            decoded_len=decoded_len,
+            left_context_size=left_context_size,
+        )
+        mx.eval(expected, actual)
+
+        self.assertTrue(
+            bool(mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item())
         )
 
 
