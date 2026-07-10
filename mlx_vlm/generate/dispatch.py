@@ -1139,19 +1139,17 @@ def stream_generate(
                     all_ids = full_input_ids_list + [
                         t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
-                # Snapshot keys/values up to the live offset for each layer.
+                # Snapshot float K/V per layer (dequants when keys are tuples).
                 layer_keys: List[mx.array] = []
                 layer_values: List[mx.array] = []
                 ok = True
                 for c in tracked_cache:
-                    k = getattr(c, "keys", None)
-                    v = getattr(c, "values", None)
-                    off = getattr(c, "offset", None)
-                    if k is None or v is None or off is None:
+                    k, v = _apc.layer_kv_for_apc(c)
+                    if k is None or v is None:
                         ok = False
                         break
-                    layer_keys.append(k[..., :off, :])
-                    layer_values.append(v[..., :off, :])
+                    layer_keys.append(k)
+                    layer_values.append(v)
                 if ok and layer_keys:
                     new_blocks = apc_manager.store_kv_blocks(
                         all_ids,

@@ -49,9 +49,9 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -154,35 +154,22 @@ def _clone_cache_entry_for_apc(
             eval_targets.extend([keys, values])
         return out
 
-    # BatchKVCache is not a KVCache subclass. With --kv-bits the batch cache
-    # factory is used even for single-row requests, so hybrid exact-mode
-    # snapshots often see BatchKVCache for the unquantized last layer.
-    # Collapse B=1 into a row KVCache (same as extract(0)); multi-row must
-    # be extracted before store.
-    if isinstance(c, lm_cache.BatchKVCache):
-        idx = int(getattr(c, "_idx", 0) or 0)
-        if c.keys is None or c.values is None or idx <= 0:
-            return lm_cache.KVCache()
-        if int(c.keys.shape[0]) != 1:
+    # Batch caches expose extract + is_single_row; collapse to a single-row
+    # entry before cloning. Multi-row stores should call snapshot_prompt_cache_row.
+    if callable(getattr(c, "extract", None)) and callable(
+        getattr(c, "is_single_row", None)
+    ):
+        if not c.is_single_row():
             return None
-        row = c.extract(0)
-        off = int(getattr(row, "offset", 0) or 0)
-        if row.keys is not None and row.values is not None and off > 0:
-            keys = _copy_mlx_array(row.keys[..., :off, :])
-            values = _copy_mlx_array(row.values[..., :off, :])
-            step = int(getattr(row, "step", getattr(type(row), "step", 256)) or 0)
-            keys, values = _pad_kv_for_capacity(
-                keys,
-                values,
-                offset=off,
-                min_capacity_tokens=min_capacity_tokens,
-                step=step,
-            )
-            row.keys = keys
-            row.values = values
-            row.offset = off
-            eval_targets.extend([keys, values])
-        return row
+        if c.empty():
+            if isinstance(c, lm_cache.BatchRotatingKVCache):
+                return lm_cache.RotatingKVCache(max_size=int(c.max_size))
+            return lm_cache.KVCache()
+        return _clone_cache_entry_for_apc(
+            c.extract(0),
+            min_capacity_tokens=min_capacity_tokens,
+            eval_targets=eval_targets,
+        )
 
     if isinstance(c, lm_cache.RotatingKVCache):
         out = type(c)(
@@ -320,6 +307,8 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
         (
             lm_cache.KVCache,
             lm_cache.BatchKVCache,
+            lm_cache.BatchRotatingKVCache,
+            lm_cache.BatchQuantizedKVCache,
             lm_cache.RotatingKVCache,
             lm_cache.ChunkedKVCache,
             lm_cache.ArraysCache,
@@ -573,6 +562,14 @@ class APCStats:
     disk_writes: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
+    rejects: int = 0
+    rejects_by_reason: Dict[str, int] = field(default_factory=dict)
+    last_reject: Optional[Dict[str, Any]] = None
+
+    def record_reject(self, reason: str, **details: Any) -> None:
+        self.rejects += 1
+        self.rejects_by_reason[reason] = self.rejects_by_reason.get(reason, 0) + 1
+        self.last_reject = {"reason": reason, **details}
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -592,6 +589,11 @@ class APCStats:
             "disk_writes": self.disk_writes,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
+            "rejects": self.rejects,
+            "rejects_by_reason": dict(self.rejects_by_reason),
+            "last_reject": (
+                dict(self.last_reject) if self.last_reject is not None else None
+            ),
         }
 
 
@@ -3093,6 +3095,12 @@ class APCManager:
                 types,
                 len(token_tuple),
             )
+            with self.lock:
+                self.stats.record_reject(
+                    "unclonable",
+                    types=types,
+                    token_len=len(token_tuple),
+                )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
@@ -3804,6 +3812,102 @@ def extract_prompt_cache_from_batch(
     return out
 
 
+def _prompt_cache_is_batch_shaped(caches: Sequence[Any]) -> bool:
+    """True when every entry can row-extract (Batch* / ArraysCache layout)."""
+    if not caches:
+        return False
+    return all(callable(getattr(c, "extract", None)) for c in caches)
+
+
+def snapshot_prompt_cache_row(
+    caches: Sequence[Any],
+    batch_idx: int = 0,
+    *,
+    min_capacity_tokens: Optional[int] = None,
+) -> Optional[List[Any]]:
+    """Row-normalize a prompt cache for APC store/lookup.
+
+    Batch-shaped layouts (every entry has ``extract``) are extracted first.
+    Single-row caches are cloned in place. Quantized layers are dequantized
+    into float ``KVCache`` entries.
+    """
+    if not caches:
+        return []
+    source: Sequence[Any] = caches
+    if _prompt_cache_is_batch_shaped(caches):
+        row = extract_prompt_cache_from_batch(caches, batch_idx)
+        if row is None:
+            return None
+        source = row
+    return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
+
+
+def layer_kv_for_apc(
+    c: Any,
+    batch_idx: Optional[int] = None,
+) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+    """Return float K/V for one layer for block-mode APC harvest.
+
+    Prefer this over slicing ``c.keys`` directly: quantized caches store keys
+    as a tuple and dense slicing raises TypeError.
+    """
+    if hasattr(c, "dequantize_for_apc"):
+        dk, dv = c.dequantize_for_apc()
+        if dk is None or dv is None:
+            return None, None
+        left_padding = getattr(c, "left_padding", None)
+        lp = 0
+        if batch_idx is not None and left_padding is not None:
+            try:
+                lp = int(left_padding[batch_idx].item())
+            except Exception:
+                lp = 0
+        if batch_idx is not None and int(dk.shape[0]) > 1:
+            return (
+                dk[batch_idx : batch_idx + 1, :, lp:, :],
+                dv[batch_idx : batch_idx + 1, :, lp:, :],
+            )
+        if lp > 0:
+            return dk[..., lp:, :], dv[..., lp:, :]
+        return dk, dv
+
+    keys = getattr(c, "keys", None)
+    values = getattr(c, "values", None)
+    if keys is None or values is None:
+        return None, None
+    # Tuple keys without dequantize_for_apc cannot be sliced as dense arrays.
+    if isinstance(keys, tuple) or isinstance(values, tuple):
+        return None, None
+
+    left_padding = getattr(c, "left_padding", None)
+    idx = getattr(c, "_idx", None)
+    if idx is None:
+        off = getattr(c, "offset", None)
+        if off is None:
+            return None, None
+        try:
+            end = int(off)
+        except Exception:
+            return None, None
+        return keys[..., :end, :], values[..., :end, :]
+
+    lp = 0
+    if batch_idx is not None and left_padding is not None:
+        try:
+            lp = int(left_padding[batch_idx].item())
+        except Exception:
+            lp = 0
+    end = int(idx)
+    if batch_idx is not None and int(keys.shape[0]) > 1:
+        return (
+            keys[batch_idx : batch_idx + 1, :, lp:end, :],
+            values[batch_idx : batch_idx + 1, :, lp:end, :],
+        )
+    if lp > 0:
+        return keys[..., lp:end, :], values[..., lp:end, :]
+    return keys[..., :end, :], values[..., :end, :]
+
+
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],
@@ -3821,47 +3925,14 @@ def harvest_blocks_from_batch_cache(
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
     for c in batch_caches:
-        # Protocol dispatch: quantized caches expose dequantize_for_apc()
-        # which returns raw float arrays suitable for direct slicing.
-        if hasattr(c, "dequantize_for_apc"):
-            dk, dv = c.dequantize_for_apc()
-            if dk is None or dv is None:
-                return []
-            idx = dk.shape[-2]
-            left_padding = getattr(c, "left_padding", None)
-            if left_padding is not None:
-                try:
-                    lp = int(left_padding[batch_idx].item())
-                except Exception:
-                    lp = 0
-            else:
-                lp = 0
-            layer_keys.append(dk[batch_idx : batch_idx + 1, :, lp:, :])
-            layer_values.append(dv[batch_idx : batch_idx + 1, :, lp:, :])
-            continue
-
-        keys = getattr(c, "keys", None)
-        values = getattr(c, "values", None)
-        idx = getattr(c, "_idx", None)
-        # Regular KVCache (non-batch) — e.g. from make_speculative_prompt_cache
-        # used with MTP draft model + batch_size=1. These entries carry
-        # ``offset`` instead of ``_idx`` and have no ``left_padding``.
-        if idx is None and keys is not None and values is not None:
-            idx = getattr(c, "offset", None)
-        left_padding = getattr(c, "left_padding", None)
-        if keys is None or values is None or idx is None:
+        k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
+        if k is None or v is None:
             return []
-        # Pull this batch row, dropping any left-padding for this seq.
-        if left_padding is not None:
-            try:
-                lp = int(left_padding[batch_idx].item())
-            except Exception:
-                lp = 0
-        else:
-            lp = 0
-        # shape after slicing: [1, H, idx-lp, D]
-        layer_keys.append(keys[batch_idx : batch_idx + 1, :, lp:idx, :])
-        layer_values.append(values[batch_idx : batch_idx + 1, :, lp:idx, :])
+        if int(k.shape[0]) != 1:
+            k = k[batch_idx : batch_idx + 1]
+            v = v[batch_idx : batch_idx + 1]
+        layer_keys.append(k)
+        layer_values.append(v)
     return apc_manager.store_kv_blocks(
         full_token_ids,
         layer_keys,

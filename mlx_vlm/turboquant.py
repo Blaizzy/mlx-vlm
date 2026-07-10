@@ -6311,6 +6311,29 @@ class BatchTurboQuantKVCache(_BaseCache):
             return None, None
         return self.dequantize()
 
+    def extract(self, idx):
+        """Extract one batch row as a single-sequence TurboQuantKVCache."""
+        cache = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        if self.keys is None or self._idx == 0:
+            return cache
+        cache.key_codec = self.key_codec
+        cache.value_codec = self.value_codec
+        padding = max(0, int(self.left_padding[idx].item()))
+        end = self._idx
+        if padding >= end:
+            return cache
+        bi = mx.array([idx])
+        keys = _filter_state(_slice_state_range(self.keys, padding, end), bi)
+        values = _filter_state(_slice_state_range(self.values, padding, end), bi)
+
+        def _contiguous(a, ndim):
+            return mx.contiguous(a)
+
+        cache.keys = _map_state(keys, _contiguous)
+        cache.values = _map_state(values, _contiguous)
+        cache.offset = _state_length(cache.keys)
+        return cache
+
     # ------------------------------------------------------------------
     # State / introspection
     # ------------------------------------------------------------------
@@ -6350,6 +6373,13 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def batch_size(self):
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
         return create_causal_mask(
