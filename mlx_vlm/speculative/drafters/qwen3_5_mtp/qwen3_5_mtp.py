@@ -492,11 +492,6 @@ class Qwen3_5MTPDraftModel(nn.Module):
             "pre_fc_norm_embedding.weight",
             "pre_fc_norm_hidden.weight",
         )
-        # The RMSNorm +1.0 shift converts HF zero-centred gammas to the MLX
-        # convention. Pre-converted MLX MTP checkpoints
-        # (e.g. mlx-community/Qwen3.6-*-MTP-*) already store shifted values with
-        # bare keys, while raw-HF MTP weights carry the `mtp.` prefix. Only shift
-        # the raw-HF layout so sanitize is idempotent and does not double-shift.
         for key, value in weights.items():
             is_hf_layout = key.startswith("mtp.")
             if is_hf_layout:
