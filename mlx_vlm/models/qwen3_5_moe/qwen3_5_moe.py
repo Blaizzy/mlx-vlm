@@ -18,6 +18,15 @@ class Model(Qwen3_5Model):
         self.language_model = LanguageModel(config.text_config, config)
 
     def sanitize(self, weights):
+        # Only shift norm weights by +1.0 when the checkpoint stores
+        # gamma-1 (indicated by MTP weights or an unsanitized conv1d axis).
+        # See mlx_vlm/models/qwen3_5/qwen3_5.py and mlx_lm/models/qwen3_5.py.
+        has_mtp_weights = any("mtp." in k for k in weights)
+        has_unsanitized_conv1d = any(
+            "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
+        )
+        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
+
         # ignore mtp weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
@@ -64,7 +73,7 @@ class Model(Qwen3_5Model):
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
+            if should_shift_norm_weights and any(key.endswith(sfx) for sfx in norm_keys):
                 if value.ndim == 1:
                     value += 1.0
 

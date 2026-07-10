@@ -120,6 +120,18 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
+        # Only shift norm weights by +1.0 when the checkpoint stores
+        # gamma-1 (indicated by MTP weights or an unsanitized conv1d axis).
+        # Standard Qwen3.5/3.6 checkpoints already store gamma directly, so
+        # an unconditional +1.0 corrupts every RMSNorm weight from ~1.0 to
+        # ~2.0, producing incoherent output and broken tool calls.
+        # Mirrors the guard in mlx_lm/models/qwen3_5.py TextModel.sanitize.
+        has_mtp_weights = any("mtp." in k for k in weights)
+        has_unsanitized_conv1d = any(
+            "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
+        )
+        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
+
         # ignore mtp weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
@@ -140,7 +152,7 @@ class Model(Qwen3VLModel):
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
+            if should_shift_norm_weights and any(key.endswith(sfx) for sfx in norm_keys):
                 if value.ndim == 1:
                     value += 1.0
 

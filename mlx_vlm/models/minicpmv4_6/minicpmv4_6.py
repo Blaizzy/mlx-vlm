@@ -423,6 +423,15 @@ class Model(nn.Module):
         return output
 
     def sanitize(self, weights):
+        # Only shift norm weights by +1.0 when the checkpoint stores
+        # gamma-1 (indicated by MTP weights or an unsanitized conv1d axis).
+        # See mlx_vlm/models/qwen3_5/qwen3_5.py and mlx_lm/models/qwen3_5.py.
+        has_mtp_weights = any("mtp." in k for k in weights)
+        has_unsanitized_conv1d = any(
+            "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
+        )
+        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
+
         sanitized_weights = {}
         norm_keys = (
             ".input_layernorm.weight",
@@ -474,7 +483,8 @@ class Model(nn.Module):
             ) and not check_array_shape(value):
                 value = value.transpose(0, 2, 3, 1)
             if any(key.endswith(suffix) for suffix in norm_keys) and value.ndim == 1:
-                value = value + 1.0
+                if should_shift_norm_weights:
+                    value = value + 1.0
 
             sanitized_weights[key] = value
 
