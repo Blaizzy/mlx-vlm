@@ -154,6 +154,36 @@ def _clone_cache_entry_for_apc(
             eval_targets.extend([keys, values])
         return out
 
+    # BatchKVCache is not a KVCache subclass. With --kv-bits the batch cache
+    # factory is used even for single-row requests, so hybrid exact-mode
+    # snapshots often see BatchKVCache for the unquantized last layer.
+    # Collapse B=1 into a row KVCache (same as extract(0)); multi-row must
+    # be extracted before store.
+    if isinstance(c, lm_cache.BatchKVCache):
+        idx = int(getattr(c, "_idx", 0) or 0)
+        if c.keys is None or c.values is None or idx <= 0:
+            return lm_cache.KVCache()
+        if int(c.keys.shape[0]) != 1:
+            return None
+        row = c.extract(0)
+        off = int(getattr(row, "offset", 0) or 0)
+        if row.keys is not None and row.values is not None and off > 0:
+            keys = _copy_mlx_array(row.keys[..., :off, :])
+            values = _copy_mlx_array(row.values[..., :off, :])
+            step = int(getattr(row, "step", getattr(type(row), "step", 256)) or 0)
+            keys, values = _pad_kv_for_capacity(
+                keys,
+                values,
+                offset=off,
+                min_capacity_tokens=min_capacity_tokens,
+                step=step,
+            )
+            row.keys = keys
+            row.values = values
+            row.offset = off
+            eval_targets.extend([keys, values])
+        return row
+
     if isinstance(c, lm_cache.RotatingKVCache):
         out = type(c)(
             max_size=int(getattr(c, "max_size")),
@@ -289,6 +319,7 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
         c,
         (
             lm_cache.KVCache,
+            lm_cache.BatchKVCache,
             lm_cache.RotatingKVCache,
             lm_cache.ChunkedKVCache,
             lm_cache.ArraysCache,
@@ -3055,6 +3086,13 @@ class APCManager:
         token_tuple = tuple(int(t) for t in token_ids)
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
+            types = [type(c).__name__ for c in prompt_cache]
+            logger.warning(
+                "APC exact-cache store rejected: unclonable prompt cache types %s "
+                "(token_len=%d). Exact-mode APC will not reuse this prefix.",
+                types,
+                len(token_tuple),
+            )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False

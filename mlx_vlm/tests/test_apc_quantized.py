@@ -16,12 +16,20 @@ from mlx_vlm.apc import (
     APCManager,
     _cache_entry_supports_block_apc,
     _cache_entry_supports_exact_apc,
+    _clone_cache_entry_for_apc,
+    _clone_prompt_cache_for_apc,
     harvest_blocks_from_batch_cache,
     make_warm_batch_kv_cache,
     make_warm_kv_cache,
     model_apc_mode,
 )
-from mlx_vlm.models.cache import BatchQuantizedKVCache, KVCache, QuantizedKVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchQuantizedKVCache,
+    KVCache,
+    QuantizedKVCache,
+)
 
 # Small dimensions: fast tests, no GPU pressure
 B, H, D = 1, 2, 32
@@ -515,6 +523,63 @@ class TestExactModeQuantized:
         assert matched_tokens == len(token_ids)
         assert warm is not None
         assert len(warm) == 2
+
+    def test_hybrid_batch_kv_and_quantized_exact_store(self):
+        """Exact store works for the --kv-bits hybrid layout (pinglin / #1534).
+
+        With kv-bits, single-row continuous-batching uses batch cache classes
+        even for B=1: ArraysCache (SSM) + BatchKVCache (unquantized last
+        attention layer) + BatchQuantizedKVCache. store_exact_cache must
+        clone this mix rather than silently returning False.
+        """
+        seq_len = 2 * BLOCK_SIZE
+        token_ids = list(range(seq_len))
+
+        arrays = ArraysCache(2)
+        arrays.cache = [
+            mx.zeros((1, seq_len, D)),
+            mx.zeros((1, seq_len, D)),
+        ]
+        arrays.left_padding = mx.array([0])
+
+        batch_kv = BatchKVCache([0])
+        k, v = _rand_kv(batch=1, seq_len=seq_len)
+        batch_kv.update_and_fetch(k, v)
+
+        batch_q = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        kq, vq = _rand_kv(batch=1, seq_len=seq_len)
+        batch_q.update_and_fetch(kq, vq)
+        mx.eval(batch_kv.keys, batch_q.keys)
+
+        prompt_cache = [arrays, batch_kv, batch_q]
+        assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
+
+        # Clone path: BatchKVCache collapses to KVCache; quant dequants to KVCache.
+        eval_targets: list = []
+        cloned_bk = _clone_cache_entry_for_apc(
+            batch_kv, min_capacity_tokens=None, eval_targets=eval_targets
+        )
+        assert isinstance(cloned_bk, KVCache)
+        assert cloned_bk.offset == seq_len
+
+        cloned = _clone_prompt_cache_for_apc(prompt_cache)
+        assert cloned is not None
+        assert len(cloned) == 3
+        assert isinstance(cloned[0], ArraysCache)
+        assert isinstance(cloned[1], KVCache)
+        assert isinstance(cloned[2], KVCache)
+
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        stored = manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
+        assert stored is True
+        assert manager.stats.exact_stores == 1
+
+        warm, matched_tokens = manager.lookup_exact_cache(
+            token_ids + [999], extra_hash=0
+        )
+        assert matched_tokens == len(token_ids)
+        assert warm is not None
+        assert len(warm) == 3
 
 
 # ---------------------------------------------------------------------------
