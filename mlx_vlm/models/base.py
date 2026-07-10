@@ -12,7 +12,7 @@ from PIL import Image
 
 from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
 from ..turboquant import _state_length as _turboquant_state_length
-from .cache import create_causal_mask
+from .cache import BatchQuantizedKVCache, create_causal_mask
 
 
 def load_chat_template(tokenizer, model_path):
@@ -309,6 +309,21 @@ def scaled_dot_product_attention(
 
     if isinstance(cache, BatchTurboQuantKVCache):
         dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    if isinstance(cache, BatchQuantizedKVCache):
+        dequantized_keys = mx.dequantize(
+            *keys, group_size=cache.group_size, bits=cache.bits
+        )
+        dequantized_values = mx.dequantize(
+            *values, group_size=cache.group_size, bits=cache.bits
+        )
         return mx.fast.scaled_dot_product_attention(
             queries,
             dequantized_keys.astype(queries.dtype),

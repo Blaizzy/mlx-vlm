@@ -305,5 +305,39 @@ class TestBatchGeneratorIntegration:
         assert gen.kv_bits is None
 
 
+class TestMultiRowAttention:
+    """Concurrent multi-row quantized attention (regression for #1562)."""
+
+    def _causal_mask(self, batch, seq_len):
+        rinds = mx.arange(seq_len)
+        causal = (rinds[:, None] >= rinds[None]).reshape(1, 1, seq_len, seq_len)
+        return mx.broadcast_to(causal, (batch, 1, seq_len, seq_len))
+
+    def test_multi_row_gqa_prefill_matches_single_row(self):
+        from mlx_vlm.models.base import scaled_dot_product_attention
+
+        n_q_heads, L = 8, 5  # GQA: 8 query heads over H=4 kv heads
+        scale = 1.0 / (D**0.5)
+        mx.random.seed(0)
+        q = mx.random.normal((B, n_q_heads, L, D))
+        k, v = _rand_kv(B, L)
+        mask = self._causal_mask(B, L)
+
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        qk, qv = cache.update_and_fetch(k, v)
+        out = scaled_dot_product_attention(q, qk, qv, cache, scale=scale, mask=mask)
+
+        single = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        qk0, qv0 = single.update_and_fetch(k[:1], v[:1])
+        out0 = scaled_dot_product_attention(
+            q[:1], qk0, qv0, single, scale=scale, mask=mask[:1]
+        )
+        mx.eval(out, out0)
+
+        assert out.shape == (B, n_q_heads, L, D)
+        # Row 0 must not depend on the co-batched row 1.
+        assert mx.abs(out[:1] - out0).max().item() < 1e-5
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
