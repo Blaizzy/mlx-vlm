@@ -1739,11 +1739,9 @@ class PromptProcessingBatch:
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
     def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
-        # Single-request cold batches use an unbatched cache that is already
-        # row-specific, so there is nothing to extract.
-        if batch_idx == 0 and len(self.uids) == 1 and self._right_pad_per_row is None:
-            return self.prompt_cache
-        return _apc.extract_prompt_cache_from_batch(self.prompt_cache, batch_idx)
+        # Always row-normalize so exact store never sees Batch* dialects
+        # (including B=1 under --kv-bits). Single-row caches clone in place.
+        return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
 
     def _store_apc_exact_checkpoints(self) -> None:
         if self._apc_manager is None or self._apc_mode != "exact":

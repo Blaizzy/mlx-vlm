@@ -1049,6 +1049,15 @@ class BatchKVCache(_BaseCache):
         return self.keys is None
 
     @property
+    def batch_size(self):
+        if self.keys is not None:
+            return int(self.keys.shape[0])
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
+
+    @property
     def nbytes(self):
         if self.keys is None:
             return 0
@@ -1407,6 +1416,15 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys is None
 
     @property
+    def batch_size(self):
+        if self.keys is not None:
+            return int(self.keys.shape[0])
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
+
+    @property
     def nbytes(self):
         if self.keys is None:
             return 0
@@ -1673,6 +1691,22 @@ class BatchQuantizedKVCache(_BaseCache):
             self.keys, self.values, self._idx, self.group_size, self.bits
         )
 
+    def extract(self, idx):
+        """Extract one batch row as a single-sequence QuantizedKVCache."""
+        cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
+        if self.keys is None or self._idx == 0:
+            return cache
+        padding = int(self.left_padding[idx].item())
+        end = self._idx
+        cache.keys = tuple(
+            mx.contiguous(k[idx : idx + 1, :, padding:end, :]) for k in self.keys
+        )
+        cache.values = tuple(
+            mx.contiguous(v[idx : idx + 1, :, padding:end, :]) for v in self.values
+        )
+        cache.offset = int(cache.keys[0].shape[2])
+        return cache
+
     def filter(self, batch_indices: mx.array):
         """Keep only the sequences at *batch_indices*."""
         if self.keys is not None:
@@ -1784,6 +1818,15 @@ class BatchQuantizedKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    @property
+    def batch_size(self):
+        if self.keys is not None:
+            return int(self.keys[0].shape[0])
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
         return create_causal_mask(
