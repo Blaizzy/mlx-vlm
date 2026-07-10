@@ -1199,7 +1199,11 @@ class BatchRotatingKVCache(_BaseCache):
         return self.keys, self.values
 
     def update_and_fetch(self, keys, values):
-        if keys.shape[2] == 1:
+        # Single-token updates normally use the in-place decode path. While
+        # right-padding bookkeeping is active (_lengths set by prepare()), the
+        # last prefill step may still be S=1; that must go through concat so
+        # pad tokens are tracked until finalize() rolls them out.
+        if keys.shape[2] == 1 and self._lengths is None:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
 

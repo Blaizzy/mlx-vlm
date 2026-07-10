@@ -557,6 +557,32 @@ def _fill_batch_turbo(left_padding, seq_len, bits=4.0):
     return cache, k, v
 
 
+class TestBatchRotatingRightPadPrefill:
+    """S=1 prefill while right-pad bookkeeping is active must not crash.
+
+    APC multi-row warm paths with unequal suffix lengths call prepare(right_padding=…)
+    then may issue a final single-token prefill before finalize().
+    """
+
+    def test_single_token_update_while_lengths_pending(self):
+        cache = BatchRotatingKVCache(32, [0, 0])
+        # Prefill a few tokens
+        k, v = _rand_kv(batch=2, seq_len=4)
+        cache.update_and_fetch(k, v)
+        # Simulate APC mixed-prefill right-pad bookkeeping
+        cache.prepare(right_padding=[1, 0], lengths=[2, 3])
+        assert cache._lengths is not None
+        # Final prefill step is often S=1
+        k1, v1 = _rand_kv(batch=2, seq_len=1)
+        out_k, out_v = cache.update_and_fetch(k1, v1)
+        assert out_k is not None
+        cache.finalize()
+        assert cache._lengths is None
+        # Decode path after finalize
+        k2, v2 = _rand_kv(batch=2, seq_len=1)
+        cache.update_and_fetch(k2, v2)
+
+
 class TestBatchTurboQuantParity:
     def test_batch_size_and_is_single_row(self):
         from mlx_vlm.turboquant import BatchTurboQuantKVCache
