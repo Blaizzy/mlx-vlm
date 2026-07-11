@@ -49,9 +49,9 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -154,6 +154,23 @@ def _clone_cache_entry_for_apc(
             eval_targets.extend([keys, values])
         return out
 
+    # Batch caches expose extract + is_single_row; collapse to a single-row
+    # entry before cloning. Multi-row stores should call snapshot_prompt_cache_row.
+    if callable(getattr(c, "extract", None)) and callable(
+        getattr(c, "is_single_row", None)
+    ):
+        if not c.is_single_row():
+            return None
+        if c.empty():
+            if isinstance(c, lm_cache.BatchRotatingKVCache):
+                return lm_cache.RotatingKVCache(max_size=int(c.max_size))
+            return lm_cache.KVCache()
+        return _clone_cache_entry_for_apc(
+            c.extract(0),
+            min_capacity_tokens=min_capacity_tokens,
+            eval_targets=eval_targets,
+        )
+
     if isinstance(c, lm_cache.RotatingKVCache):
         out = type(c)(
             max_size=int(getattr(c, "max_size")),
@@ -221,6 +238,19 @@ def _clone_cache_entry_for_apc(
             return None
         return tuple(copied)
 
+    # Protocol fallback: any cache with dequantize_for_apc (e.g. QuantizedKVCache)
+    # is cloned by dequantizing into a plain KVCache for exact-mode storage.
+    if hasattr(c, "dequantize_for_apc"):
+        dk, dv = c.dequantize_for_apc()
+        if dk is None or dv is None:
+            return lm_cache.KVCache()
+        out = lm_cache.KVCache()
+        out.keys = _copy_mlx_array(dk)
+        out.values = _copy_mlx_array(dv)
+        out.offset = dk.shape[-2]
+        eval_targets.extend([out.keys, out.values])
+        return out
+
     return None
 
 
@@ -276,11 +306,16 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
         c,
         (
             lm_cache.KVCache,
+            lm_cache.BatchKVCache,
+            lm_cache.BatchRotatingKVCache,
+            lm_cache.BatchQuantizedKVCache,
             lm_cache.RotatingKVCache,
             lm_cache.ChunkedKVCache,
             lm_cache.ArraysCache,
         ),
     ):
+        return True
+    if hasattr(c, "dequantize_for_apc"):
         return True
     if isinstance(c, lm_cache.CacheList):
         return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
@@ -292,7 +327,11 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
 def _cache_entry_supports_block_apc(c: Any) -> bool:
     from .models import cache as lm_cache
 
-    return isinstance(c, lm_cache.KVCache)
+    if isinstance(c, lm_cache.KVCache):
+        return True
+    if hasattr(c, "dequantize_for_apc"):
+        return True
+    return False
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
@@ -523,6 +562,14 @@ class APCStats:
     disk_writes: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
+    rejects: int = 0
+    rejects_by_reason: Dict[str, int] = field(default_factory=dict)
+    last_reject: Optional[Dict[str, Any]] = None
+
+    def record_reject(self, reason: str, **details: Any) -> None:
+        self.rejects += 1
+        self.rejects_by_reason[reason] = self.rejects_by_reason.get(reason, 0) + 1
+        self.last_reject = {"reason": reason, **details}
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -542,6 +589,11 @@ class APCStats:
             "disk_writes": self.disk_writes,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
+            "rejects": self.rejects,
+            "rejects_by_reason": dict(self.rejects_by_reason),
+            "last_reject": (
+                dict(self.last_reject) if self.last_reject is not None else None
+            ),
         }
 
 
@@ -3036,6 +3088,19 @@ class APCManager:
         token_tuple = tuple(int(t) for t in token_ids)
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
+            types = [type(c).__name__ for c in prompt_cache]
+            logger.warning(
+                "APC exact-cache store rejected: unclonable prompt cache types %s "
+                "(token_len=%d). Exact-mode APC will not reuse this prefix.",
+                types,
+                len(token_tuple),
+            )
+            with self.lock:
+                self.stats.record_reject(
+                    "unclonable",
+                    types=types,
+                    token_len=len(token_tuple),
+                )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
@@ -3386,18 +3451,37 @@ class APCManager:
 def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
     min_capacity_tokens: Optional[int] = None,
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Stitch matched blocks into per-layer ``KVCache`` instances pre-filled
+    """Stitch matched blocks into per-layer cache instances pre-filled
     with the cached prefix's K/V state. Used by the single-stream
     ``stream_generate`` path.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    returns ``QuantizedKVCache`` instances that re-quantize the raw float
+    blocks via ``update_and_fetch``.
     """
-    from .models.cache import KVCache
+    from .models.cache import KVCache, QuantizedKVCache
 
     if not matched_blocks:
         return []
     num_layers = len(matched_blocks[0].keys)
     out: List[Any] = []
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
+
+    if kv_quant_config is not None:
+        qbits = int(kv_quant_config["bits"])
+        qgroup = int(kv_quant_config["group_size"])
+        for layer_idx in range(num_layers):
+            ks = [b.keys[layer_idx] for b in matched_blocks]
+            vs = [b.values[layer_idx] for b in matched_blocks]
+            merged_k = mx.concatenate(ks, axis=2)
+            merged_v = mx.concatenate(vs, axis=2)
+            c = QuantizedKVCache(group_size=qgroup, bits=qbits)
+            c.update_and_fetch(merged_k, merged_v)
+            out.append(c)
+        return out
+
     step_probe = KVCache()
     kv_step = int(getattr(step_probe, "step", getattr(KVCache, "step", 256)))
     capacity = prefix_len
@@ -3432,30 +3516,47 @@ def make_warm_kv_cache_from_layers(
     layer_keys: List[mx.array],
     layer_values: List[mx.array],
     prefix_len: int,
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Build ``KVCache`` objects from already-concatenated disk-restored K/V."""
-    from .models.cache import KVCache
+    """Build cache objects from already-concatenated disk-restored K/V.
+
+    When *kv_quant_config* is provided, returns ``QuantizedKVCache`` instances.
+    """
+    from .models.cache import KVCache, QuantizedKVCache
 
     out: List[Any] = []
-    for k, v in zip(layer_keys, layer_values):
-        c = KVCache()
-        c.keys = k
-        c.values = v
-        c.offset = prefix_len
-        out.append(c)
+    if kv_quant_config is not None:
+        qbits = int(kv_quant_config["bits"])
+        qgroup = int(kv_quant_config["group_size"])
+        for k, v in zip(layer_keys, layer_values):
+            c = QuantizedKVCache(group_size=qgroup, bits=qbits)
+            c.update_and_fetch(k, v)
+            out.append(c)
+    else:
+        for k, v in zip(layer_keys, layer_values):
+            c = KVCache()
+            c.keys = k
+            c.values = v
+            c.offset = prefix_len
+            out.append(c)
     mx.clear_cache()
     return out
 
 
 def make_warm_batch_kv_cache(
     matched_blocks: List[APCBlock],
+    kv_quant_config: Optional[dict] = None,
 ) -> List[Any]:
-    """Stitch matched blocks into per-layer single-row ``BatchKVCache``
-    instances pre-filled with the cached prefix's K/V state. Used by the
-    batched continuous-batching path; the resulting cache list can be
+    """Stitch matched blocks into per-layer single-row batch cache instances
+    pre-filled with the cached prefix's K/V state. Used by the batched
+    continuous-batching path; the resulting cache list can be
     ``extend()``-ed into a running batch.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    returns ``BatchQuantizedKVCache`` instances that re-quantize the raw float
+    blocks via ``update_and_fetch``.
     """
-    from .models.cache import BatchKVCache
+    from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     if not matched_blocks:
         return []
@@ -3467,14 +3568,21 @@ def make_warm_batch_kv_cache(
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
         merged_v = mx.concatenate(vs, axis=2)
-        c = BatchKVCache(left_padding=[0])
-        # state setter: (keys, values, offset, left_padding) → also sets _idx
-        c.state = (
-            merged_k,
-            merged_v,
-            mx.array([prefix_len]),
-            mx.array([0]),
-        )
+        if kv_quant_config is not None:
+            c = BatchQuantizedKVCache(
+                [0],
+                group_size=int(kv_quant_config["group_size"]),
+                bits=int(kv_quant_config["bits"]),
+            )
+            c.update_and_fetch(merged_k, merged_v)
+        else:
+            c = BatchKVCache(left_padding=[0])
+            c.state = (
+                merged_k,
+                merged_v,
+                mx.array([prefix_len]),
+                mx.array([0]),
+            )
         out.append(c)
     return out
 
@@ -3482,11 +3590,16 @@ def make_warm_batch_kv_cache(
 def make_warm_batch_kv_cache_multi(
     picks: List[Optional[dict]],
     num_layers: int,
+    kv_quant_config: Optional[dict] = None,
 ) -> Tuple[List[Any], int]:
-    """Build a multi-row ``BatchKVCache`` list for mixed warm / cold prefill.
+    """Build a multi-row batch cache list for mixed warm / cold prefill.
 
     ``picks`` is per-row, with each entry being ``None`` (cold) or a dict
     with key ``matched_blocks`` (list of APCBlock) and ``prefix_len``.
+
+    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
+    returns ``BatchQuantizedKVCache`` instances that re-quantize the raw float
+    blocks via ``update_and_fetch``.
 
     Returns ``(cache_list, max_prefix)`` where ``max_prefix`` is the cache's
     ``_idx`` after warm-init (= max prefix_len across rows).
@@ -3496,7 +3609,7 @@ def make_warm_batch_kv_cache_multi(
       * keys[i, :, left_padding[i]:max_prefix, :] = concatenated block K
       * keys[i, :, :left_padding[i], :] = zeros (will be hidden by mask)
     """
-    from .models.cache import BatchKVCache
+    from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     B = len(picks)
     prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3552,13 +3665,21 @@ def make_warm_batch_kv_cache_multi(
 
         left_padding = [max_prefix - pl for pl in prefix_lens]
         offset = [pl for pl in prefix_lens]
-        c = BatchKVCache(left_padding=[0] * B)  # placeholder; state setter overrides
-        c.state = (
-            merged_k,
-            merged_v,
-            mx.array(offset),
-            mx.array(left_padding),
-        )
+        if kv_quant_config is not None:
+            c = BatchQuantizedKVCache(
+                left_padding,
+                group_size=int(kv_quant_config["group_size"]),
+                bits=int(kv_quant_config["bits"]),
+            )
+            c.update_and_fetch(merged_k, merged_v)
+        else:
+            c = BatchKVCache(left_padding=[0] * B)
+            c.state = (
+                merged_k,
+                merged_v,
+                mx.array(offset),
+                mx.array(left_padding),
+            )
         out.append(c)
     return out, max_prefix
 
@@ -3691,6 +3812,102 @@ def extract_prompt_cache_from_batch(
     return out
 
 
+def _prompt_cache_is_batch_shaped(caches: Sequence[Any]) -> bool:
+    """True when every entry can row-extract (Batch* / ArraysCache layout)."""
+    if not caches:
+        return False
+    return all(callable(getattr(c, "extract", None)) for c in caches)
+
+
+def snapshot_prompt_cache_row(
+    caches: Sequence[Any],
+    batch_idx: int = 0,
+    *,
+    min_capacity_tokens: Optional[int] = None,
+) -> Optional[List[Any]]:
+    """Row-normalize a prompt cache for APC store/lookup.
+
+    Batch-shaped layouts (every entry has ``extract``) are extracted first.
+    Single-row caches are cloned in place. Quantized layers are dequantized
+    into float ``KVCache`` entries.
+    """
+    if not caches:
+        return []
+    source: Sequence[Any] = caches
+    if _prompt_cache_is_batch_shaped(caches):
+        row = extract_prompt_cache_from_batch(caches, batch_idx)
+        if row is None:
+            return None
+        source = row
+    return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
+
+
+def layer_kv_for_apc(
+    c: Any,
+    batch_idx: Optional[int] = None,
+) -> Tuple[Optional[mx.array], Optional[mx.array]]:
+    """Return float K/V for one layer for block-mode APC harvest.
+
+    Prefer this over slicing ``c.keys`` directly: quantized caches store keys
+    as a tuple and dense slicing raises TypeError.
+    """
+    if hasattr(c, "dequantize_for_apc"):
+        dk, dv = c.dequantize_for_apc()
+        if dk is None or dv is None:
+            return None, None
+        left_padding = getattr(c, "left_padding", None)
+        lp = 0
+        if batch_idx is not None and left_padding is not None:
+            try:
+                lp = int(left_padding[batch_idx].item())
+            except Exception:
+                lp = 0
+        if batch_idx is not None and int(dk.shape[0]) > 1:
+            return (
+                dk[batch_idx : batch_idx + 1, :, lp:, :],
+                dv[batch_idx : batch_idx + 1, :, lp:, :],
+            )
+        if lp > 0:
+            return dk[..., lp:, :], dv[..., lp:, :]
+        return dk, dv
+
+    keys = getattr(c, "keys", None)
+    values = getattr(c, "values", None)
+    if keys is None or values is None:
+        return None, None
+    # Tuple keys without dequantize_for_apc cannot be sliced as dense arrays.
+    if isinstance(keys, tuple) or isinstance(values, tuple):
+        return None, None
+
+    left_padding = getattr(c, "left_padding", None)
+    idx = getattr(c, "_idx", None)
+    if idx is None:
+        off = getattr(c, "offset", None)
+        if off is None:
+            return None, None
+        try:
+            end = int(off)
+        except Exception:
+            return None, None
+        return keys[..., :end, :], values[..., :end, :]
+
+    lp = 0
+    if batch_idx is not None and left_padding is not None:
+        try:
+            lp = int(left_padding[batch_idx].item())
+        except Exception:
+            lp = 0
+    end = int(idx)
+    if batch_idx is not None and int(keys.shape[0]) > 1:
+        return (
+            keys[batch_idx : batch_idx + 1, :, lp:end, :],
+            values[batch_idx : batch_idx + 1, :, lp:end, :],
+        )
+    if lp > 0:
+        return keys[..., lp:end, :], values[..., lp:end, :]
+    return keys[..., :end, :], values[..., :end, :]
+
+
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],
@@ -3708,28 +3925,14 @@ def harvest_blocks_from_batch_cache(
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
     for c in batch_caches:
-        keys = getattr(c, "keys", None)
-        values = getattr(c, "values", None)
-        idx = getattr(c, "_idx", None)
-        # Regular KVCache (non-batch) — e.g. from make_speculative_prompt_cache
-        # used with MTP draft model + batch_size=1. These entries carry
-        # ``offset`` instead of ``_idx`` and have no ``left_padding``.
-        if idx is None and keys is not None and values is not None:
-            idx = getattr(c, "offset", None)
-        left_padding = getattr(c, "left_padding", None)
-        if keys is None or values is None or idx is None:
+        k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
+        if k is None or v is None:
             return []
-        # Pull this batch row, dropping any left-padding for this seq.
-        if left_padding is not None:
-            try:
-                lp = int(left_padding[batch_idx].item())
-            except Exception:
-                lp = 0
-        else:
-            lp = 0
-        # shape after slicing: [1, H, idx-lp, D]
-        layer_keys.append(keys[batch_idx : batch_idx + 1, :, lp:idx, :])
-        layer_values.append(values[batch_idx : batch_idx + 1, :, lp:idx, :])
+        if int(k.shape[0]) != 1:
+            k = k[batch_idx : batch_idx + 1]
+            v = v[batch_idx : batch_idx + 1]
+        layer_keys.append(k)
+        layer_values.append(v)
     return apc_manager.store_kv_blocks(
         full_token_ids,
         layer_keys,
