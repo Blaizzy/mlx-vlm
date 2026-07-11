@@ -781,8 +781,10 @@ Common APC environment variables:
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
 | `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
+| `APC_TRACE` | unset | Set to `1` for greppable store/reject/self-check log lines |
 
 APC is disabled automatically for models that use a custom cache layout. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; the reusable APC pool stores dequantized float K/V, so pool size does not shrink with quant.
+When APC is enabled on the server, a non-fatal layout self-check runs at model load.
 
 #### KV Cache Quantization
 
