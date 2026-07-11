@@ -112,10 +112,6 @@ class DetectorModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids, attention_mask)
 
-        # 3. Combine text + optional geometry prompts
-        prompt = inputs_embeds
-        prompt_mask = attention_mask
-
         # 4. DETR Encoder: uses LAST level of trimmed FPN (72x72)
         encoder_feat = fpn_features_trimmed[-1]  # (B, 72, 72, D)
         encoder_pos = fpn_pos_trimmed[-1]  # (B, 72, 72, D)
@@ -124,6 +120,35 @@ class DetectorModel(nn.Module):
         # Flatten: (B, H, W, D) -> (B, HW, D)
         src = encoder_feat.reshape(B, H * W, D)
         pos_flat = encoder_pos.reshape(B, H * W, D)
+
+        prompt = inputs_embeds
+        prompt_mask = attention_mask
+
+        if boxes is not None and boxes.shape[1] > 0:
+            n_boxes = boxes.shape[1]
+            box_labels = mx.ones((boxes.shape[0], n_boxes), dtype=mx.int32)
+            box_mask = mx.ones((boxes.shape[0], n_boxes), dtype=mx.bool_)
+            geom_feats, geom_mask = self.geometry_encoder(
+                boxes, box_labels, box_mask, encoder_feat, encoder_pos
+            )
+
+            if prompt.shape[0] == 1 and geom_feats.shape[0] > 1:
+                prompt = mx.broadcast_to(
+                    prompt, (geom_feats.shape[0],) + prompt.shape[1:]
+                )
+            prompt = mx.concatenate([prompt, geom_feats], axis=1)
+
+            if prompt_mask is None:
+                prompt_mask = mx.ones(
+                    (prompt.shape[0], inputs_embeds.shape[1]), dtype=geom_mask.dtype
+                )
+            elif prompt_mask.shape[0] == 1 and geom_mask.shape[0] > 1:
+                prompt_mask = mx.broadcast_to(
+                    prompt_mask, (geom_mask.shape[0], prompt_mask.shape[1])
+                )
+            prompt_mask = mx.concatenate(
+                [prompt_mask.astype(geom_mask.dtype), geom_mask], axis=1
+            )
 
         encoded = self.detr_encoder(src, pos_flat, prompt, prompt_mask)
 
