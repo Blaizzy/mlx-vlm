@@ -63,6 +63,29 @@ DEFAULT_NUM_BLOCKS = 2048
 SEED_PARENT_HASH = 0
 
 
+def _env_truthy(name: str, default: str = "") -> bool:
+    """Return True when env var is a common truthy string (1/true/yes)."""
+    return os.environ.get(name, default).lower() in ("1", "true", "yes")
+
+
+def apc_trace_enabled() -> bool:
+    """Optional request-path tracing (``APC_TRACE=1``), sibling of ``APC_DISK_TRACE``."""
+    return _env_truthy("APC_TRACE")
+
+
+def apc_trace(event: str, **fields: Any) -> None:
+    """Emit a single greppable ``APC_TRACE`` log line when tracing is enabled.
+
+    Kept separate from stats counters: stats are always-on aggregates; trace is
+    opt-in detail for debugging store/lookup/reject/self-check paths.
+    """
+    if not apc_trace_enabled():
+        return
+    parts = " ".join(f"{key}={value}" for key, value in fields.items())
+    msg = f"APC_TRACE {event}" + (f" {parts}" if parts else "")
+    logger.info(msg)
+
+
 def _hash_use_sha256() -> bool:
     return os.environ.get("APC_HASH", "fast").lower() == "sha256"
 
@@ -570,6 +593,7 @@ class APCStats:
         self.rejects += 1
         self.rejects_by_reason[reason] = self.rejects_by_reason.get(reason, 0) + 1
         self.last_reject = {"reason": reason, **details}
+        apc_trace("reject", reason=reason, **details)
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -2061,7 +2085,7 @@ class DiskBlockStore:
         """
         if not block_hashes:
             return None
-        trace = os.environ.get("APC_DISK_TRACE", "").lower() in ("1", "true", "yes")
+        trace = _env_truthy("APC_DISK_TRACE")
         trace_t0 = time.perf_counter()
 
         entries: List[Tuple[Path, int]] = []
@@ -3116,6 +3140,14 @@ class APCManager:
                 while len(self._exact_cache) > self._exact_cache_max:
                     self._exact_cache.popitem(last=False)
                 stored = True
+        if stored:
+            apc_trace(
+                "store",
+                mode="exact",
+                ok=True,
+                token_len=len(token_tuple),
+                layers=len(copied),
+            )
         if self.disk is not None:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
@@ -3965,6 +3997,172 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
 
 def model_supports_apc(language_model: Any) -> bool:
     return model_apc_mode(language_model) is not None
+
+
+@dataclass(frozen=True)
+class LayerSupport:
+    """Per-layer result from :func:`classify_layer_for_apc`."""
+
+    type_name: str
+    status: str  # "ok" | "empty_ok" | "unsupported"
+    reason: Optional[str] = None
+
+
+@dataclass
+class APCSelfCheckResult:
+    """Outcome of a dry-run layout check (startup self-check / diagnostics)."""
+
+    ok: bool
+    apc_mode: Optional[str]
+    layer_count: int
+    layer_types: List[str]
+    unsupported: List[LayerSupport] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+
+def classify_layer_for_apc(c: Any) -> LayerSupport:
+    """Classify whether one prompt-cache layer can be snapshotted for APC.
+
+    Uses the same clone path as exact store so startup checks match runtime.
+    Empty layers that clone to a storage-native type count as ``empty_ok``.
+    """
+    type_name = type(c).__name__
+    is_empty = False
+    empty_fn = getattr(c, "empty", None)
+    if callable(empty_fn):
+        try:
+            is_empty = bool(empty_fn())
+        except Exception:
+            is_empty = False
+
+    eval_targets: List[mx.array] = []
+    try:
+        copied = _clone_cache_entry_for_apc(
+            c,
+            min_capacity_tokens=None,
+            eval_targets=eval_targets,
+        )
+    except Exception as exc:
+        return LayerSupport(
+            type_name=type_name,
+            status="unsupported",
+            reason=f"clone_error:{type(exc).__name__}",
+        )
+    if copied is None:
+        return LayerSupport(
+            type_name=type_name,
+            status="unsupported",
+            reason="unclonable",
+        )
+    return LayerSupport(
+        type_name=type_name,
+        status="empty_ok" if is_empty else "ok",
+    )
+
+
+def validate_prompt_cache_layout(
+    caches: Sequence[Any],
+    *,
+    apc_mode: Optional[str] = None,
+) -> APCSelfCheckResult:
+    """Validate a prompt-cache layout for APC without running a model forward."""
+    layer_types = [type(c).__name__ for c in caches]
+    unsupported = [
+        layer
+        for layer in (classify_layer_for_apc(c) for c in caches)
+        if layer.status == "unsupported"
+    ]
+    return APCSelfCheckResult(
+        ok=not unsupported,
+        apc_mode=apc_mode,
+        layer_count=len(caches),
+        layer_types=layer_types,
+        unsupported=unsupported,
+    )
+
+
+def self_check_model_apc(
+    model: Any,
+    *,
+    kv_bits: Optional[float] = None,
+    log: bool = True,
+) -> APCSelfCheckResult:
+    """Dry-run APC layout check for a loaded model (or its ``language_model``).
+
+    Non-fatal by design: logs ERROR on failure and returns a result. Callers
+    (e.g. server load) should not crash solely because the check fails.
+    """
+    notes: List[str] = []
+    if kv_bits is not None:
+        notes.append(f"kv_bits={kv_bits}")
+
+    try:
+        language_model = (
+            model.language_model if hasattr(model, "language_model") else model
+        )
+        if not hasattr(language_model, "make_cache"):
+            result = APCSelfCheckResult(
+                ok=False,
+                apc_mode=None,
+                layer_count=0,
+                layer_types=[],
+                notes=notes + ["model has no make_cache"],
+            )
+        else:
+            apc_mode = model_apc_mode(language_model)
+            if apc_mode is None:
+                result = APCSelfCheckResult(
+                    ok=False,
+                    apc_mode=None,
+                    layer_count=0,
+                    layer_types=[],
+                    notes=notes + ["no APC-compatible cache layout"],
+                )
+            else:
+                caches = language_model.make_cache()
+                result = validate_prompt_cache_layout(caches, apc_mode=apc_mode)
+                result.notes = list(notes) + list(result.notes)
+    except Exception as exc:
+        result = APCSelfCheckResult(
+            ok=False,
+            apc_mode=None,
+            layer_count=0,
+            layer_types=[],
+            notes=notes + [f"self-check failed: {type(exc).__name__}: {exc}"],
+        )
+
+    if log:
+        types_s = ",".join(result.layer_types) if result.layer_types else "-"
+        if result.ok:
+            logger.info(
+                "APC self-check ok mode=%s layers=%d types=[%s]%s",
+                result.apc_mode,
+                result.layer_count,
+                types_s,
+                f" kv_bits={kv_bits}" if kv_bits is not None else "",
+            )
+        else:
+            bad = [
+                f"{layer.type_name}:{layer.reason or layer.status}"
+                for layer in result.unsupported
+            ]
+            logger.error(
+                "APC self-check failed mode=%s layers=%d unsupported=%s notes=%s",
+                result.apc_mode,
+                result.layer_count,
+                bad or result.notes,
+                result.notes,
+            )
+
+    apc_trace(
+        "self_check",
+        ok=result.ok,
+        mode=result.apc_mode,
+        layers=result.layer_count,
+        unsupported=len(result.unsupported),
+        kv_bits=kv_bits,
+    )
+    return result
 
 
 def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
