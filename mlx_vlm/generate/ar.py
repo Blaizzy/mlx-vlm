@@ -1739,11 +1739,7 @@ class PromptProcessingBatch:
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
     def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
-        # Single-request cold batches use an unbatched cache that is already
-        # row-specific, so there is nothing to extract.
-        if batch_idx == 0 and len(self.uids) == 1 and self._right_pad_per_row is None:
-            return self.prompt_cache
-        return _apc.extract_prompt_cache_from_batch(self.prompt_cache, batch_idx)
+        return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
 
     def _store_apc_exact_checkpoints(self) -> None:
         if self._apc_manager is None or self._apc_mode != "exact":
@@ -2130,11 +2126,9 @@ class BatchGenerator:
             top_logprobs_k = 0
             self.compute_logprobs = False
             self.top_logprobs_k = 0
-        # APC: opt-out for KV-quantized caches. Plain KV models use block APC;
+        # APC mode detection: plain KV models use block APC;
         # mixed/custom cache models use exact prompt-cache snapshots.
         self.apc_mode = None
-        if apc_manager is not None and kv_bits is not None:
-            apc_manager = None
         if apc_manager is not None:
             self.apc_mode = _apc.model_apc_mode(model)
             if self.apc_mode is None:
@@ -2428,8 +2422,13 @@ class BatchGenerator:
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
             )
+            _quant_cfg = (
+                {"bits": self.kv_bits, "group_size": self.kv_group_size}
+                if self.kv_bits is not None
+                else None
+            )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
-                picks, num_layers=num_layers
+                picks, num_layers=num_layers, kv_quant_config=_quant_cfg
             )
 
         apc_meta = [
