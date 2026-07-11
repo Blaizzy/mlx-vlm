@@ -51,6 +51,7 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     normalize_batched_shared_kv_states,
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
+from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -2257,6 +2258,12 @@ def test_kind_none_autodetects_mtp_for_deepseek_v4_mtp(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "mtp"
 
 
+def test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp(tmp_path):
+    path = _make_drafter_dir(tmp_path, "glm4_moe_lite_mtp")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
 def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     path = tmp_path / "drafter"
     path.mkdir()
@@ -3279,3 +3286,76 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
     assert "e_proj.weight" in weights
     assert "e_proj.scales" in weights
     assert "enorm.weight" in weights
+
+
+def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    cfg = {
+        "model_type": "glm4_moe_lite",
+        "hidden_size": 8,
+        "vocab_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "qk_nope_head_dim": 4,
+        "v_head_dim": 6,
+        "kv_lora_rank": 4,
+        "moe_intermediate_size": 4,
+        "n_routed_experts": 2,
+        "num_nextn_predict_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    (source / "config.json").write_text(json.dumps(cfg))
+    p = "model.layers.2."
+    weights = {
+        f"{p}embed_tokens.weight": mx.zeros((16, 8)),
+        f"{p}enorm.weight": mx.ones((8,)),
+        f"{p}hnorm.weight": mx.ones((8,)),
+        f"{p}eh_proj.weight": mx.zeros((8, 16)),
+        f"{p}input_layernorm.weight": mx.ones((8,)),
+        f"{p}post_attention_layernorm.weight": mx.ones((8,)),
+        f"{p}self_attn.kv_b_proj.weight": mx.arange(20 * 4)
+        .reshape(20, 4)
+        .astype(mx.bfloat16),
+        f"{p}self_attn.o_proj.weight": mx.zeros((8, 12)),
+        f"{p}self_attn.rotary_emb.inv_freq": mx.ones((2,)),
+        f"{p}mlp.gate.weight": mx.zeros((2, 8)),
+        f"{p}mlp.gate.e_score_correction_bias": mx.ones((2,), dtype=mx.float32),
+        f"{p}mlp.shared_experts.gate_proj.weight": mx.zeros((4, 8)),
+        f"{p}mlp.shared_experts.up_proj.weight": mx.zeros((4, 8)),
+        f"{p}mlp.shared_experts.down_proj.weight": mx.zeros((8, 4)),
+        f"{p}shared_head.norm.weight": mx.ones((8,)),
+        f"{p}shared_head.head.weight": mx.zeros((16, 8)),
+    }
+    for e in range(2):
+        weights[f"{p}mlp.experts.{e}.gate_proj.weight"] = mx.zeros((4, 8))
+        weights[f"{p}mlp.experts.{e}.up_proj.weight"] = mx.zeros((4, 8))
+        weights[f"{p}mlp.experts.{e}.down_proj.weight"] = mx.zeros((8, 4))
+    mx.save_safetensors(str(source / "model.safetensors"), weights, metadata={})
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    split_glm4_moe_lite_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        out_cfg = json.load(f)
+    out = mx.load(str(output / "model.safetensors"))
+    assert out_cfg["model_type"] == "glm4_moe_lite_mtp"
+    assert out_cfg["block_size"] == 2
+    assert out_cfg["text_config"]["model_type"] == "glm4_moe_lite"
+    # dedicated nextn embedding and untied head
+    assert "model.embed_tokens.weight" in out
+    assert "lm_head.weight" in out
+    # absorbed-MLA split replaces the fused kv_b_proj
+    assert "model.mtp_block.self_attn.kv_b_proj.weight" not in out
+    assert out["model.mtp_block.self_attn.embed_q.weight"].shape == (2, 4, 4)
+    assert out["model.mtp_block.self_attn.unembed_out.weight"].shape == (2, 6, 4)
+    # experts stacked into switch_mlp
+    assert out["model.mtp_block.mlp.switch_mlp.gate_proj.weight"].shape == (2, 4, 8)
+    assert not any(".experts.0." in k for k in out)
+    # router correction bias stays fp32
+    assert out["model.mtp_block.mlp.gate.e_score_correction_bias"].dtype == mx.float32
+    # non-parameter buffers are dropped
+    assert not any(k.endswith("rotary_emb.inv_freq") for k in out)

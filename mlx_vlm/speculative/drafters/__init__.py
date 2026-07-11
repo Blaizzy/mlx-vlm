@@ -13,6 +13,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "eagle3": "eagle3",
     "gemma4_assistant": "mtp",
     "gemma4_unified_assistant": "mtp",
+    "glm4_moe_lite_mtp": "mtp",
     "qwen3_5_mtp": "mtp",
 }
 
