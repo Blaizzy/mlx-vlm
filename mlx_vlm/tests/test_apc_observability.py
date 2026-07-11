@@ -13,6 +13,8 @@ from mlx_vlm.apc import (
     apc_trace,
     apc_trace_enabled,
     classify_layer_for_apc,
+    harvest_blocks_from_batch_cache,
+    model_apc_mode,
     self_check_model_apc,
     validate_prompt_cache_layout,
 )
@@ -75,6 +77,50 @@ class TestApcTrace:
         assert any("APC_TRACE reject" in r.message for r in caplog.records)
         assert any("unclonable" in r.message for r in caplog.records)
 
+    def test_block_store_emits_trace(self, monkeypatch, caplog):
+        monkeypatch.setenv("APC_TRACE", "1")
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        keys = [mx.zeros((1, 2, BLOCK_SIZE, 8), dtype=mx.float32)]
+        values = [mx.zeros((1, 2, BLOCK_SIZE, 8), dtype=mx.float32)]
+
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+            blocks = manager.store_kv_blocks(
+                list(range(BLOCK_SIZE)),
+                keys,
+                values,
+            )
+
+        assert len(blocks) == 1
+        assert any(
+            "APC_TRACE store mode=block" in r.message and "memory_blocks=1" in r.message
+            for r in caplog.records
+        )
+        manager.release(blocks)
+
+    def test_block_harvest_reject_emits_reason(self, monkeypatch, caplog):
+        monkeypatch.setenv("APC_TRACE", "1")
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+
+        class NoHarvestAdapter:
+            pass
+
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+            blocks = harvest_blocks_from_batch_cache(
+                manager,
+                [NoHarvestAdapter()],
+                0,
+                list(range(BLOCK_SIZE)),
+            )
+
+        assert blocks == []
+        assert manager.stats.rejects_by_reason["no_block_harvest_adapter"] == 1
+        assert any(
+            "APC_TRACE reject" in r.message
+            and "reason=no_block_harvest_adapter" in r.message
+            and "mode=block" in r.message
+            for r in caplog.records
+        )
+
 
 class TestClassifyLayer:
     def test_plain_kv_ok(self):
@@ -114,6 +160,21 @@ class TestClassifyLayer:
         result = classify_layer_for_apc(Bogus())
         assert result.status == "unsupported"
         assert result.reason
+
+    def test_exact_clone_is_materialized(self, monkeypatch):
+        c = KVCache()
+        c.update_and_fetch(
+            mx.zeros((1, 2, 4, 8), dtype=mx.float32),
+            mx.zeros((1, 2, 4, 8), dtype=mx.float32),
+        )
+
+        def fail_eval(*args, **kwargs):
+            raise RuntimeError("materialization failed")
+
+        monkeypatch.setattr("mlx_vlm.apc.mx.eval", fail_eval)
+        result = classify_layer_for_apc(c)
+        assert result.status == "unsupported"
+        assert result.reason == "clone_error:RuntimeError"
 
 
 class TestValidateLayout:
@@ -196,3 +257,122 @@ class TestSelfCheckModel:
         result = self_check_model_apc(FakeLang())
         assert result.ok is False
         assert result.notes
+
+    def test_runtime_cache_factory_failure_is_non_fatal(self):
+        class FakeLang:
+            def make_cache(self):
+                return [KVCache()]
+
+        def fail_factory():
+            raise RuntimeError("runtime cache construction failed")
+
+        result = self_check_model_apc(
+            FakeLang(),
+            cache_factory=fail_factory,
+            apc_mode="block",
+        )
+        assert result.ok is False
+        assert "runtime cache construction failed" in result.notes[-1]
+
+    @pytest.mark.parametrize(
+        ("kv_bits", "kv_quant_scheme", "expected_type"),
+        [
+            (8, "uniform", "BatchQuantizedKVCache"),
+            (3.5, "turboquant", "BatchTurboQuantKVCache"),
+        ],
+    )
+    def test_server_worker_checks_effective_quantized_runtime_layout(
+        self,
+        kv_bits,
+        kv_quant_scheme,
+        expected_type,
+    ):
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        class FakeLang:
+            def make_cache(self):
+                return [KVCache(), KVCache()]
+
+        worker = ResponseGenerator.__new__(ResponseGenerator)
+        worker.model = type("FakeVLM", (), {"language_model": FakeLang()})()
+        worker.kv_bits = kv_bits
+        worker.kv_group_size = GROUP_SIZE
+        worker.kv_quant_scheme = kv_quant_scheme
+
+        result = worker._run_apc_self_check()
+
+        assert result.ok is True
+        assert result.apc_mode == "block"
+        assert result.layer_types == [expected_type, expected_type]
+        assert f"kv_bits={kv_bits}" in result.notes
+        assert f"kv_quant_scheme={kv_quant_scheme}" in result.notes
+
+    def test_server_worker_checks_implicit_runtime_cache_layout(self):
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        class FakeLang:
+            layers = [object(), object()]
+
+        language_model = FakeLang()
+        assert model_apc_mode(language_model) == "block"
+
+        worker = ResponseGenerator.__new__(ResponseGenerator)
+        worker.model = type("FakeVLM", (), {"language_model": language_model})()
+        worker.kv_bits = None
+        worker.kv_group_size = GROUP_SIZE
+        worker.kv_quant_scheme = "uniform"
+
+        result = worker._run_apc_self_check()
+
+        assert result.ok is True
+        assert result.apc_mode == "block"
+        assert result.layer_types == ["BatchKVCache", "BatchKVCache"]
+
+    @pytest.mark.parametrize(
+        ("kv_bits", "kv_quant_scheme"),
+        [(8, "uniform"), (3.5, "turboquant")],
+    )
+    def test_effective_quantized_runtime_cache_harvests_and_traces(
+        self,
+        monkeypatch,
+        caplog,
+        kv_bits,
+        kv_quant_scheme,
+    ):
+        from mlx_vlm.generate.ar import _make_cache
+
+        class FakeLang:
+            def make_cache(self):
+                return [KVCache(), KVCache()]
+
+        caches = _make_cache(
+            FakeLang(),
+            [0],
+            kv_bits=kv_bits,
+            kv_group_size=GROUP_SIZE,
+            kv_quant_scheme=kv_quant_scheme,
+        )
+        for cache in caches:
+            cache.update_and_fetch(
+                mx.random.normal((1, 2, BLOCK_SIZE, GROUP_SIZE)),
+                mx.random.normal((1, 2, BLOCK_SIZE, GROUP_SIZE)),
+            )
+
+        monkeypatch.setenv("APC_TRACE", "1")
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+            blocks = harvest_blocks_from_batch_cache(
+                manager,
+                caches,
+                0,
+                list(range(BLOCK_SIZE)),
+            )
+
+        assert len(blocks) == 1
+        assert manager.stats.stores == 1
+        assert any(
+            "APC_TRACE store mode=block" in record.message
+            and "memory_blocks=1" in record.message
+            for record in caplog.records
+        )
+        manager.release(blocks)
