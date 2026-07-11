@@ -724,6 +724,14 @@ APC_NUM_BLOCKS=4096 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
 ```
 
+APC works with KV-cache quantization (`--kv-bits`):
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
+```
+
 Enable the persistent disk tier:
 
 ```sh
@@ -775,12 +783,12 @@ Common APC environment variables:
 | `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
 | `APC_TRACE` | unset | Set to `1` for greppable store/reject/self-check log lines |
 
-APC is disabled automatically for models that use a custom cache layout. On the server, APC is also skipped when KV-cache quantization is enabled.
+APC is disabled automatically for models that use a custom cache layout. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; the reusable APC pool stores dequantized float K/V, so pool size does not shrink with quant.
 When APC is enabled on the server, a non-fatal layout self-check runs at model load.
 
 #### KV Cache Quantization
 
-Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported:
+Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported. Compatible with Automatic Prefix Caching (`APC_ENABLED=1`).
 
 ```sh
 # Uniform 8-bit KV cache quantization
