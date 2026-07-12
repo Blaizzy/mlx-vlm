@@ -2248,5 +2248,36 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     assert all(block.ref_cnt == 0 for block in stored)
 
 
+class TestBatchTurboQuantizedKVStart:
+    def _cache_kinds(self, **kwargs):
+        from mlx_vlm.generate.ar import _make_cache
+
+        caches = _make_cache(
+            MockModel(),
+            [0],
+            kv_bits=3.5,
+            kv_quant_scheme="turboquant",
+            **kwargs,
+        )
+        return [type(c).__name__ for c in caches]
+
+    def test_defers_to_float_below_threshold(self):
+        kinds = self._cache_kinds(quantized_kv_start=5000, prefill_length=16)
+        assert "BatchTurboQuantKVCache" not in kinds
+        assert set(kinds) == {"BatchKVCache"}
+
+    def test_quantizes_at_or_above_threshold(self):
+        kinds = self._cache_kinds(quantized_kv_start=8, prefill_length=32)
+        assert "BatchTurboQuantKVCache" in kinds
+
+    def test_immediate_when_start_zero(self):
+        kinds = self._cache_kinds(quantized_kv_start=0, prefill_length=16)
+        assert "BatchTurboQuantKVCache" in kinds
+
+    def test_default_preserves_immediate_quantization(self):
+        kinds = self._cache_kinds()
+        assert "BatchTurboQuantKVCache" in kinds
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
