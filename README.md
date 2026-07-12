@@ -732,6 +732,21 @@ APC_NUM_BLOCKS=4096 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
 ```
 
+For hybrid/exact-mode models, `APC_EXACT_MAX_PROMPT_TOKENS` caps the prompt
+length eligible for exact-store (0/unset = unlimited). An exact snapshot's
+size scales linearly with prompt length while the cache is bounded by entry
+count, so deployments mixing recurring interactive prefixes with one-shot
+long prompts (document analysis, batch evaluation) can set the cap just
+above their interactive prompt scale: recurring prefixes keep their warm
+restores, one-shot long prompts stop leaving multi-GB cache residue (and
+stop paying the store's GPU-thread copy). Lookups are unaffected:
+
+```sh
+APC_ENABLED=1 \
+APC_EXACT_MAX_PROMPT_TOKENS=32768 \
+mlx_vlm.server --model mlx-community/Qwen3.5-4B-4bit --port 8080
+```
+
 Enable the persistent disk tier:
 
 ```sh

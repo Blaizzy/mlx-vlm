@@ -63,6 +63,28 @@ def _get_batch_cache_eval_interval() -> int:
         return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
 
 
+def _get_apc_exact_max_prompt_tokens() -> int:
+    """Prompt-length ceiling for APC exact-store eligibility (0 = unlimited).
+
+    An exact snapshot's size scales linearly with prompt length, while the
+    exact cache is bounded by ENTRY COUNT — so one workload's entry can weigh
+    two orders of magnitude more than another's. Deployments serving one-shot
+    long prompts (document analysis, batch evaluation) alongside recurring
+    interactive prefixes can cap storage just above their interactive prompt
+    scale: recurring prefixes keep their warm restores; one-shot long prompts
+    stop leaving multi-GB residue and stop paying the GPU-thread store copy.
+    Lookups are unaffected either way.
+    """
+    raw = os.environ.get("APC_EXACT_MAX_PROMPT_TOKENS")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("Ignoring invalid APC_EXACT_MAX_PROMPT_TOKENS=%r", raw)
+        return 0
+
+
 def _position_seed(seed: int, row_id: int, position: int) -> int:
     x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
     x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
@@ -1749,6 +1771,12 @@ class PromptProcessingBatch:
                 continue
             checkpoint_len = int(meta.get("checkpoint_len") or 0)
             if checkpoint_len <= 0:
+                continue
+            cap = _get_apc_exact_max_prompt_tokens()
+            if cap and checkpoint_len > cap:
+                # Over the storage ceiling: never store, and mark done so the
+                # row is not re-examined every step. Lookups stay untouched.
+                meta["checkpoint_done"] = True
                 continue
             if self._row_real_tokens_processed(batch_idx) != checkpoint_len:
                 continue
