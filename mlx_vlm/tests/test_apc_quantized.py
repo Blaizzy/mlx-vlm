@@ -10,7 +10,11 @@ behavior required for issue #1174 (APC + KV-cache quantization).
 
 from __future__ import annotations
 
+import os
+from typing import List
+
 import mlx.core as mx
+import pytest
 
 from mlx_vlm.apc import (
     APCManager,
@@ -20,9 +24,11 @@ from mlx_vlm.apc import (
     _clone_prompt_cache_for_apc,
     harvest_blocks_from_batch_cache,
     make_warm_batch_kv_cache,
+    make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
     model_apc_mode,
 )
+from mlx_vlm.generate.ar import _extend_cache, _make_cache
 from mlx_vlm.models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -967,3 +973,273 @@ class TestCacheTypeHomogeneity:
             )
             assert isinstance(warm_layer, BatchQuantizedKVCache)
         manager.release(matched)
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Warm restore last-layer policy + staggered join (#1562 residual)
+# ---------------------------------------------------------------------------
+# Kept here (not a new file) so APC+kv tests stay co-located with #1174 suite.
+# See also PR #1568 review: prefer existing test modules over new files.
+
+
+KV_CFG = {"bits": BITS, "group_size": GROUP_SIZE}
+
+
+def _store_prefix_blocks(
+    manager: APCManager, num_layers: int, seq_len: int, token_ids: List[int]
+):
+    lk, lv = [], []
+    for _ in range(num_layers):
+        k, v = _rand_kv(seq_len=seq_len)
+        lk.append(k)
+        lv.append(v)
+    mx.eval(lk + lv)
+    blocks = manager.store_kv_blocks(token_ids, lk, lv)
+    manager.release(blocks)
+    matched, _ = manager.lookup_prefix(token_ids)
+    assert matched, "expected APC hit after store"
+    return matched
+
+
+def _layer_type_names(caches) -> List[str]:
+    return [type(c).__name__ for c in caches]
+
+
+def _expected_make_cache_types(num_layers: int) -> List[str]:
+    class FakeLayer:
+        pass
+
+    class FakeModel:
+        layers = [FakeLayer() for _ in range(num_layers)]
+
+    caches = _make_cache(
+        FakeModel(),
+        [0],
+        kv_bits=float(BITS),
+        kv_group_size=GROUP_SIZE,
+        kv_quant_scheme="uniform",
+    )
+    return _layer_type_names(caches)
+
+
+class TestWarmRestoreLayerTypesMatchMakeCache:
+    """APC warm path must match ``_make_cache`` last-layer policy (#1562)."""
+
+    def test_make_cache_skips_last_layer_for_n_gt_2(self):
+        assert _expected_make_cache_types(4) == [
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+            "BatchKVCache",
+        ]
+
+    def test_make_cache_quantizes_all_when_n_le_2(self):
+        assert _expected_make_cache_types(2) == [
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+        ]
+
+    def test_make_warm_batch_kv_cache_matches_make_cache_types(self):
+        num_layers = 4
+        seq_len = 2 * BLOCK_SIZE
+        manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
+        try:
+            token_ids = list(range(seq_len))
+            matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
+            warm = make_warm_batch_kv_cache(matched, kv_quant_config=KV_CFG)
+            assert _layer_type_names(warm) == _expected_make_cache_types(num_layers)
+            assert isinstance(warm[-1], BatchKVCache)
+            assert isinstance(warm[0], BatchQuantizedKVCache)
+        finally:
+            manager.close()
+
+    def test_make_warm_batch_kv_cache_multi_matches_make_cache_types(self):
+        num_layers = 4
+        seq_len = 2 * BLOCK_SIZE
+        manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
+        try:
+            token_ids = list(range(seq_len))
+            matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
+            pick = {"matched_blocks": matched, "prefix_len": seq_len}
+            warm, max_prefix = make_warm_batch_kv_cache_multi(
+                [pick, None],
+                num_layers=num_layers,
+                kv_quant_config=KV_CFG,
+            )
+            assert max_prefix == seq_len
+            assert _layer_type_names(warm) == _expected_make_cache_types(num_layers)
+            assert isinstance(warm[-1], BatchKVCache)
+            assert warm[-1].left_padding.tolist() == [0, seq_len]
+        finally:
+            manager.close()
+
+    def test_make_warm_without_kv_config_all_float(self):
+        num_layers = 3
+        seq_len = BLOCK_SIZE
+        manager = APCManager(num_blocks=16, block_size=BLOCK_SIZE)
+        try:
+            token_ids = list(range(seq_len))
+            matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
+            warm = make_warm_batch_kv_cache(matched, kv_quant_config=None)
+            assert all(isinstance(c, BatchKVCache) for c in warm)
+        finally:
+            manager.close()
+
+
+class TestExtendGenBatchWithWarmRestoredRow:
+    """``_extend_cache`` must join live ``_make_cache`` row with APC-warm row."""
+
+    def _live_gen_cache(self, num_layers: int, seq_len: int, left_padding=(0,)):
+        class FakeLayer:
+            pass
+
+        class FakeModel:
+            layers = [FakeLayer() for _ in range(num_layers)]
+
+        caches = _make_cache(
+            FakeModel(),
+            list(left_padding),
+            kv_bits=float(BITS),
+            kv_group_size=GROUP_SIZE,
+            kv_quant_scheme="uniform",
+        )
+        for c in caches:
+            k, v = _rand_kv(batch=len(left_padding), seq_len=seq_len)
+            c.update_and_fetch(k, v)
+        return caches
+
+    def test_extend_live_make_cache_with_warm_single_row(self):
+        num_layers = 4
+        seq_len = 2 * BLOCK_SIZE
+        manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
+        try:
+            token_ids = list(range(seq_len))
+            matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
+            warm = make_warm_batch_kv_cache(matched, kv_quant_config=KV_CFG)
+            live = self._live_gen_cache(num_layers, seq_len=seq_len)
+
+            assert _layer_type_names(live) == _layer_type_names(warm)
+
+            extended = _extend_cache(live, warm)
+            assert len(extended) == num_layers
+            for c in extended:
+                assert int(c.offset.shape[0]) == 2
+            assert isinstance(extended[-1], BatchKVCache)
+            assert not isinstance(extended[-1].keys, tuple)
+        finally:
+            manager.close()
+
+    def test_extend_mismatched_last_layer_types_raises(self):
+        """Historical failure mode: BatchKVCache.extend vs quantized tuple keys."""
+        live = BatchKVCache([0])
+        k, v = _rand_kv(seq_len=8)
+        live.update_and_fetch(k, v)
+
+        other = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+        ok, ov = _rand_kv(seq_len=8)
+        other.update_and_fetch(ok, ov)
+        assert isinstance(other.keys, tuple)
+
+        with pytest.raises(AttributeError, match="shape"):
+            live.extend(other)
+
+
+class TestStaggeredJoinSynthetic:
+    """Simulate A live then B APC-warm join under kv-bits (server concurrent shape)."""
+
+    def test_staggered_warm_join_layer_types_compatible(self):
+        num_layers = 4
+        seq_len = 2 * BLOCK_SIZE
+        manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
+        try:
+            token_ids = list(range(seq_len))
+            matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
+
+            class FakeLayer:
+                pass
+
+            class FakeModel:
+                layers = [FakeLayer() for _ in range(num_layers)]
+
+            live = _make_cache(
+                FakeModel(),
+                [0],
+                kv_bits=float(BITS),
+                kv_group_size=GROUP_SIZE,
+                kv_quant_scheme="uniform",
+            )
+            for c in live:
+                k, v = _rand_kv(seq_len=seq_len + 4)
+                c.update_and_fetch(k, v)
+
+            warm = make_warm_batch_kv_cache(matched, kv_quant_config=KV_CFG)
+            assert _layer_type_names(live) == _layer_type_names(warm), (
+                f"layer type mismatch blocks continuous-batching join: "
+                f"live={_layer_type_names(live)} warm={_layer_type_names(warm)}"
+            )
+            extended = _extend_cache(live, warm)
+            assert int(extended[0].offset.shape[0]) == 2
+        finally:
+            manager.close()
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_APC_KV_JOIN", "0") != "1",
+    reason="Set RUN_LIVE_APC_KV_JOIN=1 to run live model staggered join smoke",
+)
+def test_live_batch_generator_staggered_apc_kv_join():
+    """Live repro of server concurrent APC+kv join (optional smoke)."""
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    from mlx_vlm import load
+    from mlx_vlm.generate import BatchGenerator
+
+    model_id = os.environ.get("REPRO_MODEL", "mlx-community/Qwen3-0.6B-4bit")
+    model, processor = load(model_id)
+    lm = model.language_model if hasattr(model, "language_model") else model
+    tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    def ids(text: str):
+        x = tok.encode(text)
+        return list(x.ids if hasattr(x, "ids") else x)
+
+    def embeds(id_list):
+        e = model.get_input_embeddings(mx.array([id_list]))
+        return {k: v for k, v in e.to_dict().items() if v is not None}
+
+    def close(gen):
+        if hasattr(gen, "close") and callable(gen.close):
+            gen.close()
+        elif hasattr(gen, "_wire_stack"):
+            gen._wire_stack.close()
+
+    prefix = "Shared prefix for agent tools: " + ("schema " * 50)
+    a = ids(prefix + " task A")
+    b = ids(prefix + " task B")
+    apc = APCManager(num_blocks=4096, block_size=16)
+    gen = BatchGenerator(
+        lm,
+        processor,
+        max_tokens=24,
+        kv_bits=8.0,
+        kv_quant_scheme="uniform",
+        apc_manager=apc,
+        prefill_step_size=64,
+        compute_logprobs=False,
+    )
+    try:
+        gen.insert([a], max_tokens=24, prompt_kwargs=[embeds(a)])
+        steps = 0
+        while gen.has_work and steps < 200:
+            _pr, resp = gen.next()
+            steps += 1
+            if resp:
+                gen.insert([b], max_tokens=24, prompt_kwargs=[embeds(b)])
+                break
+        while gen.has_work:
+            gen.next()
+            steps += 1
+            if steps > 800:
+                raise TimeoutError("drain too long")
+    finally:
+        close(gen)
+        apc.close()

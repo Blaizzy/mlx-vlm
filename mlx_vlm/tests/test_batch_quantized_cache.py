@@ -7,6 +7,7 @@ from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchQuantizedKVCache,
     StaticPrefixKVCache,
+    should_quantize_kv_layer,
 )
 
 B, H, D = 2, 4, 64  # batch, heads, head_dim
@@ -252,6 +253,28 @@ class TestPrepareFinalize:
         assert cache.left_padding.tolist() == before
 
 
+class TestShouldQuantizeKvLayerPolicy:
+    """Shared last-layer quant policy used by _make_cache / APC warm / stream."""
+
+    def test_shallow_stack_quantizes_all(self):
+        assert should_quantize_kv_layer(0, 1) is True
+        assert should_quantize_kv_layer(0, 2) is True
+        assert should_quantize_kv_layer(1, 2) is True
+
+    def test_deep_stack_skips_last(self):
+        n = 4
+        assert [should_quantize_kv_layer(i, n) for i in range(n)] == [
+            True,
+            True,
+            True,
+            False,
+        ]
+
+    def test_deep_stack_boundary(self):
+        assert should_quantize_kv_layer(26, 28) is True
+        assert should_quantize_kv_layer(27, 28) is False
+
+
 class TestMakeCache:
     """Test that _make_cache creates BatchQuantizedKVCache when kv_bits is set."""
 
@@ -285,6 +308,28 @@ class TestMakeCache:
         caches = _make_cache(FakeModel(), [0, 0])
         for c in caches:
             assert isinstance(c, BatchKVCache)
+
+    def test_make_cache_uses_should_quantize_kv_layer_policy(self):
+        from mlx_vlm.generate import _make_cache
+
+        class FakeLayer:
+            pass
+
+        class FakeModelDeep:
+            layers = [FakeLayer() for _ in range(4)]
+
+        class FakeModelShallow:
+            layers = [FakeLayer() for _ in range(2)]
+
+        deep = _make_cache(FakeModelDeep(), [0], kv_bits=8, kv_group_size=64)
+        assert [type(c).__name__ for c in deep] == [
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+            "BatchKVCache",
+        ]
+        shallow = _make_cache(FakeModelShallow(), [0], kv_bits=8, kv_group_size=64)
+        assert all(type(c).__name__ == "BatchQuantizedKVCache" for c in shallow)
 
 
 class TestStaticPrefixKVCache:
