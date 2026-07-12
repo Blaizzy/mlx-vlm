@@ -210,6 +210,48 @@ class TestMakeMask:
         assert mx.all(mask == reference_mask).item()
 
 
+class TestPrepareFinalize:
+    """Multi-row right-pad lifecycle parity with BatchKVCache (#1567 / #1562)."""
+
+    def test_prepare_finalize_methods_exist(self):
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        assert callable(getattr(cache, "prepare", None))
+        assert callable(getattr(cache, "finalize", None))
+
+    def test_prepare_stores_right_padding(self):
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        cache.prepare(right_padding=[3, 0])
+        assert cache._right_padding is not None
+        assert cache._right_padding.tolist() == [3, 0]
+
+    def test_finalize_updates_left_padding_like_batch_kv(self):
+        right_padding = [2, 0]
+        quant = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        ref = BatchKVCache([0, 0])
+
+        quant.prepare(right_padding=right_padding)
+        ref.prepare(right_padding=right_padding)
+
+        k, v = _rand_kv(B, 6)
+        quant.update_and_fetch(k, v)
+        ref.update_and_fetch(k, v)
+
+        quant.finalize()
+        ref.finalize()
+
+        assert quant._right_padding is None
+        assert quant.left_padding.tolist() == ref.left_padding.tolist()
+        assert quant.offset.tolist() == ref.offset.tolist()
+
+    def test_finalize_noop_without_prepare(self):
+        cache = BatchQuantizedKVCache([1, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(B, 4)
+        cache.update_and_fetch(k, v)
+        before = cache.left_padding.tolist()
+        cache.finalize()
+        assert cache.left_padding.tolist() == before
+
+
 class TestMakeCache:
     """Test that _make_cache creates BatchQuantizedKVCache when kv_bits is set."""
 
