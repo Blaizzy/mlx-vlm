@@ -920,6 +920,66 @@ def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
     assert isinstance(batch_cache[1], BatchKVCache)
 
 
+def _qwen3_5_hybrid_batch_model():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.num_hidden_layers = 2
+    text_config.full_attention_interval = 2
+    return qwen_language.Qwen3_5Model(text_config), text_config
+
+
+def _qwen3_5_batch_cache(left_padding):
+    arrays = ArraysCache(size=2)
+    arrays.left_padding = mx.array(left_padding, dtype=mx.int32)
+    return [arrays, BatchKVCache(list(left_padding))]
+
+
+def test_qwen3_5_fully_padded_prefill_row_survives_chunks():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 0])
+
+    first = model(mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32), cache=cache)
+    mx.eval(first, cache[1].offset, cache[1].left_padding)
+    assert first.shape == (2, 3, text_config.hidden_size)
+    assert cache[1].offset.tolist() == [-2, 3]
+    assert cache[1].left_padding.tolist() == [5, 0]
+
+    second = model(mx.array([[0, 0, 4], [4, 5, 6]], dtype=mx.int32), cache=cache)
+    mx.eval(second, cache[1].offset, cache[1].left_padding)
+    assert second.shape == (2, 3, text_config.hidden_size)
+    assert cache[1].offset.tolist() == [1, 6]
+    assert cache[1].left_padding.tolist() == [5, 0]
+
+
+def test_qwen3_5_all_rows_fully_padded_prefill():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 5])
+    out = model(mx.array([[0, 0, 0], [0, 0, 0]], dtype=mx.int32), cache=cache)
+    mx.eval(out)
+    assert out.shape == (2, 3, text_config.hidden_size)
+
+
+def test_qwen3_5_partially_padded_rows_match_unbatched():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    mx.eval(model.parameters())
+
+    batched = model(
+        mx.array([[0, 7, 8], [1, 2, 3]], dtype=mx.int32),
+        cache=_qwen3_5_batch_cache([1, 0]),
+    )
+    row0 = model(
+        mx.array([[7, 8]], dtype=mx.int32),
+        cache=[ArraysCache(size=2), KVCache()],
+    )
+    row1 = model(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        cache=[ArraysCache(size=2), KVCache()],
+    )
+    mx.eval(batched, row0, row1)
+
+    assert bool(mx.array_equal(batched[0:1, 1:], row0).item())
+    assert bool(mx.array_equal(batched[1:2], row1).item())
+
+
 def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
     text_config = _tiny_qwen3_5_text_config()
     text_config.hidden_size = 64
