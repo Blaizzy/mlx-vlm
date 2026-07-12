@@ -3776,7 +3776,7 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(
             sanitized["language_model.model.layers.0.self_attn.q_proj.weight"].dtype,
-            mx.float32,
+            mx.bfloat16,
         )
         self.assertEqual(
             sanitized["language_model.model.layers.0.self_attn.q_proj.scales"].dtype,
