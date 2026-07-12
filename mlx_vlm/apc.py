@@ -3480,6 +3480,75 @@ class APCManager:
             self.disk.close()
 
 
+def _fill_stream_layer_cache(
+    merged_k: mx.array,
+    merged_v: mx.array,
+    prefix_len: int,
+    *,
+    quantize: bool,
+    kv_quant_config: Optional[dict],
+    capacity: Optional[int] = None,
+    reuse_cache: Any = None,
+) -> Any:
+    """Build one stream-path layer cache (float or quantized) from dense K/V."""
+    from .models.cache import KVCache, QuantizedKVCache
+
+    if quantize and kv_quant_config is not None:
+        c = QuantizedKVCache(
+            group_size=int(kv_quant_config["group_size"]),
+            bits=int(kv_quant_config["bits"]),
+        )
+        c.update_and_fetch(merged_k, merged_v)
+        return c
+
+    if capacity is not None and capacity > prefix_len:
+        pad_tokens = capacity - prefix_len
+        k_pad_shape = (*merged_k.shape[:2], pad_tokens, merged_k.shape[3])
+        v_pad_shape = (*merged_v.shape[:2], pad_tokens, merged_v.shape[3])
+        merged_k = mx.concatenate(
+            [merged_k, mx.zeros(k_pad_shape, dtype=merged_k.dtype)], axis=2
+        )
+        merged_v = mx.concatenate(
+            [merged_v, mx.zeros(v_pad_shape, dtype=merged_v.dtype)], axis=2
+        )
+    c = reuse_cache if reuse_cache is not None else KVCache()
+    c.keys = merged_k
+    c.values = merged_v
+    c.offset = prefix_len
+    return c
+
+
+def _fill_batch_layer_cache(
+    merged_k: mx.array,
+    merged_v: mx.array,
+    left_padding: List[int],
+    offset: List[int],
+    *,
+    quantize: bool,
+    kv_quant_config: Optional[dict],
+) -> Any:
+    """Build one batch-path layer cache matching ``_make_cache`` layout."""
+    from .models.cache import BatchKVCache, BatchQuantizedKVCache
+
+    if quantize and kv_quant_config is not None:
+        c = BatchQuantizedKVCache(
+            left_padding,
+            group_size=int(kv_quant_config["group_size"]),
+            bits=int(kv_quant_config["bits"]),
+        )
+        c.update_and_fetch(merged_k, merged_v)
+        return c
+
+    c = BatchKVCache(left_padding=list(left_padding))
+    c.state = (
+        merged_k,
+        merged_v,
+        mx.array(offset),
+        mx.array(left_padding),
+    )
+    return c
+
+
 def make_warm_kv_cache(
     matched_blocks: List[APCBlock],
     min_capacity_tokens: Optional[int] = None,
@@ -3490,29 +3559,17 @@ def make_warm_kv_cache(
     ``stream_generate`` path.
 
     When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
-    returns ``QuantizedKVCache`` instances that re-quantize the raw float
-    blocks via ``update_and_fetch``.
+    re-quantizes raw float blocks via ``update_and_fetch`` on layers that
+    ``should_quantize_kv_layer`` marks for quant (last layer stays float when
+    ``num_layers > 2``, matching live generation).
     """
-    from .models.cache import KVCache, QuantizedKVCache
+    from .models.cache import KVCache, should_quantize_kv_layer
 
     if not matched_blocks:
         return []
     num_layers = len(matched_blocks[0].keys)
     out: List[Any] = []
     prefix_len = sum(b.keys[0].shape[-2] for b in matched_blocks)
-
-    if kv_quant_config is not None:
-        qbits = int(kv_quant_config["bits"])
-        qgroup = int(kv_quant_config["group_size"])
-        for layer_idx in range(num_layers):
-            ks = [b.keys[layer_idx] for b in matched_blocks]
-            vs = [b.values[layer_idx] for b in matched_blocks]
-            merged_k = mx.concatenate(ks, axis=2)
-            merged_v = mx.concatenate(vs, axis=2)
-            c = QuantizedKVCache(group_size=qgroup, bits=qbits)
-            c.update_and_fetch(merged_k, merged_v)
-            out.append(c)
-        return out
 
     step_probe = KVCache()
     kv_step = int(getattr(step_probe, "step", getattr(KVCache, "step", 256)))
@@ -3521,26 +3578,26 @@ def make_warm_kv_cache(
         capacity = max(prefix_len, int(min_capacity_tokens))
         if capacity > prefix_len and kv_step > 0:
             capacity = ((capacity + kv_step - 1) // kv_step) * kv_step
+
     for layer_idx in range(num_layers):
         ks = [b.keys[layer_idx] for b in matched_blocks]
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)
         merged_v = mx.concatenate(vs, axis=2)
-        if capacity > prefix_len:
-            pad_tokens = capacity - prefix_len
-            k_pad_shape = (*merged_k.shape[:2], pad_tokens, merged_k.shape[3])
-            v_pad_shape = (*merged_v.shape[:2], pad_tokens, merged_v.shape[3])
-            merged_k = mx.concatenate(
-                [merged_k, mx.zeros(k_pad_shape, dtype=merged_k.dtype)], axis=2
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
+        )
+        out.append(
+            _fill_stream_layer_cache(
+                merged_k,
+                merged_v,
+                prefix_len,
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
+                capacity=None if quantize else capacity,
+                reuse_cache=step_probe if layer_idx == 0 and not quantize else None,
             )
-            merged_v = mx.concatenate(
-                [merged_v, mx.zeros(v_pad_shape, dtype=merged_v.dtype)], axis=2
-            )
-        c = step_probe if layer_idx == 0 else KVCache()
-        c.keys = merged_k
-        c.values = merged_v
-        c.offset = prefix_len
-        out.append(c)
+        )
     return out
 
 
@@ -3552,25 +3609,26 @@ def make_warm_kv_cache_from_layers(
 ) -> List[Any]:
     """Build cache objects from already-concatenated disk-restored K/V.
 
-    When *kv_quant_config* is provided, returns ``QuantizedKVCache`` instances.
+    When *kv_quant_config* is provided, quantizes layers per
+    ``should_quantize_kv_layer`` (last layer float when n > 2).
     """
-    from .models.cache import KVCache, QuantizedKVCache
+    from .models.cache import should_quantize_kv_layer
 
+    num_layers = len(layer_keys)
     out: List[Any] = []
-    if kv_quant_config is not None:
-        qbits = int(kv_quant_config["bits"])
-        qgroup = int(kv_quant_config["group_size"])
-        for k, v in zip(layer_keys, layer_values):
-            c = QuantizedKVCache(group_size=qgroup, bits=qbits)
-            c.update_and_fetch(k, v)
-            out.append(c)
-    else:
-        for k, v in zip(layer_keys, layer_values):
-            c = KVCache()
-            c.keys = k
-            c.values = v
-            c.offset = prefix_len
-            out.append(c)
+    for layer_idx, (k, v) in enumerate(zip(layer_keys, layer_values)):
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
+        )
+        out.append(
+            _fill_stream_layer_cache(
+                k,
+                v,
+                prefix_len,
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
+            )
+        )
     mx.clear_cache()
     return out
 
@@ -3584,11 +3642,11 @@ def make_warm_batch_kv_cache(
     continuous-batching path; the resulting cache list can be
     ``extend()``-ed into a running batch.
 
-    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
-    returns ``BatchQuantizedKVCache`` instances that re-quantize the raw float
-    blocks via ``update_and_fetch``.
+    When *kv_quant_config* is provided, layer types match ``_make_cache``:
+    quantized batch caches for layers that ``should_quantize_kv_layer`` allows,
+    float ``BatchKVCache`` for the last layer when ``num_layers > 2``.
     """
-    from .models.cache import BatchKVCache, BatchQuantizedKVCache
+    from .models.cache import should_quantize_kv_layer
 
     if not matched_blocks:
         return []
@@ -3600,22 +3658,19 @@ def make_warm_batch_kv_cache(
         vs = [b.values[layer_idx] for b in matched_blocks]
         merged_k = mx.concatenate(ks, axis=2)  # [1, H, prefix_len, D]
         merged_v = mx.concatenate(vs, axis=2)
-        if kv_quant_config is not None:
-            c = BatchQuantizedKVCache(
-                [0],
-                group_size=int(kv_quant_config["group_size"]),
-                bits=int(kv_quant_config["bits"]),
-            )
-            c.update_and_fetch(merged_k, merged_v)
-        else:
-            c = BatchKVCache(left_padding=[0])
-            c.state = (
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
+        )
+        out.append(
+            _fill_batch_layer_cache(
                 merged_k,
                 merged_v,
-                mx.array([prefix_len]),
-                mx.array([0]),
+                left_padding=[0],
+                offset=[prefix_len],
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
             )
-        out.append(c)
+        )
     return out
 
 
@@ -3629,9 +3684,8 @@ def make_warm_batch_kv_cache_multi(
     ``picks`` is per-row, with each entry being ``None`` (cold) or a dict
     with key ``matched_blocks`` (list of APCBlock) and ``prefix_len``.
 
-    When *kv_quant_config* is provided (dict with ``bits`` and ``group_size``),
-    returns ``BatchQuantizedKVCache`` instances that re-quantize the raw float
-    blocks via ``update_and_fetch``.
+    When *kv_quant_config* is provided, layer types match ``_make_cache`` via
+    ``should_quantize_kv_layer`` (last layer stays float when n > 2).
 
     Returns ``(cache_list, max_prefix)`` where ``max_prefix`` is the cache's
     ``_idx`` after warm-init (= max prefix_len across rows).
@@ -3641,7 +3695,7 @@ def make_warm_batch_kv_cache_multi(
       * keys[i, :, left_padding[i]:max_prefix, :] = concatenated block K
       * keys[i, :, :left_padding[i], :] = zeros (will be hidden by mask)
     """
-    from .models.cache import BatchKVCache, BatchQuantizedKVCache
+    from .models.cache import should_quantize_kv_layer
 
     B = len(picks)
     prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3697,22 +3751,19 @@ def make_warm_batch_kv_cache_multi(
 
         left_padding = [max_prefix - pl for pl in prefix_lens]
         offset = [pl for pl in prefix_lens]
-        if kv_quant_config is not None:
-            c = BatchQuantizedKVCache(
-                left_padding,
-                group_size=int(kv_quant_config["group_size"]),
-                bits=int(kv_quant_config["bits"]),
-            )
-            c.update_and_fetch(merged_k, merged_v)
-        else:
-            c = BatchKVCache(left_padding=[0] * B)
-            c.state = (
+        quantize = kv_quant_config is not None and should_quantize_kv_layer(
+            layer_idx, num_layers
+        )
+        out.append(
+            _fill_batch_layer_cache(
                 merged_k,
                 merged_v,
-                mx.array(offset),
-                mx.array(left_padding),
+                left_padding=left_padding,
+                offset=offset,
+                quantize=quantize,
+                kv_quant_config=kv_quant_config,
             )
-        out.append(c)
+        )
     return out, max_prefix
 
 

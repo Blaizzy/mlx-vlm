@@ -29,6 +29,7 @@ from mlx_vlm.models.cache import (
     BatchQuantizedKVCache,
     KVCache,
     QuantizedKVCache,
+    should_quantize_kv_layer,
 )
 
 # Small dimensions: fast tests, no GPU pressure
@@ -262,11 +263,16 @@ class TestRestoreIntoQuantizedCache:
         warm = make_warm_kv_cache(matched, kv_quant_config=quant_config)
 
         assert len(warm) == 3
-        for c in warm:
-            assert isinstance(c, QuantizedKVCache)
-            assert c.offset == seq_len
-            assert c.bits == BITS
-            assert c.group_size == GROUP_SIZE
+        # n=3 > 2: last layer stays float (matches stream / batch last-layer policy)
+        for i, c in enumerate(warm):
+            if should_quantize_kv_layer(i, 3):
+                assert isinstance(c, QuantizedKVCache)
+                assert c.offset == seq_len
+                assert c.bits == BITS
+                assert c.group_size == GROUP_SIZE
+            else:
+                assert isinstance(c, KVCache)
+                assert c.offset == seq_len
         manager.release(matched)
 
     def test_restored_values_approximate_stored(self):

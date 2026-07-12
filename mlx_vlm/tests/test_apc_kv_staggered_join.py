@@ -43,13 +43,39 @@ from mlx_vlm.apc import (
     make_warm_batch_kv_cache_multi,
 )
 from mlx_vlm.generate.ar import _extend_cache, _make_cache
-from mlx_vlm.models.cache import BatchKVCache, BatchQuantizedKVCache
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BatchQuantizedKVCache,
+    should_quantize_kv_layer,
+)
 
 B, H, D = 1, 2, 32
 GROUP_SIZE = 32
 BITS = 8
 BLOCK_SIZE = 16
 KV_CFG = {"bits": BITS, "group_size": GROUP_SIZE}
+
+
+class TestShouldQuantizeKvLayerPolicy:
+    """Unit tests for the shared last-layer quant policy."""
+
+    def test_shallow_stack_quantizes_all(self):
+        assert should_quantize_kv_layer(0, 1) is True
+        assert should_quantize_kv_layer(0, 2) is True
+        assert should_quantize_kv_layer(1, 2) is True
+
+    def test_deep_stack_skips_last(self):
+        n = 4
+        assert [should_quantize_kv_layer(i, n) for i in range(n)] == [
+            True,
+            True,
+            True,
+            False,
+        ]
+
+    def test_deep_stack_boundary(self):
+        assert should_quantize_kv_layer(26, 28) is True
+        assert should_quantize_kv_layer(27, 28) is False
 
 
 def _rand_kv(batch: int = B, seq_len: int = 32, heads: int = H, dim: int = D):

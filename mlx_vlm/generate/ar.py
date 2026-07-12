@@ -778,9 +778,8 @@ def _make_cache(
     if hasattr(model, "make_cache"):
         model_cache = model.make_cache()
         n = len(model_cache)
-        # Skip quantizing the last layer — it's sensitive to quantization
         return [
-            to_batch_cache(c, quantize=(i < n - 1 if n > 2 else True))
+            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
             for i, c in enumerate(model_cache)
         ]
     else:
@@ -789,7 +788,7 @@ def _make_cache(
             return [
                 (
                     _make_quant_cache(left_padding)
-                    if i < n - 1 or n <= 2
+                    if cache.should_quantize_kv_layer(i, n)
                     else cache.BatchKVCache(left_padding)
                 )
                 for i in range(n)
