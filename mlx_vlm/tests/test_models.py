@@ -2415,6 +2415,76 @@ class TestModels(unittest.TestCase):
             "language_model.lm_head.weight",
         )
 
+    def test_qwen3_5_sanitize_preserves_converted_norm_weights(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        for model_module in (qwen3_5, qwen3_5_moe):
+            with self.subTest(model_type=model_module.__name__):
+                context = SimpleNamespace(
+                    config=SimpleNamespace(
+                        text_config=SimpleNamespace(
+                            tie_word_embeddings=False,
+                            num_hidden_layers=1,
+                            num_experts=0,
+                        )
+                    )
+                )
+                weights = {
+                    "language_model.model.layers.0.input_layernorm.weight": mx.ones(
+                        (2,)
+                    ),
+                    "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                        (4, 3, 1)
+                    ),
+                }
+
+                sanitized = model_module.Model.sanitize(context, weights)
+
+                self.assertEqual(
+                    sanitized[
+                        "language_model.model.layers.0.input_layernorm.weight"
+                    ].tolist(),
+                    [1.0, 1.0],
+                )
+
+    def test_qwen3_5_sanitize_offsets_source_norm_weights_when_needed(self):
+        from mlx_vlm.models import qwen3_5, qwen3_5_moe
+
+        for model_module in (qwen3_5, qwen3_5_moe):
+            with self.subTest(model_type=model_module.__name__):
+                context = SimpleNamespace(
+                    config=SimpleNamespace(
+                        text_config=SimpleNamespace(
+                            tie_word_embeddings=False,
+                            num_hidden_layers=1,
+                            num_experts=0,
+                        )
+                    )
+                )
+                weights = {
+                    "model.language_model.layers.0.input_layernorm.weight": mx.zeros(
+                        (2,)
+                    ),
+                    "model.language_model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                        (4, 1, 3)
+                    ),
+                }
+
+                sanitized = model_module.Model.sanitize(context, weights)
+
+                self.assertEqual(
+                    sanitized[
+                        "language_model.model.layers.0.input_layernorm.weight"
+                    ].tolist(),
+                    [1.0, 1.0],
+                )
+                self.assertEqual(
+                    sanitized[
+                        "language_model.model.layers.0.linear_attn.conv1d.weight"
+                    ].shape,
+                    (4, 3, 1),
+                )
+
     def test_qwen3_5_rotary_inv_freq_is_thread_safe(self):
         if not mx.metal.is_available():
             self.skipTest("requires Metal streams")
@@ -8742,6 +8812,54 @@ class TestMiniCPMV4_6(unittest.TestCase):
         image_grid_thw = mx.array([[1, 2, 2]], dtype=mx.int32)
         with self.assertRaisesRegex(ValueError, "does not support Qwen3.5-VL"):
             lm.get_rope_index(input_ids, image_grid_thw=image_grid_thw)
+
+    def test_minicpmv4_6_sanitize_preserves_converted_norm_weights(self):
+        from mlx_vlm.models import minicpmv4_6
+
+        context = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(tie_word_embeddings=False)
+            )
+        )
+        weights = {
+            "language_model.model.layers.0.input_layernorm.weight": mx.ones((2,)),
+            "language_model.model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                (4, 3, 1)
+            ),
+        }
+
+        sanitized = minicpmv4_6.Model.sanitize(context, weights)
+
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.input_layernorm.weight"].tolist(),
+            [1.0, 1.0],
+        )
+
+    def test_minicpmv4_6_sanitize_offsets_source_norm_weights_when_needed(self):
+        from mlx_vlm.models import minicpmv4_6
+
+        context = SimpleNamespace(
+            config=SimpleNamespace(
+                text_config=SimpleNamespace(tie_word_embeddings=False)
+            )
+        )
+        weights = {
+            "model.language_model.layers.0.input_layernorm.weight": mx.zeros((2,)),
+            "model.language_model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                (4, 1, 3)
+            ),
+        }
+
+        sanitized = minicpmv4_6.Model.sanitize(context, weights)
+
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.input_layernorm.weight"].tolist(),
+            [1.0, 1.0],
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.linear_attn.conv1d.weight"].shape,
+            (4, 3, 1),
+        )
 
 
 class TestMiniCPMO(unittest.TestCase):
