@@ -1141,6 +1141,129 @@ class TestDiffusionGemma4(unittest.TestCase):
         self.assertEqual(drafts[-1].diffusion_total_steps, 2)
         self.assertEqual(finals[-1].generation_tokens, 2)
 
+    def test_diffusion_initial_canvas_pads_short_decoder_input_ids(self):
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+
+        decoder_input_ids = diffusion_module._normalize_decoder_input_ids(
+            [[10, 11]],
+            batch_size=1,
+            dtype=mx.int32,
+        )
+        with patch.object(
+            diffusion_module,
+            "_diffusion_initialize_canvas",
+            return_value=mx.array([[7, 8, 9]], dtype=mx.int32),
+        ):
+            canvas = diffusion_module._diffusion_initial_canvas(
+                decoder_input_ids,
+                start_index=0,
+                batch_size=1,
+                canvas_length=3,
+                vocab_size=64,
+                dtype=mx.int32,
+            )
+            mx.eval(canvas)
+
+        self.assertEqual(canvas.tolist(), [[10, 11, 9]])
+
+    def test_diffusion_decoder_input_ids_validation(self):
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+
+        with self.assertRaisesRegex(ValueError, "2D array"):
+            diffusion_module._normalize_decoder_input_ids(
+                [10, 11],
+                batch_size=1,
+                dtype=mx.int32,
+            )
+
+        with self.assertRaisesRegex(ValueError, "batch size"):
+            diffusion_module._normalize_decoder_input_ids(
+                [[10, 11], [12, 13]],
+                batch_size=1,
+                dtype=mx.int32,
+            )
+
+    def test_stream_generate_uses_decoder_input_ids_as_initial_canvas(self):
+        diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        seen_canvases = []
+
+        def decoder_logits(current_canvas, *args, **kwargs):
+            del args, kwargs
+            mx.eval(current_canvas)
+            seen_canvases.append(current_canvas.tolist())
+            return mx.zeros(
+                (
+                    current_canvas.shape[0],
+                    current_canvas.shape[1],
+                    config.text_config.vocab_size,
+                )
+            )
+
+        with (
+            patch.object(model, "diffusion_decoder_logits", side_effect=decoder_logits),
+            patch.object(
+                diffusion_module,
+                "_diffusion_initialize_canvas",
+                return_value=mx.array([[7, 8, 9]], dtype=mx.int32),
+            ),
+        ):
+            responses = list(
+                stream_generate(
+                    model,
+                    FakeProcessor(),
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=1,
+                    max_denoising_steps=1,
+                    decoder_input_ids=mx.array([[10, 11]], dtype=mx.int32),
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 1)
+        self.assertEqual(seen_canvases[0], [[10, 11, 9]])
+
+    def test_stream_generate_slices_decoder_input_ids_by_canvas(self):
+        from mlx_vlm.generate import stream_generate
+        from mlx_vlm.models.diffusion_gemma import Model, ModelConfig
+
+        config = ModelConfig.from_dict(tiny_config_dict())
+        model = Model(config)
+        seen_canvases = []
+
+        def decoder_logits(current_canvas, *args, **kwargs):
+            del args, kwargs
+            mx.eval(current_canvas)
+            seen_canvases.append(current_canvas.tolist())
+            return mx.zeros(
+                (
+                    current_canvas.shape[0],
+                    current_canvas.shape[1],
+                    config.text_config.vocab_size,
+                )
+            )
+
+        with patch.object(model, "diffusion_decoder_logits", side_effect=decoder_logits):
+            responses = list(
+                stream_generate(
+                    model,
+                    FakeProcessor(),
+                    "",
+                    input_ids=mx.array([[2, 3]], dtype=mx.int32),
+                    max_tokens=4,
+                    max_denoising_steps=1,
+                    diffusion_max_canvas_length=2,
+                    decoder_input_ids=mx.array([[10, 11, 12, 13]], dtype=mx.int32),
+                )
+            )
+
+        self.assertEqual(responses[-1].generation_tokens, 4)
+        self.assertEqual(seen_canvases[:2], [[[10, 11]], [[12, 13]]])
+
     def test_diffusion_zero_temperature_uses_argmax_canvas(self):
         diffusion_module = importlib.import_module("mlx_vlm.generate.diffusion")
         from mlx_vlm.generate.diffusion import _diffusion_sample_canvas
