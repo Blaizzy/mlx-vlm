@@ -8624,6 +8624,31 @@ class TestMultiImageMRoPE(unittest.TestCase):
                 )
 
 
+class TestQwen35GatedDeltaTraining(unittest.TestCase):
+    def test_chunked_update_allows_value_and_grad(self):
+        from mlx_vlm.models.qwen3_5.gated_delta import gated_delta_chunked
+
+        mx.random.seed(0)
+        batch, seq, heads, dim = 1, 4, 1, 4
+        q = mx.random.normal((batch, seq, heads, dim))
+        k = mx.random.normal((batch, seq, heads, dim))
+        v = mx.random.normal((batch, seq, heads, dim))
+        g = mx.full((batch, seq, heads), 0.9)
+        beta = mx.full((batch, seq, heads), 0.5)
+        state = mx.zeros((batch, heads, dim, dim))
+
+        def loss(q):
+            y, next_state = gated_delta_chunked(q, k, v, g, beta, state, C=2)
+            return y.astype(mx.float32).sum() + next_state.astype(mx.float32).sum()
+
+        value, grad = mx.value_and_grad(loss)(q)
+        mx.eval(value, grad)
+
+        self.assertTrue(bool(mx.isfinite(value)))
+        self.assertEqual(grad.shape, q.shape)
+        self.assertTrue(bool(mx.all(mx.isfinite(grad))))
+
+
 class TestMRoPETrainingVJP(unittest.TestCase):
     """Regression tests for issue #1474: LoRA/fine-tuning any M-RoPE VL model
     crashed on the first backward with ``[Primitive::vjp] Not implemented for
