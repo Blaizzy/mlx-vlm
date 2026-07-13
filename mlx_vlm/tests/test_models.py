@@ -3846,7 +3846,7 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(
             sanitized["language_model.model.layers.0.self_attn.q_proj.weight"].dtype,
-            mx.float32,
+            mx.bfloat16,
         )
         self.assertEqual(
             sanitized["language_model.model.layers.0.self_attn.q_proj.scales"].dtype,
@@ -7919,6 +7919,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "qwen3_omni_moe")
+        self._assert_qwen_request_owned_mrope_kwargs(model)
 
     def test_qwen3_omni_audio_sanitize_is_idempotent_for_conv2d_weights(self):
         from mlx_vlm.models import qwen3_omni_moe

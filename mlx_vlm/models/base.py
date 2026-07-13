@@ -225,6 +225,25 @@ def create_ssm_mask(h, cache=None):
     return None
 
 
+def align_attention_mask_to_scores(mask, scores: mx.array):
+    """Broadcast an attention mask onto *scores* without mis-aligning batch vs heads.
+
+    Quantized GQA expands scores to 5D ``(B, n_kv_heads, n_repeats, L, K)`` while
+    batch left-pad masks are typically 4D ``(B, 1, L, K)``. Right-aligning those
+    shapes aliases ``B`` with ``n_kv_heads`` and crashes for multi-row batches
+    (see #1567). Insert singleton dims *before* the last two axes until ranks
+    match so the layout is ``(B, 1, …, 1, L, K)``.
+    """
+    if mask is None or isinstance(mask, str):
+        return mask
+
+    # Grow rank by inserting size-1 axes immediately before (L, K).
+    while mask.ndim < scores.ndim:
+        insert_at = max(mask.ndim - 2, 0)
+        mask = mx.expand_dims(mask, axis=insert_at)
+    return mask
+
+
 def quantized_scaled_dot_product_attention(
     queries: mx.array,
     q_keys: tuple[mx.array, mx.array, mx.array],
@@ -254,6 +273,7 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
+        mask = align_attention_mask_to_scores(mask, scores)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:

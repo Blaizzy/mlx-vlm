@@ -226,6 +226,8 @@ class Model(nn.Module):
                 if k in ["image_grid_thw", "video_grid_thw"]
             }
         )
+        decode_lm_kwargs = dict(lm_kwargs)
+        decode_lm_kwargs.pop("position_ids", None)
 
         prompt_cache = kv_cache.make_prompt_cache(self.thinker.language_model)
         outputs = self.thinker.language_model(
@@ -276,7 +278,7 @@ class Model(nn.Module):
                 token[:, None],
                 cache=prompt_cache,
                 output_hidden_state_idx=target_layer_idx + 1,
-                **lm_kwargs,
+                **decode_lm_kwargs,
             )
             hidden_states.append(step_outputs.hidden_states)
             if token_id == thinker_eos_token_id:
