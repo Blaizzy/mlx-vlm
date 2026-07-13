@@ -34,7 +34,14 @@ class ModelConfig(AttributeConfig):
     @classmethod
     def from_dict(cls, params):
         params = dict(params or {})
-        from mlx_lm.utils import _get_classes
+        try:
+            from mlx_lm.utils import _get_classes
+        except ImportError as e:
+            raise ImportError(
+                f"Loading text-only model_type '{params.get('model_type')}' relies "
+                "on mlx-lm's model registry (no native mlx-vlm implementation). "
+                "Install it with `pip install mlx-lm`."
+            ) from e
 
         model_class, model_args_class = _get_classes(params)
         return cls(params, model_class, model_args_class)

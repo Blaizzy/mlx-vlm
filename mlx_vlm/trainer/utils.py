@@ -321,7 +321,13 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
         nn.Module: The updated model with LoRA layers applied.
     """
     if getattr(model, "_is_text_model", False):
-        from mlx_lm.utils import load_adapters
+        try:
+            from mlx_lm.utils import load_adapters
+        except ImportError as e:
+            raise ImportError(
+                "Loading LoRA adapters for a text-only fallback model relies on "
+                "mlx-lm. Install it with `pip install mlx-lm`."
+            ) from e
 
         model.language_model._model = load_adapters(
             model.language_model._model, adapter_path
