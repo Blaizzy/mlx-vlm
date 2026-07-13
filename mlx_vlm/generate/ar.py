@@ -714,6 +714,8 @@ def _make_cache(
     kv_bits=None,
     kv_group_size=64,
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+    quantized_kv_start=0,
+    prefill_length=0,
 ):
     """
     Convert a list of regular caches into their corresponding
@@ -729,8 +731,14 @@ def _make_cache(
     """
     use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
 
+    defer_turbo = (
+        use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
+    )
+
     def _make_quant_cache(lp):
         if use_turbo:
+            if defer_turbo:
+                return cache.BatchKVCache(lp)
             return BatchTurboQuantKVCache(lp, bits=kv_bits)
         return cache.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
@@ -1531,6 +1539,7 @@ class PromptProcessingBatch:
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start: int = 0,
         warm_cache: Optional[List[Any]] = None,
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
@@ -1629,6 +1638,8 @@ class PromptProcessingBatch:
                     kv_bits=kv_bits,
                     kv_group_size=kv_group_size,
                     kv_quant_scheme=kv_quant_scheme,
+                    quantized_kv_start=quantized_kv_start,
+                    prefill_length=max_length,
                 ),
             )
         elif (
@@ -1645,6 +1656,8 @@ class PromptProcessingBatch:
                 kv_bits=kv_bits,
                 kv_group_size=kv_group_size,
                 kv_quant_scheme=kv_quant_scheme,
+                quantized_kv_start=quantized_kv_start,
+                prefill_length=max_length,
             )
 
         # Declare per-row right-padding on each cache so finalize() can roll
@@ -2474,6 +2487,9 @@ class BatchGenerator:
             kv_bits=self.kv_bits,
             kv_group_size=self.kv_group_size,
             kv_quant_scheme=self.kv_quant_scheme,
+            quantized_kv_start=getattr(
+                self, "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+            ),
             warm_cache=warm_cache,
             apc_meta=apc_meta,
             apc_manager=self.apc_manager,
@@ -2773,6 +2789,9 @@ class BatchGenerator:
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
+                quantized_kv_start=getattr(
+                    self, "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+                ),
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
                 apc_mode=self.apc_mode,
