@@ -119,7 +119,11 @@ def gated_delta_chunked(q, k, v, g, beta, state, mask=None, C: int = 64):
     # this boundary without blocking the Python thread, letting graph-building
     # for the next layer overlap with GPU compute. Decode (T==1) never calls
     # this path, so its CUDA graphs stay intact.
-    mx.async_eval(Y, S)
+    try:
+        mx.async_eval(Y, S)
+    except ValueError as exc:
+        if "Not allowed inside a graph transformation" not in str(exc):
+            raise
     return Y, S
 
 

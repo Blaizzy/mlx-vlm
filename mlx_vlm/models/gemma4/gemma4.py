@@ -291,30 +291,12 @@ class Model(nn.Module):
                 mid_dim = v.shape[-1] // 2
                 gate_value = v[..., :mid_dim].swapaxes(-1, -2)
                 up_value = v[..., mid_dim:].swapaxes(-1, -2)
-                if self._needs_float32_language_weight(gate_key, gate_value):
-                    gate_value = gate_value.astype(mx.float32)
-                if self._needs_float32_language_weight(up_key, up_value):
-                    up_value = up_value.astype(mx.float32)
                 sanitized[gate_key] = gate_value
                 sanitized[up_key] = up_value
                 continue
 
-            if self._needs_float32_language_weight(new_key, v):
-                v = v.astype(mx.float32)
-
             sanitized[new_key] = v
         return sanitized
-
-    def _needs_float32_language_weight(self, key: str, value: mx.array) -> bool:
-        if not key.startswith("language_model."):
-            return False
-        if value.dtype not in (mx.bfloat16, mx.float16):
-            return False
-        # Quantized MLX checkpoints keep scale/bias tensors alongside packed
-        # weights. Leave those in their checkpoint dtype.
-        if key.endswith((".scales", ".biases")):
-            return False
-        return True
 
     @property
     def quant_predicate(self):
