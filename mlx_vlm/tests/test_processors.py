@@ -2738,5 +2738,39 @@ class TestLocateAnythingProcessor(unittest.TestCase):
             self.assertEqual(reloaded.tokenizer.chat_template, chat_template)
 
 
+class TestProcessorRegistration(unittest.TestCase):
+    _AFFECTED_MODULES = (
+        "mlx_vlm.models.glm4v.glm4v",
+        "mlx_vlm.models.glm4v_moe.glm4v_moe",
+        "mlx_vlm.models.deepseek_vl_v2.deepseek_vl_v2",
+        "mlx_vlm.models.deepseekocr.deepseekocr",
+        "mlx_vlm.models.deepseekocr_2.deepseekocr_2",
+        "mlx_vlm.models.unlimited_ocr.unlimitedocr",
+        "mlx_vlm.models.jina_vlm.jina_vlm",
+    )
+
+    def test_no_string_first_autoprocessor_register(self):
+        import re
+        from pathlib import Path
+
+        import mlx_vlm
+
+        models_dir = Path(mlx_vlm.__file__).parent / "models"
+        pattern = re.compile(r"""AutoProcessor\.register\(\s*['"]""")
+        offenders = [
+            str(path.relative_to(models_dir))
+            for path in models_dir.rglob("*.py")
+            if pattern.search(path.read_text())
+        ]
+        self.assertEqual(offenders, [], f"string-first register calls: {offenders}")
+
+    def test_affected_modules_import_cleanly(self):
+        import importlib
+
+        for module in self._AFFECTED_MODULES:
+            with self.subTest(module=module):
+                importlib.import_module(module)
+
+
 if __name__ == "__main__":
     unittest.main()
