@@ -24,6 +24,28 @@ def sanitize_key(key):
     return key
 
 
+NORM_WEIGHT_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+
+def should_shift_norm_weights(weights):
+    has_mtp_weights = any("mtp." in key for key in weights)
+    has_unsanitized_conv1d = any(
+        "conv1d.weight" in key and value.shape[-1] != 1
+        for key, value in weights.items()
+    )
+    return has_mtp_weights or has_unsanitized_conv1d
+
+
+def should_offset_norm_weight(original_key, shift_norm_weights):
+    return shift_norm_weights or not original_key.startswith("language_model.")
+
+
 class Model(Qwen3VLModel):
 
     def __init__(self, config: ModelConfig):
@@ -120,19 +142,13 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
+        shift_norm_weights = should_shift_norm_weights(weights)
+
         # ignore mtp weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
 
         sanitized_weights = {}
         for key, value in weights.items():
@@ -141,8 +157,10 @@ class Model(Qwen3VLModel):
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
-                if value.ndim == 1 and not original_key.startswith("language_model."):
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                if value.ndim == 1 and should_offset_norm_weight(
+                    original_key, shift_norm_weights
+                ):
                     value += 1.0
 
             sanitized_weights[key] = value
