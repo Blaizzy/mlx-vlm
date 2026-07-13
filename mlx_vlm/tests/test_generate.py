@@ -826,6 +826,41 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
 
+    def test_generation_batch_extend_expands_compact_processor_state(self):
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+
+        def make_batch(uid, processor=None):
+            return GenerationBatch(
+                model=object(),
+                uids=[uid],
+                inputs=mx.array([uid + 1], dtype=mx.int32),
+                prompt_cache=[],
+                sampler=sampler,
+                stop_criteria=stop_criteria,
+                max_tokens=[2],
+                token_context=[[30]] if processor is not None else None,
+                logits_processors=[[processor]] if processor is not None else None,
+            )
+
+        first_plain = make_batch(0)
+        second_plain = make_batch(1)
+        structured_processor = lambda tokens, logits: logits
+        structured = make_batch(2, structured_processor)
+
+        first_plain.extend(second_plain)
+        assert first_plain.logits_processors == []
+
+        first_plain.extend(structured)
+
+        assert first_plain.uids == [0, 1, 2]
+        assert first_plain.token_context == [[], [], [30]]
+        assert first_plain.logits_processors == [
+            None,
+            None,
+            [structured_processor],
+        ]
+
     def test_generation_batch_extend_discards_inactive_stale_processor_state(self):
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False

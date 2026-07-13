@@ -921,6 +921,15 @@ class GenerationBatch:
     def cache_states(self):
         return [c.state for c in self.prompt_cache if hasattr(c, "state")]
 
+    def _ensure_logits_processor_slots(self, *, force: bool = False):
+        if not (force or (self.logits_processors and any(self.logits_processors))):
+            return
+        if len(self.logits_processors) < len(self.uids):
+            missing = len(self.uids) - len(self.logits_processors)
+            self.logits_processors.extend([None] * missing)
+        elif len(self.logits_processors) > len(self.uids):
+            self.logits_processors = self.logits_processors[: len(self.uids)]
+
     def _ensure_token_context(self, *, force: bool = False):
         if not (force or (self.logits_processors and any(self.logits_processors))):
             if not self.logits_processors:
@@ -1102,6 +1111,8 @@ class GenerationBatch:
         self_has_processors = self.logits_processors and any(self.logits_processors)
         other_has_processors = other.logits_processors and any(other.logits_processors)
         if self_has_processors or other_has_processors:
+            self._ensure_logits_processor_slots(force=bool(other_has_processors))
+            other._ensure_logits_processor_slots(force=bool(self_has_processors))
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
         else:
@@ -1117,6 +1128,7 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
         self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self._ensure_logits_processor_slots()
         self._ensure_token_context()
 
         if self._current_tokens is None:
