@@ -264,3 +264,8 @@ class JinaVLMProcessor(ProcessorMixin):
             result["image_masks"] = mx.concatenate(all_image_masks, axis=0)
 
         return result
+
+
+from ..base import install_auto_processor_patch
+
+install_auto_processor_patch(["jina_vlm", "jvlm"], JinaVLMProcessor)

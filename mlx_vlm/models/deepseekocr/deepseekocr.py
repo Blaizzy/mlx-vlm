@@ -4,17 +4,14 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from transformers import AutoProcessor
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 
 from .config import ModelConfig, ProjectorConfig, SAMViTConfig
 from .language import LanguageModel
-from .processing_deepseekocr import DeepseekOCRProcessor
+from .processing_deepseekocr import DeepseekOCRProcessor  # noqa: F401
 from .sam import SAMEncoder
 from .vision import VisionModel
-
-AutoProcessor.register("deepseekocr", DeepseekOCRProcessor)
 
 
 class MlpProjector(nn.Module):
