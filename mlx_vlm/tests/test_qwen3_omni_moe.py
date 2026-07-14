@@ -126,9 +126,6 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                 input_ids,
                 target_layer_idx=0,
                 thinker_max_new_tokens=3,
-                # The randomly initialized tiny model can emit any in-vocab
-                # token. Use an impossible EOS so this test deterministically
-                # exercises the max-length hidden-state alignment path.
                 thinker_eos_token_id=-1,
             )
         )
