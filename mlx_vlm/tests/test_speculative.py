@@ -574,31 +574,39 @@ def test_qwen_target_verify_gemv_kernel_matches_singleton_dense_gemv():
 
 
 def test_qwen_target_verify_quantized_linear_matches_singleton_path():
-    mx.random.seed(15)
-    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
-    linear.scales = linear.scales.astype(mx.bfloat16)
-    linear.biases = linear.biases.astype(mx.bfloat16)
-    x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+    for bits in (4, 5, 8):
+        for group_size in (32, 64, 128):
+            mx.random.seed(150 + bits + group_size)
+            linear = nn.QuantizedLinear(
+                512, 16, bias=False, group_size=group_size, bits=bits
+            )
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+            x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
 
-    ref = qwen_language._target_verify_timewise(linear, x)
-    out = qwen_language._target_verify_linear(linear, x, target_verify=True)
-    mx.eval(ref, out)
+            ref = qwen_language._target_verify_singletons(linear, x)
+            out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+            mx.eval(ref, out)
 
-    assert bool(mx.array_equal(ref, out).item())
+            assert bool(mx.array_equal(ref, out).item())
 
 
-def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
-    mx.random.seed(17)
-    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
-    linear.scales = linear.scales.astype(mx.bfloat16)
-    linear.biases = linear.biases.astype(mx.bfloat16)
-    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+def test_qwen_target_verify_quantized_single_batch_matches_timewise():
+    for bits in (4, 5, 8):
+        for group_size in (32, 64, 128):
+            mx.random.seed(170 + bits + group_size)
+            linear = nn.QuantizedLinear(
+                512, 16, bias=False, group_size=group_size, bits=bits
+            )
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
+            x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
 
-    ref = linear(x)
-    out = qwen_language._target_verify_quantized_linear(linear, x)
-    mx.eval(ref, out)
+            ref = qwen_language._target_verify_timewise(linear, x)
+            out = qwen_language._target_verify_linear(linear, x, target_verify=True)
+            mx.eval(ref, out)
 
-    assert bool(mx.array_equal(ref, out).item())
+            assert bool(mx.array_equal(ref, out).item())
 
 
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
@@ -621,18 +629,70 @@ def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
         assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
 
 
+def test_qwen_target_verify_quantized_linears_fused_matches_separate():
+    for bits in (4, 5, 8):
+        for dtype in (mx.bfloat16, mx.float16):
+            mx.random.seed(178 + bits)
+            linears = [
+                nn.QuantizedLinear(512, out_dim, bias=False, group_size=64, bits=bits)
+                for out_dim in (64, 32, 16)
+            ]
+            for linear in linears:
+                linear.scales = linear.scales.astype(dtype)
+                linear.biases = linear.biases.astype(dtype)
+            x = mx.random.normal((2, 3, 512), dtype=dtype)
+
+            ref = tuple(
+                qwen_language._target_verify_linear(linear, x, target_verify=True)
+                for linear in linears
+            )
+            out = qwen_language._target_verify_quantized_linears_fused(
+                tuple(linears), x
+            )
+
+            assert out is not None
+            mx.eval(*ref, *out)
+            assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
+def test_qwen_target_verify_quantized_qkv_fused_matches_production_shape():
+    mx.random.seed(179)
+    linears = [
+        nn.QuantizedLinear(2048, out_dim, bias=False, group_size=64, bits=8)
+        for out_dim in (8192, 512, 512)
+    ]
+    for linear in linears:
+        linear.scales = linear.scales.astype(mx.bfloat16)
+        linear.biases = linear.biases.astype(mx.bfloat16)
+    x = mx.random.normal((1, 4, 2048), dtype=mx.bfloat16)
+
+    ref = tuple(
+        qwen_language._target_verify_linear(linear, x, target_verify=True)
+        for linear in linears
+    )
+    out = qwen_language._target_verify_quantized_linears_fused(tuple(linears), x)
+
+    assert out is not None
+    mx.eval(*ref, *out)
+    assert all(bool(mx.array_equal(a, b).item()) for a, b in zip(ref, out))
+
+
 def test_qwen_target_verify_quantized_argmax_matches_singleton_path():
-    mx.random.seed(16)
-    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
-    linear.scales = linear.scales.astype(mx.bfloat16)
-    linear.biases = linear.biases.astype(mx.bfloat16)
+    for bits in (4, 5, 8):
+        for group_size in (32, 64, 128):
+            mx.random.seed(160 + bits + group_size)
+            linear = nn.QuantizedLinear(
+                512, 16, bias=False, group_size=group_size, bits=bits
+            )
+            linear.scales = linear.scales.astype(mx.bfloat16)
+            linear.biases = linear.biases.astype(mx.bfloat16)
 
-    x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
-    ref = mx.argmax(qwen_language._target_verify_timewise(linear, x), axis=-1)
-    out = qwen_language._target_verify_quantized_argmax(linear, x)
-    mx.eval(ref, out)
+            x = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+            ref = mx.argmax(qwen_language._target_verify_singletons(linear, x), axis=-1)
+            out = qwen_language._target_verify_quantized_argmax(linear, x)
+            mx.eval(ref, out)
 
-    assert bool(mx.array_equal(ref, out).item())
+            assert bool(mx.array_equal(ref, out).item())
 
 
 def test_qwen3_5_quantized_argmax_batch_as_time_matches_rowwise():

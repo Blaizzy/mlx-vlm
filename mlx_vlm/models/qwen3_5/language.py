@@ -222,6 +222,11 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
           x_thread[i + 6] = x[i + 6] / 64.0f;
           x_thread[i + 7] = x[i + 7] / 8.0f;
         }
+      } else if (BITS == 8) {
+        for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+          sum += x[i];
+          x_thread[i] = x[i];
+        }
       }
       return sum;
     }
@@ -259,6 +264,10 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
           accum += (wb[3] & 0xc0) * xt[6];
           accum += (wb[4] & 0x7) * (xt[6] * 256.0f);
           accum += (wb[4] & 0xf8) * xt[7];
+        }
+      } else if (BITS == 8) {
+        for (int i = 0; i < VALUES_PER_THREAD; ++i) {
+          accum += x_thread[i] * w[i];
         }
       }
       return scale * accum + sum * bias;
@@ -473,7 +482,8 @@ def _can_target_verify_quantized(linear, x: mx.array) -> bool:
         not isinstance(linear, nn.QuantizedLinear)
         or x.ndim != 3
         or x.shape[1] < 1
-        or linear.bits not in (4, 5)
+        or linear.bits not in (4, 5, 8)
+        or linear.group_size not in (32, 64, 128)
         or linear.mode != "affine"
         or linear.biases is None
         or x.dtype not in (mx.bfloat16, mx.float16)
@@ -516,12 +526,9 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
     return out
 
 
-def _decode_quantized_linears_fused(linears, x: mx.array):
-    if (
-        x.ndim != 3
-        or x.shape[1] != 1
-        or len(linears) != 4
-        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
+def _quantized_linears_fused_parameters(linears, x: mx.array):
+    if not linears or not all(
+        isinstance(linear, nn.QuantizedLinear) for linear in linears
     ):
         return None
 
@@ -541,7 +548,7 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     cache_key = tuple(
         (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
     )
-    cached = getattr(first, "_qwen3_5_fused_decode_linears", None)
+    cached = getattr(first, "_qwen3_5_fused_linears", None)
     if cached is None or cached[0] != cache_key:
         weights = mx.concatenate([linear.weight for linear in linears], axis=0)
         scales = mx.concatenate([linear.scales for linear in linears], axis=0)
@@ -553,9 +560,20 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
             split_indices.append(offset)
         mx.eval(weights, scales, biases)
         cached = (cache_key, weights, scales, biases, split_indices)
-        first._qwen3_5_fused_decode_linears = cached
+        first._qwen3_5_fused_linears = cached
 
-    _, weights, scales, biases, split_indices = cached
+    return first, *cached[1:]
+
+
+def _decode_quantized_linears_fused(linears, x: mx.array):
+    if x.ndim != 3 or x.shape[1] != 1 or len(linears) != 4:
+        return None
+
+    fused = _quantized_linears_fused_parameters(linears, x)
+    if fused is None:
+        return None
+
+    first, weights, scales, biases, split_indices = fused
     output = mx.quantized_matmul(
         x,
         weights,
@@ -566,6 +584,43 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         bits=first.bits,
         mode=first.mode,
     )
+    return tuple(mx.split(output, split_indices, axis=-1))
+
+
+def _target_verify_quantized_linears_fused(linears, x: mx.array):
+    if (
+        x.ndim != 3
+        or x.shape[1] <= 1
+        or len(linears) < 2
+        or not all(
+            _can_target_verify_quantized(linear, x) and "bias" not in linear
+            for linear in linears
+        )
+    ):
+        return None
+
+    fused = _quantized_linears_fused_parameters(linears, x)
+    if fused is None:
+        return None
+
+    first, weights, scales, biases, split_indices = fused
+    B, T, K = x.shape
+    N = weights.shape[0]
+    x = mx.contiguous(x)
+    kernel = _target_verify_qmv_kernel(first.bits, first.group_size, x.dtype, T, K, N)
+    output = kernel(
+        inputs=[x, weights, scales, biases],
+        template=[
+            ("T", x.dtype),
+            ("VERIFY_T", int(T)),
+            ("K_SIZE", int(K)),
+            ("N_SIZE", int(N)),
+        ],
+        grid=(32, 2 * (N // 8), B),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(B, T, N)],
+        output_dtypes=[x.dtype],
+    )[0]
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
@@ -625,8 +680,6 @@ def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
         return linear(x)
 
     if isinstance(linear, nn.QuantizedLinear):
-        if x.shape[0] == 1:
-            return linear(x)
         out = _target_verify_quantized_linear(linear, x)
         if out is not None:
             return out
@@ -654,6 +707,10 @@ def _target_verify_linears(linears, x: mx.array, target_verify: bool):
             return out
         return tuple(linear(x) for linear in linears)
 
+    if len(linears) == 3:
+        out = _target_verify_quantized_linears_fused(linears, x)
+        if out is not None:
+            return out
     return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
 
 
