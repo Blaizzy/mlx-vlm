@@ -627,9 +627,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             else model
         )
 
-        # Stock MLX does not accept bits=1 in nn.quantize/quantized_matmul.
-        # Replace checkpoint-backed affine 1-bit leaves with Python-hosted
-        # custom Metal kernel modules before handling the remaining modes.
+        # Stock MLX rejects bits=1; route those layers to our Metal kernel.
         replace_one_bit_modules(quantized_model, quantization, weights)
 
         def get_class_predicate(p, m):
@@ -641,8 +639,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and not _has_quantized_weights(p, weights)
             ):
                 return False
-            # 1-bit leaves were handled above. Returning False here also keeps
-            # unsupported stock MLX quantizers from seeing bits=1.
+            # Skip 1-bit layers already replaced above.
             if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
             # Handle custom per layer quantizations
