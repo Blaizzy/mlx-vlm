@@ -75,6 +75,130 @@ _ONE_BIT_QMV_SOURCE = r"""
 """
 
 
+_ONE_BIT_QMM_HEADER = r"""
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+"""
+
+
+_ONE_BIT_QMM_SOURCE = r"""
+    constexpr short BM = 32;
+    constexpr short BK = 32;
+    constexpr short BN = 32;
+    constexpr short TILE_STRIDE = BK + 16 / sizeof(T);
+
+    const int M = x_shape[0];
+    const int K = x_shape[1];
+    const int N = weight_shape[0];
+    const uint lane = thread_index_in_simdgroup;
+    const uint simd_group = simdgroup_index_in_threadgroup;
+    const uint thread_index = thread_index_in_threadgroup;
+    const int tile_row = threadgroup_position_in_grid.y * BM;
+    const int tile_column = threadgroup_position_in_grid.x * BN;
+    const int load_row = thread_index / 4;
+    const int load_column = (thread_index % 4) * 8;
+    const int simd_row = simd_group / 2;
+    const int simd_column = simd_group % 2;
+
+    const short quad = lane / 4;
+    const short fragment_row = (quad & 4) + ((lane / 2) % 4);
+    const short fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+
+    threadgroup T x_tile[BM * TILE_STRIDE];
+    threadgroup T weight_tile[BN * TILE_STRIDE];
+
+    metal::simdgroup_matrix<float, 8, 8> accumulators[2][2];
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < 2; ++row) {
+        #pragma clang loop unroll(full)
+        for (short column = 0; column < 2; ++column) {
+            accumulators[row][column].thread_elements()[0] = 0.0f;
+            accumulators[row][column].thread_elements()[1] = 0.0f;
+        }
+    }
+
+    for (int k_start = 0; k_start < K; k_start += BK) {
+        int input_row = tile_row + load_row;
+        int input_column = k_start + load_column;
+        int weight_row = tile_column + load_row;
+        int packed_column = k_start / 32;
+        uint packed = weight_row < N
+            ? weight[weight_row * weight_shape[1] + packed_column]
+            : 0;
+        uchar packed_byte = uchar(packed >> ((thread_index % 4) * 8));
+        T scale = weight_row < N
+            ? scales[weight_row * scales_shape[1] + k_start / GROUP_SIZE]
+            : T(0);
+        T bias = weight_row < N
+            ? biases[weight_row * biases_shape[1] + k_start / GROUP_SIZE]
+            : T(0);
+
+        #pragma clang loop unroll(full)
+        for (short element = 0; element < 8; ++element) {
+            x_tile[load_row * TILE_STRIDE + load_column + element] =
+                input_row < M ? x[input_row * K + input_column + element] : T(0);
+            weight_tile[load_row * TILE_STRIDE + load_column + element] =
+                bias + ((packed_byte & (uchar(1) << element)) ? scale : T(0));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma clang loop unroll(full)
+        for (short k_fragment = 0; k_fragment < BK; k_fragment += 8) {
+            metal::simdgroup_matrix<float, 8, 8> a[2];
+            metal::simdgroup_matrix<float, 8, 8> b[2];
+            #pragma clang loop unroll(full)
+            for (short tile = 0; tile < 2; ++tile) {
+                int a_row = simd_row * 16 + tile * 8 + fragment_row;
+                int b_row = simd_column * 16 + tile * 8 + fragment_column;
+                #pragma clang loop unroll(full)
+                for (short element = 0; element < 2; ++element) {
+                    a[tile].thread_elements()[element] = static_cast<float>(
+                        x_tile[a_row * TILE_STRIDE + k_fragment +
+                               fragment_column + element]);
+                    b[tile].thread_elements()[element] = static_cast<float>(
+                        weight_tile[(b_row + element) * TILE_STRIDE +
+                                    k_fragment + fragment_row]);
+                }
+            }
+
+            #pragma clang loop unroll(full)
+            for (short row = 0; row < 2; ++row) {
+                #pragma clang loop unroll(full)
+                for (short column = 0; column < 2; ++column) {
+                    metal::simdgroup_matrix<float, 8, 8> result;
+                    simdgroup_multiply_accumulate(
+                        result,
+                        a[row],
+                        b[column],
+                        accumulators[row][column]);
+                    accumulators[row][column] = result;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma clang loop unroll(full)
+    for (short row = 0; row < 2; ++row) {
+        #pragma clang loop unroll(full)
+        for (short column = 0; column < 2; ++column) {
+            int output_row = tile_row + simd_row * 16 + row * 8 + fragment_row;
+            int output_column =
+                tile_column + simd_column * 16 + column * 8 + fragment_column;
+            #pragma clang loop unroll(full)
+            for (short element = 0; element < 2; ++element) {
+                if (output_row < M && output_column + element < N) {
+                    out[output_row * N + output_column + element] = static_cast<T>(
+                        accumulators[row][column].thread_elements()[element]);
+                }
+            }
+        }
+    }
+"""
+
+
 def _validate_group_size(group_size: int) -> None:
     if group_size not in SUPPORTED_GROUP_SIZES:
         raise ValueError(
@@ -96,6 +220,20 @@ def _one_bit_qmv_kernel(group_size: int, output_aligned: bool):
         input_names=["x", "weight", "scales", "biases"],
         output_names=["out"],
         source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _one_bit_qmm_kernel(group_size: int):
+    _validate_group_size(group_size)
+    if not hasattr(mx, "metal") or not mx.metal.is_available():
+        return None
+    return mx.fast.metal_kernel(
+        name=f"mlx_vlm_affine_1bit_qmm_gs_{group_size}",
+        input_names=["x", "weight", "scales", "biases"],
+        output_names=["out"],
+        header=_ONE_BIT_QMM_HEADER,
+        source=_ONE_BIT_QMM_SOURCE.replace("GROUP_SIZE", str(group_size)),
     )
 
 
@@ -164,6 +302,23 @@ def one_bit_quantized_matmul(
     output_dims = weight.shape[0]
     output_shape = (*x.shape[:-1], output_dims)
     x_2d = x.reshape(-1, input_dims)
+    if x_2d.shape[0] >= 16 and input_dims % 512 == 0:
+        kernel = _one_bit_qmm_kernel(group_size)
+        if kernel is not None:
+            out = kernel(
+                inputs=[x_2d, weight, scales, biases],
+                template=[("T", x.dtype)],
+                grid=(
+                    ((output_dims + 31) // 32) * 128,
+                    (x_2d.shape[0] + 31) // 32,
+                    1,
+                ),
+                threadgroup=(128, 1, 1),
+                output_shapes=[(x_2d.shape[0] * output_dims,)],
+                output_dtypes=[x.dtype],
+            )[0]
+            return out.reshape(output_shape)
+
     kernel = _one_bit_qmv_kernel(group_size, output_dims % 8 == 0)
     if kernel is None:
         dense_weight = dequantize_one_bit(weight, scales, biases, group_size).astype(
