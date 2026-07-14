@@ -17,9 +17,10 @@ _ONE_BIT_QMV_SOURCE = r"""
     uint input_dims = x_shape[1];
     uint output_dims = weight_shape[0];
     uint groups = scales_shape[1];
-    uint output_start = threadgroup_position_in_grid.x * 8 + simd_group * 4;
+    uint output_start = threadgroup_position_in_grid.x * OUTPUTS_PER_THREADGROUP +
+        simd_group * OUTPUTS_PER_SIMDGROUP;
 
-    float accumulators[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accumulators[OUTPUTS_PER_SIMDGROUP] = {0.0f};
     constexpr uint VALUES_PER_THREAD = 16;
     constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
 
@@ -42,7 +43,7 @@ _ONE_BIT_QMV_SOURCE = r"""
         uint group = block_start / GROUP_SIZE;
         uint packed_column = block_start >> 5;
         uint packed_shift = block_start & 31;
-        for (uint row = 0; row < 4; ++row) {
+        for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
             uint output_row = output_start + row;
             if (ROW_VALID) {
                 ushort packed = ushort(
@@ -64,7 +65,7 @@ _ONE_BIT_QMV_SOURCE = r"""
         }
     }
 
-    for (uint row = 0; row < 4; ++row) {
+    for (uint row = 0; row < OUTPUTS_PER_SIMDGROUP; ++row) {
         accumulators[row] = simd_sum(accumulators[row]);
         uint output_row = output_start + row;
         if (lane == 0 && output_row < output_dims) {
@@ -208,15 +209,23 @@ def _validate_group_size(group_size: int) -> None:
 
 
 @lru_cache(maxsize=None)
-def _one_bit_qmv_kernel(group_size: int, output_aligned: bool):
+def _one_bit_qmv_kernel(
+    group_size: int, output_aligned: bool, outputs_per_simdgroup: int
+):
     _validate_group_size(group_size)
     if not hasattr(mx, "metal") or not mx.metal.is_available():
         return None
-    source = _ONE_BIT_QMV_SOURCE.replace("GROUP_SIZE", str(group_size)).replace(
-        "ROW_VALID", "true" if output_aligned else "output_row < output_dims"
+    source = (
+        _ONE_BIT_QMV_SOURCE.replace("GROUP_SIZE", str(group_size))
+        .replace("OUTPUTS_PER_THREADGROUP", str(outputs_per_simdgroup * 2))
+        .replace("OUTPUTS_PER_SIMDGROUP", str(outputs_per_simdgroup))
+        .replace("ROW_VALID", "true" if output_aligned else "output_row < output_dims")
     )
     return mx.fast.metal_kernel(
-        name=f"mlx_vlm_affine_1bit_qmv_gs_{group_size}_aligned_{int(output_aligned)}",
+        name=(
+            f"mlx_vlm_affine_1bit_qmv_gs_{group_size}_"
+            f"rows_{outputs_per_simdgroup}_aligned_{int(output_aligned)}"
+        ),
         input_names=["x", "weight", "scales", "biases"],
         output_names=["out"],
         source=source,
@@ -319,7 +328,15 @@ def one_bit_quantized_matmul(
             )[0]
             return out.reshape(output_shape)
 
-    kernel = _one_bit_qmv_kernel(group_size, output_dims % 8 == 0)
+    outputs_per_simdgroup = (
+        4 if output_dims <= 64 or input_dims >= 2 * output_dims else 8
+    )
+    outputs_per_threadgroup = outputs_per_simdgroup * 2
+    kernel = _one_bit_qmv_kernel(
+        group_size,
+        output_dims % outputs_per_threadgroup == 0,
+        outputs_per_simdgroup,
+    )
     if kernel is None:
         dense_weight = dequantize_one_bit(weight, scales, biases, group_size).astype(
             x.dtype
@@ -329,7 +346,12 @@ def one_bit_quantized_matmul(
     out = kernel(
         inputs=[x_2d, weight, scales, biases],
         template=[("T", x.dtype)],
-        grid=(((output_dims + 7) // 8) * 64, x_2d.shape[0], 1),
+        grid=(
+            ((output_dims + outputs_per_threadgroup - 1) // outputs_per_threadgroup)
+            * 64,
+            x_2d.shape[0],
+            1,
+        ),
         threadgroup=(64, 1, 1),
         output_shapes=[(x_2d.shape[0] * output_dims,)],
         output_dtypes=[x.dtype],
