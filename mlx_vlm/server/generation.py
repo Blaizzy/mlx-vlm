@@ -335,6 +335,25 @@ def _count_prompt_tokens(raw_inputs: dict) -> int:
     return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
 
 
+def _materialize_mx_arrays(value):
+    arrays = []
+
+    def collect(item):
+        if isinstance(item, mx.array):
+            arrays.append(item)
+        elif isinstance(item, dict):
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                collect(child)
+
+    collect(value)
+    if arrays:
+        mx.eval(*arrays)
+    return value
+
+
 def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
     context_limit = get_configured_context_limit()
     requested_tokens = prompt_tokens + max(0, int(max_tokens or 0))
@@ -1058,6 +1077,7 @@ class ResponseGenerator:
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+        _materialize_mx_arrays(raw_inputs)
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
@@ -1372,27 +1392,27 @@ class ResponseGenerator:
                             prefill_step_size=get_prefill_step_size(),
                         )
 
-                    # Vision encoder runs on the GPU thread; text tokenization
-                    # already happened on the caller thread.
-                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
-                    has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
-                    # Per-tenant APC salt: keep this out of the model forward
-                    # by namespacing under "_apc_tenant"; BatchGenerator strips
-                    # it before merging kwargs for the language model.
-                    if getattr(args, "tenant_id", None):
-                        gen_kwargs["_apc_tenant"] = args.tenant_id
-
-                    # Drain pending text-only prompts before inserting an
-                    # embed-bearing request — multi-row PromptProcessingBatch
-                    # admission expects all rows to carry inputs_embeds (the
-                    # mixed APC path concatenates them per-row).
-                    if has_embeds and any(
-                        not (s[3] and s[3].get("inputs_embeds") is not None)
-                        for s in batch_gen.unprocessed_prompts
-                    ):
-                        self._flush(batch_gen, active)
-
                     try:
+                        # Vision encoder runs on the GPU thread; text tokenization
+                        # already happened on the caller thread.
+                        input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
+                        has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
+                        # Per-tenant APC salt: keep this out of the model forward
+                        # by namespacing under "_apc_tenant"; BatchGenerator strips
+                        # it before merging kwargs for the language model.
+                        if getattr(args, "tenant_id", None):
+                            gen_kwargs["_apc_tenant"] = args.tenant_id
+
+                        # Drain pending text-only prompts before inserting an
+                        # embed-bearing request — multi-row PromptProcessingBatch
+                        # admission expects all rows to carry inputs_embeds (the
+                        # mixed APC path concatenates them per-row).
+                        if has_embeds and any(
+                            not (s[3] and s[3].get("inputs_embeds") is not None)
+                            for s in batch_gen.unprocessed_prompts
+                        ):
+                            self._flush(batch_gen, active)
+
                         thinking_budget_criteria = self._make_thinking_budget_criteria(
                             args, input_ids
                         )

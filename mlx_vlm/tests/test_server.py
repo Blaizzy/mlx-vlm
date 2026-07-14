@@ -214,6 +214,28 @@ def test_speculative_server_samples_first_bonus_with_positioned_sampler():
     assert tokens.tolist() == [2, 0]
 
 
+def test_materialize_mx_arrays_evaluates_nested_preprocess_outputs(monkeypatch):
+    input_ids = mx.array([[1, 2, 3]])
+    attention_mask = mx.array([[1, 1, 1]])
+    grid = mx.array([[1, 2, 3]])
+    raw_inputs = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "metadata": [{"image_grid_thw": grid}, "keep"],
+    }
+    evaluated = []
+
+    def fake_eval(*arrays):
+        evaluated.extend(arrays)
+
+    monkeypatch.setattr(server_generation.mx, "eval", fake_eval)
+
+    result = server_generation._materialize_mx_arrays(raw_inputs)
+
+    assert result is raw_inputs
+    assert evaluated == [input_ids, attention_mask, grid]
+
+
 def test_positioned_target_sampler_is_batch_grouping_invariant():
     sampler = server_generation._PositionedTargetSampler(
         temperature=0.7, top_p=1.0, seed=42
@@ -682,6 +704,50 @@ def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
     gen._run_speculative()
 
     assert calls == {"clear_cache": 1, "collect": 1}
+
+
+def test_ar_thread_gpu_embed_exception_reaches_client_queue(monkeypatch):
+    gen = _unstarted_response_generator()
+
+    def fake_initialize_model():
+        gen.model = SimpleNamespace(language_model=object())
+        gen.processor = SimpleNamespace()
+        gen.config = SimpleNamespace()
+        gen.stop_tokens = set()
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.tokenizer = SimpleNamespace()
+
+    class FakeBatchGenerator:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+    rqueue = Queue()
+    pending = [
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
+        )
+    ]
+    calls = {"count": 0}
+    error = RuntimeError("gpu embed failed")
+
+    def collect_pending_requests(**_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pending, False
+        return [], True
+
+    gen._initialize_model = fake_initialize_model
+    gen._collect_pending_requests = collect_pending_requests
+    gen._gpu_embed = MagicMock(side_effect=error)
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+
+    gen._run()
+
+    assert rqueue.get(timeout=1) is error
 
 
 def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
