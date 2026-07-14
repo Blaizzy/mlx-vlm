@@ -960,11 +960,7 @@ class GenerationBatch:
 
         lm_head = getattr(self._language_model, "lm_head", None)
         if getattr(lm_head, "bits", None) == 1:
-            output = self._language_model(
-                inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
-            )
-            logits = output.logits if hasattr(output, "logits") else output
-            return self.sampler(logits[:, -1, :])
+            return None
 
         argmax_from_hidden = getattr(
             self._language_model, "speculative_argmax_from_hidden", None
@@ -1035,13 +1031,22 @@ class GenerationBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = _sample_with_positions(
-            self.sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
-            positions=[n + 1 for n in self._num_tokens],
-        )
+        if (
+            self.greedy_sampling
+            and not self.compute_logprobs
+            and self.top_logprobs_k == 0
+            and not (self.logits_processors and any(self.logits_processors))
+        ):
+            logprobs = None
+            sampled = self.sampler(logits)
+        else:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            sampled = _sample_with_positions(
+                self.sampler,
+                logprobs,
+                row_ids=[0] * len(self.uids),
+                positions=[n + 1 for n in self._num_tokens],
+            )
 
         self._next_tokens = sampled
         prev_top_idx = self._next_top_idx

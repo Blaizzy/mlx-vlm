@@ -763,12 +763,18 @@ class TestBatchGenerator:
                 raise AssertionError("1-bit decode should use direct logits")
 
         model = OneBitModel()
+        sampled_logits = []
+
+        def sample(logits):
+            sampled_logits.append(logits.tolist())
+            return mx.argmax(logits, axis=-1)
+
         batch = GenerationBatch(
             model=model,
             uids=[0],
             inputs=mx.array([5], dtype=mx.int32),
             prompt_cache=[],
-            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            sampler=sample,
             stop_criteria=lambda token: False,
             max_tokens=[2],
             greedy_sampling=True,
@@ -779,6 +785,7 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5]
         assert batch._next_tokens.tolist() == [2]
         assert model.calls == [{}]
+        assert sampled_logits == [[[0.0, 1.0, 4.0, 2.0]]]
 
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
         def fake_rounds(*args, **kwargs):
