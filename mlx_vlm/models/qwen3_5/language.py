@@ -468,25 +468,33 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
     )
 
 
-def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+def _can_target_verify_quantized_head(linear) -> bool:
     if (
         not isinstance(linear, nn.QuantizedLinear)
-        or x.ndim != 3
-        or x.shape[1] < 1
         or linear.bits not in (4, 5)
         or linear.mode != "affine"
         or linear.biases is None
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
+        or linear.scales.dtype not in (mx.bfloat16, mx.float16)
+        or linear.biases.dtype != linear.scales.dtype
     ):
         return False
 
-    _, _, K = x.shape
+    K = linear.weight.shape[1] * 32 // linear.bits
     N = linear.weight.shape[0]
-    return (
-        K == linear.weight.shape[1] * 32 // linear.bits and K % 512 == 0 and N % 8 == 0
-    )
+    return K % 512 == 0 and N % 8 == 0
+
+
+def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+    if (
+        not _can_target_verify_quantized_head(linear)
+        or x.ndim != 3
+        or x.shape[1] < 1
+        or x.dtype != linear.scales.dtype
+    ):
+        return False
+
+    K = linear.weight.shape[1] * 32 // linear.bits
+    return x.shape[-1] == K
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -2645,6 +2653,27 @@ class LanguageModel(nn.Module):
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
         return mx.argmax(logits, axis=-1)
+
+    def fused_greedy_decode(self, inputs: mx.array, cache=None, **kwargs):
+        if (
+            self.args.tie_word_embeddings
+            or not _can_target_verify_quantized_head(self.lm_head)
+            or "bias" in self.lm_head
+        ):
+            return None
+
+        output = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            skip_logits=True,
+            **kwargs,
+        )
+        hidden = output.hidden_states[-1]
+        sampled = _target_verify_quantized_argmax(self.lm_head, hidden)
+        if sampled is not None:
+            return sampled
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(
