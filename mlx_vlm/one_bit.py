@@ -75,109 +75,6 @@ _ONE_BIT_QMV_SOURCE = r"""
 """
 
 
-_ONE_BIT_FUSED_QMV_SOURCE = r"""
-    uint lane = thread_index_in_simdgroup;
-    uint simd_group = simdgroup_index_in_threadgroup;
-    uint input_row = threadgroup_position_in_grid.y;
-    uint input_dims = x_shape[1];
-    uint tile = threadgroup_position_in_grid.x;
-    uint tiles_0 = (weight_0_shape[0] + 7) / 8;
-    uint tiles_1 = (weight_1_shape[0] + 7) / 8;
-    uint tiles_2 = (weight_2_shape[0] + 7) / 8;
-
-    auto packed_weights = weight_0;
-    auto group_scales = scales_0;
-    auto group_biases = biases_0;
-    auto output = out_0;
-    uint local_tile = tile;
-    uint output_dims = weight_0_shape[0];
-    uint packed_row_size = weight_0_shape[1];
-    uint groups = scales_0_shape[1];
-
-    if (tile >= tiles_0 + tiles_1 + tiles_2) {
-        packed_weights = weight_3;
-        group_scales = scales_3;
-        group_biases = biases_3;
-        output = out_3;
-        local_tile -= tiles_0 + tiles_1 + tiles_2;
-        output_dims = weight_3_shape[0];
-        packed_row_size = weight_3_shape[1];
-        groups = scales_3_shape[1];
-    } else if (tile >= tiles_0 + tiles_1) {
-        packed_weights = weight_2;
-        group_scales = scales_2;
-        group_biases = biases_2;
-        output = out_2;
-        local_tile -= tiles_0 + tiles_1;
-        output_dims = weight_2_shape[0];
-        packed_row_size = weight_2_shape[1];
-        groups = scales_2_shape[1];
-    } else if (tile >= tiles_0) {
-        packed_weights = weight_1;
-        group_scales = scales_1;
-        group_biases = biases_1;
-        output = out_1;
-        local_tile -= tiles_0;
-        output_dims = weight_1_shape[0];
-        packed_row_size = weight_1_shape[1];
-        groups = scales_1_shape[1];
-    }
-
-    uint output_start = local_tile * 8 + simd_group * 4;
-    float accumulators[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    constexpr uint VALUES_PER_THREAD = 16;
-    constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
-
-    for (uint block_start = lane * VALUES_PER_THREAD;
-         block_start < input_dims;
-         block_start += BLOCK_SIZE) {
-        float x_thread[VALUES_PER_THREAD];
-        float total_sum = 0.0f;
-        #pragma clang loop unroll(full)
-        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
-            float value = static_cast<float>(
-                x[input_row * input_dims + block_start + i]);
-            x_thread[i] = value;
-            total_sum += value;
-        }
-
-        uint group = block_start / GROUP_SIZE;
-        uint packed_column = block_start >> 5;
-        uint packed_shift = block_start & 31;
-        for (uint row = 0; row < 4; ++row) {
-            uint output_row = output_start + row;
-            if (output_row < output_dims) {
-                ushort packed = ushort(
-                    packed_weights[
-                        output_row * packed_row_size + packed_column] >>
-                    packed_shift);
-                float selected_sum = 0.0f;
-                #pragma clang loop unroll(full)
-                for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
-                    selected_sum +=
-                        (packed & (ushort(1) << i)) ? x_thread[i] : 0.0f;
-                }
-
-                uint parameter_index = output_row * groups + group;
-                accumulators[row] += selected_sum *
-                    static_cast<float>(group_scales[parameter_index]);
-                accumulators[row] += total_sum *
-                    static_cast<float>(group_biases[parameter_index]);
-            }
-        }
-    }
-
-    for (uint row = 0; row < 4; ++row) {
-        accumulators[row] = simd_sum(accumulators[row]);
-        uint output_row = output_start + row;
-        if (lane == 0 && output_row < output_dims) {
-            output[input_row * output_dims + output_row] =
-                static_cast<T>(accumulators[row]);
-        }
-    }
-"""
-
-
 def _validate_group_size(group_size: int) -> None:
     if group_size not in SUPPORTED_GROUP_SIZES:
         raise ValueError(
@@ -199,23 +96,6 @@ def _one_bit_qmv_kernel(group_size: int, output_aligned: bool):
         input_names=["x", "weight", "scales", "biases"],
         output_names=["out"],
         source=source,
-    )
-
-
-@lru_cache(maxsize=None)
-def _one_bit_fused_qmv_kernel(group_size: int):
-    _validate_group_size(group_size)
-    if not hasattr(mx, "metal") or not mx.metal.is_available():
-        return None
-
-    input_names = ["x"]
-    for index in range(4):
-        input_names.extend([f"weight_{index}", f"scales_{index}", f"biases_{index}"])
-    return mx.fast.metal_kernel(
-        name=f"mlx_vlm_affine_1bit_qmv_fused4_gs_{group_size}",
-        input_names=input_names,
-        output_names=[f"out_{index}" for index in range(4)],
-        source=_ONE_BIT_FUSED_QMV_SOURCE.replace("GROUP_SIZE", str(group_size)),
     )
 
 
@@ -300,67 +180,6 @@ def one_bit_quantized_matmul(
         output_dtypes=[x.dtype],
     )[0]
     return out.reshape(output_shape)
-
-
-def one_bit_quantized_matmul_fused(
-    x: mx.array,
-    weights,
-    scales,
-    biases,
-    *,
-    group_size: int,
-):
-    """Run four affine 1-bit projections in one dispatch without copying weights."""
-    if not (len(weights) == len(scales) == len(biases) == 4):
-        raise ValueError("Fused 1-bit matmul requires exactly four projections.")
-
-    input_dims = x.shape[-1]
-    output_dims = []
-    for index, (weight, scale, bias) in enumerate(zip(weights, scales, biases)):
-        if weight.ndim != 2 or scale.ndim != 2 or bias.ndim != 2:
-            raise ValueError(f"Fused 1-bit projection {index} must use 2D arrays.")
-        if weight.dtype != mx.uint32:
-            raise ValueError(
-                f"Packed 1-bit projection {index} must be uint32, got {weight.dtype}."
-            )
-        if scale.shape != bias.shape or scale.shape[0] != weight.shape[0]:
-            raise ValueError(f"Fused 1-bit projection {index} has mismatched rows.")
-        if weight.shape[1] * 32 != input_dims:
-            raise ValueError(
-                f"Fused 1-bit projection {index} expects "
-                f"{weight.shape[1] * 32} features, got {input_dims}."
-            )
-        if scale.shape[1] * group_size != input_dims:
-            raise ValueError(
-                f"Fused 1-bit projection {index} scales describe "
-                f"{scale.shape[1] * group_size} features, got {input_dims}."
-            )
-        output_dims.append(weight.shape[0])
-
-    kernel = _one_bit_fused_qmv_kernel(group_size)
-    if kernel is None:
-        return tuple(
-            one_bit_quantized_matmul(x, weight, scale, bias, group_size=group_size)
-            for weight, scale, bias in zip(weights, scales, biases)
-        )
-
-    x_2d = x.reshape(-1, input_dims)
-    inputs = [x_2d]
-    for arrays in zip(weights, scales, biases):
-        inputs.extend(arrays)
-    rows = x_2d.shape[0]
-    outputs = kernel(
-        inputs=inputs,
-        template=[("T", x.dtype)],
-        grid=(sum((dims + 7) // 8 for dims in output_dims) * 64, rows, 1),
-        threadgroup=(64, 1, 1),
-        output_shapes=[(rows * dims,) for dims in output_dims],
-        output_dtypes=[x.dtype] * 4,
-    )
-    return tuple(
-        output.reshape(*x.shape[:-1], dims)
-        for output, dims in zip(outputs, output_dims)
-    )
 
 
 class OneBitLinear(nn.Module):

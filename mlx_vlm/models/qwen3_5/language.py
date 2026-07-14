@@ -4,7 +4,6 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ...one_bit import OneBitLinear, one_bit_quantized_matmul_fused
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -518,13 +517,11 @@ def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
 
 
 def _decode_quantized_linears_fused(linears, x: mx.array):
-    one_bit = all(isinstance(linear, OneBitLinear) for linear in linears)
-    native_quantized = all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
     if (
         x.ndim != 3
         or x.shape[1] != 1
         or len(linears) != 4
-        or not (one_bit or native_quantized)
+        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
     ):
         return None
 
@@ -540,15 +537,6 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         for linear in linears
     ):
         return None
-
-    if one_bit:
-        return one_bit_quantized_matmul_fused(
-            x,
-            tuple(linear.weight for linear in linears),
-            tuple(linear.scales for linear in linears),
-            tuple(linear.biases for linear in linears),
-            group_size=first.group_size,
-        )
 
     cache_key = tuple(
         (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
