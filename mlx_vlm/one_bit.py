@@ -1,9 +1,4 @@
-"""Python-hosted 1-bit affine inference kernels.
-
-The packing and affine convention match PrismML's MLX implementation:
-bit 0 maps to ``bias`` and bit 1 maps to ``bias + scale``.  Keeping the
-Metal source here lets mlx-vlm load 1-bit checkpoints with a stock MLX wheel.
-"""
+"""Python-hosted 1-bit affine inference kernels."""
 
 from functools import lru_cache
 from typing import Dict, Optional
@@ -15,10 +10,6 @@ from mlx.utils import tree_map_with_path
 SUPPORTED_GROUP_SIZES = (32, 64, 128)
 
 
-# Adapted from PrismML-Eng/mlx's 1-bit affine qmv implementation.  The MLX
-# fork implements this in compiled Metal templates; this version is deliberately
-# self-contained so mx.fast.metal_kernel can JIT it from Python.
-# https://github.com/PrismML-Eng/mlx/commit/784203f0db24a1effe1b98462d301e9d756857fc
 _ONE_BIT_QMV_SOURCE = r"""
     uint lane = thread_index_in_simdgroup;
     uint simd_group = simdgroup_index_in_threadgroup;
