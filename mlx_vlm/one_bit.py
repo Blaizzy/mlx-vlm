@@ -29,32 +29,41 @@ _ONE_BIT_QMV_SOURCE = r"""
     uint output_start = threadgroup_position_in_grid.x * 8 + simd_group * 4;
 
     float accumulators[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (uint group = 0; group < groups; ++group) {
-        float selected_sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    constexpr uint VALUES_PER_THREAD = 32;
+    constexpr uint BLOCK_SIZE = VALUES_PER_THREAD * 32;
+
+    // Match PrismML's qmv_fast SIMD layout: each lane owns one packed uint32
+    // and its 32 contiguous activation values. Four output rows reuse the
+    // register-resident activation block.
+    for (uint block_start = lane * VALUES_PER_THREAD;
+         block_start < input_dims;
+         block_start += BLOCK_SIZE) {
+        float x_thread[VALUES_PER_THREAD];
         float total_sum = 0.0f;
-        uint group_start = group * GROUP_SIZE;
-
-        for (uint offset = lane; offset < GROUP_SIZE; offset += 32) {
-            uint column = group_start + offset;
-            float value = static_cast<float>(x[input_row * input_dims + column]);
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+            float value = static_cast<float>(
+                x[input_row * input_dims + block_start + i]);
+            x_thread[i] = value;
             total_sum += value;
-
-            for (uint row = 0; row < 4; ++row) {
-                uint output_row = output_start + row;
-                if (output_row < output_dims) {
-                    uint packed = weight[
-                        output_row * weight_shape[1] + (column >> 5)];
-                    uint bit = (packed >> (column & 31)) & 1u;
-                    selected_sums[row] += bit ? value : 0.0f;
-                }
-            }
         }
 
+        uint group = block_start / GROUP_SIZE;
+        uint packed_column = block_start >> 5;
         for (uint row = 0; row < 4; ++row) {
             uint output_row = output_start + row;
-            if (output_row < output_dims) {
+            if (ROW_VALID) {
+                uint packed = weight[
+                    output_row * weight_shape[1] + packed_column];
+                float selected_sum = 0.0f;
+                #pragma clang loop unroll(full)
+                for (uint i = 0; i < VALUES_PER_THREAD; ++i) {
+                    selected_sum +=
+                        (packed & (1u << i)) ? x_thread[i] : 0.0f;
+                }
+
                 uint parameter_index = output_row * groups + group;
-                accumulators[row] += selected_sums[row] *
+                accumulators[row] += selected_sum *
                     static_cast<float>(scales[parameter_index]);
                 accumulators[row] += total_sum *
                     static_cast<float>(biases[parameter_index]);
@@ -82,15 +91,18 @@ def _validate_group_size(group_size: int) -> None:
 
 
 @lru_cache(maxsize=None)
-def _one_bit_qmv_kernel(group_size: int):
+def _one_bit_qmv_kernel(group_size: int, output_aligned: bool):
     _validate_group_size(group_size)
     if not hasattr(mx, "metal") or not mx.metal.is_available():
         return None
+    source = _ONE_BIT_QMV_SOURCE.replace("GROUP_SIZE", str(group_size)).replace(
+        "ROW_VALID", "true" if output_aligned else "output_row < output_dims"
+    )
     return mx.fast.metal_kernel(
-        name=f"mlx_vlm_affine_1bit_qmv_gs_{group_size}",
+        name=f"mlx_vlm_affine_1bit_qmv_gs_{group_size}_aligned_{int(output_aligned)}",
         input_names=["x", "weight", "scales", "biases"],
         output_names=["out"],
-        source=_ONE_BIT_QMV_SOURCE.replace("GROUP_SIZE", str(group_size)),
+        source=source,
     )
 
 
@@ -159,7 +171,7 @@ def one_bit_quantized_matmul(
     output_dims = weight.shape[0]
     output_shape = (*x.shape[:-1], output_dims)
     x_2d = x.reshape(-1, input_dims)
-    kernel = _one_bit_qmv_kernel(group_size)
+    kernel = _one_bit_qmv_kernel(group_size, output_dims % 8 == 0)
     if kernel is None:
         dense_weight = dequantize_one_bit(weight, scales, biases, group_size).astype(
             x.dtype

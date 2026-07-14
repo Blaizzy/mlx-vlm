@@ -3,6 +3,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
+from mlx_vlm.models.qwen3_5 import language as qwen3_5_language
 from mlx_vlm.one_bit import (
     OneBitEmbedding,
     OneBitLinear,
@@ -97,3 +98,26 @@ def test_replace_one_bit_checkpoint_modules_only():
     assert isinstance(model.proj, OneBitLinear)
     assert isinstance(model.embedding, OneBitEmbedding)
     assert isinstance(model.unquantized, nn.Linear)
+
+
+def test_qwen3_5_fuses_one_bit_decode_linears():
+    rng = np.random.default_rng(91)
+    x = mx.array(rng.normal(size=(2, 1, 128)).astype(np.float32))
+    linears = []
+    for output_dims in (8, 16, 8, 24):
+        layer = OneBitLinear(128, output_dims, bias=False, group_size=64)
+        bits = rng.integers(0, 2, size=(output_dims, 128), dtype=np.uint32)
+        layer.weight = _pack_bits(bits)
+        layer.scales = mx.array(rng.normal(size=(output_dims, 2)).astype(np.float32))
+        layer.biases = mx.array(rng.normal(size=(output_dims, 2)).astype(np.float32))
+        linears.append(layer)
+
+    reference = tuple(linear(x) for linear in linears)
+    fused = qwen3_5_language._decode_quantized_linears_fused(linears, x)
+    mx.eval(*reference, *fused)
+
+    assert fused is not None
+    assert all(
+        mx.allclose(actual, expected, rtol=1e-5, atol=1e-4).item()
+        for actual, expected in zip(fused, reference)
+    )
