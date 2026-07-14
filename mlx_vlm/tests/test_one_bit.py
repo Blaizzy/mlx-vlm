@@ -117,6 +117,7 @@ def test_qwen3_5_fuses_one_bit_decode_linears():
     mx.eval(*reference, *fused)
 
     assert fused is not None
+    assert not hasattr(linears[0], "_qwen3_5_fused_decode_linears")
     assert all(
         mx.allclose(actual, expected, rtol=1e-5, atol=1e-4).item()
         for actual, expected in zip(fused, reference)

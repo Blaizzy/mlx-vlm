@@ -4,7 +4,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ...one_bit import OneBitLinear, one_bit_quantized_matmul
+from ...one_bit import OneBitLinear, one_bit_quantized_matmul_fused
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
@@ -541,6 +541,15 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     ):
         return None
 
+    if one_bit:
+        return one_bit_quantized_matmul_fused(
+            x,
+            tuple(linear.weight for linear in linears),
+            tuple(linear.scales for linear in linears),
+            tuple(linear.biases for linear in linears),
+            group_size=first.group_size,
+        )
+
     cache_key = tuple(
         (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
     )
@@ -559,25 +568,16 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         first._qwen3_5_fused_decode_linears = cached
 
     _, weights, scales, biases, split_indices = cached
-    if one_bit:
-        output = one_bit_quantized_matmul(
-            x,
-            weights,
-            scales,
-            biases,
-            group_size=first.group_size,
-        )
-    else:
-        output = mx.quantized_matmul(
-            x,
-            weights,
-            scales=scales,
-            biases=biases,
-            transpose=True,
-            group_size=first.group_size,
-            bits=first.bits,
-            mode=first.mode,
-        )
+    output = mx.quantized_matmul(
+        x,
+        weights,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=first.group_size,
+        bits=first.bits,
+        mode=first.mode,
+    )
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
