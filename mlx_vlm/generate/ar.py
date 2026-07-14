@@ -2428,14 +2428,28 @@ class BatchGenerator:
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
+        # bits + group_size + scheme so warm restore matches live _make_cache
+        # backend (uniform BatchQuantized vs BatchTurboQuant).
+        _quant_cfg = (
+            {
+                "bits": self.kv_bits,
+                "group_size": self.kv_group_size,
+                "scheme": self.kv_quant_scheme,
+            }
+            if self.kv_bits is not None
+            else None
+        )
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
                 for p in picks
             ]
+            # Pass kv_quant_config so exact multi warm matches live _make_cache
+            # layer types under --kv-bits (cold quant row + exact float join).
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
+                kv_quant_config=_quant_cfg,
             )
             if warm_cache is None:
                 return None
@@ -2445,11 +2459,6 @@ class BatchGenerator:
                 len(self.model.make_cache())
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
-            )
-            _quant_cfg = (
-                {"bits": self.kv_bits, "group_size": self.kv_group_size}
-                if self.kv_bits is not None
-                else None
             )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
                 picks, num_layers=num_layers, kv_quant_config=_quant_cfg

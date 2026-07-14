@@ -965,6 +965,7 @@ def stream_generate(
                         {
                             "bits": _kv_bits,
                             "group_size": kwargs.get("kv_group_size", 64),
+                            "scheme": kwargs.get("kv_quant_scheme"),
                         }
                         if _kv_bits is not None
                         else None

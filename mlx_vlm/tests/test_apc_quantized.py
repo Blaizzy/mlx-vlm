@@ -23,6 +23,7 @@ from mlx_vlm.apc import (
     _clone_cache_entry_for_apc,
     _clone_prompt_cache_for_apc,
     harvest_blocks_from_batch_cache,
+    make_warm_batch_exact_cache_multi,
     make_warm_batch_kv_cache,
     make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
@@ -37,6 +38,7 @@ from mlx_vlm.models.cache import (
     QuantizedKVCache,
     should_quantize_kv_layer,
 )
+from mlx_vlm.turboquant import BatchTurboQuantKVCache
 
 # Small dimensions: fast tests, no GPU pressure
 B, H, D = 1, 2, 32
@@ -983,6 +985,7 @@ class TestCacheTypeHomogeneity:
 
 
 KV_CFG = {"bits": BITS, "group_size": GROUP_SIZE}
+TQ_CFG = {"bits": 3.5, "group_size": GROUP_SIZE, "scheme": "turboquant"}
 
 
 def _store_prefix_blocks(
@@ -1181,6 +1184,251 @@ class TestStaggeredJoinSynthetic:
             assert int(extended[0].offset.shape[0]) == 2
         finally:
             manager.close()
+
+
+class TestExactHybridColdStaggeredJoin:
+    """#1579: exact multi warm must match live quant layout for staggered join.
+
+    Hybrid models (Qwen3.5-class ArraysCache + full-attn) use exact APC.
+    Live cold rows are BatchQuantized on full-attn layers; exact merge alone
+    yields float BatchKVCache — _extend_cache then blows up. Requant on
+    make_warm_batch_exact_cache_multi(kv_quant_config=...) fixes it.
+    """
+
+    def _hybrid_row_caches(self, seq_len: int, *, n_full_attn: int = 3):
+        """Synthetic hybrid: ArraysCache + n_full_attn KVCache layers."""
+        arrays = ArraysCache(2)
+        arrays.cache = [
+            mx.zeros((1, seq_len, D)),
+            mx.zeros((1, seq_len, D)),
+        ]
+        rows = [arrays]
+        for _ in range(n_full_attn):
+            c = KVCache()
+            k, v = _rand_kv(batch=1, seq_len=seq_len)
+            c.keys = k
+            c.values = v
+            c.offset = seq_len
+            rows.append(c)
+        return rows
+
+    def _live_hybrid_batch(self, seq_len: int, n_full_attn: int = 3):
+        """Live continuous-batching row: ArraysCache + quant full-attn + last float."""
+        arrays = ArraysCache(2)
+        arrays.cache = [
+            mx.zeros((1, seq_len, D)),
+            mx.zeros((1, seq_len, D)),
+        ]
+        arrays.left_padding = mx.array([0])
+        caches = [arrays]
+        n = 1 + n_full_attn
+        for i in range(n_full_attn):
+            layer_idx = 1 + i
+            quantize = should_quantize_kv_layer(layer_idx, n)
+            k, v = _rand_kv(batch=1, seq_len=seq_len)
+            if quantize:
+                c = BatchQuantizedKVCache([0], group_size=GROUP_SIZE, bits=BITS)
+            else:
+                c = BatchKVCache([0])
+            c.update_and_fetch(k, v)
+            caches.append(c)
+        return caches
+
+    def test_exact_multi_without_kv_config_all_float_full_attn(self):
+        seq_len = 16
+        row = self._hybrid_row_caches(seq_len)
+        warm, max_p = make_warm_batch_exact_cache_multi([row], [seq_len])
+        assert max_p == seq_len
+        assert isinstance(warm[0], ArraysCache)
+        assert all(isinstance(c, BatchKVCache) for c in warm[1:])
+
+    def test_exact_multi_with_kv_config_matches_live_types(self):
+        seq_len = 16
+        n_full = 3
+        row = self._hybrid_row_caches(seq_len, n_full_attn=n_full)
+        warm, max_p = make_warm_batch_exact_cache_multi(
+            [row], [seq_len], kv_quant_config=KV_CFG
+        )
+        assert max_p == seq_len
+        # n = 1 Arrays + 3 full-attn → last of 4 layers stays float
+        assert isinstance(warm[0], ArraysCache)
+        assert isinstance(warm[1], BatchQuantizedKVCache)
+        assert isinstance(warm[2], BatchQuantizedKVCache)
+        assert isinstance(warm[3], BatchKVCache)
+        assert not isinstance(warm[3].keys, tuple)
+
+    def test_historical_exact_float_join_mismatches_live_quant(self):
+        """Without kv_quant_config, exact warm full-attn is float — extend fails."""
+        seq_len = 16
+        live = self._live_hybrid_batch(seq_len)
+        row = self._hybrid_row_caches(seq_len)
+        # Call without kv_quant_config (pre-#1579 API / float-only exact multi).
+        warm_float, _ = make_warm_batch_exact_cache_multi([row], [seq_len])
+        assert isinstance(live[1], BatchQuantizedKVCache)
+        assert isinstance(warm_float[1], BatchKVCache)
+        with pytest.raises((ValueError, AttributeError)):
+            _extend_cache(live, warm_float)
+
+    def test_exact_warm_with_kv_config_extends_live_quant(self):
+        seq_len = 16
+        live = self._live_hybrid_batch(seq_len)
+        row = self._hybrid_row_caches(seq_len)
+        warm, _ = make_warm_batch_exact_cache_multi(
+            [row], [seq_len], kv_quant_config=KV_CFG
+        )
+        assert _layer_type_names(live) == _layer_type_names(warm)
+        extended = _extend_cache(live, warm)
+        assert int(extended[1].offset.shape[0]) == 2
+        assert isinstance(extended[1], BatchQuantizedKVCache)
+        assert isinstance(extended[-1], BatchKVCache)
+
+    def test_exact_multi_mixed_warm_cold_rows_under_kv(self):
+        """Warm + cold exact multi still requants full-attn layers under kv-bits."""
+        seq_len = 16
+        warm_row = self._hybrid_row_caches(seq_len)
+        # Cold exact rows use empty make_cache()-style entries (None Arrays states).
+        cold_arrays = ArraysCache(2)
+        cold_row = [cold_arrays, KVCache(), KVCache(), KVCache()]
+        warm, max_p = make_warm_batch_exact_cache_multi(
+            [warm_row, cold_row],
+            [seq_len, 0],
+            kv_quant_config=KV_CFG,
+        )
+        assert max_p == seq_len
+        assert isinstance(warm[0], ArraysCache)
+        assert isinstance(warm[1], BatchQuantizedKVCache)
+        assert isinstance(warm[2], BatchQuantizedKVCache)
+        assert isinstance(warm[3], BatchKVCache)
+        # Batch size 2 on full-attn layers
+        assert int(warm[1].offset.shape[0]) == 2
+        assert int(warm[-1].offset.shape[0]) == 2
+
+
+class TestTurboQuantWarmRestoreLayout:
+    """APC warm must use BatchTurboQuant when live gen does (#1579 TQ follow-up).
+
+    Live ``_make_cache`` selects TurboQuant via ``turboquant_enabled(bits, scheme)``.
+    Warm helpers must not force uniform ``BatchQuantizedKVCache(bits=int(3.5))``
+    — that packing fails for some head dims and cannot ``extend`` with TQ peers.
+    """
+
+    def _pure_attn_row(self, seq_len: int, num_layers: int = 4, head_dim: int = D):
+        rows = []
+        for _ in range(num_layers):
+            c = KVCache()
+            k = mx.random.normal((1, H, seq_len, head_dim))
+            v = mx.random.normal((1, H, seq_len, head_dim))
+            mx.eval(k, v)
+            c.keys, c.values, c.offset = k, v, seq_len
+            rows.append(c)
+        return rows
+
+    def _live_tq_batch(self, seq_len: int, num_layers: int = 4, head_dim: int = D):
+        class FakeLayer:
+            pass
+
+        class FakeModel:
+            layers = [FakeLayer() for _ in range(num_layers)]
+
+        caches = _make_cache(
+            FakeModel(),
+            [0],
+            kv_bits=3.5,
+            kv_group_size=GROUP_SIZE,
+            kv_quant_scheme="turboquant",
+        )
+        for c in caches:
+            k = mx.random.normal((1, H, seq_len, head_dim))
+            v = mx.random.normal((1, H, seq_len, head_dim))
+            mx.eval(k, v)
+            c.update_and_fetch(k, v)
+        return caches
+
+    def test_fill_batch_layer_uses_turboquant_when_scheme_set(self):
+        from mlx_vlm.apc import _fill_batch_layer_cache
+
+        k = mx.random.normal((1, H, 16, D))
+        v = mx.random.normal((1, H, 16, D))
+        mx.eval(k, v)
+        c = _fill_batch_layer_cache(
+            k,
+            v,
+            left_padding=[0],
+            offset=[16],
+            quantize=True,
+            kv_quant_config=TQ_CFG,
+        )
+        assert isinstance(c, BatchTurboQuantKVCache)
+        assert float(c.bits) == 3.5
+
+    def test_fill_batch_layer_uniform_unchanged_for_int_bits(self):
+        from mlx_vlm.apc import _fill_batch_layer_cache
+
+        k = mx.random.normal((1, H, 16, D))
+        v = mx.random.normal((1, H, 16, D))
+        mx.eval(k, v)
+        c = _fill_batch_layer_cache(
+            k,
+            v,
+            left_padding=[0],
+            offset=[16],
+            quantize=True,
+            kv_quant_config=KV_CFG,
+        )
+        assert isinstance(c, BatchQuantizedKVCache)
+        assert int(c.bits) == BITS
+
+    def test_historical_int_35_uniform_packing_fails_head256(self):
+        """Document why int(3.5) uniform is wrong for TQ-sized heads."""
+        head_dim = 256
+        k = mx.random.normal((1, H, 16, head_dim))
+        v = mx.random.normal((1, H, 16, head_dim))
+        mx.eval(k, v)
+        c = BatchQuantizedKVCache([0], group_size=64, bits=int(3.5))
+        with pytest.raises(ValueError, match="broadcast"):
+            c.update_and_fetch(k, v)
+
+    def test_block_warm_multi_turboquant_matches_make_cache_types(self):
+        num_layers = 4
+        seq_len = 16
+        manager = APCManager(num_blocks=32, block_size=BLOCK_SIZE)
+        try:
+            # Store float blocks (APC always float); restore with TQ config.
+            token_ids = list(range(seq_len))
+            matched = _store_prefix_blocks(manager, num_layers, seq_len, token_ids)
+            warm = make_warm_batch_kv_cache(matched, kv_quant_config=TQ_CFG)
+            live = self._live_tq_batch(seq_len, num_layers=num_layers)
+            assert _layer_type_names(warm) == _layer_type_names(live)
+            assert isinstance(warm[0], BatchTurboQuantKVCache)
+            assert isinstance(warm[-1], BatchKVCache)
+        finally:
+            manager.close()
+
+    def test_exact_multi_turboquant_matches_live_and_extends(self):
+        seq_len = 16
+        num_layers = 4
+        row = self._pure_attn_row(seq_len, num_layers=num_layers)
+        warm, _ = make_warm_batch_exact_cache_multi(
+            [row], [seq_len], kv_quant_config=TQ_CFG
+        )
+        live = self._live_tq_batch(seq_len, num_layers=num_layers)
+        assert _layer_type_names(live) == _layer_type_names(warm)
+        assert isinstance(warm[0], BatchTurboQuantKVCache)
+        assert isinstance(warm[-1], BatchKVCache)
+        extended = _extend_cache(live, warm)
+        assert int(extended[0].offset.shape[0]) == 2
+        assert isinstance(extended[0], BatchTurboQuantKVCache)
+
+    def test_exact_multi_turboquant_head256_does_not_use_int_bits_pack(self):
+        """Regression: smoke failure was head_dim=256 + int(3.5) uniform pack."""
+        seq_len = 16
+        head_dim = 256
+        row = self._pure_attn_row(seq_len, num_layers=4, head_dim=head_dim)
+        warm, _ = make_warm_batch_exact_cache_multi(
+            [row], [seq_len], kv_quant_config=TQ_CFG
+        )
+        assert isinstance(warm[0], BatchTurboQuantKVCache)
+        assert isinstance(warm[-1], BatchKVCache)
 
 
 @pytest.mark.skipif(

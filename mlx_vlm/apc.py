@@ -3490,13 +3490,25 @@ def _fill_stream_layer_cache(
     capacity: Optional[int] = None,
     reuse_cache: Any = None,
 ) -> Any:
-    """Build one stream-path layer cache (float or quantized) from dense K/V."""
+    """Build one stream-path layer cache (float or quantized) from dense K/V.
+
+    Backend selection matches batch warm / live ``maybe_quantize_kv_cache``:
+    TurboQuant for fractional bits / scheme, else uniform ``QuantizedKVCache``.
+    """
     from .models.cache import KVCache, QuantizedKVCache
 
     if quantize and kv_quant_config is not None:
+        bits = kv_quant_config["bits"]
+        scheme = kv_quant_config.get("scheme")
+        from .turboquant import TurboQuantKVCache, turboquant_enabled
+
+        if turboquant_enabled(bits, scheme):
+            c = TurboQuantKVCache(bits=float(bits))
+            c.update_and_fetch(merged_k, merged_v)
+            return c
         c = QuantizedKVCache(
-            group_size=int(kv_quant_config["group_size"]),
-            bits=int(kv_quant_config["bits"]),
+            group_size=int(kv_quant_config.get("group_size", 64)),
+            bits=int(bits),
         )
         c.update_and_fetch(merged_k, merged_v)
         return c
@@ -3527,14 +3539,27 @@ def _fill_batch_layer_cache(
     quantize: bool,
     kv_quant_config: Optional[dict],
 ) -> Any:
-    """Build one batch-path layer cache matching ``_make_cache`` layout."""
+    """Build one batch-path layer cache matching ``_make_cache`` layout.
+
+    When quantizing, select the same backend as live generation:
+    TurboQuant (``BatchTurboQuantKVCache``) if ``turboquant_enabled(bits, scheme)``,
+    otherwise uniform ``BatchQuantizedKVCache`` with integer bits.
+    """
     from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     if quantize and kv_quant_config is not None:
+        bits = kv_quant_config["bits"]
+        scheme = kv_quant_config.get("scheme")
+        from .turboquant import BatchTurboQuantKVCache, turboquant_enabled
+
+        if turboquant_enabled(bits, scheme):
+            c = BatchTurboQuantKVCache(left_padding, bits=float(bits))
+            c.update_and_fetch(merged_k, merged_v)
+            return c
         c = BatchQuantizedKVCache(
             left_padding,
-            group_size=int(kv_quant_config["group_size"]),
-            bits=int(kv_quant_config["bits"]),
+            group_size=int(kv_quant_config.get("group_size", 64)),
+            bits=int(bits),
         )
         c.update_and_fetch(merged_k, merged_v)
         return c
@@ -3843,11 +3868,76 @@ def _merge_exact_cache_entries(
     return None
 
 
+def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
+    """Empty quantized batch cache matching live ``_make_cache`` backend."""
+    bits = kv_quant_config["bits"]
+    scheme = kv_quant_config.get("scheme")
+    from .turboquant import BatchTurboQuantKVCache, turboquant_enabled
+
+    if turboquant_enabled(bits, scheme):
+        return BatchTurboQuantKVCache(left_padding, bits=float(bits))
+    from .models.cache import BatchQuantizedKVCache
+
+    return BatchQuantizedKVCache(
+        left_padding,
+        group_size=int(kv_quant_config.get("group_size", 64)),
+        bits=int(bits),
+    )
+
+
+def _align_exact_batch_caches_to_kv_policy(
+    caches: List[Any],
+    kv_quant_config: dict,
+) -> List[Any]:
+    """Requant float full-attn batch layers to match live ``_make_cache``.
+
+    Exact store keeps float snapshots; continuous-batching join under
+    ``--kv-bits`` requires the same per-layer types as a cold live row
+    (uniform or TurboQuant for layers that ``should_quantize_kv_layer``
+    marks, float last layer when n > 2). Hybrid non-KV types
+    (``ArraysCache``, ``BatchRotatingKVCache``, …) are left unchanged.
+    """
+    from .models.cache import BatchKVCache, should_quantize_kv_layer
+
+    n = len(caches)
+    out: List[Any] = []
+    for layer_idx, c in enumerate(caches):
+        quantize = should_quantize_kv_layer(layer_idx, n)
+        if not quantize or not isinstance(c, BatchKVCache):
+            out.append(c)
+            continue
+        left_padding = [int(x) for x in c.left_padding.tolist()]
+        if c.keys is None or int(c._idx) == 0:
+            out.append(_empty_quant_batch_cache(left_padding, kv_quant_config))
+            continue
+        merged_k = c.keys[..., : int(c._idx), :]
+        merged_v = c.values[..., : int(c._idx), :]
+        offset = [int(x) for x in c.offset.tolist()]
+        out.append(
+            _fill_batch_layer_cache(
+                merged_k,
+                merged_v,
+                left_padding=left_padding,
+                offset=offset,
+                quantize=True,
+                kv_quant_config=kv_quant_config,
+            )
+        )
+    return out
+
+
 def make_warm_batch_exact_cache_multi(
     row_caches: Sequence[Sequence[Any]],
     prefix_lens: Sequence[int],
+    kv_quant_config: Optional[dict] = None,
 ) -> Tuple[Optional[List[Any]], int]:
-    """Merge single-row exact-cache snapshots into batch-aware caches."""
+    """Merge single-row exact-cache snapshots into batch-aware caches.
+
+    When *kv_quant_config* is provided, full-attention ``BatchKVCache`` layers
+    are re-quantized to match live ``_make_cache`` via
+    ``should_quantize_kv_layer`` (last layer stays float when n > 2). Hybrid
+    non-KV entries are unchanged. On-disk exact snapshots remain float.
+    """
 
     if not row_caches:
         return [], 0
@@ -3866,6 +3956,9 @@ def make_warm_batch_exact_cache_multi(
         if merged is None:
             return None, 0
         out.append(merged)
+
+    if kv_quant_config is not None:
+        out = _align_exact_batch_caches_to_kv_policy(out, kv_quant_config)
 
     eval_targets: List[mx.array] = []
     for c in out:
