@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from mlx_vlm.models.qwen3_5 import language as qwen3_5_language
-from mlx_vlm.quantization.one_bit import (
+from mlx_vlm.one_bit import (
     OneBitEmbedding,
     OneBitLinear,
     dequantize_one_bit,
