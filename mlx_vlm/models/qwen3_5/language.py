@@ -4,7 +4,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ...one_bit import OneBitLinear, one_bit_quantized_matmul_fused
+from ...quantization.one_bit import OneBitLinear, one_bit_quantized_matmul_fused
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
