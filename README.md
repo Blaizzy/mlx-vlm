@@ -19,6 +19,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
     - [Continuous Batching](#continuous-batching)
     - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
     - [KV Cache Quantization](#kv-cache-quantization)
+- [1-bit Affine Inference](#1-bit-affine-inference)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -1114,6 +1115,38 @@ curl -X POST "http://localhost:8080/responses" \
 - `thinking_end_token`: Token that closes a thinking block
 - `stream`: Enable streaming responses
 
+## 1-bit Affine Inference
+
+MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX
+build. When a checkpoint declares `"bits": 1`, compatible `Linear` and
+`Embedding` layers are replaced automatically with an inference-only module
+that JIT-compiles its Metal kernel from Python.
+
+The checkpoint must use MLX's packed `uint32` weight layout, include `scales`
+and `biases`, and declare a group size of `32`, `64`, or `128`:
+
+```json
+{
+  "quantization": {
+    "group_size": 64,
+    "bits": 1,
+    "mode": "affine"
+  }
+}
+```
+
+Load and generate normally; no extra inference flag is needed:
+
+```python
+from mlx_vlm import generate, load
+
+model, processor = load("path/to/1bit-model")
+result = generate(model, processor, "Describe this image", image=["image.jpg"])
+```
+
+This path is for inference from an already quantized checkpoint. Converting a
+floating-point model to 1-bit still requires a quantizer that can produce the
+packed weights and affine parameters.
 
 ## Activation Quantization (CUDA)
 

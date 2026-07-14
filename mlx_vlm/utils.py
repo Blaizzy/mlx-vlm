@@ -21,6 +21,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -626,6 +627,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             else model
         )
 
+        # Stock MLX does not accept bits=1 in nn.quantize/quantized_matmul.
+        # Replace checkpoint-backed affine 1-bit leaves with Python-hosted
+        # custom Metal kernel modules before handling the remaining modes.
+        replace_one_bit_modules(quantized_model, quantization, weights)
+
         def get_class_predicate(p, m):
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
@@ -634,6 +640,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and skip_vision
                 and not _has_quantized_weights(p, weights)
             ):
+                return False
+            # 1-bit leaves were handled above. Returning False here also keeps
+            # unsupported stock MLX quantizers from seeing bits=1.
+            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
