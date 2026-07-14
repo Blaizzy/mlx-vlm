@@ -3,7 +3,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
-from mlx_vlm.one_bit import (
+from mlx_vlm.quantization.one_bit import (
     OneBitEmbedding,
     OneBitLinear,
     dequantize_one_bit,
