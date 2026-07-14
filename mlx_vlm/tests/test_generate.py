@@ -744,6 +744,42 @@ class TestBatchGenerator:
         assert batch._next_tokens.tolist() == [7, 7]
         assert model.calls == [{"return_hidden": True, "skip_logits": True}]
 
+    def test_generation_batch_uses_direct_logits_argmax_for_one_bit_head(self):
+        class OneBitModel:
+            def __init__(self):
+                self.lm_head = SimpleNamespace(bits=1)
+                self.calls = []
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                del cache
+                self.calls.append(kwargs)
+                logits = mx.broadcast_to(
+                    mx.array([0.0, 1.0, 4.0, 2.0]),
+                    (input_ids.shape[0], input_ids.shape[1], 4),
+                )
+                return SimpleNamespace(logits=logits)
+
+            def speculative_argmax_from_hidden(self, hidden):
+                raise AssertionError("1-bit decode should use direct logits")
+
+        model = OneBitModel()
+        batch = GenerationBatch(
+            model=model,
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            greedy_sampling=True,
+        )
+        batch.compute_logprobs = False
+
+        first = batch.next()
+        assert [r.token for r in first] == [5]
+        assert batch._next_tokens.tolist() == [2]
+        assert model.calls == [{}]
+
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
         def fake_rounds(*args, **kwargs):
             del args, kwargs

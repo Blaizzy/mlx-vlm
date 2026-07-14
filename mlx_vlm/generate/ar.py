@@ -958,6 +958,14 @@ class GenerationBatch:
         ):
             return None
 
+        lm_head = getattr(self._language_model, "lm_head", None)
+        if getattr(lm_head, "bits", None) == 1:
+            output = self._language_model(
+                inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
+            )
+            logits = output.logits if hasattr(output, "logits") else output
+            return self.sampler(logits[:, -1, :])
+
         argmax_from_hidden = getattr(
             self._language_model, "speculative_argmax_from_hidden", None
         )
