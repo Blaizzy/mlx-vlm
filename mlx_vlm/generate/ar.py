@@ -483,7 +483,7 @@ def generate_step(
             mx.clear_cache()
 
         if thinking_budget_criteria is not None:
-            forced_token_id = thinking_budget_criteria.apply_forced_token()
+            forced_token_id = thinking_budget_criteria.pop_forced_token_id()
             if forced_token_id is not None:
                 next_y = mx.array([forced_token_id], dtype=next_y.dtype)
         y, logprobs = next_y, next_logprobs
@@ -1251,7 +1251,7 @@ class GenerationBatch:
             ):
                 criteria = self.thinking_budget_criteria[i]
                 criteria(tok)
-                forced_next_tokens[i] = criteria.apply_forced_token()
+                forced_next_tokens[i] = criteria.pop_forced_token_id()
 
             if self.stop_criteria(tok):
                 finish_reason = "stop"

@@ -1955,7 +1955,7 @@ class ThinkingBudgetCriteria:
         self.forced_token_id = None
         return None
 
-    def apply_forced_token(self) -> Optional[int]:
+    def pop_forced_token_id(self) -> Optional[int]:
         """Return and clear the pending forced token ID, if any."""
         if self.forced_token_id is None or not self.enable_thinking:
             return None
