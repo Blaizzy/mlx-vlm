@@ -5,6 +5,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..interpolate import resize_bilinear
+from ..mlp import GELUMLP as MLP
 from .config import VisionConfig
 
 
@@ -76,20 +77,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.out_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, config: VisionConfig):
-        super().__init__()
-        self.activation_fn = nn.GELU(approx="precise")
-        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size, bias=True)
-        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        x = self.fc1(x)
-        x = self.activation_fn(x)
-        x = self.fc2(x)
-        return x
 
 
 class EncoderLayer(nn.Module):
