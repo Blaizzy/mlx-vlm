@@ -322,7 +322,7 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     """
     is_text_model = getattr(model, "_is_text_model", False)
     # Text-only fallback models wrap the inner LM as language_model._model;
-    # apply LoRA to that inner module with mlx-vlm's own loader 
+    # apply LoRA to that inner module with mlx-vlm's own loader
     target = model.language_model._model if is_text_model else model
 
     adapter_path = Path(adapter_path)
