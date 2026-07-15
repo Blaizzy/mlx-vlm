@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import typing
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1761,6 +1762,24 @@ def test_stream_generate_forwards_verbose_to_generate_step():
         )
 
     assert captured["verbose"] is True
+
+
+def test_public_generation_annotations_match_runtime_results():
+    hints = typing.get_type_hints(dispatch_module.stream_generate)
+
+    assert hints["return"] == typing.Generator[GenerationResult, None, None]
+    assert type(None) in typing.get_args(hints["image"])
+    assert type(None) in typing.get_args(hints["audio"])
+    assert type(None) in typing.get_args(hints["video"])
+
+
+def test_batch_generate_optional_input_annotations_match_defaults():
+    hints = typing.get_type_hints(ar_module.batch_generate)
+
+    assert type(None) in typing.get_args(hints["images"])
+    assert type(None) in typing.get_args(hints["audios"])
+    assert type(None) in typing.get_args(hints["prompts"])
+    assert hints["return"] is BatchResponse
 
 
 def test_normalize_resize_shape_expands_single_value():
