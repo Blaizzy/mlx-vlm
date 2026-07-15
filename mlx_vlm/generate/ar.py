@@ -951,7 +951,7 @@ class GenerationBatch:
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
 
-    def _greedy_argmax_step(self, inputs: mx.array, fwd_kwargs: dict):
+    def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
         if (
             not self.greedy_sampling
             or self.compute_logprobs
@@ -960,21 +960,15 @@ class GenerationBatch:
         ):
             return None
 
-        argmax_from_hidden = getattr(
-            self._language_model, "speculative_argmax_from_hidden", None
-        )
-        if not callable(argmax_from_hidden):
+        fused_greedy_decode = getattr(self._language_model, "fused_greedy_decode", None)
+        if not callable(fused_greedy_decode):
             return None
 
-        output = self._language_model(
+        sampled = fused_greedy_decode(
             inputs[:, None],
             cache=self.prompt_cache,
-            return_hidden=True,
-            skip_logits=True,
             **fwd_kwargs,
         )
-        hidden = output.hidden_states[-1]
-        sampled = argmax_from_hidden(hidden)
         if sampled is None:
             return None
         if sampled.ndim == 2 and sampled.shape[1] == 1:
@@ -991,7 +985,7 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
-        sampled = self._greedy_argmax_step(inputs, fwd_kwargs)
+        sampled = self._fused_greedy_step(inputs, fwd_kwargs)
         if sampled is not None:
             self._next_tokens = sampled
             self._next_lps = None

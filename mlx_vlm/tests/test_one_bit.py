@@ -67,6 +67,24 @@ def test_one_bit_prompt_matmul_matches_dense(group_size):
     assert mx.allclose(out, reference, rtol=1e-5, atol=1e-4).item()
 
 
+def test_one_bit_wide_decode_matmul_matches_dense():
+    rng = np.random.default_rng(117)
+    input_dims = 128
+    output_dims = 128
+    bits = rng.integers(0, 2, size=(output_dims, input_dims), dtype=np.uint32)
+    weight = _pack_bits(bits)
+    scales = mx.array(rng.normal(size=(output_dims, 2)).astype(np.float32))
+    biases = mx.array(rng.normal(size=(output_dims, 2)).astype(np.float32))
+    x = mx.array(rng.normal(size=(1, input_dims)).astype(np.float32))
+
+    out = one_bit_quantized_matmul(x, weight, scales, biases, group_size=64)
+    dense = dequantize_one_bit(weight, scales, biases, 64)
+    reference = x @ dense.T
+    mx.eval(out, reference)
+
+    assert mx.allclose(out, reference, rtol=1e-5, atol=1e-4).item()
+
+
 def test_one_bit_linear_applies_output_bias():
     layer = OneBitLinear(64, 3, bias=True, group_size=64)
     layer.weight = _pack_bits(np.ones((3, 64), dtype=np.uint32))

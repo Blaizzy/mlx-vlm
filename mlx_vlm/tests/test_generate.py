@@ -750,21 +750,17 @@ class TestBatchGenerator:
         assert mock_eval.call_count == 1
         assert [r.token for r in batch.next()] == [3]
 
-    def test_generation_batch_uses_greedy_hidden_argmax_without_logprobs(self):
+    def test_generation_batch_uses_fused_greedy_decode_without_logprobs(self):
         class FastArgmaxModel:
             def __init__(self):
                 self.calls = []
 
-            def __call__(self, input_ids, cache=None, **kwargs):
-                del cache
+            def fused_greedy_decode(self, input_ids, cache=None, **kwargs):
                 self.calls.append(kwargs)
-                assert kwargs["return_hidden"] is True
-                assert kwargs["skip_logits"] is True
-                hidden = mx.ones((input_ids.shape[0], input_ids.shape[1], 3))
-                return SimpleNamespace(hidden_states=[hidden])
-
-            def speculative_argmax_from_hidden(self, hidden):
-                return mx.full((hidden.shape[0], hidden.shape[1]), 7, dtype=mx.int32)
+                assert cache == []
+                return mx.full(
+                    (input_ids.shape[0], input_ids.shape[1]), 7, dtype=mx.int32
+                )
 
         model = FastArgmaxModel()
         batch = GenerationBatch(
@@ -782,7 +778,42 @@ class TestBatchGenerator:
         first = batch.next()
         assert [r.token for r in first] == [5, 6]
         assert batch._next_tokens.tolist() == [7, 7]
-        assert model.calls == [{"return_hidden": True, "skip_logits": True}]
+        assert model.calls == [{}]
+
+    def test_generation_batch_ignores_speculative_argmax_without_fused_decode(self):
+        class FallbackArgmaxModel:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, input_ids, cache=None, **kwargs):
+                del cache
+                self.calls.append(kwargs)
+                logits = mx.broadcast_to(
+                    mx.array([0.0, 1.0, 4.0, 2.0]),
+                    (input_ids.shape[0], input_ids.shape[1], 4),
+                )
+                return SimpleNamespace(logits=logits)
+
+            def speculative_argmax_from_hidden(self, hidden):
+                raise AssertionError("fallback argmax must not select the fused path")
+
+        model = FallbackArgmaxModel()
+        batch = GenerationBatch(
+            model=model,
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            greedy_sampling=True,
+        )
+        batch.compute_logprobs = False
+
+        first = batch.next()
+        assert [r.token for r in first] == [5]
+        assert batch._next_tokens.tolist() == [2]
+        assert model.calls == [{}]
 
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
         def fake_rounds(*args, **kwargs):
