@@ -393,12 +393,14 @@ def get_model_and_args(config: dict):
     for pkg in ("mlx_vlm.models", "mlx_vlm.speculative.drafters"):
         try:
             arch = importlib.import_module(f"{pkg}.{model_type}")
-            return arch, model_type
         except ImportError as e:
             if model_type not in str(e):
                 raise
             last_err = e
             continue
+        if not hasattr(arch, "Model"):
+            continue
+        return arch, model_type
 
     if _is_text_only_config(config):
         arch = importlib.import_module("mlx_vlm.models.text_only")

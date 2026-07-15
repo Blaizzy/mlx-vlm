@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from ..mlp import SwiGLUMLP as MLP
 from ..switch_layers import SwitchGLU
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
 @dataclass

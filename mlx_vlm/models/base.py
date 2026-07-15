@@ -15,6 +15,18 @@ from ..turboquant import _state_length as _turboquant_state_length
 from .cache import create_causal_mask
 
 
+class BaseModelArgs:
+    @classmethod
+    def from_dict(cls, params):
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
+
+
 def load_chat_template(tokenizer, model_path):
     """Apply a chat template from the model directory to *tokenizer*."""
     import json

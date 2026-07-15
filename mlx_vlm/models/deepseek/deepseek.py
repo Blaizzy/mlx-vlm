@@ -5,8 +5,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..activations import swiglu
+from ..base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from ..switch_layers import SwitchGLU
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
 @dataclass
