@@ -135,6 +135,13 @@ def test_chat_request_schema_requires_model():
     assert "model" in server.ChatRequest.model_json_schema()["required"]
 
 
+def test_chat_request_schema_declares_tool_choice_fields():
+    properties = server.ChatRequest.model_json_schema()["properties"]
+
+    assert "tools" in properties
+    assert "tool_choice" in properties
+
+
 def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     resize_shape = server.ChatRequest.model_json_schema()["properties"]["resize_shape"]
     lengths = {
@@ -144,6 +151,174 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     }
 
     assert lengths == {(1, 1), (2, 2)}
+
+
+def test_chat_completions_tool_choice_none_disables_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(chat_template="<tool_call>\n<function=")
+    )
+    config = SimpleNamespace(model_type="qwen3_5")
+    result = GenerationResult(
+        text="No tool call.", prompt_tokens=5, generation_tokens=3
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Use the tool."}],
+                "tools": tools,
+                "tool_choice": "none",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["tool_calls"] is None
+    assert mock_template.call_args.kwargs["tools"] is None
+    assert mock_template.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_chat_completions_required_tool_choice_adds_instruction(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": tools,
+                "tool_choice": "required",
+            },
+        )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert messages[0]["role"] == "user"
+    assert "must call one or more" in messages[0]["content"]
+    assert mock_template.call_args.kwargs["tools"] == tools
+    assert mock_template.call_args.kwargs["tool_choice"] == "required"
+
+
+def test_chat_completions_forced_tool_choice_filters_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_time", "parameters": {"type": "object"}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        },
+    ]
+    tool_choice = {"type": "function", "function": {"name": "get_weather"}}
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "Say hello."},
+                ],
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert messages[0]["content"].startswith("Be concise.")
+    assert "must call the 'get_weather' function" in messages[0]["content"]
+    assert "must call the 'get_weather' function" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_weather"]
+    assert mock_template.call_args.kwargs["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize(
+    ("tools", "tool_choice", "detail"),
+    [
+        ([], "required", "requires at least one tool"),
+        (
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather"},
+                }
+            ],
+            {"type": "function", "function": {"name": "missing"}},
+            "unknown function 'missing'",
+        ),
+        ([], "sometimes", "Invalid tool_choice"),
+    ],
+)
+def test_chat_completions_rejects_invalid_tool_choice(
+    client, tools, tool_choice, detail
+):
+    with patch.object(server, "get_cached_model") as mock_get_cached_model:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        )
+
+    assert response.status_code == 400
+    assert detail in response.json()["detail"]
+    mock_get_cached_model.assert_not_called()
 
 
 def test_speculative_server_dispatches_mtp_batch_loop():
