@@ -1249,7 +1249,7 @@ requires-dist = [
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=5.19.0" },
     { name = "llguidance", specifier = ">=1.7.0" },
     { name = "miniaudio", specifier = ">=1.59" },
-    { name = "mlx", specifier = ">=0.31.2" },
+    { name = "mlx", specifier = ">=0.32.0" },
     { name = "mlx-audio", specifier = ">=0.4.3" },
     { name = "mlx-cpu", marker = "extra == 'cpu'" },
     { name = "mlx-cuda", marker = "extra == 'cuda'" },
@@ -1261,7 +1261,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.31.0" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tqdm", specifier = ">=4.66.2" },
-    { name = "transformers", specifier = ">=5.5.0,!=5.13.0" },
+    { name = "transformers", specifier = ">=5.14.0" },
     { name = "uvicorn" },
 ]
 provides-extras = ["ui", "cuda", "cpu"]
