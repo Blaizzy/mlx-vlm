@@ -1760,8 +1760,11 @@ def prepare_inputs(
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
+        attention_mask = inputs.get("attention_mask")
         model_inputs["attention_mask"] = (
-            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+            attention_mask
+            if attention_mask is None or isinstance(attention_mask, mx.array)
+            else mx.array(attention_mask)
         )
 
         # Convert inputs to model_inputs with mx.array if present
