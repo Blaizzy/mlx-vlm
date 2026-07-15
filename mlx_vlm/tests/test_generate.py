@@ -626,6 +626,55 @@ class TestBatchGenerator:
         assert [p.prompt_tokens for p in progress] == [5, 3]
         assert [p.cached_tokens for p in progress] == [3, 0]
 
+    def test_prompt_step_schedules_cache_evaluation_asynchronously(self, monkeypatch):
+        cache_state = mx.array([1])
+        batch = PromptProcessingBatch(
+            model=MagicMock(),
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        eval_mock = MagicMock()
+        async_eval_mock = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
+        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+
+        async_eval_mock.assert_called_once_with([cache_state])
+        eval_mock.assert_not_called()
+
+    def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
+        cache_state = mx.array([1])
+        batch = PromptProcessingBatch(
+            model=MagicMock(),
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        batch._next_apc_checkpoint_column = lambda: 2
+        batch._store_apc_exact_checkpoints = MagicMock()
+        eval_mock = MagicMock()
+        async_eval_mock = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
+        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+
+        async_eval_mock.assert_called_once_with([cache_state])
+        eval_mock.assert_not_called()
+        batch._store_apc_exact_checkpoints.assert_called_once_with()
+
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"
@@ -1720,6 +1769,52 @@ class TestSamplerArgs:
         mock_make_logits_processors.assert_called_once_with(
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
         )
+
+
+def test_generate_step_schedules_final_prefill_async():
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    events = []
+    original_async_eval = mx.async_eval
+    original_eval = mx.eval
+
+    def record_async_eval(*args):
+        events.append("async")
+        return original_async_eval(*args)
+
+    def record_eval(*args):
+        events.append("sync")
+        return original_eval(*args)
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(generate_module.mx, "async_eval", side_effect=record_async_eval),
+        patch.object(generate_module.mx, "eval", side_effect=record_eval),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+        )
+        next(gen)
+
+    assert events[0] == "async"
 
 
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])

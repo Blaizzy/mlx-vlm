@@ -448,7 +448,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.eval(y, logprobs)
+    mx.async_eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
@@ -1813,7 +1813,7 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.eval([c.state for c in self.prompt_cache])
+        mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
