@@ -686,10 +686,8 @@ class TestBatchGenerator:
             def __call__(self, token):
                 self.forced_token_id = 3 if token == 5 else None
 
-            def apply_forced_token(self, next_y):
-                if self.forced_token_id is None:
-                    return next_y
-                forced = mx.array([self.forced_token_id], dtype=mx.int32)
+            def apply_forced_token(self):
+                forced = self.forced_token_id
                 self.forced_token_id = None
                 return forced
 
@@ -726,13 +724,10 @@ class TestBatchGenerator:
             def __call__(self, token):
                 self.forced_token_id = 3 if token == 5 else None
 
-            def pop_forced_token_id(self):
+            def apply_forced_token(self):
                 forced_token_id = self.forced_token_id
                 self.forced_token_id = None
                 return forced_token_id
-
-            def apply_forced_token(self, next_y):
-                return next_y
 
         batch = GenerationBatch(
             model=FixedLogitModel(),
@@ -1598,9 +1593,8 @@ class TestThinkingBudgetCriteria:
         whose first generated token is the thinking delimiter.
         """
         criteria = self._make_criteria()
-        y = mx.array([7])
-        # No __call__ yet: must be a no-op that returns the input unchanged.
-        assert criteria.apply_forced_token(y).tolist() == [7]
+        # No __call__ yet: there is no pending token ID to consume.
+        assert criteria.apply_forced_token() is None
 
     def test_apply_forced_token_safe_after_start_delimiter(self):
         """Regression: the start-token early return in __call__ does not set
@@ -1608,7 +1602,7 @@ class TestThinkingBudgetCriteria:
         criteria = self._make_criteria()
         # First generated token is the start delimiter -> early return, no force.
         assert criteria(99) is None
-        assert criteria.apply_forced_token(mx.array([7])).tolist() == [7]
+        assert criteria.apply_forced_token() is None
 
     def test_apply_forced_token_safe_after_end_delimiter(self):
         """Regression: the end-token early return in __call__ does not set
@@ -1616,27 +1610,27 @@ class TestThinkingBudgetCriteria:
         criteria = self._make_criteria()
         # End delimiter resets thinking state and returns None without forcing.
         assert criteria(100) is None
-        assert criteria.apply_forced_token(mx.array([8])).tolist() == [8]
+        assert criteria.apply_forced_token() is None
 
     def test_apply_forced_token_emits_forced_token_when_budget_exceeded(self):
         """End-to-end: once the budget is exceeded, the token returned by
-        __call__ is the same one apply_forced_token injects into the stream."""
+        __call__ is the same one apply_forced_token exposes to the generator."""
         criteria = self._make_criteria()
         # Burn the budget (5 tokens), then trip it on the 6th.
         for i in range(5):
             assert criteria(50 + i) is None
         forced = criteria(60)  # \n forced
         assert forced == 10
-        assert criteria.apply_forced_token(mx.array([0])).tolist() == [10]
+        assert criteria.apply_forced_token() == 10
 
-    def test_pop_forced_token_id_consumes_pending_token(self):
+    def test_apply_forced_token_consumes_pending_token_id(self):
         criteria = self._make_criteria()
         for i in range(5):
             assert criteria(50 + i) is None
 
         assert criteria(60) == 10
-        assert criteria.pop_forced_token_id() == 10
-        assert criteria.pop_forced_token_id() is None
+        assert criteria.apply_forced_token() == 10
+        assert criteria.apply_forced_token() is None
 
 
 class TestSamplerArgs:

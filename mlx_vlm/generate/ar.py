@@ -483,7 +483,9 @@ def generate_step(
             mx.clear_cache()
 
         if thinking_budget_criteria is not None:
-            next_y = thinking_budget_criteria.apply_forced_token(next_y)
+            forced_token_id = thinking_budget_criteria.apply_forced_token()
+            if forced_token_id is not None:
+                next_y = mx.array([forced_token_id], dtype=next_y.dtype)
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -1239,7 +1241,6 @@ class GenerationBatch:
         keep = []
         responses = []
         forced_next_tokens = [None] * len(self.uids)
-        fallback_next_tokens = {}
         for i in range(len(self.uids)):
             finish_reason = None
             self._num_tokens[i] += 1
@@ -1250,15 +1251,7 @@ class GenerationBatch:
             ):
                 criteria = self.thinking_budget_criteria[i]
                 criteria(tok)
-                pop_forced_token_id = getattr(criteria, "pop_forced_token_id", None)
-                if callable(pop_forced_token_id):
-                    forced_next_tokens[i] = pop_forced_token_id()
-                else:
-                    # Keep compatibility with custom criteria without
-                    # materializing the asynchronously generated token.
-                    fallback_next_tokens[i] = criteria.apply_forced_token(
-                        self._next_tokens[i : i + 1]
-                    )
+                forced_next_tokens[i] = criteria.apply_forced_token()
 
             if self.stop_criteria(tok):
                 finish_reason = "stop"
@@ -1293,15 +1286,7 @@ class GenerationBatch:
             )
             self._next_tokens = mx.where(force_mask, replacements, self._next_tokens)
 
-        if fallback_next_tokens:
-            self._next_tokens = mx.concatenate(
-                [
-                    fallback_next_tokens.get(i, self._next_tokens[i : i + 1])
-                    for i in range(len(self.uids))
-                ]
-            )
-
-        if has_forced_next_tokens or fallback_next_tokens:
+        if has_forced_next_tokens:
             mx.async_eval(self._next_tokens)
 
         if len(keep) < len(self.uids):
