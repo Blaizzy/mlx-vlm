@@ -10,8 +10,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from ..activations import swiglu
 from ..cache import ArraysCache, KVCache
+from ..mlp import SwiGLUMLP as Qwen3NextMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .base import (
@@ -156,17 +156,6 @@ class Qwen3NextAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output * mx.sigmoid(gate))
-
-
-class Qwen3NextMLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
