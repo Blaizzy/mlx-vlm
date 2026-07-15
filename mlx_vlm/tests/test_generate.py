@@ -626,6 +626,55 @@ class TestBatchGenerator:
         assert [p.prompt_tokens for p in progress] == [5, 3]
         assert [p.cached_tokens for p in progress] == [3, 0]
 
+    def test_prompt_step_schedules_cache_evaluation_asynchronously(self, monkeypatch):
+        cache_state = mx.array([1])
+        batch = PromptProcessingBatch(
+            model=MagicMock(),
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        eval_mock = MagicMock()
+        async_eval_mock = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
+        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+
+        async_eval_mock.assert_called_once_with([cache_state])
+        eval_mock.assert_not_called()
+
+    def test_prompt_step_keeps_exact_apc_checkpoint_async(self, monkeypatch):
+        cache_state = mx.array([1])
+        batch = PromptProcessingBatch(
+            model=MagicMock(),
+            uids=[1],
+            input_ids=[[1, 2, 3, 4, 5]],
+            max_tokens=[1],
+            inputs_embeds=mx.ones((1, 5, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[SimpleNamespace(state=cache_state)],
+        )
+        batch._next_apc_checkpoint_column = lambda: 2
+        batch._store_apc_exact_checkpoints = MagicMock()
+        eval_mock = MagicMock()
+        async_eval_mock = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "eval", eval_mock)
+        monkeypatch.setattr(ar_module.mx, "async_eval", async_eval_mock)
+        monkeypatch.setattr(ar_module.mx, "clear_cache", MagicMock())
+
+        assert batch.prompt_step() == 2
+
+        async_eval_mock.assert_called_once_with([cache_state])
+        eval_mock.assert_not_called()
+        batch._store_apc_exact_checkpoints.assert_called_once_with()
+
     def test_response_dataclass(self):
         response = GenerationBatch.Response(
             uid=0, token=42, token_logprob=-0.5, finish_reason="stop"

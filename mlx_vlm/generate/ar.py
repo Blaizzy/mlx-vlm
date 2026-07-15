@@ -1813,7 +1813,12 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.eval([c.state for c in self.prompt_cache])
+        cache_states = [c.state for c in self.prompt_cache]
+        # Keep the continuous-batching worker responsive while Metal runs this
+        # chunk. Later chunks consume the same cache arrays, so MLX preserves
+        # their dependency order. Exact APC owns its required synchronization
+        # when it clones the checkpoint for storage.
+        mx.async_eval(cache_states)
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
