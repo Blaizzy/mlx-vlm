@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -3538,6 +3539,68 @@ class TestResponseGenerator:
             gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
 
         assert gen.requests.empty()
+
+    def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._tokenizer_lock = Lock()
+        gen._cancel = lambda uid: None
+
+        state_lock = Lock()
+        active = 0
+        max_active = 0
+        queued = []
+        next_uid = 0
+
+        def tokenizer_work():
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.01)
+            with state_lock:
+                active -= 1
+
+        def preprocess(prompt, images=None, audio=None, videos=None):
+            del prompt, images, audio, videos
+            tokenizer_work()
+            return {"input_ids": mx.array([[99]], dtype=mx.int32)}
+
+        def make_criteria(args, input_ids):
+            del args, input_ids
+            tokenizer_work()
+            return object()
+
+        class Requests:
+            def put(self, request):
+                nonlocal next_uid
+                next_uid += 1
+                queued.append(request)
+                request.rqueue.put(
+                    server.GenerationContext(uid=next_uid, prompt_tokens=1)
+                )
+
+        gen._preprocess_request = preprocess
+        gen._make_thinking_budget_criteria = make_criteria
+        gen.requests = Requests()
+
+        def generate_one(_):
+            _, token_iter = gen.generate(
+                "prompt",
+                args=server.GenerationArguments(
+                    max_tokens=1,
+                    thinking_budget=512,
+                ),
+            )
+            token_iter.close()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(generate_one, range(4)))
+
+        assert max_active == 1
+        assert len(queued) == 4
+        assert all(request.thinking_budget_criteria is not None for request in queued)
 
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")

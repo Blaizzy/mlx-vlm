@@ -483,7 +483,9 @@ def generate_step(
             mx.clear_cache()
 
         if thinking_budget_criteria is not None:
-            next_y = thinking_budget_criteria.apply_forced_token(next_y)
+            forced_token_id = thinking_budget_criteria.pop_forced_token_id()
+            if forced_token_id is not None:
+                next_y = mx.array([forced_token_id], dtype=next_y.dtype)
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -1232,7 +1234,7 @@ class GenerationBatch:
 
         keep = []
         responses = []
-        forced_next_tokens = None
+        forced_next_tokens = [None] * len(self.uids)
         for i in range(len(self.uids)):
             finish_reason = None
             self._num_tokens[i] += 1
@@ -1243,15 +1245,7 @@ class GenerationBatch:
             ):
                 criteria = self.thinking_budget_criteria[i]
                 criteria(tok)
-                if forced_next_tokens is None:
-                    mx.eval(self._next_tokens)
-                    forced_next_tokens = self._next_tokens.tolist()
-                next_y = criteria.apply_forced_token(
-                    mx.array([forced_next_tokens[i]], dtype=mx.int32)
-                )
-                next_token = int(next_y.item())
-                if next_token != forced_next_tokens[i]:
-                    forced_next_tokens[i] = next_token
+                forced_next_tokens[i] = criteria.pop_forced_token_id()
 
             if self.stop_criteria(tok):
                 finish_reason = "stop"
@@ -1275,8 +1269,18 @@ class GenerationBatch:
                 )
             )
 
-        if forced_next_tokens is not None:
-            self._next_tokens = mx.array(forced_next_tokens, dtype=mx.int32)
+        has_forced_next_tokens = any(token is not None for token in forced_next_tokens)
+        if has_forced_next_tokens:
+            force_mask = mx.array(
+                [token is not None for token in forced_next_tokens], dtype=mx.bool_
+            )
+            replacements = mx.array(
+                [token if token is not None else 0 for token in forced_next_tokens],
+                dtype=self._next_tokens.dtype,
+            )
+            self._next_tokens = mx.where(force_mask, replacements, self._next_tokens)
+
+        if has_forced_next_tokens:
             mx.async_eval(self._next_tokens)
 
         if len(keep) < len(self.uids):
