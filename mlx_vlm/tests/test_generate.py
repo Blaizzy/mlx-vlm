@@ -1771,6 +1771,52 @@ class TestSamplerArgs:
         )
 
 
+def test_generate_step_schedules_final_prefill_async():
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    events = []
+    original_async_eval = mx.async_eval
+    original_eval = mx.eval
+
+    def record_async_eval(*args):
+        events.append("async")
+        return original_async_eval(*args)
+
+    def record_eval(*args):
+        events.append("sync")
+        return original_eval(*args)
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(generate_module.mx, "async_eval", side_effect=record_async_eval),
+        patch.object(generate_module.mx, "eval", side_effect=record_eval),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+        )
+        next(gen)
+
+    assert events[0] == "async"
+
+
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
 def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     pbar = MagicMock()
