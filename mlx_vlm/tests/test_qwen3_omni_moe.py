@@ -126,7 +126,7 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                 input_ids,
                 target_layer_idx=0,
                 thinker_max_new_tokens=3,
-                thinker_eos_token_id=63,
+                thinker_eos_token_id=-1,
             )
         )
         expected_hidden_states, expected_input_embeds = (

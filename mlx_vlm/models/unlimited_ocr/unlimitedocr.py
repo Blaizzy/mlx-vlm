@@ -2,7 +2,6 @@ from typing import Optional
 
 import mlx.core as mx
 import numpy as np
-from transformers import AutoProcessor
 
 from mlx_vlm.models.base import InputEmbeddingsFeatures
 
@@ -13,8 +12,6 @@ from ..deepseekocr.vision import VisionModel
 from .config import ModelConfig
 from .language import LanguageModel
 from .processing_unlimitedocr import UnlimitedOCRHFProcessor, UnlimitedOCRProcessor
-
-AutoProcessor.register("unlimited-ocr", UnlimitedOCRProcessor)
 
 
 class Model(DeepseekOCRModel):

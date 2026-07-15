@@ -715,6 +715,8 @@ def _make_cache(
     kv_bits=None,
     kv_group_size=64,
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+    quantized_kv_start=0,
+    prefill_length=0,
 ):
     """
     Convert a list of regular caches into their corresponding
@@ -730,8 +732,14 @@ def _make_cache(
     """
     use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
 
+    defer_turbo = (
+        use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
+    )
+
     def _make_quant_cache(lp):
         if use_turbo:
+            if defer_turbo:
+                return cache.BatchKVCache(lp)
             return BatchTurboQuantKVCache(lp, bits=kv_bits)
         return cache.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
@@ -922,6 +930,15 @@ class GenerationBatch:
     def cache_states(self):
         return [c.state for c in self.prompt_cache if hasattr(c, "state")]
 
+    def _ensure_logits_processor_slots(self, *, force: bool = False):
+        if not (force or (self.logits_processors and any(self.logits_processors))):
+            return
+        if len(self.logits_processors) < len(self.uids):
+            missing = len(self.uids) - len(self.logits_processors)
+            self.logits_processors.extend([None] * missing)
+        elif len(self.logits_processors) > len(self.uids):
+            self.logits_processors = self.logits_processors[: len(self.uids)]
+
     def _ensure_token_context(self, *, force: bool = False):
         if not (force or (self.logits_processors and any(self.logits_processors))):
             if not self.logits_processors:
@@ -933,7 +950,7 @@ class GenerationBatch:
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
 
-    def _greedy_argmax_step(self, inputs: mx.array, fwd_kwargs: dict):
+    def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
         if (
             not self.greedy_sampling
             or self.compute_logprobs
@@ -942,21 +959,15 @@ class GenerationBatch:
         ):
             return None
 
-        argmax_from_hidden = getattr(
-            self._language_model, "speculative_argmax_from_hidden", None
-        )
-        if not callable(argmax_from_hidden):
+        fused_greedy_decode = getattr(self._language_model, "fused_greedy_decode", None)
+        if not callable(fused_greedy_decode):
             return None
 
-        output = self._language_model(
+        sampled = fused_greedy_decode(
             inputs[:, None],
             cache=self.prompt_cache,
-            return_hidden=True,
-            skip_logits=True,
             **fwd_kwargs,
         )
-        hidden = output.hidden_states[-1]
-        sampled = argmax_from_hidden(hidden)
         if sampled is None:
             return None
         if sampled.ndim == 2 and sampled.shape[1] == 1:
@@ -973,7 +984,7 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
-        sampled = self._greedy_argmax_step(inputs, fwd_kwargs)
+        sampled = self._fused_greedy_step(inputs, fwd_kwargs)
         if sampled is not None:
             self._next_tokens = sampled
             self._next_lps = None
@@ -1103,6 +1114,8 @@ class GenerationBatch:
         self_has_processors = self.logits_processors and any(self.logits_processors)
         other_has_processors = other.logits_processors and any(other.logits_processors)
         if self_has_processors or other_has_processors:
+            self._ensure_logits_processor_slots(force=bool(other_has_processors))
+            other._ensure_logits_processor_slots(force=bool(self_has_processors))
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
         else:
@@ -1118,6 +1131,7 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
         self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self._ensure_logits_processor_slots()
         self._ensure_token_context()
 
         if self._current_tokens is None:
@@ -1520,6 +1534,7 @@ class PromptProcessingBatch:
         kv_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start: int = 0,
         warm_cache: Optional[List[Any]] = None,
         apc_meta: Optional[List[dict]] = None,
         apc_manager: Optional["_apc.APCManager"] = None,
@@ -1618,6 +1633,8 @@ class PromptProcessingBatch:
                     kv_bits=kv_bits,
                     kv_group_size=kv_group_size,
                     kv_quant_scheme=kv_quant_scheme,
+                    quantized_kv_start=quantized_kv_start,
+                    prefill_length=max_length,
                 ),
             )
         elif (
@@ -1634,6 +1651,8 @@ class PromptProcessingBatch:
                 kv_bits=kv_bits,
                 kv_group_size=kv_group_size,
                 kv_quant_scheme=kv_quant_scheme,
+                quantized_kv_start=quantized_kv_start,
+                prefill_length=max_length,
             )
 
         # Declare per-row right-padding on each cache so finalize() can roll
@@ -2463,6 +2482,9 @@ class BatchGenerator:
             kv_bits=self.kv_bits,
             kv_group_size=self.kv_group_size,
             kv_quant_scheme=self.kv_quant_scheme,
+            quantized_kv_start=getattr(
+                self, "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+            ),
             warm_cache=warm_cache,
             apc_meta=apc_meta,
             apc_manager=self.apc_manager,
@@ -2762,6 +2784,9 @@ class BatchGenerator:
                 kv_bits=self.kv_bits,
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
+                quantized_kv_start=getattr(
+                    self, "quantized_kv_start", DEFAULT_QUANTIZED_KV_START
+                ),
                 apc_meta=apc_meta,
                 apc_manager=self.apc_manager,
                 apc_mode=self.apc_mode,
