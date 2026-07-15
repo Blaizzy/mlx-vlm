@@ -3,6 +3,7 @@ import json
 import struct
 from io import BytesIO
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -404,6 +405,37 @@ def test_prepare_inputs():
     )
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
+
+
+def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
+    attention_mask = mx.array([[1, 1]], dtype=mx.int32)
+
+    class Processor:
+        tokenizer = SimpleNamespace(pad_token="[PAD]", eos_token="[EOS]")
+
+        def __call__(self, text=None, images=None, padding=None, return_tensors="mlx"):
+            return {
+                "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+                "attention_mask": attention_mask,
+                "pixel_values": mx.zeros((1, 2), dtype=mx.float32),
+            }
+
+    inputs = prepare_inputs(
+        Processor(),
+        prompts="test <image>",
+        images=mx.zeros((3, 8, 8)),
+    )
+    consumed = []
+
+    def consume_attention_mask():
+        consumed.append(inputs["attention_mask"].tolist())
+
+    worker = Thread(target=consume_attention_mask)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert inputs["attention_mask"] is attention_mask
+    assert consumed == [[[1, 1]]]
 
 
 def test_process_inputs_with_fallback():

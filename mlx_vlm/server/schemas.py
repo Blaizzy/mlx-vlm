@@ -795,6 +795,13 @@ class StreamOptions(BaseModel):
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
     stream_options: Optional[StreamOptions] = None
+    tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
+    tool_choice: Optional[Any] = Field(
+        None,
+        description=(
+            "Controls tool use: none, auto, required, or a specific function."
+        ),
+    )
 
 
 class TopLogprob(BaseModel):
