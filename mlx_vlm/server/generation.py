@@ -15,6 +15,7 @@ import mlx.core as mx
 from fastapi import HTTPException
 
 from .. import apc as _apc
+from ..array_utils import materialize_mx_arrays
 from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -1069,6 +1070,9 @@ class ResponseGenerator:
             )
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
+
+        # Inputs cross from the caller thread to the GPU generation thread here.
+        materialize_mx_arrays(raw_inputs)
 
         self.requests.put(
             QueuedGenerationRequest(

@@ -3602,6 +3602,37 @@ class TestResponseGenerator:
         assert len(queued) == 4
         assert all(request.thinking_budget_criteria is not None for request in queued)
 
+    def test_generate_materializes_inputs_before_generation_thread_handoff(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._cancel = lambda uid: None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3]], dtype=mx.int32),
+            "attention_mask": mx.arange(3) * 2,
+        }
+        errors = []
+
+        class Requests:
+            def put(self, item):
+                def consume():
+                    try:
+                        item.raw_inputs["attention_mask"].tolist()
+                    except Exception as exc:
+                        errors.append(exc)
+
+                thread = Thread(target=consume)
+                thread.start()
+                thread.join(timeout=1.0)
+                assert not thread.is_alive()
+                item.rqueue.put(SimpleNamespace(uid="req-1"))
+
+        gen.requests = Requests()
+
+        gen.generate("hello")
+
+        assert errors == []
+
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         monkeypatch.setattr(

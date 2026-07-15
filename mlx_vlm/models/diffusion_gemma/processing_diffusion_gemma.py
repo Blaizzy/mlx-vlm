@@ -10,10 +10,10 @@ from typing import List, Optional, Union
 
 import mlx.core as mx
 import numpy as np
-from mlx.utils import tree_flatten
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 
+from ...array_utils import materialize_mx_arrays
 from ..gemma4.processing_gemma4 import Gemma4Processor
 
 _TOOL_PARSER_TOKENS = {
@@ -53,15 +53,6 @@ def _make_tool_parser_tokens_non_special(tokenizer):
         for token in additional_tokens
         if _token_text(token) not in _TOOL_PARSER_TOKENS
     ]
-
-
-def _materialize_mx_arrays(inputs: BatchFeature) -> BatchFeature:
-    arrays = [
-        value for _, value in tree_flatten(inputs.data) if isinstance(value, mx.array)
-    ]
-    if arrays:
-        mx.eval(*arrays)
-    return inputs
 
 
 class DiffusionGemma4Processor(Gemma4Processor):
@@ -171,7 +162,9 @@ class DiffusionGemma4Processor(Gemma4Processor):
                 "Provide `text`, `images`, and/or `videos` for DiffusionGemma4Processor."
             )
         inputs = super().__call__(images=images, text=text, videos=videos, **kwargs)
-        return _materialize_mx_arrays(self._merge_video_pixel_values(inputs))
+        inputs = self._merge_video_pixel_values(inputs)
+        materialize_mx_arrays(inputs.data)
+        return inputs
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
