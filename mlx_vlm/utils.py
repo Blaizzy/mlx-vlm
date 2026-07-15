@@ -1956,11 +1956,20 @@ class ThinkingBudgetCriteria:
         return None
 
     def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
-        if self.forced_token_id is not None and self.enable_thinking:
-            next_y = mx.array([self.forced_token_id])
-            self.forced_token_id = None
+        forced_token_id = self.pop_forced_token_id()
+        if forced_token_id is not None:
+            next_y = mx.array([forced_token_id])
             return next_y
         return next_y
+
+    def pop_forced_token_id(self) -> Optional[int]:
+        """Return and clear the pending forced token, if any."""
+        if self.forced_token_id is None or not self.enable_thinking:
+            return None
+
+        forced_token_id = self.forced_token_id
+        self.forced_token_id = None
+        return forced_token_id
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:

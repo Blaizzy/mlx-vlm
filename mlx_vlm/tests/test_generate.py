@@ -710,6 +710,51 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [3]
 
+    def test_generation_batch_thinking_budget_does_not_sync_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def pop_forced_token_id(self):
+                forced_token_id = self.forced_token_id
+                self.forced_token_id = None
+                return forced_token_id
+
+            def apply_forced_token(self, next_y):
+                return next_y
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        original_eval = mx.eval
+        with patch.object(generate_module.mx, "eval", wraps=original_eval) as mock_eval:
+            first = batch.next()
+
+        assert [r.token for r in first] == [5]
+        # GenerationBatch._step synchronizes the current token once. Budget
+        # handling must not add a second synchronization for the next token.
+        assert mock_eval.call_count == 1
+        assert [r.token for r in batch.next()] == [3]
+
     def test_generation_batch_uses_greedy_hidden_argmax_without_logprobs(self):
         class FastArgmaxModel:
             def __init__(self):
@@ -1583,6 +1628,15 @@ class TestThinkingBudgetCriteria:
         forced = criteria(60)  # \n forced
         assert forced == 10
         assert criteria.apply_forced_token(mx.array([0])).tolist() == [10]
+
+    def test_pop_forced_token_id_consumes_pending_token(self):
+        criteria = self._make_criteria()
+        for i in range(5):
+            assert criteria(50 + i) is None
+
+        assert criteria(60) == 10
+        assert criteria.pop_forced_token_id() == 10
+        assert criteria.pop_forced_token_id() is None
 
 
 class TestSamplerArgs:
