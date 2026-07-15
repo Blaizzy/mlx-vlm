@@ -10,8 +10,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
+from ..activations import swiglu
 from ..cache import ArraysCache, KVCache
-from .activations import swiglu
+from ..rope_utils import initialize_rope
+from ..switch_layers import SwitchGLU
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -19,8 +21,6 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .gated_delta import gated_delta_update
-from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
 
 
 @dataclass

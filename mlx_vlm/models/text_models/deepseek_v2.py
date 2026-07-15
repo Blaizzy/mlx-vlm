@@ -8,10 +8,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
-from .activations import swiglu
+from ..activations import swiglu
+from ..pipeline import PipelineMixin
+from ..switch_layers import SwitchGLU
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU
 
 
 @dataclass
