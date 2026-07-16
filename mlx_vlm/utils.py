@@ -48,6 +48,7 @@ MODEL_REMAPPING = {
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
+    "inkling_mm_model": "inkling",
 }
 
 MAX_FILE_SIZE_GB = 5
