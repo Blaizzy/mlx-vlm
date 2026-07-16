@@ -1,5 +1,3 @@
-import importlib
-import importlib.util
 import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -12,18 +10,8 @@ from .base import InputEmbeddingsFeatures, LanguageModelOutput
 _is_text_model_arch = True
 
 
-_TEXT_FAMILIES = ("qwen", "deepseek", "gemma", "phi", "glm", "cohere")
-
-
 def _resolve_text_model_classes(params):
     model_type = params.get("model_type")
-    if model_type is not None:
-        for family in _TEXT_FAMILIES:
-            name = f"{__package__}.{family}.{model_type}"
-            if importlib.util.find_spec(name) is not None:
-                arch = importlib.import_module(name)
-                return arch.Model, arch.ModelArgs
-
     try:
         from mlx_lm.utils import _get_classes
     except ImportError as e:
