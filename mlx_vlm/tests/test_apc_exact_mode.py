@@ -15,6 +15,7 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm.apc import APCManager, model_apc_mode
+from mlx_vlm.models.cache import KVCache
 
 # ============================================================================
 # Model factories — tiny random-weight instances, no downloads needed
@@ -149,6 +150,25 @@ def test_apc_exact_mode_detected_for_hybrid_models(model_factory):
     """Hybrid models must route to exact mode, not block mode."""
     lm = model_factory()
     assert model_apc_mode(lm) == "exact"
+
+
+def test_apc_exact_store_materializes_its_snapshot(monkeypatch):
+    cache = KVCache()
+    cache.keys = mx.ones((1, 1, 4, 2))
+    cache.values = mx.ones((1, 1, 4, 2))
+    cache.offset = 4
+    apc = APCManager(num_blocks=4, block_size=4)
+    real_eval = mx.eval
+    eval_calls = []
+
+    def recording_eval(*args):
+        eval_calls.append(args)
+        return real_eval(*args)
+
+    monkeypatch.setattr(mx, "eval", recording_eval)
+
+    assert apc.store_exact_cache([1, 2, 3, 4], [cache])
+    assert eval_calls
 
 
 @pytest.mark.parametrize("model_factory", [_make_tiny_gemma4, _make_tiny_qwen35])
