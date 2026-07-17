@@ -1,35 +1,17 @@
-# Copyright © 2023-2024 Apple Inc.
-
-from dataclasses import dataclass
-
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-
-
-@dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str
-    hidden_size: int = 2048
-    num_attention_heads: int = 16
-    num_hidden_layers: int = 24
-    kv_channels: int = 128
-    max_position_embeddings: int = 8192
-    layer_norm_epsilon: float = 1e-6
-    intermediate_size: int = 11008
-    no_bias: bool = True
-    vocab_size: int = 151936
-    num_key_value_heads = None
-
-    def __post_init__(self):
-        if self.num_key_value_heads is None:
-            self.num_key_value_heads = self.num_attention_heads
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from .config import ModelConfig
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
 
         hidden_size = args.hidden_size
@@ -74,7 +56,7 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
 
         self.w1 = nn.Linear(
@@ -94,7 +76,7 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
 
         self.ln_1 = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
@@ -115,14 +97,14 @@ class TransformerBlock(nn.Module):
 
 
 class QwenModel(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
         self.wte = nn.Embedding(args.vocab_size, args.hidden_size)
         self.h = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
         self.ln_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
-    def __call__(self, inputs, cache=None):
-        x = self.wte(inputs)
+    def __call__(self, inputs, cache=None, inputs_embeds=None):
+        x = self.wte(inputs) if inputs_embeds is None else inputs_embeds
 
         if cache is None:
             cache = [None] * len(self.h)
@@ -134,8 +116,8 @@ class QwenModel(nn.Module):
         return self.ln_f(x)
 
 
-class Model(nn.Module):
-    def __init__(self, config: ModelArgs):
+class LanguageModel(nn.Module):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.model_type = config.model_type
         self.transformer = QwenModel(config)
@@ -145,13 +127,19 @@ class Model(nn.Module):
         self.args = config
 
     def __call__(
-        self,
-        x: mx.array,
-        cache=None,
+        self, x: mx.array, cache=None, inputs_embeds=None, mask=None, **kwargs
     ) -> mx.array:
-        y = self.transformer(x, cache)
-        return self.lm_head(y)
+        y = self.transformer(x, cache, inputs_embeds=inputs_embeds)
+        return LanguageModelOutput(logits=self.lm_head(y))
+
+    def sanitize(self, weights):
+        return weights
 
     @property
     def layers(self):
         return self.transformer.h
+
+    def make_cache(self):
+        from ..cache import KVCache
+
+        return [KVCache() for _ in self.layers]

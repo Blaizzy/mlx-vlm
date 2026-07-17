@@ -1,58 +1,24 @@
-# Copyright © 2025 Apple Inc.
-
 from __future__ import annotations
 
-from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from ..cache import ArraysCache, KVCache
-from ..mlp import SwiGLUMLP as Qwen3NextMLP
-from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
-from .base import (
-    BaseModelArgs,
+from ..base import (
+    LanguageModelOutput,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .gated_delta import gated_delta_update
-
-
-@dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str
-    hidden_size: int
-    num_hidden_layers: int
-    intermediate_size: int
-    num_attention_heads: int
-    linear_num_value_heads: int
-    linear_num_key_heads: int
-    linear_key_head_dim: int
-    linear_value_head_dim: int
-    linear_conv_kernel_dim: int
-    num_experts: int
-    num_experts_per_tok: int
-    decoder_sparse_step: int
-    shared_expert_intermediate_size: int
-    mlp_only_layers: List[int]
-    moe_intermediate_size: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: int
-    rope_theta: float
-    partial_rotary_factor: float
-    max_position_embeddings: int
-    head_dim: int
-    norm_topk_prob: bool = False
-    tie_word_embeddings: bool = False
-    attention_bias: bool = False
-    rope_scaling: Optional[Dict[str, Union[float, str]]] = None
-    full_attention_interval: int = 4
+from ..cache import ArraysCache, KVCache
+from ..gated_delta import gated_delta_update
+from ..mlp import SwiGLUMLP as Qwen3NextMLP
+from ..rope_utils import initialize_rope
+from ..switch_layers import SwitchGLU
+from .config import ModelConfig
 
 
 @partial(mx.compile, shapeless=True)
@@ -79,7 +45,7 @@ class Qwen3NextRMSNormGated(nn.Module):
 
 
 class Qwen3NextAttention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
         self.num_key_value_heads = args.num_key_value_heads
         self.num_attention_heads = args.num_attention_heads
@@ -159,7 +125,7 @@ class Qwen3NextAttention(nn.Module):
 
 
 class Qwen3NextGatedDeltaNet(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_v_heads = config.linear_num_value_heads
@@ -295,7 +261,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
@@ -344,7 +310,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
 
 class Qwen3NextDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
+    def __init__(self, args: ModelConfig, layer_idx: int):
         super().__init__()
         self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
         if self.is_linear:
@@ -379,7 +345,7 @@ class Qwen3NextDecoderLayer(nn.Module):
 
 
 class Qwen3NextModel(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelConfig):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
@@ -391,11 +357,11 @@ class Qwen3NextModel(nn.Module):
         self.fa_idx = args.full_attention_interval - 1
 
     def __call__(
-        self,
-        inputs: mx.array,
-        cache: Optional[Any] = None,
+        self, inputs: mx.array, cache: Optional[Any] = None, inputs_embeds=None
     ) -> mx.array:
-        hidden_states = self.embed_tokens(inputs)
+        hidden_states = (
+            self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        )
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -410,8 +376,8 @@ class Qwen3NextModel(nn.Module):
         return self.norm(hidden_states)
 
 
-class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+class LanguageModel(nn.Module):
+    def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
@@ -423,13 +389,16 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        inputs_embeds=None,
+        mask=None,
+        **kwargs,
     ) -> mx.array:
-        out = self.model(inputs, cache)
+        out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
-        return out
+        return LanguageModelOutput(logits=out)
 
     @property
     def layers(self):

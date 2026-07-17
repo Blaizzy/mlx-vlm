@@ -1,48 +1,19 @@
-# Copyright © 2023-2024 Apple Inc.
-
 import math
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
-from ..activations import swiglu
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
+from ..mlp import DeepseekMLP as DeepseekV2MLP
 from ..pipeline import PipelineMixin
 from ..switch_layers import SwitchGLU
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-
-
-@dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str = "deepseek_v2"
-    vocab_size: int = 102400
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    moe_intermediate_size: int = 1407
-    num_hidden_layers: int = 30
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32
-    n_shared_experts: Optional[int] = None
-    n_routed_experts: Optional[int] = None
-    routed_scaling_factor: float = 1.0
-    kv_lora_rank: int = 512
-    q_lora_rank: int = 1536
-    qk_rope_head_dim: int = 64
-    v_head_dim: int = 128
-    qk_nope_head_dim: int = 128
-    topk_method: str = "gready"
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
-    moe_layer_freq: int = 1
-    first_k_dense_replace: int = 0
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
-    rope_scaling: Dict = None
-    attention_bias: bool = False
+from .config import ModelConfig
 
 
 def yarn_find_correction_dim(
@@ -73,7 +44,7 @@ def yarn_get_mscale(scale=1, mscale=1):
 
 def yarn_linear_ramp_mask(min_val, max_val, dim):
     if min_val == max_val:
-        max_val += 0.001  # Prevent singularity
+        max_val += 0.001
 
     linear_func = (mx.arange(dim, dtype=mx.float32) - min_val) / (max_val - min_val)
     return mx.clip(linear_func, 0, 1)
@@ -127,7 +98,7 @@ class DeepseekV2YarnRotaryEmbedding(nn.Module):
 
 
 class DeepseekV2Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -245,28 +216,8 @@ class DeepseekV2Attention(nn.Module):
         return self.o_proj(output)
 
 
-class DeepseekV2MLP(nn.Module):
-    def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-        return down_proj
-
-
 class MoEGate(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_tok
@@ -302,7 +253,7 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
@@ -336,7 +287,7 @@ class DeepseekV2MoE(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int):
+    def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.self_attn = DeepseekV2Attention(config)
         self.mlp = (
@@ -367,7 +318,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 
 
 class DeepseekV2Model(PipelineMixin, nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -378,11 +329,9 @@ class DeepseekV2Model(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
-        self,
-        x: mx.array,
-        cache: Optional[Any] = None,
+        self, x: mx.array, cache: Optional[Any] = None, inputs_embeds=None
     ) -> mx.array:
-        h = self.embed_tokens(x)
+        h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
 
         pipeline_rank = self.pipeline_rank
         pipeline_size = self.pipeline_size
@@ -391,28 +340,25 @@ class DeepseekV2Model(PipelineMixin, nn.Module):
             cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(h, cache[0])
 
-        # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         for l, c in zip(self.pipeline_layers, cache):
             h = l(h, mask, cache=c)
 
-        # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
             if cache[-1] is not None:
                 cache[-1].keys = mx.depends(cache[-1].keys, h)
 
-        # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
 
-class Model(nn.Module):
-    def __init__(self, config: ModelArgs):
+class LanguageModel(nn.Module):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
@@ -423,9 +369,12 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        inputs_embeds=None,
+        mask=None,
+        **kwargs,
     ):
-        out = self.model(inputs, cache)
-        return self.lm_head(out)
+        out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        return LanguageModelOutput(logits=self.lm_head(out))
 
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
@@ -444,7 +393,6 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         for layer in self.model.layers:
-            # Shard the self attention
             if layer.self_attn.q_lora_rank is None:
                 layer.self_attn.q_proj = shard_linear(
                     layer.self_attn.q_proj, "all-to-sharded", group=group
@@ -461,7 +409,6 @@ class Model(nn.Module):
             )
             layer.self_attn.num_heads //= N
 
-            # Shard the MLP
             if isinstance(layer.mlp, DeepseekV2MLP):
                 layer.mlp.gate_proj = shard_linear(
                     layer.mlp.gate_proj, "all-to-sharded", group=group
@@ -473,8 +420,6 @@ class Model(nn.Module):
                     layer.mlp.up_proj, "all-to-sharded", group=group
                 )
 
-            # Shard the MoE. Shard in place since the MoE should be responsible
-            # for aggregating the results.
             else:
                 layer.mlp.sharding_group = group
                 shard_inplace(
@@ -499,3 +444,8 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.pipeline_layers
+
+    def make_cache(self):
+        from ..cache import KVCache
+
+        return [KVCache() for _ in self.layers]
