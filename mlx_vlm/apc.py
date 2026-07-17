@@ -494,8 +494,11 @@ def adjust_prefix_to_text_suffix_boundary(
     )
     if max_len <= 0:
         return 0
-    desired = max(1, int(desired_prefix_len))
-    prefix_len = max(desired, media_safe_prefix_min(token_ids, media_token_ids))
+    desired = int(desired_prefix_len)
+    media_min = media_safe_prefix_min(token_ids, media_token_ids)
+    if desired <= 0 and media_min <= 0:
+        return 0
+    prefix_len = max(desired, media_min)
     if prefix_len > max_len:
         return 0
     return prefix_len

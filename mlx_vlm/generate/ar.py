@@ -2251,13 +2251,17 @@ class BatchGenerator:
         if not ids_list or len(ids_list) < 2:
             return None
         safe_lookup_min = self._apc_safe_prefix_lookup_min(ids_list)
+        exact_lookup_min = max(
+            safe_lookup_min,
+            self.apc_manager.exact_cache_guard_tokens,
+        )
         extra_hash = self._apc_extra_hash(prompt_kwargs or {})
         apc_mode = getattr(self, "apc_mode", "block")
         if apc_mode == "exact":
             exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
                 ids_list,
                 extra_hash=extra_hash,
-                min_prefix_tokens=safe_lookup_min,
+                min_prefix_tokens=exact_lookup_min,
             )
             if (
                 exact_cache is not None
@@ -2287,7 +2291,7 @@ class BatchGenerator:
             exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
                 ids_list,
                 extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, safe_lookup_min),
+                min_prefix_tokens=max(prefix_len, exact_lookup_min),
             )
         warm_cache = None
         disk_prefix_len = 0

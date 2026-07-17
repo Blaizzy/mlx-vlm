@@ -897,6 +897,50 @@ def test_adjust_prefix_returns_zero_when_no_text_suffix_remains():
     )
 
 
+def test_adjust_prefix_returns_zero_for_short_text_prompt_below_guard():
+    token_ids = list(range(15))
+
+    assert (
+        apc_module.adjust_prefix_to_text_suffix_boundary(
+            token_ids,
+            desired_prefix_len=len(token_ids) - 16,
+            media_token_ids=set(),
+            max_prefix_tokens=len(token_ids) - 1,
+        )
+        == 0
+    )
+
+
+def test_adjust_prefix_allows_media_floor_when_desired_is_non_positive():
+    token_ids = [1, 42, 42, 2, 3]
+
+    assert (
+        apc_module.adjust_prefix_to_text_suffix_boundary(
+            token_ids,
+            desired_prefix_len=-11,
+            media_token_ids={42},
+            max_prefix_tokens=len(token_ids) - 1,
+        )
+        == 3
+    )
+
+
+def test_exact_lookup_can_reject_entries_at_or_below_guard(monkeypatch):
+    monkeypatch.setenv("APC_EXACT_PREFIX_GUARD_TOKENS", "16")
+    manager = APCManager(num_blocks=1, block_size=16)
+    token_ids = list(range(15))
+    assert manager.store_exact_cache(token_ids, _make_exact_row_cache(len(token_ids)))
+
+    warm, matched = manager.lookup_exact_cache(
+        token_ids + [999],
+        min_prefix_tokens=manager.exact_cache_guard_tokens,
+    )
+
+    assert warm is None
+    assert matched == 0
+    manager.close()
+
+
 def test_exact_disk_hit_is_promoted_to_memory(tmp_path, monkeypatch):
     """After a disk restore, the entry is written to _exact_cache so the next
     identical request is served from memory (disk_hits stays unchanged)."""

@@ -822,6 +822,7 @@ def stream_generate(
         multimodal_token_ids,
     )
     apc_safe_prefix_lookup_min = max(0, apc_safe_prefix_min - 1)
+    apc_exact_lookup_min = apc_safe_prefix_lookup_min
 
     def _apc_suffix_is_text_only(prefix_len: int) -> bool:
         return _apc.prefix_leaves_text_only_suffix(
@@ -841,6 +842,11 @@ def stream_generate(
         apc_mode = _apc.model_apc_mode(model.language_model)
         if apc_mode is None:
             apc_manager = None
+        else:
+            apc_exact_lookup_min = max(
+                apc_exact_lookup_min,
+                apc_manager.exact_cache_guard_tokens,
+            )
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
@@ -877,7 +883,7 @@ def stream_generate(
             exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                 full_input_ids_list,
                 extra_hash=apc_extra_hash,
-                min_prefix_tokens=apc_safe_prefix_lookup_min,
+                min_prefix_tokens=apc_exact_lookup_min,
             )
             if (
                 exact_prompt_cache is not None
@@ -905,7 +911,7 @@ def stream_generate(
                 exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
                     full_input_ids_list,
                     extra_hash=apc_extra_hash,
-                    min_prefix_tokens=max(prefix_len, apc_safe_prefix_lookup_min),
+                    min_prefix_tokens=max(prefix_len, apc_exact_lookup_min),
                 )
             disk_prompt_cache = None
             disk_prefix_len = 0
