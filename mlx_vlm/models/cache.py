@@ -5,6 +5,22 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 
+def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
+    """Whether layer ``layer_idx`` should use a quantized KV cache.
+
+    Live batch generation (``_make_cache``), stream quantize, and APC warm
+    restore must share this policy so continuous-batching ``extend`` always
+    joins same-typed peers.
+
+    For deep stacks (``num_layers > 2``) the last full-attention layer stays
+    unquantized — it is sensitive to quantization (see gemma-4-class models).
+    Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
+    """
+    if num_layers <= 2:
+        return True
+    return layer_idx < num_layers - 1
+
+
 def create_causal_mask(
     N: int,
     offset: int = 0,
