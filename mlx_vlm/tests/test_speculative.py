@@ -30,6 +30,7 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -602,6 +603,75 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
+def test_qwen_fused_greedy_decode_support_matches_lm_head():
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    model = SimpleNamespace(
+        args=SimpleNamespace(tie_word_embeddings=False),
+        lm_head=linear,
+    )
+    assert qwen_language._can_target_verify_quantized_head(model.lm_head)
+
+    model.lm_head = OneBitLinear(512, 16, bias=False, group_size=32)
+    assert not qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert (
+        qwen_language.LanguageModel.fused_greedy_decode(
+            model, mx.array([[1]], dtype=mx.int32), cache=[]
+        )
+        is None
+    )
+
+    model.lm_head = linear
+    model.args.tie_word_embeddings = True
+    assert (
+        qwen_language.LanguageModel.fused_greedy_decode(
+            model, mx.array([[1]], dtype=mx.int32), cache=[]
+        )
+        is None
+    )
+
+
+def test_qwen_fused_greedy_decode_uses_quantized_argmax():
+    mx.random.seed(19)
+    hidden = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+
+    class Model:
+        args = SimpleNamespace(tie_word_embeddings=False)
+
+        def __init__(self):
+            self.lm_head = nn.QuantizedLinear(
+                512, 16, bias=False, group_size=32, bits=4
+            )
+            self.lm_head.scales = self.lm_head.scales.astype(mx.bfloat16)
+            self.lm_head.biases = self.lm_head.biases.astype(mx.bfloat16)
+            self.calls = []
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            self.calls.append((inputs.tolist(), cache, kwargs))
+            return SimpleNamespace(hidden_states=[hidden])
+
+        def speculative_logits_from_hidden(self, value):
+            return self.lm_head(value)
+
+    model = Model()
+    inputs = mx.array([[1]], dtype=mx.int32)
+    out = qwen_language.LanguageModel.fused_greedy_decode(
+        model, inputs, cache=["cache"]
+    )
+    ref = qwen_language._target_verify_quantized_argmax(model.lm_head, hidden)
+    mx.eval(out, ref)
+
+    assert bool(mx.array_equal(out, ref).item())
+    assert model.calls == [
+        (
+            [[1]],
+            ["cache"],
+            {"return_hidden": True, "skip_logits": True},
+        )
+    ]
+
+
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
     for bits in (4, 5):
         mx.random.seed(170 + bits)
@@ -919,6 +989,66 @@ def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
 
     assert bool(mx.array_equal(singleton_decode, batch_decode).item())
     assert isinstance(batch_cache[1], BatchKVCache)
+
+
+def _qwen3_5_hybrid_batch_model():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.num_hidden_layers = 2
+    text_config.full_attention_interval = 2
+    return qwen_language.Qwen3_5Model(text_config), text_config
+
+
+def _qwen3_5_batch_cache(left_padding):
+    arrays = ArraysCache(size=2)
+    arrays.left_padding = mx.array(left_padding, dtype=mx.int32)
+    return [arrays, BatchKVCache(list(left_padding))]
+
+
+def test_qwen3_5_fully_padded_prefill_row_survives_chunks():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 0])
+
+    first = model(mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32), cache=cache)
+    mx.eval(first, cache[1].offset, cache[1].left_padding)
+    assert first.shape == (2, 3, text_config.hidden_size)
+    assert cache[1].offset.tolist() == [-2, 3]
+    assert cache[1].left_padding.tolist() == [5, 0]
+
+    second = model(mx.array([[0, 0, 4], [4, 5, 6]], dtype=mx.int32), cache=cache)
+    mx.eval(second, cache[1].offset, cache[1].left_padding)
+    assert second.shape == (2, 3, text_config.hidden_size)
+    assert cache[1].offset.tolist() == [1, 6]
+    assert cache[1].left_padding.tolist() == [5, 0]
+
+
+def test_qwen3_5_all_rows_fully_padded_prefill():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 5])
+    out = model(mx.array([[0, 0, 0], [0, 0, 0]], dtype=mx.int32), cache=cache)
+    mx.eval(out)
+    assert out.shape == (2, 3, text_config.hidden_size)
+
+
+def test_qwen3_5_partially_padded_rows_match_unbatched():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    mx.eval(model.parameters())
+
+    batched = model(
+        mx.array([[0, 7, 8], [1, 2, 3]], dtype=mx.int32),
+        cache=_qwen3_5_batch_cache([1, 0]),
+    )
+    row0 = model(
+        mx.array([[7, 8]], dtype=mx.int32),
+        cache=[ArraysCache(size=2), KVCache()],
+    )
+    row1 = model(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        cache=[ArraysCache(size=2), KVCache()],
+    )
+    mx.eval(batched, row0, row1)
+
+    assert bool(mx.array_equal(batched[0:1, 1:], row0).item())
+    assert bool(mx.array_equal(batched[1:2], row1).item())
 
 
 def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():

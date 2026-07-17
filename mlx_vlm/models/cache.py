@@ -5,6 +5,22 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 
+def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
+    """Whether layer ``layer_idx`` should use a quantized KV cache.
+
+    Live batch generation (``_make_cache``), stream quantize, and APC warm
+    restore must share this policy so continuous-batching ``extend`` always
+    joins same-typed peers.
+
+    For deep stacks (``num_layers > 2``) the last full-attention layer stays
+    unquantized — it is sensitive to quantization (see gemma-4-class models).
+    Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
+    """
+    if num_layers <= 2:
+        return True
+    return layer_idx < num_layers - 1
+
+
 def create_causal_mask(
     N: int,
     offset: int = 0,
@@ -1629,6 +1645,39 @@ class BatchQuantizedKVCache(_BaseCache):
         self._idx = 0
         self.group_size = group_size
         self.bits = bits
+        # Set by prepare() for multi-row right-pad prefill; cleared in finalize().
+        self._right_padding = None
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        """Batch pad lifecycle — same contract as :class:`BatchKVCache`."""
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchQuantizedKVCache"
+                )
+            left_padding = mx.array(left_padding)
+            self.left_padding += left_padding
+            self.offset -= left_padding
+
+        if right_padding is not None and max(right_padding) > 0:
+            self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        """Roll right-padding into left-padding after multi-row prefill."""
+        if self._right_padding is None:
+            return
+        padding = self._right_padding
+        if self.keys is not None:
+            # Seq axis is 2 for packed/scales/biases (B, H, S, …) — same as BatchKVCache.
+            self.keys = tuple(
+                dynamic_roll(k, padding[:, None], axis=2) for k in self.keys
+            )
+            self.values = tuple(
+                dynamic_roll(v, padding[:, None], axis=2) for v in self.values
+            )
+        self.offset -= padding
+        self.left_padding += padding
+        self._right_padding = None
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Quantize incoming keys/values and append to the cache.
