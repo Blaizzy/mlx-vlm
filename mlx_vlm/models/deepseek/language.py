@@ -1,38 +1,20 @@
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..activations import swiglu
+from ..base import (
+    LanguageModelOutput,
+    create_attention_mask,
+    scaled_dot_product_attention,
+)
 from ..switch_layers import SwitchGLU
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-
-
-@dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str = "deepseek"
-    vocab_size: int = 102400
-    hidden_size: int = 4096
-    intermediate_size: int = 11008
-    moe_intermediate_size: int = 1407
-    num_hidden_layers: int = 30
-    num_attention_heads: int = 32
-    num_key_value_heads: int = 32
-    n_shared_experts: Optional[int] = None
-    n_routed_experts: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
-    moe_layer_freq: int = 1
-    first_k_dense_replace: int = 0
-    max_position_embeddings: int = 2048
-    rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
-    rope_scaling: Optional[Dict] = None
-    attention_bias: bool = False
+from .config import ModelConfig
 
 
 class DeepseekAttention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -108,7 +90,7 @@ class DeepseekAttention(nn.Module):
 class DeepseekMLP(nn.Module):
     def __init__(
         self,
-        config: ModelArgs,
+        config: ModelConfig,
         hidden_size: Optional[int] = None,
         intermediate_size: Optional[int] = None,
     ):
@@ -125,7 +107,7 @@ class DeepseekMLP(nn.Module):
 
 
 class MoEGate(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_tok
@@ -142,7 +124,7 @@ class MoEGate(nn.Module):
 
 
 class DeepseekMoE(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.switch_mlp = SwitchGLU(
@@ -167,7 +149,7 @@ class DeepseekMoE(nn.Module):
 
 
 class DeepseekDecoderLayer(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int):
+    def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.self_attn = DeepseekAttention(config)
         self.mlp = (
@@ -198,7 +180,7 @@ class DeepseekDecoderLayer(nn.Module):
 
 
 class DeepseekModel(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -208,11 +190,9 @@ class DeepseekModel(nn.Module):
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def __call__(
-        self,
-        x: mx.array,
-        cache: Optional[Any] = None,
+        self, x: mx.array, cache: Optional[Any] = None, inputs_embeds=None
     ) -> mx.array:
-        h = self.embed_tokens(x)
+        h = self.embed_tokens(x) if inputs_embeds is None else inputs_embeds
 
         if cache is None:
             cache = [None] * len(self.layers)
@@ -225,8 +205,8 @@ class DeepseekModel(nn.Module):
         return self.norm(h)
 
 
-class Model(nn.Module):
-    def __init__(self, config: ModelArgs):
+class LanguageModel(nn.Module):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
@@ -237,9 +217,12 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
+        inputs_embeds=None,
+        mask=None,
+        **kwargs,
     ):
-        out = self.model(inputs, cache)
-        return self.lm_head(out)
+        out = self.model(inputs, cache, inputs_embeds=inputs_embeds)
+        return LanguageModelOutput(logits=self.lm_head(out))
 
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
@@ -257,3 +240,8 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
+
+    def make_cache(self):
+        from ..cache import KVCache
+
+        return [KVCache() for _ in self.layers]

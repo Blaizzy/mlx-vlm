@@ -448,7 +448,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.eval(y, logprobs)
+    mx.async_eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
@@ -780,9 +780,8 @@ def _make_cache(
     if hasattr(model, "make_cache"):
         model_cache = model.make_cache()
         n = len(model_cache)
-        # Skip quantizing the last layer — it's sensitive to quantization
         return [
-            to_batch_cache(c, quantize=(i < n - 1 if n > 2 else True))
+            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
             for i, c in enumerate(model_cache)
         ]
     else:
@@ -791,7 +790,7 @@ def _make_cache(
             return [
                 (
                     _make_quant_cache(left_padding)
-                    if i < n - 1 or n <= 2
+                    if cache.should_quantize_kv_layer(i, n)
                     else cache.BatchKVCache(left_padding)
                 )
                 for i in range(n)
@@ -1813,7 +1812,7 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.eval([c.state for c in self.prompt_cache])
+        mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
@@ -2427,14 +2426,28 @@ class BatchGenerator:
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
+        # bits + group_size + scheme so warm restore matches live _make_cache
+        # backend (uniform BatchQuantized vs BatchTurboQuant).
+        _quant_cfg = (
+            {
+                "bits": self.kv_bits,
+                "group_size": self.kv_group_size,
+                "scheme": self.kv_quant_scheme,
+            }
+            if self.kv_bits is not None
+            else None
+        )
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
                 for p in picks
             ]
+            # Pass kv_quant_config so exact multi warm matches live _make_cache
+            # layer types under --kv-bits (cold quant row + exact float join).
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
+                kv_quant_config=_quant_cfg,
             )
             if warm_cache is None:
                 return None
@@ -2444,11 +2457,6 @@ class BatchGenerator:
                 len(self.model.make_cache())
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
-            )
-            _quant_cfg = (
-                {"bits": self.kv_bits, "group_size": self.kv_group_size}
-                if self.kv_bits is not None
-                else None
             )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
                 picks, num_layers=num_layers, kv_quant_config=_quant_cfg
