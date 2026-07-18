@@ -1290,7 +1290,7 @@ class ResponseGenerator:
         return pending, should_stop
 
     def _run(self):
-        """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
+        """Single GPU thread: owns BatchGenerator and its phased scheduler."""
         try:
             self._initialize_model()
         except Exception as e:
@@ -1432,7 +1432,7 @@ class ResponseGenerator:
                 if not active or batch_gen is None:
                     continue
 
-                self._step(batch_gen, active)
+                self._scheduler_iteration(batch_gen, active)
 
             except Exception as e:
                 logger.exception("Error in generation thread")
@@ -1819,19 +1819,16 @@ class ResponseGenerator:
                 mx.clear_cache()
                 gc.collect()
 
-    def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
-        kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+    @staticmethod
+    def _record_prompt_progress(prompt_responses, active):
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
                 active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
                 active[prompt_response.uid]["cached_tokens"] = getattr(
                     prompt_response, "cached_tokens", 0
                 )
-        if not responses:
-            return
 
+    def _emit_responses(self, responses, active):
         for r in responses:
             if r.uid not in active:
                 continue
@@ -1868,6 +1865,17 @@ class ResponseGenerator:
                 rqueue.put(None)
                 del active[r.uid]
 
+    def _scheduler_iteration(self, batch_gen, active):
+        """Decode, emit completed tokens, then advance prompt prefill."""
+        responses = batch_gen.decode_step()
+        self._emit_responses(responses, active)
+        if responses:
+            # Give response consumers a chance to dequeue emitted tokens before
+            # this GPU worker enters a potentially long prefill operation.
+            time.sleep(0)
+        prompt_responses = batch_gen.prefill_step()
+        self._record_prompt_progress(prompt_responses, active)
+
     def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:
         """Convert one generated token into a streaming text segment."""
         return info["streamer"].advance(token, finish_reason)
@@ -1875,7 +1883,7 @@ class ResponseGenerator:
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
         while batch_gen.has_pending_prompts:
-            self._step(batch_gen, active)
+            self._scheduler_iteration(batch_gen, active)
 
     def validate_context_budget(
         self,

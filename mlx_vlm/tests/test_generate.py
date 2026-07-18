@@ -575,7 +575,7 @@ class TestBatchGenerator:
         assert stats.prompt_tps == 200.0  # 100 / 0.5
         assert stats.prompt_tokens == 100
 
-    def test_next_reports_prompt_progress_for_completed_prefill(
+    def test_prefill_step_reports_prompt_progress_for_completed_prefill(
         self, mock_model, mock_processor, monkeypatch
     ):
         gen = BatchGenerator(
@@ -594,7 +594,11 @@ class TestBatchGenerator:
         ticks = iter([10.0, 10.2])
         monkeypatch.setattr(ar_module.time, "perf_counter", lambda: next(ticks))
 
-        prompt_responses, generation_responses = gen.next()
+        assert not hasattr(gen, "next")
+        assert len(gen.unprocessed_prompts) == 1
+        generation_responses = gen.decode_step()
+        assert len(gen.unprocessed_prompts) == 1
+        prompt_responses = gen.prefill_step()
 
         assert generation_responses == []
         assert len(prompt_responses) == 1
@@ -2309,7 +2313,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
         )
 
     with patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch):
-        bg._next()
+        bg._prefill_step()
 
     prompt_kwargs = captured["prompt_kwargs"]
     assert captured["inputs_embeds"].shape == (4, 4, 3)
