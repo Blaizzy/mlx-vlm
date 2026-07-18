@@ -2,6 +2,52 @@ import json
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
+
+_LLGUIDANCE_MASK_KERNEL = mx.fast.metal_kernel(
+    name="mlx_vlm_llguidance_mask",
+    input_names=["logits", "mask"],
+    output_names=["out"],
+    source="""
+        uint batch = thread_position_in_grid.y;
+        uint token = thread_position_in_grid.x;
+        uint word = token >> 5;
+        uint bit = token & 31;
+        bool allowed = word < mask_shape[1] &&
+            ((as_type<uint>(mask[batch * mask_shape[1] + word]) >> bit) & 1u);
+        uint offset = batch * logits_shape[1] + token;
+        out[offset] = allowed ? logits[offset] : -metal::numeric_limits<T>::infinity();
+    """,
+)
+
+
+def _apply_llguidance_mask(logits: mx.array, mask: mx.array) -> mx.array:
+    if logits.ndim == 1:
+        logits = logits[None, :]
+    if mask.ndim == 1:
+        mask = mask[None, :]
+    return _LLGUIDANCE_MASK_KERNEL(
+        inputs=[logits, mask],
+        template=[("T", logits.dtype)],
+        grid=(logits.shape[1], logits.shape[0], 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[logits.shape],
+        output_dtypes=[logits.dtype],
+    )[0]
+
+
+def _allocate_shared_bitmask(batch_size: int, vocab_size: int):
+    """Allocate a CPU-writable mask backed by MLX shared memory."""
+    mask = mx.full(
+        (batch_size, (vocab_size + 31) // 32),
+        -1,
+        dtype=mx.int32,
+    )
+    mx.eval(mask)
+    view = np.array(mask, copy=False)
+    if not view.flags["C_CONTIGUOUS"] or not view.flags["WRITEABLE"]:
+        raise RuntimeError("MLX bitmask must expose writable contiguous memory")
+    return mask, view
 
 
 class LLGuidanceLogitsProcessor:
@@ -12,10 +58,15 @@ class LLGuidanceLogitsProcessor:
     (batch, vocab).
     """
 
+    # Do not hold a latency-sensitive constrained token behind unrelated
+    # prompt-prefill work after it has been decoded.
+    requires_immediate_decode_yield = True
+
     def __init__(self, grammar: str, llg_tokenizer) -> None:
         self.grammar = grammar
         self.llg_tokenizer = llg_tokenizer
         self.is_first_token = True
+        self._mask_cursor = -1
 
     def clone(self) -> "LLGuidanceLogitsProcessor":
         return LLGuidanceLogitsProcessor(self.grammar, self.llg_tokenizer)
@@ -24,18 +75,21 @@ class LLGuidanceLogitsProcessor:
         self.is_first_token = True
         self.ll_matchers = None
         self.bitmask = None
+        self.bitmask_mx = None
+        self._mask_buffers = None
+        self._mask_cursor = -1
 
     def _setup(self, batch_size: int) -> None:
-        import llguidance
-        import llguidance.numpy
         from llguidance import LLMatcher
 
         self.ll_matchers = [
             LLMatcher(self.llg_tokenizer, self.grammar) for _ in range(batch_size)
         ]
-        self.bitmask = llguidance.numpy.allocate_token_bitmask(
-            batch_size, self.llg_tokenizer.vocab_size
-        )
+        self._mask_buffers = [
+            _allocate_shared_bitmask(batch_size, self.llg_tokenizer.vocab_size)
+            for _ in range(2)
+        ]
+        self._mask_cursor = -1
 
     def _consume_tokens(self, last_tokens: list[int]) -> None:
         for i, last_token in enumerate(last_tokens):
@@ -44,24 +98,26 @@ class LLGuidanceLogitsProcessor:
             if error:
                 raise ValueError(f"LLGuidance matcher error: {error}")
 
-    def _apply_bitmask(self, logits: mx.array) -> mx.array:
-        import llguidance.mlx
+    def _fill_next_token_mask(self) -> mx.array:
         import llguidance.numpy
 
-        biased_logits = []
-        for i in range(logits.shape[0]):
-            llguidance.numpy.fill_next_token_bitmask(
-                self.ll_matchers[i], self.bitmask, i
-            )
-            row = mx.array(
-                llguidance.mlx.apply_token_bitmask(logits[i], self.bitmask[i])
-            )
-            if row.ndim == 2 and row.shape[0] == 1:
-                row = row[0]
-            biased_logits.append(row)
-        return mx.concatenate(
-            [mx.array(logit)[None, :] for logit in biased_logits], axis=0
-        )
+        self._mask_cursor = (self._mask_cursor + 1) % len(self._mask_buffers)
+        self.bitmask_mx, self.bitmask = self._mask_buffers[self._mask_cursor]
+        for i, matcher in enumerate(self.ll_matchers):
+            llguidance.numpy.fill_next_token_bitmask(matcher, self.bitmask, i)
+        return self.bitmask_mx
+
+    def _apply_bitmask(self, logits: mx.array) -> mx.array:
+        return _apply_llguidance_mask(logits, self._fill_next_token_mask())
+
+    def prepare_next_token_mask(self, last_token: int) -> mx.array:
+        """Advance one matcher and return its packed MLX token mask."""
+        if self.is_first_token:
+            self._setup(1)
+            self.is_first_token = False
+        else:
+            self._consume_tokens([last_token])
+        return self._fill_next_token_mask()
 
     def process_last_token(self, last_token: int, logits: mx.array) -> mx.array:
         if logits.ndim == 1:

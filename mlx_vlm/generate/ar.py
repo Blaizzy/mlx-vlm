@@ -951,22 +951,27 @@ class GenerationBatch:
             self.token_context = self.token_context[: len(self.uids)]
 
     def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
-        if (
-            not self.greedy_sampling
-            or self.compute_logprobs
-            or self.top_logprobs_k > 0
-            or (self.logits_processors and any(self.logits_processors))
-        ):
+        if not self.greedy_sampling or self.compute_logprobs or self.top_logprobs_k > 0:
             return None
 
         fused_greedy_decode = getattr(self._language_model, "fused_greedy_decode", None)
         if not callable(fused_greedy_decode):
             return None
 
+        decode_kwargs = dict(fwd_kwargs)
+        if self.logits_processors and any(self.logits_processors):
+            supports_processors = getattr(
+                self._language_model, "supports_fused_greedy_logits_processors", None
+            )
+            if not callable(supports_processors) or not supports_processors(
+                self.logits_processors
+            ):
+                return None
+            decode_kwargs["logits_processors"] = self.logits_processors
         sampled = fused_greedy_decode(
             inputs[:, None],
             cache=self.prompt_cache,
-            **fwd_kwargs,
+            **decode_kwargs,
         )
         if sampled is None:
             return None
@@ -2670,6 +2675,11 @@ class BatchGenerator:
         prompt_responses = []
 
         # Decode-first: always emit a generation step before touching prefill.
+        yield_after_decode = any(
+            getattr(processor, "requires_immediate_decode_yield", False)
+            for processors in getattr(self._generation_batch, "logits_processors", [])
+            for processor in processors or []
+        )
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
@@ -2684,6 +2694,8 @@ class BatchGenerator:
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
+            if yield_after_decode:
+                return prompt_responses, generation_responses
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
