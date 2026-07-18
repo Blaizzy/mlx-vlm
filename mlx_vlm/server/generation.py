@@ -52,6 +52,7 @@ logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
+DEFAULT_PREFILL_DELAYER_MAX_DELAY_MS = 5000.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
@@ -109,6 +110,17 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def get_prefill_delayer_max_delay_s():
+    raw = os.environ.get(
+        "MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS",
+        str(DEFAULT_PREFILL_DELAYER_MAX_DELAY_MS),
+    )
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_PREFILL_DELAYER_MAX_DELAY_MS / 1000.0
 
 
 def _sequence_aligned_prefill_keys(
@@ -958,6 +970,7 @@ class ResponseGenerator:
         self._cancelled: set = set()
         self._cancel_lock = Lock()
         self._tokenizer_lock = Lock()
+        self._prefill_delay_started_at: Optional[float] = None
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1873,6 +1886,22 @@ class ResponseGenerator:
             # Give response consumers a chance to dequeue emitted tokens before
             # this GPU worker enters a potentially long prefill operation.
             time.sleep(0)
+
+        has_pending_prompts = getattr(batch_gen, "has_pending_prompts", False)
+        # Like SGLang's prefill delayer, protect decode with scheduler state and
+        # a wall-clock starvation cap instead of a fixed decode-step quantum.
+        if responses and has_pending_prompts:
+            now = time.perf_counter()
+            delay_started = getattr(self, "_prefill_delay_started_at", None)
+            max_delay_s = get_prefill_delayer_max_delay_s()
+            if max_delay_s > 0:
+                if delay_started is None:
+                    self._prefill_delay_started_at = now
+                    return
+                if now - delay_started < max_delay_s:
+                    return
+
+        self._prefill_delay_started_at = None
         prompt_responses = batch_gen.prefill_step()
         self._record_prompt_progress(prompt_responses, active)
 

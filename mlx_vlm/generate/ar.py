@@ -2670,6 +2670,30 @@ class BatchGenerator:
         else:
             self._generation_batch.extend(gen_batch)
 
+    def _take_prefill_sequences(self, limit: int):
+        """Take the shortest prompt-length bucket without padding across buckets."""
+        if not self._unprocessed_sequences or limit <= 0:
+            return []
+
+        def length_bucket(sequence) -> int:
+            length = max(1, len(sequence[1]))
+            return 0 if length <= 512 else (length - 1).bit_length()
+
+        bucket = min(length_bucket(s) for s in self._unprocessed_sequences)
+        selected_indices = [
+            i
+            for i, sequence in enumerate(self._unprocessed_sequences)
+            if length_bucket(sequence) == bucket
+        ][:limit]
+        selected = [self._unprocessed_sequences[i] for i in selected_indices]
+        selected_set = set(selected_indices)
+        self._unprocessed_sequences = [
+            sequence
+            for i, sequence in enumerate(self._unprocessed_sequences)
+            if i not in selected_set
+        ]
+        return selected
+
     def _decode_step(self) -> List[GenerationBatch.Response]:
         generation_responses = []
         if len(self._generation_batch) > 0:
@@ -2734,7 +2758,8 @@ class BatchGenerator:
             # warm/cold PromptProcessingBatch with right-padded suffixes so
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
-            sequences = self._unprocessed_sequences[:n]
+            sequences = self._take_prefill_sequences(n)
+            n = len(sequences)
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
@@ -2743,7 +2768,6 @@ class BatchGenerator:
                 )
             mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
-                self._unprocessed_sequences = self._unprocessed_sequences[n:]
                 self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
@@ -2768,8 +2792,6 @@ class BatchGenerator:
                     self._prompt_batch = None
                     mx.clear_cache()
                 return prompt_responses
-
-            self._unprocessed_sequences = self._unprocessed_sequences[n:]
 
             uids = [s[0] for s in sequences]
             input_ids = [s[1] for s in sequences]

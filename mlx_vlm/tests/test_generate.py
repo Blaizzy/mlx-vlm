@@ -504,6 +504,21 @@ class TestLeftPadPrompts:
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    def test_prefill_admission_uses_shortest_length_bucket(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._wire_stack = None
+        gen._unprocessed_sequences = [
+            (0, [0] * 8192, 10, {}, None, None),
+            (1, [1] * 401, 10, {}, None, None),
+            (2, [2] * 7800, 10, {}, None, None),
+            (3, [3] * 400, 10, {}, None, None),
+        ]
+
+        selected = gen._take_prefill_sequences(4)
+
+        assert [sequence[0] for sequence in selected] == [1, 3]
+        assert [sequence[0] for sequence in gen._unprocessed_sequences] == [0, 2]
+
     def test_initialization(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
