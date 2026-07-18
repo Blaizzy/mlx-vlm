@@ -537,16 +537,18 @@ def maybe_quantize_kv_cache(
                 return tuple(quantize_entry(sub_entry) for sub_entry in entry)
             return entry
 
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
+        # Last-layer policy shared with _make_cache / APC warm restore.
+        n = len(prompt_cache)
         for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
+            if not cache.should_quantize_kv_layer(index, n):
                 continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    n = len(prompt_cache)
     for index, layer_cache in enumerate(prompt_cache):
+        if not cache.should_quantize_kv_layer(index, n):
+            continue
         if (
             hasattr(layer_cache, "to_quantized")
             and layer_cache.offset >= quantized_kv_start
@@ -958,9 +960,20 @@ def stream_generate(
                     input_ids = input_ids[:, prefix_len:]
                     pixel_values = None
                     kwargs.pop("cached_image_features", None)
+                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_cfg = (
+                        {
+                            "bits": _kv_bits,
+                            "group_size": kwargs.get("kv_group_size", 64),
+                            "scheme": kwargs.get("kv_quant_scheme"),
+                        }
+                        if _kv_bits is not None
+                        else None
+                    )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
                         min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                        kv_quant_config=_quant_cfg,
                     )
                 else:
                     apc_manager.release(matched_blocks)
@@ -1129,19 +1142,17 @@ def stream_generate(
                     all_ids = full_input_ids_list + [
                         t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
-                # Snapshot keys/values up to the live offset for each layer.
+                # Snapshot float K/V per layer (dequants when keys are tuples).
                 layer_keys: List[mx.array] = []
                 layer_values: List[mx.array] = []
                 ok = True
                 for c in tracked_cache:
-                    k = getattr(c, "keys", None)
-                    v = getattr(c, "values", None)
-                    off = getattr(c, "offset", None)
-                    if k is None or v is None or off is None:
+                    k, v = _apc.layer_kv_for_apc(c)
+                    if k is None or v is None:
                         ok = False
                         break
-                    layer_keys.append(k[..., :off, :])
-                    layer_values.append(v[..., :off, :])
+                    layer_keys.append(k)
+                    layer_values.append(v)
                 if ok and layer_keys:
                     new_blocks = apc_manager.store_kv_blocks(
                         all_ids,

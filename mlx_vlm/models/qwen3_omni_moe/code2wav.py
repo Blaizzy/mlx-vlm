@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
 from mlx_vlm.models.qwen3_omni_moe.config import Code2WavConfig
 
@@ -517,26 +518,53 @@ class Code2WavModel(nn.Module):
         return wav_chunk[:, :, valid_start_sample:]
 
     def sanitize(self, weights):
+        target_shapes = {
+            key: tuple(value.shape)
+            for key, value in tree_flatten(self.parameters())
+            if key.endswith("conv.weight")
+        }
+
+        def maybe_transpose(key, value, axes):
+            target_shape = target_shapes.get(key)
+            if target_shape is not None and tuple(value.shape) == target_shape:
+                return value
+            return value.transpose(*axes)
+
         sanitized_weights = {}
         for k, v in weights.items():
-            if ("upsample" in k and "conv.weight" in k and "dwconv" not in k) or (
-                "decoder" in k
-                and "block" in k
-                and "conv.weight" in k
-                and "conv1" not in k
-                and "conv2" not in k
+            local_key = k
+            if local_key.startswith("code2wav."):
+                local_key = local_key[len("code2wav.") :]
+
+            if (
+                "upsample" in local_key
+                and "conv.weight" in local_key
+                and "dwconv" not in local_key
+            ) or (
+                "decoder" in local_key
+                and "block" in local_key
+                and "conv.weight" in local_key
+                and "conv1" not in local_key
+                and "conv2" not in local_key
             ):
-                sanitized_weights[k] = v.transpose(1, 2, 0)
+                sanitized_weights[k] = maybe_transpose(local_key, v, (1, 2, 0))
             elif (
-                ("dwconv.conv.weight" in k)
-                or ("decoder" in k and "conv.weight" in k and "block" not in k)
+                ("dwconv.conv.weight" in local_key)
                 or (
-                    "decoder" in k
-                    and "block" in k
-                    and ("conv1.conv.weight" in k or "conv2.conv.weight" in k)
+                    "decoder" in local_key
+                    and "conv.weight" in local_key
+                    and "block" not in local_key
+                )
+                or (
+                    "decoder" in local_key
+                    and "block" in local_key
+                    and (
+                        "conv1.conv.weight" in local_key
+                        or "conv2.conv.weight" in local_key
+                    )
                 )
             ):
-                sanitized_weights[k] = v.transpose(0, 2, 1)
+                sanitized_weights[k] = maybe_transpose(local_key, v, (0, 2, 1))
             else:
                 sanitized_weights[k] = v
 

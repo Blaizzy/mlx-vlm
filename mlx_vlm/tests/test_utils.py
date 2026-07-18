@@ -3,6 +3,7 @@ import json
 import struct
 from io import BytesIO
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -406,6 +407,37 @@ def test_prepare_inputs():
     assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
 
 
+def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
+    attention_mask = mx.array([[1, 1]], dtype=mx.int32)
+
+    class Processor:
+        tokenizer = SimpleNamespace(pad_token="[PAD]", eos_token="[EOS]")
+
+        def __call__(self, text=None, images=None, padding=None, return_tensors="mlx"):
+            return {
+                "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+                "attention_mask": attention_mask,
+                "pixel_values": mx.zeros((1, 2), dtype=mx.float32),
+            }
+
+    inputs = prepare_inputs(
+        Processor(),
+        prompts="test <image>",
+        images=mx.zeros((3, 8, 8)),
+    )
+    consumed = []
+
+    def consume_attention_mask():
+        consumed.append(inputs["attention_mask"].tolist())
+
+    worker = Thread(target=consume_attention_mask)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert inputs["attention_mask"] is attention_mask
+    assert consumed == [[[1, 1]]]
+
+
 def test_process_inputs_with_fallback():
 
     processor = MockProcessor()
@@ -495,10 +527,17 @@ def test_load_passes_revision():
 
 
 def test_get_model_and_args_routes_text_only_configs():
-    model_class, model_type = get_model_and_args({"model_type": "llama"})
+    model_class, model_type = get_model_and_args({"model_type": "unvendored_text_arch"})
 
     assert model_class.__name__ == "mlx_vlm.models.text_only"
     assert model_type == "text_only"
+
+
+def test_get_model_and_args_remaps_mistral_to_llama():
+    model_class, model_type = get_model_and_args({"model_type": "mistral"})
+
+    assert model_class.__name__ == "mlx_vlm.models.llama"
+    assert model_type == "llama"
 
 
 def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
@@ -523,7 +562,10 @@ def test_load_model_routes_text_models_through_existing_loader():
             return self.model(inputs)
 
     with (
-        patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={"model_type": "unvendored_text_arch"},
+        ),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
         patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
         patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),

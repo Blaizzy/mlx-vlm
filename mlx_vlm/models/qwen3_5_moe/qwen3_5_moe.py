@@ -2,7 +2,12 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
-from ..qwen3_5.qwen3_5 import sanitize_key
+from ..qwen3_5.qwen3_5 import (
+    NORM_WEIGHT_SUFFIXES,
+    sanitize_key,
+    should_offset_norm_weight,
+    should_shift_norm_weights,
+)
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -18,6 +23,8 @@ class Model(Qwen3_5Model):
         self.language_model = LanguageModel(config.text_config, config)
 
     def sanitize(self, weights):
+        shift_norm_weights = should_shift_norm_weights(weights)
+
         # ignore mtp weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
@@ -50,22 +57,17 @@ class Model(Qwen3_5Model):
                         ]
                     )
 
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-
         sanitized_weights = {}
         for key, value in weights.items():
+            original_key = key
             key = sanitize_key(key)
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
-                if value.ndim == 1:
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                if value.ndim == 1 and should_offset_norm_weight(
+                    original_key, shift_norm_weights
+                ):
                     value += 1.0
 
             sanitized_weights[key] = value

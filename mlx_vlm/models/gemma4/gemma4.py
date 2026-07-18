@@ -71,7 +71,9 @@ class Model(nn.Module):
         self,
         input_ids: Optional[mx.array] = None,
         pixel_values: Optional[mx.array] = None,
+        image_position_ids: Optional[mx.array] = None,
         pixel_values_videos: Optional[mx.array] = None,
+        video_position_ids: Optional[mx.array] = None,
         audio_features: Optional[mx.array] = None,
         audio_mask: Optional[mx.array] = None,
         input_features: Optional[mx.array] = None,
@@ -123,20 +125,26 @@ class Model(nn.Module):
             )
             return masked_scatter(inputs_embeds, mask_expanded, features)
 
-        def _encode_vision(pixels):
-            return self.embed_vision(self.vision_tower(pixels))
+        def _encode_vision(pixels, position_ids=None):
+            return self.embed_vision(self.vision_tower(pixels, position_ids))
+
+        def _encode_image(pixels):
+            return _encode_vision(pixels, image_position_ids)
+
+        def _encode_video(pixels):
+            return _encode_vision(pixels, video_position_ids)
 
         inputs_embeds = _scatter(
             pixel_values,
             self.config.image_token_id,
-            _encode_vision,
+            _encode_image,
             "cached_image_features",
             "_image_key",
         )
         inputs_embeds = _scatter(
             pixel_values_videos,
             video_token_id,
-            _encode_vision,
+            _encode_video,
             "cached_video_features",
             "_video_key",
         )
@@ -162,13 +170,15 @@ class Model(nn.Module):
             inputs_embeds=inputs_embeds, per_layer_inputs=per_layer_inputs
         )
 
-    def encode_image(self, pixel_values: mx.array) -> mx.array:
+    def encode_image(
+        self, pixel_values: mx.array, image_position_ids: Optional[mx.array] = None
+    ) -> mx.array:
         """Encode pixel_values through vision_tower + embed_vision.
 
         Returns projected image features suitable for passing as
         cached_image_features to get_input_embeddings.
         """
-        image_features = self.vision_tower(pixel_values)
+        image_features = self.vision_tower(pixel_values, image_position_ids)
         image_features = self.embed_vision(image_features)
         return image_features
 
@@ -195,12 +205,15 @@ class Model(nn.Module):
                 "shared_kv_sink",
                 "return_hidden",
                 "return_shared_kv",
+                "mm_token_type_ids",
+                "token_type_ids",
             )
             if k in kwargs
         }
 
         logits = self.language_model(
             input_ids=None,
+            mask=mask,
             cache=cache,
             inputs_embeds=input_embeddings_features.inputs_embeds,
             per_layer_inputs=input_embeddings_features.per_layer_inputs,
@@ -236,16 +249,27 @@ class Model(nn.Module):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest
 
-            # Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]
+            # Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in].
+            # Some converted checkpoints already store the MLX layout.
             if (
                 "subsample_conv_projection" in new_key
                 and "conv.weight" in new_key
                 and v.ndim == 4
             ):
-                v = v.transpose(0, 2, 3, 1)
-            # Conv1d: PyTorch [out, in, kW] -> MLX [out, kW, in]
+                expected_in = None
+                audio_config = getattr(self.config, "audio_config", None)
+                if audio_config is not None:
+                    if ".layer0." in new_key:
+                        expected_in = 1
+                    elif ".layer1." in new_key:
+                        expected_in = audio_config.subsampling_conv_channels[0]
+                if expected_in is None or v.shape[-1] != expected_in:
+                    v = v.transpose(0, 2, 3, 1)
+            # Conv1d: PyTorch [out, in, kW] -> MLX [out, kW, in].
+            # Converted checkpoints may already use the MLX layout.
             if "depthwise_conv1d.weight" in new_key and v.ndim == 3:
-                v = v.transpose(0, 2, 1)
+                if v.shape[-1] != 1:
+                    v = v.transpose(0, 2, 1)
 
             # MoE: experts.down_proj -> experts.switch_glu.down_proj.weight
             # experts.gate_up_proj -> split into switch_glu.gate_proj + switch_glu.up_proj
@@ -265,8 +289,10 @@ class Model(nn.Module):
 
                 v = v.swapaxes(-1, -2)
                 mid_dim = v.shape[-1] // 2
-                sanitized[gate_key] = v[..., :mid_dim].swapaxes(-1, -2)
-                sanitized[up_key] = v[..., mid_dim:].swapaxes(-1, -2)
+                gate_value = v[..., :mid_dim].swapaxes(-1, -2)
+                up_value = v[..., mid_dim:].swapaxes(-1, -2)
+                sanitized[gate_key] = gate_value
+                sanitized[up_key] = up_value
                 continue
 
             sanitized[new_key] = v

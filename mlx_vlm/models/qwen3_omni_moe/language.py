@@ -10,6 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from ..switch_layers import SwitchGLU
@@ -127,17 +128,6 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
 class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -233,6 +223,7 @@ class Qwen3VLMoEModel(nn.Module):
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
         output_hidden_states: bool = False,
+        output_hidden_state_idx: Optional[int] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -248,6 +239,7 @@ class Qwen3VLMoEModel(nn.Module):
             )
 
         all_hidden_states = [] if output_hidden_states else None
+        selected_hidden_state = h if output_hidden_state_idx == 0 else None
         position_embeddings = None
         if (
             position_ids is not None
@@ -272,13 +264,22 @@ class Qwen3VLMoEModel(nn.Module):
 
             if layer_idx % 4 == 0:
                 mx.eval(h)
+            if output_hidden_state_idx == layer_idx + 1:
+                selected_hidden_state = h
 
         if output_hidden_states:
             all_hidden_states.append(h)
 
-        return (
-            (self.norm(h), all_hidden_states) if output_hidden_states else self.norm(h)
-        )
+        h = self.norm(h)
+        if output_hidden_states:
+            return h, all_hidden_states
+        if output_hidden_state_idx is not None:
+            if selected_hidden_state is None:
+                raise ValueError(
+                    f"output_hidden_state_idx={output_hidden_state_idx} is out of range"
+                )
+            return h, selected_hidden_state
+        return h
 
     def _deepstack_process(
         self,
@@ -606,6 +607,7 @@ class LanguageModel(nn.Module):
         visual_pos_masks = kwargs.get("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
+        output_hidden_state_idx = kwargs.pop("output_hidden_state_idx", None)
 
         if position_ids is not None:
             mx.eval(position_ids)
@@ -618,10 +620,11 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
             output_hidden_states=output_hidden_states,
+            output_hidden_state_idx=output_hidden_state_idx,
         )
 
-        if output_hidden_states:
-            hidden_states, all_hidden_states = out
+        if output_hidden_states or output_hidden_state_idx is not None:
+            hidden_states, captured_hidden_states = out
             out = hidden_states
 
         if self.args.tie_word_embeddings:
@@ -631,7 +634,11 @@ class LanguageModel(nn.Module):
 
         return LanguageModelOutput(
             logits=logits,
-            hidden_states=all_hidden_states if output_hidden_states else None,
+            hidden_states=(
+                captured_hidden_states
+                if output_hidden_states or output_hidden_state_idx is not None
+                else None
+            ),
         )
 
     def sanitize(self, weights):
