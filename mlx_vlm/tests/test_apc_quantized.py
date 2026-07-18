@@ -1478,13 +1478,15 @@ def test_live_batch_generator_staggered_apc_kv_join():
         gen.insert([a], max_tokens=24, prompt_kwargs=[embeds(a)])
         steps = 0
         while gen.has_work and steps < 200:
-            _pr, resp = gen.next()
+            resp = gen.decode_step()
+            gen.prefill_step()
             steps += 1
             if resp:
                 gen.insert([b], max_tokens=24, prompt_kwargs=[embeds(b)])
                 break
         while gen.has_work:
-            gen.next()
+            gen.decode_step()
+            gen.prefill_step()
             steps += 1
             if steps > 800:
                 raise TimeoutError("drain too long")

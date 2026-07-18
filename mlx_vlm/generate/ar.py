@@ -2101,9 +2101,9 @@ class BatchGenerator:
     """
     Continuous batching with separate prompt processing and generation phases.
 
-    next() returns (prompt_responses, generation_responses) where:
-    - prompt_responses contains completed prompt-batch timing stats
-    - generation_responses is a list of GenerationBatch.Response objects
+    Scheduling is split into explicit phases:
+    - decode_step() returns GenerationBatch.Response objects
+    - prefill_step() advances prompt work and returns completed timing stats
     """
 
     def __init__(
@@ -2670,16 +2670,32 @@ class BatchGenerator:
         else:
             self._generation_batch.extend(gen_batch)
 
-    def _next(self, **kwargs):
-        generation_responses = []
-        prompt_responses = []
+    def _take_prefill_sequences(self, limit: int):
+        """Take the shortest prompt-length bucket without padding across buckets."""
+        if not self._unprocessed_sequences or limit <= 0:
+            return []
 
-        # Decode-first: always emit a generation step before touching prefill.
-        yield_after_decode = any(
-            getattr(processor, "requires_immediate_decode_yield", False)
-            for processors in getattr(self._generation_batch, "logits_processors", [])
-            for processor in processors or []
-        )
+        def length_bucket(sequence) -> int:
+            length = max(1, len(sequence[1]))
+            return 0 if length <= 512 else (length - 1).bit_length()
+
+        bucket = min(length_bucket(s) for s in self._unprocessed_sequences)
+        selected_indices = [
+            i
+            for i, sequence in enumerate(self._unprocessed_sequences)
+            if length_bucket(sequence) == bucket
+        ][:limit]
+        selected = [self._unprocessed_sequences[i] for i in selected_indices]
+        selected_set = set(selected_indices)
+        self._unprocessed_sequences = [
+            sequence
+            for i, sequence in enumerate(self._unprocessed_sequences)
+            if i not in selected_set
+        ]
+        return selected
+
+    def _decode_step(self) -> List[GenerationBatch.Response]:
+        generation_responses = []
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
@@ -2694,17 +2710,19 @@ class BatchGenerator:
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
-            if yield_after_decode:
-                return prompt_responses, generation_responses
+        return generation_responses
+
+    def _prefill_step(self) -> List[PromptProgress]:
+        prompt_responses = []
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
             and len(self._generation_batch) > 0
         ):
-            return prompt_responses, generation_responses
+            return prompt_responses
 
         if len(self._generation_batch) >= self.completion_batch_size:
-            return prompt_responses, generation_responses
+            return prompt_responses
 
         if self._prompt_batch is not None:
             if self._prompt_batch.needs_processing():
@@ -2714,7 +2732,7 @@ class BatchGenerator:
                 self._prompt_time_counter += elapsed
                 self._record_prompt_batch_time(self._prompt_batch, elapsed)
                 self._prompt_tokens_counter += n
-                return prompt_responses, generation_responses
+                return prompt_responses
 
             tic = time.perf_counter()
             gen_batch = self._prompt_batch.generate(
@@ -2730,7 +2748,7 @@ class BatchGenerator:
             self._extend_generation_batch(gen_batch)
             self._prompt_batch = None
             mx.clear_cache()
-            return prompt_responses, generation_responses
+            return prompt_responses
 
         num_active = len(self._generation_batch)
         num_to_add = self.completion_batch_size - num_active
@@ -2740,7 +2758,8 @@ class BatchGenerator:
             # warm/cold PromptProcessingBatch with right-padded suffixes so
             # warm and cold rows prefill in a single forward pass.
             n = min(self.prefill_batch_size, len(self._unprocessed_sequences))
-            sequences = self._unprocessed_sequences[:n]
+            sequences = self._take_prefill_sequences(n)
+            n = len(sequences)
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
@@ -2749,7 +2768,6 @@ class BatchGenerator:
                 )
             mixed = self._build_mixed_prompt_batch(sequences)
             if mixed is not None:
-                self._unprocessed_sequences = self._unprocessed_sequences[n:]
                 self._prompt_batch = mixed
                 self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
                 if self._prompt_batch.needs_processing():
@@ -2773,9 +2791,7 @@ class BatchGenerator:
                     self._extend_generation_batch(gen_batch)
                     self._prompt_batch = None
                     mx.clear_cache()
-                return prompt_responses, generation_responses
-
-            self._unprocessed_sequences = self._unprocessed_sequences[n:]
+                return prompt_responses
 
             uids = [s[0] for s in sequences]
             input_ids = [s[1] for s in sequences]
@@ -2842,13 +2858,17 @@ class BatchGenerator:
                 self._prompt_batch = None
                 mx.clear_cache()
 
-            return prompt_responses, generation_responses
+            return prompt_responses
 
-        return prompt_responses, generation_responses
+        return prompt_responses
 
-    def next(self, **kwargs):
+    def decode_step(self) -> List[GenerationBatch.Response]:
         with mx.stream(self._stream):
-            return self._next(**kwargs)
+            return self._decode_step()
+
+    def prefill_step(self) -> List[PromptProgress]:
+        with mx.stream(self._stream):
+            return self._prefill_step()
 
 
 def batch_generate(
@@ -3184,10 +3204,11 @@ def _generate_batch(
 
     tic = time.perf_counter()
     while gen.has_work:
-        _, generation_responses = gen.next()
+        generation_responses = gen.decode_step()
         for r in generation_responses:
             if r.finish_reason != "stop":
                 results[r.uid].append(r.token)
+        gen.prefill_step()
     total_time = time.perf_counter() - tic
 
     gen.close()
