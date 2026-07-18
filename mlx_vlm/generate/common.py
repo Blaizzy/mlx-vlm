@@ -19,6 +19,30 @@ DEFAULT_QUANTIZED_KV_START = 5000
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
 
+def set_generation_device(device_name: str):
+    """Set the default device and rebuild the generation streams.
+
+    Modules bind ``generation_stream`` by name at import time, so the new
+    stream is also patched into any already-imported generation modules.
+    """
+    import sys
+
+    device = mx.cpu if device_name == "cpu" else mx.gpu
+    mx.set_default_device(device)
+    stream = mx.new_thread_local_stream(device)
+    global generation_stream
+    generation_stream = stream
+    for mod_name in (
+        "mlx_vlm.generate.ar",
+        "mlx_vlm.generate.diffusion",
+        "mlx_vlm.generate.dispatch",
+        "mlx_vlm.speculative.common",
+    ):
+        mod = sys.modules.get(mod_name)
+        if mod is not None and hasattr(mod, "generation_stream"):
+            mod.generation_stream = stream
+
+
 def _policy_enabled(policy) -> bool:
     return bool(getattr(policy, "enabled", policy))
 
@@ -119,7 +143,7 @@ def maybe_quantize_kv_cache(
 @contextlib.contextmanager
 def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     """Temporarily set the wired memory limit for generation."""
-    if not mx.metal.is_available():
+    if not mx.metal.is_available() or mx.default_device().type != mx.DeviceType.gpu:
         yield
         return
 

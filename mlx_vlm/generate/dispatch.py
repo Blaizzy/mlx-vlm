@@ -65,6 +65,13 @@ def parse_arguments():
         help="The path to the local model directory or Hugging Face repo.",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        choices=("cpu", "gpu"),
+        default=None,
+        help="Device to run inference on. Defaults to the MLX default device.",
+    )
+    parser.add_argument(
         "--output-modality",
         type=str,
         choices=("text", "image"),
@@ -566,7 +573,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
-    if not mx.metal.is_available():
+    if not mx.metal.is_available() or mx.default_device().type != mx.DeviceType.gpu:
         yield
         return
 
@@ -1294,6 +1301,11 @@ def generate(
 
 def main():
     args = parse_arguments()
+
+    if getattr(args, "device", None):
+        from .common import set_generation_device
+
+        set_generation_device(args.device)
 
     if getattr(args, "output_modality", "text") == "image":
         run_image_generation_cli(args)
