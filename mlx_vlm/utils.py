@@ -1192,23 +1192,26 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
     original_source = image_source
     try:
-        if not isinstance(image_source, (str, Path, BytesIO)):
+        # PIL.Image 直通: 已加载的内存图无需再 open
+        if isinstance(image_source, Image.Image):
+            image = image_source
+        elif not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
                 f"Unsupported image source type: {type(image_source).__name__}"
             )
-        if isinstance(image_source, str) and image_source.startswith("data:image/"):
-            if "," not in image_source:
-                raise ValueError("Invalid data URI format - missing comma separator")
-            _, data = image_source.split(",", 1)
-            image_source = BytesIO(base64.b64decode(data))
-        if isinstance(image_source, str) and image_source.startswith(
-            ("http://", "https://")
-        ):
-            with requests.get(image_source, stream=True, timeout=timeout) as response:
-                response.raise_for_status()
-                image_source = BytesIO(response.content)
-
-        image = Image.open(image_source)
+        else:
+            if isinstance(image_source, str) and image_source.startswith("data:image/"):
+                if "," not in image_source:
+                    raise ValueError("Invalid data URI format - missing comma separator")
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+            if isinstance(image_source, str) and image_source.startswith(
+                ("http://", "https://")
+            ):
+                with requests.get(image_source, stream=True, timeout=timeout) as response:
+                    response.raise_for_status()
+                    image_source = BytesIO(response.content)
+            image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:

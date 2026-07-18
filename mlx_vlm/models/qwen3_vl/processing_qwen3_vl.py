@@ -390,8 +390,28 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         all_patches = []
         all_thw = []
         for v in videos:
-            if not isinstance(v, np.ndarray):
+            # 支持 PIL 帧列表 / np.ndarray 帧列表 / np.ndarray (T,H,W,C) 三种输入
+            if isinstance(v, list):
+                # PIL.Image 帧列表 → (T,H,W,C) uint8
+                frames = []
+                for frame in v:
+                    if isinstance(frame, np.ndarray):
+                        arr = frame
+                    else:
+                        # PIL.Image → np.asarray 后是 (H,W,C)
+                        arr = np.asarray(frame.convert("RGB"))
+                    if arr.ndim == 2:  # 灰度 → RGB
+                        arr = np.repeat(arr[..., None], 3, axis=-1)
+                    frames.append(arr)
+                v = np.stack(frames, axis=0)  # (T,H,W,C)
+            elif isinstance(v, np.ndarray) and v.dtype == object:
+                # object 数组 (PIL 帧列表被 np.asarray 误转) → 重建
+                v = np.stack([np.asarray(f.convert("RGB")) for f in v], axis=0)
+            elif not isinstance(v, np.ndarray):
                 v = np.asarray(v)
+            # 此时 v 应是 (T,H,W,C) uint8, 转成 (T,C,H,W) 喂 _process_one
+            if v.ndim == 4 and v.shape[-1] in (1, 3, 4):  # (T,H,W,C)
+                v = v.transpose(0, 3, 1, 2)  # → (T,C,H,W)
             patches, thw = self._process_one(v)
             all_patches.append(patches)
             all_thw.append(thw)
