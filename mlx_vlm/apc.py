@@ -4213,6 +4213,12 @@ def apc_lookup_plan(
     return None
 
 
+def _adapter_schema_version() -> int:
+    from .apc_adapters import ADAPTER_SCHEMA_VERSION
+
+    return ADAPTER_SCHEMA_VERSION
+
+
 @dataclass(frozen=True)
 class LayerSupport:
     """Per-layer result from :func:`classify_layer_for_apc`."""
@@ -4220,6 +4226,7 @@ class LayerSupport:
     type_name: str
     status: str  # "ok" | "empty_ok" | "unsupported"
     reason: Optional[str] = None
+    capability: Optional[str] = None  # pageable | windowed | checkpoint | composite
 
 
 @dataclass
@@ -4232,6 +4239,17 @@ class APCSelfCheckResult:
     layer_types: List[str]
     unsupported: List[LayerSupport] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    capabilities: List[str] = field(default_factory=list)
+    schema_version: int = field(default_factory=_adapter_schema_version)
+
+
+def _layer_capability(c: Any) -> Optional[str]:
+    from .apc_adapters import resolve_capability
+
+    try:
+        return resolve_capability(c).value
+    except Exception:
+        return None
 
 
 def classify_layer_for_apc(c: Any) -> LayerSupport:
@@ -4241,6 +4259,7 @@ def classify_layer_for_apc(c: Any) -> LayerSupport:
     Empty layers that clone to a storage-native type count as ``empty_ok``.
     """
     type_name = type(c).__name__
+    capability = _layer_capability(c)
     is_empty = False
     empty_fn = getattr(c, "empty", None)
     if callable(empty_fn):
@@ -4261,16 +4280,19 @@ def classify_layer_for_apc(c: Any) -> LayerSupport:
             type_name=type_name,
             status="unsupported",
             reason=f"clone_error:{type(exc).__name__}",
+            capability=capability,
         )
     if copied is None:
         return LayerSupport(
             type_name=type_name,
             status="unsupported",
             reason="unclonable",
+            capability=capability,
         )
     return LayerSupport(
         type_name=type_name,
         status="empty_ok" if is_empty else "ok",
+        capability=capability,
     )
 
 
@@ -4280,18 +4302,15 @@ def validate_prompt_cache_layout(
     apc_mode: Optional[str] = None,
 ) -> APCSelfCheckResult:
     """Validate a prompt-cache layout for APC without running a model forward."""
-    layer_types = [type(c).__name__ for c in caches]
-    unsupported = [
-        layer
-        for layer in (classify_layer_for_apc(c) for c in caches)
-        if layer.status == "unsupported"
-    ]
+    classified = [classify_layer_for_apc(c) for c in caches]
+    unsupported = [layer for layer in classified if layer.status == "unsupported"]
     return APCSelfCheckResult(
         ok=not unsupported,
         apc_mode=apc_mode,
         layer_count=len(caches),
-        layer_types=layer_types,
+        layer_types=[layer.type_name for layer in classified],
         unsupported=unsupported,
+        capabilities=[layer.capability or "unknown" for layer in classified],
     )
 
 
@@ -4347,12 +4366,15 @@ def self_check_model_apc(
 
     if log:
         types_s = ",".join(result.layer_types) if result.layer_types else "-"
+        caps_s = ",".join(result.capabilities) if result.capabilities else "-"
         if result.ok:
             logger.info(
-                "APC self-check ok mode=%s layers=%d types=[%s]%s",
+                "APC self-check ok mode=%s schema=v%d layers=%d types=[%s] caps=[%s]%s",
                 result.apc_mode,
+                result.schema_version,
                 result.layer_count,
                 types_s,
+                caps_s,
                 f" kv_bits={kv_bits}" if kv_bits is not None else "",
             )
         else:
@@ -4361,8 +4383,9 @@ def self_check_model_apc(
                 for layer in result.unsupported
             ]
             logger.error(
-                "APC self-check failed mode=%s layers=%d unsupported=%s notes=%s",
+                "APC self-check failed mode=%s schema=v%d layers=%d unsupported=%s notes=%s",
                 result.apc_mode,
+                result.schema_version,
                 result.layer_count,
                 bad or result.notes,
                 result.notes,
@@ -4372,6 +4395,7 @@ def self_check_model_apc(
         "self_check",
         ok=result.ok,
         mode=result.apc_mode,
+        schema_version=result.schema_version,
         layers=result.layer_count,
         unsupported=len(result.unsupported),
         kv_bits=kv_bits,
