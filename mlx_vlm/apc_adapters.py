@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checka
 
 import mlx.core as mx
 
+# Bumped when the adapter snapshot/restore contract changes; folds into the key, disk namespace, and self-check.
+ADAPTER_SCHEMA_VERSION = 1
+
 
 class Capability(str, Enum):
     """Reuse capability of a single cache component."""
@@ -55,7 +58,7 @@ class StateFragment:
     capability: Capability
     prefix_len: int
     payload: Any  # adapter-defined; for CheckpointAdapter this is the snapshot dict
-    schema: str = "v1"
+    schema: str = f"v{ADAPTER_SCHEMA_VERSION}"
 
     def eval_targets(self) -> List[mx.array]:
         out: List[mx.array] = []

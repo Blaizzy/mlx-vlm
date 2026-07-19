@@ -194,6 +194,32 @@ def semantic_extra_hash(
     return tenant_scoped_hash(tenant, folded)
 
 
+def apc_disk_namespace(
+    model_path: str,
+    *,
+    kv_bits: Any = None,
+    kv_group_size: Any = None,
+    kv_quant_scheme: Any = None,
+    quantized_kv_start: Any = None,
+) -> str:
+    """On-disk APC namespace fingerprinted by model + KV-quant + adapter schema.
+
+    Changing the model path, KV quantization, or the adapter schema version
+    yields a new namespace, so incompatible on-disk caches are never served.
+    """
+    from .apc_adapters import ADAPTER_SCHEMA_VERSION
+
+    kv_descriptor = (
+        f"kv{kv_bits}-{kv_group_size}-{kv_quant_scheme}-{quantized_kv_start}"
+    )
+    fingerprint = _stable_int_hash(
+        ADAPTER_SCHEMA_VERSION,
+        _hash_payload(str(model_path)) or 0,
+        _hash_payload(kv_descriptor) or 0,
+    ) & ((1 << 32) - 1)
+    return f"{model_path}#s{ADAPTER_SCHEMA_VERSION}-{fingerprint:08x}"
+
+
 def _copy_mlx_array(x: mx.array) -> mx.array:
     """Materialize ``x`` into a fresh MLX-owned contiguous buffer."""
     return mx.contiguous(mx.array(x, dtype=x.dtype))

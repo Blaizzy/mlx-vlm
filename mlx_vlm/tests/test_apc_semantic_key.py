@@ -8,11 +8,13 @@ import mlx.core as mx
 
 from mlx_vlm.apc import (
     _hash_payload,
+    apc_disk_namespace,
     hash_image_payload,
     model_key_dependencies,
     semantic_extra_hash,
     tenant_scoped_hash,
 )
+from mlx_vlm.apc_adapters import ADAPTER_SCHEMA_VERSION
 
 
 def test_reduces_to_tenant_image_when_no_extra_inputs():
@@ -80,3 +82,14 @@ def test_hash_payload_none_list_and_ref():
     assert _hash_payload([]) is None
     assert _hash_payload(["a.png", "b.png"]) == _hash_payload(["a.png", "b.png"])
     assert _hash_payload("x") == hash_image_payload(image_ref="x")
+
+
+def test_disk_namespace_is_stable_and_fingerprinted():
+    ns = apc_disk_namespace("org/model", kv_bits=4, kv_group_size=64)
+    # readable prefix + schema tag, deterministic
+    assert ns.startswith("org/model#s%d-" % ADAPTER_SCHEMA_VERSION)
+    assert ns == apc_disk_namespace("org/model", kv_bits=4, kv_group_size=64)
+    # model, KV quant each change the namespace
+    assert ns != apc_disk_namespace("org/other", kv_bits=4, kv_group_size=64)
+    assert ns != apc_disk_namespace("org/model", kv_bits=8, kv_group_size=64)
+    assert ns != apc_disk_namespace("org/model", kv_bits=None)

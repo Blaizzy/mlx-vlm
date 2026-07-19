@@ -753,14 +753,23 @@ def get_cached_model(
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
-    # APC: build a shared block pool if opted in via env var.
-    runtime.apc_manager = _apc.from_env(model_namespace=model_path)
-
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
+
+    # APC: build a shared block pool if opted in via env var. The disk namespace
+    # is fingerprinted so a model/KV-quant/schema change invalidates stale files.
+    runtime.apc_manager = _apc.from_env(
+        model_namespace=_apc.apc_disk_namespace(
+            model_path,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+        )
+    )
 
     response_generator = ResponseGenerator(
         model_path=model_path,
