@@ -290,10 +290,34 @@ class Qwen3VLMoEModel(nn.Module):
         if visual_pos_masks.ndim == 3:
             visual_pos_masks = visual_pos_masks[..., 0]
         visual_embeds = visual_embeds.astype(hidden_states.dtype)
-        visual_indices = np.where(visual_pos_masks)[0].tolist()
-        local_this = hidden_states[:, visual_indices, :] + visual_embeds
-        hidden_states[:, visual_indices, :] = local_this
-        return hidden_states
+
+        batch_size = hidden_states.shape[0]
+
+        updated_batches = []
+        offset = 0
+        for b in range(batch_size):
+            batch_mask = visual_pos_masks[b]
+            batch_hidden = hidden_states[b]
+
+            batch_indices = mx.array(np.where(batch_mask)[0], dtype=mx.uint32)
+
+            n_visual = len(batch_indices)
+            if n_visual == 0:
+                updated_batches.append(batch_hidden)
+                continue
+
+            sample_embeds = visual_embeds[offset : offset + n_visual]
+            offset += n_visual
+            if sample_embeds.shape[0] != n_visual:
+                updated_batches.append(batch_hidden)
+                continue
+
+            batch_result = mx.array(batch_hidden)  # avoid modifying in-place
+            batch_result = batch_result.at[batch_indices].add(sample_embeds)
+
+            updated_batches.append(batch_result)
+
+        return mx.stack(updated_batches, axis=0)
 
 
 class LanguageModel(nn.Module):
@@ -604,8 +628,6 @@ class LanguageModel(nn.Module):
         if position_ids is not None:
             mx.eval(position_ids)
 
-        visual_pos_masks = kwargs.get("visual_pos_masks", None)
-        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds", None)
         output_hidden_states = kwargs.pop("output_hidden_states", False)
         output_hidden_state_idx = kwargs.pop("output_hidden_state_idx", None)
 

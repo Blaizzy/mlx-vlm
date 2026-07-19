@@ -140,7 +140,6 @@ class Thinker(nn.Module):
     ):
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
         visual_pos_masks = None
-        deepstack_visual_embeds = None
         visual_embeds_multiscale = None
 
         if input_features is not None:
@@ -277,7 +276,7 @@ class Thinker(nn.Module):
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
             visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
+            deepstack_visual_embeds=visual_embeds_multiscale,
             position_ids=position_ids,
             rope_deltas=rope_deltas,
         )

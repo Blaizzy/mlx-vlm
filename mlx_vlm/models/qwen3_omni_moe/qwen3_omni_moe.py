@@ -132,6 +132,10 @@ class Model(nn.Module):
     def layers(self):
         return self.thinker.language_model.layers
 
+    @property
+    def quant_predicate(self):
+        return self.thinker.language_model.quant_predicate
+
     def extract_thinker_hidden_states(self, input_ids, target_layer_idx, **kwargs):
         embed_kwargs = {
             k: v
