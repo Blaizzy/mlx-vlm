@@ -417,7 +417,22 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+At `INFO`, the server logs request start/completion, chunked-prefill progress,
+time to first token, periodic decode throughput, and the final token counts. Set
+`--log-level DEBUG` to emit decode progress for every token and add its token
+number, token ID, and decoded text to the same log entry. Decode progress uses
+`rate` for the instantaneous inter-token rate; decode completion uses the same
+field name for aggregate decode throughput measured across completed token
+intervals.
+
+OpenAI-compatible streaming responses expose throughput under
+`timings.predicted_per_second`. Token-bearing SSE chunks report the instantaneous
+inter-token rate, while terminal and usage chunks report the aggregate rate as
+`(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
+`null` because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh
