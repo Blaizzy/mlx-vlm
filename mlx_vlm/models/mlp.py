@@ -4,11 +4,11 @@ from .activations import swiglu
 
 
 class SwiGLUMLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
+    def __init__(self, dim, hidden_dim, bias=False):
         super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=bias)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=bias)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=bias)
 
     def __call__(self, x):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))

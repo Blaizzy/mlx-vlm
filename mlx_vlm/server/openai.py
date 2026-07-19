@@ -7,7 +7,6 @@ import logging
 import random
 import re
 import time
-import traceback
 import uuid
 from datetime import datetime
 from io import BytesIO
@@ -79,6 +78,7 @@ from .schemas import (
     ResponseOutputItemDoneEvent,
     ResponseOutputTextDeltaEvent,
     ResponseOutputTextDoneEvent,
+    StreamingTimings,
     UsageStats,
 )
 
@@ -331,11 +331,13 @@ def _final_chat_chunk(
     request_id: str,
     model: str,
     finish_reason: str,
+    predicted_per_second: Optional[float] = None,
 ) -> ChatStreamChunk:
     return ChatStreamChunk(
         id=request_id,
         created=int(time.time()),
         model=model,
+        timings=StreamingTimings(predicted_per_second=predicted_per_second),
         choices=[
             ChatStreamChoice(
                 finish_reason=finish_reason,
@@ -639,7 +641,7 @@ async def images_generations_endpoint(request: Request):
             stream=False,
             error=str(e),
         )
-        traceback.print_exc()
+        logger.exception("Image generation failed: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
@@ -764,7 +766,7 @@ async def images_edits_endpoint(request: Request):
             stream=False,
             error=str(e),
         )
-        traceback.print_exc()
+        logger.exception("Image edit failed: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"Image edit failed: {e}")
@@ -932,7 +934,7 @@ async def responses_endpoint(request: Request):
         kwargs = {}
 
         if openai_request.input is None:
-            print("no input")
+            logger.warning("Responses request is missing input.")
             raise HTTPException(status_code=400, detail="Missing input.")
 
         current_input_items = _normalize_response_input(openai_request.input)
@@ -1103,6 +1105,7 @@ async def responses_endpoint(request: Request):
                             output_tokens += getattr(token, "token_count", 1)
                             raw_delta = token.text
                             full_text += raw_delta
+                            chunk_rate = metrics.record_chunk(token)
                             thinking_delta = thinking_state.feed(raw_delta)
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
@@ -1115,20 +1118,20 @@ async def responses_endpoint(request: Request):
                                         "output_index": 0,
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
+                                        "timings": {"predicted_per_second": chunk_rate},
                                     },
                                 )
                             delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            metrics.record_chunk(token)
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                             if token.finish_reason:
@@ -1153,6 +1156,7 @@ async def responses_endpoint(request: Request):
 
                             raw_delta = chunk.text
                             full_text += raw_delta
+                            chunk_rate = metrics.record_chunk(chunk)
                             thinking_delta = thinking_state.feed(raw_delta)
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
@@ -1165,13 +1169,13 @@ async def responses_endpoint(request: Request):
                                         "output_index": 0,
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
+                                        "timings": {"predicted_per_second": chunk_rate},
                                     },
                                 )
                             delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            metrics.record_chunk(chunk)
                             chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
@@ -1181,7 +1185,7 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                     output_items, clean_text, _, output_finish_reason = (
@@ -1218,7 +1222,7 @@ async def responses_endpoint(request: Request):
                         )
 
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
@@ -1347,8 +1351,7 @@ async def responses_endpoint(request: Request):
                             error=str(e),
                         )
                         metrics_finalized = True
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
+                    logger.exception("Responses stream generation failed: %s", e)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -1365,7 +1368,7 @@ async def responses_endpoint(request: Request):
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    print("Stream finished.")
+                    logger.debug("Responses stream closed.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1542,8 +1545,7 @@ async def responses_endpoint(request: Request):
                     stream=False,
                     error=str(e),
                 )
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
+                logger.exception("Responses generation failed: %s", e)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -1551,8 +1553,7 @@ async def responses_endpoint(request: Request):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Unexpected error in /responses endpoint: {e}")
-        traceback.print_exc()
+        logger.exception("Unexpected error in /responses endpoint: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
@@ -1771,7 +1772,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 break
                             output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
-                            metrics.record_chunk(token)
+                            chunk_rate = metrics.record_chunk(token)
 
                             # Detect thinking boundaries
                             thinking_delta = thinking_state.feed(token.text)
@@ -1820,6 +1821,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=chunk_rate
+                                    ),
                                 )
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -1850,6 +1854,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=metrics.rate
+                                    ),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if not terminal_emitted:
@@ -1858,6 +1865,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 request_id,
                                 request.model,
                                 finish_reason,
+                                metrics.rate,
                             )
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
@@ -1898,7 +1906,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             output_text += chunk.text
                             stream_prompt_tokens = chunk.prompt_tokens
                             output_tokens = chunk.generation_tokens
-                            metrics.record_chunk(chunk)
+                            chunk_rate = metrics.record_chunk(chunk)
                             chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
@@ -1919,6 +1927,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=chunk_rate
+                                    ),
                                 )
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -1929,6 +1940,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             request_id,
                             request.model,
                             finish_reason,
+                            metrics.rate,
                         )
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if emit_usage:
@@ -2003,8 +2015,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             error=str(e),
                         )
                         metrics_finalized = True
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
+                    logger.exception("Chat completion stream generation failed: %s", e)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -2022,7 +2033,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             stream=True,
                             error="stream_closed_before_completion",
                         )
-                    print("Stream finished.")
+                    logger.debug("Chat completion stream closed.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -2271,8 +2282,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     stream=False,
                     error=str(e),
                 )
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
+                logger.exception("Chat completion generation failed: %s", e)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -2282,8 +2292,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
-        print(f"Unexpected error in /generate endpoint: {e}")
-        traceback.print_exc()
+        logger.exception("Unexpected error in /chat/completions endpoint: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
