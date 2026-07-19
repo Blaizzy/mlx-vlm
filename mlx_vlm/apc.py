@@ -122,6 +122,78 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
+def _hash_payload(payload: Any) -> Optional[int]:
+    """Stable content hash of one non-token semantic input, or None to skip.
+
+    Tensors hash by bytes (fp16 for floats), lists fold element-wise, other
+    refs hash by path/repr -- mirroring ``hash_image_payload`` so any media
+    input can salt the APC key the same way an image does.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (list, tuple)):
+        folded = SEED_PARENT_HASH
+        seen = False
+        for item in payload:
+            sub = _hash_payload(item)
+            if sub is not None:
+                folded = _stable_int_hash(folded, sub)
+                seen = True
+        return folded if seen else None
+    if isinstance(payload, (mx.array, np.ndarray)):
+        return hash_image_payload(pixel_values=payload)
+    return hash_image_payload(image_ref=payload)
+
+
+def model_key_dependencies(model: Any = None, processor: Any = None) -> Tuple[int, ...]:
+    """Fold any model/processor-declared APC key dependencies into hashes.
+
+    A model or processor may expose ``apc_key_dependencies()`` returning extra
+    semantic inputs. Absent or failing hooks contribute nothing.
+    """
+    deps: List[int] = []
+    for obj in (model, processor):
+        if obj is None:
+            continue
+        hook = getattr(obj, "apc_key_dependencies", None)
+        if not callable(hook):
+            continue
+        try:
+            for dep in hook() or ():
+                sub = _hash_payload(dep)
+                if sub is not None:
+                    deps.append(sub)
+        except Exception:
+            continue
+    return tuple(deps)
+
+
+def semantic_extra_hash(
+    *,
+    tenant: Optional[str] = None,
+    image_hash: int = 0,
+    media: Optional[Dict[str, Any]] = None,
+    model: Any = None,
+    processor: Any = None,
+) -> int:
+    """Complete APC salt: tenant + image + non-token media inputs + model/processor deps.
+
+    ``media`` maps a semantic-input name (audio/video/embeddings/masks/
+    rope_deltas/...) to its payload; entries fold in sorted-key order so the
+    result is order-independent. Reduces exactly to
+    ``tenant_scoped_hash(tenant, image_hash)`` when no extra inputs are present.
+    """
+    folded = int(image_hash)
+    if media:
+        for key in sorted(media):
+            sub = _hash_payload(media[key])
+            if sub is not None:
+                folded = _stable_int_hash(folded, _hash_payload(key), sub)
+    for dep in model_key_dependencies(model, processor):
+        folded = _stable_int_hash(folded, dep)
+    return tenant_scoped_hash(tenant, folded)
+
+
 def _copy_mlx_array(x: mx.array) -> mx.array:
     """Materialize ``x`` into a fresh MLX-owned contiguous buffer."""
     return mx.contiguous(mx.array(x, dtype=x.dtype))

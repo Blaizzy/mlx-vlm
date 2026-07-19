@@ -2208,7 +2208,18 @@ class BatchGenerator:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.tenant_scoped_hash(tenant, img)
+        return _apc.semantic_extra_hash(
+            tenant=tenant,
+            image_hash=img,
+            media={
+                "audio": prompt_kwargs.get("input_features"),
+                "video": prompt_kwargs.get("pixel_values_videos"),
+                "embeddings": prompt_kwargs.get("inputs_embeds"),
+                "masks": prompt_kwargs.get("attention_mask"),
+            },
+            model=getattr(self, "model", None),
+            processor=getattr(self, "processor", None),
+        )
 
     def _apc_media_token_ids(self) -> set[int]:
         return _apc.multimodal_token_ids_from_config(self.model.config)

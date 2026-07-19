@@ -846,7 +846,18 @@ def stream_generate(
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
-        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
+        apc_extra_hash = _apc.semantic_extra_hash(
+            tenant=apc_tenant,
+            image_hash=image_hash,
+            media={
+                "audio": audio,
+                "video": video,
+                "embeddings": kwargs.get("inputs_embeds"),
+                "masks": mask,
+            },
+            model=model,
+            processor=processor,
+        )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
