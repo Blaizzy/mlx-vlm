@@ -154,127 +154,12 @@ def _clone_cache_entry_for_apc(
     min_capacity_tokens: Optional[int],
     eval_targets: List[mx.array],
 ) -> Optional[Any]:
-    """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
-    from .models import cache as lm_cache
+    """Deep-copy one prompt-cache entry via the registered cache adapter."""
+    from .apc_adapters import clone_cache_entry
 
-    if isinstance(c, lm_cache.KVCache):
-        out = type(c)()
-        off = int(getattr(c, "offset", 0) or 0)
-        if c.keys is not None and c.values is not None and off > 0:
-            keys = _copy_mlx_array(c.keys[..., :off, :])
-            values = _copy_mlx_array(c.values[..., :off, :])
-            step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
-            keys, values = _pad_kv_for_capacity(
-                keys,
-                values,
-                offset=off,
-                min_capacity_tokens=min_capacity_tokens,
-                step=step,
-            )
-            out.keys = keys
-            out.values = values
-            out.offset = off
-            eval_targets.extend([keys, values])
-        return out
-
-    # Batch caches expose extract + is_single_row; collapse to a single-row
-    # entry before cloning. Multi-row stores should call snapshot_prompt_cache_row.
-    if callable(getattr(c, "extract", None)) and callable(
-        getattr(c, "is_single_row", None)
-    ):
-        if not c.is_single_row():
-            return None
-        if c.empty():
-            if isinstance(c, lm_cache.BatchRotatingKVCache):
-                return lm_cache.RotatingKVCache(max_size=int(c.max_size))
-            return lm_cache.KVCache()
-        return _clone_cache_entry_for_apc(
-            c.extract(0),
-            min_capacity_tokens=min_capacity_tokens,
-            eval_targets=eval_targets,
-        )
-
-    if isinstance(c, lm_cache.RotatingKVCache):
-        out = type(c)(
-            max_size=int(getattr(c, "max_size")),
-            keep=int(getattr(c, "keep", 0)),
-        )
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out._idx = int(getattr(c, "_idx", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ChunkedKVCache):
-        out = type(c)(chunk_size=int(getattr(c, "chunk_size")))
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out.start_position = int(getattr(c, "start_position", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ArraysCache):
-        out = lm_cache.ArraysCache(len(c.cache))
-        out.cache = []
-        for state in c.cache:
-            if state is None:
-                out.cache.append(None)
-                continue
-            copied = _copy_mlx_array(state)
-            out.cache.append(copied)
-            eval_targets.append(copied)
-        if c.left_padding is not None:
-            out.left_padding = _copy_mlx_array(c.left_padding)
-            eval_targets.append(out.left_padding)
-        if c.lengths is not None:
-            out.lengths = _copy_mlx_array(c.lengths)
-            eval_targets.append(out.lengths)
-        return out
-
-    if isinstance(c, lm_cache.CacheList):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c.caches
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return lm_cache.CacheList(*copied)
-
-    if isinstance(c, tuple):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return tuple(copied)
-
-    # Protocol fallback: any cache with dequantize_for_apc (e.g. QuantizedKVCache)
-    # is cloned by dequantizing into a plain KVCache for exact-mode storage.
-    if hasattr(c, "dequantize_for_apc"):
-        dk, dv = c.dequantize_for_apc()
-        if dk is None or dv is None:
-            return lm_cache.KVCache()
-        out = lm_cache.KVCache()
-        out.keys = _copy_mlx_array(dk)
-        out.values = _copy_mlx_array(dv)
-        out.offset = dk.shape[-2]
-        eval_targets.extend([out.keys, out.values])
-        return out
-
-    return None
+    return clone_cache_entry(
+        c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+    )
 
 
 def _clone_prompt_cache_for_apc(
@@ -3811,42 +3696,10 @@ def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from .models import cache as lm_cache
+    """Merge single-row exact snapshots via the registered cache adapter."""
+    from .apc_adapters import merge_cache_entries
 
-    if not entries:
-        return None
-    first = entries[0]
-    if all(isinstance(c, lm_cache.KVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
-        return lm_cache.BatchRotatingKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
-        return _merge_arrays_cache_entries(entries, prefix_lens)
-    if all(isinstance(c, lm_cache.CacheList) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry.caches[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first.caches))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    if all(isinstance(c, tuple) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    return None
+    return merge_cache_entries(entries, prefix_lens)
 
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:

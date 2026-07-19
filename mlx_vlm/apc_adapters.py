@@ -1,25 +1,4 @@
-"""Pluggable cache-component adapters for Automatic Prefix Caching (APC).
-
-Phase 1 of the APC redesign (issue #1629): a capability-driven adapter layer so
-APC does not need a central allowlist of concrete cache classes.
-
-This module provides:
-
-* :class:`Capability` — how a cache component can be reused.
-* :class:`PrefixStateAdapter` — the capture/restore/merge/(de)serialize contract.
-* :class:`CheckpointAdapter` — the universal fallback built on the
-  ``prefix_cache_snapshot`` / ``prefix_cache_restore`` contract on ``_BaseCache``
-  (i.e. ``state`` + ``meta_state``).
-* :class:`CompositeAdapter` — recurses into ``CacheList`` / tuple caches.
-* a capability registry + :func:`resolve_adapter` / :func:`resolve_capability`.
-* :func:`build_prefix_cache_plan` — resolves one adapter per cache entry a model
-  produces, without APC knowing the concrete classes.
-
-It intentionally does not yet change APC storage or behaviour (that is phase 2).
-The key correctness rule enforced here (issue #1629): an *unregistered*
-``KVCache`` subclass is **not** assumed pageable via inheritance — it falls back
-to the conservative checkpoint capability.
-"""
+"""Pluggable cache-component adapters for Automatic Prefix Caching (issue #1629)."""
 
 from __future__ import annotations
 
@@ -108,17 +87,11 @@ def _is_snapshotable(cache: Any) -> bool:
     if callable(getattr(cache, "prefix_cache_snapshot", None)):
         return True
     # duck-typed: has a ``state`` we can capture (covers non-_BaseCache caches
-    # such as MiniMaxM3KVCache that expose state/meta_state/merge).
     return hasattr(cache, "state") and hasattr(cache, "meta_state")
 
 
 class CheckpointAdapter:
-    """Universal fallback: snapshot ``state`` + ``meta_state`` as an opaque blob.
-
-    Correct for any cache exposing the ``prefix_cache_snapshot`` contract (all
-    ``_BaseCache`` subclasses) or ``state``/``meta_state`` (e.g. custom caches).
-    Not batch-mergeable by default (single-row exact reuse only).
-    """
+    """Universal fallback: snapshot ``state`` + ``meta_state`` as an opaque blob."""
 
     capability = Capability.CHECKPOINT
 
@@ -253,12 +226,7 @@ def register_default_capabilities() -> None:
 def resolve_capability(
     cache: Any, overrides: Optional[Dict[type, Capability]] = None
 ) -> Capability:
-    """Resolve the capability of ``cache``.
-
-    Key rule: an unregistered subclass is never assumed ``PAGEABLE`` via
-    inheritance (that would misclassify ring/windowed caches subclassing
-    ``KVCache``); such cases downgrade to the conservative ``CHECKPOINT``.
-    """
+    """Resolve the capability of ``cache``."""
     if not _CAPABILITY:
         register_default_capabilities()
     t = type(cache)
@@ -288,12 +256,6 @@ def resolve_adapter_by_capability(cap: Capability) -> PrefixStateAdapter:
 
 
 # --- APC mode eligibility (phase 2) --------------------------------------
-# Registry-driven replacement for apc.py's hard-coded isinstance ladders in
-# ``_cache_entry_supports_block_apc`` / ``_cache_entry_supports_exact_apc`` /
-# ``model_apc_mode``. Behaviour-preserving vs the ladders except for one
-# intentional fix (issue #1629): block reuse requires an *exact* pageable type,
-# so a ``KVCache`` subclass (e.g. RingSlidingKVCache) no longer inherits
-# block-eligibility -- it drops to exact-only, which is correct.
 
 _APC_EXACT_TYPES: Optional[tuple] = None
 _APC_BLOCK_TYPES: Optional[set] = None
@@ -347,6 +309,221 @@ def apc_mode(caches: Sequence[Any]) -> Optional[str]:
         return "block"
     if all(apc_exact_eligible(c) for c in caches):
         return "exact"
+    return None
+
+
+# --- specialized clone/merge adapters (phase 3) --------------------------
+
+
+def _apc_array_helpers():
+    from .apc import _copy_mlx_array, _pad_kv_for_capacity
+
+    return _copy_mlx_array, _pad_kv_for_capacity
+
+
+class KVCacheCloneAdapter:
+    capability = Capability.PAGEABLE
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        copy, pad = _apc_array_helpers()
+        out = type(c)()
+        off = int(getattr(c, "offset", 0) or 0)
+        if c.keys is not None and c.values is not None and off > 0:
+            keys = copy(c.keys[..., :off, :])
+            values = copy(c.values[..., :off, :])
+            step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
+            keys, values = pad(
+                keys,
+                values,
+                offset=off,
+                min_capacity_tokens=min_capacity_tokens,
+                step=step,
+            )
+            out.keys, out.values, out.offset = keys, values, off
+            eval_targets.extend([keys, values])
+        return out
+
+    def merge_rows(self, caches, prefix_lens):
+        from .models import cache as lm
+
+        return lm.BatchKVCache.merge(caches)
+
+
+class RotatingKVCacheCloneAdapter:
+    capability = Capability.WINDOWED
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        copy, _ = _apc_array_helpers()
+        out = type(c)(max_size=int(c.max_size), keep=int(getattr(c, "keep", 0)))
+        out.offset = int(getattr(c, "offset", 0) or 0)
+        out._idx = int(getattr(c, "_idx", 0) or 0)
+        if c.keys is not None and c.values is not None:
+            out.keys, out.values = copy(c.keys), copy(c.values)
+            eval_targets.extend([out.keys, out.values])
+        return out
+
+    def merge_rows(self, caches, prefix_lens):
+        from .models import cache as lm
+
+        return lm.BatchRotatingKVCache.merge(caches)
+
+
+class ChunkedKVCacheCloneAdapter:
+    capability = Capability.PAGEABLE
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        copy, _ = _apc_array_helpers()
+        out = type(c)(chunk_size=int(c.chunk_size))
+        out.offset = int(getattr(c, "offset", 0) or 0)
+        out.start_position = int(getattr(c, "start_position", 0) or 0)
+        if c.keys is not None and c.values is not None:
+            out.keys, out.values = copy(c.keys), copy(c.values)
+            eval_targets.extend([out.keys, out.values])
+        return out
+
+    def merge_rows(self, caches, prefix_lens):
+        from .models import cache as lm
+
+        return lm.BatchKVCache.merge(caches)
+
+
+class ArraysCacheCloneAdapter:
+    capability = Capability.CHECKPOINT
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        from .models import cache as lm
+
+        copy, _ = _apc_array_helpers()
+        out = lm.ArraysCache(len(c.cache))
+        out.cache = []
+        for state in c.cache:
+            if state is None:
+                out.cache.append(None)
+                continue
+            cp = copy(state)
+            out.cache.append(cp)
+            eval_targets.append(cp)
+        if c.left_padding is not None:
+            out.left_padding = copy(c.left_padding)
+            eval_targets.append(out.left_padding)
+        if c.lengths is not None:
+            out.lengths = copy(c.lengths)
+            eval_targets.append(out.lengths)
+        return out
+
+    def merge_rows(self, caches, prefix_lens):
+        from .models import cache as lm
+
+        size = len(caches[0].cache)
+        out = lm.ArraysCache(size)
+        merged: List[Optional[mx.array]] = []
+        for i in range(size):
+            states = [c.cache[i] for c in caches]
+            sample = next((s for s in states if s is not None), None)
+            if sample is None:
+                merged.append(None)
+                continue
+            rows = [
+                (
+                    mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype)
+                    if s is None
+                    else s[:1]
+                )
+                for s in states
+            ]
+            merged.append(mx.concatenate(rows, axis=0))
+        out.cache = merged
+        return out
+
+
+_CLONE_RULES: Optional[list] = None
+
+
+def _clone_rules():
+    global _CLONE_RULES
+    if _CLONE_RULES is None:
+        from .models import cache as lm
+
+        _CLONE_RULES = [
+            (lm.KVCache, KVCacheCloneAdapter()),
+            (lm.RotatingKVCache, RotatingKVCacheCloneAdapter()),
+            (lm.ChunkedKVCache, ChunkedKVCacheCloneAdapter()),
+            (lm.ArraysCache, ArraysCacheCloneAdapter()),
+        ]
+    return _CLONE_RULES
+
+
+def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
+    from .models import cache as lm
+
+    if callable(getattr(c, "extract", None)) and callable(
+        getattr(c, "is_single_row", None)
+    ):
+        if not c.is_single_row():
+            return None
+        if c.empty():
+            if isinstance(c, lm.BatchRotatingKVCache):
+                return lm.RotatingKVCache(max_size=int(c.max_size))
+            return lm.KVCache()
+        return clone_cache_entry(
+            c.extract(0),
+            min_capacity_tokens=min_capacity_tokens,
+            eval_targets=eval_targets,
+        )
+    for typ, adapter in _clone_rules():
+        if isinstance(c, typ):
+            return adapter.clone(
+                c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+            )
+    if isinstance(c, lm.CacheList):
+        subs = [
+            clone_cache_entry(
+                s, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+            )
+            for s in c.caches
+        ]
+        return None if any(s is None for s in subs) else lm.CacheList(*subs)
+    if isinstance(c, tuple):
+        subs = [
+            clone_cache_entry(
+                s, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+            )
+            for s in c
+        ]
+        return None if any(s is None for s in subs) else tuple(subs)
+    if hasattr(c, "dequantize_for_apc"):
+        copy, _ = _apc_array_helpers()
+        dk, dv = c.dequantize_for_apc()
+        if dk is None or dv is None:
+            return lm.KVCache()
+        out = lm.KVCache()
+        out.keys, out.values, out.offset = copy(dk), copy(dv), dk.shape[-2]
+        eval_targets.extend([out.keys, out.values])
+        return out
+    return None
+
+
+def merge_cache_entries(entries, prefix_lens):
+    from .models import cache as lm
+
+    if not entries:
+        return None
+    first = entries[0]
+    for typ, adapter in _clone_rules():
+        if all(isinstance(c, typ) for c in entries):
+            return adapter.merge_rows(entries, prefix_lens)
+    if all(isinstance(c, lm.CacheList) for c in entries):
+        merged = [
+            merge_cache_entries([e.caches[i] for e in entries], prefix_lens)
+            for i in range(len(first.caches))
+        ]
+        return None if any(m is None for m in merged) else lm.CacheList(*merged)
+    if all(isinstance(c, tuple) for c in entries):
+        merged = [
+            merge_cache_entries([e[i] for e in entries], prefix_lens)
+            for i in range(len(first))
+        ]
+        return None if any(m is None for m in merged) else lm.CacheList(*merged)
     return None
 
 
