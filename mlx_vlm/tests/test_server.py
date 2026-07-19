@@ -4902,6 +4902,35 @@ class TestResponseGenerator:
         assert args.logit_bias == {5: -1.0}  # string keys converted to int
         assert args.to_generate_kwargs()["apc_tenant"] == "tenant-a"
 
+    def test_read_tenant_id_prefers_apc_header(self, monkeypatch):
+        monkeypatch.setenv("APC_DEFAULT_TENANT", "env-tenant")
+        req = SimpleNamespace(
+            headers={
+                "x-apc-tenant": "header-tenant",
+                "x-tenant-id": "legacy-tenant",
+            }
+        )
+
+        assert server._read_tenant_id(req) == "header-tenant"
+
+    def test_read_tenant_id_uses_legacy_header_before_env(self, monkeypatch):
+        monkeypatch.setenv("APC_DEFAULT_TENANT", "env-tenant")
+        req = SimpleNamespace(headers={"x-tenant-id": "legacy-tenant"})
+
+        assert server._read_tenant_id(req) == "legacy-tenant"
+
+    def test_read_tenant_id_uses_env_default(self, monkeypatch):
+        monkeypatch.setenv("APC_DEFAULT_TENANT", "env-tenant")
+        req = SimpleNamespace(headers={})
+
+        assert server._read_tenant_id(req) == "env-tenant"
+
+    def test_read_tenant_id_falls_back_to_default(self, monkeypatch):
+        monkeypatch.delenv("APC_DEFAULT_TENANT", raising=False)
+        req = SimpleNamespace(headers={})
+
+        assert server._read_tenant_id(req) == "default"
+
     def test_build_gen_args_from_chat_request(self):
         req = SimpleNamespace(
             max_tokens=256,
