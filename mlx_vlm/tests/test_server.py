@@ -2460,6 +2460,66 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
     assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
 
 
+def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="lfm2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="Hello", token=1, logprobs=0.0, finish_reason=None
+                    ),
+                    server.StreamingToken(
+                        text="!", token=2, logprobs=0.0, finish_reason="stop"
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "liquidai/LFM2.5-VL-1.6B",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("content") or "" for delta in deltas) == "Hello!"
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+
+
 def test_chat_completions_response_uses_reasoning_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -5706,6 +5766,28 @@ class TestSplitThinking:
 
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
+
+    def test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking(self):
+        assert server.prompt_has_open_thinking("prompt", enable_thinking=True) is False
+        assert (
+            server.prompt_has_open_thinking("prompt<think>\n", enable_thinking=True)
+            is True
+        )
+        assert (
+            server.prompt_has_open_thinking(
+                "User: Say <think> literally\nAssistant:", enable_thinking=True
+            )
+            is False
+        )
+        assert (
+            server.prompt_has_open_thinking(
+                "prompt<analysis>",
+                enable_thinking=True,
+                thinking_start_token="<analysis>",
+                thinking_end_token="</analysis>",
+            )
+            is True
+        )
 
     @pytest.mark.parametrize("enable_thinking", [False, True])
     def test_gemma_channel_markers_and_content_in_same_delta(self, enable_thinking):

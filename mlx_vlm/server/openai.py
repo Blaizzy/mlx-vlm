@@ -43,6 +43,7 @@ from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
     process_tool_calls,
+    prompt_has_open_thinking,
     response_store,
     response_store_lock,
     suppress_tool_call_content,
@@ -1071,7 +1072,12 @@ async def responses_endpoint(request: Request):
                         else None
                     )
                     thinking_state = ThinkingStreamState(
-                        gen_args.enable_thinking,
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     )
@@ -1750,7 +1756,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         thinking_state = ThinkingStreamState(
-                            gen_args.enable_thinking,
+                            prompt_has_open_thinking(
+                                formatted_prompt,
+                                gen_args.enable_thinking,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
@@ -1895,7 +1906,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
                         thinking_state = ThinkingStreamState(
-                            gen_args.enable_thinking,
+                            prompt_has_open_thinking(
+                                formatted_prompt,
+                                gen_args.enable_thinking,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
