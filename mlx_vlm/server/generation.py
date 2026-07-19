@@ -1058,6 +1058,25 @@ class ResponseGenerator:
             raise self._load_error
         return self.model, self.processor, self.config
 
+    def _run_apc_self_check(self):
+        """Validate the exact cache layout this worker will use at runtime."""
+        language_model = getattr(self.model, "language_model", self.model)
+        apc_mode = _apc.model_apc_mode(language_model)
+        return _apc.self_check_model_apc(
+            language_model,
+            cache_factory=lambda: _make_cache(
+                language_model,
+                [0],
+                kv_bits=self.kv_bits,
+                kv_group_size=self.kv_group_size,
+                kv_quant_scheme=self.kv_quant_scheme,
+            ),
+            apc_mode=apc_mode,
+            kv_bits=self.kv_bits,
+            kv_group_size=self.kv_group_size,
+            kv_quant_scheme=self.kv_quant_scheme,
+        )
+
     def _cancel(self, uid):
         with self._cancel_lock:
             self._cancelled.add(uid)
@@ -1580,6 +1599,13 @@ class ResponseGenerator:
             self._ready.set()
             logger.exception("Error loading model in generation thread: %s", e)
             return
+
+        if getattr(self, "apc_manager", None) is not None:
+            try:
+                self._run_apc_self_check()
+            except Exception as exc:
+                # Diagnostics must never prevent the model from serving.
+                logger.warning("APC runtime self-check raised unexpectedly: %s", exc)
 
         self._ready.set()
 

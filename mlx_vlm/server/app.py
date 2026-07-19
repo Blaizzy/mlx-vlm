@@ -780,13 +780,6 @@ def get_cached_model(
         vision_cache.clear()
         raise
 
-    # Dry-run APC layout when the shared pool is enabled (log-only; never blocks serve).
-    if runtime.apc_manager is not None:
-        try:
-            _apc.self_check_model_apc(model, kv_bits=kv_bits)
-        except Exception as exc:
-            logger.warning("APC self-check raised unexpectedly: %s", exc)
-
     cache = {
         "cache_key": cache_key,
         "model_path": model_path,

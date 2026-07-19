@@ -51,7 +51,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -3108,6 +3108,13 @@ class APCManager:
     ) -> bool:
         """Store a full prompt-cache snapshot for exact-prefix reuse."""
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
+            apc_trace(
+                "store",
+                mode="exact",
+                ok=False,
+                reason="empty_tokens" if not token_ids else "no_storage_tier",
+                token_len=len(token_ids),
+            )
             return False
         token_tuple = tuple(int(t) for t in token_ids)
         copied = _clone_prompt_cache_for_apc(prompt_cache)
@@ -3128,6 +3135,8 @@ class APCManager:
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
+        memory_stored = False
+        disk_stored = False
         with self.lock:
             if self._exact_cache_max > 0:
                 self._exact_cache[key] = APCExactCacheEntry(
@@ -3140,22 +3149,32 @@ class APCManager:
                 while len(self._exact_cache) > self._exact_cache_max:
                     self._exact_cache.popitem(last=False)
                 stored = True
-        if stored:
-            apc_trace(
-                "store",
-                mode="exact",
-                ok=True,
-                token_len=len(token_tuple),
-                layers=len(copied),
-            )
+                memory_stored = True
         if self.disk is not None:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
                 with self.lock:
                     self.stats.disk_writes += 1
                 stored = True
+                disk_stored = True
             except Exception as e:
                 logger.warning("APC exact disk save scheduling failed: %s", e)
+                apc_trace(
+                    "reject",
+                    mode="exact",
+                    reason="disk_save_error",
+                    error=type(e).__name__,
+                    token_len=len(token_tuple),
+                )
+        apc_trace(
+            "store",
+            mode="exact",
+            ok=stored,
+            token_len=len(token_tuple),
+            layers=len(copied),
+            memory=memory_stored,
+            disk=disk_stored,
+        )
         if stored:
             with self.lock:
                 self.stats.exact_stores += 1
@@ -3312,6 +3331,10 @@ class APCManager:
             )
             new_blocks: List[APCBlock] = []
             disk_blocks: List[_DiskLayerMajorBlock] = []
+            memory_stores = 0
+            reused_blocks = 0
+            disk_stores = 0
+            skip_reason: Optional[str] = None
             per_block_tensors = len(layer_keys) + len(layer_values)
             token_tuple = tuple(int(t) for t in token_ids[:layer_major_prefix_tokens])
             layer_major_stored = False
@@ -3370,6 +3393,7 @@ class APCManager:
                 if existing is not None and existing.token_ids == chunk:
                     acquired = self._acquire_existing(existing)
                     new_blocks.append(acquired)
+                    reused_blocks += 1
                     parent = h
                     continue
                 if (
@@ -3385,6 +3409,7 @@ class APCManager:
                         n_full,
                     )
                     if self.disk is None:
+                        skip_reason = "pool_tensor_limit"
                         break
                     parent = h
                     continue
@@ -3396,6 +3421,7 @@ class APCManager:
                         n_full,
                     )
                     if self.disk is None:
+                        skip_reason = "pool_exhausted"
                         break
                     parent = h
                     continue
@@ -3417,6 +3443,7 @@ class APCManager:
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
+                memory_stores += 1
                 self.stats.stores += 1
                 self.stats.served_tokens += self.block_size
                 parent = h
@@ -3426,9 +3453,37 @@ class APCManager:
                         disk_blocks, layer_keys, layer_values, self.block_size
                     )
                     self.stats.disk_writes += len(disk_blocks)
+                    disk_stores = len(disk_blocks)
                 except Exception as e:
                     logger.warning("APC disk save scheduling failed: %s", e)
+                    skip_reason = "disk_save_error"
+                    apc_trace(
+                        "reject",
+                        mode="block",
+                        reason=skip_reason,
+                        error=type(e).__name__,
+                        token_len=len(token_ids),
+                    )
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
+            no_new_blocks = n_full <= skip_full
+            apc_trace(
+                "store",
+                mode="block",
+                ok=bool(
+                    memory_stores
+                    or reused_blocks
+                    or disk_stores
+                    or layer_major_stored
+                    or no_new_blocks
+                ),
+                token_len=len(token_ids),
+                full_blocks=n_full,
+                memory_blocks=memory_stores,
+                disk_blocks=disk_stores,
+                reused_blocks=reused_blocks,
+                layer_major=layer_major_stored,
+                reason=skip_reason or ("no_new_full_blocks" if no_new_blocks else "-"),
+            )
             return new_blocks
 
     def stats_snapshot(self) -> dict:
@@ -4100,9 +4155,17 @@ def harvest_blocks_from_batch_cache(
     """
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
-    for c in batch_caches:
+    for layer_idx, c in enumerate(batch_caches):
         k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
         if k is None or v is None:
+            with apc_manager.lock:
+                apc_manager.stats.record_reject(
+                    "no_block_harvest_adapter",
+                    mode="block",
+                    layer=layer_idx,
+                    type=type(c).__name__,
+                    token_len=len(full_token_ids),
+                )
             return []
         if int(k.shape[0]) != 1:
             k = k[batch_idx : batch_idx + 1]
@@ -4164,11 +4227,13 @@ class APCSelfCheckResult:
     notes: List[str] = field(default_factory=list)
 
 
-def classify_layer_for_apc(c: Any) -> LayerSupport:
+def classify_layer_for_apc(c: Any, *, apc_mode: str = "exact") -> LayerSupport:
     """Classify whether one prompt-cache layer can be snapshotted for APC.
 
-    Uses the same clone path as exact store so startup checks match runtime.
-    Empty layers that clone to a storage-native type count as ``empty_ok``.
+    Exact mode uses the same materialized clone path as exact store. Block mode
+    validates the adapter contract used by :func:`layer_kv_for_apc`; empty
+    runtime caches cannot yield K/V yet, so their protocol is checked without a
+    synthetic model forward.
     """
     type_name = type(c).__name__
     is_empty = False
@@ -4179,6 +4244,35 @@ def classify_layer_for_apc(c: Any) -> LayerSupport:
         except Exception:
             is_empty = False
 
+    if apc_mode == "block":
+        # Quantized caches expose an explicit dequantization adapter. Dense
+        # caches are harvested through keys/values plus either _idx (batch) or
+        # offset (single-row). This mirrors layer_kv_for_apc without requiring
+        # a forward pass merely to populate an otherwise-empty cache.
+        has_dequant = callable(getattr(c, "dequantize_for_apc", None))
+        has_dense_state = (
+            hasattr(c, "keys")
+            and hasattr(c, "values")
+            and (hasattr(c, "_idx") or hasattr(c, "offset"))
+        )
+        if not (has_dequant or has_dense_state):
+            return LayerSupport(
+                type_name=type_name,
+                status="unsupported",
+                reason="no_block_harvest_adapter",
+            )
+        return LayerSupport(
+            type_name=type_name,
+            status="empty_ok" if is_empty else "ok",
+        )
+
+    if apc_mode != "exact":
+        return LayerSupport(
+            type_name=type_name,
+            status="unsupported",
+            reason=f"unknown_mode:{apc_mode}",
+        )
+
     eval_targets: List[mx.array] = []
     try:
         copied = _clone_cache_entry_for_apc(
@@ -4186,6 +4280,8 @@ def classify_layer_for_apc(c: Any) -> LayerSupport:
             min_capacity_tokens=None,
             eval_targets=eval_targets,
         )
+        if eval_targets:
+            mx.eval(eval_targets)
     except Exception as exc:
         return LayerSupport(
             type_name=type_name,
@@ -4213,7 +4309,9 @@ def validate_prompt_cache_layout(
     layer_types = [type(c).__name__ for c in caches]
     unsupported = [
         layer
-        for layer in (classify_layer_for_apc(c) for c in caches)
+        for layer in (
+            classify_layer_for_apc(c, apc_mode=apc_mode or "exact") for c in caches
+        )
         if layer.status == "unsupported"
     ]
     return APCSelfCheckResult(
@@ -4228,10 +4326,20 @@ def validate_prompt_cache_layout(
 def self_check_model_apc(
     model: Any,
     *,
+    caches: Optional[Sequence[Any]] = None,
+    cache_factory: Optional[Callable[[], Sequence[Any]]] = None,
+    apc_mode: Optional[str] = None,
     kv_bits: Optional[float] = None,
+    kv_group_size: Optional[int] = None,
+    kv_quant_scheme: Optional[str] = None,
     log: bool = True,
 ) -> APCSelfCheckResult:
     """Dry-run APC layout check for a loaded model (or its ``language_model``).
+
+    Servers should pass ``cache_factory`` for the effective runtime layout so
+    cache construction and validation are both covered by this non-fatal
+    boundary. Direct ``caches`` and the ``make_cache`` fallback are retained for
+    standalone diagnostics and tests.
 
     Non-fatal by design: logs ERROR on failure and returns a result. Callers
     (e.g. server load) should not crash solely because the check fails.
@@ -4239,32 +4347,43 @@ def self_check_model_apc(
     notes: List[str] = []
     if kv_bits is not None:
         notes.append(f"kv_bits={kv_bits}")
+    if kv_group_size is not None:
+        notes.append(f"kv_group_size={kv_group_size}")
+    if kv_quant_scheme is not None:
+        notes.append(f"kv_quant_scheme={kv_quant_scheme}")
 
     try:
         language_model = (
             model.language_model if hasattr(model, "language_model") else model
         )
-        if not hasattr(language_model, "make_cache"):
+        resolved_mode = apc_mode or model_apc_mode(language_model)
+        if resolved_mode is None:
             result = APCSelfCheckResult(
                 ok=False,
                 apc_mode=None,
                 layer_count=0,
                 layer_types=[],
-                notes=notes + ["model has no make_cache"],
+                notes=notes + ["no APC-compatible cache layout"],
             )
         else:
-            apc_mode = model_apc_mode(language_model)
-            if apc_mode is None:
+            effective_caches = caches
+            if effective_caches is None and cache_factory is not None:
+                effective_caches = cache_factory()
+            if effective_caches is None and hasattr(language_model, "make_cache"):
+                effective_caches = language_model.make_cache()
+            if effective_caches is None:
                 result = APCSelfCheckResult(
                     ok=False,
-                    apc_mode=None,
+                    apc_mode=resolved_mode,
                     layer_count=0,
                     layer_types=[],
-                    notes=notes + ["no APC-compatible cache layout"],
+                    notes=notes + ["runtime cache layout was not supplied"],
                 )
             else:
-                caches = language_model.make_cache()
-                result = validate_prompt_cache_layout(caches, apc_mode=apc_mode)
+                result = validate_prompt_cache_layout(
+                    effective_caches,
+                    apc_mode=resolved_mode,
+                )
                 result.notes = list(notes) + list(result.notes)
     except Exception as exc:
         result = APCSelfCheckResult(
@@ -4283,7 +4402,7 @@ def self_check_model_apc(
                 result.apc_mode,
                 result.layer_count,
                 types_s,
-                f" kv_bits={kv_bits}" if kv_bits is not None else "",
+                f" {' '.join(result.notes)}" if result.notes else "",
             )
         else:
             bad = [
@@ -4305,6 +4424,8 @@ def self_check_model_apc(
         layers=result.layer_count,
         unsupported=len(result.unsupported),
         kv_bits=kv_bits,
+        kv_group_size=kv_group_size,
+        kv_quant_scheme=kv_quant_scheme,
     )
     return result
 
