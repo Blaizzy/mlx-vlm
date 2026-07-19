@@ -21,7 +21,7 @@ def test_reduces_to_tenant_image_when_no_extra_inputs():
     assert semantic_extra_hash(tenant="t", image_hash=123) == tenant_scoped_hash(
         "t", 123
     )
-    # empty / all-None media must stay a no-op (preserves the batch pin)
+
     got = semantic_extra_hash(
         tenant="tenant-a",
         image_hash=123,
@@ -35,11 +35,11 @@ def test_media_inputs_change_the_key():
     audio = mx.ones((1, 4, 8))
     with_audio = semantic_extra_hash(tenant="t", image_hash=7, media={"audio": audio})
     assert with_audio != base
-    # deterministic for identical media...
+
     assert with_audio == semantic_extra_hash(
         tenant="t", image_hash=7, media={"audio": mx.ones((1, 4, 8))}
     )
-    # ...and different content diverges
+
     assert with_audio != semantic_extra_hash(
         tenant="t", image_hash=7, media={"audio": mx.zeros((1, 4, 8))}
     )
@@ -65,7 +65,6 @@ def test_model_processor_hook_contributes_and_is_defensive():
     contributor = SimpleNamespace(apc_key_dependencies=lambda: ["adapter-x"])
     assert semantic_extra_hash(image_hash=5, model=contributor) != base
 
-    # no hook, failing hook, and non-callable attr all contribute nothing
     plain = SimpleNamespace(foo=1)
     boom = SimpleNamespace(
         apc_key_dependencies=lambda: (_ for _ in ()).throw(ValueError)
@@ -86,10 +85,10 @@ def test_hash_payload_none_list_and_ref():
 
 def test_disk_namespace_is_stable_and_fingerprinted():
     ns = apc_disk_namespace("org/model", kv_bits=4, kv_group_size=64)
-    # readable prefix + schema tag, deterministic
+
     assert ns.startswith("org/model#s%d-" % ADAPTER_SCHEMA_VERSION)
     assert ns == apc_disk_namespace("org/model", kv_bits=4, kv_group_size=64)
-    # model, KV quant each change the namespace
+
     assert ns != apc_disk_namespace("org/other", kv_bits=4, kv_group_size=64)
     assert ns != apc_disk_namespace("org/model", kv_bits=8, kv_group_size=64)
     assert ns != apc_disk_namespace("org/model", kv_bits=None)

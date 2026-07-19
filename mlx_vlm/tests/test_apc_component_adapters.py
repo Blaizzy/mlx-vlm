@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import mlx.core as mx
+import pytest
 
 from mlx_vlm import apc_adapters as A
 from mlx_vlm.models import cache as C
+
+
+@pytest.fixture(autouse=True)
+def _seeded():
+    mx.random.seed(0)
 
 
 def test_capability_classification():
@@ -20,18 +26,17 @@ def test_capability_classification():
 
 
 def test_kvcache_subclass_is_not_pageable_by_inheritance():
-    # Key correctness rule (#1629): a KVCache subclass must not inherit the
-    # pageable/block capability -- RingSlidingKVCache is ring-windowed.
+
     from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
 
     ring = RingSlidingKVCache(window_size=64)
     assert A.resolve_capability(ring) == A.Capability.CHECKPOINT
-    assert A.apc_block_eligible(ring) is False  # was wrongly True before
-    assert A.apc_exact_eligible(ring) is True  # exact snapshot still works
+    assert A.apc_block_eligible(ring) is False
+    assert A.apc_exact_eligible(ring) is True
 
 
 def test_custom_cache_accepted_via_checkpoint():
-    # MiniMaxM3KVCache is not a _BaseCache subclass but exposes state/meta_state.
+
     from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 
     assert A.resolve_capability(MiniMaxM3KVCache()) == A.Capability.CHECKPOINT
@@ -48,7 +53,7 @@ def test_checkpoint_adapter_roundtrip_and_detach():
     for a, b in zip(kv.state, fresh.state):
         assert bool(mx.array_equal(a, b))
     assert kv.offset == fresh.offset
-    # snapshot is detached: mutating the source must not change the restore
+
     kv.update_and_fetch(mx.random.normal((1, 2, 1, 4)), mx.random.normal((1, 2, 1, 4)))
     mx.eval(kv.state, fresh.state)
     assert fresh.offset == 5
@@ -93,7 +98,7 @@ def test_apc_py_delegates_to_registry():
 
     assert _cache_entry_supports_block_apc(C.KVCache()) is True
     assert _cache_entry_supports_exact_apc(C.ArraysCache(2)) is True
-    # the fix, exercised through apc.py's public helper:
+
     assert _cache_entry_supports_block_apc(RingSlidingKVCache(window_size=64)) is False
 
 

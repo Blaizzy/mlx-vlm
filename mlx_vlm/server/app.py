@@ -759,8 +759,6 @@ def get_cached_model(
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
 
-    # APC: build a shared block pool if opted in via env var. The disk namespace
-    # is fingerprinted so a model/KV-quant/schema change invalidates stale files.
     runtime.apc_manager = _apc.from_env(
         model_namespace=_apc.apc_disk_namespace(
             model_path,

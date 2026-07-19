@@ -8,18 +8,17 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence, runtime_checka
 
 import mlx.core as mx
 
-# Bumped when the adapter snapshot/restore contract changes; folds into the key, disk namespace, and self-check.
 ADAPTER_SCHEMA_VERSION = 1
 
 
 class Capability(str, Enum):
     """Reuse capability of a single cache component."""
 
-    PAGEABLE = "pageable"  # token-aligned KV, splittable + concatenable
-    WINDOWED = "windowed"  # adapter-defined retained window/anchors
-    CHECKPOINT = "checkpoint"  # opaque state valid only at an exact boundary
-    COMPOSITE = "composite"  # container (CacheList/tuple) of sub-components
-    UNSUPPORTED = "unsupported"  # no restorable contract
+    PAGEABLE = "pageable"
+    WINDOWED = "windowed"
+    CHECKPOINT = "checkpoint"
+    COMPOSITE = "composite"
+    UNSUPPORTED = "unsupported"
 
 
 def _copy_array(x: mx.array) -> mx.array:
@@ -57,7 +56,7 @@ class StateFragment:
 
     capability: Capability
     prefix_len: int
-    payload: Any  # adapter-defined; for CheckpointAdapter this is the snapshot dict
+    payload: Any
     schema: str = f"v{ADAPTER_SCHEMA_VERSION}"
 
     def eval_targets(self) -> List[mx.array]:
@@ -89,7 +88,7 @@ def _is_snapshotable(cache: Any) -> bool:
     """True if ``cache`` exposes a restorable snapshot contract."""
     if callable(getattr(cache, "prefix_cache_snapshot", None)):
         return True
-    # duck-typed: has a ``state`` we can capture (covers non-_BaseCache caches
+
     return hasattr(cache, "state") and hasattr(cache, "meta_state")
 
 
@@ -124,7 +123,7 @@ class CheckpointAdapter:
     def merge_rows(
         self, caches: Sequence[Any], prefix_lens: Sequence[int]
     ) -> Optional[Any]:
-        # A cache may still declare batch merge via the contract.
+
         first = caches[0] if caches else None
         merge = getattr(first, "prefix_cache_merge", None)
         return merge(caches, prefix_lens) if callable(merge) else None
@@ -198,12 +197,10 @@ class CompositeAdapter:
         return StateFragment(self.capability, int(tree["prefix_len"]), payload=children)
 
 
-# --- registry ------------------------------------------------------------
-
 _CAPABILITY: Dict[type, Capability] = {}
 _ADAPTERS: Dict[Capability, PrefixStateAdapter] = {
-    Capability.PAGEABLE: CheckpointAdapter(),  # phase-1: checkpoint fallback
-    Capability.WINDOWED: CheckpointAdapter(),  # phase-1: checkpoint fallback
+    Capability.PAGEABLE: CheckpointAdapter(),
+    Capability.WINDOWED: CheckpointAdapter(),
     Capability.CHECKPOINT: CheckpointAdapter(),
     Capability.COMPOSITE: CompositeAdapter(),
 }
@@ -237,9 +234,9 @@ def resolve_capability(
         return Capability.COMPOSITE
     if overrides and t in overrides:
         return overrides[t]
-    if t in _CAPABILITY:  # exact registration wins
+    if t in _CAPABILITY:
         return _CAPABILITY[t]
-    for base in t.__mro__[1:]:  # inherited capability (conservative only)
+    for base in t.__mro__[1:]:
         if base in _CAPABILITY:
             cap = _CAPABILITY[base]
             return Capability.CHECKPOINT if cap == Capability.PAGEABLE else cap
@@ -257,8 +254,6 @@ def resolve_adapter(
 def resolve_adapter_by_capability(cap: Capability) -> PrefixStateAdapter:
     return _ADAPTERS[cap]
 
-
-# --- APC mode eligibility (phase 2) --------------------------------------
 
 _APC_EXACT_TYPES: Optional[tuple] = None
 _APC_BLOCK_TYPES: Optional[set] = None
@@ -313,9 +308,6 @@ def apc_mode(caches: Sequence[Any]) -> Optional[str]:
     if all(apc_exact_eligible(c) for c in caches):
         return "exact"
     return None
-
-
-# --- specialized clone/merge adapters (phase 3) --------------------------
 
 
 def _apc_array_helpers():
@@ -498,7 +490,7 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
             eval_targets=eval_targets,
         )
     for typ, adapter in _clone_rules():
-        # KVCache matches by exact type so subclasses (RingSlidingKVCache) fall through.
+
         matched = type(c) is typ if typ is lm.KVCache else isinstance(c, typ)
         if matched:
             return adapter.clone(
@@ -559,14 +551,11 @@ def merge_cache_entries(entries, prefix_lens):
             for i in range(len(first))
         ]
         return None if any(m is None for m in merged) else lm.CacheList(*merged)
-    # Custom caches (e.g. MiniMaxM3KVCache) may declare their own batch merge.
+
     merge = getattr(type(first), "merge", None)
     if callable(merge) and all(type(c) is type(first) for c in entries):
         return merge(entries, prefix_lens)
     return None
-
-
-# --- plan ----------------------------------------------------------------
 
 
 @dataclass(frozen=True)

@@ -308,16 +308,12 @@ def _clone_layer_major_kv_cache_for_apc(
 
 
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    # Registry-driven (see apc_adapters); replaces the per-class isinstance ladder.
     from .apc_adapters import apc_exact_eligible
 
     return apc_exact_eligible(c)
 
 
 def _cache_entry_supports_block_apc(c: Any) -> bool:
-    # Registry-driven (see apc_adapters). Note: a KVCache *subclass* (e.g.
-    # RingSlidingKVCache) is no longer block-eligible via inheritance -- it
-    # drops to exact-only, which is correct (issue #1629).
     from .apc_adapters import apc_block_eligible
 
     return apc_block_eligible(c)
@@ -3786,32 +3782,6 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
             _collect_mx_arrays(item, out)
 
 
-def _merge_arrays_cache_entries(
-    entries: Sequence[Any],
-    prefix_lens: Sequence[int],
-) -> Any:
-    from .models import cache as lm_cache
-
-    size = len(entries[0].cache)
-    out = lm_cache.ArraysCache(size)
-    merged_states: List[Optional[mx.array]] = []
-    for state_idx in range(size):
-        states = [entry.cache[state_idx] for entry in entries]
-        sample = next((s for s in states if s is not None), None)
-        if sample is None:
-            merged_states.append(None)
-            continue
-        rows = []
-        for state in states:
-            if state is None:
-                rows.append(mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype))
-            else:
-                rows.append(state[:1])
-        merged_states.append(mx.concatenate(rows, axis=0))
-    out.cache = merged_states
-    return out
-
-
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
@@ -4226,7 +4196,7 @@ class LayerSupport:
     type_name: str
     status: str  # "ok" | "empty_ok" | "unsupported"
     reason: Optional[str] = None
-    capability: Optional[str] = None  # pageable | windowed | checkpoint | composite
+    capability: Optional[str] = None
 
 
 @dataclass

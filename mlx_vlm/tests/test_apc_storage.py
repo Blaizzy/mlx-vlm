@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import mlx.core as mx
+import pytest
 
 from mlx_vlm.apc import APCBlock, APCManager
 from mlx_vlm.apc_storage import APCNode, KVBlockHandle
+
+
+@pytest.fixture(autouse=True)
+def _seeded():
+    mx.random.seed(0)
 
 
 def _fake_kv(num_layers=2, seq_len=32, heads=2, head_dim=4):
@@ -21,19 +27,14 @@ def test_kv_block_handle_roundtrip():
     keys, values = _fake_kv(num_layers=3, seq_len=16)
     handle = KVBlockHandle(keys, values)
     assert handle.resident_bytes() == sum(t.nbytes for t in keys + values)
-    ser_k, ser_v = handle.serialize()
-    assert ser_k is not keys and len(ser_k) == 3
-    assert bool(mx.array_equal(ser_k[0], keys[0]))
     handle.release()
     assert handle.keys is None and handle.values is None
     assert handle.resident_bytes() == 0
-    assert handle.serialize() is None
 
 
 def test_kv_block_handle_empty():
     handle = KVBlockHandle()
     assert handle.resident_bytes() == 0
-    assert handle.serialize() is None
 
 
 def test_apcblock_is_node_and_delegates():
@@ -69,9 +70,9 @@ def test_store_populates_kv_component_and_accounting():
 
     stored = manager.store_kv_blocks(token_ids, keys, values)
     assert len(stored) == 2
-    # storage lives behind the "kv" component handle...
+
     assert isinstance(stored[0].kv_handle(), KVBlockHandle)
-    # ...while the per-layer read view is still indexable (test_apc pin).
+
     assert stored[0].keys[0].shape == (1, 2, block_size, 4)
 
     total = manager.resident_bytes()

@@ -133,26 +133,6 @@ class _BaseCache:
         obj.meta_state = meta_state
         return obj
 
-    # Automatic Prefix Caching snapshot/restore/merge contract (see apc_adapters).
-    def prefix_cache_snapshot(self):
-        """Return an opaque, restorable snapshot of this cache's state."""
-        return {"state": self.state, "meta_state": self.meta_state}
-
-    def prefix_cache_restore(self, snapshot):
-        """Restore a snapshot from ``prefix_cache_snapshot`` into ``self``."""
-        self.state = snapshot["state"]
-        self.meta_state = snapshot["meta_state"]
-
-    def prefix_cache_merge(self, rows, prefix_lens):
-        """Merge single-row snapshots into a batched cache, or ``None``."""
-        return None
-
-    # --- Automatic Prefix Caching (APC) contract ---------------------------
-    # A cache exposes a restorable snapshot of its state at the current prefix
-    # boundary. The default captures ``state`` + ``meta_state`` (the same pair
-    # ``from_state`` reconstructs from); caches with extra behaviour-affecting
-    # attributes should override to include them. See mlx_vlm/apc_adapters.py.
-
     def prefix_cache_snapshot(self):
         """Return an opaque, restorable snapshot of this cache's state.
 

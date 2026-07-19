@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Protocol, Tuple, runtime_checkable
+from typing import Dict, List, Optional, Protocol, runtime_checkable
 
 import mlx.core as mx
 
@@ -52,11 +52,6 @@ class KVBlockHandle:
             for t in group or ():
                 total += _array_bytes(t)
         return total
-
-    def serialize(self) -> Optional[Tuple[List[mx.array], List[mx.array]]]:
-        if self.keys is None or self.values is None:
-            return None
-        return list(self.keys), list(self.values)
 
     def release(self) -> None:
         self.keys = None
