@@ -298,7 +298,7 @@ def apc_exact_eligible(cache: Any) -> bool:
         return all(apc_exact_eligible(s) for s in cache.caches)
     if isinstance(cache, tuple):
         return all(apc_exact_eligible(s) for s in cache)
-    return False
+    return _custom_state_contract(cache)
 
 
 def apc_mode(caches: Sequence[Any]) -> Optional[str]:
@@ -453,6 +453,30 @@ def _clone_rules():
     return _CLONE_RULES
 
 
+def _custom_state_contract(c) -> bool:
+    """True if ``c`` defines its own ``state`` property, not the trivial base one."""
+    from .models.cache import _BaseCache
+
+    base_state = _BaseCache.__dict__.get("state")
+    for klass in type(c).__mro__:
+        if "state" in klass.__dict__:
+            return klass.__dict__["state"] is not base_state
+    return False
+
+
+def _state_clone(c, eval_targets):
+    """Clone via the state/meta_state contract (from_state), detaching arrays."""
+    detached = _snapshot_tree(c.state)
+    _eval_tree(detached, eval_targets)
+    from_state = getattr(type(c), "from_state", None)
+    if callable(from_state):
+        return from_state(detached, c.meta_state)
+    out = type(c).__new__(type(c))
+    out.state = detached
+    out.meta_state = c.meta_state
+    return out
+
+
 def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
     from .models import cache as lm
 
@@ -471,7 +495,9 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
             eval_targets=eval_targets,
         )
     for typ, adapter in _clone_rules():
-        if isinstance(c, typ):
+        # KVCache matches by exact type so subclasses (RingSlidingKVCache) fall through.
+        matched = type(c) is typ if typ is lm.KVCache else isinstance(c, typ)
+        if matched:
             return adapter.clone(
                 c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
             )
@@ -500,6 +526,8 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         out.keys, out.values, out.offset = copy(dk), copy(dv), dk.shape[-2]
         eval_targets.extend([out.keys, out.values])
         return out
+    if _custom_state_contract(c):
+        return _state_clone(c, eval_targets)
     return None
 
 
@@ -510,7 +538,11 @@ def merge_cache_entries(entries, prefix_lens):
         return None
     first = entries[0]
     for typ, adapter in _clone_rules():
-        if all(isinstance(c, typ) for c in entries):
+        if typ is lm.KVCache:
+            ok = all(type(c) is typ for c in entries)
+        else:
+            ok = all(isinstance(c, typ) for c in entries)
+        if ok:
             return adapter.merge_rows(entries, prefix_lens)
     if all(isinstance(c, lm.CacheList) for c in entries):
         merged = [
@@ -524,6 +556,10 @@ def merge_cache_entries(entries, prefix_lens):
             for i in range(len(first))
         ]
         return None if any(m is None for m in merged) else lm.CacheList(*merged)
+    # Custom caches (e.g. MiniMaxM3KVCache) may declare their own batch merge.
+    merge = getattr(type(first), "merge", None)
+    if callable(merge) and all(type(c) is type(first) for c in entries):
+        return merge(entries, prefix_lens)
     return None
 
 

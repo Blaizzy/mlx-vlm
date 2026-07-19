@@ -95,3 +95,53 @@ def test_apc_py_delegates_to_registry():
     assert _cache_entry_supports_exact_apc(C.ArraysCache(2)) is True
     # the fix, exercised through apc.py's public helper:
     assert _cache_entry_supports_block_apc(RingSlidingKVCache(window_size=64)) is False
+
+
+def _clone(c):
+    et = []
+    out = A.clone_cache_entry(c, min_capacity_tokens=None, eval_targets=et)
+    mx.eval(et)
+    return out
+
+
+def test_ring_sliding_clone_roundtrip():
+    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+
+    ring = RingSlidingKVCache(window_size=4)
+    assert A.apc_exact_eligible(ring) is True and A.apc_block_eligible(ring) is False
+    ring.update_and_fetch(
+        mx.random.normal((1, 2, 6, 8)), mx.random.normal((1, 2, 6, 8))
+    )
+    for _ in range(7):
+        ring.update_and_fetch(
+            mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8))
+        )
+    mx.eval(ring.keys, ring.values)
+    cl = _clone(ring)
+    assert type(cl).__name__ == "RingSlidingKVCache"
+    assert cl.window_size == ring.window_size and cl._ring_pos == ring._ring_pos
+    assert cl.prefill_length == ring.prefill_length and cl.offset == ring.offset
+    k, v = mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8))
+    ka, va = ring.update_and_fetch(k, v)
+    kb, vb = cl.update_and_fetch(k, v)
+    mx.eval(ka, va, kb, vb)
+    assert bool(mx.array_equal(ka, kb)) and bool(mx.array_equal(va, vb))
+
+
+def test_minimax_clone_roundtrip():
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+    mm = MiniMaxM3KVCache()
+    assert A.apc_exact_eligible(mm) is True
+    mm.update_and_fetch(mx.random.normal((1, 2, 5, 8)), mx.random.normal((1, 2, 5, 8)))
+    mm.update_index_and_fetch(mx.random.normal((1, 2, 5, 8)))
+    mx.eval(mm.state[0], mm.index_keys)
+    mc = _clone(mm)
+    assert (
+        type(mc).__name__ == "MiniMaxM3KVCache" and mc.index_offset == mm.index_offset
+    )
+    k, v = mx.random.normal((1, 2, 1, 8)), mx.random.normal((1, 2, 1, 8))
+    oa, _ = mm.update_and_fetch(k, v)
+    ob, _ = mc.update_and_fetch(k, v)
+    mx.eval(oa, ob)
+    assert bool(mx.array_equal(oa, ob))
