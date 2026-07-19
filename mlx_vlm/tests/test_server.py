@@ -538,17 +538,6 @@ def test_speculative_server_reads_batch_coalesce_env(monkeypatch):
     assert server.get_speculative_batch_coalesce_s() == pytest.approx(0.005)
 
 
-def test_server_reads_prefill_delayer_env(monkeypatch):
-    monkeypatch.delenv("MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS", raising=False)
-    assert server_generation.get_prefill_delayer_max_delay_s() == pytest.approx(5.0)
-
-    monkeypatch.setenv("MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS", "250")
-    assert server_generation.get_prefill_delayer_max_delay_s() == pytest.approx(0.25)
-
-    monkeypatch.setenv("MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS", "bad")
-    assert server_generation.get_prefill_delayer_max_delay_s() == pytest.approx(5.0)
-
-
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     class FakeResponseGenerator:
         def __init__(self, model_path, adapter_path=None, **kwargs):
@@ -4670,9 +4659,7 @@ class TestResponseGenerator:
         assert [bg.sampler for bg in created] == ["sampler-0.0", "sampler-0.6"]
         assert created[0].closed is True
 
-    def test_scheduler_emits_before_prefill_and_applies_prompt_progress(
-        self, monkeypatch
-    ):
+    def test_scheduler_emits_before_prefill_and_applies_prompt_progress(self):
         class SimpleTokenizer:
             vocab = {"hi": 0}
 
@@ -4716,15 +4703,6 @@ class TestResponseGenerator:
                 "cached_tokens": 0,
             }
         }
-        yield_calls = []
-
-        def yield_to_consumer(seconds):
-            assert seconds == 0
-            assert not rqueue.empty(), "decode response must be emitted before yielding"
-            yield_calls.append(seconds)
-
-        monkeypatch.setattr(server_generation.time, "sleep", yield_to_consumer)
-
         batch = PromptProgressBatch()
         gen._scheduler_iteration(batch, active)
 
@@ -4738,11 +4716,10 @@ class TestResponseGenerator:
         assert item.prompt_tps == pytest.approx(184.431)
         assert item.cached_tokens == 7
         assert rqueue.get() is None
-        assert yield_calls == [0, 0]
 
-    def test_scheduler_runs_one_decode_before_one_prefill(self):
+    def test_scheduler_prefills_pending_prompt_after_decode(self):
         class PhasedBatch:
-            has_pending_prompts = False
+            has_pending_prompts = True
 
             def __init__(self):
                 self.calls = []
@@ -4782,95 +4759,6 @@ class TestResponseGenerator:
 
         assert batch.calls == ["decode", "prefill"]
         assert rqueue.get().token == 0
-
-    def test_scheduler_delays_prefill_while_decode_is_progressing(self, monkeypatch):
-        class RunningBatch:
-            has_pending_prompts = True
-
-            def __init__(self):
-                self.calls = []
-
-            def decode_step(self):
-                self.calls.append("decode")
-                return [
-                    SimpleNamespace(
-                        uid=1,
-                        token=0,
-                        token_logprob=0.0,
-                        finish_reason=None,
-                    )
-                ]
-
-            def prefill_step(self):
-                self.calls.append("prefill")
-                return []
-
-        class Streamer:
-            def advance(self, token, finish_reason):
-                return str(token)
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: 10.0)
-        rqueue = Queue()
-        active = {
-            1: {
-                "rqueue": rqueue,
-                "streamer": Streamer(),
-                "prompt_tps": None,
-                "cached_tokens": 0,
-            }
-        }
-        batch = RunningBatch()
-
-        gen._scheduler_iteration(batch, active)
-
-        assert batch.calls == ["decode"]
-        assert gen._prefill_delay_started_at == 10.0
-        assert rqueue.get().token == 0
-
-    def test_scheduler_releases_prefill_after_delay_deadline(self, monkeypatch):
-        class RunningBatch:
-            has_pending_prompts = True
-
-            def __init__(self):
-                self.calls = []
-
-            def decode_step(self):
-                self.calls.append("decode")
-                return [
-                    SimpleNamespace(
-                        uid=1,
-                        token=0,
-                        token_logprob=0.0,
-                        finish_reason=None,
-                    )
-                ]
-
-            def prefill_step(self):
-                self.calls.append("prefill")
-                return []
-
-        class Streamer:
-            def advance(self, token, finish_reason):
-                return str(token)
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen._prefill_delay_started_at = 10.0
-        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: 15.0)
-        active = {
-            1: {
-                "rqueue": Queue(),
-                "streamer": Streamer(),
-                "prompt_tps": None,
-                "cached_tokens": 0,
-            }
-        }
-        batch = RunningBatch()
-
-        gen._scheduler_iteration(batch, active)
-
-        assert batch.calls == ["decode", "prefill"]
-        assert gen._prefill_delay_started_at is None
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
