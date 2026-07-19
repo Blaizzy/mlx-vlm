@@ -453,7 +453,18 @@ class GenerationTimings(BaseModel):
             )
         cached_tokens = metrics.cached_tokens
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
-        prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
+        measured_prompt_tps = getattr(metrics, "measured_prompt_tps", None)
+        prompt_tps = getattr(metrics, "prompt_rate", None)
+        if prompt_tps is None:
+            prompt_tps = metrics.prompt_tps
+        prompt_rate_tokens = (
+            prompt_n if measured_prompt_tps is not None else prompt_tokens
+        )
+        prompt_s = (
+            prompt_rate_tokens / prompt_tps
+            if prompt_tps and prompt_rate_tokens
+            else 0.0
+        )
         prompt_ms = prompt_s * 1000.0
         predicted_ms = (
             output_tokens / generation_tps * 1000.0 if generation_tps else 0.0
@@ -478,6 +489,16 @@ class StreamingTimings(BaseModel):
     """Timing data available while a response is still streaming."""
 
     predicted_per_second: Optional[float] = None
+
+
+class PrefillTimings(BaseModel):
+    """Timing data for one chunked-prefill update."""
+
+    prompt_n: int
+    prompt_total: int
+    cache_n: int
+    prompt_per_second: Optional[float]
+    prompt_complete: bool
 
 
 class OpenAIErrorObject(BaseModel):
@@ -862,7 +883,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
-    timings: Optional[Union[GenerationTimings, StreamingTimings]] = None
+    timings: Optional[Union[GenerationTimings, StreamingTimings, PrefillTimings]] = None
 
 
 # Models for Anthropic-compatible /v1/messages endpoint

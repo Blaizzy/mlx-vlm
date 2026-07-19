@@ -28,6 +28,7 @@ from ..utils import prepare_inputs
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
+    StreamingPrefillProgress,
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
@@ -69,6 +70,7 @@ from .schemas import (
     OpenAIRequest,
     OpenAIResponse,
     OpenAIUsage,
+    PrefillTimings,
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
@@ -97,6 +99,16 @@ _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".
 _MISSING_INPUT_DETAIL = (
     "Request must include at least one non-empty message content or media input."
 )
+
+
+def _prefill_timings(progress: StreamingPrefillProgress) -> PrefillTimings:
+    return PrefillTimings(
+        prompt_n=progress.prompt_tokens,
+        prompt_total=progress.total_prompt_tokens,
+        cache_n=progress.cached_tokens,
+        prompt_per_second=progress.prompt_per_second,
+        prompt_complete=progress.completed,
+    )
 
 
 def _has_non_empty_text(value: Any) -> bool:
@@ -1079,6 +1091,7 @@ async def responses_endpoint(request: Request):
                     streamed_reasoning = ""
 
                     if runtime.response_generator is not None:
+                        gen_args.stream_prefill_progress = True
                         # generate() blocks on _cpu_preprocess + queue.get;
                         # offload so concurrent handlers preprocess in parallel.
                         ctx, token_iter = await asyncio.to_thread(
@@ -1102,6 +1115,22 @@ async def responses_endpoint(request: Request):
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
+                            if isinstance(token, StreamingPrefillProgress):
+                                metrics.record_prefill(token)
+                                event_type = (
+                                    "response.prefill.done"
+                                    if token.completed
+                                    else "response.prefill.delta"
+                                )
+                                yield _response_sse_event(
+                                    event_type,
+                                    {
+                                        "type": event_type,
+                                        "response_id": response_id,
+                                        "timings": _prefill_timings(token).model_dump(),
+                                    },
+                                )
+                                continue
                             output_tokens += getattr(token, "token_count", 1)
                             raw_delta = token.text
                             full_text += raw_delta
@@ -1312,7 +1341,7 @@ async def responses_endpoint(request: Request):
                         request_elapsed_s=time.perf_counter() - request_start,
                         request_started_s=request_start,
                         token_times=metrics.token_times,
-                        prompt_tps=metrics.prompt_tps,
+                        prompt_tps=metrics.prompt_rate,
                         generation_tps=metrics.generation_tps,
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
@@ -1516,7 +1545,7 @@ async def responses_endpoint(request: Request):
                     request_elapsed_s=elapsed,
                     request_started_s=request_start,
                     token_times=metrics.token_times,
-                    prompt_tps=metrics.prompt_tps,
+                    prompt_tps=metrics.prompt_rate,
                     generation_tps=metrics.generation_tps,
                     peak_memory_gb=metrics.peak_memory or None,
                     finish_reason=finish_reason,
@@ -1735,6 +1764,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
+                        gen_args.stream_prefill_progress = True
                         # generate() does blocking Queue.get — run off event loop
                         generate_kwargs = {"args": gen_args}
                         if videos:
@@ -1770,6 +1800,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
+                            if isinstance(token, StreamingPrefillProgress):
+                                metrics.record_prefill(token)
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    choices=[],
+                                    timings=_prefill_timings(token),
+                                )
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                continue
                             output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)
@@ -1982,7 +2023,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         request_elapsed_s=time.perf_counter() - request_start,
                         request_started_s=request_start,
                         token_times=metrics.token_times,
-                        prompt_tps=metrics.prompt_tps,
+                        prompt_tps=metrics.prompt_rate,
                         generation_tps=metrics.generation_tps,
                         peak_memory_gb=metrics.peak_memory or None,
                         finish_reason=finish_reason,
@@ -2248,7 +2289,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     request_elapsed_s=elapsed,
                     request_started_s=request_start,
                     token_times=metrics.token_times,
-                    prompt_tps=metrics.prompt_tps,
+                    prompt_tps=metrics.prompt_rate,
                     generation_tps=metrics.generation_tps,
                     peak_memory_gb=metrics.peak_memory or None,
                     finish_reason=(

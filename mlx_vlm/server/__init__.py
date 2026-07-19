@@ -64,6 +64,7 @@ from .generation import (
     PromptTooLongError,
     ResponseGenerator,
     ServerMetricsStore,
+    StreamingPrefillProgress,
     StreamingToken,
     _build_metrics_envelope,
     _check_configured_context_budget,
