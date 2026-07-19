@@ -133,6 +133,34 @@ class _BaseCache:
         obj.meta_state = meta_state
         return obj
 
+    # --- Automatic Prefix Caching (APC) contract ---------------------------
+    # A cache exposes a restorable snapshot of its state at the current prefix
+    # boundary. The default captures ``state`` + ``meta_state`` (the same pair
+    # ``from_state`` reconstructs from); caches with extra behaviour-affecting
+    # attributes should override to include them. See mlx_vlm/apc_adapters.py.
+
+    def prefix_cache_snapshot(self):
+        """Return an opaque, restorable snapshot of this cache's state.
+
+        The returned object must round-trip through ``prefix_cache_restore``
+        into a fresh cache from ``model.make_cache()``. References are returned
+        as-is; the caller (adapter) is responsible for any detaching copy.
+        """
+        return {"state": self.state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore a snapshot from :meth:`prefix_cache_snapshot` into ``self``."""
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge single-row snapshots into a batched cache, or ``None``.
+
+        Default: not batch-mergeable. Pageable/windowed caches override to
+        return a batched cache built from ``rows``.
+        """
+        return None
+
 
 def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
     """Dequantize uniform-quantized K/V tuples to raw float arrays.
