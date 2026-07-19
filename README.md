@@ -434,13 +434,6 @@ inter-token rate, while terminal and usage chunks report the aggregate rate as
 `(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
 `null` because it has no preceding token interval.
 
-When chunked prefill is active, timing-only SSE events are emitted with empty
-choices and `timings.prompt_n`, `prompt_total`, `cache_n`,
-`prompt_per_second`, and `prompt_complete`. Prefill progress events report each
-chunk's instantaneous rate; the completed prefill event reports aggregate prompt
-throughput. The Responses API emits the same payload as
-`response.prefill.delta` and `response.prefill.done` events.
-
 You can also set trust remote code via environment variable:
 ```sh
 MLX_TRUST_REMOTE_CODE=true mlx_vlm.server

@@ -2000,67 +2000,6 @@ def test_responses_streaming_emits_reasoning_events(client):
     assert completed["output_text"] == "Done."
 
 
-def test_responses_streaming_emits_prefill_progress(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-
-    class FakeResponseGenerator:
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            assert args.stream_prefill_progress is True
-            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
-                [
-                    server.StreamingPrefillProgress(
-                        prompt_tokens=4,
-                        total_prompt_tokens=8,
-                        cached_tokens=0,
-                        prompt_per_second=100.0,
-                        completed=False,
-                        emitted_at=9.5,
-                    ),
-                    server.StreamingPrefillProgress(
-                        prompt_tokens=8,
-                        total_prompt_tokens=8,
-                        cached_tokens=0,
-                        prompt_per_second=80.0,
-                        completed=True,
-                        emitted_at=10.0,
-                    ),
-                    server.StreamingToken(
-                        text="done",
-                        token=1,
-                        logprobs=0.0,
-                        finish_reason="stop",
-                        emitted_at=10.25,
-                    ),
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-    ):
-        response = client.post(
-            "/v1/responses",
-            json={"model": "demo", "input": "hello", "stream": True},
-        )
-
-    assert response.status_code == 200
-    events = _sse_events(response.text)
-    progress = next(data for kind, data in events if kind == "response.prefill.delta")
-    completed = next(data for kind, data in events if kind == "response.prefill.done")
-    assert progress["timings"]["prompt_n"] == 4
-    assert progress["timings"]["prompt_per_second"] == 100.0
-    assert completed["timings"]["prompt_n"] == 8
-    assert completed["timings"]["prompt_per_second"] == 80.0
-
-
 def test_responses_streaming_emits_function_call_arguments_done(client):
     server.response_store.clear()
     server.response_store_order.clear()
@@ -2775,22 +2714,6 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         def generate(self, prompt, images=None, audio=None, args=None):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
-                    server.StreamingPrefillProgress(
-                        prompt_tokens=4,
-                        total_prompt_tokens=8,
-                        cached_tokens=2,
-                        prompt_per_second=100.0,
-                        completed=False,
-                        emitted_at=9.5,
-                    ),
-                    server.StreamingPrefillProgress(
-                        prompt_tokens=8,
-                        total_prompt_tokens=8,
-                        cached_tokens=2,
-                        prompt_per_second=80.0,
-                        completed=True,
-                        emitted_at=10.0,
-                    ),
                     server.StreamingToken(
                         text="hi",
                         token=1,
@@ -2837,27 +2760,7 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     timed_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
     assert timed_chunk["choices"] == []
     assert timed_chunk["timings"]["cache_n"] == 2
-    assert timed_chunk["timings"]["prompt_per_second"] == 80.0
     assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
-    prefill_chunks = [
-        chunk for chunk in chunks if not chunk["choices"] and chunk.get("usage") is None
-    ]
-    assert [chunk["timings"] for chunk in prefill_chunks] == [
-        {
-            "prompt_n": 4,
-            "prompt_total": 8,
-            "cache_n": 2,
-            "prompt_per_second": 100.0,
-            "prompt_complete": False,
-        },
-        {
-            "prompt_n": 8,
-            "prompt_total": 8,
-            "cache_n": 2,
-            "prompt_per_second": 80.0,
-            "prompt_complete": True,
-        },
-    ]
     token_chunks = [
         chunk
         for chunk in chunks
@@ -4112,38 +4015,6 @@ class TestResponseGenerator:
         gen._log_prefill_progress(SimpleNamespace(_prompt_batch=prompt_batch), active)
 
         assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
-
-    def test_chunked_prefill_progress_is_streamed(self, monkeypatch):
-        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: 10.0)
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        prompt_batch = SimpleNamespace(
-            _processed_prompt_columns=2,
-            _inputs_embeds=mx.zeros((1, 4, 8)),
-            uids=[1],
-            _suffix_lens=[6],
-            _cached_tokens_per_row=[0],
-            _left_padding_per_row=[0],
-            _right_pad_per_row=None,
-        )
-        rqueue = Queue()
-        active = {
-            1: {
-                "request_id": "req-1",
-                "rqueue": rqueue,
-                "stream_prefill_progress": True,
-                "prefill_processed": -1,
-                "prefill_uncached_processed": 0,
-                "prefill_last_at": 9.5,
-            }
-        }
-
-        gen._log_prefill_progress(SimpleNamespace(_prompt_batch=prompt_batch), active)
-
-        progress = rqueue.get_nowait()
-        assert progress.prompt_tokens == 2
-        assert progress.total_prompt_tokens == 6
-        assert progress.prompt_per_second == pytest.approx(4.0)
-        assert progress.completed is False
 
     def test_token_iterator_reports_timeout_and_cancels_request(self, monkeypatch):
         gen = self._bare_generator()

@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from types import SimpleNamespace
 from typing import Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -707,7 +706,6 @@ class GenerationArguments:
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
-    stream_prefill_progress: bool = False
 
     def diffusion_kwargs(self) -> dict:
         """Diffusion-only generation kwargs explicitly supplied by a request."""
@@ -792,18 +790,6 @@ class GenerationContext:
 
 
 @dataclass
-class StreamingPrefillProgress:
-    """A chunked-prefill timing update for streaming clients."""
-
-    prompt_tokens: int
-    total_prompt_tokens: int
-    cached_tokens: int
-    prompt_per_second: Optional[float]
-    completed: bool
-    emitted_at: float
-
-
-@dataclass
 class QueuedGenerationRequest:
     """Preprocessed generation request waiting for the GPU worker."""
 
@@ -815,7 +801,6 @@ class QueuedGenerationRequest:
     images: Optional[List] = None
     videos: Optional[List] = None
     audio: Optional[List] = None
-    stream_prefill_progress: bool = False
     request_id: Optional[str] = None
     queued_at: float = field(default_factory=time.perf_counter)
 
@@ -833,7 +818,6 @@ class GenerationMetrics:
     last_chunk_rate: Optional[float] = None
     generated_tokens: int = 0
     first_chunk_tokens: int = 0
-    measured_prompt_tps: Optional[float] = None
 
     def record_chunk(self, chunk) -> Optional[float]:
         now = getattr(chunk, "emitted_at", None) or time.perf_counter()
@@ -866,12 +850,6 @@ class GenerationMetrics:
         measured_tokens = self.generated_tokens - self.first_chunk_tokens
         return measured_tokens / elapsed if elapsed > 0 else None
 
-    @property
-    def prompt_rate(self) -> Optional[float]:
-        if self.measured_prompt_tps is not None:
-            return self.measured_prompt_tps
-        return self.prompt_tps
-
     def record_result(self, result) -> None:
         self.peak_memory = max(
             self.peak_memory, float(getattr(result, "peak_memory", 0.0) or 0.0)
@@ -885,11 +863,6 @@ class GenerationMetrics:
         cached_tokens = getattr(result, "cached_tokens", None)
         if cached_tokens is not None:
             self.cached_tokens = max(self.cached_tokens, int(cached_tokens))
-
-    def record_prefill(self, progress: StreamingPrefillProgress) -> None:
-        self.cached_tokens = max(self.cached_tokens, progress.cached_tokens)
-        if progress.completed:
-            self.measured_prompt_tps = progress.prompt_per_second
 
 
 @dataclass
@@ -1196,7 +1169,6 @@ class ResponseGenerator:
             images=images,
             videos=videos,
             audio=audio,
-            stream_prefill_progress=args.stream_prefill_progress,
             request_id=request_id,
             queued_at=request_started_at,
         )
@@ -1270,12 +1242,8 @@ class ResponseGenerator:
         )
         return {
             "request_id": request_id,
-            "rqueue": request.rqueue,
-            "stream_prefill_progress": request.stream_prefill_progress,
             "queued_at": request.queued_at,
             "prefill_started_at": now,
-            "prefill_last_at": now,
-            "prefill_uncached_processed": 0,
             "prefill_processed": -1,
             "generated_tokens": 0,
             "decode_started_at": None,
@@ -1283,7 +1251,7 @@ class ResponseGenerator:
         }
 
     def _log_prefill_progress(self, batch_gen, active: dict) -> None:
-        """Report and optionally stream each chunked-prefill step."""
+        """Report each chunked-prefill step without changing generation output."""
         prompt_batch = getattr(batch_gen, "_prompt_batch", None)
         if prompt_batch is None:
             return
@@ -1321,56 +1289,23 @@ class ResponseGenerator:
             if processed <= int(info.get("prefill_processed", -1)):
                 continue
             info["prefill_processed"] = processed
-            previous_processed = int(info.get("prefill_uncached_processed", 0) or 0)
-            now = time.perf_counter()
-            previous_at = float(info.get("prefill_last_at", now) or now)
-            chunk_tokens = max(0, suffix_processed - previous_processed)
-            chunk_elapsed = max(0.0, now - previous_at)
-            prompt_per_second = (
-                chunk_tokens / chunk_elapsed
-                if chunk_tokens > 0 and chunk_elapsed > 0
-                else None
-            )
-            info["prefill_uncached_processed"] = suffix_processed
-            info["prefill_last_at"] = now
             percent = 100.0 * processed / total if total > 0 else 100.0
             logger.info(
-                "Prefill progress: request=%s tokens=%d/%d (%.1f%%) rate=%s",
+                "Prefill progress: request=%s tokens=%d/%d (%.1f%%)",
                 info.get("request_id", uid),
                 processed,
                 total,
                 percent,
-                (
-                    "n/a"
-                    if prompt_per_second is None
-                    else f"{prompt_per_second:.1f} tok/s"
-                ),
             )
-            if info.get("stream_prefill_progress"):
-                info["rqueue"].put(
-                    StreamingPrefillProgress(
-                        prompt_tokens=suffix_processed,
-                        total_prompt_tokens=suffix_len,
-                        cached_tokens=cached,
-                        prompt_per_second=prompt_per_second,
-                        completed=False,
-                        emitted_at=now,
-                    )
-                )
 
     @staticmethod
-    def _log_prefill_completed(uid, info: dict, prompt_response) -> float:
+    def _log_prefill_completed(uid, info: dict, prompt_response) -> None:
         prompt_tokens = int(getattr(prompt_response, "prompt_tokens", 0) or 0)
         cached_tokens = int(getattr(prompt_response, "cached_tokens", 0) or 0)
-        now = time.perf_counter()
-        prefill_started_at = float(info.get("prefill_started_at", now) or now)
-        prompt_time = max(0.0, now - prefill_started_at)
-        uncached_tokens = max(0, prompt_tokens - cached_tokens)
-        prompt_tps = (
-            uncached_tokens / prompt_time
-            if uncached_tokens > 0 and prompt_time > 0
-            else 0.0
-        )
+        prompt_tps = float(getattr(prompt_response, "prompt_tps", 0.0) or 0.0)
+        prompt_time = float(getattr(prompt_response, "prompt_time", 0.0) or 0.0)
+        if prompt_time <= 0 and prompt_tps > 0:
+            prompt_time = prompt_tokens / prompt_tps
         info["prefill_processed"] = prompt_tokens
         logger.info(
             "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
@@ -1381,18 +1316,6 @@ class ResponseGenerator:
             prompt_time,
             prompt_tps,
         )
-        if info.get("stream_prefill_progress"):
-            info["rqueue"].put(
-                StreamingPrefillProgress(
-                    prompt_tokens=uncached_tokens,
-                    total_prompt_tokens=uncached_tokens,
-                    cached_tokens=cached_tokens,
-                    prompt_per_second=prompt_tps,
-                    completed=True,
-                    emitted_at=now,
-                )
-            )
-        return prompt_tps
 
     @staticmethod
     def _log_decode_progress(
@@ -1898,7 +1821,17 @@ class ResponseGenerator:
         def on_result(result):
             nonlocal prefill_logged
             if not prefill_logged and getattr(result, "prompt_tps", None) is not None:
-                self._log_prefill_completed(uid, log_state, result)
+                prompt_tps = float(result.prompt_tps or 0.0)
+                prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+                logger.info(
+                    "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
+                    "elapsed=%.3fs rate=%.1f tok/s",
+                    log_state.get("request_id", uid),
+                    prompt_tokens,
+                    int(getattr(result, "cached_tokens", 0) or 0),
+                    prompt_tokens / prompt_tps if prompt_tps > 0 else 0.0,
+                    prompt_tps,
+                )
                 prefill_logged = True
             for chunk in emitter.feed(result):
                 chunk.emitted_at = self._log_decode_progress(
@@ -2046,6 +1979,7 @@ class ResponseGenerator:
                 ):
                     prefill_step_size = None
 
+                prompt_started = time.perf_counter()
                 out, input_mx = _run_chunked_speculative_prefill(
                     lm,
                     input_mx,
@@ -2066,12 +2000,21 @@ class ResponseGenerator:
                     positions=[0] * B,
                 )
                 mx.eval(first_bonus, hidden, out.logits)
+                prompt_elapsed = time.perf_counter() - prompt_started
                 for uid in uids:
                     prompt_tokens = prompt_tokens_map[uid]
-                    prompt_tps_map[uid] = self._log_prefill_completed(
-                        uid,
-                        stream_infos[uid],
-                        SimpleNamespace(prompt_tokens=prompt_tokens, cached_tokens=0),
+                    prompt_tps_map[uid] = (
+                        prompt_tokens / prompt_elapsed
+                        if prompt_tokens > 0 and prompt_elapsed > 0
+                        else None
+                    )
+                    logger.info(
+                        "Prefill completed: request=%s prompt_tokens=%d "
+                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        stream_infos[uid].get("request_id", uid),
+                        prompt_tokens,
+                        prompt_elapsed,
+                        float(prompt_tps_map[uid] or 0.0),
                     )
 
                 finished_uids = set()
