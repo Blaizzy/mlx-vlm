@@ -3,6 +3,7 @@
 import logging
 import sys
 from argparse import Namespace
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -531,6 +532,91 @@ class TestBatchGenerator:
         assert gen.model == mock_model.language_model
         assert len(gen._generation_batch) == 0
         assert gen.uid_count == 0
+
+    def test_background_prefill_materializes_before_handoff(self, monkeypatch):
+        class FakePromptBatch:
+            def __init__(self):
+                self.uids = [7]
+                self.steps = 0
+                self.recorded_time = None
+
+            def needs_processing(self):
+                return self.steps < 2
+
+            def prompt_step(self, *, clear_cache=True):
+                assert clear_cache is False
+                self.steps += 1
+
+            def generate(self, *args, **kwargs):
+                return generation_batch
+
+            def record_prompt_time(self, elapsed):
+                self.recorded_time = elapsed
+
+            def prompt_progress(self):
+                return [ar_module.PromptProgress(uid=7, prompt_tokens=4)]
+
+            def _release_apc_meta_blocks(self):
+                raise AssertionError("successful prefill must not release APC blocks")
+
+        generation_batch = MagicMock()
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._wire_stack = None
+        gen._prefill_worker_state = ar_module.threading.local()
+        gen._cancelled_background_prefill_uids = set()
+        gen.sampler = object()
+        gen.tokenizer = SimpleNamespace(stopping_criteria=object())
+        gen.compute_logprobs = False
+        gen.top_logprobs_k = 0
+        prompt_batch = FakePromptBatch()
+
+        worker_stream = object()
+        monkeypatch.setattr(ar_module.mx, "new_stream", lambda device: worker_stream)
+        monkeypatch.setattr(ar_module.mx, "stream", lambda stream: nullcontext())
+        synchronize = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "synchronize", synchronize)
+        ticks = iter([10.0, 10.5])
+        monkeypatch.setattr(ar_module.time, "perf_counter", lambda: next(ticks))
+
+        completed = gen._run_background_prefill(prompt_batch)
+
+        assert prompt_batch.steps == 2
+        assert generation_batch._eval_pending_state.call_count == 1
+        assert synchronize.call_count == 3
+        assert completed.elapsed_s == pytest.approx(0.5)
+        assert completed.progress[0].uid == 7
+
+    def test_background_prefill_stops_when_all_rows_are_cancelled(self, monkeypatch):
+        prompt_batch = SimpleNamespace(
+            uids=[7],
+            needs_processing=lambda: True,
+            _release_apc_meta_blocks=MagicMock(),
+        )
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._wire_stack = None
+        gen._prefill_worker_state = ar_module.threading.local()
+        gen._cancelled_background_prefill_uids = {7}
+
+        worker_stream = object()
+        monkeypatch.setattr(ar_module.mx, "new_stream", lambda device: worker_stream)
+        monkeypatch.setattr(ar_module.mx, "stream", lambda stream: nullcontext())
+
+        completed = gen._run_background_prefill(prompt_batch)
+
+        prompt_batch._release_apc_meta_blocks.assert_called_once_with()
+        assert completed.generation_batch is None
+        assert completed.progress == []
+
+    def test_pending_background_prefill_never_blocks_active_decode(self):
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._wire_stack = None
+        gen._prefill_future = MagicMock()
+        gen._prefill_future.done.return_value = False
+        gen._generation_batch = MagicMock()
+        gen._generation_batch.__len__.return_value = 1
+
+        assert gen._poll_background_prefill() == []
+        gen._prefill_future.result.assert_not_called()
 
     def test_insert_prompts(self, mock_model, mock_processor):
         gen = BatchGenerator(

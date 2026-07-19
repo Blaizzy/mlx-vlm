@@ -1380,6 +1380,7 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=get_prefill_step_size(),
+                            background_prefill=True,
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
