@@ -323,38 +323,19 @@ def _clone_layer_major_kv_cache_for_apc(
 
 
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    from .models import cache as lm_cache
+    # Registry-driven (see apc_adapters); replaces the per-class isinstance ladder.
+    from .apc_adapters import apc_exact_eligible
 
-    if isinstance(
-        c,
-        (
-            lm_cache.KVCache,
-            lm_cache.BatchKVCache,
-            lm_cache.BatchRotatingKVCache,
-            lm_cache.BatchQuantizedKVCache,
-            lm_cache.RotatingKVCache,
-            lm_cache.ChunkedKVCache,
-            lm_cache.ArraysCache,
-        ),
-    ):
-        return True
-    if hasattr(c, "dequantize_for_apc"):
-        return True
-    if isinstance(c, lm_cache.CacheList):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
-    if isinstance(c, tuple):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c)
-    return False
+    return apc_exact_eligible(c)
 
 
 def _cache_entry_supports_block_apc(c: Any) -> bool:
-    from .models import cache as lm_cache
+    # Registry-driven (see apc_adapters). Note: a KVCache *subclass* (e.g.
+    # RingSlidingKVCache) is no longer block-eligible via inheritance -- it
+    # drops to exact-only, which is correct (issue #1629).
+    from .apc_adapters import apc_block_eligible
 
-    if isinstance(c, lm_cache.KVCache):
-        return True
-    if hasattr(c, "dequantize_for_apc"):
-        return True
-    return False
+    return apc_block_eligible(c)
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:

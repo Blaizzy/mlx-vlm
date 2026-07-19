@@ -287,6 +287,69 @@ def resolve_adapter_by_capability(cap: Capability) -> PrefixStateAdapter:
     return _ADAPTERS[cap]
 
 
+# --- APC mode eligibility (phase 2) --------------------------------------
+# Registry-driven replacement for apc.py's hard-coded isinstance ladders in
+# ``_cache_entry_supports_block_apc`` / ``_cache_entry_supports_exact_apc`` /
+# ``model_apc_mode``. Behaviour-preserving vs the ladders except for one
+# intentional fix (issue #1629): block reuse requires an *exact* pageable type,
+# so a ``KVCache`` subclass (e.g. RingSlidingKVCache) no longer inherits
+# block-eligibility -- it drops to exact-only, which is correct.
+
+_APC_EXACT_TYPES: Optional[tuple] = None
+_APC_BLOCK_TYPES: Optional[set] = None
+
+
+def _apc_type_tables():
+    global _APC_EXACT_TYPES, _APC_BLOCK_TYPES
+    if _APC_EXACT_TYPES is None:
+        from .models import cache as c
+
+        _APC_EXACT_TYPES = (
+            c.KVCache,
+            c.BatchKVCache,
+            c.BatchRotatingKVCache,
+            c.BatchQuantizedKVCache,
+            c.RotatingKVCache,
+            c.ChunkedKVCache,
+            c.ArraysCache,
+        )
+        _APC_BLOCK_TYPES = {c.KVCache}
+    return _APC_EXACT_TYPES, _APC_BLOCK_TYPES
+
+
+def apc_block_eligible(cache: Any) -> bool:
+    """True if ``cache`` supports block-level (pageable KV) APC reuse."""
+    if hasattr(cache, "dequantize_for_apc"):
+        return True
+    _, block_types = _apc_type_tables()
+    return type(cache) in block_types
+
+
+def apc_exact_eligible(cache: Any) -> bool:
+    """True if ``cache`` supports exact whole-prefix snapshot APC reuse."""
+    from .models import cache as c
+
+    exact_types, _ = _apc_type_tables()
+    if isinstance(cache, exact_types) or hasattr(cache, "dequantize_for_apc"):
+        return True
+    if isinstance(cache, c.CacheList):
+        return all(apc_exact_eligible(s) for s in cache.caches)
+    if isinstance(cache, tuple):
+        return all(apc_exact_eligible(s) for s in cache)
+    return False
+
+
+def apc_mode(caches: Sequence[Any]) -> Optional[str]:
+    """APC strategy for a prompt cache: ``"block"``, ``"exact"`` or ``None``."""
+    if not caches:
+        return None
+    if all(apc_block_eligible(c) for c in caches):
+        return "block"
+    if all(apc_exact_eligible(c) for c in caches):
+        return "exact"
+    return None
+
+
 # --- plan ----------------------------------------------------------------
 
 
