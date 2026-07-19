@@ -814,10 +814,37 @@ class GenerationMetrics:
     cached_tokens: int = 0
     prompt_tps: Optional[float] = None
     generation_tps: Optional[float] = None
+    last_chunk_at: Optional[float] = None
+    last_chunk_rate: Optional[float] = None
+    generated_tokens: int = 0
 
-    def record_chunk(self, chunk) -> None:
-        self.token_times.append(time.perf_counter())
+    def record_chunk(self, chunk) -> Optional[float]:
+        now = time.perf_counter()
+        token_count = getattr(chunk, "token_count", None)
+        if token_count is None:
+            generation_tokens = getattr(chunk, "generation_tokens", None)
+            token_count = (
+                max(0, int(generation_tokens) - self.generated_tokens)
+                if generation_tokens is not None
+                else 1
+            )
+        emitted_tokens = max(0, int(token_count or 0))
+        self.last_chunk_rate = None
+        if emitted_tokens > 0:
+            self.generated_tokens += emitted_tokens
+            if self.last_chunk_at is not None and now > self.last_chunk_at:
+                self.last_chunk_rate = emitted_tokens / (now - self.last_chunk_at)
+            self.last_chunk_at = now
+            self.token_times.append(now)
         self.record_result(chunk)
+        return self.last_chunk_rate
+
+    @property
+    def rate(self) -> Optional[float]:
+        if not self.token_times:
+            return None
+        elapsed = self.token_times[-1] - self.token_times[0]
+        return self.generated_tokens / elapsed if elapsed > 0 else 0.0
 
     def record_result(self, result) -> None:
         self.peak_memory = max(
@@ -1308,7 +1335,7 @@ class ResponseGenerator:
             if previous_token_at is not None and now > previous_token_at:
                 token_rate = emitted_tokens / (now - previous_token_at)
             info["last_token_at"] = now
-        token_rate_text = "n/a" if token_rate is None else f"{token_rate:.1f} tok/s"
+        progress_rate_text = "n/a" if token_rate is None else f"{token_rate:.1f} tok/s"
 
         decode_started_at = info.get("decode_started_at")
         if decode_started_at is None:
@@ -1331,12 +1358,11 @@ class ResponseGenerator:
         if debug_enabled:
             logger.debug(
                 "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%.1f tok/s token_rate=%s token_number=%d token_id=%s text=%r",
+                "rate=%s token_number=%d token_id=%s text=%r",
                 request_id,
                 generated_tokens,
                 elapsed,
-                rate,
-                token_rate_text,
+                progress_rate_text,
                 generated_tokens,
                 token,
                 text,
@@ -1345,23 +1371,21 @@ class ResponseGenerator:
         if finish_reason is not None:
             logger.info(
                 "Decode completed: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%.1f tok/s token_rate=%s finish_reason=%s",
+                "rate=%.1f tok/s finish_reason=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
                 rate,
-                token_rate_text,
                 finish_reason,
             )
         elif crossed_interval and not debug_enabled:
             logger.info(
                 "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%.1f tok/s token_rate=%s",
+                "rate=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
-                rate,
-                token_rate_text,
+                progress_rate_text,
             )
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:

@@ -1967,24 +1967,31 @@ def test_responses_streaming_emits_reasoning_events(client):
 
     assert response.status_code == 200
     events = _sse_events(response.text)
-    reasoning = [
-        data["delta"]
+    reasoning_events = [
+        data
         for event_type, data in events
         if event_type == "response.reasoning_text.delta"
     ]
-    text_deltas = [
-        data["delta"]
+    text_delta_events = [
+        data
         for event_type, data in events
         if event_type == "response.output_text.delta"
     ]
+    done_event = next(
+        data for event_type, data in events if event_type == "response.output_text.done"
+    )
     completed = next(
         data["response"]
         for event_type, data in events
         if event_type == "response.completed"
     )
 
-    assert "".join(reasoning) == "Check briefly."
-    assert "".join(text_deltas) == "Done."
+    assert "".join(event["delta"] for event in reasoning_events) == "Check briefly."
+    assert "".join(event["delta"] for event in text_delta_events) == "Done."
+    assert reasoning_events[0]["rate"] is None
+    assert reasoning_events[1]["rate"] > 0
+    assert text_delta_events[0]["rate"] == reasoning_events[1]["rate"]
+    assert done_event["rate"] > 0
     assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
     assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
     assert completed["output_text"] == "Done."
@@ -2637,6 +2644,19 @@ def test_generation_timings_from_metrics():
     assert timings.predicted_per_token_ms == 0.0
 
 
+def test_generation_metrics_reports_chunk_and_aggregate_rates(monkeypatch):
+    times = iter([10.0, 10.25])
+    monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
+    metrics = server_generation.GenerationMetrics()
+
+    first_rate = metrics.record_chunk(SimpleNamespace(generation_tokens=1))
+    second_rate = metrics.record_chunk(SimpleNamespace(generation_tokens=4))
+
+    assert first_rate is None
+    assert second_rate == pytest.approx(12.0)
+    assert metrics.rate == pytest.approx(16.0)
+
+
 def test_chat_completions_returns_timings(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
@@ -2738,6 +2758,20 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     assert timed_chunk["choices"] == []
     assert timed_chunk["timings"]["cache_n"] == 2
     assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    token_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["delta"].get("content") is not None
+    ]
+    assert token_chunks[0]["rate"] is None
+    assert token_chunks[1]["rate"] > 0
+    terminal_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "stop"
+    )
+    assert terminal_chunk["rate"] > 0
+    assert timed_chunk["rate"] == terminal_chunk["rate"]
 
 
 def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
@@ -3921,7 +3955,7 @@ class TestResponseGenerator:
         assert "token_id=" not in progress[0]
         assert "text=" not in progress[0]
 
-    def test_decode_logging_reports_instantaneous_token_rate(self, monkeypatch, caplog):
+    def test_decode_logging_uses_one_rate_field(self, monkeypatch, caplog):
         times = iter([10.0, 10.25])
         monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
         caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
@@ -3939,7 +3973,7 @@ class TestResponseGenerator:
                 info,
                 token=token_number,
                 text=str(token_number),
-                finish_reason=None,
+                finish_reason="stop" if token_number == 2 else None,
             )
 
         progress = [
@@ -3947,8 +3981,16 @@ class TestResponseGenerator:
             for record in caplog.records
             if record.getMessage().startswith("Decode progress:")
         ]
-        assert "token_rate=n/a" in progress[0]
-        assert "token_rate=4.0 tok/s" in progress[1]
+        assert "rate=n/a" in progress[0]
+        assert "rate=4.0 tok/s" in progress[1]
+        assert not any("token_rate=" in message for message in progress)
+        completed = next(
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode completed:")
+        )
+        assert "rate=8.0 tok/s" in completed
+        assert "token_rate=" not in completed
 
     def test_chunked_prefill_logging_reports_partial_progress(self, caplog):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")

@@ -423,8 +423,14 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
 time to first token, periodic decode throughput, and the final token counts. Set
 `--log-level DEBUG` to emit decode progress for every token and add its token
-number, token ID, decoded text, and instantaneous `token_rate` to the same log
-entry. The existing `rate` field remains the cumulative decode throughput.
+number, token ID, and decoded text to the same log entry. Decode progress uses
+`rate` for the instantaneous inter-token rate; decode completion uses the same
+field name for aggregate decode throughput.
+
+OpenAI-compatible streaming responses expose the same numeric `rate` field in
+tokens per second. Token-bearing SSE chunks report the instantaneous rate, while
+the terminal chunk reports the aggregate rate. The first token reports `null`
+because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh

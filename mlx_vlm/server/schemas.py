@@ -583,6 +583,7 @@ class ResponseOutputTextDeltaEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     delta: str
+    rate: Optional[float] = None
 
 
 class ResponseOutputTextDoneEvent(BaseStreamEvent):
@@ -591,6 +592,7 @@ class ResponseOutputTextDoneEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     text: str
+    rate: Optional[float] = None
 
 
 class ResponseContentPartDoneEvent(BaseStreamEvent):
@@ -853,6 +855,13 @@ class ChatStreamChunk(BaseModel):
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
     timings: Optional[GenerationTimings] = None
+    rate: Optional[float] = Field(
+        None,
+        description=(
+            "Instantaneous tokens per second for token chunks, or aggregate "
+            "decode tokens per second for terminal chunks"
+        ),
+    )
 
 
 # Models for Anthropic-compatible /v1/messages endpoint
