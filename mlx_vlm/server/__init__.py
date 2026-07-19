@@ -53,6 +53,7 @@ from .audio import (
 )
 from .generation import (
     DEFAULT_ENABLE_THINKING,
+    DEFAULT_LOG_PROGRESS_INTERVAL,
     DEFAULT_SPECULATIVE_BATCH_COALESCE_MS,
     DEFAULT_TOKEN_QUEUE_TIMEOUT,
     METRICS_HISTORY_LIMIT,
@@ -72,6 +73,7 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_log_progress_interval,
     get_max_kv_size,
     get_prefill_step_size,
     get_quantized_kv_bits,
