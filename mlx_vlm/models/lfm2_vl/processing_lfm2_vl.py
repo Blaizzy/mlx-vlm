@@ -341,7 +341,10 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path) if is_local else pretrained_model_name_or_path,
-        trust_remote_code=True,
+        # The tokenizer is a standard PreTrainedTokenizerFast. Trusting remote
+        # code here makes AutoConfig import modeling_lfm2_vl.py, which requires
+        # torch even though MLX only needs the tokenizer files.
+        trust_remote_code=False,
         local_files_only=is_local,
     )
     if is_local:

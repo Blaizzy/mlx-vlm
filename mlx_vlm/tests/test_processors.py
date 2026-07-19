@@ -2149,7 +2149,7 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
                 patch(
                     "transformers.AutoTokenizer.from_pretrained",
                     return_value=_mock_tokenizer(),
-                ),
+                ) as tokenizer_from_pretrained,
                 patch(
                     "mlx_vlm.models.lfm2_vl.processing_lfm2_vl.Siglip2ImageProcessor",
                     DummySiglip2ImageProcessor,
@@ -2169,6 +2169,11 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertIsInstance(processor.image_processor, DummySiglip2ImageProcessor)
         self.assertTrue(processor.image_processor.do_resize)
         self.assertFalse(processor.image_processor.do_image_splitting)
+        tokenizer_from_pretrained.assert_called_once_with(
+            tmpdir,
+            trust_remote_code=False,
+            local_files_only=True,
+        )
 
 
 class TestMolmoPointProcessor(unittest.TestCase):
