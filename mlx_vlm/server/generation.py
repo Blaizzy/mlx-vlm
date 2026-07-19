@@ -817,9 +817,10 @@ class GenerationMetrics:
     last_chunk_at: Optional[float] = None
     last_chunk_rate: Optional[float] = None
     generated_tokens: int = 0
+    first_chunk_tokens: int = 0
 
     def record_chunk(self, chunk) -> Optional[float]:
-        now = time.perf_counter()
+        now = getattr(chunk, "emitted_at", None) or time.perf_counter()
         token_count = getattr(chunk, "token_count", None)
         if token_count is None:
             generation_tokens = getattr(chunk, "generation_tokens", None)
@@ -831,6 +832,8 @@ class GenerationMetrics:
         emitted_tokens = max(0, int(token_count or 0))
         self.last_chunk_rate = None
         if emitted_tokens > 0:
+            if not self.token_times:
+                self.first_chunk_tokens = emitted_tokens
             self.generated_tokens += emitted_tokens
             if self.last_chunk_at is not None and now > self.last_chunk_at:
                 self.last_chunk_rate = emitted_tokens / (now - self.last_chunk_at)
@@ -841,10 +844,11 @@ class GenerationMetrics:
 
     @property
     def rate(self) -> Optional[float]:
-        if not self.token_times:
+        if len(self.token_times) < 2:
             return None
         elapsed = self.token_times[-1] - self.token_times[0]
-        return self.generated_tokens / elapsed if elapsed > 0 else 0.0
+        measured_tokens = self.generated_tokens - self.first_chunk_tokens
+        return measured_tokens / elapsed if elapsed > 0 else None
 
     def record_result(self, result) -> None:
         self.peak_memory = max(
@@ -879,6 +883,7 @@ class StreamingToken:
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
     token_count: int = 1
+    emitted_at: Optional[float] = None
 
 
 class _DiffusionBlockEmitter:
@@ -1321,7 +1326,7 @@ class ResponseGenerator:
         text: str,
         finish_reason: Optional[str],
         token_count: int = 1,
-    ) -> None:
+    ) -> float:
         now = time.perf_counter()
         previous_tokens = int(info.get("generated_tokens", 0) or 0)
         emitted_tokens = max(0, int(token_count or 0))
@@ -1349,7 +1354,12 @@ class ResponseGenerator:
             )
 
         elapsed = max(0.0, now - decode_started_at)
-        rate = generated_tokens / elapsed if elapsed > 0 else 0.0
+        first_chunk_tokens = int(info.get("decode_first_chunk_tokens", 0) or 0)
+        if first_chunk_tokens == 0:
+            first_chunk_tokens = emitted_tokens
+            info["decode_first_chunk_tokens"] = emitted_tokens
+        measured_tokens = max(0, generated_tokens - first_chunk_tokens)
+        rate = measured_tokens / elapsed if elapsed > 0 else 0.0
         interval = get_log_progress_interval()
         crossed_interval = interval > 0 and (
             generated_tokens // interval > previous_tokens // interval
@@ -1387,6 +1397,7 @@ class ResponseGenerator:
                 elapsed,
                 progress_rate_text,
             )
+        return now
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
@@ -1823,7 +1834,7 @@ class ResponseGenerator:
                 )
                 prefill_logged = True
             for chunk in emitter.feed(result):
-                self._log_decode_progress(
+                chunk.emitted_at = self._log_decode_progress(
                     uid,
                     log_state,
                     token=chunk.token,
@@ -2017,7 +2028,7 @@ class ResponseGenerator:
                     is_max = len(token_lists[uid]) >= max_tokens_map[uid]
                     finish = "stop" if is_stop else "length" if is_max else None
                     text = self._stream_text(stream_infos[uid], tok, finish)
-                    self._log_decode_progress(
+                    emitted_at = self._log_decode_progress(
                         uid,
                         stream_infos[uid],
                         token=tok,
@@ -2032,6 +2043,7 @@ class ResponseGenerator:
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
+                            emitted_at=emitted_at,
                         )
                     )
                     if finish is not None:
@@ -2090,7 +2102,7 @@ class ResponseGenerator:
                         finish = "stop" if is_stop else "length" if is_max else None
                         text = self._stream_text(stream_infos[uid], tok, finish)
 
-                        self._log_decode_progress(
+                        emitted_at = self._log_decode_progress(
                             uid,
                             stream_infos[uid],
                             token=tok,
@@ -2106,6 +2118,7 @@ class ResponseGenerator:
                                 finish_reason=finish,
                                 peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
+                                emitted_at=emitted_at,
                             )
                         )
 
@@ -2133,7 +2146,7 @@ class ResponseGenerator:
                 for uid in uids:
                     if uid not in finished_uids:
                         text = stream_infos[uid]["streamer"].finalize()
-                        self._log_decode_progress(
+                        emitted_at = self._log_decode_progress(
                             uid,
                             stream_infos[uid],
                             token=0,
@@ -2149,6 +2162,8 @@ class ResponseGenerator:
                                 finish_reason="length",
                                 peak_memory=mx.get_peak_memory() / 1e9,
                                 prompt_tps=prompt_tps_map.get(uid),
+                                token_count=0,
+                                emitted_at=emitted_at,
                             )
                         )
                         rqueues[uid].put(None)
@@ -2197,7 +2212,7 @@ class ResponseGenerator:
 
             lp = r.token_logprob
 
-            self._log_decode_progress(
+            emitted_at = self._log_decode_progress(
                 r.uid,
                 info,
                 token=tok,
@@ -2216,6 +2231,8 @@ class ResponseGenerator:
                     prompt_tps=info.get("prompt_tps"),
                     top_logprobs=getattr(r, "top_logprobs", None),
                     cached_tokens=info.get("cached_tokens", 0),
+                    token_count=token_count,
+                    emitted_at=emitted_at,
                 )
             )
 

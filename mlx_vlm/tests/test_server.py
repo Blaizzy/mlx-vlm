@@ -1988,10 +1988,13 @@ def test_responses_streaming_emits_reasoning_events(client):
 
     assert "".join(event["delta"] for event in reasoning_events) == "Check briefly."
     assert "".join(event["delta"] for event in text_delta_events) == "Done."
-    assert reasoning_events[0]["rate"] is None
-    assert reasoning_events[1]["rate"] > 0
-    assert text_delta_events[0]["rate"] == reasoning_events[1]["rate"]
-    assert done_event["rate"] > 0
+    assert reasoning_events[0]["timings"]["predicted_per_second"] is None
+    assert reasoning_events[1]["timings"]["predicted_per_second"] > 0
+    assert (
+        text_delta_events[0]["timings"]["predicted_per_second"]
+        == reasoning_events[1]["timings"]["predicted_per_second"]
+    )
+    assert done_event["timings"]["predicted_per_second"] > 0
     assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
     assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
     assert completed["output_text"] == "Done."
@@ -2644,17 +2647,19 @@ def test_generation_timings_from_metrics():
     assert timings.predicted_per_token_ms == 0.0
 
 
-def test_generation_metrics_reports_chunk_and_aggregate_rates(monkeypatch):
-    times = iter([10.0, 10.25])
-    monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
+def test_generation_metrics_reports_chunk_and_aggregate_rates():
     metrics = server_generation.GenerationMetrics()
 
-    first_rate = metrics.record_chunk(SimpleNamespace(generation_tokens=1))
-    second_rate = metrics.record_chunk(SimpleNamespace(generation_tokens=4))
+    first_rate = metrics.record_chunk(
+        SimpleNamespace(generation_tokens=1, emitted_at=10.0)
+    )
+    second_rate = metrics.record_chunk(
+        SimpleNamespace(generation_tokens=4, emitted_at=10.25)
+    )
 
     assert first_rate is None
     assert second_rate == pytest.approx(12.0)
-    assert metrics.rate == pytest.approx(16.0)
+    assert metrics.rate == pytest.approx(12.0)
 
 
 def test_chat_completions_returns_timings(client, monkeypatch):
@@ -2752,9 +2757,7 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         for line in response.text.splitlines()
         if line.startswith("data: ") and line != "data: [DONE]"
     ]
-    timed_chunks = [chunk for chunk in chunks if chunk.get("timings") is not None]
-    assert len(timed_chunks) == 1
-    timed_chunk = timed_chunks[0]
+    timed_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
     assert timed_chunk["choices"] == []
     assert timed_chunk["timings"]["cache_n"] == 2
     assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
@@ -2763,15 +2766,18 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         for chunk in chunks
         if chunk["choices"] and chunk["choices"][0]["delta"].get("content") is not None
     ]
-    assert token_chunks[0]["rate"] is None
-    assert token_chunks[1]["rate"] > 0
+    assert token_chunks[0]["timings"]["predicted_per_second"] is None
+    assert token_chunks[1]["timings"]["predicted_per_second"] > 0
     terminal_chunk = next(
         chunk
         for chunk in chunks
         if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "stop"
     )
-    assert terminal_chunk["rate"] > 0
-    assert timed_chunk["rate"] == terminal_chunk["rate"]
+    assert terminal_chunk["timings"]["predicted_per_second"] > 0
+    assert (
+        timed_chunk["timings"]["predicted_per_second"]
+        == terminal_chunk["timings"]["predicted_per_second"]
+    )
 
 
 def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
@@ -3989,7 +3995,7 @@ class TestResponseGenerator:
             for record in caplog.records
             if record.getMessage().startswith("Decode completed:")
         )
-        assert "rate=8.0 tok/s" in completed
+        assert "rate=4.0 tok/s" in completed
         assert "token_rate=" not in completed
 
     def test_chunked_prefill_logging_reports_partial_progress(self, caplog):

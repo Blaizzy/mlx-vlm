@@ -425,12 +425,14 @@ time to first token, periodic decode throughput, and the final token counts. Set
 `--log-level DEBUG` to emit decode progress for every token and add its token
 number, token ID, and decoded text to the same log entry. Decode progress uses
 `rate` for the instantaneous inter-token rate; decode completion uses the same
-field name for aggregate decode throughput.
+field name for aggregate decode throughput measured across completed token
+intervals.
 
-OpenAI-compatible streaming responses expose the same numeric `rate` field in
-tokens per second. Token-bearing SSE chunks report the instantaneous rate, while
-the terminal chunk reports the aggregate rate. The first token reports `null`
-because it has no preceding token interval.
+OpenAI-compatible streaming responses expose throughput under
+`timings.predicted_per_second`. Token-bearing SSE chunks report the instantaneous
+inter-token rate, while terminal and usage chunks report the aggregate rate as
+`(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
+`null` because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh

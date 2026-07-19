@@ -78,6 +78,7 @@ from .schemas import (
     ResponseOutputItemDoneEvent,
     ResponseOutputTextDeltaEvent,
     ResponseOutputTextDoneEvent,
+    StreamingTimings,
     UsageStats,
 )
 
@@ -330,13 +331,13 @@ def _final_chat_chunk(
     request_id: str,
     model: str,
     finish_reason: str,
-    rate: Optional[float] = None,
+    predicted_per_second: Optional[float] = None,
 ) -> ChatStreamChunk:
     return ChatStreamChunk(
         id=request_id,
         created=int(time.time()),
         model=model,
-        rate=rate,
+        timings=StreamingTimings(predicted_per_second=predicted_per_second),
         choices=[
             ChatStreamChoice(
                 finish_reason=finish_reason,
@@ -360,7 +361,6 @@ def _chat_usage_chunk(
         usage=UsageStats.from_metrics(metrics, prompt_tokens, output_tokens),
         choices=[],
         timings=GenerationTimings.from_metrics(metrics, prompt_tokens, output_tokens),
-        rate=metrics.rate,
     )
 
 
@@ -1118,7 +1118,7 @@ async def responses_endpoint(request: Request):
                                         "output_index": 0,
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
-                                        "rate": chunk_rate,
+                                        "timings": {"predicted_per_second": chunk_rate},
                                     },
                                 )
                             delta = thinking_delta.content
@@ -1131,7 +1131,7 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, rate=chunk_rate).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                             if token.finish_reason:
@@ -1169,7 +1169,7 @@ async def responses_endpoint(request: Request):
                                         "output_index": 0,
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
-                                        "rate": chunk_rate,
+                                        "timings": {"predicted_per_second": chunk_rate},
                                     },
                                 )
                             delta = thinking_delta.content
@@ -1185,7 +1185,7 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, rate=chunk_rate).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                     output_items, clean_text, _, output_finish_reason = (
@@ -1222,7 +1222,7 @@ async def responses_endpoint(request: Request):
                         )
 
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, rate=metrics.rate).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
@@ -1821,7 +1821,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
-                                    rate=chunk_rate,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=chunk_rate
+                                    ),
                                 )
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -1852,7 +1854,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
-                                    rate=metrics.rate,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=metrics.rate
+                                    ),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                         if not terminal_emitted:
@@ -1923,7 +1927,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
-                                    rate=chunk_rate,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=chunk_rate
+                                    ),
                                 )
 
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
