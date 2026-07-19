@@ -6211,6 +6211,108 @@ class TestModels(unittest.TestCase):
         self.assertEqual(features.shape, (1, 4, 3, config.embed_dim))
         self.assertTrue(mx.all(mx.isfinite(features)).item())
 
+    def _tiny_inkling_config(self):
+        from mlx_vlm.models.inkling.config import (
+            AudioConfig,
+            ModelConfig,
+            TextConfig,
+            VisionConfig,
+        )
+
+        text = TextConfig(
+            model_type="inkling",
+            hidden_size=64,
+            num_hidden_layers=2,
+            vocab_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=2,
+            swa_head_dim=16,
+            sliding_window_size=8,
+            layer_types=["hybrid_sliding", "hybrid"],
+            d_rel=4,
+            rel_extent=16,
+            sconv_kernel_size=4,
+            mlp_layer_types=["dense", "sparse"],
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_shared_experts=2,
+            logits_mup_width_multiplier=1.0,
+        )
+        return ModelConfig(
+            model_type="inkling",
+            text_config=text,
+            vision_config=VisionConfig(
+                patch_size=4, temporal_patch_size=2, num_channels=3, n_layers=1
+            ),
+            audio_config=AudioConfig(n_mel_bins=8, mel_vocab_size=4),
+            image_token_id=100,
+            audio_token_id=101,
+            vocab_size=128,
+        )
+
+    def test_inkling_language_model(self):
+        from mlx_vlm.models import inkling
+
+        config = self._tiny_inkling_config()
+        model = inkling.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "CacheList")
+        self.assertEqual(type(cache[0][0]).__name__, "KVCache")
+        self.assertEqual(type(cache[0][1]).__name__, "ArraysCache")
+
+    def test_inkling_towers_and_multimodal(self):
+        from mlx_vlm.models import inkling
+
+        config = self._tiny_inkling_config()
+        hidden = config.text_config.hidden_size
+        model = inkling.Model(config)
+        mx.eval(model.parameters())
+
+        # vision HMLP tower: one soft token per patch, projected into LM space
+        n_patches = 2
+        pixel_values = mx.random.uniform(shape=(n_patches, 2, 4, 4, 3))
+        image_features = model.get_image_features(pixel_values)
+        self.assertEqual(image_features.shape, (n_patches, hidden))
+
+        # dMel audio tower: one embedding per frame
+        n_frames = 3
+        audio_input_ids = mx.zeros((1, n_frames, 8), dtype=mx.int32)
+        audio_features = model.get_audio_features(audio_input_ids)
+        self.assertEqual(audio_features.shape, (n_frames, hidden))
+
+        # multimodal merge: image/audio placeholder tokens replaced by tower features
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        ids = [1, 100, 100, 2, 101, 101, 101, 3]
+        emb = model.get_input_embeddings(
+            mx.array([ids]),
+            pixel_values=pixel_values,
+            audio_input_ids=audio_input_ids,
+        )
+        self.assertIsInstance(emb, InputEmbeddingsFeatures)
+        self.assertEqual(emb.inputs_embeds.shape, (1, len(ids), hidden))
+
+        out = model(
+            mx.array([ids]),
+            pixel_values=pixel_values,
+            audio_input_ids=audio_input_ids,
+        )
+        self.assertEqual(out.logits.shape, (1, len(ids), config.text_config.vocab_size))
+        self.assertTrue(bool(mx.isfinite(out.logits).all()))
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
