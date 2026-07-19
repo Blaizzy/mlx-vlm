@@ -1215,6 +1215,7 @@ class ResponseGenerator:
             "prefill_processed": -1,
             "generated_tokens": 0,
             "decode_started_at": None,
+            "last_token_at": None,
         }
 
     def _log_prefill_progress(self, batch_gen, active: dict) -> None:
@@ -1296,9 +1297,18 @@ class ResponseGenerator:
     ) -> None:
         now = time.perf_counter()
         previous_tokens = int(info.get("generated_tokens", 0) or 0)
-        generated_tokens = previous_tokens + max(0, int(token_count or 0))
+        emitted_tokens = max(0, int(token_count or 0))
+        generated_tokens = previous_tokens + emitted_tokens
         info["generated_tokens"] = generated_tokens
         request_id = info.get("request_id", uid)
+
+        previous_token_at = info.get("last_token_at")
+        token_rate = None
+        if emitted_tokens > 0:
+            if previous_token_at is not None and now > previous_token_at:
+                token_rate = emitted_tokens / (now - previous_token_at)
+            info["last_token_at"] = now
+        token_rate_text = "n/a" if token_rate is None else f"{token_rate:.1f} tok/s"
 
         decode_started_at = info.get("decode_started_at")
         if decode_started_at is None:
@@ -1321,11 +1331,12 @@ class ResponseGenerator:
         if debug_enabled:
             logger.debug(
                 "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%.1f tok/s token_number=%d token_id=%s text=%r",
+                "rate=%.1f tok/s token_rate=%s token_number=%d token_id=%s text=%r",
                 request_id,
                 generated_tokens,
                 elapsed,
                 rate,
+                token_rate_text,
                 generated_tokens,
                 token,
                 text,
@@ -1334,21 +1345,23 @@ class ResponseGenerator:
         if finish_reason is not None:
             logger.info(
                 "Decode completed: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%.1f tok/s finish_reason=%s",
+                "rate=%.1f tok/s token_rate=%s finish_reason=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
                 rate,
+                token_rate_text,
                 finish_reason,
             )
         elif crossed_interval and not debug_enabled:
             logger.info(
                 "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%.1f tok/s",
+                "rate=%.1f tok/s token_rate=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
                 rate,
+                token_rate_text,
             )
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:

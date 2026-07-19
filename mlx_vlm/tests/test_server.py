@@ -3921,6 +3921,35 @@ class TestResponseGenerator:
         assert "token_id=" not in progress[0]
         assert "text=" not in progress[0]
 
+    def test_decode_logging_reports_instantaneous_token_rate(self, monkeypatch, caplog):
+        times = iter([10.0, 10.25])
+        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
+        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": 9.0,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+            "last_token_at": None,
+        }
+
+        for token_number in range(1, 3):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason=None,
+            )
+
+        progress = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode progress:")
+        ]
+        assert "token_rate=n/a" in progress[0]
+        assert "token_rate=4.0 tok/s" in progress[1]
+
     def test_chunked_prefill_logging_reports_partial_progress(self, caplog):
         caplog.set_level(logging.INFO, logger="mlx_vlm.server")
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
