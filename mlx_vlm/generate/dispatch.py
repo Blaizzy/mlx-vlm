@@ -1077,28 +1077,14 @@ def stream_generate(
                     all_ids = full_input_ids_list + [
                         t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
-                # Snapshot float K/V per layer (dequants when keys are tuples).
-                layer_keys: List[mx.array] = []
-                layer_values: List[mx.array] = []
-                ok = True
-                for c in tracked_cache:
-                    k, v = _apc.layer_kv_for_apc(c)
-                    if k is None or v is None:
-                        ok = False
-                        break
-                    layer_keys.append(k)
-                    layer_values.append(v)
-                if ok and layer_keys:
-                    new_blocks = apc_manager.store_kv_blocks(
-                        all_ids,
-                        layer_keys,
-                        layer_values,
-                        extra_hash=apc_extra_hash,
-                        skip_first_n_tokens=reused_prefix_len,
-                    )
-                    apc_manager.release(apc_blocks_in_use + new_blocks)
-                else:
-                    apc_manager.release(apc_blocks_in_use)
+                _apc.commit_prefix_blocks(
+                    apc_manager,
+                    tracked_cache,
+                    all_ids,
+                    extra_hash=apc_extra_hash,
+                    skip_first_n_tokens=reused_prefix_len,
+                    blocks_in_use=apc_blocks_in_use,
+                )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
                 apc_manager.release(apc_blocks_in_use)

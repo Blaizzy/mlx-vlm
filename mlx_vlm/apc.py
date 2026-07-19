@@ -3921,16 +3921,17 @@ def layer_kv_for_apc(
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],
-    batch_idx: int,
     full_token_ids: Sequence[int],
     *,
+    batch_idx: Optional[int] = None,
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
 ) -> List[APCBlock]:
-    """Slice one row out of a batched KV cache and store its full blocks.
+    """Harvest full blocks from a prompt cache and store them.
 
-    Used at the end of prompt prefill in continuous-batching mode to add
-    the new prefix to APC.
+    With ``batch_idx`` set, slices one row out of a batched KV cache
+    (continuous-batching prefill). With ``batch_idx`` unset, harvests a
+    single-request cache. Either way, adds the new prefix to APC.
     """
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
@@ -3938,7 +3939,7 @@ def harvest_blocks_from_batch_cache(
         k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
         if k is None or v is None:
             return []
-        if int(k.shape[0]) != 1:
+        if batch_idx is not None and int(k.shape[0]) != 1:
             k = k[batch_idx : batch_idx + 1]
             v = v[batch_idx : batch_idx + 1]
         layer_keys.append(k)
@@ -3950,6 +3951,29 @@ def harvest_blocks_from_batch_cache(
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
     )
+
+
+def commit_prefix_blocks(
+    apc_manager: "APCManager",
+    prompt_cache: List[Any],
+    full_token_ids: Sequence[int],
+    *,
+    batch_idx: Optional[int] = None,
+    extra_hash: int = 0,
+    skip_first_n_tokens: int = 0,
+    blocks_in_use: Sequence[APCBlock] = (),
+) -> List[APCBlock]:
+    """Harvest one (row of a) prompt cache into hashed blocks, store them, then release the in-use prefix blocks together with the new ones. Shared block-mode commit for both generate paths."""
+    new_blocks = harvest_blocks_from_batch_cache(
+        apc_manager,
+        prompt_cache,
+        full_token_ids,
+        batch_idx=batch_idx,
+        extra_hash=extra_hash,
+        skip_first_n_tokens=skip_first_n_tokens,
+    )
+    apc_manager.release(list(blocks_in_use) + new_blocks)
+    return new_blocks
 
 
 def model_apc_mode(language_model: Any) -> Optional[str]:
