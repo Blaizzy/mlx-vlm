@@ -417,7 +417,13 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `32`)
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+At `INFO`, the server logs request start/completion, chunked-prefill progress,
+time to first token, periodic decode throughput, and the final token counts. Set
+`--log-level DEBUG` to emit decode progress for every token and add its token
+number, token ID, and decoded text to the same log entry.
 
 You can also set trust remote code via environment variable:
 ```sh

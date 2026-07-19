@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import sys
 import time
@@ -3604,6 +3605,32 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     assert payload["server"]["apc"] == {"enabled": False}
 
 
+def test_metrics_store_logs_request_lifecycle(caplog):
+    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+    metrics = server.ServerMetricsStore()
+    metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
+    metrics.record_success(
+        {
+            "endpoint": "/chat/completions",
+            "model": "demo",
+            "stream": True,
+            "backend": "continuous_batching",
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "generated_tokens": 4,
+            "request_elapsed_s": 0.5,
+            "decode_elapsed_s": 0.1,
+            "prefill_tok_s": 100.0,
+            "decode_tok_s": 40.0,
+            "finish_reason": "stop",
+        }
+    )
+
+    assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
+    assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
+    assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
+
+
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "apc_manager", None)
@@ -3823,6 +3850,94 @@ class TestResponseGenerator:
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0")
 
         assert server.get_token_queue_timeout() is None
+
+    def test_log_progress_interval_is_configurable(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "7")
+        assert server.get_log_progress_interval() == 7
+
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "-1")
+        assert server.get_log_progress_interval() == 0
+
+    def test_debug_decode_logging_adds_token_details(self, monkeypatch, caplog):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
+        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": time.perf_counter() - 0.1,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+        }
+
+        for token_number in range(1, 4):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason="stop" if token_number == 3 else None,
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "Decode progress: request=req-1 generated_tokens=1" in m
+            and "token_number=1 token_id=1 text='1'" in m
+            for m in messages
+        )
+        assert not any("Token streamed:" in m for m in messages)
+        assert any("Decode started: request=req-1" in m for m in messages)
+        assert any(
+            "Decode completed: request=req-1 generated_tokens=3" in m for m in messages
+        )
+
+    def test_info_decode_logging_uses_interval_without_token_details(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": time.perf_counter(),
+            "generated_tokens": 0,
+            "decode_started_at": None,
+        }
+
+        for token_number in range(1, 3):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason=None,
+            )
+
+        progress = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode progress:")
+        ]
+        assert len(progress) == 1
+        assert "generated_tokens=2" in progress[0]
+        assert "token_number=" not in progress[0]
+        assert "token_id=" not in progress[0]
+        assert "text=" not in progress[0]
+
+    def test_chunked_prefill_logging_reports_partial_progress(self, caplog):
+        caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        prompt_batch = SimpleNamespace(
+            _processed_prompt_columns=2,
+            _inputs_embeds=mx.zeros((1, 4, 8)),
+            uids=[1],
+            _suffix_lens=[6],
+            _cached_tokens_per_row=[0],
+            _left_padding_per_row=[0],
+            _right_pad_per_row=None,
+        )
+        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+
+        gen._log_prefill_progress(SimpleNamespace(_prompt_batch=prompt_batch), active)
+
+        assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
 
     def test_token_iterator_reports_timeout_and_cancels_request(self, monkeypatch):
         gen = self._bare_generator()
