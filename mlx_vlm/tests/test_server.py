@@ -3892,6 +3892,9 @@ class TestResponseGenerator:
         assert server.get_token_queue_timeout() is None
 
     def test_log_progress_interval_is_configurable(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_LOG_PROGRESS_INTERVAL", raising=False)
+        assert server.get_log_progress_interval() == 10
+
         monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "7")
         assert server.get_log_progress_interval() == 7
 
