@@ -151,8 +151,6 @@ class _PositionedTargetSampler:
         if not configs:
             raise ValueError("_PositionedTargetSampler requires at least one config.")
         self.configs = list(configs)
-        # Per-row seed vector drives _position_keys. All-equal fast-path flag.
-        self._uniform = len(set(self.configs)) == 1
 
     def _arrays(self):
         c = self.configs
@@ -978,11 +976,14 @@ class GenerationBatch:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        sampling: Optional[List["SamplingConfig"]] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
         self.uids = uids
         self.prompt_cache = prompt_cache
+        # Retained for PromptProcessingBatch/SpeculativeGenerationBatch/API
+        # compatibility; _step() now samples per-row via self.sampling, not this.
         self.sampler = sampler
         self.stop_criteria = stop_criteria
         self.max_tokens = max_tokens
@@ -992,6 +993,7 @@ class GenerationBatch:
         self.greedy_sampling = greedy_sampling
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
+        self.sampling = list(sampling) if sampling is not None else []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
         self._ensure_token_context()
 
@@ -1030,6 +1032,13 @@ class GenerationBatch:
             self.token_context.extend([[] for _ in range(missing)])
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
+
+    def _extend_sampling(self, other: "GenerationBatch"):
+        self.sampling.extend(other.sampling)
+
+    def _filter_sampling(self, keep: List[int]):
+        if self.sampling:
+            self.sampling = [self.sampling[idx] for idx in keep]
 
     def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
         if not self.greedy_sampling or self.compute_logprobs or self.top_logprobs_k > 0:
@@ -1109,10 +1118,11 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampler = _PositionedTargetSampler(self.sampling)
         sampled = _sample_with_positions(
-            self.sampler,
+            sampler,
             logprobs,
-            row_ids=[0] * len(self.uids),
+            row_ids=list(range(len(self.uids))),
             positions=[n + 1 for n in self._num_tokens],
         )
 
@@ -1217,6 +1227,10 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
         self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self._extend_sampling(other)
+        # An all-greedy accumulator that absorbs a temperature>0 batch must
+        # drop the greedy fast path; only all-greedy AND all-greedy stays greedy.
+        self.greedy_sampling = self.greedy_sampling and other.greedy_sampling
         self._ensure_logits_processor_slots()
         self._ensure_token_context()
 
@@ -1283,6 +1297,7 @@ class GenerationBatch:
             self.thinking_budget_criteria = [
                 self.thinking_budget_criteria[idx] for idx in keep
             ]
+        self._filter_sampling(keep)
 
         if not keep:
             self.prompt_cache.clear()
@@ -1296,6 +1311,7 @@ class GenerationBatch:
             self.token_context = []
             self.logits_processors = []
             self.thinking_budget_criteria = []
+            self.sampling = []
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1399,6 +1415,7 @@ class GenerationBatch:
         batch.token_context = []
         batch.logits_processors = []
         batch.thinking_budget_criteria = []
+        batch.sampling = []
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -1633,6 +1650,7 @@ class PromptProcessingBatch:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        sampling: Optional[List["SamplingConfig"]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1643,6 +1661,7 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        self.sampling = list(sampling) if sampling is not None else []
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1971,10 +1990,11 @@ class PromptProcessingBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        first_sampler = _PositionedTargetSampler(self.sampling)
         first_tokens = _sample_with_positions(
-            sampler,
+            first_sampler,
             logprobs,
-            row_ids=[0] * len(self.uids),
+            row_ids=list(range(len(self.uids))),
             positions=[0] * len(self.uids),
         )
 
@@ -2041,6 +2061,7 @@ class PromptProcessingBatch:
                 token_context=[list(ctx) for ctx in self._token_context],
                 logits_processors=list(self.logits_processors),
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
+                sampling=list(self.sampling),
             )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -2450,6 +2471,7 @@ class BatchGenerator:
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
         thinking_budget_criteria = [s[5] for s in sequences]
+        sampling_configs = [s[6] for s in sequences]
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -2591,7 +2613,9 @@ class BatchGenerator:
             draft_model=getattr(self, "draft_model", None),
             draft_kind=getattr(self, "draft_kind", None),
             draft_block_size=getattr(self, "draft_block_size", None),
-            greedy_sampling=getattr(self, "greedy_sampling", False),
+            sampling=sampling_configs,
+            # derive per-batch greedy flag from the actual configs (was: request #1)
+            greedy_sampling=all(c.temperature == 0 for c in sampling_configs),
         )
 
     def _build_apc_meta_for_cold(
@@ -2639,6 +2663,7 @@ class BatchGenerator:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        sampling_configs: Optional[List["SamplingConfig"]] = None,
     ):
         uids = []
 
@@ -2655,15 +2680,20 @@ class BatchGenerator:
             thinking_budget_criteria = [None] * len(prompts)
         elif len(thinking_budget_criteria) != len(prompts):
             raise ValueError("Insufficient number of thinking_budget_criteria provided")
+        if sampling_configs is None:
+            sampling_configs = [SamplingConfig()] * len(prompts)
+        elif len(sampling_configs) != len(prompts):
+            raise ValueError("Insufficient number of sampling_configs provided")
 
-        for p, m, kw, lp, tc in zip(
+        for p, m, kw, lp, tc, sc in zip(
             prompts,
             max_tokens,
             prompt_kwargs,
             logits_processors,
             thinking_budget_criteria,
+            sampling_configs,
         ):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc, sc))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2676,7 +2706,9 @@ class BatchGenerator:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _, _, _) in enumerate(
+                self._unprocessed_sequences
+            ):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -2864,6 +2896,7 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
             thinking_budget_criteria = [s[5] for s in sequences]
+            sampling_configs = [s[6] for s in sequences]
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
@@ -2897,7 +2930,9 @@ class BatchGenerator:
                 draft_model=getattr(self, "draft_model", None),
                 draft_kind=getattr(self, "draft_kind", None),
                 draft_block_size=getattr(self, "draft_block_size", None),
-                greedy_sampling=getattr(self, "greedy_sampling", False),
+                sampling=sampling_configs,
+                # derive per-batch greedy flag from the actual configs (was: request #1)
+                greedy_sampling=all(c.temperature == 0 for c in sampling_configs),
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

@@ -25,6 +25,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.generate.ar import SamplingConfig
 from mlx_vlm.models.cache import BatchKVCache, KVCache
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
@@ -445,6 +446,65 @@ class TestGenerationBatch:
         assert captured.tolist() == [[5], [7]]
 
 
+def test_sampling_configs_survive_extend_and_filter():
+    from mlx_vlm.generate.ar import GenerationBatch, SamplingConfig
+
+    def mk(uids, configs):
+        b = GenerationBatch.__new__(GenerationBatch)
+        b.uids = list(uids)
+        b.sampling = list(configs)
+        return b
+
+    a = mk([1], [SamplingConfig(temperature=0.7)])
+    b = mk([2, 3], [SamplingConfig(temperature=1.0), SamplingConfig(temperature=2.0)])
+    GenerationBatch._extend_sampling(a, b)  # helper under test
+    assert [c.temperature for c in a.sampling] == [0.7, 1.0, 2.0]
+    GenerationBatch._filter_sampling(a, [0, 2])  # keep rows 0 and 2
+    assert [c.temperature for c in a.sampling] == [0.7, 2.0]
+
+
+def test_real_extend_and_filter_keep_sampling_aligned_to_uids():
+    """Exercise .extend()/.filter() on real GenerationBatch instances so the
+    per-row sampling list is proven to stay 1:1 with self.uids across the
+    genuine lifecycle (not just the isolated helpers)."""
+
+    def make_batch(uids, temps, *, greedy_sampling):
+        return GenerationBatch(
+            model=object(),
+            uids=list(uids),
+            inputs=mx.array(list(uids), dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[4] * len(uids),
+            sampling=[SamplingConfig(temperature=t) for t in temps],
+            greedy_sampling=greedy_sampling,
+        )
+
+    # Real extend: sampling concatenates in order and stays aligned to uids.
+    a = make_batch([1], [0.7], greedy_sampling=False)
+    b = make_batch([2, 3], [1.0, 2.0], greedy_sampling=False)
+    a.extend(b)
+    assert a.uids == [1, 2, 3]
+    assert [c.temperature for c in a.sampling] == [0.7, 1.0, 2.0]
+    assert len(a.sampling) == len(a.uids)
+
+    # Real filter dropping the middle row keeps sampling aligned to uids.
+    a.filter([0, 2])
+    assert a.uids == [1, 3]
+    assert [c.temperature for c in a.sampling] == [0.7, 2.0]
+    assert len(a.sampling) == len(a.uids)
+
+    # Greedy reconciliation: all-greedy accumulator absorbing a temperature>0
+    # batch must drop the greedy fast path.
+    greedy = make_batch([10], [0.0], greedy_sampling=True)
+    sampled = make_batch([11], [1.5], greedy_sampling=False)
+    assert greedy.greedy_sampling is True
+    greedy.extend(sampled)
+    assert greedy.greedy_sampling is False
+    assert [c.temperature for c in greedy.sampling] == [0.0, 1.5]
+
+
 # ============================================================================
 # Tests for Helper Functions
 # ============================================================================
@@ -710,6 +770,7 @@ class TestBatchGenerator:
             max_tokens=[2, 2],
             token_context=[mx.array([10]), mx.array([20])],
             logits_processors=[[force_token_2], [force_token_2]],
+            sampling=[SamplingConfig(), SamplingConfig()],
         )
 
         first = batch.next()
@@ -749,6 +810,7 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[2],
             thinking_budget_criteria=[ForceAfterFirst()],
+            sampling=[SamplingConfig()],
         )
 
         first = batch.next()
@@ -787,6 +849,7 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[2],
             thinking_budget_criteria=[ForceAfterFirst()],
+            sampling=[SamplingConfig()],
         )
 
         original_eval = mx.eval
@@ -856,6 +919,7 @@ class TestBatchGenerator:
             stop_criteria=lambda token: False,
             max_tokens=[2],
             greedy_sampling=True,
+            sampling=[SamplingConfig()],
         )
         batch.compute_logprobs = False
 
@@ -926,6 +990,7 @@ class TestBatchGenerator:
             stop_criteria=stop_criteria,
             max_tokens=[2, 2],
             logits_processors=[None, None],
+            sampling=[SamplingConfig(), SamplingConfig()],
         )
         structured = GenerationBatch(
             model=FixedLogitModel(),
@@ -937,6 +1002,7 @@ class TestBatchGenerator:
             max_tokens=[2],
             token_context=[[30]],
             logits_processors=[[force_token_2]],
+            sampling=[SamplingConfig()],
         )
 
         plain.extend(structured)
@@ -2294,6 +2360,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
             },
             [],
             None,
+            SamplingConfig(),
         )
         for i, length in enumerate(lengths)
     ]
@@ -2390,6 +2457,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
             },
             [],
             None,
+            SamplingConfig(),
         ),
         (
             2,
@@ -2403,6 +2471,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
             },
             [],
             None,
+            SamplingConfig(),
         ),
     ]
     picks = [
