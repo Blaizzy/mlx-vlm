@@ -66,6 +66,16 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 pip install -U mlx-vlm
 ```
 
+The [Gradio chat UI](#chat-ui-with-gradio) needs an extra dependency that is not
+part of the base install:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Quote the package name so that shells which expand square brackets, such as
+`zsh`, do not treat `[ui]` as a glob pattern.
+
 ## Usage
 
 ### Command Line Interface (CLI)
@@ -272,7 +282,14 @@ for model-specific conversion and runtime notes.
 
 ### Chat UI with Gradio
 
-Launch a chat interface using Gradio:
+The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
+install does not include:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Then launch the chat interface:
 
 ```sh
 mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
