@@ -528,7 +528,7 @@ def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
 
     configs = [
         SamplingConfig(temperature=1.5, seed=1),
-        SamplingConfig(temperature=1.5, seed=99),
+        SamplingConfig(temperature=1.5, seed=2),
     ]
     batch = PromptProcessingBatch(
         model=FixedLogitModel(),
@@ -552,7 +552,7 @@ def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
         expected_logits, axis=-1, keepdims=True
     )
     expected = _PositionedTargetSampler(configs).sample_target(
-        expected_logprobs, row_ids=[0, 1], positions=[0, 0]
+        expected_logprobs, row_ids=[0, 0], positions=[0, 0]
     )
     mx.eval(expected, gen_batch._next_tokens)
 
@@ -561,6 +561,105 @@ def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
     # The two rows' distinct seeds must actually matter here — otherwise
     # this test would pass even if per-row seeding were silently broken.
     assert sampled[0] != sampled[1]
+
+
+def test_generation_batch_row_sampling_invariant_to_batch_composition():
+    """_step() used to key each row's RNG off its *positional* index in the
+    batch (row_ids=list(range(len(self.uids)))). filter() compacts finished
+    rows out of self.uids, so a survivor's positional index — and therefore
+    its sampling RNG key — shifted depending on which other rows happened to
+    share the batch and finish early. A seeded request must be reproducible
+    regardless of batch composition (vLLM's "same seed => same stream"
+    contract); row_id is now held constant so only the row's own seed
+    differentiates it. This drives a real GenerationBatch: row "R" co-batched
+    with a row that finishes after one step and gets filter()-compacted away
+    must sample the identical token stream as R generating alone from the
+    start.
+
+    This test fails under the old `row_ids=list(range(len(self.uids)))`
+    keying (verified manually: R's first post-filter token flips from 2 to 3
+    because its positional index was 1 while co-batched vs. 0 when alone) and
+    passes under the fixed constant `row_ids=[0] * len(self.uids)`.
+    """
+
+    class FixedLogitModel:
+        def __call__(self, input_ids, cache=None, **kwargs):
+            token_scores = mx.array([0.0, 1.0, 2.0, 3.0])
+            logits = mx.broadcast_to(
+                token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+            )
+            return SimpleNamespace(logits=logits)
+
+    # temperature=2.0/seed=1 was picked because, at position=1, row_id=0 and
+    # row_id=1 provably sample different tokens (2 vs. 3) from this fixed
+    # logit distribution — a prerequisite for the bug to be observable at all.
+    seeded_cfg = SamplingConfig(temperature=2.0, seed=1)
+
+    def run(uids, sampling, max_tokens, steps):
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=list(uids),
+            inputs=mx.array(list(uids), dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=list(max_tokens),
+            sampling=list(sampling),
+        )
+        tokens_for_row = []
+        for _ in range(steps):
+            for response in batch.next():
+                if response.uid == 1:
+                    tokens_for_row.append(response.token)
+        return tokens_for_row
+
+    # Row 1 ("R") co-batched with row 0, which finishes after its first step
+    # (max_tokens=1) and is filter()-compacted out — R's positional index
+    # shifts from 1 (co-batched) to 0 (once alone).
+    co_batched = run(
+        uids=[0, 1],
+        sampling=[SamplingConfig(temperature=0.0), seeded_cfg],
+        max_tokens=[1, 3],
+        steps=3,
+    )
+
+    # Same row, alone in its own batch from the start — positional index is
+    # always 0.
+    solo = run(
+        uids=[1],
+        sampling=[seeded_cfg],
+        max_tokens=[3],
+        steps=3,
+    )
+
+    assert co_batched == solo
+
+
+def test_generation_batch_filter_reenables_greedy_fast_path():
+    """filter() re-derives self.sampling for the surviving rows via
+    _filter_sampling() but, before this fix, never recomputed
+    greedy_sampling — so a mixed batch that drops its last temperature>0 row
+    stayed permanently off the _fused_greedy_step fast path. Build a mixed
+    batch (greedy_sampling False), filter the temp>0 row out, and confirm
+    greedy_sampling flips back to True so subsequent steps can use the fused
+    greedy decode path again."""
+    batch = GenerationBatch(
+        model=object(),
+        uids=[0, 1],
+        inputs=mx.array([0, 1], dtype=mx.int32),
+        prompt_cache=[],
+        sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+        stop_criteria=lambda token: False,
+        max_tokens=[4, 4],
+        sampling=[SamplingConfig(temperature=0.0), SamplingConfig(temperature=1.0)],
+        greedy_sampling=False,
+    )
+
+    assert batch.greedy_sampling is False
+
+    batch.filter([0])  # drop the temperature>0 row; only the greedy row remains
+
+    assert batch.greedy_sampling is True
 
 
 # ============================================================================

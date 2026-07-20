@@ -14,7 +14,12 @@ def test_config_is_frozen_and_hashable():
     c = SamplingConfig(temperature=0.7, top_p=0.9, top_k=40, min_p=0.0, seed=1)
     with pytest.raises(Exception):
         c.temperature = 0.1  # frozen
-    assert len({c, SamplingConfig(temperature=0.7, top_p=0.9, top_k=40, min_p=0.0, seed=1)}) == 1
+    assert (
+        len(
+            {c, SamplingConfig(temperature=0.7, top_p=0.9, top_k=40, min_p=0.0, seed=1)}
+        )
+        == 1
+    )
 
 
 def _sampled_set(row_logprobs, *, top_k, top_p=1.0, min_p=0.0, temperature=1.0, n=256):
@@ -72,8 +77,12 @@ def test_topk_matches_scalar_primitive_keep_set_for_uniform_k():
 def test_greedy_rows_return_argmax():
     lp = mx.array([[0.0, 5.0, 1.0], [9.0, 0.0, 0.0]])
     got = batched_row_sample(
-        lp, temperature=mx.zeros(2), top_p=mx.ones(2),
-        top_k=mx.zeros(2, dtype=mx.int32), min_p=mx.zeros(2), keys=_keys(2),
+        lp,
+        temperature=mx.zeros(2),
+        top_p=mx.ones(2),
+        top_k=mx.zeros(2, dtype=mx.int32),
+        min_p=mx.zeros(2),
+        keys=_keys(2),
     )
     assert got.tolist() == [1, 0]  # argmax per row, no NaN from temp==0
 
@@ -81,8 +90,12 @@ def test_greedy_rows_return_argmax():
 def test_mixed_greedy_and_sampled_batch():
     lp = mx.array([[0.0, 9.0, 0.0], [1.0, 1.0, 1.0]])
     got = batched_row_sample(
-        lp, temperature=mx.array([0.0, 1.0]), top_p=mx.ones(2),
-        top_k=mx.zeros(2, dtype=mx.int32), min_p=mx.zeros(2), keys=_keys(2),
+        lp,
+        temperature=mx.array([0.0, 1.0]),
+        top_p=mx.ones(2),
+        top_k=mx.zeros(2, dtype=mx.int32),
+        min_p=mx.zeros(2),
+        keys=_keys(2),
     )
     assert int(got[0].item()) == 1  # greedy row -> argmax
     assert 0 <= int(got[1].item()) < 3  # sampled row -> valid draw

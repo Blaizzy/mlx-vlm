@@ -5045,7 +5045,6 @@ class TestResponseGenerator:
         assert kwargs["draft_model"] is draft_model
         assert kwargs["draft_kind"] == "mtp"
         assert kwargs["draft_block_size"] == 6
-        assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
         assert batch_state["instance"].next_active_sizes == [2]
 

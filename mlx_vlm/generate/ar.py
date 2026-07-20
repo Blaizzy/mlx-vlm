@@ -114,8 +114,8 @@ def batched_row_sample(
     B, V = logprobs.shape
     work = logprobs.astype(mx.float32) if logprobs.dtype == mx.bfloat16 else logprobs
 
-    order = mx.argsort(-work, axis=-1)                      # [B, V] descending
-    sl = mx.take_along_axis(work, order, axis=-1)           # sorted logprobs
+    order = mx.argsort(-work, axis=-1)  # [B, V] descending
+    sl = mx.take_along_axis(work, order, axis=-1)  # sorted logprobs
 
     safe_t = mx.where(temperature < eps, 1.0, temperature)
     p = mx.softmax(sl / safe_t[:, None], axis=-1)
@@ -123,10 +123,10 @@ def batched_row_sample(
 
     ranks = mx.arange(V, dtype=mx.int32)[None, :]
     k_eff = mx.where(top_k <= 0, V, top_k)
-    keep = ranks < k_eff[:, None]                           # top_k, exactly-k by rank
-    keep = keep & ((csum - p) <= top_p[:, None])            # top_p (>=1 keeps all)
-    keep = keep & (p >= (p[:, :1] * min_p[:, None]))        # min_p (<=0 keeps all)
-    keep = keep | (ranks == 0)                              # always keep >=1 token
+    keep = ranks < k_eff[:, None]  # top_k, exactly-k by rank
+    keep = keep & ((csum - p) <= top_p[:, None])  # top_p (>=1 keeps all)
+    keep = keep & (p >= (p[:, :1] * min_p[:, None]))  # min_p (<=0 keeps all)
+    keep = keep | (ranks == 0)  # always keep >=1 token
 
     masked = mx.where(keep, sl / safe_t[:, None], mx.array(-float("inf"), mx.float32))
     sampled_pos = mx.vmap(
@@ -1122,7 +1122,7 @@ class GenerationBatch:
         sampled = _sample_with_positions(
             sampler,
             logprobs,
-            row_ids=list(range(len(self.uids))),
+            row_ids=[0] * len(self.uids),
             positions=[n + 1 for n in self._num_tokens],
         )
 
@@ -1298,6 +1298,9 @@ class GenerationBatch:
                 self.thinking_budget_criteria[idx] for idx in keep
             ]
         self._filter_sampling(keep)
+        self.greedy_sampling = bool(self.sampling) and all(
+            c.temperature == 0 for c in self.sampling
+        )
 
         if not keep:
             self.prompt_cache.clear()
@@ -1999,7 +2002,7 @@ class PromptProcessingBatch:
         first_tokens = _sample_with_positions(
             first_sampler,
             logprobs,
-            row_ids=list(range(len(self.uids))),
+            row_ids=[0] * len(self.uids),
             positions=[0] * len(self.uids),
         )
 

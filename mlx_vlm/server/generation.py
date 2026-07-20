@@ -1652,7 +1652,6 @@ class ResponseGenerator:
                             draft_model=self.draft_model,
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),
-                            greedy_sampling=args.temperature == 0,
                             prefill_step_size=get_prefill_step_size(),
                         )
 
@@ -1921,9 +1920,7 @@ class ResponseGenerator:
                 if not pending:
                     continue
 
-                pending, configs = self._serialize_speculative_batch_by_config(
-                    pending
-                )
+                pending, configs = self._serialize_speculative_batch_by_config(pending)
 
                 # --- Phase 2: prefill new batch ---
                 uids = []

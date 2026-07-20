@@ -333,7 +333,7 @@ class OpenAIRequest(FlexibleBaseModel):
         description="Maximum number of tokens to generate.",
     )
     temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+        DEFAULT_TEMPERATURE, ge=0.0, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, gt=0.0, le=1.0, description="Top-p sampling.")
     top_k: int = Field(0, ge=0, description="Top-k sampling (0 disables).")
@@ -713,7 +713,7 @@ class VLMRequest(FlexibleBaseModel):
         description="Lowest token probability threshold for masked diffusion transfer.",
     )
     temperature: float = Field(
-        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+        DEFAULT_TEMPERATURE, ge=0.0, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, gt=0.0, le=1.0, description="Top-p sampling.")
     top_k: int = Field(0, ge=0, description="Top-k sampling (0 disables).")
@@ -902,7 +902,7 @@ class AnthropicRequest(FlexibleBaseModel):
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
-    top_k: int = Field(0, description="Top-k sampling.")
+    top_k: int = Field(0, ge=0, description="Top-k sampling.")
     stop_sequences: Optional[List[str]] = None
     tools: Optional[List[Any]] = None
     tool_choice: Optional[Any] = None
