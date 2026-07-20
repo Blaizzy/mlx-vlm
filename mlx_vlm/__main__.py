@@ -22,8 +22,18 @@ if __name__ == "__main__":
 
     # Device selection must happen before the submodule import: generation
     # streams are created at import time from the default device.
+    device = None
     if "--device" in sys.argv:
-        device = sys.argv[sys.argv.index("--device") + 1]
+        idx = sys.argv.index("--device")
+        if idx + 1 >= len(sys.argv):
+            raise ValueError("--device requires a value (cpu or gpu)")
+        device = sys.argv[idx + 1]
+    else:
+        for arg in sys.argv:
+            if arg.startswith("--device="):
+                device = arg.split("=", 1)[1]
+                break
+    if device is not None:
         if device not in ("cpu", "gpu"):
             raise ValueError(f"--device must be cpu or gpu, got {device}")
         import mlx.core as mx

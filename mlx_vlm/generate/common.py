@@ -23,7 +23,9 @@ def set_generation_device(device_name: str):
     """Set the default device and rebuild the generation streams.
 
     Modules bind ``generation_stream`` by name at import time, so the new
-    stream is also patched into any already-imported generation modules.
+    stream is also patched into every already-imported mlx_vlm module that
+    carries the binding (scanning sys.modules rather than a fixed list, so
+    new modules that adopt the pattern keep working).
     """
     import sys
 
@@ -32,14 +34,12 @@ def set_generation_device(device_name: str):
     stream = mx.new_thread_local_stream(device)
     global generation_stream
     generation_stream = stream
-    for mod_name in (
-        "mlx_vlm.generate.ar",
-        "mlx_vlm.generate.diffusion",
-        "mlx_vlm.generate.dispatch",
-        "mlx_vlm.speculative.common",
-    ):
-        mod = sys.modules.get(mod_name)
-        if mod is not None and hasattr(mod, "generation_stream"):
+    for mod_name, mod in list(sys.modules.items()):
+        if (
+            mod_name.startswith("mlx_vlm")
+            and mod is not None
+            and isinstance(getattr(mod, "generation_stream", None), mx.Stream)
+        ):
             mod.generation_stream = stream
 
 

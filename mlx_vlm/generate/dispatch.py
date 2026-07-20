@@ -505,10 +505,6 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
-
-
 def maybe_quantize_kv_cache(
     prompt_cache,
     quantized_kv_start,
@@ -564,44 +560,6 @@ def maybe_quantize_kv_cache(
                 group_size=kv_group_size,
                 bits=int(kv_bits),
             )
-
-
-@contextlib.contextmanager
-def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
-    """
-    A context manager to temporarily change the wired limit.
-
-    Note, the wired limit should not be changed during an async eval.  If an
-    async eval could be running pass in the streams to synchronize with prior
-    to exiting the context manager.
-    """
-    if not mx.metal.is_available() or mx.default_device().type != mx.DeviceType.gpu:
-        yield
-        return
-
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
-    )
-    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
-        )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
 
 
 @dataclass
