@@ -122,12 +122,34 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
+def _tensor_content_hash(t: Any) -> int:
+    """Lossless content hash of a tensor: shape + dtype + exact bytes.
+
+    Unlike ``hash_image_payload`` this keeps shape and dtype and does not
+    downcast to fp16, so distinct masks/embeddings never collide.
+    """
+    dtype = str(getattr(t, "dtype", ""))
+    shape = tuple(getattr(t, "shape", ()))
+    if isinstance(t, mx.array):
+        mx.eval(t)
+        try:
+            raw = np.asarray(t)
+        except Exception:
+            raw = np.asarray(t.astype(mx.float32))
+    else:
+        raw = np.ascontiguousarray(t)
+    h = hashlib.sha256()
+    h.update(repr(shape).encode("utf-8"))
+    h.update(dtype.encode("utf-8"))
+    h.update(raw.tobytes())
+    return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
 def _hash_payload(payload: Any) -> Optional[int]:
     """Stable content hash of one non-token semantic input, or None to skip.
 
-    Tensors hash by bytes (fp16 for floats), lists fold element-wise, other
-    refs hash by path/repr -- mirroring ``hash_image_payload`` so any media
-    input can salt the APC key the same way an image does.
+    Tensors hash losslessly by shape + dtype + bytes; lists fold element-wise;
+    other refs hash by path/repr.
     """
     if payload is None:
         return None
@@ -141,7 +163,7 @@ def _hash_payload(payload: Any) -> Optional[int]:
                 seen = True
         return folded if seen else None
     if isinstance(payload, (mx.array, np.ndarray)):
-        return hash_image_payload(pixel_values=payload)
+        return _tensor_content_hash(payload)
     return hash_image_payload(image_ref=payload)
 
 
@@ -197,15 +219,19 @@ def semantic_extra_hash(
 def apc_disk_namespace(
     model_path: str,
     *,
+    adapter_path: Any = None,
+    weights_fingerprint: Any = None,
     kv_bits: Any = None,
     kv_group_size: Any = None,
     kv_quant_scheme: Any = None,
     quantized_kv_start: Any = None,
 ) -> str:
-    """On-disk APC namespace fingerprinted by model + KV-quant + adapter schema.
+    """On-disk APC namespace fingerprinted by model identity + KV-quant + adapter schema.
 
-    Changing the model path, KV quantization, or the adapter schema version
-    yields a new namespace, so incompatible on-disk caches are never served.
+    Folds the model path, any adapter path / weights fingerprint, and KV
+    quantization into the namespace so a different adapter, model revision,
+    quantization, or adapter schema version never reads or writes another's
+    on-disk cache.
     """
     from .apc_adapters import ADAPTER_SCHEMA_VERSION
 
@@ -215,6 +241,9 @@ def apc_disk_namespace(
     fingerprint = _stable_int_hash(
         ADAPTER_SCHEMA_VERSION,
         _hash_payload(str(model_path)) or 0,
+        _hash_payload("" if adapter_path is None else str(adapter_path)) or 0,
+        _hash_payload("" if weights_fingerprint is None else str(weights_fingerprint))
+        or 0,
         _hash_payload(kv_descriptor) or 0,
     ) & ((1 << 32) - 1)
     return f"{model_path}#s{ADAPTER_SCHEMA_VERSION}-{fingerprint:08x}"

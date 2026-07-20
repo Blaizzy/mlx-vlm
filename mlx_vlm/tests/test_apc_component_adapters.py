@@ -150,3 +150,27 @@ def test_minimax_clone_roundtrip():
     ob, _ = mc.update_and_fetch(k, v)
     mx.eval(oa, ob)
     assert bool(mx.array_equal(oa, ob))
+
+
+def test_ring_sliding_batch_merge_rejects_instead_of_crashing():
+    from mlx_vlm.models.unlimited_ocr.language import RingSlidingKVCache
+
+    ring = RingSlidingKVCache(window_size=4)
+    ring.update_and_fetch(mx.ones((1, 2, 3, 4)), mx.ones((1, 2, 3, 4)))
+    assert A.merge_cache_entries([ring], [3]) is None
+
+
+def test_minimax_batch_merge_still_supported():
+    from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+    caches = []
+    for _ in range(2):
+        mm = MiniMaxM3KVCache()
+        k = mx.random.normal((1, 2, 5, 8))
+        v = mx.random.normal((1, 2, 5, 8))
+        idx = mx.random.normal((1, 2, 5, 8))
+        mx.eval(k, v, idx)
+        mm.update_and_fetch(k, v)
+        mm.update_index_and_fetch(idx)
+        caches.append(mm)
+    assert A.merge_cache_entries(caches, [5, 5]) is not None

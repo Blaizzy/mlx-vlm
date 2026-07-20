@@ -552,9 +552,8 @@ def merge_cache_entries(entries, prefix_lens):
         ]
         return None if any(m is None for m in merged) else lm.CacheList(*merged)
 
-    merge = getattr(type(first), "merge", None)
-    if callable(merge) and all(type(c) is type(first) for c in entries):
-        return merge(entries, prefix_lens)
+    if "merge" in type(first).__dict__ and all(type(c) is type(first) for c in entries):
+        return type(first).merge(entries, prefix_lens)
     return None
 
 

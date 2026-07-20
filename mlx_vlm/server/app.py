@@ -623,6 +623,7 @@ def get_cached_model(
     runtime.apc_manager = _apc.from_env(
         model_namespace=_apc.apc_disk_namespace(
             model_path,
+            adapter_path=adapter_path,
             kv_bits=kv_bits,
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,

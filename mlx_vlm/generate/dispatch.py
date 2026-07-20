@@ -846,12 +846,14 @@ def stream_generate(
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
+        audio_features = kwargs.get("input_features")
+        video_features = kwargs.get("pixel_values_videos")
         apc_extra_hash = _apc.semantic_extra_hash(
             tenant=apc_tenant,
             image_hash=image_hash,
             media={
-                "audio": audio,
-                "video": video,
+                "audio": audio_features if audio_features is not None else audio,
+                "video": video_features if video_features is not None else video,
                 "embeddings": kwargs.get("inputs_embeds"),
                 "masks": mask,
             },

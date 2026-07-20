@@ -92,3 +92,31 @@ def test_disk_namespace_is_stable_and_fingerprinted():
     assert ns != apc_disk_namespace("org/other", kv_bits=4, kv_group_size=64)
     assert ns != apc_disk_namespace("org/model", kv_bits=8, kv_group_size=64)
     assert ns != apc_disk_namespace("org/model", kv_bits=None)
+
+
+def test_disk_namespace_distinguishes_adapters_and_weights():
+    base = apc_disk_namespace("org/model", kv_bits=4)
+    a = apc_disk_namespace("org/model", adapter_path="adapter-a", kv_bits=4)
+    b = apc_disk_namespace("org/model", adapter_path="adapter-b", kv_bits=4)
+    assert base != a and a != b
+    assert base != apc_disk_namespace(
+        "org/model", weights_fingerprint="rev-2", kv_bits=4
+    )
+
+
+def test_tensor_hash_is_shape_aware_and_lossless():
+    same_bytes_diff_shape = _hash_payload(mx.array([[1, 2, 3, 4]])) != _hash_payload(
+        mx.array([[1, 2], [3, 4]])
+    )
+    assert same_bytes_diff_shape
+    x = mx.array([1.0], dtype=mx.float32)
+    y = mx.array([1.0001], dtype=mx.float32)
+    assert _hash_payload(x) != _hash_payload(y)
+
+
+def test_processed_feature_tensor_changes_the_key():
+    def audio_key(input_features):
+        payload = input_features if input_features is not None else None
+        return semantic_extra_hash(image_hash=0, media={"audio": payload})
+
+    assert audio_key(mx.zeros((1, 80, 10))) != audio_key(mx.ones((1, 80, 10)))
