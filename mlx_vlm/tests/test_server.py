@@ -2000,6 +2000,72 @@ def test_responses_streaming_emits_reasoning_events(client):
     assert completed["output_text"] == "Done."
 
 
+def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="cohere2_moe")
+    chunks = [
+        GenerationResult(text="North reasoning.", prompt_tokens=8, generation_tokens=1),
+        GenerationResult(
+            text="<|END_THINKING|><|START_TEXT|>North answer.<|END_TEXT|>",
+            prompt_tokens=8,
+            generation_tokens=4,
+            finish_reason="stop",
+        ),
+    ]
+    template_kwargs = {}
+
+    def fake_apply_chat_template(*args, **kwargs):
+        template_kwargs.update(kwargs)
+        return "prompt<|START_THINKING|>"
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server,
+            "apply_chat_template",
+            side_effect=fake_apply_chat_template,
+        ),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+        patch.object(server.runtime, "response_generator", None),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "CohereLabs/North-Mini-Code-1.0-w4a16",
+                "input": "hello",
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    events = _sse_events(response.text)
+    reasoning = "".join(
+        data["delta"]
+        for event_type, data in events
+        if event_type == "response.reasoning_text.delta"
+    )
+    content = "".join(
+        data["delta"]
+        for event_type, data in events
+        if event_type == "response.output_text.delta"
+    )
+
+    assert reasoning == "North reasoning."
+    assert content == "North answer."
+    assert template_kwargs["enable_thinking"] is True
+    assert template_kwargs["reasoning"] is True
+    assert template_kwargs["reasoning_effort"] == "high"
+    assert "<|END_THINKING|>" not in response.text
+    assert "<|START_TEXT|>" not in response.text
+    assert "<|END_TEXT|>" not in response.text
+
+
 def test_responses_streaming_emits_function_call_arguments_done(client):
     server.response_store.clear()
     server.response_store_order.clear()
@@ -2458,6 +2524,88 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
         "Custom reasoning."
     )
     assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
+
+
+def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="cohere2_moe")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="North reasoning.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason=None,
+                    ),
+                    server.StreamingToken(
+                        text="<|END_THINK",
+                        token=2,
+                        logprobs=0.0,
+                        finish_reason=None,
+                    ),
+                    server.StreamingToken(
+                        text="ING|><|START_TEXT|>North answer.<|END_TEXT|>",
+                        token=3,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server,
+            "apply_chat_template",
+            return_value="prompt<|START_THINKING|>",
+        ),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "CohereLabs/North-Mini-Code-1.0-w4a16",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == (
+        "North reasoning."
+    )
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
+        "North reasoning."
+    )
+    assert "".join(delta.get("content") or "" for delta in deltas) == "North answer."
+    assert "<|END_THINKING|>" not in response.text
+    assert "<|START_TEXT|>" not in response.text
+    assert "<|END_TEXT|>" not in response.text
 
 
 def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled(
@@ -4987,11 +5135,15 @@ class TestResponseGenerator:
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(
             enable_thinking=False,
+            reasoning=True,
+            reasoning_effort="high",
             thinking_budget=50,
             thinking_end_token="</think>",
         )
         kw = args.to_template_kwargs()
         assert kw["enable_thinking"] is False
+        assert kw["reasoning"] is True
+        assert kw["reasoning_effort"] == "high"
         assert kw["thinking_budget"] == 50
         assert kw["thinking_end_token"] == "</think>"
 
@@ -5180,6 +5332,61 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_maps_responses_reasoning_configuration(self):
+        req = server.OpenAIRequest(
+            model="demo",
+            input="hi",
+            reasoning={"effort": "high", "summary": "auto"},
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is True
+        assert args.reasoning is True
+        assert args.reasoning_effort == "high"
+        assert args.to_template_kwargs()["reasoning"] is True
+        assert args.to_template_kwargs()["reasoning_effort"] == "high"
+
+    def test_build_gen_args_maps_chat_reasoning_effort(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            reasoning_effort="low",
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is True
+        assert args.reasoning is True
+        assert args.reasoning_effort == "low"
+
+    def test_build_gen_args_maps_none_reasoning_effort_to_disabled(self):
+        req = server.OpenAIRequest(
+            model="demo",
+            input="hi",
+            reasoning={"effort": "none"},
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is False
+        assert args.reasoning is False
+        assert args.reasoning_effort == "none"
+
+    def test_build_gen_args_explicit_thinking_overrides_standard_reasoning(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=False,
+            reasoning_effort="high",
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is False
+        assert args.reasoning is False
+        assert args.reasoning_effort == "high"
 
     def test_build_gen_args_preserves_diffusion_options(self):
         req = server.ChatRequest(
@@ -5785,6 +5992,14 @@ class TestThinkingStreamState:
                 enable_thinking=True,
                 thinking_start_token="<analysis>",
                 thinking_end_token="</analysis>",
+            )
+            is True
+        )
+
+    def test_prompt_open_marker_is_authoritative_when_flag_is_disabled(self):
+        assert (
+            server.prompt_has_open_thinking(
+                "prompt<|START_THINKING|>", enable_thinking=False
             )
             is True
         )

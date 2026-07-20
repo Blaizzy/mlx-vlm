@@ -697,6 +697,8 @@ class GenerationArguments:
     min_threshold: Optional[float] = None
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
+    reasoning: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
@@ -772,6 +774,10 @@ class GenerationArguments:
     def to_template_kwargs(self) -> dict:
         """Convert to kwargs for apply_chat_template()."""
         kw = {"enable_thinking": self.enable_thinking}
+        if self.reasoning is not None:
+            kw["reasoning"] = self.reasoning
+        if self.reasoning_effort is not None:
+            kw["reasoning_effort"] = self.reasoning_effort
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
