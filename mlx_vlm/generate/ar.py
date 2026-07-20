@@ -82,6 +82,62 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
     )
 
 
+@dataclass(frozen=True)
+class SamplingConfig:
+    """Immutable per-row sampling parameters. One per request; rides the batch
+    like logits_processors. Frozen so it is hashable (cheap all-equal checks)."""
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    seed: int = 0
+
+
+def batched_row_sample(
+    logprobs: mx.array,
+    *,
+    temperature: mx.array,
+    top_p: mx.array,
+    top_k: mx.array,
+    min_p: mx.array,
+    keys: mx.array,
+) -> mx.array:
+    """Row-heterogeneous sampling in one sorted-space pass.
+
+    logprobs: [B, V] log-normalized. temperature/top_p/min_p: [B] float.
+    top_k: [B] int (<=0 disables). keys: [B] PRNG keys. Returns [B] token ids.
+    Order: temperature -> top_k (rank cutoff, exactly-k) -> top_p -> min_p.
+    Greedy rows (temperature < eps) return argmax.
+    """
+    eps = 1e-5
+    B, V = logprobs.shape
+    work = logprobs.astype(mx.float32) if logprobs.dtype == mx.bfloat16 else logprobs
+
+    order = mx.argsort(-work, axis=-1)                      # [B, V] descending
+    sl = mx.take_along_axis(work, order, axis=-1)           # sorted logprobs
+
+    safe_t = mx.where(temperature < eps, 1.0, temperature)
+    p = mx.softmax(sl / safe_t[:, None], axis=-1)
+    csum = mx.cumsum(p, axis=-1)
+
+    ranks = mx.arange(V, dtype=mx.int32)[None, :]
+    k_eff = mx.where(top_k <= 0, V, top_k)
+    keep = ranks < k_eff[:, None]                           # top_k, exactly-k by rank
+    keep = keep & ((csum - p) <= top_p[:, None])            # top_p (>=1 keeps all)
+    keep = keep & (p >= (p[:, :1] * min_p[:, None]))        # min_p (<=0 keeps all)
+    keep = keep | (ranks == 0)                              # always keep >=1 token
+
+    masked = mx.where(keep, sl / safe_t[:, None], mx.array(-float("inf"), mx.float32))
+    sampled_pos = mx.vmap(
+        lambda row, key: mx.random.categorical(row, key=key), in_axes=(0, 0)
+    )(masked, keys)
+    sampled = mx.take_along_axis(order, sampled_pos[:, None], axis=-1)[:, 0]
+
+    greedy = mx.argmax(work, axis=-1)
+    return mx.where(temperature < eps, greedy, sampled)
+
+
 class _PositionedTargetSampler:
     """Sampler with stateless target draws keyed by generated-token position."""
 
