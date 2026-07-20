@@ -505,6 +505,64 @@ def test_real_extend_and_filter_keep_sampling_aligned_to_uids():
     assert [c.temperature for c in greedy.sampling] == [0.0, 1.5]
 
 
+def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
+    """Task 3 wired PromptProcessingBatch.generate()'s first token through
+    self.sampling, but the server admission crash (fixed in Task 4) kept the
+    real server path from ever exercising it — the earlier coverage only
+    checked plumbing (extend/filter alignment), not that a live first-token
+    draw actually differs per row. Two rows share identical logits but
+    distinct SamplingConfigs (different temperature/seed); their sampled
+    first tokens must match an independent _PositionedTargetSampler call
+    over the same configs — proof the batch doesn't fall back to a single
+    shared sampler for the whole row."""
+    from mlx_vlm.generate.ar import _PositionedTargetSampler
+
+    class FixedLogitModel:
+        def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+            token_scores = mx.array([0.0, 1.0, 2.0, 3.0])
+            return SimpleNamespace(
+                logits=mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+            )
+
+    configs = [
+        SamplingConfig(temperature=1.5, seed=1),
+        SamplingConfig(temperature=1.5, seed=99),
+    ]
+    batch = PromptProcessingBatch(
+        model=FixedLogitModel(),
+        uids=[0, 1],
+        input_ids=[[5], [6]],
+        max_tokens=[1, 1],
+        inputs_embeds=mx.ones((2, 1, 4)),
+        prompt_kwargs={},
+        prefill_step_size=None,
+        warm_cache=[],
+        sampling=configs,
+    )
+
+    gen_batch = batch.generate(
+        lambda logprobs: mx.argmax(logprobs, axis=-1),  # unused: real path is self.sampling
+        stop_criteria=lambda token: False,
+    )
+
+    expected_logits = mx.broadcast_to(mx.array([0.0, 1.0, 2.0, 3.0]), (2, 4))
+    expected_logprobs = expected_logits - mx.logsumexp(
+        expected_logits, axis=-1, keepdims=True
+    )
+    expected = _PositionedTargetSampler(configs).sample_target(
+        expected_logprobs, row_ids=[0, 1], positions=[0, 0]
+    )
+    mx.eval(expected, gen_batch._next_tokens)
+
+    sampled = gen_batch._next_tokens.tolist()
+    assert sampled == expected.tolist()
+    # The two rows' distinct seeds must actually matter here — otherwise
+    # this test would pass even if per-row seeding were silently broken.
+    assert sampled[0] != sampled[1]
+
+
 # ============================================================================
 # Tests for Helper Functions
 # ============================================================================

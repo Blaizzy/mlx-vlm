@@ -21,6 +21,7 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
+    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
@@ -40,7 +41,7 @@ from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-from ..sample_utils import make_logits_processors, make_sampler
+from ..sample_utils import make_logits_processors
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -727,6 +728,17 @@ class GenerationArguments:
         return kw
 
 
+def _config_from_args(args: "GenerationArguments") -> SamplingConfig:
+    """Build the per-row sampling config admitted with a request."""
+    return SamplingConfig(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        seed=DEFAULT_SEED if args.seed is None else int(args.seed),
+    )
+
+
 @dataclass
 class GenerationContext:
     """Context returned when a request is queued."""
@@ -1072,6 +1084,28 @@ class ResponseGenerator:
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
+    def _model_vocab_size(self) -> Optional[int]:
+        """Best-effort text vocab size for the loaded model, or None if it
+        can't be determined (checks are skipped rather than guessed at)."""
+        model = getattr(self, "model", None)
+        if model is None:
+            return None
+        lm = getattr(model, "language_model", model)
+        candidates = (
+            getattr(lm, "vocab_size", None),
+            getattr(getattr(lm, "config", None), "vocab_size", None),
+            getattr(getattr(model, "config", None), "vocab_size", None),
+            getattr(
+                getattr(getattr(model, "config", None), "text_config", None),
+                "vocab_size",
+                None,
+            ),
+        )
+        for vocab_size in candidates:
+            if isinstance(vocab_size, int) and vocab_size > 0:
+                return vocab_size
+        return None
+
     def generate(
         self,
         prompt: str,
@@ -1089,6 +1123,15 @@ class ResponseGenerator:
         if self.draft_model is not None and args.thinking_budget is not None:
             raise ValueError(
                 "thinking_budget is not supported with speculative decoding in the server."
+            )
+        vocab_size = self._model_vocab_size()
+        if vocab_size is not None and args.top_k >= vocab_size:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"top_k={args.top_k} is out of range for this model's "
+                    f"vocabulary ({vocab_size} tokens)."
+                ),
             )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
@@ -1345,15 +1388,6 @@ class ResponseGenerator:
             )
         return now
 
-    def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
-        if args.temperature == 0:
-            return None
-        return _PositionedTargetSampler(
-            temperature=args.temperature,
-            top_p=args.top_p,
-            seed=args.seed,
-        )
-
     def _make_logits_processors(
         self, args: GenerationArguments, input_ids: Optional[mx.array] = None
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
@@ -1597,11 +1631,16 @@ class ResponseGenerator:
                         request, backend="continuous_batching"
                     )
                     if batch_gen is None:
+                        # No `sampler=` here: the batch samples per-row from
+                        # `sampling_configs` passed to insert() below, so the
+                        # BatchGenerator-level sampler is inert on this path
+                        # (kept only for PromptProcessingBatch/GenerationBatch
+                        # constructor compatibility) — its default argmax
+                        # fallback is harmless.
                         batch_gen = BatchGenerator(
                             self.model.language_model,
                             self.processor,
                             stop_tokens=self.stop_tokens,
-                            sampler=self._make_sampler(args),
                             kv_bits=self.kv_bits,
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
@@ -1647,6 +1686,7 @@ class ResponseGenerator:
                                 self._make_logits_processors(args, input_ids)
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
+                            sampling_configs=[_config_from_args(args)],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -1815,6 +1855,39 @@ class ResponseGenerator:
         finally:
             results.close()
 
+    def _serialize_speculative_batch_by_config(
+        self, pending: List[QueuedGenerationRequest]
+    ) -> Tuple[List[QueuedGenerationRequest], List[SamplingConfig]]:
+        """dflash/eagle3 don't yet thread per-row sampling params through the
+        drafter verify path (that's PR2). Never let one row's params
+        silently win for the whole batch: if `pending` disagrees on
+        sampling config, keep only the requests that match the first one
+        and requeue the rest for the next round.
+
+        Returns (kept, configs): `configs` is uniform and aligned 1:1 with
+        `kept` (which is `pending` unchanged when it was already uniform).
+        """
+        configs = [_config_from_args(request.args) for request in pending]
+        if len(set(configs)) <= 1:
+            return pending, configs
+
+        target_config = configs[0]
+        kept, deferred = [], []
+        for request, config in zip(pending, configs):
+            (kept if config == target_config else deferred).append(request)
+        logger.info(
+            "dflash/eagle3 speculative batch has heterogeneous sampling "
+            "params; serializing by config instead of co-batching (%d of "
+            "%d requests deferred to the next round). Full per-row "
+            "speculative sampling lands in a follow-up PR.",
+            len(deferred),
+            len(pending),
+        )
+        # TODO(PR2): per-row dflash/eagle3 sampling.
+        for request in deferred:
+            self.requests.put(request)
+        return kept, [target_config] * len(kept)
+
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
 
@@ -1831,7 +1904,6 @@ class ResponseGenerator:
         is_mtp = draft_kind == "mtp"
         prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
-        sampler = make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
@@ -1848,6 +1920,11 @@ class ResponseGenerator:
 
                 if not pending:
                     continue
+
+                pending, configs = self._serialize_speculative_batch_by_config(
+                    pending
+                )
+
                 # --- Phase 2: prefill new batch ---
                 uids = []
                 rqueues = {}
@@ -1890,9 +1967,13 @@ class ResponseGenerator:
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    sampler = self._make_sampler(args) or make_sampler(temp=0)
 
                 B = len(uids)
+                # `configs` is uniform across `pending` at this point (either
+                # it already was, or the heterogeneous-batch check above
+                # serialized it down to one config) — safe to broadcast into
+                # a single row-aware sampler for the whole round.
+                sampler = _PositionedTargetSampler(configs)
                 max_len = max(len(ids) for ids in all_input_ids)
                 left_padding = [max_len - len(ids) for ids in all_input_ids]
                 padded = [

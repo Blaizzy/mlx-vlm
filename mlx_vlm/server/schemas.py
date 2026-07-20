@@ -335,9 +335,9 @@ class OpenAIRequest(FlexibleBaseModel):
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
-    top_k: int = Field(0, description="Top-k sampling.")
-    min_p: float = Field(0.0, description="Min-p sampling.")
+    top_p: float = Field(DEFAULT_TOP_P, gt=0.0, le=1.0, description="Top-p sampling.")
+    top_k: int = Field(0, ge=0, description="Top-k sampling (0 disables).")
+    min_p: float = Field(0.0, ge=0.0, le=1.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
@@ -715,9 +715,9 @@ class VLMRequest(FlexibleBaseModel):
     temperature: float = Field(
         DEFAULT_TEMPERATURE, description="Temperature for sampling."
     )
-    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
-    top_k: int = Field(0, description="Top-k sampling.")
-    min_p: float = Field(0.0, description="Min-p sampling.")
+    top_p: float = Field(DEFAULT_TOP_P, gt=0.0, le=1.0, description="Top-p sampling.")
+    top_k: int = Field(0, ge=0, description="Top-k sampling (0 disables).")
+    min_p: float = Field(0.0, ge=0.0, le=1.0, description="Min-p sampling.")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
