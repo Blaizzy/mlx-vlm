@@ -21,7 +21,6 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
@@ -31,11 +30,17 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
+from ..generate.ar import (
+    SamplingConfig,
+    _PositionedTargetSampler,
+    _position_keys,
+    _position_seed,
+)
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import make_logits_processors, make_sampler
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -212,71 +217,6 @@ def _run_chunked_speculative_prefill(
     with mx.stream(generation_stream):
         out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
     return out, remaining_input_ids
-
-
-def _position_seed(seed: int, row_id: int, position: int) -> int:
-    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
-    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
-    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
-    x ^= x >> 16
-    x = (x * 0x7FEB352D) & 0xFFFFFFFF
-    x ^= x >> 15
-    return int(x & 0xFFFFFFFF)
-
-
-def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
-    return mx.stack(
-        [
-            mx.random.key(_position_seed(seed, row, pos))
-            for row, pos in zip(row_ids, positions)
-        ]
-    )
-
-
-class _PositionedTargetSampler:
-    """Server sampler with stateless target draws for ragged verification."""
-
-    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.seed = DEFAULT_SEED if seed is None else int(seed)
-
-    def __call__(self, logprobs: mx.array) -> mx.array:
-        if self.top_p > 0 and self.top_p < 1.0:
-            return top_p_sampling(logprobs, self.top_p, self.temperature)
-        return mx.random.categorical(logprobs * (1 / self.temperature))
-
-    def sample_target(
-        self,
-        logprobs: mx.array,
-        *,
-        row_ids: List[int],
-        positions: List[int],
-    ) -> mx.array:
-        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
-            raise ValueError("row_ids and positions must match logprobs batch size.")
-        keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
-        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
-
-    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
-
-    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
-        )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
 
 
 def _sample_last_token(

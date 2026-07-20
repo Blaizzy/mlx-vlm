@@ -18,7 +18,7 @@ from tqdm import tqdm
 from .. import apc as _apc
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import make_logits_processors, make_sampler
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -139,49 +139,67 @@ def batched_row_sample(
 
 
 class _PositionedTargetSampler:
-    """Sampler with stateless target draws keyed by generated-token position."""
+    """Row-aware sampler with stateless per-(row,position) RNG keying.
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.seed = int(seed)
+    Built from a per-row list of SamplingConfig. Each row is sampled with its
+    own temperature/top_p/top_k/min_p; the RNG key is derived per row from its
+    own seed + row_id + position, so a row's draw is invariant to batch
+    composition. Keeps the sample_target signature that speculative/mtp.py and
+    _sample_with_positions depend on."""
+
+    def __init__(self, configs: List["SamplingConfig"]):
+        if not configs:
+            raise ValueError("_PositionedTargetSampler requires at least one config.")
+        self.configs = list(configs)
+        # Per-row seed vector drives _position_keys. All-equal fast-path flag.
+        self._uniform = len(set(self.configs)) == 1
+
+    def _arrays(self):
+        c = self.configs
+        return (
+            mx.array([x.temperature for x in c], dtype=mx.float32),
+            mx.array([x.top_p for x in c], dtype=mx.float32),
+            mx.array([x.top_k for x in c], dtype=mx.int32),
+            mx.array([x.min_p for x in c], dtype=mx.float32),
+        )
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        if self.top_p > 0 and self.top_p < 1.0:
-            return top_p_sampling(logprobs, self.top_p, self.temperature)
-        return mx.random.categorical(logprobs * (1 / self.temperature))
+        n = logprobs.shape[0]
+        keys = mx.stack(
+            [
+                mx.random.key(_position_seed(c.seed, i, 0))
+                for i, c in enumerate(self.configs)
+            ]
+        )
+        if n != len(self.configs):
+            raise ValueError("configs length must match logprobs batch size.")
+        return self._draw(logprobs, keys)
 
     def sample_target(
-        self,
-        logprobs: mx.array,
-        *,
-        row_ids: List[int],
-        positions: List[int],
+        self, logprobs: mx.array, *, row_ids: List[int], positions: List[int]
     ) -> mx.array:
-        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
-            raise ValueError("row_ids and positions must match logprobs batch size.")
-        keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
-        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
-
-    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
-
-    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
+        if logprobs.shape[0] != len(self.configs):
+            raise ValueError("configs length must match logprobs batch size.")
+        if len(row_ids) != len(positions) or len(row_ids) != len(self.configs):
+            raise ValueError("row_ids/positions must match configs length.")
+        keys = mx.stack(
+            [
+                mx.random.key(_position_seed(cfg.seed, row, pos))
+                for cfg, row, pos in zip(self.configs, row_ids, positions)
+            ]
         )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+        return self._draw(logprobs, keys)
+
+    def _draw(self, logprobs: mx.array, keys: mx.array) -> mx.array:
+        temperature, top_p, top_k, min_p = self._arrays()
+        return batched_row_sample(
+            logprobs,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            keys=keys,
+        )
 
 
 def _generate_module_override(name: str, fallback):
@@ -311,9 +329,16 @@ def generate_step(
             and top_k == DEFAULT_TOP_K
         ):
             sampler = _PositionedTargetSampler(
-                temperature=temperature,
-                top_p=top_p,
-                seed=seed,
+                [
+                    SamplingConfig(
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        seed=seed,
+                    )
+                ]
+                * input_ids.shape[0]
             )
         else:
             sampler = _generate_module_override("make_sampler", make_sampler)(

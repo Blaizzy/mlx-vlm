@@ -392,33 +392,26 @@ def test_speculative_server_samples_first_bonus_with_positioned_sampler():
 
 
 def test_positioned_target_sampler_is_batch_grouping_invariant():
-    sampler = server_generation._PositionedTargetSampler(
-        temperature=0.7, top_p=1.0, seed=42
-    )
+    # Two rows with DISTINCT ids and DISTINCT params: each row's token must be
+    # identical whether drawn alone or co-batched. This is the row-level proof.
+    from mlx_vlm.generate.ar import SamplingConfig
+
+    cfg0 = SamplingConfig(temperature=2.0, top_p=1.0, top_k=1, min_p=0.0, seed=42)
+    cfg1 = SamplingConfig(temperature=0.7, top_p=0.9, top_k=40, min_p=0.6, seed=7)
     logits = mx.array(
-        [
-            [0.0, 1.0, 2.0, 3.0],
-            [3.0, 2.0, 1.0, 0.0],
-        ],
-        dtype=mx.float32,
+        [[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32
     )
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-    batched = sampler.sample_target(
-        logprobs,
-        row_ids=[0, 0],
-        positions=[5, 5],
-    )
-    single_0 = sampler.sample_target(
-        logprobs[0:1],
-        row_ids=[0],
-        positions=[5],
-    )
-    single_1 = sampler.sample_target(
-        logprobs[1:2],
-        row_ids=[0],
-        positions=[5],
-    )
+    batched = server_generation._PositionedTargetSampler(
+        [cfg0, cfg1]
+    ).sample_target(logprobs, row_ids=[0, 1], positions=[5, 5])
+    single_0 = server_generation._PositionedTargetSampler(
+        [cfg0]
+    ).sample_target(logprobs[0:1], row_ids=[0], positions=[5])
+    single_1 = server_generation._PositionedTargetSampler(
+        [cfg1]
+    ).sample_target(logprobs[1:2], row_ids=[1], positions=[5])
     mx.eval(batched, single_0, single_1)
 
     assert batched.tolist() == [single_0.item(), single_1.item()]
