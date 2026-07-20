@@ -35,10 +35,12 @@ def set_generation_device(device_name: str):
     global generation_stream
     generation_stream = stream
     for mod_name, mod in list(sys.modules.items()):
+        # match by attribute presence: new_thread_local_stream returns a
+        # ThreadLocalStream, which is not an isinstance of mx.Stream
         if (
             mod_name.startswith("mlx_vlm")
             and mod is not None
-            and isinstance(getattr(mod, "generation_stream", None), mx.Stream)
+            and hasattr(mod, "generation_stream")
         ):
             mod.generation_stream = stream
 
