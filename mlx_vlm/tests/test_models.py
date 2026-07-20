@@ -10039,10 +10039,14 @@ class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
 
 class TestSetGenerationDevice(unittest.TestCase):
     def test_rebinds_streams_in_imported_modules(self):
-        import mlx_vlm.generate.ar as ar
-        import mlx_vlm.generate.common as common
-        import mlx_vlm.generate.dispatch as dispatch
-        from mlx_vlm.generate.common import set_generation_device
+        # mlx_vlm.__init__ re-exports the generate *function*, shadowing the
+        # generate package for `import ... as` attribute binding
+        import importlib
+
+        ar = importlib.import_module("mlx_vlm.generate.ar")
+        common = importlib.import_module("mlx_vlm.generate.common")
+        dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
+        set_generation_device = common.set_generation_device
 
         original_device = mx.default_device()
         original_stream = common.generation_stream
