@@ -1440,7 +1440,6 @@ class SpeculativeGenerationBatch:
         uids: List[int],
         first_tokens: mx.array,
         prompt_cache: List[Any],
-        sampler: Callable[[mx.array], mx.array],
         stop_criteria,
         max_tokens: List[int],
         hidden: mx.array,
@@ -1449,7 +1448,7 @@ class SpeculativeGenerationBatch:
         *,
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
-        greedy_sampling: bool = False,
+        sampling: Optional[List["SamplingConfig"]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1458,7 +1457,6 @@ class SpeculativeGenerationBatch:
         self._all_uids = list(uids)
         self.first_tokens = first_tokens
         self.prompt_cache = prompt_cache
-        self.sampler = sampler
         self.stop_criteria = stop_criteria
         self.max_tokens = list(max_tokens)
         self.hidden = hidden
@@ -1466,11 +1464,18 @@ class SpeculativeGenerationBatch:
         self.prompt_tokens = prompt_tokens
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
-        self.greedy_sampling = greedy_sampling
+        self._init_sampling(sampling)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+
+    def _init_sampling(self, sampling):
+        self.sampling = (
+            list(sampling) if sampling else [SamplingConfig()] * len(self._all_uids)
+        )
+        self.sampler = _PositionedTargetSampler(self.sampling)
+        self.greedy_sampling = all(c.temperature == 0 for c in self.sampling)
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -2034,7 +2039,6 @@ class PromptProcessingBatch:
                 uids=list(self.uids),
                 first_tokens=first_tokens,
                 prompt_cache=self.prompt_cache,
-                sampler=sampler,
                 stop_criteria=stop_criteria,
                 max_tokens=list(self.max_tokens),
                 hidden=speculative_hidden_state(self.draft_kind, output),
@@ -2044,7 +2048,7 @@ class PromptProcessingBatch:
                 prompt_tokens=self._input_ids,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
-                greedy_sampling=self.greedy_sampling,
+                sampling=list(self.sampling),
             )
             compute_logprobs = False
         else:

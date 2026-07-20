@@ -944,7 +944,6 @@ class TestBatchGenerator:
             uids=[100, 200],
             first_tokens=mx.array([0, 9], dtype=mx.int32),
             prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
             stop_criteria=lambda token: False,
             max_tokens=[10, 10],
             hidden=mx.zeros((2, 1, 1)),

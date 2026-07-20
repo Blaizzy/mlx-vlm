@@ -1092,7 +1092,16 @@ def _mtp_rounds_batch(
         # plain KVCache / RotatingKVCache do not, so we keep all rows
         # in the batch and just stop emitting for finished rows. End the
         # round-loop when every row has finished.
-        cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
+        #
+        # Positioned per-row samplers are built once at the full batch width
+        # (one config per original row); mid-round compaction would feed the
+        # walk a shrunk logprobs and break the sampler's configs-length
+        # invariant. Keep all rows (finished rows are masked when emitting) so
+        # the sampler always sees the full width. Costs some compute on
+        # finished rows until the whole batch drains; correctness > that.
+        cache_filterable = all(
+            hasattr(c, "filter") for c in prompt_cache
+        ) and not _sampler_supports_positioned_target(sampler)
         if all(finished[active_idx[j]] for j in range(n_active)):
             break
         if cache_filterable:
