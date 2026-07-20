@@ -171,7 +171,7 @@ def prompt_has_open_thinking(
     thinking_end_token: Optional[str] = None,
 ) -> bool:
     """Return whether generation starts inside a prompt-opened thinking block."""
-    if not enable_thinking or not isinstance(prompt, str):
+    if not isinstance(prompt, str):
         return False
 
     stripped_prompt = prompt.rstrip()

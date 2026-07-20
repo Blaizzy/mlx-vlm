@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import FastAPI, HTTPException, Request
@@ -17,17 +17,13 @@ from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 
 from .. import apc as _apc
-from ..generate import (
-    DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
-)
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
+from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
 from .generation import (
@@ -41,11 +37,6 @@ from .generation import (
     get_kv_quant_scheme,
     get_quantized_kv_bits,
     get_quantized_kv_start,
-    get_server_enable_thinking,
-    get_server_max_tokens,
-    get_server_thinking_budget,
-    get_server_thinking_end_token,
-    get_server_thinking_start_token,
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
@@ -58,6 +49,8 @@ DEFAULT_SERVER_PORT = 8080
 SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
 
 logger = logging.getLogger("mlx_vlm.server")
+
+_as_plain_dict = _request_normalization._as_plain_dict
 
 
 def _server_api_key() -> Optional[str]:
@@ -166,109 +159,13 @@ def _server_runtime_snapshot() -> dict:
 def _build_gen_args(
     request, processor=None, tenant_id: Optional[str] = None
 ) -> GenerationArguments:
-    """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
-    max_tokens = getattr(request, "max_tokens", None)
-    if max_tokens is None:
-        max_tokens = getattr(request, "max_output_tokens", None)
-    if max_tokens is None:
-        max_tokens = get_server_max_tokens()
-    logit_bias = getattr(request, "logit_bias", None)
-    if logit_bias is not None and isinstance(logit_bias, dict):
-        logit_bias = {int(k): v for k, v in logit_bias.items()}
-    enable_thinking = _request_field_or_default(
+    """Build GenerationArguments from a compatible API request."""
+    return _request_normalization._build_gen_args(
         request,
-        "enable_thinking",
-        get_server_enable_thinking(),
-    )
-    default_temperature = _model_config_field_or_default(
-        processor, "temperature", DEFAULT_TEMPERATURE
-    )
-    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
-    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
-    if _model_config_field_or_default(processor, "do_sample", None) is False:
-        default_temperature = 0.0
-    args = GenerationArguments(
-        max_tokens=max_tokens,
-        temperature=_request_field_or_default(
-            request, "temperature", default_temperature
-        ),
-        top_p=_request_field_or_default(request, "top_p", default_top_p),
-        top_k=_request_field_or_default(request, "top_k", default_top_k),
-        min_p=getattr(request, "min_p", 0.0),
-        seed=getattr(request, "seed", None),
-        logprobs=bool(getattr(request, "logprobs", False)),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
-        repetition_context_size=_request_field_or_default(
-            request,
-            "repetition_context_size",
-            DEFAULT_REPETITION_CONTEXT_SIZE,
-        ),
-        presence_penalty=getattr(request, "presence_penalty", None),
-        presence_context_size=_request_field_or_default(
-            request,
-            "presence_context_size",
-            DEFAULT_REPETITION_CONTEXT_SIZE,
-        ),
-        frequency_penalty=getattr(request, "frequency_penalty", None),
-        frequency_context_size=_request_field_or_default(
-            request,
-            "frequency_context_size",
-            DEFAULT_REPETITION_CONTEXT_SIZE,
-        ),
-        max_denoising_steps=_request_field_or_default(
-            request, "max_denoising_steps", None
-        ),
-        block_length=_request_field_or_default(request, "block_length", None),
-        num_to_transfer=_request_field_or_default(request, "num_to_transfer", None),
-        max_transfer_per_step=_request_field_or_default(
-            request, "max_transfer_per_step", None
-        ),
-        editing_threshold=_request_field_or_default(request, "editing_threshold", None),
-        max_post_steps=_request_field_or_default(request, "max_post_steps", None),
-        stability_steps=_request_field_or_default(request, "stability_steps", None),
-        diffusion_full_canvas=_request_field_or_default(
-            request, "diffusion_full_canvas", None
-        ),
-        diffusion_min_canvas_length=_request_field_or_default(
-            request, "diffusion_min_canvas_length", None
-        ),
-        diffusion_max_canvas_length=_request_field_or_default(
-            request, "diffusion_max_canvas_length", None
-        ),
-        diffusion_sampler=_request_field_or_default(request, "diffusion_sampler", None),
-        threshold=_request_field_or_default(request, "threshold", None),
-        min_threshold=_request_field_or_default(request, "min_threshold", None),
-        logit_bias=logit_bias,
-        enable_thinking=enable_thinking,
-        thinking_budget=_request_field_or_default(
-            request, "thinking_budget", get_server_thinking_budget()
-        ),
-        thinking_start_token=_request_field_or_default(
-            request, "thinking_start_token", get_server_thinking_start_token()
-        ),
-        thinking_end_token=_request_field_or_default(
-            request, "thinking_end_token", get_server_thinking_end_token()
-        ),
+        processor=processor,
         tenant_id=tenant_id,
+        structured_logits_processor_builder=_build_structured_logits_processors,
     )
-    if processor is not None:
-        args.logits_processors = _build_structured_logits_processors(request, processor)
-    return args
-
-
-def _request_field_or_default(request, field_name: str, default):
-    fields_set = getattr(request, "model_fields_set", None)
-    if fields_set is not None and field_name not in fields_set:
-        return default
-    value = getattr(request, field_name, default)
-    return default if value is None else value
-
-
-def _model_config_field_or_default(processor, field_name: str, default):
-    config = runtime.model_cache.get("config")
-    if config is None and processor is not None:
-        config = getattr(processor, "config", None)
-    return getattr(config, field_name, default)
 
 
 def _read_tenant_id(http_request) -> Optional[str]:
@@ -316,56 +213,20 @@ async def _preflight_stream_context_budget(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-def _as_plain_dict(value):
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    return value
-
-
-def _extract_response_format_schema(request) -> Optional[Union[str, dict]]:
-    response_format = _as_plain_dict(getattr(request, "response_format", None))
-
-    text_config = _as_plain_dict(getattr(request, "text", None))
-    if response_format is None and isinstance(text_config, dict):
-        response_format = _as_plain_dict(text_config.get("format"))
-
-    if response_format is None:
-        return None
-
-    format_type = response_format.get("type")
-    if format_type in (None, "text"):
-        return None
-    if format_type in ("json_object", "object"):
-        return {"type": "object"}
-    if format_type != "json_schema":
-        raise ValueError(f"Unsupported response_format type: {format_type!r}")
-
-    json_schema = _as_plain_dict(response_format.get("json_schema"))
-    if json_schema is None:
-        # Responses API text.format places schema directly on the format object.
-        json_schema = response_format
-
-    schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
-    if schema is None:
-        raise ValueError("response_format json_schema must include a schema field")
-    return schema
-
-
 def _build_structured_logits_processors(request, processor):
-    schema = _extract_response_format_schema(request)
-    if schema is None:
-        return None
+    return _request_normalization._build_structured_logits_processors(
+        request,
+        processor,
+        logits_processor_factory=_server_package_attr(
+            "build_json_schema_logits_processor",
+            build_json_schema_logits_processor,
+        ),
+    )
 
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    logits_processor = _server_package_attr(
-        "build_json_schema_logits_processor",
-        build_json_schema_logits_processor,
-    )(tokenizer, schema)
-    return [logits_processor]
+
+def _extract_response_format_schema(request):
+    """Retain the package-level compatibility alias for schema extraction."""
+    return _request_normalization._extract_response_format_schema(request)
 
 
 def _count_thinking_tag_tokens(
