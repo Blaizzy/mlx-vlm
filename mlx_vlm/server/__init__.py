@@ -114,6 +114,7 @@ from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
     process_tool_calls,
+    prompt_has_open_thinking,
     response_store,
     response_store_lock,
     response_store_order,
