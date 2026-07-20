@@ -1360,6 +1360,52 @@ class TestQwen3VLProcessor(_ProcessorTestBase, unittest.TestCase):
             1280 * 28 * 28,
         )
 
+    def test_video_processor_accepts_pil_frame_lists(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        frames = [
+            Image.new("RGB", (224, 224), color=(i * 40, 128, 128)) for i in range(4)
+        ]
+        processor = Qwen3VLVideoProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            do_rescale=False,
+            do_normalize=False,
+        )
+
+        output = processor(videos=[frames])
+
+        np.testing.assert_array_equal(
+            output["video_grid_thw"], np.array([[2, 16, 16]], dtype=np.int64)
+        )
+        self.assertEqual(output["pixel_values_videos"].shape, (512, 1176))
+
+        direct_output = processor(videos=frames)
+        np.testing.assert_array_equal(
+            direct_output["video_grid_thw"], np.array([[2, 16, 16]], dtype=np.int64)
+        )
+        self.assertEqual(direct_output["pixel_values_videos"].shape, (512, 1176))
+
+    def test_video_processor_accepts_channel_last_arrays(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLVideoProcessor
+
+        video = np.zeros((4, 224, 224, 3), dtype=np.uint8)
+        processor = Qwen3VLVideoProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            do_rescale=False,
+            do_normalize=False,
+        )
+
+        output = processor(videos=[video])
+
+        np.testing.assert_array_equal(
+            output["video_grid_thw"], np.array([[2, 16, 16]], dtype=np.int64)
+        )
+        self.assertEqual(output["pixel_values_videos"].shape, (512, 1176))
+
 
 class TestQwen3OmniMoeProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
