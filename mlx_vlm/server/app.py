@@ -274,12 +274,14 @@ def _model_config_field_or_default(processor, field_name: str, default):
 def _read_tenant_id(http_request) -> Optional[str]:
     """Pull a per-tenant APC salt from the request headers.
 
-    Honoured headers (in order): ``X-APC-Tenant``, ``X-Tenant-Id``.
+    Honoured sources, in order: ``X-APC-Tenant``, ``X-Tenant-Id``,
+    ``APC_DEFAULT_TENANT``, then ``default``.
     """
+    default_tenant = os.environ.get("APC_DEFAULT_TENANT") or "default"
     if http_request is None or not hasattr(http_request, "headers"):
-        return None
+        return default_tenant
     h = http_request.headers
-    return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+    return h.get("x-apc-tenant") or h.get("x-tenant-id") or default_tenant
 
 
 async def _preflight_stream_context_budget(

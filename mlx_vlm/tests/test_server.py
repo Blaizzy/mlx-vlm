@@ -1581,6 +1581,35 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
     assert "_apc_tenant" not in call
 
 
+def test_read_tenant_id_prefers_apc_header(monkeypatch):
+    monkeypatch.setenv("APC_DEFAULT_TENANT", "env-tenant")
+    request = SimpleNamespace(
+        headers={"x-apc-tenant": "header-tenant", "x-tenant-id": "legacy-tenant"}
+    )
+
+    assert server._read_tenant_id(request) == "header-tenant"
+
+
+def test_read_tenant_id_uses_legacy_header_before_env(monkeypatch):
+    monkeypatch.setenv("APC_DEFAULT_TENANT", "env-tenant")
+    request = SimpleNamespace(headers={"x-tenant-id": "legacy-tenant"})
+
+    assert server._read_tenant_id(request) == "legacy-tenant"
+
+
+def test_read_tenant_id_uses_env_default(monkeypatch):
+    monkeypatch.setenv("APC_DEFAULT_TENANT", "env-tenant")
+
+    assert server._read_tenant_id(SimpleNamespace(headers={})) == "env-tenant"
+    assert server._read_tenant_id(None) == "env-tenant"
+
+
+def test_read_tenant_id_falls_back_to_default(monkeypatch):
+    monkeypatch.delenv("APC_DEFAULT_TENANT", raising=False)
+
+    assert server._read_tenant_id(SimpleNamespace(headers={})) == "default"
+
+
 def test_responses_endpoint_forwards_new_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
