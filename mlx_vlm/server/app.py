@@ -163,6 +163,52 @@ def _server_runtime_snapshot() -> dict:
     }
 
 
+_DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+
+def _request_field_is_set(request, field_name: str) -> bool:
+    fields_set = getattr(request, "model_fields_set", None)
+    if fields_set is not None:
+        return field_name in fields_set
+    return getattr(request, field_name, None) is not None
+
+
+def _reasoning_effort_enabled(effort) -> Tuple[Optional[bool], Optional[str]]:
+    if effort is None:
+        return None, None
+    normalized = str(effort).strip().lower()
+    if not normalized:
+        return None, None
+    return normalized not in _DISABLED_REASONING_EFFORTS, normalized
+
+
+def _standard_reasoning_control(
+    request,
+) -> Tuple[Optional[bool], Optional[str], bool]:
+    """Normalize OpenAI reasoning fields into a thinking-mode decision."""
+    if _request_field_is_set(request, "reasoning"):
+        reasoning = getattr(request, "reasoning", None)
+        if hasattr(reasoning, "model_dump"):
+            reasoning = reasoning.model_dump(exclude_none=True)
+        if isinstance(reasoning, dict):
+            enabled, effort = _reasoning_effort_enabled(reasoning.get("effort"))
+            return (True if enabled is None else enabled), effort, True
+        if isinstance(reasoning, bool):
+            return reasoning, None, True
+        enabled, effort = _reasoning_effort_enabled(reasoning)
+        if enabled is not None:
+            return enabled, effort, True
+
+    if _request_field_is_set(request, "reasoning_effort"):
+        enabled, effort = _reasoning_effort_enabled(
+            getattr(request, "reasoning_effort", None)
+        )
+        if enabled is not None:
+            return enabled, effort, True
+
+    return None, None, False
+
+
 def _build_gen_args(
     request, processor=None, tenant_id: Optional[str] = None
 ) -> GenerationArguments:
@@ -175,11 +221,21 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
-    enable_thinking = _request_field_or_default(
-        request,
-        "enable_thinking",
-        get_server_enable_thinking(),
+    standard_reasoning, reasoning_effort, has_standard_reasoning = (
+        _standard_reasoning_control(request)
     )
+    server_enable_thinking = get_server_enable_thinking()
+    if _request_field_is_set(request, "enable_thinking"):
+        enable_thinking = bool(getattr(request, "enable_thinking", False))
+        template_reasoning = enable_thinking
+    elif has_standard_reasoning:
+        enable_thinking = bool(standard_reasoning)
+        template_reasoning = enable_thinking
+    else:
+        enable_thinking = server_enable_thinking
+        # Preserve a model template's native default when the server default is
+        # off and the request did not express a reasoning preference.
+        template_reasoning = True if server_enable_thinking else None
     default_temperature = _model_config_field_or_default(
         processor, "temperature", DEFAULT_TEMPERATURE
     )
@@ -240,6 +296,8 @@ def _build_gen_args(
         min_threshold=_request_field_or_default(request, "min_threshold", None),
         logit_bias=logit_bias,
         enable_thinking=enable_thinking,
+        reasoning=template_reasoning,
+        reasoning_effort=reasoning_effort,
         thinking_budget=_request_field_or_default(
             request, "thinking_budget", get_server_thinking_budget()
         ),

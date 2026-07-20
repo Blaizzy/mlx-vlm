@@ -358,6 +358,14 @@ class OpenAIRequest(FlexibleBaseModel):
             "server default set by --enable-thinking is used."
         ),
     )
+    reasoning: Optional[Any] = Field(
+        None,
+        description="OpenAI Responses API reasoning configuration.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="OpenAI-compatible reasoning effort.",
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -730,6 +738,14 @@ class VLMRequest(FlexibleBaseModel):
             "Override server thinking mode for this request. If omitted, the "
             "server default set by --enable-thinking is used."
         ),
+    )
+    reasoning: Optional[Any] = Field(
+        None,
+        description="OpenAI-compatible reasoning configuration.",
+    )
+    reasoning_effort: Optional[str] = Field(
+        None,
+        description="OpenAI-compatible reasoning effort.",
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
