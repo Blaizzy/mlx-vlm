@@ -3,13 +3,13 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -22,17 +22,6 @@ def _rope_base(args: ModelConfig, rope_config: Dict[str, Union[float, str]]) -> 
 def _rope_dims(args: ModelConfig, rope_config: Dict[str, Union[float, str]]) -> int:
     partial = float(rope_config.get("partial_rotary_factor", 1.0))
     return int(args.head_dim * partial)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class LagunaTopKRouter(nn.Module):

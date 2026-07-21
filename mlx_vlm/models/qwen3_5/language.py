@@ -437,6 +437,15 @@ _TARGET_VERIFY_QARGMAX_SOURCE = r"""
     }
 """
 
+_TARGET_VERIFY_MASKED_QARGMAX_SOURCE = _TARGET_VERIFY_QARGMAX_SOURCE.replace(
+    "if (n < N_SIZE) {",
+    """if (
+          n < N_SIZE &&
+          ((as_type<uint>(mask[
+                (int(b_idx) * VERIFY_T + t) * mask_shape[1] + (n >> 5)]) >>
+            (n & 31)) & 1u) != 0u) {""",
+)
+
 
 @lru_cache(maxsize=None)
 def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
@@ -468,25 +477,50 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
     )
 
 
-def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+@lru_cache(maxsize=None)
+def _target_verify_masked_qargmax_kernel(
+    bits, group_size, dtype, verify_t, k_size, n_size
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_masked_qargmax_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases", "mask"],
+        output_names=["tile_values", "tile_indices"],
+        header=_target_verify_qlinear_header(bits, group_size),
+        source=_TARGET_VERIFY_MASKED_QARGMAX_SOURCE,
+    )
+
+
+def _can_target_verify_quantized_head(linear) -> bool:
     if (
         not isinstance(linear, nn.QuantizedLinear)
-        or x.ndim != 3
-        or x.shape[1] < 1
         or linear.bits not in (4, 5)
         or linear.mode != "affine"
         or linear.biases is None
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
+        or linear.scales.dtype not in (mx.bfloat16, mx.float16)
+        or linear.biases.dtype != linear.scales.dtype
     ):
         return False
 
-    _, _, K = x.shape
+    K = linear.weight.shape[1] * 32 // linear.bits
     N = linear.weight.shape[0]
-    return (
-        K == linear.weight.shape[1] * 32 // linear.bits and K % 512 == 0 and N % 8 == 0
-    )
+    return K % 512 == 0 and N % 8 == 0
+
+
+def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+    if (
+        not _can_target_verify_quantized_head(linear)
+        or x.ndim != 3
+        or x.shape[1] < 1
+        or x.dtype != linear.scales.dtype
+    ):
+        return False
+
+    K = linear.weight.shape[1] * 32 // linear.bits
+    return x.shape[-1] == K
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -569,13 +603,17 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
-def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
+def _target_verify_quantized_argmax(
+    linear, x: mx.array, token_mask: Optional[mx.array] = None
+) -> Optional[mx.array]:
     if not _can_target_verify_quantized(linear, x) or "bias" in linear:
         return None
 
     B, T, K = x.shape
     if T == 1 and 1 < B <= 4:
-        out = _target_verify_quantized_argmax(linear, x.transpose(1, 0, 2))
+        out = _target_verify_quantized_argmax(
+            linear, x.transpose(1, 0, 2), token_mask=token_mask
+        )
         if out is not None:
             return out.transpose(1, 0)
 
@@ -583,11 +621,27 @@ def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
     num_tiles = N // 8
 
     x = mx.contiguous(x)
-    kernel = _target_verify_qargmax_kernel(
-        linear.bits, linear.group_size, x.dtype, T, K, N
+    kernel_factory = (
+        _target_verify_masked_qargmax_kernel
+        if token_mask is not None
+        else _target_verify_qargmax_kernel
     )
+    kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
+    inputs = [x, linear.weight, linear.scales, linear.biases]
+    if token_mask is not None:
+        if token_mask.ndim == 1:
+            token_mask = token_mask[None, :]
+        if (
+            token_mask.dtype != mx.int32
+            or token_mask.shape[0] != B * T
+            or token_mask.shape[1] < (N + 31) // 32
+        ):
+            raise ValueError(
+                "packed token mask must be int32 with one complete row per token"
+            )
+        inputs.append(token_mask)
     tile_values, tile_indices = kernel(
-        inputs=[x, linear.weight, linear.scales, linear.biases],
+        inputs=inputs,
         template=[
             ("T", x.dtype),
             ("VERIFY_T", int(T)),
@@ -2645,6 +2699,65 @@ class LanguageModel(nn.Module):
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
         return mx.argmax(logits, axis=-1)
+
+    def supports_fused_greedy_logits_processors(self, logits_processors) -> bool:
+        return (
+            len(logits_processors) <= 4
+            and all(
+                processors
+                and len(processors) == 1
+                and callable(getattr(processors[0], "prepare_next_token_mask", None))
+                for processors in logits_processors
+            )
+            and not self.args.tie_word_embeddings
+            and _can_target_verify_quantized_head(self.lm_head)
+            and "bias" not in self.lm_head
+        )
+
+    def fused_greedy_decode(
+        self,
+        inputs: mx.array,
+        cache=None,
+        logits_processors=None,
+        **kwargs,
+    ):
+        if (
+            self.args.tie_word_embeddings
+            or not _can_target_verify_quantized_head(self.lm_head)
+            or "bias" in self.lm_head
+        ):
+            return None
+
+        token_mask = None
+        if logits_processors:
+            if not self.supports_fused_greedy_logits_processors(logits_processors):
+                return None
+            token_mask = mx.concatenate(
+                [
+                    processors[0].prepare_next_token_mask(token)
+                    for processors, token in zip(
+                        logits_processors, inputs[:, -1].tolist()
+                    )
+                ],
+                axis=0,
+            )
+
+        output = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            skip_logits=True,
+            **kwargs,
+        )
+        hidden = output.hidden_states[-1]
+        sampled = _target_verify_quantized_argmax(
+            self.lm_head, hidden, token_mask=token_mask
+        )
+        if sampled is not None:
+            return sampled
+        if token_mask is not None:
+            raise RuntimeError("masked fused greedy decode became unsupported")
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(

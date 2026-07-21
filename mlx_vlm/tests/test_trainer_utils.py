@@ -78,21 +78,32 @@ class TestTrainerUtils(unittest.TestCase):
         result = find_all_linear_names(model)
         self.assertEqual(set(result), {"layer1", "layer2"})
 
-    @patch("mlx_lm.utils.load_adapters")
-    def test_apply_lora_layers_dispatches_text_model_adapters(self, mock_load_adapters):
-        inner_model = MagicMock()
-        loaded_inner_model = MagicMock()
-        mock_load_adapters.return_value = loaded_inner_model
+    @patch("mlx_vlm.trainer.utils._apply_lora_layers")
+    def test_apply_lora_layers_dispatches_text_model_adapters(self, mock_apply):
+        with TemporaryDirectory() as tmpdir:
+            adapter_dir = Path(tmpdir) / "adapter"
+            adapter_dir.mkdir()
+            (adapter_dir / "adapter_config.json").write_text(
+                '{"lora_parameters": {"rank": 4, "scale": 2.0, "dropout": 0.0}}'
+            )
+            (adapter_dir / "adapters.safetensors").touch()
 
-        model = MagicMock()
-        model._is_text_model = True
-        model.language_model._model = inner_model
+            inner_model = MagicMock()
+            loaded_inner_model = MagicMock()
+            mock_apply.return_value = loaded_inner_model
 
-        result = apply_lora_layers(model, "adapter-dir")
+            model = MagicMock()
+            model._is_text_model = True
+            model.language_model._model = inner_model
 
-        self.assertIs(result, model)
-        mock_load_adapters.assert_called_once_with(inner_model, "adapter-dir")
-        self.assertIs(model.language_model._model, loaded_inner_model)
+            result = apply_lora_layers(model, str(adapter_dir))
+
+            self.assertIs(result, model)
+            self.assertIs(mock_apply.call_args[0][0], inner_model)
+            loaded_inner_model.load_weights.assert_called_once_with(
+                str(adapter_dir / "adapters.safetensors"), strict=False
+            )
+            self.assertIs(model.language_model._model, loaded_inner_model)
 
     @patch("mlx_vlm.trainer.utils.get_peft_model")
     def test_apply_lora_layers_keeps_vlm_adapter_schema(self, mock_get_peft):

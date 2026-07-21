@@ -21,6 +21,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -638,6 +639,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             else model
         )
 
+        # Stock MLX rejects bits=1; route those layers to our Metal kernel.
+        replace_one_bit_modules(quantized_model, quantization, weights)
+
         def get_class_predicate(p, m):
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
@@ -646,6 +650,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and skip_vision
                 and not _has_quantized_weights(p, weights)
             ):
+                return False
+            # Skip 1-bit layers already replaced above.
+            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -1196,7 +1203,7 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
+def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: int = 10):
     """
     Helper function to load an image from either a URL, file path, data URI,
     or BytesIO object.
@@ -1205,23 +1212,30 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
     original_source = image_source
     try:
-        if not isinstance(image_source, (str, Path, BytesIO)):
+        if isinstance(image_source, Image.Image):
+            image = image_source
+        elif not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
                 f"Unsupported image source type: {type(image_source).__name__}"
             )
-        if isinstance(image_source, str) and image_source.startswith("data:image/"):
-            if "," not in image_source:
-                raise ValueError("Invalid data URI format - missing comma separator")
-            _, data = image_source.split(",", 1)
-            image_source = BytesIO(base64.b64decode(data))
-        if isinstance(image_source, str) and image_source.startswith(
-            ("http://", "https://")
-        ):
-            with requests.get(image_source, stream=True, timeout=timeout) as response:
-                response.raise_for_status()
-                image_source = BytesIO(response.content)
+        else:
+            if isinstance(image_source, str) and image_source.startswith("data:image/"):
+                if "," not in image_source:
+                    raise ValueError(
+                        "Invalid data URI format - missing comma separator"
+                    )
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+            if isinstance(image_source, str) and image_source.startswith(
+                ("http://", "https://")
+            ):
+                with requests.get(
+                    image_source, stream=True, timeout=timeout
+                ) as response:
+                    response.raise_for_status()
+                    image_source = BytesIO(response.content)
 
-        image = Image.open(image_source)
+            image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:
@@ -1765,8 +1779,11 @@ def prepare_inputs(
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
+        attention_mask = inputs.get("attention_mask")
         model_inputs["attention_mask"] = (
-            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+            attention_mask
+            if attention_mask is None or isinstance(attention_mask, mx.array)
+            else mx.array(attention_mask)
         )
 
         # Convert inputs to model_inputs with mx.array if present
@@ -1960,12 +1977,14 @@ class ThinkingBudgetCriteria:
         self.forced_token_id = None
         return None
 
-    def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
-        if self.forced_token_id is not None and self.enable_thinking:
-            next_y = mx.array([self.forced_token_id])
-            self.forced_token_id = None
-            return next_y
-        return next_y
+    def pop_forced_token_id(self) -> Optional[int]:
+        """Return and clear the pending forced token ID, if any."""
+        if self.forced_token_id is None or not self.enable_thinking:
+            return None
+
+        forced_token_id = self.forced_token_id
+        self.forced_token_id = None
+        return forced_token_id
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:

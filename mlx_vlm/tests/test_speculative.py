@@ -30,6 +30,7 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -599,6 +600,75 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     mx.eval(ref, out)
 
     assert bool(mx.array_equal(ref, out).item())
+
+
+def test_qwen_fused_greedy_decode_support_matches_lm_head():
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    model = SimpleNamespace(
+        args=SimpleNamespace(tie_word_embeddings=False),
+        lm_head=linear,
+    )
+    assert qwen_language._can_target_verify_quantized_head(model.lm_head)
+
+    model.lm_head = OneBitLinear(512, 16, bias=False, group_size=32)
+    assert not qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert (
+        qwen_language.LanguageModel.fused_greedy_decode(
+            model, mx.array([[1]], dtype=mx.int32), cache=[]
+        )
+        is None
+    )
+
+    model.lm_head = linear
+    model.args.tie_word_embeddings = True
+    assert (
+        qwen_language.LanguageModel.fused_greedy_decode(
+            model, mx.array([[1]], dtype=mx.int32), cache=[]
+        )
+        is None
+    )
+
+
+def test_qwen_fused_greedy_decode_uses_quantized_argmax():
+    mx.random.seed(19)
+    hidden = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+
+    class Model:
+        args = SimpleNamespace(tie_word_embeddings=False)
+
+        def __init__(self):
+            self.lm_head = nn.QuantizedLinear(
+                512, 16, bias=False, group_size=32, bits=4
+            )
+            self.lm_head.scales = self.lm_head.scales.astype(mx.bfloat16)
+            self.lm_head.biases = self.lm_head.biases.astype(mx.bfloat16)
+            self.calls = []
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            self.calls.append((inputs.tolist(), cache, kwargs))
+            return SimpleNamespace(hidden_states=[hidden])
+
+        def speculative_logits_from_hidden(self, value):
+            return self.lm_head(value)
+
+    model = Model()
+    inputs = mx.array([[1]], dtype=mx.int32)
+    out = qwen_language.LanguageModel.fused_greedy_decode(
+        model, inputs, cache=["cache"]
+    )
+    ref = qwen_language._target_verify_quantized_argmax(model.lm_head, hidden)
+    mx.eval(out, ref)
+
+    assert bool(mx.array_equal(out, ref).item())
+    assert model.calls == [
+        (
+            [[1]],
+            ["cache"],
+            {"return_hidden": True, "skip_logits": True},
+        )
+    ]
 
 
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
