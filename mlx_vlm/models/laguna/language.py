@@ -335,8 +335,7 @@ class LanguageModel(nn.Module):
         if quantization.get("mode") != "nvfp4":
             return weights
         if not any(
-            ".mlp.experts." in key and key.endswith(".weight_packed")
-            for key in weights
+            ".mlp.experts." in key and key.endswith(".weight_packed") for key in weights
         ):
             return weights
 

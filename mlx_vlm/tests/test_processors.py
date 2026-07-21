@@ -2453,9 +2453,7 @@ class TestLagunaProcessor(unittest.TestCase):
                 json.dumps(
                     {
                         "model_type": "laguna",
-                        "rope_parameters": {
-                            "sliding_attention": {"rope_type": "yarn"}
-                        },
+                        "rope_parameters": {"sliding_attention": {"rope_type": "yarn"}},
                     }
                 )
             )
