@@ -179,6 +179,9 @@ def _transform_compressed_tensors_nvfp4_weights(
     round-trip entirely.
     """
     packed_suffix = ".weight_packed"
+    # Laguna-S has tens of thousands of compressed expert tensors. Flush the
+    # lazy scale-folding graph periodically to avoid Metal resource exhaustion.
+    pending_eval = []
 
     new_weights = {}
     for key in list(weights.keys()):
@@ -198,11 +201,20 @@ def _transform_compressed_tensors_nvfp4_weights(
             # is re-rounded once.
             decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
             new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+            pending_eval.extend(
+                [new_weights[f"{prefix}.weight"], new_weights[f"{prefix}.scales"]]
+            )
+            if len(pending_eval) >= 256:
+                mx.eval(*pending_eval)
+                pending_eval.clear()
         elif key.endswith(".weight_scale") or key.endswith(".weight_global_scale"):
             # Consumed alongside their ``.weight_packed``.
             continue
         else:
             new_weights[key] = weights[key]
+
+    if pending_eval:
+        mx.eval(*pending_eval)
 
     return new_weights
 

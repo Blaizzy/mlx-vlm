@@ -15,6 +15,7 @@ from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
     _load_safetensors,
+    _transform_compressed_tensors_weights,
     apply_generation_config_defaults,
     get_model_and_args,
     load,
@@ -657,6 +658,39 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["group_size"] == 64
     assert quantize.call_args.kwargs["bits"] == 8
     assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_compressed_tensors_nvfp4_transform_flushes_lazy_graph():
+    weights = {}
+    for idx in range(129):
+        prefix = f"model.layers.0.mlp.experts.{idx}.gate_proj"
+        weights[f"{prefix}.weight_packed"] = mx.zeros((1, 8), dtype=mx.uint8)
+        weights[f"{prefix}.weight_scale"] = mx.array([[0x38]], dtype=mx.uint8)
+        weights[f"{prefix}.weight_global_scale"] = mx.array([1.0], dtype=mx.float32)
+
+    quantization_config = {
+        "quant_method": "compressed-tensors",
+        "format": "nvfp4-pack-quantized",
+        "config_groups": {
+            "group_0": {
+                "weights": {
+                    "group_size": 16,
+                    "num_bits": 4,
+                    "type": "float",
+                }
+            }
+        },
+    }
+
+    with patch("mlx_vlm.utils.mx.eval", wraps=mx.eval) as eval_mock:
+        transformed, quantization = _transform_compressed_tensors_weights(
+            weights, quantization_config
+        )
+
+    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    assert eval_mock.call_count == 2
+    assert "model.layers.0.mlp.experts.0.gate_proj.scales" in transformed
+    assert "model.layers.0.mlp.experts.128.gate_proj.scales" in transformed
 
 
 def test_load_model_quantizes_projector_with_scales_when_skip_vision():
