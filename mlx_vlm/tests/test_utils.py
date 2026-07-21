@@ -692,7 +692,7 @@ def test_load_model_uses_deepseek_v4_fp8_quantization_config():
     assert quantize.call_args.kwargs["mode"] == "affine"
 
 
-def test_compressed_tensors_nvfp4_transform_flushes_lazy_graph():
+def test_compressed_tensors_nvfp4_transform_keeps_scale_folding_lazy():
     weights = {}
     for idx in range(129):
         prefix = f"model.layers.0.mlp.experts.{idx}.gate_proj"
@@ -720,7 +720,7 @@ def test_compressed_tensors_nvfp4_transform_flushes_lazy_graph():
         )
 
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-    assert eval_mock.call_count == 2
+    eval_mock.assert_not_called()
     assert "model.layers.0.mlp.experts.0.gate_proj.scales" in transformed
     assert "model.layers.0.mlp.experts.128.gate_proj.scales" in transformed
 

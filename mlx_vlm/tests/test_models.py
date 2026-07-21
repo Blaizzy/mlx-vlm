@@ -163,35 +163,99 @@ class TestModels(unittest.TestCase):
     def test_laguna_nvfp4_compressed_tensors_config(self):
         from mlx_vlm.models import laguna
 
-        config = laguna.ModelConfig.from_dict(
-            {
-                "model_type": "laguna",
-                "vocab_size": 128,
-                "hidden_size": 64,
-                "intermediate_size": 128,
-                "num_hidden_layers": 1,
-                "num_attention_heads": 4,
-                "num_key_value_heads": 2,
-                "head_dim": 16,
-                "max_position_embeddings": 128,
-                "quantization_config": {
-                    "quant_method": "compressed-tensors",
-                    "format": "nvfp4-pack-quantized",
-                    "config_groups": {
-                        "group_0": {
-                            "format": "nvfp4-pack-quantized",
-                            "weights": {"group_size": 16, "num_bits": 4},
-                        }
-                    },
+        raw_config = {
+            "model_type": "laguna",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "max_position_embeddings": 128,
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "nvfp4-pack-quantized",
+                        "weights": {"group_size": 16, "num_bits": 4},
+                    }
                 },
-            }
-        )
+            },
+        }
+        config = laguna.ModelConfig.from_dict(raw_config)
 
         self.assertEqual(
             config.quantization,
             {"group_size": 16, "bits": 4, "mode": "nvfp4"},
         )
         self.assertIs(config.quantization_config, config.quantization)
+        self.assertEqual(raw_config["quantization"], config.quantization)
+        self.assertEqual(raw_config["quantization_config"], config.quantization)
+
+    def test_laguna_stacks_nvfp4_experts_before_scale_folding(self):
+        from unittest.mock import patch
+
+        import mlx_vlm.utils as utils
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        weights = {
+            "model.layers.1.mlp.gate.weight": mx.zeros((3, 16)),
+            "model.layers.1.mlp.experts.e_score_correction_bias": mx.zeros((3,)),
+        }
+        for expert_idx in range(config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
+                weights[f"{prefix}.weight_packed"] = mx.zeros((16, 8), dtype=mx.uint8)
+                weights[f"{prefix}.weight_scale"] = mx.full(
+                    (16, 1), 0x38, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+                weights[f"{prefix}.input_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+
+        with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
+            sanitized = model.language_model.sanitize(weights)
+
+        self.assertEqual(encode.call_count, 3)
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            self.assertEqual(
+                sanitized[f"model.layers.1.mlp.switch_mlp.{proj}.weight"].shape,
+                (3, 16, 2),
+            )
+            self.assertEqual(
+                sanitized[f"model.layers.1.mlp.switch_mlp.{proj}.scales"].shape,
+                (3, 16, 1),
+            )
+        self.assertIn("model.layers.1.mlp.gate.e_score_correction_bias", sanitized)
+        self.assertFalse(any(".weight_packed" in key for key in sanitized))
+        self.assertFalse(any(".weight_scale" in key for key in sanitized))
+        self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
+        self.assertFalse(any(".input_global_scale" in key for key in sanitized))
 
     def test_laguna_sanitize_drops_input_global_scale(self):
         from mlx_vlm.models import laguna

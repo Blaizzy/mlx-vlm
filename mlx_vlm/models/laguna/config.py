@@ -74,17 +74,16 @@ class ModelConfig(BaseModelConfig):
         if not params:
             return cls()
 
-        values = {
-            k: v
-            for k, v in params.items()
-            if k in cls.__dataclass_fields__
-        }
         quantization = _normalize_compressed_tensors_quantization(
             params.get("quantization_config")
         )
-        if quantization is not None and "quantization" not in params:
-            values["quantization"] = quantization
-            values["quantization_config"] = quantization
+        if quantization is not None:
+            # load_model reads this dict again after ModelConfig construction.
+            # Normalize it so Laguna can batch expert unpacking in sanitize().
+            params.setdefault("quantization", quantization)
+            params["quantization_config"] = params["quantization"]
+
+        values = {k: v for k, v in params.items() if k in cls.__dataclass_fields__}
 
         return cls(**values)
 

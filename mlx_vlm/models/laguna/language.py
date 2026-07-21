@@ -290,6 +290,7 @@ class LanguageModel(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
+        weights = self._stack_compressed_nvfp4_experts(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
@@ -328,6 +329,54 @@ class LanguageModel(nn.Module):
             else:
                 new_weights[k] = v
         return new_weights
+
+    def _stack_compressed_nvfp4_experts(self, weights):
+        quantization = self.args.quantization or {}
+        if quantization.get("mode") != "nvfp4":
+            return weights
+        if not any(
+            ".mlp.experts." in key and key.endswith(".weight_packed")
+            for key in weights
+        ):
+            return weights
+
+        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
+
+        for layer_idx in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}.mlp"
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                first_key = f"{prefix}.experts.0.{proj}.weight_packed"
+                if first_key not in weights:
+                    continue
+
+                packed = []
+                scales = []
+                global_scales = []
+                for expert_idx in range(self.args.num_experts):
+                    expert_prefix = f"{prefix}.experts.{expert_idx}.{proj}"
+                    packed.append(weights.pop(f"{expert_prefix}.weight_packed"))
+                    scales.append(weights.pop(f"{expert_prefix}.weight_scale"))
+                    global_scales.append(
+                        weights.pop(f"{expert_prefix}.weight_global_scale").astype(
+                            mx.float32
+                        )
+                    )
+                    weights.pop(f"{expert_prefix}.input_global_scale", None)
+
+                stacked_scales = mx.stack(scales)
+                global_scale = mx.stack(global_scales).reshape(
+                    self.args.num_experts, 1, 1
+                )
+                decoded = _E4M3_DECODE_LUT[stacked_scales.astype(mx.uint32)]
+
+                weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
+                    [p.view(mx.uint32) for p in packed]
+                )
+                weights[f"{prefix}.switch_mlp.{proj}.scales"] = _f32_to_e4m3(
+                    decoded / global_scale
+                )
+
+        return weights
 
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
