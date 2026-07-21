@@ -941,7 +941,25 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    except Exception as exc:
+        try:
+            config = load_config(model_path, **kwargs)
+        except Exception:
+            raise exc
+        if not _is_text_only_config(config):
+            raise
+        tokenizer_config_extra = dict(kwargs.get("tokenizer_config", {}))
+        if "trust_remote_code" in kwargs:
+            tokenizer_config_extra.setdefault(
+                "trust_remote_code", kwargs["trust_remote_code"]
+            )
+        processor = load_tokenizer(
+            model_path,
+            return_tokenizer=True,
+            tokenizer_config_extra=tokenizer_config_extra,
+        )
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
