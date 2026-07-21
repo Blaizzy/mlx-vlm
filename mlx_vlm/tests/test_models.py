@@ -227,7 +227,14 @@ class TestModels(unittest.TestCase):
         for expert_idx in range(config.num_experts):
             for proj in ["gate_proj", "up_proj", "down_proj"]:
                 prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
-                weights[f"{prefix}.weight_packed"] = mx.zeros((16, 8), dtype=mx.uint8)
+                fill_value = {
+                    "gate_proj": expert_idx + 1,
+                    "up_proj": expert_idx + 11,
+                    "down_proj": expert_idx + 21,
+                }[proj]
+                weights[f"{prefix}.weight_packed"] = mx.full(
+                    (16, 8), fill_value, dtype=mx.uint8
+                )
                 weights[f"{prefix}.weight_scale"] = mx.full(
                     (16, 1), 0x38, dtype=mx.uint8
                 )
@@ -241,16 +248,33 @@ class TestModels(unittest.TestCase):
         with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
             sanitized = model.language_model.sanitize(weights)
 
-        self.assertEqual(encode.call_count, 3)
-        for proj in ["gate_proj", "up_proj", "down_proj"]:
-            self.assertEqual(
-                sanitized[f"model.layers.1.mlp.switch_mlp.{proj}.weight"].shape,
-                (3, 16, 2),
-            )
-            self.assertEqual(
-                sanitized[f"model.layers.1.mlp.switch_mlp.{proj}.scales"].shape,
-                (3, 16, 1),
-            )
+        self.assertEqual(encode.call_count, 2)
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"].shape,
+            (3, 32, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.scales"].shape,
+            (3, 32, 1),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.down_proj.weight"].shape,
+            (3, 16, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.down_proj.scales"].shape,
+            (3, 16, 1),
+        )
+        gate_up = sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"]
+        mx.eval(gate_up)
+        expected_gate = mx.full((16, 8), 1, dtype=mx.uint8).view(mx.uint32)
+        expected_up = mx.full((16, 8), 11, dtype=mx.uint8).view(mx.uint32)
+        self.assertTrue(
+            np.array_equal(np.array(gate_up[0, :16]), np.array(expected_gate))
+        )
+        self.assertTrue(
+            np.array_equal(np.array(gate_up[0, 16:]), np.array(expected_up))
+        )
         self.assertIn("model.layers.1.mlp.gate.e_score_correction_bias", sanitized)
         self.assertFalse(any(".weight_packed" in key for key in sanitized))
         self.assertFalse(any(".weight_scale" in key for key in sanitized))
