@@ -119,22 +119,26 @@ class MultiplexMaskDecoder(nn.Module):
         H = W = int(HW**0.5)
         src = src.reshape(B, H, W, d)
 
+        # Stage 1 (144): add the conv_s1 high-res skip BEFORE LayerNorm+GELU so the
+        # semantic transformer path and the high-res skip are co-normalized.
+        # Reference (facebookresearch/sam2 mask_decoder.predict_masks):
+        #   upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
         upscaled = self.upscale_conv1(src)
-        upscaled = self.upscale_layer_norm(upscaled)
-        upscaled = nn.gelu(upscaled)
-
         if high_res_features is not None and len(high_res_features) >= 1:
             s1_feat = self.conv_s1(high_res_features[0])
             if s1_feat.shape[1:3] == upscaled.shape[1:3]:
                 upscaled = upscaled + s1_feat
-
-        upscaled = self.upscale_conv2(upscaled)
+        upscaled = self.upscale_layer_norm(upscaled)
         upscaled = nn.gelu(upscaled)
 
+        # Stage 2 (288): add the conv_s0 high-res skip BEFORE the final GELU.
+        # Reference: upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
+        upscaled = self.upscale_conv2(upscaled)
         if high_res_features is not None and len(high_res_features) >= 2:
             s0_feat = self.conv_s0(high_res_features[1])
             if s0_feat.shape[1:3] == upscaled.shape[1:3]:
                 upscaled = upscaled + s0_feat
+        upscaled = nn.gelu(upscaled)
 
         B, H_up, W_up, C_up = upscaled.shape
         upscaled_flat = upscaled.reshape(B, H_up * W_up, C_up)
