@@ -162,6 +162,7 @@ def generate_step(
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
+    p_less: bool = False,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -253,6 +254,7 @@ def generate_step(
             and temperature > 0
             and min_p == DEFAULT_MIN_P
             and top_k == DEFAULT_TOP_K
+            and not p_less
         ):
             sampler = _PositionedTargetSampler(
                 temperature=temperature,
@@ -265,6 +267,7 @@ def generate_step(
                 top_p=top_p,
                 min_p=min_p,
                 top_k=top_k,
+                p_less=p_less,
             )
 
     processors = _generate_module_override(

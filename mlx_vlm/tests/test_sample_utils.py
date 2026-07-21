@@ -1,8 +1,24 @@
 import unittest
 
 import mlx.core as mx
+import numpy as np
 
-from mlx_vlm.sample_utils import top_p_sampling
+from mlx_vlm.sample_utils import apply_p_less, make_sampler, top_p_sampling
+
+
+def _np_p_less_keep(logits, temp):
+    z = np.asarray(logits, dtype=np.float64) / temp
+    z = z - z.max()
+    p = np.exp(z)
+    p = p / p.sum()
+    L = float((p * p).sum())
+    return p >= L, p, L
+
+
+def _p_less_kept(logits, temp):
+    out = apply_p_less(logits, temp)
+    mx.eval(out)
+    return [i for i, v in enumerate(out.tolist()) if v != -float("inf")]
 
 
 class TestTopPSampling(unittest.TestCase):
@@ -87,6 +103,70 @@ class TestTopPSampling(unittest.TestCase):
             mx.zeros([3, 50], dtype=mx.bfloat16), top_p=0.9, temperature=1.0
         )
         self.assertEqual(tokens.shape, (3,))
+
+
+class TestPLess(unittest.TestCase):
+    def test_matches_numpy_reference(self):
+        """Mask equals (p >= sum p^2) from an independent numpy implementation,
+        across random logits, vocab sizes and temperatures."""
+        rng = np.random.default_rng(0)
+        for _ in range(40):
+            V = int(rng.integers(8, 200))
+            temp = float(rng.choice([0.5, 0.7, 1.0, 1.3, 2.0]))
+            logits = rng.normal(0, 3, size=V).astype(np.float32)
+            keep_ref, p, L = _np_p_less_keep(logits, temp)
+            out = np.asarray(
+                apply_p_less(mx.array(logits), temp).tolist(), dtype=np.float64
+            )
+            keep_mlx = np.isfinite(out)
+            far = np.abs(p - L) > 1e-5
+            self.assertTrue(np.array_equal(keep_ref[far], keep_mlx[far]))
+
+    def test_argmax_always_survives(self):
+        """L = sum p^2 <= max p, so the most likely token is never masked."""
+        rng = np.random.default_rng(1)
+        for _ in range(50):
+            V = int(rng.integers(2, 128))
+            temp = float(rng.choice([0.5, 1.0, 2.0]))
+            logits = rng.normal(0, 3, size=V).astype(np.float32)
+            out = apply_p_less(mx.array(logits), temp)
+            mx.eval(out)
+            self.assertNotEqual(out.tolist()[int(np.argmax(logits))], -float("inf"))
+
+    def test_peaked_keeps_top_only(self):
+        """A sharply peaked distribution collapses to the argmax."""
+        self.assertEqual(_p_less_kept(mx.array([10.0, 0.0, 0.0, 0.0, 0.0]), 1.0), [0])
+
+    def test_higher_temp_keeps_more(self):
+        """Flattening the distribution (higher temp) never shrinks the set."""
+        logits = mx.array([4.0, 2.0, 1.0, 0.5, 0.0, -1.0])
+        counts = [len(_p_less_kept(logits, t)) for t in (0.5, 1.0, 2.0, 5.0)]
+        self.assertEqual(counts, sorted(counts))
+
+    def test_batched_rows_independent(self):
+        """Threshold is computed per row."""
+        logits = mx.array([[10.0, 0.0, 0.0, 0.0, 0.0], [1.0, 0.9, 0.8, 0.7, 0.6]])
+        out = apply_p_less(logits, 1.0)
+        mx.eval(out)
+        rows = [
+            [i for i, v in enumerate(r) if v != -float("inf")] for r in out.tolist()
+        ]
+        self.assertEqual(rows[0], [0])
+        self.assertGreater(len(rows[1]), 1)
+
+    def test_make_sampler_survivor_only(self):
+        """make_sampler(p_less=True) only ever samples a surviving token."""
+        sampler = make_sampler(temp=1.0, p_less=True)
+        toks = sampler(mx.array([[10.0, 0.0, 0.0, 0.0, 0.0]] * 128))
+        mx.eval(toks)
+        self.assertTrue(all(t == 0 for t in toks.tolist()))
+
+    def test_disabled_by_default(self):
+        """p_less=False (default) leaves the sampler unfiltered."""
+        sampler = make_sampler(temp=1.0)
+        toks = sampler(mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]] * 16))
+        mx.eval(toks)
+        self.assertEqual(toks.shape, (16,))
 
 
 if __name__ == "__main__":

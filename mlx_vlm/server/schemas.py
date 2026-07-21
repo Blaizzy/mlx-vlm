@@ -338,6 +338,9 @@ class OpenAIRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    p_less: bool = Field(
+        False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
@@ -700,6 +703,9 @@ class VLMRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    p_less: bool = Field(
+        False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
