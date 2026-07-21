@@ -734,19 +734,6 @@ class TestTokenizerWrapper:
         # Should forward vocab attribute to underlying tokenizer
         assert wrapper.vocab == tokenizer.vocab
 
-    def test_call_forwarding(self):
-        class CallableTokenizer(MockTokenizer):
-            def __call__(self, *args, **kwargs):
-                return args, kwargs
-
-        tokenizer = CallableTokenizer()
-        wrapper = TokenizerWrapper(tokenizer)
-
-        assert wrapper("prompt", return_tensors="mlx") == (
-            ("prompt",),
-            {"return_tensors": "mlx"},
-        )
-
     def test_custom_detokenizer_class(self):
         tokenizer = MockTokenizer()
         wrapper = TokenizerWrapper(tokenizer, SPMStreamingDetokenizer)

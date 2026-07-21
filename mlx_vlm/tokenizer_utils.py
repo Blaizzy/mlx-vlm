@@ -402,9 +402,6 @@ class TokenizerWrapper:
         else:
             return getattr(self._tokenizer, attr)
 
-    def __call__(self, *args, **kwargs):
-        return self._tokenizer(*args, **kwargs)
-
 
 def make_streaming_detokenizer(processor):
     """Return an isolated, reset streaming detokenizer for a processor."""

@@ -2335,6 +2335,92 @@ class TestPhi3VPatch(unittest.TestCase):
         )
 
 
+class TestLagunaProcessor(unittest.TestCase):
+    @staticmethod
+    def _fast_tokenizer():
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import PreTrainedTokenizerFast
+
+        tokenizer = Tokenizer(
+            WordLevel(
+                {"<unk>": 0, "<eos>": 1, "<pad>": 2, "prompt": 3},
+                unk_token="<unk>",
+            )
+        )
+        tokenizer.pre_tokenizer = Whitespace()
+        fast_tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=tokenizer,
+            unk_token="<unk>",
+            eos_token="<eos>",
+            pad_token="<pad>",
+        )
+        fast_tokenizer.chat_template = "template"
+        return fast_tokenizer
+
+    def test_from_pretrained_loads_fast_tokenizer_directly(self):
+        from mlx_vlm.models.laguna.processing_laguna import LagunaProcessor
+
+        tokenizer = self._fast_tokenizer()
+        with patch(
+            "mlx_vlm.models.laguna.processing_laguna."
+            "PreTrainedTokenizerFast.from_pretrained",
+            return_value=tokenizer,
+        ) as from_pretrained:
+            processor = LagunaProcessor.from_pretrained(
+                "/tmp/model",
+                processor_kwargs={"local_files_only": True},
+                quantize_activations=True,
+                trust_remote_code=True,
+            )
+
+        self.assertIs(processor.tokenizer, tokenizer)
+        args, kwargs = from_pretrained.call_args
+        self.assertEqual(args, ("/tmp/model",))
+        self.assertTrue(kwargs["fix_mistral_regex"])
+        self.assertTrue(kwargs["local_files_only"])
+        self.assertTrue(kwargs["trust_remote_code"])
+        self.assertNotIn("processor_kwargs", kwargs)
+        self.assertNotIn("quantize_activations", kwargs)
+
+    def test_auto_processor_patch_intercepts_laguna(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.laguna.processing_laguna import LagunaProcessor
+
+        importlib.import_module("mlx_vlm.models.laguna")
+
+        tokenizer = self._fast_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "laguna",
+                        "rope_parameters": {
+                            "sliding_attention": {"rope_type": "yarn"}
+                        },
+                    }
+                )
+            )
+            with patch(
+                "mlx_vlm.models.laguna.processing_laguna."
+                "PreTrainedTokenizerFast.from_pretrained",
+                return_value=tokenizer,
+            ):
+                processor = AutoProcessor.from_pretrained(
+                    tmpdir, quantize_activations=True
+                )
+
+        self.assertIsInstance(processor, LagunaProcessor)
+        self.assertIs(processor.tokenizer, tokenizer)
+
+
 class TestHunYuanVLPatch(unittest.TestCase):
     def test_patch_intercepts(self):
         _assert_patch_intercepts(

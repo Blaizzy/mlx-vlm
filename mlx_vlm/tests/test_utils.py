@@ -783,33 +783,6 @@ def test_load_processor_propagates_auto_processor_errors():
             load_processor(Path("/tmp/model"), eos_token_ids=2)
 
 
-def test_load_processor_falls_back_to_tokenizer_for_text_only_auto_processor_errors():
-    fallback_processor = object()
-
-    with (
-        patch(
-            "mlx_vlm.utils.AutoProcessor.from_pretrained",
-            side_effect=KeyError("original_max_position_embeddings"),
-        ),
-        patch("mlx_vlm.utils.load_config", return_value={"model_type": "laguna"}),
-        patch(
-            "mlx_vlm.utils.load_tokenizer", return_value=fallback_processor
-        ) as load_tokenizer_mock,
-    ):
-        processor = load_processor(
-            Path("/tmp/model"), add_detokenizer=False, trust_remote_code=True
-        )
-
-    assert processor is fallback_processor
-    load_tokenizer_mock.assert_called_once()
-    args, kwargs = load_tokenizer_mock.call_args
-    assert args == (Path("/tmp/model"),)
-    assert kwargs["return_tokenizer"] is True
-    tokenizer_config_extra = kwargs["tokenizer_config_extra"]
-    assert tokenizer_config_extra["trust_remote_code"] is True
-    assert tokenizer_config_extra["config"].model_type == "laguna"
-
-
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():
     class TinyInner(nn.Module):
         def __init__(self):

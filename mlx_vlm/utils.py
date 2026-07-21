@@ -17,7 +17,7 @@ import requests
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import AutoProcessor, PretrainedConfig
+from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
@@ -941,29 +941,7 @@ def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    try:
-        processor = AutoProcessor.from_pretrained(model_path, **kwargs)
-    except Exception as exc:
-        try:
-            config = load_config(model_path, **kwargs)
-        except Exception:
-            raise exc
-        if not _is_text_only_config(config):
-            raise
-        tokenizer_config_extra = dict(kwargs.get("tokenizer_config", {}))
-        if "trust_remote_code" in kwargs:
-            tokenizer_config_extra.setdefault(
-                "trust_remote_code", kwargs["trust_remote_code"]
-            )
-        if "config" not in tokenizer_config_extra:
-            tokenizer_config = PretrainedConfig()
-            tokenizer_config.model_type = config.get("model_type", "")
-            tokenizer_config_extra["config"] = tokenizer_config
-        processor = load_tokenizer(
-            model_path,
-            return_tokenizer=True,
-            tokenizer_config_extra=tokenizer_config_extra,
-        )
+    processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
