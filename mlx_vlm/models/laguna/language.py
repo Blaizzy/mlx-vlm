@@ -310,6 +310,7 @@ class LanguageModel(nn.Module):
             if "rotary_emb.inv_freq" not in k
             and not k.endswith(".self_attn.k_scale")
             and not k.endswith(".self_attn.v_scale")
+            and not k.endswith(".input_global_scale")
         }
 
     def _unpack_compressed_tensors(self, weights):

@@ -160,6 +160,70 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_laguna_nvfp4_compressed_tensors_config(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig.from_dict(
+            {
+                "model_type": "laguna",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "max_position_embeddings": 128,
+                "quantization_config": {
+                    "quant_method": "compressed-tensors",
+                    "format": "nvfp4-pack-quantized",
+                    "config_groups": {
+                        "group_0": {
+                            "format": "nvfp4-pack-quantized",
+                            "weights": {"group_size": 16, "num_bits": 4},
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(
+            config.quantization,
+            {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        self.assertIs(config.quantization_config, config.quantization)
+
+    def test_laguna_sanitize_drops_input_global_scale(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            num_attention_heads_per_layer=[4],
+            num_experts=0,
+        )
+        model = laguna.Model(config)
+
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mlp.gate_proj.input_global_scale": mx.array(
+                    [1.0], dtype=mx.float32
+                )
+            }
+        )
+
+        self.assertNotIn(
+            "language_model.model.layers.0.mlp.gate_proj.input_global_scale",
+            sanitized,
+        )
+
     def test_hrm_text_language_model(self):
         from mlx_vlm.models import hrm_text
 

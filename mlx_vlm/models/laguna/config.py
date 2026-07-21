@@ -4,6 +4,27 @@ from typing import Any, Dict, List, Optional, Union
 from ..base import BaseModelConfig
 
 
+def _normalize_compressed_tensors_quantization(
+    quantization_config: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(quantization_config, dict):
+        return None
+    if quantization_config.get("quant_method") != "compressed-tensors":
+        return None
+
+    group = quantization_config.get("config_groups", {}).get("group_0", {})
+    ct_format = quantization_config.get("format") or group.get("format")
+    if ct_format != "nvfp4-pack-quantized":
+        return None
+
+    weights = group.get("weights", {})
+    return {
+        "group_size": weights.get("group_size", 16),
+        "bits": weights.get("num_bits", 4),
+        "mode": "nvfp4",
+    }
+
+
 @dataclass
 class ModelConfig(BaseModelConfig):
     model_type: str
@@ -45,6 +66,27 @@ class ModelConfig(BaseModelConfig):
     bos_token_id: Optional[int] = None
     eos_token_id: Optional[Union[int, List[int]]] = None
     pad_token_id: Optional[int] = None
+    quantization: Optional[Dict[str, Any]] = None
+    quantization_config: Optional[Dict[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, params):
+        if not params:
+            return cls()
+
+        values = {
+            k: v
+            for k, v in params.items()
+            if k in cls.__dataclass_fields__
+        }
+        quantization = _normalize_compressed_tensors_quantization(
+            params.get("quantization_config")
+        )
+        if quantization is not None and "quantization" not in params:
+            values["quantization"] = quantization
+            values["quantization_config"] = quantization
+
+        return cls(**values)
 
     def __post_init__(self):
         if self.gating is True:
