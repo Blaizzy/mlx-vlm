@@ -624,6 +624,7 @@ class GenerationArguments:
     top_p: float = DEFAULT_TOP_P
     top_k: int = 0
     min_p: float = 0.0
+    top_n_sigma: float = 0.0
     seed: Optional[int] = None
     logprobs: bool = False
     repetition_penalty: Optional[float] = None
@@ -688,6 +689,7 @@ class GenerationArguments:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "min_p": self.min_p,
+            "top_n_sigma": self.top_n_sigma,
             "enable_thinking": self.enable_thinking,
         }
         if self.seed is not None:
@@ -1120,6 +1122,12 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
+        if args.top_n_sigma > 0:
+            return make_sampler(
+                temp=args.temperature,
+                top_p=args.top_p,
+                top_n_sigma=args.top_n_sigma,
+            )
         return _PositionedTargetSampler(
             temperature=args.temperature,
             top_p=args.top_p,
