@@ -17,7 +17,7 @@ import requests
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
-from transformers import AutoProcessor
+from transformers import AutoProcessor, PretrainedConfig
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
@@ -955,6 +955,10 @@ def load_processor(
             tokenizer_config_extra.setdefault(
                 "trust_remote_code", kwargs["trust_remote_code"]
             )
+        if "config" not in tokenizer_config_extra:
+            tokenizer_config = PretrainedConfig()
+            tokenizer_config.model_type = config.get("model_type", "")
+            tokenizer_config_extra["config"] = tokenizer_config
         processor = load_tokenizer(
             model_path,
             return_tokenizer=True,

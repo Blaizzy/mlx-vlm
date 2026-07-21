@@ -801,11 +801,13 @@ def test_load_processor_falls_back_to_tokenizer_for_text_only_auto_processor_err
         )
 
     assert processor is fallback_processor
-    load_tokenizer_mock.assert_called_once_with(
-        Path("/tmp/model"),
-        return_tokenizer=True,
-        tokenizer_config_extra={"trust_remote_code": True},
-    )
+    load_tokenizer_mock.assert_called_once()
+    args, kwargs = load_tokenizer_mock.call_args
+    assert args == (Path("/tmp/model"),)
+    assert kwargs["return_tokenizer"] is True
+    tokenizer_config_extra = kwargs["tokenizer_config_extra"]
+    assert tokenizer_config_extra["trust_remote_code"] is True
+    assert tokenizer_config_extra["config"].model_type == "laguna"
 
 
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():
