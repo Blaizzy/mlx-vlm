@@ -447,6 +447,7 @@ def get_model_path(
                 allow_patterns=allow_patterns
                 or [
                     "*.json",
+                    "*.jsonl",
                     "*.safetensors",
                     "*.py",
                     "*.model",

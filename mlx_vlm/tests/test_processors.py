@@ -2677,6 +2677,38 @@ class TestDeepseekV4Processor(unittest.TestCase):
         self.assertIsInstance(processor, DeepseekV4Processor)
 
 
+class TestPlamo2VLPatch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        import importlib
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        module = importlib.import_module("mlx_vlm.models.plamo2vl.processing")
+        sentinel = object()
+
+        def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+            self.assertEqual(Path(pretrained_model_name_or_path), Path(tmpdir))
+            self.assertTrue(kwargs.get("trust_remote_code"))
+            return sentinel
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "plamo2vl"}),
+                encoding="utf-8",
+            )
+            with patch.object(
+                module.Plamo2VLProcessor,
+                "from_pretrained",
+                classmethod(from_pretrained),
+            ):
+                processor = AutoProcessor.from_pretrained(tmpdir)
+
+        self.assertIs(processor, sentinel)
+
+
 class TestPatchChainsForUnknownModelType(unittest.TestCase):
     def test_falls_through(self):
         import importlib

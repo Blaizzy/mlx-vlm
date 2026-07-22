@@ -46,6 +46,7 @@ class VisionConfig(BaseModelConfig):
     vocab_size: int = 32000
     num_channels: int = 3
     layer_norm_eps: float = 1e-5
+    hidden_act: str = "gelu"
 
 
 @dataclass
