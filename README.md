@@ -19,6 +19,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
     - [Continuous Batching](#continuous-batching)
     - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
     - [KV Cache Quantization](#kv-cache-quantization)
+- [1-bit Affine Inference](#1-bit-affine-inference)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -64,6 +65,16 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 ```sh
 pip install -U mlx-vlm
 ```
+
+The [Gradio chat UI](#chat-ui-with-gradio) needs an extra dependency that is not
+part of the base install:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Quote the package name so that shells which expand square brackets, such as
+`zsh`, do not treat `[ui]` as a glob pattern.
 
 ## Usage
 
@@ -271,7 +282,14 @@ for model-specific conversion and runtime notes.
 
 ### Chat UI with Gradio
 
-Launch a chat interface using Gradio:
+The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
+install does not include:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Then launch the chat interface:
 
 ```sh
 mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
@@ -416,7 +434,22 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+At `INFO`, the server logs request start/completion, chunked-prefill progress,
+time to first token, periodic decode throughput, and the final token counts. Set
+`--log-level DEBUG` to emit decode progress for every token and add its token
+number, token ID, and decoded text to the same log entry. Decode progress uses
+`rate` for the instantaneous inter-token rate; decode completion uses the same
+field name for aggregate decode throughput measured across completed token
+intervals.
+
+OpenAI-compatible streaming responses expose throughput under
+`timings.predicted_per_second`. Token-bearing SSE chunks report the instantaneous
+inter-token rate, while terminal and usage chunks report the aggregate rate as
+`(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
+`null` because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -1114,6 +1147,38 @@ curl -X POST "http://localhost:8080/responses" \
 - `thinking_end_token`: Token that closes a thinking block
 - `stream`: Enable streaming responses
 
+## 1-bit Affine Inference
+
+MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX
+build. When a checkpoint declares `"bits": 1`, compatible `Linear` and
+`Embedding` layers are replaced automatically with an inference-only module
+that JIT-compiles its Metal kernel from Python.
+
+The checkpoint must use MLX's packed `uint32` weight layout, include `scales`
+and `biases`, and declare a group size of `32`, `64`, or `128`:
+
+```json
+{
+  "quantization": {
+    "group_size": 64,
+    "bits": 1,
+    "mode": "affine"
+  }
+}
+```
+
+Load and generate normally; no extra inference flag is needed:
+
+```python
+from mlx_vlm import generate, load
+
+model, processor = load("path/to/1bit-model")
+result = generate(model, processor, "Describe this image", image=["image.jpg"])
+```
+
+This path is for inference from an already quantized checkpoint. Converting a
+floating-point model to 1-bit still requires a quantizer that can produce the
+packed weights and affine parameters.
 
 ## Activation Quantization (CUDA)
 
@@ -1374,7 +1439,12 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA.
+MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+eval scripts) need the training extra, which is not installed by default:
+
+```bash
+pip install "mlx-vlm[train]"
+```
 
 ## LoRA & QLoRA
 

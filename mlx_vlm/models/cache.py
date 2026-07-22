@@ -5,6 +5,22 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 
+def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
+    """Whether layer ``layer_idx`` should use a quantized KV cache.
+
+    Live batch generation (``_make_cache``), stream quantize, and APC warm
+    restore must share this policy so continuous-batching ``extend`` always
+    joins same-typed peers.
+
+    For deep stacks (``num_layers > 2``) the last full-attention layer stays
+    unquantized — it is sensitive to quantization (see gemma-4-class models).
+    Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
+    """
+    if num_layers <= 2:
+        return True
+    return layer_idx < num_layers - 1
+
+
 def create_causal_mask(
     N: int,
     offset: int = 0,
@@ -116,6 +132,28 @@ class _BaseCache:
         obj.state = state
         obj.meta_state = meta_state
         return obj
+
+    def prefix_cache_snapshot(self):
+        """Return an opaque, restorable snapshot of this cache's state.
+
+        The returned object must round-trip through ``prefix_cache_restore``
+        into a fresh cache from ``model.make_cache()``. References are returned
+        as-is; the caller (adapter) is responsible for any detaching copy.
+        """
+        return {"state": self.state, "meta_state": self.meta_state}
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore a snapshot from :meth:`prefix_cache_snapshot` into ``self``."""
+        self.state = snapshot["state"]
+        self.meta_state = snapshot["meta_state"]
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge single-row snapshots into a batched cache, or ``None``.
+
+        Default: not batch-mergeable. Pageable/windowed caches override to
+        return a batched cache built from ``rows``.
+        """
+        return None
 
 
 def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):

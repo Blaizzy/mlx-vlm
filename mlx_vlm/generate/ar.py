@@ -37,6 +37,7 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -45,6 +46,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
+DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
@@ -162,6 +164,8 @@ def generate_step(
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
+    top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
+    p_less: bool = False,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -253,6 +257,8 @@ def generate_step(
             and temperature > 0
             and min_p == DEFAULT_MIN_P
             and top_k == DEFAULT_TOP_K
+            and top_n_sigma == DEFAULT_TOP_N_SIGMA
+            and not p_less
         ):
             sampler = _PositionedTargetSampler(
                 temperature=temperature,
@@ -265,6 +271,8 @@ def generate_step(
                 top_p=top_p,
                 min_p=min_p,
                 top_k=top_k,
+                top_n_sigma=top_n_sigma,
+                p_less=p_less,
             )
 
     processors = _generate_module_override(
@@ -448,7 +456,7 @@ def generate_step(
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
-    mx.eval(y, logprobs)
+    mx.async_eval(y, logprobs)
 
     # Speculative decoding
     if draft_model is not None:
@@ -483,7 +491,9 @@ def generate_step(
             mx.clear_cache()
 
         if thinking_budget_criteria is not None:
-            next_y = thinking_budget_criteria.apply_forced_token(next_y)
+            forced_token_id = thinking_budget_criteria.pop_forced_token_id()
+            if forced_token_id is not None:
+                next_y = mx.array([forced_token_id], dtype=next_y.dtype)
         y, logprobs = next_y, next_logprobs
         n += 1
 
@@ -778,9 +788,8 @@ def _make_cache(
     if hasattr(model, "make_cache"):
         model_cache = model.make_cache()
         n = len(model_cache)
-        # Skip quantizing the last layer — it's sensitive to quantization
         return [
-            to_batch_cache(c, quantize=(i < n - 1 if n > 2 else True))
+            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
             for i, c in enumerate(model_cache)
         ]
     else:
@@ -789,7 +798,7 @@ def _make_cache(
             return [
                 (
                     _make_quant_cache(left_padding)
-                    if i < n - 1 or n <= 2
+                    if cache.should_quantize_kv_layer(i, n)
                     else cache.BatchKVCache(left_padding)
                 )
                 for i in range(n)
@@ -949,30 +958,29 @@ class GenerationBatch:
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
 
-    def _greedy_argmax_step(self, inputs: mx.array, fwd_kwargs: dict):
-        if (
-            not self.greedy_sampling
-            or self.compute_logprobs
-            or self.top_logprobs_k > 0
-            or (self.logits_processors and any(self.logits_processors))
-        ):
+    def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
+        if not self.greedy_sampling or self.compute_logprobs or self.top_logprobs_k > 0:
             return None
 
-        argmax_from_hidden = getattr(
-            self._language_model, "speculative_argmax_from_hidden", None
-        )
-        if not callable(argmax_from_hidden):
+        fused_greedy_decode = getattr(self._language_model, "fused_greedy_decode", None)
+        if not callable(fused_greedy_decode):
             return None
 
-        output = self._language_model(
+        decode_kwargs = dict(fwd_kwargs)
+        if self.logits_processors and any(self.logits_processors):
+            supports_processors = getattr(
+                self._language_model, "supports_fused_greedy_logits_processors", None
+            )
+            if not callable(supports_processors) or not supports_processors(
+                self.logits_processors
+            ):
+                return None
+            decode_kwargs["logits_processors"] = self.logits_processors
+        sampled = fused_greedy_decode(
             inputs[:, None],
             cache=self.prompt_cache,
-            return_hidden=True,
-            skip_logits=True,
-            **fwd_kwargs,
+            **decode_kwargs,
         )
-        hidden = output.hidden_states[-1]
-        sampled = argmax_from_hidden(hidden)
         if sampled is None:
             return None
         if sampled.ndim == 2 and sampled.shape[1] == 1:
@@ -989,7 +997,7 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
-        sampled = self._greedy_argmax_step(inputs, fwd_kwargs)
+        sampled = self._fused_greedy_step(inputs, fwd_kwargs)
         if sampled is not None:
             self._next_tokens = sampled
             self._next_lps = None
@@ -1238,7 +1246,7 @@ class GenerationBatch:
 
         keep = []
         responses = []
-        forced_next_tokens = None
+        forced_next_tokens = [None] * len(self.uids)
         for i in range(len(self.uids)):
             finish_reason = None
             self._num_tokens[i] += 1
@@ -1249,15 +1257,7 @@ class GenerationBatch:
             ):
                 criteria = self.thinking_budget_criteria[i]
                 criteria(tok)
-                if forced_next_tokens is None:
-                    mx.eval(self._next_tokens)
-                    forced_next_tokens = self._next_tokens.tolist()
-                next_y = criteria.apply_forced_token(
-                    mx.array([forced_next_tokens[i]], dtype=mx.int32)
-                )
-                next_token = int(next_y.item())
-                if next_token != forced_next_tokens[i]:
-                    forced_next_tokens[i] = next_token
+                forced_next_tokens[i] = criteria.pop_forced_token_id()
 
             if self.stop_criteria(tok):
                 finish_reason = "stop"
@@ -1281,8 +1281,18 @@ class GenerationBatch:
                 )
             )
 
-        if forced_next_tokens is not None:
-            self._next_tokens = mx.array(forced_next_tokens, dtype=mx.int32)
+        has_forced_next_tokens = any(token is not None for token in forced_next_tokens)
+        if has_forced_next_tokens:
+            force_mask = mx.array(
+                [token is not None for token in forced_next_tokens], dtype=mx.bool_
+            )
+            replacements = mx.array(
+                [token if token is not None else 0 for token in forced_next_tokens],
+                dtype=self._next_tokens.dtype,
+            )
+            self._next_tokens = mx.where(force_mask, replacements, self._next_tokens)
+
+        if has_forced_next_tokens:
             mx.async_eval(self._next_tokens)
 
         if len(keep) < len(self.uids):
@@ -1815,7 +1825,7 @@ class PromptProcessingBatch:
             n_to_process=n,
             **prompt_kwargs,
         )
-        mx.eval([c.state for c in self.prompt_cache])
+        mx.async_eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
@@ -2024,16 +2034,14 @@ class PromptProcessingBatch:
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
-                        new_blocks = _apc.harvest_blocks_from_batch_cache(
+                        _apc.commit_prefix_blocks(
                             self._apc_manager,
                             self.prompt_cache,
-                            batch_idx,
                             meta["full_input_ids"],
+                            batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
-                        )
-                        self._apc_manager.release(
-                            meta.get("apc_blocks", []) + new_blocks
+                            blocks_in_use=meta.get("apc_blocks", []),
                         )
             except Exception as e:
                 logger.warning("APC harvest failed during batched prefill: %s", e)
@@ -2208,7 +2216,18 @@ class BatchGenerator:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.tenant_scoped_hash(tenant, img)
+        return _apc.semantic_extra_hash(
+            tenant=tenant,
+            image_hash=img,
+            media={
+                "audio": prompt_kwargs.get("input_features"),
+                "video": prompt_kwargs.get("pixel_values_videos"),
+                "embeddings": prompt_kwargs.get("inputs_embeds"),
+                "masks": prompt_kwargs.get("attention_mask"),
+            },
+            model=getattr(self, "model", None),
+            processor=getattr(self, "processor", None),
+        )
 
     def _apc_media_token_ids(self) -> set[int]:
         return _apc.multimodal_token_ids_from_config(self.model.config)
@@ -2252,93 +2271,15 @@ class BatchGenerator:
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
-        safe_lookup_min = self._apc_safe_prefix_lookup_min(ids_list)
-        extra_hash = self._apc_extra_hash(prompt_kwargs or {})
-        apc_mode = getattr(self, "apc_mode", "block")
-        if apc_mode == "exact":
-            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=safe_lookup_min,
-            )
-            if (
-                exact_cache is not None
-                and exact_prefix_len > 0
-                and exact_prefix_len < len(ids_list)
-            ):
-                if not self._apc_suffix_is_text_only(ids_list, exact_prefix_len):
-                    return None
-                return {
-                    "matched_blocks": [],
-                    "warm_cache": exact_cache,
-                    "prefix_len": exact_prefix_len,
-                    "extra_hash": extra_hash,
-                    "full_input_ids": list(ids_list),
-                }
-            return None
-        matched, prefix_len = self.apc_manager.lookup_prefix(
-            ids_list, extra_hash=extra_hash
+        return _apc.apc_lookup_plan(
+            self.apc_manager,
+            ids_list,
+            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            apc_mode=getattr(self, "apc_mode", "block"),
+            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
+            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
+            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
         )
-        if prefix_len > 0 and self._apc_prefix_has_media_tokens(ids_list, prefix_len):
-            self.apc_manager.release(matched)
-            matched = []
-            prefix_len = 0
-        exact_cache = None
-        exact_prefix_len = 0
-        if prefix_len < len(ids_list):
-            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, safe_lookup_min),
-            )
-        warm_cache = None
-        disk_prefix_len = 0
-        if max(prefix_len, exact_prefix_len) < len(ids_list):
-            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
-                allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
-            )
-        if disk_prefix_len > max(
-            prefix_len, exact_prefix_len
-        ) and disk_prefix_len < len(ids_list):
-            if matched:
-                self.apc_manager.release(matched)
-            if not self._apc_suffix_is_text_only(ids_list, disk_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": warm_cache,
-                "prefix_len": disk_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
-            if matched:
-                self.apc_manager.release(matched)
-            if not self._apc_suffix_is_text_only(ids_list, exact_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": exact_cache,
-                "prefix_len": exact_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if prefix_len > 0 and prefix_len < len(ids_list):
-            if not self._apc_suffix_is_text_only(ids_list, prefix_len):
-                self.apc_manager.release(matched)
-                return None
-            return {
-                "matched_blocks": matched,
-                "prefix_len": prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if matched:
-            self.apc_manager.release(matched)
-        return None
 
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]
@@ -2429,14 +2370,28 @@ class BatchGenerator:
             merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
+        # bits + group_size + scheme so warm restore matches live _make_cache
+        # backend (uniform BatchQuantized vs BatchTurboQuant).
+        _quant_cfg = (
+            {
+                "bits": self.kv_bits,
+                "group_size": self.kv_group_size,
+                "scheme": self.kv_quant_scheme,
+            }
+            if self.kv_bits is not None
+            else None
+        )
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
                 for p in picks
             ]
+            # Pass kv_quant_config so exact multi warm matches live _make_cache
+            # layer types under --kv-bits (cold quant row + exact float join).
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
+                kv_quant_config=_quant_cfg,
             )
             if warm_cache is None:
                 return None
@@ -2446,11 +2401,6 @@ class BatchGenerator:
                 len(self.model.make_cache())
                 if hasattr(self.model, "make_cache")
                 else len(self.model.layers)
-            )
-            _quant_cfg = (
-                {"bits": self.kv_bits, "group_size": self.kv_group_size}
-                if self.kv_bits is not None
-                else None
             )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
                 picks, num_layers=num_layers, kv_quant_config=_quant_cfg
@@ -2664,6 +2614,11 @@ class BatchGenerator:
         prompt_responses = []
 
         # Decode-first: always emit a generation step before touching prefill.
+        yield_after_decode = any(
+            getattr(processor, "requires_immediate_decode_yield", False)
+            for processors in getattr(self._generation_batch, "logits_processors", [])
+            for processor in processors or []
+        )
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
@@ -2678,6 +2633,8 @@ class BatchGenerator:
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
+            if yield_after_decode:
+                return prompt_responses, generation_responses
 
         if (
             getattr(self._generation_batch, "is_speculative", False)
@@ -2834,17 +2791,17 @@ class BatchGenerator:
 
 
 def batch_generate(
-    model,
-    processor,
-    images: Union[str, List[str]] = None,
-    audios: Union[str, List[str]] = None,
-    prompts: List[str] = None,
+    model: nn.Module,
+    processor: ProcessorLike,
+    images: Union[str, List[str], None] = None,
+    audios: Union[str, List[str], None] = None,
+    prompts: Optional[List[str]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
-    **kwargs,
-):
+    **kwargs: Unpack[GenerateKwargs],
+) -> BatchResponse:
     """
     Generate responses for the given batch of prompts with variable-sized images.
 

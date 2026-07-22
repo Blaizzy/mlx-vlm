@@ -537,16 +537,18 @@ def maybe_quantize_kv_cache(
                 return tuple(quantize_entry(sub_entry) for sub_entry in entry)
             return entry
 
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
+        # Last-layer policy shared with _make_cache / APC warm restore.
+        n = len(prompt_cache)
         for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
+            if not cache.should_quantize_kv_layer(index, n):
                 continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    n = len(prompt_cache)
     for index, layer_cache in enumerate(prompt_cache):
+        if not cache.should_quantize_kv_layer(index, n):
+            continue
         if (
             hasattr(layer_cache, "to_quantized")
             and layer_cache.offset >= quantized_kv_start
@@ -649,6 +651,7 @@ from .diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 
 def _prime_cached_prefix_rope_state(
@@ -696,13 +699,13 @@ from .ar import generate_step
 
 def stream_generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
-    **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
+    **kwargs: Unpack[GenerateKwargs],
+) -> Generator[GenerationResult, None, None]:
     """
     A generator producing text based on the given prompt from the model.
 
@@ -844,7 +847,20 @@ def stream_generate(
 
     if apc_manager is not None:
         image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
-        apc_extra_hash = _apc.tenant_scoped_hash(apc_tenant, image_hash)
+        audio_features = kwargs.get("input_features")
+        video_features = kwargs.get("pixel_values_videos")
+        apc_extra_hash = _apc.semantic_extra_hash(
+            tenant=apc_tenant,
+            image_hash=image_hash,
+            media={
+                "audio": audio_features if audio_features is not None else audio,
+                "video": video_features if video_features is not None else video,
+                "embeddings": kwargs.get("inputs_embeds"),
+                "masks": mask,
+            },
+            model=model,
+            processor=processor,
+        )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
@@ -873,109 +889,45 @@ def stream_generate(
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        if apc_mode == "exact":
-            exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
-                full_input_ids_list,
-                extra_hash=apc_extra_hash,
-                min_prefix_tokens=apc_safe_prefix_lookup_min,
-            )
-            if (
-                exact_prompt_cache is not None
-                and exact_prefix_len > 0
-                and exact_prefix_len < input_ids.shape[1]
-                and _apc_suffix_is_text_only(exact_prefix_len)
-                and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
-            ):
-                reused_prefix_len = exact_prefix_len
-                input_ids = input_ids[:, exact_prefix_len:]
+        plan = _apc.apc_lookup_plan(
+            apc_manager,
+            full_input_ids_list,
+            extra_hash=apc_extra_hash,
+            apc_mode=apc_mode,
+            safe_lookup_min=apc_safe_prefix_lookup_min,
+            suffix_is_text_only=_apc_suffix_is_text_only,
+            prefix_has_media=_apc_prefix_has_media_tokens,
+        )
+        if plan is not None:
+            plen = plan["prefix_len"]
+            warm_cache = plan.get("warm_cache")
+            matched_blocks = plan.get("matched_blocks") or []
+            primed = _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+            if primed:
+                reused_prefix_len = plen
+                input_ids = input_ids[:, plen:]
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-                kwargs["prompt_cache"] = exact_prompt_cache
-        else:
-            matched_blocks, prefix_len = apc_manager.lookup_prefix(
-                full_input_ids_list, extra_hash=apc_extra_hash
-            )
-            if prefix_len > 0 and _apc_prefix_has_media_tokens(prefix_len):
-                apc_manager.release(matched_blocks)
-                matched_blocks = []
-                prefix_len = 0
-            exact_prompt_cache = None
-            exact_prefix_len = 0
-            if prefix_len < input_ids.shape[1]:
-                exact_prompt_cache, exact_prefix_len = apc_manager.lookup_exact_cache(
-                    full_input_ids_list,
-                    extra_hash=apc_extra_hash,
-                    min_prefix_tokens=max(prefix_len, apc_safe_prefix_lookup_min),
-                )
-            disk_prompt_cache = None
-            disk_prefix_len = 0
-            if max(prefix_len, exact_prefix_len) < input_ids.shape[1]:
-                disk_prompt_cache, disk_prefix_len = (
-                    apc_manager.lookup_prefix_disk_cache(
-                        full_input_ids_list,
-                        extra_hash=apc_extra_hash,
-                        min_prefix_tokens=max(
-                            prefix_len,
-                            exact_prefix_len,
-                            apc_safe_prefix_lookup_min,
-                        ),
-                        allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
-                    )
-                )
-            if (
-                disk_prefix_len > max(prefix_len, exact_prefix_len)
-                and disk_prefix_len < input_ids.shape[1]
-            ):
-                if matched_blocks:
-                    apc_manager.release(matched_blocks)
-                if _apc_suffix_is_text_only(
-                    disk_prefix_len
-                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
-                    reused_prefix_len = disk_prefix_len
-                    input_ids = input_ids[:, disk_prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
-                    kwargs["prompt_cache"] = disk_prompt_cache
-            elif (
-                exact_prefix_len > prefix_len and exact_prefix_len < input_ids.shape[1]
-            ):
-                if matched_blocks:
-                    apc_manager.release(matched_blocks)
-                if _apc_suffix_is_text_only(
-                    exact_prefix_len
-                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
-                    reused_prefix_len = exact_prefix_len
-                    input_ids = input_ids[:, exact_prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
-                    kwargs["prompt_cache"] = exact_prompt_cache
-            elif prefix_len > 0 and prefix_len < input_ids.shape[1]:
-                if _apc_suffix_is_text_only(
-                    prefix_len
-                ) and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+                if warm_cache is not None:
+                    kwargs["prompt_cache"] = warm_cache
+                else:
                     apc_blocks_in_use = matched_blocks
-                    reused_prefix_len = prefix_len
-                    input_ids = input_ids[:, prefix_len:]
-                    pixel_values = None
-                    kwargs.pop("cached_image_features", None)
                     _kv_bits = kwargs.get("kv_bits")
                     _quant_cfg = (
                         {
                             "bits": _kv_bits,
                             "group_size": kwargs.get("kv_group_size", 64),
+                            "scheme": kwargs.get("kv_quant_scheme"),
                         }
                         if _kv_bits is not None
                         else None
                     )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
-                        min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                        min_capacity_tokens=plen + input_ids.shape[1] + 1,
                         kv_quant_config=_quant_cfg,
                     )
-                else:
-                    apc_manager.release(matched_blocks)
-            elif matched_blocks:
-                # Full match (no new tokens to compute) — release; fall through to normal path
+            elif warm_cache is None and matched_blocks:
                 apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
@@ -1139,28 +1091,14 @@ def stream_generate(
                     all_ids = full_input_ids_list + [
                         t.item() if hasattr(t, "item") else t for t in generated_tokens
                     ]
-                # Snapshot float K/V per layer (dequants when keys are tuples).
-                layer_keys: List[mx.array] = []
-                layer_values: List[mx.array] = []
-                ok = True
-                for c in tracked_cache:
-                    k, v = _apc.layer_kv_for_apc(c)
-                    if k is None or v is None:
-                        ok = False
-                        break
-                    layer_keys.append(k)
-                    layer_values.append(v)
-                if ok and layer_keys:
-                    new_blocks = apc_manager.store_kv_blocks(
-                        all_ids,
-                        layer_keys,
-                        layer_values,
-                        extra_hash=apc_extra_hash,
-                        skip_first_n_tokens=reused_prefix_len,
-                    )
-                    apc_manager.release(apc_blocks_in_use + new_blocks)
-                else:
-                    apc_manager.release(apc_blocks_in_use)
+                _apc.commit_prefix_blocks(
+                    apc_manager,
+                    tracked_cache,
+                    all_ids,
+                    extra_hash=apc_extra_hash,
+                    skip_first_n_tokens=reused_prefix_len,
+                    blocks_in_use=apc_blocks_in_use,
+                )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
                 apc_manager.release(apc_blocks_in_use)
@@ -1171,13 +1109,13 @@ def stream_generate(
 
 def generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
     verbose: bool = False,
-    **kwargs,
+    **kwargs: Unpack[GenerateKwargs],
 ) -> GenerationResult:
     """
     Generate text from the model.

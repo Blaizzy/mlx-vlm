@@ -10,6 +10,20 @@ from .base import InputEmbeddingsFeatures, LanguageModelOutput
 _is_text_model_arch = True
 
 
+def _resolve_text_model_classes(params):
+    model_type = params.get("model_type")
+    try:
+        from mlx_lm.utils import _get_classes
+    except ImportError as e:
+        raise ImportError(
+            f"Loading text-only model_type '{model_type}' relies on mlx-lm's "
+            "model registry (no native mlx-vlm implementation). Install it with "
+            "`pip install mlx-lm`."
+        ) from e
+
+    return _get_classes(params)
+
+
 @dataclass
 class AttributeConfig:
     """Attribute-style config wrapper."""
@@ -34,9 +48,7 @@ class ModelConfig(AttributeConfig):
     @classmethod
     def from_dict(cls, params):
         params = dict(params or {})
-        from mlx_lm.utils import _get_classes
-
-        model_class, model_args_class = _get_classes(params)
+        model_class, model_args_class = _resolve_text_model_classes(params)
         return cls(params, model_class, model_args_class)
 
     def __init__(self, values, model_class, model_args_class):

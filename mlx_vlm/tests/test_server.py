@@ -1,9 +1,11 @@
 import asyncio
 import base64
 import json
+import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
@@ -134,6 +136,13 @@ def test_chat_request_schema_requires_model():
     assert "model" in server.ChatRequest.model_json_schema()["required"]
 
 
+def test_chat_request_schema_declares_tool_choice_fields():
+    properties = server.ChatRequest.model_json_schema()["properties"]
+
+    assert "tools" in properties
+    assert "tool_choice" in properties
+
+
 def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     resize_shape = server.ChatRequest.model_json_schema()["properties"]["resize_shape"]
     lengths = {
@@ -143,6 +152,174 @@ def test_chat_request_schema_allows_one_or_two_resize_shape_values():
     }
 
     assert lengths == {(1, 1), (2, 2)}
+
+
+def test_chat_completions_tool_choice_none_disables_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(chat_template="<tool_call>\n<function=")
+    )
+    config = SimpleNamespace(model_type="qwen3_5")
+    result = GenerationResult(
+        text="No tool call.", prompt_tokens=5, generation_tokens=3
+    )
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Use the tool."}],
+                "tools": tools,
+                "tool_choice": "none",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["tool_calls"] is None
+    assert mock_template.call_args.kwargs["tools"] is None
+    assert mock_template.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_chat_completions_required_tool_choice_adds_instruction(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }
+    ]
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather?"}],
+                "tools": tools,
+                "tool_choice": "required",
+            },
+        )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert messages[0]["role"] == "user"
+    assert "must call one or more" in messages[0]["content"]
+    assert mock_template.call_args.kwargs["tools"] == tools
+    assert mock_template.call_args.kwargs["tool_choice"] == "required"
+
+
+def test_chat_completions_forced_tool_choice_filters_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "get_time", "parameters": {"type": "object"}},
+        },
+        {
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        },
+    ]
+    tool_choice = {"type": "function", "function": {"name": "get_weather"}}
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "Say hello."},
+                ],
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert messages[0]["content"].startswith("Be concise.")
+    assert "must call the 'get_weather' function" in messages[0]["content"]
+    assert "must call the 'get_weather' function" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_weather"]
+    assert mock_template.call_args.kwargs["tool_choice"] == tool_choice
+
+
+@pytest.mark.parametrize(
+    ("tools", "tool_choice", "detail"),
+    [
+        ([], "required", "requires at least one tool"),
+        (
+            [
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather"},
+                }
+            ],
+            {"type": "function", "function": {"name": "missing"}},
+            "unknown function 'missing'",
+        ),
+        ([], "sometimes", "Invalid tool_choice"),
+    ],
+)
+def test_chat_completions_rejects_invalid_tool_choice(
+    client, tools, tool_choice, detail
+):
+    with patch.object(server, "get_cached_model") as mock_get_cached_model:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+            },
+        )
+
+    assert response.status_code == 400
+    assert detail in response.json()["detail"]
+    mock_get_cached_model.assert_not_called()
 
 
 def test_speculative_server_dispatches_mtp_batch_loop():
@@ -1790,27 +1967,103 @@ def test_responses_streaming_emits_reasoning_events(client):
 
     assert response.status_code == 200
     events = _sse_events(response.text)
-    reasoning = [
-        data["delta"]
+    reasoning_events = [
+        data
         for event_type, data in events
         if event_type == "response.reasoning_text.delta"
     ]
-    text_deltas = [
-        data["delta"]
+    text_delta_events = [
+        data
         for event_type, data in events
         if event_type == "response.output_text.delta"
     ]
+    done_event = next(
+        data for event_type, data in events if event_type == "response.output_text.done"
+    )
     completed = next(
         data["response"]
         for event_type, data in events
         if event_type == "response.completed"
     )
 
-    assert "".join(reasoning) == "Check briefly."
-    assert "".join(text_deltas) == "Done."
+    assert "".join(event["delta"] for event in reasoning_events) == "Check briefly."
+    assert "".join(event["delta"] for event in text_delta_events) == "Done."
+    assert reasoning_events[0]["timings"]["predicted_per_second"] is None
+    assert reasoning_events[1]["timings"]["predicted_per_second"] > 0
+    assert (
+        text_delta_events[0]["timings"]["predicted_per_second"]
+        == reasoning_events[1]["timings"]["predicted_per_second"]
+    )
+    assert done_event["timings"]["predicted_per_second"] > 0
     assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
     assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
     assert completed["output_text"] == "Done."
+
+
+def test_responses_streaming_uses_prompt_opened_thinking_without_flag(client):
+    server.response_store.clear()
+    server.response_store_order.clear()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="cohere2_moe")
+    chunks = [
+        GenerationResult(text="North reasoning.", prompt_tokens=8, generation_tokens=1),
+        GenerationResult(
+            text="<|END_THINKING|><|START_TEXT|>North answer.<|END_TEXT|>",
+            prompt_tokens=8,
+            generation_tokens=4,
+            finish_reason="stop",
+        ),
+    ]
+    template_kwargs = {}
+
+    def fake_apply_chat_template(*args, **kwargs):
+        template_kwargs.update(kwargs)
+        return "prompt<|START_THINKING|>"
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server,
+            "apply_chat_template",
+            side_effect=fake_apply_chat_template,
+        ),
+        patch.object(server, "stream_generate", return_value=iter(chunks)),
+        patch.object(server.runtime, "response_generator", None),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "CohereLabs/North-Mini-Code-1.0-w4a16",
+                "input": "hello",
+                "reasoning": {"effort": "high", "summary": "auto"},
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    events = _sse_events(response.text)
+    reasoning = "".join(
+        data["delta"]
+        for event_type, data in events
+        if event_type == "response.reasoning_text.delta"
+    )
+    content = "".join(
+        data["delta"]
+        for event_type, data in events
+        if event_type == "response.output_text.delta"
+    )
+
+    assert reasoning == "North reasoning."
+    assert content == "North answer."
+    assert template_kwargs["enable_thinking"] is True
+    assert template_kwargs["reasoning"] is True
+    assert template_kwargs["reasoning_effort"] == "high"
+    assert "<|END_THINKING|>" not in response.text
+    assert "<|START_TEXT|>" not in response.text
+    assert "<|END_TEXT|>" not in response.text
 
 
 def test_responses_streaming_emits_function_call_arguments_done(client):
@@ -2273,6 +2526,148 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
     assert "".join(delta.get("content") or "" for delta in deltas) == ("Custom answer.")
 
 
+def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="cohere2_moe")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="North reasoning.",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason=None,
+                    ),
+                    server.StreamingToken(
+                        text="<|END_THINK",
+                        token=2,
+                        logprobs=0.0,
+                        finish_reason=None,
+                    ),
+                    server.StreamingToken(
+                        text="ING|><|START_TEXT|>North answer.<|END_TEXT|>",
+                        token=3,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server,
+            "apply_chat_template",
+            return_value="prompt<|START_THINKING|>",
+        ),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "CohereLabs/North-Mini-Code-1.0-w4a16",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == (
+        "North reasoning."
+    )
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
+        "North reasoning."
+    )
+    assert "".join(delta.get("content") or "" for delta in deltas) == "North answer."
+    assert "<|END_THINKING|>" not in response.text
+    assert "<|START_TEXT|>" not in response.text
+    assert "<|END_TEXT|>" not in response.text
+
+
+def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="lfm2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="Hello", token=1, logprobs=0.0, finish_reason=None
+                    ),
+                    server.StreamingToken(
+                        text="!", token=2, logprobs=0.0, finish_reason="stop"
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "liquidai/LFM2.5-VL-1.6B",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("content") or "" for delta in deltas) == "Hello!"
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+
+
 def test_chat_completions_response_uses_reasoning_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -2460,6 +2855,21 @@ def test_generation_timings_from_metrics():
     assert timings.predicted_per_token_ms == 0.0
 
 
+def test_generation_metrics_reports_chunk_and_aggregate_rates():
+    metrics = server_generation.GenerationMetrics()
+
+    first_rate = metrics.record_chunk(
+        SimpleNamespace(generation_tokens=1, emitted_at=10.0)
+    )
+    second_rate = metrics.record_chunk(
+        SimpleNamespace(generation_tokens=4, emitted_at=10.25)
+    )
+
+    assert first_rate is None
+    assert second_rate == pytest.approx(12.0)
+    assert metrics.rate == pytest.approx(12.0)
+
+
 def test_chat_completions_returns_timings(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
@@ -2555,12 +2965,27 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         for line in response.text.splitlines()
         if line.startswith("data: ") and line != "data: [DONE]"
     ]
-    timed_chunks = [chunk for chunk in chunks if chunk.get("timings") is not None]
-    assert len(timed_chunks) == 1
-    timed_chunk = timed_chunks[0]
+    timed_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
     assert timed_chunk["choices"] == []
     assert timed_chunk["timings"]["cache_n"] == 2
     assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    token_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["delta"].get("content") is not None
+    ]
+    assert token_chunks[0]["timings"]["predicted_per_second"] is None
+    assert token_chunks[1]["timings"]["predicted_per_second"] > 0
+    terminal_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "stop"
+    )
+    assert terminal_chunk["timings"]["predicted_per_second"] > 0
+    assert (
+        timed_chunk["timings"]["predicted_per_second"]
+        == terminal_chunk["timings"]["predicted_per_second"]
+    )
 
 
 def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
@@ -3428,6 +3853,32 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     assert payload["server"]["apc"] == {"enabled": False}
 
 
+def test_metrics_store_logs_request_lifecycle(caplog):
+    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+    metrics = server.ServerMetricsStore()
+    metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
+    metrics.record_success(
+        {
+            "endpoint": "/chat/completions",
+            "model": "demo",
+            "stream": True,
+            "backend": "continuous_batching",
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "generated_tokens": 4,
+            "request_elapsed_s": 0.5,
+            "decode_elapsed_s": 0.1,
+            "prefill_tok_s": 100.0,
+            "decode_tok_s": 40.0,
+            "finish_reason": "stop",
+        }
+    )
+
+    assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
+    assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
+    assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
+
+
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "apc_manager", None)
@@ -3539,6 +3990,68 @@ class TestResponseGenerator:
 
         assert gen.requests.empty()
 
+    def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._tokenizer_lock = Lock()
+        gen._cancel = lambda uid: None
+
+        state_lock = Lock()
+        active = 0
+        max_active = 0
+        queued = []
+        next_uid = 0
+
+        def tokenizer_work():
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.01)
+            with state_lock:
+                active -= 1
+
+        def preprocess(prompt, images=None, audio=None, videos=None):
+            del prompt, images, audio, videos
+            tokenizer_work()
+            return {"input_ids": mx.array([[99]], dtype=mx.int32)}
+
+        def make_criteria(args, input_ids):
+            del args, input_ids
+            tokenizer_work()
+            return object()
+
+        class Requests:
+            def put(self, request):
+                nonlocal next_uid
+                next_uid += 1
+                queued.append(request)
+                request.rqueue.put(
+                    server.GenerationContext(uid=next_uid, prompt_tokens=1)
+                )
+
+        gen._preprocess_request = preprocess
+        gen._make_thinking_budget_criteria = make_criteria
+        gen.requests = Requests()
+
+        def generate_one(_):
+            _, token_iter = gen.generate(
+                "prompt",
+                args=server.GenerationArguments(
+                    max_tokens=1,
+                    thinking_budget=512,
+                ),
+            )
+            token_iter.close()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(generate_one, range(4)))
+
+        assert max_active == 1
+        assert len(queued) == 4
+        assert all(request.thinking_budget_criteria is not None for request in queued)
+
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         monkeypatch.setattr(
@@ -3585,6 +4098,134 @@ class TestResponseGenerator:
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0")
 
         assert server.get_token_queue_timeout() is None
+
+    def test_log_progress_interval_is_configurable(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_LOG_PROGRESS_INTERVAL", raising=False)
+        assert server.get_log_progress_interval() == 10
+
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "7")
+        assert server.get_log_progress_interval() == 7
+
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "-1")
+        assert server.get_log_progress_interval() == 0
+
+    def test_debug_decode_logging_adds_token_details(self, monkeypatch, caplog):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
+        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": time.perf_counter() - 0.1,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+        }
+
+        for token_number in range(1, 4):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason="stop" if token_number == 3 else None,
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "Decode progress: request=req-1 generated_tokens=1" in m
+            and "token_number=1 token_id=1 text='1'" in m
+            for m in messages
+        )
+        assert not any("Token streamed:" in m for m in messages)
+        assert any("Decode started: request=req-1" in m for m in messages)
+        assert any(
+            "Decode completed: request=req-1 generated_tokens=3" in m for m in messages
+        )
+
+    def test_info_decode_logging_uses_interval_without_token_details(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": time.perf_counter(),
+            "generated_tokens": 0,
+            "decode_started_at": None,
+        }
+
+        for token_number in range(1, 3):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason=None,
+            )
+
+        progress = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode progress:")
+        ]
+        assert len(progress) == 1
+        assert "generated_tokens=2" in progress[0]
+        assert "token_number=" not in progress[0]
+        assert "token_id=" not in progress[0]
+        assert "text=" not in progress[0]
+
+    def test_decode_logging_uses_one_rate_field(self, monkeypatch, caplog):
+        times = iter([10.0, 10.25])
+        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
+        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": 9.0,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+            "last_token_at": None,
+        }
+
+        for token_number in range(1, 3):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason="stop" if token_number == 2 else None,
+            )
+
+        progress = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode progress:")
+        ]
+        assert "rate=n/a" in progress[0]
+        assert "rate=4.0 tok/s" in progress[1]
+        assert not any("token_rate=" in message for message in progress)
+        completed = next(
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode completed:")
+        )
+        assert "rate=4.0 tok/s" in completed
+        assert "token_rate=" not in completed
+
+    def test_chunked_prefill_logging_reports_partial_progress(self, caplog):
+        caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        prompt_batch = SimpleNamespace(
+            _processed_prompt_columns=2,
+            _inputs_embeds=mx.zeros((1, 4, 8)),
+            uids=[1],
+            _suffix_lens=[6],
+            _cached_tokens_per_row=[0],
+            _left_padding_per_row=[0],
+            _right_pad_per_row=None,
+        )
+        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+
+        gen._log_prefill_progress(SimpleNamespace(_prompt_batch=prompt_batch), active)
+
+        assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
 
     def test_token_iterator_reports_timeout_and_cancels_request(self, monkeypatch):
         gen = self._bare_generator()
@@ -4494,11 +5135,15 @@ class TestResponseGenerator:
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(
             enable_thinking=False,
+            reasoning=True,
+            reasoning_effort="high",
             thinking_budget=50,
             thinking_end_token="</think>",
         )
         kw = args.to_template_kwargs()
         assert kw["enable_thinking"] is False
+        assert kw["reasoning"] is True
+        assert kw["reasoning_effort"] == "high"
         assert kw["thinking_budget"] == 50
         assert kw["thinking_end_token"] == "</think>"
 
@@ -4687,6 +5332,61 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_maps_responses_reasoning_configuration(self):
+        req = server.OpenAIRequest(
+            model="demo",
+            input="hi",
+            reasoning={"effort": "high", "summary": "auto"},
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is True
+        assert args.reasoning is True
+        assert args.reasoning_effort == "high"
+        assert args.to_template_kwargs()["reasoning"] is True
+        assert args.to_template_kwargs()["reasoning_effort"] == "high"
+
+    def test_build_gen_args_maps_chat_reasoning_effort(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            reasoning_effort="low",
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is True
+        assert args.reasoning is True
+        assert args.reasoning_effort == "low"
+
+    def test_build_gen_args_maps_none_reasoning_effort_to_disabled(self):
+        req = server.OpenAIRequest(
+            model="demo",
+            input="hi",
+            reasoning={"effort": "none"},
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is False
+        assert args.reasoning is False
+        assert args.reasoning_effort == "none"
+
+    def test_build_gen_args_explicit_thinking_overrides_standard_reasoning(self):
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=False,
+            reasoning_effort="high",
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.enable_thinking is False
+        assert args.reasoning is False
+        assert args.reasoning_effort == "high"
 
     def test_build_gen_args_preserves_diffusion_options(self):
         req = server.ChatRequest(
@@ -5273,6 +5973,36 @@ class TestSplitThinking:
 
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
+
+    def test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking(self):
+        assert server.prompt_has_open_thinking("prompt", enable_thinking=True) is False
+        assert (
+            server.prompt_has_open_thinking("prompt<think>\n", enable_thinking=True)
+            is True
+        )
+        assert (
+            server.prompt_has_open_thinking(
+                "User: Say <think> literally\nAssistant:", enable_thinking=True
+            )
+            is False
+        )
+        assert (
+            server.prompt_has_open_thinking(
+                "prompt<analysis>",
+                enable_thinking=True,
+                thinking_start_token="<analysis>",
+                thinking_end_token="</analysis>",
+            )
+            is True
+        )
+
+    def test_prompt_open_marker_is_authoritative_when_flag_is_disabled(self):
+        assert (
+            server.prompt_has_open_thinking(
+                "prompt<|START_THINKING|>", enable_thinking=False
+            )
+            is True
+        )
 
     @pytest.mark.parametrize("enable_thinking", [False, True])
     def test_gemma_channel_markers_and_content_in_same_delta(self, enable_thinking):
