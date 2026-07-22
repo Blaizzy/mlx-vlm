@@ -126,7 +126,6 @@ def make_logits_processors(
     return logits_processors
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_top_k(
     logprobs: mx.array,
     top_k: int,
@@ -144,6 +143,11 @@ def apply_top_k(
             f"`top_k` has to be an integer in the (0, {vocab_size}] interval,"
             f" but is {top_k}."
         )
+    return _apply_top_k(logprobs, top_k)
+
+
+@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def _apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
     mask_idx = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[..., top_k:]
     masked_logprobs = mx.put_along_axis(
         logprobs, mask_idx, mx.array(-float("inf"), logprobs.dtype), axis=-1
@@ -151,7 +155,6 @@ def apply_top_k(
     return masked_logprobs
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def apply_min_p(
     logprobs: mx.array,
     min_p: float,
@@ -181,7 +184,15 @@ def apply_min_p(
         raise ValueError(
             f"`min_tokens_to_keep` has to be a positive integer, but is {min_tokens_to_keep}"
         )
+    return _apply_min_p(logprobs, min_p, min_tokens_to_keep)
 
+
+@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def _apply_min_p(
+    logprobs: mx.array,
+    min_p: float,
+    min_tokens_to_keep: int = 1,
+) -> mx.array:
     top_logprobs = mx.max(logprobs, axis=-1, keepdims=True)
     scaled_min_p = top_logprobs + math.log(min_p)
     tokens_to_remove = logprobs < scaled_min_p
