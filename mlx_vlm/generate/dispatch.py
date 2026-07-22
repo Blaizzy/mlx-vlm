@@ -651,6 +651,7 @@ from .diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 
 def _prime_cached_prefix_rope_state(
@@ -698,13 +699,13 @@ from .ar import generate_step
 
 def stream_generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
-    **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
+    **kwargs: Unpack[GenerateKwargs],
+) -> Generator[GenerationResult, None, None]:
     """
     A generator producing text based on the given prompt from the model.
 
@@ -1108,13 +1109,13 @@ def stream_generate(
 
 def generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
     verbose: bool = False,
-    **kwargs,
+    **kwargs: Unpack[GenerateKwargs],
 ) -> GenerationResult:
     """
     Generate text from the model.
