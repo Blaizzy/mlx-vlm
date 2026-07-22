@@ -107,9 +107,13 @@ class Qwen3OmniMoeProcessor(ProcessorMixin):
                 "attention_mask", None
             )
             audio_inputs["input_features"] = audio_inputs.pop("input_features", None)
+            # feature_attention_mask is sample-domain; convert to mel
+            # frames before deriving token counts (fixes ~80x audio token
+            # over-expansion for real-length audio, see #1651)
             audio_lengths = iter(
                 _get_feat_extract_output_lengths(
                     audio_inputs["feature_attention_mask"].sum(-1)
+                    // self.feature_extractor.hop_length
                 )
             )
         else:
