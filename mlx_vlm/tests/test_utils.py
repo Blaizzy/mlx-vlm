@@ -852,6 +852,14 @@ def _make_test_image_bytes():
 
 
 class TestLoadImage:
+    def test_pil_image_input(self):
+        from PIL import Image as PILImage
+
+        source = PILImage.new("RGBA", (4, 4), color="red")
+        img = load_image(source)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
     def test_bytesio_input(self):
         buf = _make_test_image_bytes()
         img = load_image(buf)

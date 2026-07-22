@@ -37,6 +37,7 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -45,6 +46,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
+DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
@@ -162,6 +164,8 @@ def generate_step(
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
+    top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
+    p_less: bool = False,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -253,6 +257,8 @@ def generate_step(
             and temperature > 0
             and min_p == DEFAULT_MIN_P
             and top_k == DEFAULT_TOP_K
+            and top_n_sigma == DEFAULT_TOP_N_SIGMA
+            and not p_less
         ):
             sampler = _PositionedTargetSampler(
                 temperature=temperature,
@@ -265,6 +271,8 @@ def generate_step(
                 top_p=top_p,
                 min_p=min_p,
                 top_k=top_k,
+                top_n_sigma=top_n_sigma,
+                p_less=p_less,
             )
 
     processors = _generate_module_override(
@@ -2026,16 +2034,14 @@ class PromptProcessingBatch:
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
-                        new_blocks = _apc.harvest_blocks_from_batch_cache(
+                        _apc.commit_prefix_blocks(
                             self._apc_manager,
                             self.prompt_cache,
-                            batch_idx,
                             meta["full_input_ids"],
+                            batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
-                        )
-                        self._apc_manager.release(
-                            meta.get("apc_blocks", []) + new_blocks
+                            blocks_in_use=meta.get("apc_blocks", []),
                         )
             except Exception as e:
                 logger.warning("APC harvest failed during batched prefill: %s", e)
@@ -2210,7 +2216,18 @@ class BatchGenerator:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.tenant_scoped_hash(tenant, img)
+        return _apc.semantic_extra_hash(
+            tenant=tenant,
+            image_hash=img,
+            media={
+                "audio": prompt_kwargs.get("input_features"),
+                "video": prompt_kwargs.get("pixel_values_videos"),
+                "embeddings": prompt_kwargs.get("inputs_embeds"),
+                "masks": prompt_kwargs.get("attention_mask"),
+            },
+            model=getattr(self, "model", None),
+            processor=getattr(self, "processor", None),
+        )
 
     def _apc_media_token_ids(self) -> set[int]:
         return _apc.multimodal_token_ids_from_config(self.model.config)
@@ -2254,93 +2271,15 @@ class BatchGenerator:
         uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
         if not ids_list or len(ids_list) < 2:
             return None
-        safe_lookup_min = self._apc_safe_prefix_lookup_min(ids_list)
-        extra_hash = self._apc_extra_hash(prompt_kwargs or {})
-        apc_mode = getattr(self, "apc_mode", "block")
-        if apc_mode == "exact":
-            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=safe_lookup_min,
-            )
-            if (
-                exact_cache is not None
-                and exact_prefix_len > 0
-                and exact_prefix_len < len(ids_list)
-            ):
-                if not self._apc_suffix_is_text_only(ids_list, exact_prefix_len):
-                    return None
-                return {
-                    "matched_blocks": [],
-                    "warm_cache": exact_cache,
-                    "prefix_len": exact_prefix_len,
-                    "extra_hash": extra_hash,
-                    "full_input_ids": list(ids_list),
-                }
-            return None
-        matched, prefix_len = self.apc_manager.lookup_prefix(
-            ids_list, extra_hash=extra_hash
+        return _apc.apc_lookup_plan(
+            self.apc_manager,
+            ids_list,
+            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            apc_mode=getattr(self, "apc_mode", "block"),
+            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
+            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
+            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
         )
-        if prefix_len > 0 and self._apc_prefix_has_media_tokens(ids_list, prefix_len):
-            self.apc_manager.release(matched)
-            matched = []
-            prefix_len = 0
-        exact_cache = None
-        exact_prefix_len = 0
-        if prefix_len < len(ids_list):
-            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, safe_lookup_min),
-            )
-        warm_cache = None
-        disk_prefix_len = 0
-        if max(prefix_len, exact_prefix_len) < len(ids_list):
-            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
-                allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
-            )
-        if disk_prefix_len > max(
-            prefix_len, exact_prefix_len
-        ) and disk_prefix_len < len(ids_list):
-            if matched:
-                self.apc_manager.release(matched)
-            if not self._apc_suffix_is_text_only(ids_list, disk_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": warm_cache,
-                "prefix_len": disk_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
-            if matched:
-                self.apc_manager.release(matched)
-            if not self._apc_suffix_is_text_only(ids_list, exact_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": exact_cache,
-                "prefix_len": exact_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if prefix_len > 0 and prefix_len < len(ids_list):
-            if not self._apc_suffix_is_text_only(ids_list, prefix_len):
-                self.apc_manager.release(matched)
-                return None
-            return {
-                "matched_blocks": matched,
-                "prefix_len": prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if matched:
-            self.apc_manager.release(matched)
-        return None
 
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]
@@ -2852,17 +2791,17 @@ class BatchGenerator:
 
 
 def batch_generate(
-    model,
-    processor,
-    images: Union[str, List[str]] = None,
-    audios: Union[str, List[str]] = None,
-    prompts: List[str] = None,
+    model: nn.Module,
+    processor: ProcessorLike,
+    images: Union[str, List[str], None] = None,
+    audios: Union[str, List[str], None] = None,
+    prompts: Optional[List[str]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
-    **kwargs,
-):
+    **kwargs: Unpack[GenerateKwargs],
+) -> BatchResponse:
     """
     Generate responses for the given batch of prompts with variable-sized images.
 
