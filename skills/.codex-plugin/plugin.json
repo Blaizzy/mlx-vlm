@@ -1,0 +1,27 @@
+{
+  "name": "mlx-vlm-skills",
+  "version": "0.1.0",
+  "description": "Skills for MLX-VLM CLI inference, server inference, HF cache model listing, and reproducible GitHub issues.",
+  "author": {
+    "name": "MLX-VLM contributors"
+  },
+  "keywords": [
+    "mlx",
+    "mlx-vlm",
+    "vision-language-models",
+    "apple-silicon"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "MLX-VLM skills",
+    "shortDescription": "Run inference, list cached models, and write issues",
+    "longDescription": "Skills for MLX-VLM's practical support workflows: command-line inference, local server/API inference, Hugging Face cache model listing, and creating reproducible GitHub issues from failures or bug reports.",
+    "defaultPrompt": "Use the MLX-VLM skills to help run CLI inference, debug server inference, list supported cached models, or create a reproducible GitHub issue.",
+    "developerName": "MLX-VLM contributors",
+    "category": "Coding",
+    "capabilities": [
+      "Read",
+      "Write"
+    ]
+  }
+}
