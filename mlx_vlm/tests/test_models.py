@@ -160,6 +160,44 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_qwen3_omni_audio_features_use_mel_domain_lengths(self):
+        # Regression for #1651: feature_attention_mask is sample-domain, so the audio
+        # tower must receive mel-frame feature_lens (mask.sum // hop) rather than the
+        # raw sample count -- otherwise it builds ~hop x too many chunks (100s of GB)
+        # and the token count no longer matches the encoder output.
+        from types import SimpleNamespace
+
+        from mlx_vlm.models.qwen3_omni_moe.audio import (
+            AudioModel,
+            _get_feat_extract_output_lengths,
+        )
+        from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
+        from mlx_vlm.models.qwen3_omni_moe.thinker import Thinker
+
+        cfg = AudioConfig(
+            d_model=128,
+            encoder_layers=2,
+            num_hidden_layers=2,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=256,
+            num_mel_bins=128,
+            output_dim=64,
+            downsample_hidden_size=64,
+            n_window=50,
+        )
+        tower = AudioModel(cfg)
+        tower.eval()
+        mx.eval(tower.parameters())
+        holder = SimpleNamespace(audio_tower=tower)
+
+        mel, hop = 2000, 160
+        feats = mx.zeros((1, cfg.num_mel_bins, mel))
+        mask = mx.ones((1, mel * hop))  # sample-domain attention mask
+        out = Thinker.get_audio_features(holder, feats, feature_attention_mask=mask)
+        mx.eval(out)
+        expected = int(_get_feat_extract_output_lengths(mx.array([mel]))[0])
+        self.assertEqual(out.shape[0], expected)
+
     def test_laguna_nvfp4_compressed_tensors_config(self):
         from mlx_vlm.models import laguna
 
