@@ -537,6 +537,9 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
+
         # Use ``cache._idx`` — the Python-int token counter — instead of
         # syncing on ``cache[0].offset``. See Qwen2.5-VL for details.
         cache_offset = 0
@@ -550,6 +553,17 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = c0.offset
+
+        # Chunked prefill passes the full-prompt position_ids to every chunk;
+        # slice it down to this chunk's [offset, offset + len) window.
+        if position_ids is not None and cache_offsets is None:
+            seq_length = (
+                inputs.shape[-1] if inputs is not None else inputs_embeds.shape[1]
+            )
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
 
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
