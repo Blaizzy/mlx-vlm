@@ -3,7 +3,13 @@ import json
 import logging
 
 import mlx.optimizers as optim
-from datasets import load_dataset
+
+try:
+    from datasets import load_dataset
+except ModuleNotFoundError as e:  # optional 'train' extra
+    raise ImportError(
+        "Fine-tuning requires the 'train' extra: pip install 'mlx-vlm[train]'"
+    ) from e
 
 from .trainer.datasets import PreferenceVisionDataset, VisionDataset
 from .trainer.orpo_trainer import ORPOTrainingArgs, train_orpo

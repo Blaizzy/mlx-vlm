@@ -1439,7 +1439,12 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA.
+MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+eval scripts) need the training extra, which is not installed by default:
+
+```bash
+pip install "mlx-vlm[train]"
+```
 
 ## LoRA & QLoRA
 

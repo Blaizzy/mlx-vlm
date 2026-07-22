@@ -56,6 +56,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import mlx.core as mx
 import numpy as np
 
+from .apc_storage import APCNode, ComponentId, StateHandle
+
 logger = logging.getLogger("mlx_vlm.apc")
 
 DEFAULT_BLOCK_SIZE = 16
@@ -120,6 +122,133 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
     return int.from_bytes(h.digest()[:8], "little", signed=True)
 
 
+def _tensor_content_hash(t: Any) -> int:
+    """Lossless content hash of a tensor: shape + dtype + exact bytes.
+
+    Unlike ``hash_image_payload`` this keeps shape and dtype and does not
+    downcast to fp16, so distinct masks/embeddings never collide.
+    """
+    dtype = str(getattr(t, "dtype", ""))
+    shape = tuple(getattr(t, "shape", ()))
+    if isinstance(t, mx.array):
+        mx.eval(t)
+        try:
+            raw = np.asarray(t)
+        except Exception:
+            raw = np.asarray(t.astype(mx.float32))
+    else:
+        raw = np.ascontiguousarray(t)
+    h = hashlib.sha256()
+    h.update(repr(shape).encode("utf-8"))
+    h.update(dtype.encode("utf-8"))
+    h.update(raw.tobytes())
+    return int.from_bytes(h.digest()[:8], "little", signed=True)
+
+
+def _hash_payload(payload: Any) -> Optional[int]:
+    """Stable content hash of one non-token semantic input, or None to skip.
+
+    Tensors hash losslessly by shape + dtype + bytes; lists fold element-wise;
+    other refs hash by path/repr.
+    """
+    if payload is None:
+        return None
+    if isinstance(payload, (list, tuple)):
+        folded = SEED_PARENT_HASH
+        seen = False
+        for item in payload:
+            sub = _hash_payload(item)
+            if sub is not None:
+                folded = _stable_int_hash(folded, sub)
+                seen = True
+        return folded if seen else None
+    if isinstance(payload, (mx.array, np.ndarray)):
+        return _tensor_content_hash(payload)
+    return hash_image_payload(image_ref=payload)
+
+
+def model_key_dependencies(model: Any = None, processor: Any = None) -> Tuple[int, ...]:
+    """Fold any model/processor-declared APC key dependencies into hashes.
+
+    A model or processor may expose ``apc_key_dependencies()`` returning extra
+    semantic inputs. Absent or failing hooks contribute nothing.
+    """
+    deps: List[int] = []
+    for obj in (model, processor):
+        if obj is None:
+            continue
+        hook = getattr(obj, "apc_key_dependencies", None)
+        if not callable(hook):
+            continue
+        try:
+            for dep in hook() or ():
+                sub = _hash_payload(dep)
+                if sub is not None:
+                    deps.append(sub)
+        except Exception:
+            continue
+    return tuple(deps)
+
+
+def semantic_extra_hash(
+    *,
+    tenant: Optional[str] = None,
+    image_hash: int = 0,
+    media: Optional[Dict[str, Any]] = None,
+    model: Any = None,
+    processor: Any = None,
+) -> int:
+    """Complete APC salt: tenant + image + non-token media inputs + model/processor deps.
+
+    ``media`` maps a semantic-input name (audio/video/embeddings/masks/
+    rope_deltas/...) to its payload; entries fold in sorted-key order so the
+    result is order-independent. Reduces exactly to
+    ``tenant_scoped_hash(tenant, image_hash)`` when no extra inputs are present.
+    """
+    folded = int(image_hash)
+    if media:
+        for key in sorted(media):
+            sub = _hash_payload(media[key])
+            if sub is not None:
+                folded = _stable_int_hash(folded, _hash_payload(key), sub)
+    for dep in model_key_dependencies(model, processor):
+        folded = _stable_int_hash(folded, dep)
+    return tenant_scoped_hash(tenant, folded)
+
+
+def apc_disk_namespace(
+    model_path: str,
+    *,
+    adapter_path: Any = None,
+    weights_fingerprint: Any = None,
+    kv_bits: Any = None,
+    kv_group_size: Any = None,
+    kv_quant_scheme: Any = None,
+    quantized_kv_start: Any = None,
+) -> str:
+    """On-disk APC namespace fingerprinted by model identity + KV-quant + adapter schema.
+
+    Folds the model path, any adapter path / weights fingerprint, and KV
+    quantization into the namespace so a different adapter, model revision,
+    quantization, or adapter schema version never reads or writes another's
+    on-disk cache.
+    """
+    from .apc_adapters import ADAPTER_SCHEMA_VERSION
+
+    kv_descriptor = (
+        f"kv{kv_bits}-{kv_group_size}-{kv_quant_scheme}-{quantized_kv_start}"
+    )
+    fingerprint = _stable_int_hash(
+        ADAPTER_SCHEMA_VERSION,
+        _hash_payload(str(model_path)) or 0,
+        _hash_payload("" if adapter_path is None else str(adapter_path)) or 0,
+        _hash_payload("" if weights_fingerprint is None else str(weights_fingerprint))
+        or 0,
+        _hash_payload(kv_descriptor) or 0,
+    ) & ((1 << 32) - 1)
+    return f"{model_path}#s{ADAPTER_SCHEMA_VERSION}-{fingerprint:08x}"
+
+
 def _copy_mlx_array(x: mx.array) -> mx.array:
     """Materialize ``x`` into a fresh MLX-owned contiguous buffer."""
     return mx.contiguous(mx.array(x, dtype=x.dtype))
@@ -154,127 +283,12 @@ def _clone_cache_entry_for_apc(
     min_capacity_tokens: Optional[int],
     eval_targets: List[mx.array],
 ) -> Optional[Any]:
-    """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
-    from .models import cache as lm_cache
+    """Deep-copy one prompt-cache entry via the registered cache adapter."""
+    from .apc_adapters import clone_cache_entry
 
-    if isinstance(c, lm_cache.KVCache):
-        out = type(c)()
-        off = int(getattr(c, "offset", 0) or 0)
-        if c.keys is not None and c.values is not None and off > 0:
-            keys = _copy_mlx_array(c.keys[..., :off, :])
-            values = _copy_mlx_array(c.values[..., :off, :])
-            step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
-            keys, values = _pad_kv_for_capacity(
-                keys,
-                values,
-                offset=off,
-                min_capacity_tokens=min_capacity_tokens,
-                step=step,
-            )
-            out.keys = keys
-            out.values = values
-            out.offset = off
-            eval_targets.extend([keys, values])
-        return out
-
-    # Batch caches expose extract + is_single_row; collapse to a single-row
-    # entry before cloning. Multi-row stores should call snapshot_prompt_cache_row.
-    if callable(getattr(c, "extract", None)) and callable(
-        getattr(c, "is_single_row", None)
-    ):
-        if not c.is_single_row():
-            return None
-        if c.empty():
-            if isinstance(c, lm_cache.BatchRotatingKVCache):
-                return lm_cache.RotatingKVCache(max_size=int(c.max_size))
-            return lm_cache.KVCache()
-        return _clone_cache_entry_for_apc(
-            c.extract(0),
-            min_capacity_tokens=min_capacity_tokens,
-            eval_targets=eval_targets,
-        )
-
-    if isinstance(c, lm_cache.RotatingKVCache):
-        out = type(c)(
-            max_size=int(getattr(c, "max_size")),
-            keep=int(getattr(c, "keep", 0)),
-        )
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out._idx = int(getattr(c, "_idx", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ChunkedKVCache):
-        out = type(c)(chunk_size=int(getattr(c, "chunk_size")))
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out.start_position = int(getattr(c, "start_position", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ArraysCache):
-        out = lm_cache.ArraysCache(len(c.cache))
-        out.cache = []
-        for state in c.cache:
-            if state is None:
-                out.cache.append(None)
-                continue
-            copied = _copy_mlx_array(state)
-            out.cache.append(copied)
-            eval_targets.append(copied)
-        if c.left_padding is not None:
-            out.left_padding = _copy_mlx_array(c.left_padding)
-            eval_targets.append(out.left_padding)
-        if c.lengths is not None:
-            out.lengths = _copy_mlx_array(c.lengths)
-            eval_targets.append(out.lengths)
-        return out
-
-    if isinstance(c, lm_cache.CacheList):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c.caches
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return lm_cache.CacheList(*copied)
-
-    if isinstance(c, tuple):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return tuple(copied)
-
-    # Protocol fallback: any cache with dequantize_for_apc (e.g. QuantizedKVCache)
-    # is cloned by dequantizing into a plain KVCache for exact-mode storage.
-    if hasattr(c, "dequantize_for_apc"):
-        dk, dv = c.dequantize_for_apc()
-        if dk is None or dv is None:
-            return lm_cache.KVCache()
-        out = lm_cache.KVCache()
-        out.keys = _copy_mlx_array(dk)
-        out.values = _copy_mlx_array(dv)
-        out.offset = dk.shape[-2]
-        eval_targets.extend([out.keys, out.values])
-        return out
-
-    return None
+    return clone_cache_entry(
+        c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+    )
 
 
 def _clone_prompt_cache_for_apc(
@@ -323,38 +337,15 @@ def _clone_layer_major_kv_cache_for_apc(
 
 
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    from .models import cache as lm_cache
+    from .apc_adapters import apc_exact_eligible
 
-    if isinstance(
-        c,
-        (
-            lm_cache.KVCache,
-            lm_cache.BatchKVCache,
-            lm_cache.BatchRotatingKVCache,
-            lm_cache.BatchQuantizedKVCache,
-            lm_cache.RotatingKVCache,
-            lm_cache.ChunkedKVCache,
-            lm_cache.ArraysCache,
-        ),
-    ):
-        return True
-    if hasattr(c, "dequantize_for_apc"):
-        return True
-    if isinstance(c, lm_cache.CacheList):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
-    if isinstance(c, tuple):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c)
-    return False
+    return apc_exact_eligible(c)
 
 
 def _cache_entry_supports_block_apc(c: Any) -> bool:
-    from .models import cache as lm_cache
+    from .apc_adapters import apc_block_eligible
 
-    if isinstance(c, lm_cache.KVCache):
-        return True
-    if hasattr(c, "dequantize_for_apc"):
-        return True
-    return False
+    return apc_block_eligible(c)
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
@@ -502,8 +493,8 @@ def adjust_prefix_to_text_suffix_boundary(
 
 
 @dataclass
-class APCBlock:
-    """One fixed-size KV block. Holds per-layer K/V slabs once committed."""
+class APCBlock(APCNode):
+    """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
 
     block_id: int
     block_hash: Optional[int] = None
@@ -511,11 +502,26 @@ class APCBlock:
     token_ids: Tuple[int, ...] = ()
     extra_hash: int = 0
     ref_cnt: int = 0
-    keys: Optional[List[mx.array]] = None
-    values: Optional[List[mx.array]] = None
+    components: Dict[ComponentId, StateHandle] = field(default_factory=dict)
     last_used: float = 0.0
     prev: Optional["APCBlock"] = None
     next: Optional["APCBlock"] = None
+
+    @property
+    def node_key(self) -> Optional[int]:
+        return self.block_hash
+
+    @property
+    def prefix_len(self) -> int:
+        return len(self.token_ids)
+
+    @property
+    def parent_key(self) -> int:
+        return self.parent_hash
+
+    @property
+    def lock_count(self) -> int:
+        return self.ref_cnt
 
 
 @dataclass
@@ -2939,8 +2945,7 @@ class APCManager:
         b.token_ids = ()
         b.parent_hash = SEED_PARENT_HASH
         b.extra_hash = 0
-        b.keys = None
-        b.values = None
+        b.release_components()
         return b
 
     def _acquire_existing(self, b: APCBlock) -> APCBlock:
@@ -2959,6 +2964,13 @@ class APCManager:
         with self.lock:
             for b in blocks:
                 self._release_one(b)
+
+    def _resident_bytes_locked(self) -> int:
+        return sum(b.resident_bytes() for b in self.pool)
+
+    def resident_bytes(self) -> int:
+        with self.lock:
+            return self._resident_bytes_locked()
 
     # ---------- Public API ----------
     def lookup_exact_cache(
@@ -3412,8 +3424,7 @@ class APCManager:
                 b.parent_hash = parent
                 b.token_ids = chunk
                 b.extra_hash = extra_hash
-                b.keys = k_slabs
-                b.values = v_slabs
+                b.set_kv(k_slabs, v_slabs)
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
@@ -3435,6 +3446,7 @@ class APCManager:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
+            snap["resident_bytes"] = self._resident_bytes_locked()
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes
@@ -3463,8 +3475,7 @@ class APCManager:
                 b.token_ids = ()
                 b.parent_hash = SEED_PARENT_HASH
                 b.extra_hash = 0
-                b.keys = None
-                b.values = None
+                b.release_components()
                 b.ref_cnt = 0
                 b.prev = b.next = None
             self.hash_table.clear()
@@ -3800,72 +3811,14 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
             _collect_mx_arrays(item, out)
 
 
-def _merge_arrays_cache_entries(
-    entries: Sequence[Any],
-    prefix_lens: Sequence[int],
-) -> Any:
-    from .models import cache as lm_cache
-
-    size = len(entries[0].cache)
-    out = lm_cache.ArraysCache(size)
-    merged_states: List[Optional[mx.array]] = []
-    for state_idx in range(size):
-        states = [entry.cache[state_idx] for entry in entries]
-        sample = next((s for s in states if s is not None), None)
-        if sample is None:
-            merged_states.append(None)
-            continue
-        rows = []
-        for state in states:
-            if state is None:
-                rows.append(mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype))
-            else:
-                rows.append(state[:1])
-        merged_states.append(mx.concatenate(rows, axis=0))
-    out.cache = merged_states
-    return out
-
-
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from .models import cache as lm_cache
+    """Merge single-row exact snapshots via the registered cache adapter."""
+    from .apc_adapters import merge_cache_entries
 
-    if not entries:
-        return None
-    first = entries[0]
-    if all(isinstance(c, lm_cache.KVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
-        return lm_cache.BatchRotatingKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
-        return _merge_arrays_cache_entries(entries, prefix_lens)
-    if all(isinstance(c, lm_cache.CacheList) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry.caches[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first.caches))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    if all(isinstance(c, tuple) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    return None
+    return merge_cache_entries(entries, prefix_lens)
 
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
@@ -4087,16 +4040,17 @@ def layer_kv_for_apc(
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],
-    batch_idx: int,
     full_token_ids: Sequence[int],
     *,
+    batch_idx: Optional[int] = None,
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
 ) -> List[APCBlock]:
-    """Slice one row out of a batched KV cache and store its full blocks.
+    """Harvest full blocks from a prompt cache and store them.
 
-    Used at the end of prompt prefill in continuous-batching mode to add
-    the new prefix to APC.
+    With ``batch_idx`` set, slices one row out of a batched KV cache
+    (continuous-batching prefill). With ``batch_idx`` unset, harvests a
+    single-request cache. Either way, adds the new prefix to APC.
     """
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
@@ -4104,7 +4058,7 @@ def harvest_blocks_from_batch_cache(
         k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
         if k is None or v is None:
             return []
-        if int(k.shape[0]) != 1:
+        if batch_idx is not None and int(k.shape[0]) != 1:
             k = k[batch_idx : batch_idx + 1]
             v = v[batch_idx : batch_idx + 1]
         layer_keys.append(k)
@@ -4116,6 +4070,29 @@ def harvest_blocks_from_batch_cache(
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
     )
+
+
+def commit_prefix_blocks(
+    apc_manager: "APCManager",
+    prompt_cache: List[Any],
+    full_token_ids: Sequence[int],
+    *,
+    batch_idx: Optional[int] = None,
+    extra_hash: int = 0,
+    skip_first_n_tokens: int = 0,
+    blocks_in_use: Sequence[APCBlock] = (),
+) -> List[APCBlock]:
+    """Harvest one (row of a) prompt cache into hashed blocks, store them, then release the in-use prefix blocks together with the new ones. Shared block-mode commit for both generate paths."""
+    new_blocks = harvest_blocks_from_batch_cache(
+        apc_manager,
+        prompt_cache,
+        full_token_ids,
+        batch_idx=batch_idx,
+        extra_hash=extra_hash,
+        skip_first_n_tokens=skip_first_n_tokens,
+    )
+    apc_manager.release(list(blocks_in_use) + new_blocks)
+    return new_blocks
 
 
 def model_apc_mode(language_model: Any) -> Optional[str]:
@@ -4143,6 +4120,104 @@ def model_supports_apc(language_model: Any) -> bool:
     return model_apc_mode(language_model) is not None
 
 
+def apc_lookup_plan(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    apc_mode: str,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+) -> Optional[dict]:
+    """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    n = len(ids_list)
+    if not ids_list or n < 2:
+        return None
+
+    if apc_mode == "exact":
+        exact_cache, exact_prefix_len = manager.lookup_exact_cache(
+            ids_list, extra_hash=extra_hash, min_prefix_tokens=safe_lookup_min
+        )
+        if exact_cache is not None and 0 < exact_prefix_len < n:
+            if not suffix_is_text_only(exact_prefix_len):
+                return None
+            return {
+                "matched_blocks": [],
+                "warm_cache": exact_cache,
+                "prefix_len": exact_prefix_len,
+                "extra_hash": extra_hash,
+                "full_input_ids": list(ids_list),
+            }
+        return None
+
+    matched, prefix_len = manager.lookup_prefix(ids_list, extra_hash=extra_hash)
+    if prefix_len > 0 and prefix_has_media(prefix_len):
+        manager.release(matched)
+        matched = []
+        prefix_len = 0
+    exact_cache = None
+    exact_prefix_len = 0
+    if prefix_len < n:
+        exact_cache, exact_prefix_len = manager.lookup_exact_cache(
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=max(prefix_len, safe_lookup_min),
+        )
+    warm_cache = None
+    disk_prefix_len = 0
+    if max(prefix_len, exact_prefix_len) < n:
+        warm_cache, disk_prefix_len = manager.lookup_prefix_disk_cache(
+            ids_list,
+            extra_hash=extra_hash,
+            min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
+            allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
+        )
+    if disk_prefix_len > max(prefix_len, exact_prefix_len) and disk_prefix_len < n:
+        if matched:
+            manager.release(matched)
+        if not suffix_is_text_only(disk_prefix_len):
+            return None
+        return {
+            "matched_blocks": [],
+            "warm_cache": warm_cache,
+            "prefix_len": disk_prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+    if exact_prefix_len > prefix_len and exact_prefix_len < n:
+        if matched:
+            manager.release(matched)
+        if not suffix_is_text_only(exact_prefix_len):
+            return None
+        return {
+            "matched_blocks": [],
+            "warm_cache": exact_cache,
+            "prefix_len": exact_prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+    if 0 < prefix_len < n:
+        if not suffix_is_text_only(prefix_len):
+            manager.release(matched)
+            return None
+        return {
+            "matched_blocks": matched,
+            "prefix_len": prefix_len,
+            "extra_hash": extra_hash,
+            "full_input_ids": list(ids_list),
+        }
+    if matched:
+        manager.release(matched)
+    return None
+
+
+def _adapter_schema_version() -> int:
+    from .apc_adapters import ADAPTER_SCHEMA_VERSION
+
+    return ADAPTER_SCHEMA_VERSION
+
+
 @dataclass(frozen=True)
 class LayerSupport:
     """Per-layer result from :func:`classify_layer_for_apc`."""
@@ -4150,6 +4225,7 @@ class LayerSupport:
     type_name: str
     status: str  # "ok" | "empty_ok" | "unsupported"
     reason: Optional[str] = None
+    capability: Optional[str] = None
 
 
 @dataclass
@@ -4162,6 +4238,17 @@ class APCSelfCheckResult:
     layer_types: List[str]
     unsupported: List[LayerSupport] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+    capabilities: List[str] = field(default_factory=list)
+    schema_version: int = field(default_factory=_adapter_schema_version)
+
+
+def _layer_capability(c: Any) -> Optional[str]:
+    from .apc_adapters import resolve_capability
+
+    try:
+        return resolve_capability(c).value
+    except Exception:
+        return None
 
 
 def classify_layer_for_apc(c: Any) -> LayerSupport:
@@ -4171,6 +4258,7 @@ def classify_layer_for_apc(c: Any) -> LayerSupport:
     Empty layers that clone to a storage-native type count as ``empty_ok``.
     """
     type_name = type(c).__name__
+    capability = _layer_capability(c)
     is_empty = False
     empty_fn = getattr(c, "empty", None)
     if callable(empty_fn):
@@ -4191,16 +4279,19 @@ def classify_layer_for_apc(c: Any) -> LayerSupport:
             type_name=type_name,
             status="unsupported",
             reason=f"clone_error:{type(exc).__name__}",
+            capability=capability,
         )
     if copied is None:
         return LayerSupport(
             type_name=type_name,
             status="unsupported",
             reason="unclonable",
+            capability=capability,
         )
     return LayerSupport(
         type_name=type_name,
         status="empty_ok" if is_empty else "ok",
+        capability=capability,
     )
 
 
@@ -4210,18 +4301,15 @@ def validate_prompt_cache_layout(
     apc_mode: Optional[str] = None,
 ) -> APCSelfCheckResult:
     """Validate a prompt-cache layout for APC without running a model forward."""
-    layer_types = [type(c).__name__ for c in caches]
-    unsupported = [
-        layer
-        for layer in (classify_layer_for_apc(c) for c in caches)
-        if layer.status == "unsupported"
-    ]
+    classified = [classify_layer_for_apc(c) for c in caches]
+    unsupported = [layer for layer in classified if layer.status == "unsupported"]
     return APCSelfCheckResult(
         ok=not unsupported,
         apc_mode=apc_mode,
         layer_count=len(caches),
-        layer_types=layer_types,
+        layer_types=[layer.type_name for layer in classified],
         unsupported=unsupported,
+        capabilities=[layer.capability or "unknown" for layer in classified],
     )
 
 
@@ -4277,12 +4365,15 @@ def self_check_model_apc(
 
     if log:
         types_s = ",".join(result.layer_types) if result.layer_types else "-"
+        caps_s = ",".join(result.capabilities) if result.capabilities else "-"
         if result.ok:
             logger.info(
-                "APC self-check ok mode=%s layers=%d types=[%s]%s",
+                "APC self-check ok mode=%s schema=v%d layers=%d types=[%s] caps=[%s]%s",
                 result.apc_mode,
+                result.schema_version,
                 result.layer_count,
                 types_s,
+                caps_s,
                 f" kv_bits={kv_bits}" if kv_bits is not None else "",
             )
         else:
@@ -4291,8 +4382,9 @@ def self_check_model_apc(
                 for layer in result.unsupported
             ]
             logger.error(
-                "APC self-check failed mode=%s layers=%d unsupported=%s notes=%s",
+                "APC self-check failed mode=%s schema=v%d layers=%d unsupported=%s notes=%s",
                 result.apc_mode,
+                result.schema_version,
                 result.layer_count,
                 bad or result.notes,
                 result.notes,
@@ -4302,6 +4394,7 @@ def self_check_model_apc(
         "self_check",
         ok=result.ok,
         mode=result.apc_mode,
+        schema_version=result.schema_version,
         layers=result.layer_count,
         unsupported=len(result.unsupported),
         kv_bits=kv_bits,

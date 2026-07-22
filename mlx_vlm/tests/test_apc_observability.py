@@ -196,3 +196,37 @@ class TestSelfCheckModel:
         result = self_check_model_apc(FakeLang())
         assert result.ok is False
         assert result.notes
+
+
+class TestSelfCheckCapabilityAndSchema:
+    def test_layer_capability_is_reported(self):
+        from mlx_vlm.models.cache import RotatingKVCache
+
+        assert classify_layer_for_apc(KVCache()).capability == "pageable"
+        assert classify_layer_for_apc(RotatingKVCache(max_size=64)).capability == (
+            "windowed"
+        )
+
+    def test_layout_reports_capabilities_and_schema(self):
+        from mlx_vlm.apc_adapters import ADAPTER_SCHEMA_VERSION
+
+        result = validate_prompt_cache_layout([KVCache(), KVCache()], apc_mode="block")
+        assert result.capabilities == ["pageable", "pageable"]
+        assert result.schema_version == ADAPTER_SCHEMA_VERSION
+
+    def test_self_check_log_includes_schema_and_caps(self, caplog):
+        from mlx_vlm.apc_adapters import ADAPTER_SCHEMA_VERSION
+
+        class FakeLang:
+            def make_cache(self):
+                return [KVCache(), KVCache()]
+
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+            result = self_check_model_apc(FakeLang())
+        assert result.schema_version == ADAPTER_SCHEMA_VERSION
+        assert result.capabilities == ["pageable", "pageable"]
+        assert any(
+            ("schema=v%d" % ADAPTER_SCHEMA_VERSION) in r.message
+            and "caps=[pageable,pageable]" in r.message
+            for r in caplog.records
+        )
