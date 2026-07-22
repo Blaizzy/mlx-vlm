@@ -2,7 +2,6 @@ import gc
 import logging
 import os
 import time
-import traceback
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -52,6 +51,7 @@ logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
+DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
@@ -109,6 +109,22 @@ def get_speculative_batch_coalesce_s():
         return max(0.0, float(raw)) / 1000.0
     except ValueError:
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
+
+
+def get_log_progress_interval():
+    """Number of decoded tokens between INFO progress messages (0 disables)."""
+    raw = os.environ.get(
+        "MLX_VLM_LOG_PROGRESS_INTERVAL", str(DEFAULT_LOG_PROGRESS_INTERVAL)
+    )
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_LOG_PROGRESS_INTERVAL=%r; falling back to %d.",
+            raw,
+            DEFAULT_LOG_PROGRESS_INTERVAL,
+        )
+        return DEFAULT_LOG_PROGRESS_INTERVAL
 
 
 def _sequence_aligned_prefill_keys(
@@ -303,7 +319,9 @@ def get_quantized_kv_bits(model: str):
     if kv_bits == 0:
         return None
     if "qat" in model:
-        print(f"Model {model} is quantization aware, KV cache will not be quantized.")
+        logger.info(
+            "Model %s is quantization aware; KV cache will not be quantized.", model
+        )
         return None
     return kv_bits
 
@@ -321,7 +339,7 @@ def get_max_kv_size(model: str):
     if max_kv_tokens == 0:
         return None
     if get_quantized_kv_bits(model) is not None:
-        print(f"Model {model} uses QuantizedKVCache, can't set max KV size.")
+        logger.warning("Model %s uses QuantizedKVCache; MAX_KV_SIZE is ignored.", model)
         return None
     return max_kv_tokens
 
@@ -412,12 +430,19 @@ class ServerMetricsStore:
         self._last_error: Optional[dict] = None
 
     def begin_request(self, *, endpoint: str, model: str, stream: bool):
-        del endpoint, model
         with self._lock:
             self._requests_started += 1
             self._in_flight += 1
             if stream:
                 self._streaming_requests += 1
+            in_flight = self._in_flight
+        logger.info(
+            "Request started: endpoint=%s model=%s stream=%s in_flight=%d",
+            endpoint,
+            model,
+            stream,
+            in_flight,
+        )
 
     def record_success(self, envelope: dict):
         payload = dict(envelope)
@@ -432,6 +457,23 @@ class ServerMetricsStore:
             self._generated_tokens_total += int(payload.get("generated_tokens") or 0)
             self._request_time_total_s += float(payload.get("request_elapsed_s") or 0.0)
             self._decode_time_total_s += float(payload.get("decode_elapsed_s") or 0.0)
+            in_flight = self._in_flight
+        logger.info(
+            "Request completed: endpoint=%s model=%s stream=%s backend=%s "
+            "prompt_tokens=%d generated_tokens=%d elapsed=%.3fs "
+            "prefill=%.1f tok/s decode=%.1f tok/s finish_reason=%s in_flight=%d",
+            payload.get("endpoint"),
+            payload.get("model"),
+            payload.get("stream"),
+            payload.get("backend"),
+            int(payload.get("prompt_tokens") or 0),
+            int(payload.get("generated_tokens") or 0),
+            float(payload.get("request_elapsed_s") or 0.0),
+            float(payload.get("prefill_tok_s") or 0.0),
+            float(payload.get("decode_tok_s") or 0.0),
+            payload.get("finish_reason"),
+            in_flight,
+        )
 
     def record_failure(self, *, endpoint: str, model: str, stream: bool, error: str):
         with self._lock:
@@ -445,6 +487,15 @@ class ServerMetricsStore:
                 "stream": bool(stream),
                 "error": error,
             }
+            in_flight = self._in_flight
+        logger.warning(
+            "Request failed: endpoint=%s model=%s stream=%s error=%s in_flight=%d",
+            endpoint,
+            model,
+            stream,
+            error,
+            in_flight,
+        )
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -591,9 +642,9 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
     Handles potential loading errors.
     """
     try:
-        print(f"Loading model from: {model_path}")
+        logger.info("Loading model: %s", model_path)
         if adapter_path:
-            print(f"Loading adapter from: {adapter_path}")
+            logger.info("Loading adapter: %s", adapter_path)
         # Use the load function from utils.py which handles path resolution and loading
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
@@ -602,11 +653,10 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             model_path, adapter_path, trust_remote_code=trust_remote_code
         )
         config = model.config
-        print("Model and processor loaded successfully.")
+        logger.info("Model and processor loaded successfully.")
         return model, processor, config
     except Exception as e:
-        print(f"Error loading model {model_path}: {e}")
-        traceback.print_exc()  # Print detailed traceback for debugging
+        logger.exception("Error loading model %s: %s", model_path, e)
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
@@ -647,6 +697,8 @@ class GenerationArguments:
     min_threshold: Optional[float] = None
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
+    reasoning: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
@@ -722,6 +774,10 @@ class GenerationArguments:
     def to_template_kwargs(self) -> dict:
         """Convert to kwargs for apply_chat_template()."""
         kw = {"enable_thinking": self.enable_thinking}
+        if self.reasoning is not None:
+            kw["reasoning"] = self.reasoning
+        if self.reasoning_effort is not None:
+            kw["reasoning_effort"] = self.reasoning_effort
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:
@@ -750,6 +806,9 @@ class QueuedGenerationRequest:
     thinking_budget_criteria: Optional[ThinkingBudgetCriteria] = None
     images: Optional[List] = None
     videos: Optional[List] = None
+    audio: Optional[List] = None
+    request_id: Optional[str] = None
+    queued_at: float = field(default_factory=time.perf_counter)
 
 
 @dataclass
@@ -761,10 +820,41 @@ class GenerationMetrics:
     cached_tokens: int = 0
     prompt_tps: Optional[float] = None
     generation_tps: Optional[float] = None
+    last_chunk_at: Optional[float] = None
+    last_chunk_rate: Optional[float] = None
+    generated_tokens: int = 0
+    first_chunk_tokens: int = 0
 
-    def record_chunk(self, chunk) -> None:
-        self.token_times.append(time.perf_counter())
+    def record_chunk(self, chunk) -> Optional[float]:
+        now = getattr(chunk, "emitted_at", None) or time.perf_counter()
+        token_count = getattr(chunk, "token_count", None)
+        if token_count is None:
+            generation_tokens = getattr(chunk, "generation_tokens", None)
+            token_count = (
+                max(0, int(generation_tokens) - self.generated_tokens)
+                if generation_tokens is not None
+                else 1
+            )
+        emitted_tokens = max(0, int(token_count or 0))
+        self.last_chunk_rate = None
+        if emitted_tokens > 0:
+            if not self.token_times:
+                self.first_chunk_tokens = emitted_tokens
+            self.generated_tokens += emitted_tokens
+            if self.last_chunk_at is not None and now > self.last_chunk_at:
+                self.last_chunk_rate = emitted_tokens / (now - self.last_chunk_at)
+            self.last_chunk_at = now
+            self.token_times.append(now)
         self.record_result(chunk)
+        return self.last_chunk_rate
+
+    @property
+    def rate(self) -> Optional[float]:
+        if len(self.token_times) < 2:
+            return None
+        elapsed = self.token_times[-1] - self.token_times[0]
+        measured_tokens = self.generated_tokens - self.first_chunk_tokens
+        return measured_tokens / elapsed if elapsed > 0 else None
 
     def record_result(self, result) -> None:
         self.peak_memory = max(
@@ -799,6 +889,7 @@ class StreamingToken:
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
     token_count: int = 1
+    emitted_at: Optional[float] = None
 
 
 class _DiffusionBlockEmitter:
@@ -1003,30 +1094,33 @@ class ResponseGenerator:
                 validate_drafter_compatibility,
             )
 
-            print(
-                f"Loading speculative drafter ({draft_kind or 'auto'}): "
-                f"{draft_model_path}"
+            logger.info(
+                "Loading speculative drafter (%s): %s",
+                draft_kind or "auto",
+                draft_model_path,
             )
             draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
             if draft_kind is None:
-                print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+                logger.info("Auto-detected speculative draft kind: %s", resolved_kind)
             elif resolved_kind != draft_kind:
-                print(
-                    f"  → drafter requires --draft-kind={resolved_kind!r}; "
-                    f"using {resolved_kind!r} instead of {draft_kind!r}."
+                logger.warning(
+                    "Drafter requires draft kind %s; using it instead of %s.",
+                    resolved_kind,
+                    draft_kind,
                 )
             draft_kind = resolved_kind
             try:
                 validate_drafter_compatibility(model, draft_model, draft_kind)
             except ValueError as e:
-                print(
+                logger.warning(
                     "Speculative drafter is incompatible with the target model; "
-                    f"falling back to autoregressive generation. {e}"
+                    "falling back to autoregressive generation: %s",
+                    e,
                 )
                 draft_model = None
                 draft_kind = None
             else:
-                print("Drafter ready — speculative decoding enabled.")
+                logger.info("Drafter ready; speculative decoding enabled.")
 
         self.model = model
         self.processor = processor
@@ -1057,6 +1151,7 @@ class ResponseGenerator:
                 "thinking_budget is not supported with speculative decoding in the server."
             )
         rqueue: Queue = Queue()
+        request_started_at = time.perf_counter()
 
         # CPU preprocessing and thinking-token resolution share tokenizer state.
         # Keep both on the caller side and serialize them so the GPU worker never
@@ -1070,17 +1165,30 @@ class ResponseGenerator:
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
-        self.requests.put(
-            QueuedGenerationRequest(
-                rqueue=rqueue,
-                raw_inputs=raw_inputs,
-                prompt_tokens=prompt_tokens,
-                args=args,
-                thinking_budget_criteria=thinking_budget_criteria,
-                images=images,
-                videos=videos,
-            )
+        request_id = f"{id(rqueue):x}"
+        queued_request = QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs=raw_inputs,
+            prompt_tokens=prompt_tokens,
+            args=args,
+            thinking_budget_criteria=thinking_budget_criteria,
+            images=images,
+            videos=videos,
+            audio=audio,
+            request_id=request_id,
+            queued_at=request_started_at,
         )
+        logger.info(
+            "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
+            "images=%d audio=%d videos=%d",
+            request_id,
+            prompt_tokens,
+            args.max_tokens,
+            len(images or []),
+            len(audio or []),
+            len(videos or []),
+        )
+        self.requests.put(queued_request)
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -1116,6 +1224,186 @@ class ResponseGenerator:
         return self._cpu_preprocess(prompt, images, audio, videos)
 
     # -- internals --
+
+    @staticmethod
+    def _request_log_id(request: QueuedGenerationRequest) -> str:
+        if request.request_id is None:
+            request.request_id = f"{id(request.rqueue):x}"
+        return request.request_id
+
+    def _log_prefill_started(
+        self, request: QueuedGenerationRequest, *, backend: str
+    ) -> dict:
+        request_id = self._request_log_id(request)
+        now = time.perf_counter()
+        logger.info(
+            "Prefill started: request=%s backend=%s prompt_tokens=%d "
+            "images=%d audio=%d videos=%d",
+            request_id,
+            backend,
+            request.prompt_tokens,
+            len(request.images or []),
+            len(request.audio or []),
+            len(request.videos or []),
+        )
+        return {
+            "request_id": request_id,
+            "queued_at": request.queued_at,
+            "prefill_started_at": now,
+            "prefill_processed": -1,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+            "last_token_at": None,
+        }
+
+    def _log_prefill_progress(self, batch_gen, active: dict) -> None:
+        """Report each chunked-prefill step without changing generation output."""
+        prompt_batch = getattr(batch_gen, "_prompt_batch", None)
+        if prompt_batch is None:
+            return
+        processed_columns = int(
+            getattr(prompt_batch, "_processed_prompt_columns", 0) or 0
+        )
+        remaining = getattr(prompt_batch, "_inputs_embeds", None)
+        remaining_columns = (
+            int(remaining.shape[1]) if getattr(remaining, "ndim", 0) >= 2 else 0
+        )
+        total_columns = processed_columns + remaining_columns
+        uids = list(getattr(prompt_batch, "uids", []))
+        suffix_lengths = list(getattr(prompt_batch, "_suffix_lens", []))
+        cached_tokens = list(getattr(prompt_batch, "_cached_tokens_per_row", []))
+        left_padding = list(getattr(prompt_batch, "_left_padding_per_row", []))
+        right_padding = getattr(prompt_batch, "_right_pad_per_row", None)
+
+        for index, uid in enumerate(uids):
+            info = active.get(uid)
+            if info is None:
+                continue
+            suffix_len = (
+                int(suffix_lengths[index])
+                if index < len(suffix_lengths)
+                else total_columns
+            )
+            cached = int(cached_tokens[index]) if index < len(cached_tokens) else 0
+            if right_padding is not None:
+                suffix_processed = min(suffix_len, processed_columns)
+            else:
+                pad = int(left_padding[index]) if index < len(left_padding) else 0
+                suffix_processed = min(suffix_len, max(0, processed_columns - pad))
+            processed = cached + suffix_processed
+            total = cached + suffix_len
+            if processed <= int(info.get("prefill_processed", -1)):
+                continue
+            info["prefill_processed"] = processed
+            percent = 100.0 * processed / total if total > 0 else 100.0
+            logger.info(
+                "Prefill progress: request=%s tokens=%d/%d (%.1f%%)",
+                info.get("request_id", uid),
+                processed,
+                total,
+                percent,
+            )
+
+    @staticmethod
+    def _log_prefill_completed(uid, info: dict, prompt_response) -> None:
+        prompt_tokens = int(getattr(prompt_response, "prompt_tokens", 0) or 0)
+        cached_tokens = int(getattr(prompt_response, "cached_tokens", 0) or 0)
+        prompt_tps = float(getattr(prompt_response, "prompt_tps", 0.0) or 0.0)
+        prompt_time = float(getattr(prompt_response, "prompt_time", 0.0) or 0.0)
+        if prompt_time <= 0 and prompt_tps > 0:
+            prompt_time = prompt_tokens / prompt_tps
+        info["prefill_processed"] = prompt_tokens
+        logger.info(
+            "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
+            "elapsed=%.3fs rate=%.1f tok/s",
+            info.get("request_id", uid),
+            prompt_tokens,
+            cached_tokens,
+            prompt_time,
+            prompt_tps,
+        )
+
+    @staticmethod
+    def _log_decode_progress(
+        uid,
+        info: dict,
+        *,
+        token: int,
+        text: str,
+        finish_reason: Optional[str],
+        token_count: int = 1,
+    ) -> float:
+        now = time.perf_counter()
+        previous_tokens = int(info.get("generated_tokens", 0) or 0)
+        emitted_tokens = max(0, int(token_count or 0))
+        generated_tokens = previous_tokens + emitted_tokens
+        info["generated_tokens"] = generated_tokens
+        request_id = info.get("request_id", uid)
+
+        previous_token_at = info.get("last_token_at")
+        token_rate = None
+        if emitted_tokens > 0:
+            if previous_token_at is not None and now > previous_token_at:
+                token_rate = emitted_tokens / (now - previous_token_at)
+            info["last_token_at"] = now
+        progress_rate_text = "n/a" if token_rate is None else f"{token_rate:.1f} tok/s"
+
+        decode_started_at = info.get("decode_started_at")
+        if decode_started_at is None:
+            decode_started_at = now
+            info["decode_started_at"] = now
+            queued_at = float(info.get("queued_at", now) or now)
+            logger.info(
+                "Decode started: request=%s time_to_first_token=%.3fs",
+                request_id,
+                max(0.0, now - queued_at),
+            )
+
+        elapsed = max(0.0, now - decode_started_at)
+        first_chunk_tokens = int(info.get("decode_first_chunk_tokens", 0) or 0)
+        if first_chunk_tokens == 0:
+            first_chunk_tokens = emitted_tokens
+            info["decode_first_chunk_tokens"] = emitted_tokens
+        measured_tokens = max(0, generated_tokens - first_chunk_tokens)
+        rate = measured_tokens / elapsed if elapsed > 0 else 0.0
+        interval = get_log_progress_interval()
+        crossed_interval = interval > 0 and (
+            generated_tokens // interval > previous_tokens // interval
+        )
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        if debug_enabled:
+            logger.debug(
+                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
+                "rate=%s token_number=%d token_id=%s text=%r",
+                request_id,
+                generated_tokens,
+                elapsed,
+                progress_rate_text,
+                generated_tokens,
+                token,
+                text,
+            )
+
+        if finish_reason is not None:
+            logger.info(
+                "Decode completed: request=%s generated_tokens=%d elapsed=%.3fs "
+                "rate=%.1f tok/s finish_reason=%s",
+                request_id,
+                generated_tokens,
+                elapsed,
+                rate,
+                finish_reason,
+            )
+        elif crossed_interval and not debug_enabled:
+            logger.info(
+                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
+                "rate=%s",
+                request_id,
+                generated_tokens,
+                elapsed,
+                progress_rate_text,
+            )
+        return now
 
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
@@ -1296,8 +1584,7 @@ class ResponseGenerator:
         except Exception as e:
             self._load_error = e
             self._ready.set()
-            print(f"Error loading model in generation thread: {e}")
-            traceback.print_exc()
+            logger.exception("Error loading model in generation thread: %s", e)
             return
 
         self._ready.set()
@@ -1345,6 +1632,11 @@ class ResponseGenerator:
                         if uid in active:
                             batch_gen.remove(uid)
                             info = active.pop(uid)
+                            logger.info(
+                                "Generation cancelled: request=%s generated_tokens=%d",
+                                info.get("request_id", uid),
+                                int(info.get("generated_tokens", 0) or 0),
+                            )
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
@@ -1361,6 +1653,9 @@ class ResponseGenerator:
                     prompt_tokens = request.prompt_tokens
                     args = request.args
                     images = request.images
+                    log_state = self._log_prefill_started(
+                        request, backend="continuous_batching"
+                    )
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -1427,6 +1722,7 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        **log_state,
                     }
 
                 if not active or batch_gen is None:
@@ -1471,12 +1767,13 @@ class ResponseGenerator:
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
                     args = request.args
+                    log_state = self._log_prefill_started(request, backend="diffusion")
                     uid_counter += 1
                     uid = uid_counter
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     try:
                         self._generate_diffusion(
-                            uid, rqueue, raw_inputs, args, cancelled
+                            uid, rqueue, raw_inputs, args, cancelled, log_state
                         )
                         rqueue.put(None)
                     except Exception as e:
@@ -1492,7 +1789,10 @@ class ResponseGenerator:
                 mx.clear_cache()
                 gc.collect()
 
-    def _generate_diffusion(self, uid, rqueue, raw_inputs, args, cancelled):
+    def _generate_diffusion(
+        self, uid, rqueue, raw_inputs, args, cancelled, log_state=None
+    ):
+        log_state = log_state or {"request_id": uid, "generated_tokens": 0}
         input_ids = raw_inputs.get("input_ids")
         if input_ids is not None and input_ids.ndim == 1:
             input_ids = input_ids[None]
@@ -1522,9 +1822,32 @@ class ResponseGenerator:
         stream_kwargs.update(args.diffusion_kwargs())
 
         emitter = _DiffusionBlockEmitter()
+        prefill_logged = False
 
         def on_result(result):
+            nonlocal prefill_logged
+            if not prefill_logged and getattr(result, "prompt_tps", None) is not None:
+                prompt_tps = float(result.prompt_tps or 0.0)
+                prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+                logger.info(
+                    "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
+                    "elapsed=%.3fs rate=%.1f tok/s",
+                    log_state.get("request_id", uid),
+                    prompt_tokens,
+                    int(getattr(result, "cached_tokens", 0) or 0),
+                    prompt_tokens / prompt_tps if prompt_tps > 0 else 0.0,
+                    prompt_tps,
+                )
+                prefill_logged = True
             for chunk in emitter.feed(result):
+                chunk.emitted_at = self._log_decode_progress(
+                    uid,
+                    log_state,
+                    token=chunk.token,
+                    text=chunk.text,
+                    finish_reason=chunk.finish_reason,
+                    token_count=chunk.token_count,
+                )
                 rqueue.put(chunk)
                 if chunk.finish_reason:
                     return False
@@ -1607,6 +1930,9 @@ class ResponseGenerator:
                     prompt_tokens = request.prompt_tokens
                     args = request.args
                     images = request.images
+                    log_state = self._log_prefill_started(
+                        request, backend=f"speculative_{draft_kind}"
+                    )
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -1616,7 +1942,8 @@ class ResponseGenerator:
                         "streamer": _ServerTokenStreamer(
                             self.tokenizer,
                             make_streaming_detokenizer(self.processor),
-                        )
+                        ),
+                        **log_state,
                     }
                     max_tokens_map[uid] = args.max_tokens
                     prompt_tokens_map[uid] = prompt_tokens
@@ -1687,6 +2014,14 @@ class ResponseGenerator:
                         if prompt_tokens > 0 and prompt_elapsed > 0
                         else None
                     )
+                    logger.info(
+                        "Prefill completed: request=%s prompt_tokens=%d "
+                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        stream_infos[uid].get("request_id", uid),
+                        prompt_tokens,
+                        prompt_elapsed,
+                        float(prompt_tps_map[uid] or 0.0),
+                    )
 
                 finished_uids = set()
 
@@ -1699,6 +2034,13 @@ class ResponseGenerator:
                     is_max = len(token_lists[uid]) >= max_tokens_map[uid]
                     finish = "stop" if is_stop else "length" if is_max else None
                     text = self._stream_text(stream_infos[uid], tok, finish)
+                    emitted_at = self._log_decode_progress(
+                        uid,
+                        stream_infos[uid],
+                        token=tok,
+                        text=text,
+                        finish_reason=finish,
+                    )
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
@@ -1707,6 +2049,7 @@ class ResponseGenerator:
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
+                            emitted_at=emitted_at,
                         )
                     )
                     if finish is not None:
@@ -1765,6 +2108,14 @@ class ResponseGenerator:
                         finish = "stop" if is_stop else "length" if is_max else None
                         text = self._stream_text(stream_infos[uid], tok, finish)
 
+                        emitted_at = self._log_decode_progress(
+                            uid,
+                            stream_infos[uid],
+                            token=tok,
+                            text=text,
+                            finish_reason=finish,
+                        )
+
                         rqueues[uid].put(
                             StreamingToken(
                                 text=text,
@@ -1773,6 +2124,7 @@ class ResponseGenerator:
                                 finish_reason=finish,
                                 peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
+                                emitted_at=emitted_at,
                             )
                         )
 
@@ -1786,16 +2138,28 @@ class ResponseGenerator:
                 al = drafter.accept_lens
                 if al:
                     mean_a = (sum(al) + len(al)) / len(al)
-                    print(
-                        f"[{draft_kind.upper()}] batch={B} "
-                        f"tokens={sum(len(token_lists[u]) for u in uids)} "
-                        f"accept={mean_a:.2f} rounds={len(al)}"
+                    logger.info(
+                        "Speculative decode: kind=%s batch=%d tokens=%d "
+                        "accept=%.2f rounds=%d",
+                        draft_kind,
+                        B,
+                        sum(len(token_lists[u]) for u in uids),
+                        mean_a,
+                        len(al),
                     )
 
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
                         text = stream_infos[uid]["streamer"].finalize()
+                        emitted_at = self._log_decode_progress(
+                            uid,
+                            stream_infos[uid],
+                            token=0,
+                            text=text,
+                            finish_reason="length",
+                            token_count=0,
+                        )
                         rqueues[uid].put(
                             StreamingToken(
                                 text=text,
@@ -1804,13 +2168,14 @@ class ResponseGenerator:
                                 finish_reason="length",
                                 peak_memory=mx.get_peak_memory() / 1e9,
                                 prompt_tps=prompt_tps_map.get(uid),
+                                token_count=0,
+                                emitted_at=emitted_at,
                             )
                         )
                         rqueues[uid].put(None)
 
             except Exception as e:
-                print(f"Error in speculative generation thread: {e}")
-                traceback.print_exc()
+                logger.exception("Error in speculative generation thread: %s", e)
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
                 error_queues.update(
                     {id(request.rqueue): request.rqueue for request in pending}
@@ -1823,12 +2188,13 @@ class ResponseGenerator:
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
         prompt_responses, responses = batch_gen.next(**kwargs)
+        self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
-                active[prompt_response.uid]["prompt_tps"] = prompt_response.prompt_tps
-                active[prompt_response.uid]["cached_tokens"] = getattr(
-                    prompt_response, "cached_tokens", 0
-                )
+                info = active[prompt_response.uid]
+                info["prompt_tps"] = prompt_response.prompt_tps
+                info["cached_tokens"] = getattr(prompt_response, "cached_tokens", 0)
+                self._log_prefill_completed(prompt_response.uid, info, prompt_response)
         if not responses:
             return
 
@@ -1840,6 +2206,7 @@ class ResponseGenerator:
             rqueue = info["rqueue"]
 
             tok = r.token
+            token_count = 0 if tok is None else 1
             if tok is None:
                 text = info["streamer"].finalize()
                 tok = 0
@@ -1851,6 +2218,15 @@ class ResponseGenerator:
 
             lp = r.token_logprob
 
+            emitted_at = self._log_decode_progress(
+                r.uid,
+                info,
+                token=tok,
+                text=text,
+                finish_reason=r.finish_reason,
+                token_count=token_count,
+            )
+
             rqueue.put(
                 StreamingToken(
                     text=text,
@@ -1861,6 +2237,8 @@ class ResponseGenerator:
                     prompt_tps=info.get("prompt_tps"),
                     top_logprobs=getattr(r, "top_logprobs", None),
                     cached_tokens=info.get("cached_tokens", 0),
+                    token_count=token_count,
+                    emitted_at=emitted_at,
                 )
             )
 
