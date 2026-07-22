@@ -184,10 +184,11 @@ def apply_top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
 def _top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
-    top_logit = mx.max(logits, axis=-1, keepdims=True)
-    std = mx.std(logits, axis=-1, keepdims=True)
+    f = logits.astype(mx.float32)
+    top_logit = mx.max(f, axis=-1, keepdims=True)
+    std = mx.std(f, axis=-1, keepdims=True)
     threshold = top_logit - n_sigma * std
-    return mx.where(logits < threshold, -float("inf"), logits)
+    return mx.where(f < threshold, -float("inf"), logits)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)

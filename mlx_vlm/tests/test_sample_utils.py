@@ -148,6 +148,18 @@ class TestTopNSigma(unittest.TestCase):
         mx.eval(toks)
         self.assertEqual(toks.shape, (16,))
 
+    def test_float16_large_vocab(self):
+        """std must be computed in float32: summing a large float16 vocab
+        overflows to inf, which would otherwise disable filtering entirely."""
+        mx.random.seed(0)
+        V = 152000
+        logits = (mx.random.normal((1, V)) * 3).astype(mx.float16)
+        out = apply_top_n_sigma(logits, 1.0)
+        mx.eval(out)
+        kept = int((out[0] != -float("inf")).sum().item())
+        self.assertLess(kept, V)
+        self.assertGreater(kept, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
