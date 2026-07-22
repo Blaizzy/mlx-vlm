@@ -182,7 +182,7 @@ def apply_top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
     return _top_n_sigma(logits, n_sigma)
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+@mx.compile
 def _top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
     f = logits.astype(mx.float32)
     top_logit = mx.max(f, axis=-1, keepdims=True)
