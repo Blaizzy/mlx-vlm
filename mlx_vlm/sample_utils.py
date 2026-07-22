@@ -158,7 +158,7 @@ def apply_top_k(
     return masked_logprobs
 
 
-@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+@mx.compile
 def apply_p_less(logits: mx.array, temp: float) -> mx.array:
     """
     Apply hyperparameter-free p-less sampling to the logits.
