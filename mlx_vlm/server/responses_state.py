@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import uuid
@@ -8,6 +9,8 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+
+logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
@@ -161,6 +164,25 @@ class ThinkingStreamState:
         return text
 
 
+def prompt_has_open_thinking(
+    prompt: Any,
+    enable_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> bool:
+    """Return whether generation starts inside a prompt-opened thinking block."""
+    if not isinstance(prompt, str):
+        return False
+
+    stripped_prompt = prompt.rstrip()
+    for start_marker, _ in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        if stripped_prompt.endswith(start_marker):
+            return True
+    return False
+
+
 response_store: Dict[str, StoredResponse] = {}
 response_store_order: deque = deque()
 response_store_lock = Lock()
@@ -232,7 +254,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                             },
                         )
                 except Exception:
-                    print(f"Invalid tool call: {call}")
+                    logger.warning("Invalid tool call: %s", call)
     return dict(calls=called_tools, remaining_text=remaining)
 
 
