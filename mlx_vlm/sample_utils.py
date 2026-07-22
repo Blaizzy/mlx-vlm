@@ -14,6 +14,7 @@ def make_sampler(
     min_tokens_to_keep: int = 1,
     top_k: int = 0,
     top_n_sigma: float = 0.0,
+    p_less: bool = False,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: Optional[List[int]] = None,
@@ -36,6 +37,10 @@ def make_sampler(
           logit is within ``top_n_sigma`` standard deviations of the max logit
           (``logit >= max - top_n_sigma * std``), computed on the raw logits.
           ``0`` disables it. Typical values ~0.5-2.0; smaller is more selective.
+        p_less (bool, optional): Hyperparameter-free p-less sampling. Keeps
+          tokens whose probability is at least the collision probability
+          (sum of squared probabilities) of the temperature-scaled
+          distribution. Default: ``False``.
         xtc_probability (float, optional): The probability of applying XTC
             sampling.
         xtc_threshold (float, optional): The threshold the probs need to reach
@@ -57,6 +62,8 @@ def make_sampler(
     sampling_methods = []
     if top_n_sigma > 0.0:
         sampling_methods.append(lambda x: apply_top_n_sigma(x, top_n_sigma))
+    if p_less:
+        sampling_methods.append(lambda x: apply_p_less(x, temp))
     if top_p > 0 and top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
@@ -193,6 +200,29 @@ def _top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
     std = mx.std(f, axis=-1, keepdims=True)
     threshold = top_logit - n_sigma * std
     return mx.where(f < threshold, -float("inf"), logits)
+
+
+@mx.compile
+def apply_p_less(logits: mx.array, temp: float) -> mx.array:
+    """
+    Apply hyperparameter-free p-less sampling to the logits.
+
+    Keeps tokens whose probability is at least the collision probability
+    ``L = sum_v p(v)**2`` of the temperature-scaled distribution ``p``, i.e.
+    ``exp(-H2(p))`` where ``H2`` is the order-2 Renyi (collision) entropy. Since
+    ``L <= max_v p(v)``, the most likely token always survives.
+
+    Paper: "p-less Sampling: A Robust Hyperparameter-Free Approach for LLM
+    Decoding" (https://arxiv.org/abs/2509.23234).
+
+    Args:
+        logits: A vector of logits.
+        temp (float): Sampling temperature applied before forming the
+            distribution used to compute the threshold.
+    """
+    probs = mx.softmax(logits * (1.0 / temp), axis=-1)
+    threshold = mx.sum(probs * probs, axis=-1, keepdims=True)
+    return mx.where(probs < threshold, -float("inf"), logits)
 
 
 def apply_min_p(
