@@ -2,7 +2,20 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_vlm.sample_utils import apply_min_p, apply_top_k, make_sampler, top_p_sampling
+from mlx_vlm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_n_sigma,
+    make_sampler,
+    top_p_sampling,
+)
+
+
+def _kept(logits, n_sigma):
+    """Indices that survive apply_top_n_sigma (i.e. not masked to -inf)."""
+    out = apply_top_n_sigma(logits, n_sigma)
+    mx.eval(out)
+    return [i for i, v in enumerate(out.tolist()) if v != -float("inf")]
 
 
 class TestTopPSampling(unittest.TestCase):
@@ -87,6 +100,71 @@ class TestTopPSampling(unittest.TestCase):
             mx.zeros([3, 50], dtype=mx.bfloat16), top_p=0.9, temperature=1.0
         )
         self.assertEqual(tokens.shape, (3,))
+
+
+class TestTopNSigma(unittest.TestCase):
+    LOGITS = mx.array([0.0, 1.0, 2.0, 3.0, 4.0])
+
+    def test_threshold_masks_below(self):
+        """n_sigma=1 -> threshold 4-1.414=2.586, keep only logits 3 and 4."""
+        self.assertEqual(_kept(self.LOGITS, 1.0), [3, 4])
+
+    def test_wider_threshold_keeps_more(self):
+        """n_sigma=2 -> threshold 4-2.828=1.172, keep logits 2,3,4."""
+        self.assertEqual(_kept(self.LOGITS, 2.0), [2, 3, 4])
+
+    def test_zero_keeps_only_max(self):
+        """n_sigma=0 -> threshold == max, only the top logit survives (greedy)."""
+        self.assertEqual(_kept(self.LOGITS, 0.0), [4])
+
+    def test_large_n_keeps_all(self):
+        """A large n_sigma masks nothing."""
+        self.assertEqual(_kept(self.LOGITS, 100.0), [0, 1, 2, 3, 4])
+
+    def test_batched_rows_independent(self):
+        """Threshold is computed per row."""
+        logits = mx.array([[0.0, 1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0, 0.0]])
+        out = apply_top_n_sigma(logits, 1.0)
+        mx.eval(out)
+        keep = [
+            [i for i, v in enumerate(r) if v != -float("inf")] for r in out.tolist()
+        ]
+        self.assertEqual(keep, [[3, 4], [0, 1]])
+
+    def test_negative_raises(self):
+        with self.assertRaises(ValueError):
+            mx.eval(apply_top_n_sigma(self.LOGITS, -1.0))
+
+    def test_make_sampler_selects_survivor(self):
+        """make_sampler(top_n_sigma=...) only ever samples a surviving token.
+
+        Peaked logits make the survivor set {3, 4} deterministic; over many
+        draws the sampler must never emit a masked token.
+        """
+        sampler = make_sampler(temp=1.0, top_n_sigma=1.0)
+        logits = mx.array([[0.0, 1.0, 2.0, 3.0, 4.0]] * 64)
+        toks = sampler(logits)
+        mx.eval(toks)
+        self.assertTrue(all(t in (3, 4) for t in toks.tolist()))
+
+    def test_disabled_by_default(self):
+        """top_n_sigma=0 (default) leaves the sampler unfiltered."""
+        sampler = make_sampler(temp=1.0)
+        toks = sampler(mx.array([[0.0, 1.0, 2.0, 3.0, 4.0]] * 16))
+        mx.eval(toks)
+        self.assertEqual(toks.shape, (16,))
+
+    def test_float16_large_vocab(self):
+        """std must be computed in float32: summing a large float16 vocab
+        overflows to inf, which would otherwise disable filtering entirely."""
+        mx.random.seed(0)
+        V = 152000
+        logits = (mx.random.normal((1, V)) * 3).astype(mx.float16)
+        out = apply_top_n_sigma(logits, 1.0)
+        mx.eval(out)
+        kept = int((out[0] != -float("inf")).sum().item())
+        self.assertLess(kept, V)
+        self.assertGreater(kept, 0)
 
 
 class TestValidationDoesNotCorruptCompile(unittest.TestCase):

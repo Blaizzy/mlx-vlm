@@ -13,6 +13,7 @@ def make_sampler(
     min_p: float = 0.0,
     min_tokens_to_keep: int = 1,
     top_k: int = 0,
+    top_n_sigma: float = 0.0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: Optional[List[int]] = None,
@@ -31,6 +32,10 @@ def make_sampler(
           be filtered by min_p sampling.
         top_k (int, optional): The top k tokens ranked by probability to constrain
           the sampling to.
+        top_n_sigma (float, optional): Top-nσ sampling. Keeps only tokens whose
+          logit is within ``top_n_sigma`` standard deviations of the max logit
+          (``logit >= max - top_n_sigma * std``), computed on the raw logits.
+          ``0`` disables it. Typical values ~0.5-2.0; smaller is more selective.
         xtc_probability (float, optional): The probability of applying XTC
             sampling.
         xtc_threshold (float, optional): The threshold the probs need to reach
@@ -50,6 +55,8 @@ def make_sampler(
         return lambda x: mx.argmax(x, axis=-1)
 
     sampling_methods = []
+    if top_n_sigma > 0.0:
+        sampling_methods.append(lambda x: apply_top_n_sigma(x, top_n_sigma))
     if top_p > 0 and top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
@@ -153,6 +160,39 @@ def _apply_top_k(logprobs: mx.array, top_k: int) -> mx.array:
         logprobs, mask_idx, mx.array(-float("inf"), logprobs.dtype), axis=-1
     )
     return masked_logprobs
+
+
+def apply_top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
+    """
+    Apply top-nσ sampling to the logits.
+
+    Keeps only tokens whose logit lies within ``n_sigma`` standard deviations of
+    the maximum logit, i.e. ``logit >= max - n_sigma * std``, where ``max`` and
+    ``std`` are taken over the raw (pre-softmax) logits. Because it thresholds
+    the logits directly, it is invariant to temperature scaling.
+
+    Paper: "Top-nσ: Not All Logits Are You Need" (https://arxiv.org/abs/2411.07641).
+
+    Args:
+        logits: A vector of logits.
+        n_sigma (float): Number of standard deviations below the max logit to
+            keep. Must be non-negative. Smaller is more selective; typical
+            values are in the ~0.5-2.0 range.
+    """
+    if n_sigma < 0:
+        raise ValueError(
+            f"`top_n_sigma` has to be a non-negative float, but is {n_sigma}"
+        )
+    return _top_n_sigma(logits, n_sigma)
+
+
+@mx.compile
+def _top_n_sigma(logits: mx.array, n_sigma: float) -> mx.array:
+    f = logits.astype(mx.float32)
+    top_logit = mx.max(f, axis=-1, keepdims=True)
+    std = mx.std(f, axis=-1, keepdims=True)
+    threshold = top_logit - n_sigma * std
+    return mx.where(f < threshold, -float("inf"), logits)
 
 
 def apply_min_p(
