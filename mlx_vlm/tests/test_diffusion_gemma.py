@@ -1247,7 +1247,9 @@ class TestDiffusionGemma4(unittest.TestCase):
                 )
             )
 
-        with patch.object(model, "diffusion_decoder_logits", side_effect=decoder_logits):
+        with patch.object(
+            model, "diffusion_decoder_logits", side_effect=decoder_logits
+        ):
             responses = list(
                 stream_generate(
                     model,
