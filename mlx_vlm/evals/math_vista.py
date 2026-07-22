@@ -8,7 +8,12 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from datasets import load_dataset
+try:
+    from datasets import load_dataset
+except ModuleNotFoundError as e:  # optional 'train' extra
+    raise ImportError(
+        "Evaluation requires the 'train' extra: pip install 'mlx-vlm[train]'"
+    ) from e
 from PIL import Image
 from tqdm import tqdm
 

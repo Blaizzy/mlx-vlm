@@ -164,6 +164,25 @@ class ThinkingStreamState:
         return text
 
 
+def prompt_has_open_thinking(
+    prompt: Any,
+    enable_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> bool:
+    """Return whether generation starts inside a prompt-opened thinking block."""
+    if not isinstance(prompt, str):
+        return False
+
+    stripped_prompt = prompt.rstrip()
+    for start_marker, _ in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        if stripped_prompt.endswith(start_marker):
+            return True
+    return False
+
+
 response_store: Dict[str, StoredResponse] = {}
 response_store_order: deque = deque()
 response_store_lock = Lock()

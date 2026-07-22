@@ -1212,7 +1212,6 @@ wheels = [
 name = "mlx-vlm"
 source = { editable = "." }
 dependencies = [
-    { name = "datasets" },
     { name = "fastapi" },
     { name = "llguidance" },
     { name = "miniaudio" },
@@ -1238,13 +1237,16 @@ cpu = [
 cuda = [
     { name = "mlx-cuda" },
 ]
+train = [
+    { name = "datasets" },
+]
 ui = [
     { name = "gradio" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "datasets", specifier = ">=2.19.1" },
+    { name = "datasets", marker = "extra == 'train'", specifier = ">=2.19.1" },
     { name = "fastapi", specifier = ">=0.95.1" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=5.19.0" },
     { name = "llguidance", specifier = ">=1.7.0" },
@@ -1264,7 +1266,7 @@ requires-dist = [
     { name = "transformers", specifier = ">=5.14.0" },
     { name = "uvicorn" },
 ]
-provides-extras = ["ui", "cuda", "cpu"]
+provides-extras = ["ui", "cuda", "cpu", "train"]
 
 [[package]]
 name = "multidict"
