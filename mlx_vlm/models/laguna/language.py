@@ -11,7 +11,7 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import initialize_rope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwiGLU, SwitchLinear, _gather_sort, _scatter_unsort
 from .config import ModelConfig
 
 
@@ -54,6 +54,48 @@ class LagunaTopKRouter(nn.Module):
         return inds, weights.astype(dtype)
 
 
+class LagunaPackedSwitchGLU(nn.Module):
+    def __init__(
+        self,
+        input_dims: int,
+        hidden_dims: int,
+        num_experts: int,
+        activation=SwiGLU(),
+        bias: bool = False,
+    ):
+        super().__init__()
+
+        self.gate_up_proj = SwitchLinear(
+            input_dims, 2 * hidden_dims, num_experts, bias=bias
+        )
+        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
+        self.activation = activation
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+
+        gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+        gate, up = mx.split(gate_up, 2, axis=-1)
+        x = self.down_proj(
+            self.activation(up, gate),
+            idx,
+            sorted_indices=do_sort,
+        )
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
+
+
 class LagunaSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -63,7 +105,7 @@ class LagunaSparseMoeBlock(nn.Module):
             )
         self.routed_scaling_factor = args.moe_routed_scaling_factor
         self.gate = LagunaTopKRouter(args)
-        self.switch_mlp = SwitchGLU(
+        self.switch_mlp = LagunaPackedSwitchGLU(
             args.hidden_size, args.moe_intermediate_size, args.num_experts
         )
         self.shared_expert = MLP(args.hidden_size, args.shared_expert_intermediate_size)
@@ -290,6 +332,7 @@ class LanguageModel(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
+        weights = self._stack_compressed_nvfp4_experts(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
@@ -299,6 +342,7 @@ class LanguageModel(nn.Module):
             if "rotary_emb.inv_freq" not in k
             and not k.endswith(".self_attn.k_scale")
             and not k.endswith(".self_attn.v_scale")
+            and not k.endswith(".input_global_scale")
         }
 
     def _unpack_compressed_tensors(self, weights):
@@ -328,6 +372,58 @@ class LanguageModel(nn.Module):
                 new_weights[k] = v
         return new_weights
 
+    def _stack_compressed_nvfp4_experts(self, weights):
+        quantization = self.args.quantization or {}
+        if quantization.get("mode") != "nvfp4":
+            return weights
+        if not any(
+            ".mlp.experts." in key and key.endswith(".weight_packed") for key in weights
+        ):
+            return weights
+
+        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
+
+        def pop_projection(prefix, proj):
+            packed = []
+            scales = []
+            global_scales = []
+            for expert_idx in range(self.args.num_experts):
+                expert_prefix = f"{prefix}.experts.{expert_idx}.{proj}"
+                packed.append(weights.pop(f"{expert_prefix}.weight_packed"))
+                scales.append(weights.pop(f"{expert_prefix}.weight_scale"))
+                global_scales.append(
+                    weights.pop(f"{expert_prefix}.weight_global_scale").astype(
+                        mx.float32
+                    )
+                )
+                weights.pop(f"{expert_prefix}.input_global_scale", None)
+
+            stacked_scales = mx.stack(scales)
+            global_scale = mx.stack(global_scales).reshape(self.args.num_experts, 1, 1)
+            decoded = _E4M3_DECODE_LUT[stacked_scales.astype(mx.uint32)]
+            return mx.stack([p.view(mx.uint32) for p in packed]), decoded / global_scale
+
+        for layer_idx in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}.mlp"
+            if f"{prefix}.experts.0.gate_proj.weight_packed" in weights:
+                gate_weight, gate_scales = pop_projection(prefix, "gate_proj")
+                up_weight, up_scales = pop_projection(prefix, "up_proj")
+                weights[f"{prefix}.switch_mlp.gate_up_proj.weight"] = mx.concatenate(
+                    [gate_weight, up_weight], axis=1
+                )
+                weights[f"{prefix}.switch_mlp.gate_up_proj.scales"] = _f32_to_e4m3(
+                    mx.concatenate([gate_scales, up_scales], axis=1)
+                )
+
+            if f"{prefix}.experts.0.down_proj.weight_packed" in weights:
+                down_weight, down_scales = pop_projection(prefix, "down_proj")
+                weights[f"{prefix}.switch_mlp.down_proj.weight"] = down_weight
+                weights[f"{prefix}.switch_mlp.down_proj.scales"] = _f32_to_e4m3(
+                    down_scales
+                )
+
+        return weights
+
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
@@ -345,8 +441,27 @@ class LanguageModel(nn.Module):
     def _stack_experts(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
-            for proj in ["gate_proj", "up_proj", "down_proj"]:
-                for suffix in ["weight", "scales", "biases"]:
+            for suffix in ["weight", "scales", "biases"]:
+                gate_key = f"{prefix}.experts.0.gate_proj.{suffix}"
+                up_key = f"{prefix}.experts.0.up_proj.{suffix}"
+                if gate_key in weights and up_key in weights:
+                    gate = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.gate_proj.{suffix}")
+                            for e in range(self.args.num_experts)
+                        ]
+                    )
+                    up = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.up_proj.{suffix}")
+                            for e in range(self.args.num_experts)
+                        ]
+                    )
+                    weights[f"{prefix}.switch_mlp.gate_up_proj.{suffix}"] = (
+                        mx.concatenate([gate, up], axis=1)
+                    )
+
+                for proj in ["gate_up_proj", "down_proj"]:
                     first_key = f"{prefix}.experts.0.{proj}.{suffix}"
                     if first_key not in weights:
                         continue
