@@ -160,6 +160,41 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_qwen3_omni_audio_tower_accepts_batched_features(self):
+        # Regression for #1651: the standard path feeds the audio tower a batched
+        # (1, mel, T) input; the chunk-padding loop must not slice the mel axis.
+        from mlx_vlm.models.qwen3_omni_moe.audio import (
+            AudioModel,
+            _get_feat_extract_output_lengths,
+        )
+        from mlx_vlm.models.qwen3_omni_moe.config import AudioConfig
+
+        cfg = AudioConfig(
+            d_model=128,
+            encoder_layers=2,
+            num_hidden_layers=2,
+            encoder_attention_heads=4,
+            encoder_ffn_dim=256,
+            num_mel_bins=128,
+            output_dim=64,
+            downsample_hidden_size=64,
+            n_window=50,
+        )
+        tower = AudioModel(cfg)
+        tower.eval()
+        mx.eval(tower.parameters())
+
+        T = 200
+        feats = mx.random.normal((cfg.num_mel_bins, T))
+        expected_tokens = int(_get_feat_extract_output_lengths(mx.array([T]))[0])
+        out_2d = tower(feats, feature_lens=mx.array([T]))
+        # Batched (1, mel, T) must not raise the mel-axis broadcast error and must
+        # yield the same shape as the unbatched path.
+        out_3d = tower(feats[None], feature_lens=mx.array([T]))
+        mx.eval(out_2d, out_3d)
+        self.assertEqual(out_3d.shape, out_2d.shape)
+        self.assertEqual(out_3d.shape, (expected_tokens, cfg.output_dim))
+
     def test_laguna_nvfp4_compressed_tensors_config(self):
         from mlx_vlm.models import laguna
 
