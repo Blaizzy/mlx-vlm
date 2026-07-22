@@ -277,6 +277,7 @@ class Model(nn.Module):
             diffusion_unmasking_width=kwargs.pop("diffusion_unmasking_width", 0),
             mm_token_type_ids=mm_token_type_ids,
             prefill_step_size=kwargs.pop("prefill_step_size", None),
+            decoder_input_ids=kwargs.pop("decoder_input_ids", None),
         )
 
         generated_tokens = []
