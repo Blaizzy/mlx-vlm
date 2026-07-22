@@ -10,6 +10,7 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+from PIL import Image
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import ImageProcessingMixin
 from transformers.image_utils import ImageInput
@@ -384,14 +385,50 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
         return flatten[0], [grid_t, grid_h, grid_w]
 
+    def _frame_to_array(self, frame) -> np.ndarray:
+        if isinstance(frame, Image.Image):
+            frame = frame.convert("RGB")
+        arr = np.asarray(frame)
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim != 3:
+            raise ValueError(
+                f"Expected video frame as (H, W, C) or (C, H, W), got shape {arr.shape}."
+            )
+        if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = arr.transpose(1, 2, 0)
+        if arr.shape[-1] == 4 and self.do_convert_rgb:
+            arr = arr[..., :3]
+        return arr
+
+    def _prepare_video(self, video) -> np.ndarray:
+        if isinstance(video, np.ndarray) and video.dtype == object:
+            video = list(video)
+        if isinstance(video, list):
+            video = np.stack([self._frame_to_array(frame) for frame in video], axis=0)
+        elif not isinstance(video, np.ndarray):
+            video = np.asarray(video)
+
+        if video.ndim == 4 and video.shape[-1] in (1, 3, 4):
+            if video.shape[-1] == 4 and self.do_convert_rgb:
+                video = video[..., :3]
+            video = video.transpose(0, 3, 1, 2)
+        return video
+
+    def _is_video_frame(self, item) -> bool:
+        if isinstance(item, Image.Image):
+            return True
+        if isinstance(item, np.ndarray):
+            return item.ndim in (2, 3)
+        return False
+
     def __call__(self, videos, **kwargs):
-        if not isinstance(videos, list):
+        if not isinstance(videos, list) or (videos and self._is_video_frame(videos[0])):
             videos = [videos]
         all_patches = []
         all_thw = []
         for v in videos:
-            if not isinstance(v, np.ndarray):
-                v = np.asarray(v)
+            v = self._prepare_video(v)
             patches, thw = self._process_one(v)
             all_patches.append(patches)
             all_thw.append(thw)
