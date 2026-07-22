@@ -1766,6 +1766,7 @@ class TestSamplerArgs:
             top_p=0.9,
             min_p=0.05,
             top_k=32,
+            top_n_sigma=0.0,
             p_less=False,
         )
         mock_make_logits_processors.assert_called_once_with(

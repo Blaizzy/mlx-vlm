@@ -176,6 +176,7 @@ def _build_gen_args(
         top_p=_request_field_or_default(request, "top_p", default_top_p),
         top_k=_request_field_or_default(request, "top_k", default_top_k),
         min_p=getattr(request, "min_p", 0.0),
+        top_n_sigma=getattr(request, "top_n_sigma", 0.0),
         p_less=getattr(request, "p_less", False),
         seed=getattr(request, "seed", None),
         logprobs=bool(getattr(request, "logprobs", False)),

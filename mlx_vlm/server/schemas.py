@@ -338,6 +338,9 @@ class OpenAIRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    top_n_sigma: float = Field(
+        0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
+    )
     p_less: bool = Field(
         False, description="Hyperparameter-free p-less sampling (on/off)."
     )
@@ -721,6 +724,9 @@ class VLMRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
+    top_n_sigma: float = Field(
+        0.0, description="Top-nσ sampling. 0 disables; typical ~0.5-2.0."
+    )
     p_less: bool = Field(
         False, description="Hyperparameter-free p-less sampling (on/off)."
     )
