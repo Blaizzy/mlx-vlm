@@ -781,6 +781,48 @@ def test_load_processor_propagates_auto_processor_errors():
             load_processor(Path("/tmp/model"), eos_token_ids=2)
 
 
+def test_load_processor_registers_model_module_before_auto_processor(tmp_path):
+    """Standalone load_processor must import the model module first so
+    import-time AutoProcessor registrations (install_auto_processor_patch)
+    are visible — load() got this implicitly via load_model."""
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    call_order = []
+
+    with (
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            side_effect=lambda cfg: call_order.append(("register", cfg["model_type"])),
+        ),
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            side_effect=lambda *a, **k: call_order.append(("auto_processor",))
+            or MagicMock(),
+        ),
+    ):
+        load_processor(tmp_path, add_detokenizer=False)
+
+    assert call_order[0] == ("register", "qwen3_5")
+    assert call_order[1] == ("auto_processor",)
+
+
+def test_load_processor_module_resolution_is_best_effort(tmp_path):
+    """No local config.json and the hub fetch failing must not break
+    load_processor — AutoProcessor proceeds exactly as before."""
+    processor_mock = MagicMock()
+    with (
+        patch("huggingface_hub.hf_hub_download", side_effect=OSError("offline")),
+        patch("mlx_vlm.utils.get_model_and_args") as mock_get_model_and_args,
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor_mock,
+        ),
+    ):
+        processor = load_processor(tmp_path / "missing", add_detokenizer=False)
+
+    assert processor is processor_mock
+    mock_get_model_and_args.assert_not_called()
+
+
 def test_text_only_model_provides_input_embeddings_and_wraps_logits():
     class TinyInner(nn.Module):
         def __init__(self):

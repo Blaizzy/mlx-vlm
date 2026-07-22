@@ -932,10 +932,42 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     return image_processor
 
 
+def _ensure_model_module_registered(model_path) -> None:
+    """Best-effort import of the model's mlx-vlm module before AutoProcessor
+    resolution.
+
+    Many model modules register their own processor classes with
+    ``AutoProcessor`` at import time (``install_auto_processor_patch``), which
+    ``load_model()`` triggers via ``get_model_and_args`` but a standalone
+    ``load_processor()`` call does not — so processors that transformers
+    cannot resolve on its own (e.g. a qwen3_5 quant written by
+    ``mlx_vlm.convert``) fail to load. Only ``config.json`` is read: local
+    directories directly, hub repos via ``hf_hub_download`` (never weights).
+
+    Failures are deliberately swallowed: this is a pre-registration pass, and
+    on any error ``AutoProcessor.from_pretrained`` proceeds exactly as before.
+    """
+    try:
+        config_file = Path(model_path) / "config.json"
+        if not config_file.exists():
+            from huggingface_hub import hf_hub_download
+
+            config_file = Path(
+                hf_hub_download(repo_id=str(model_path), filename="config.json")
+            )
+        with open(config_file, encoding="utf-8") as f:
+            get_model_and_args(json.load(f))
+    except Exception:
+        pass
+
+
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
+    if isinstance(model_path, str) and Path(model_path).exists():
+        model_path = Path(model_path)  # load_tokenizer below needs a Path
+    _ensure_model_module_registered(model_path)
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
