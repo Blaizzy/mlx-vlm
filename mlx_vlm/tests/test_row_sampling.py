@@ -1,10 +1,30 @@
 import mlx.core as mx
 import pytest
 
-from mlx_vlm.generate.ar import SamplingConfig, batched_row_sample
+from mlx_vlm.generate.ar import (
+    SamplingConfig,
+    _PositionedTargetSampler,
+    batched_row_sample,
+)
 from mlx_vlm.sample_utils import apply_top_k
 
 NEG_INF = -float("inf")
+
+
+def test_positioned_sampler_select_restricts_to_kept_configs():
+    # select(keep) returns a sampler with exactly the kept per-row configs, in
+    # order -- so a speculative batch that drops finished rows keeps the
+    # sampler's configs aligned to the shrunk logprobs.
+    c0 = SamplingConfig(temperature=0.7, seed=1)
+    c1 = SamplingConfig(temperature=1.5, top_k=40, seed=2)
+    c2 = SamplingConfig(temperature=0.0, seed=3)
+    sub = _PositionedTargetSampler([c0, c1, c2]).select([0, 2])
+    assert sub.configs == [c0, c2]
+    # sample_target then accepts a 2-row batch (was 3) without the width guard firing
+    lp = mx.zeros((2, 5)) - mx.logsumexp(mx.zeros((2, 5)), axis=-1, keepdims=True)
+    tok = sub.sample_target(lp, row_ids=[0, 2], positions=[4, 4])
+    mx.eval(tok)
+    assert tok.shape == (2,)
 
 
 def _keys(n):

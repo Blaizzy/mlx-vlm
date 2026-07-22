@@ -1093,15 +1093,13 @@ def _mtp_rounds_batch(
         # in the batch and just stop emitting for finished rows. End the
         # round-loop when every row has finished.
         #
-        # Positioned per-row samplers are built once at the full batch width
-        # (one config per original row); mid-round compaction would feed the
-        # walk a shrunk logprobs and break the sampler's configs-length
-        # invariant. Keep all rows (finished rows are masked when emitting) so
-        # the sampler always sees the full width. Costs some compute on
-        # finished rows until the whole batch drains; correctness > that.
-        cache_filterable = all(
-            hasattr(c, "filter") for c in prompt_cache
-        ) and not _sampler_supports_positioned_target(sampler)
+        # A positioned per-row sampler is built at the full batch width (one
+        # config per row); when we drop finished rows we compact its configs in
+        # lockstep via .select(keep_slots) so it stays aligned to the shrunk
+        # logprobs. keep_slots indexes the current active set, matching both
+        # active_idx and the sampler's configs, so compaction stays enabled for
+        # positioned samplers too.
+        cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
         if all(finished[active_idx[j]] for j in range(n_active)):
             break
         if cache_filterable:
@@ -1113,6 +1111,9 @@ def _mtp_rounds_batch(
                 filter_drafter = getattr(draft_model, "filter_batch", None)
                 if callable(filter_drafter):
                     filter_drafter(keep_mx)
+                sampler_select = getattr(sampler, "select", None)
+                if callable(sampler_select):
+                    sampler = sampler_select(keep_slots)
                 hidden = hidden[keep_mx]
                 for k in next_shared_kv:
                     K_next, V_next = next_shared_kv[k]

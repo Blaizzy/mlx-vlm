@@ -1079,28 +1079,6 @@ class ResponseGenerator:
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
 
-    def _model_vocab_size(self) -> Optional[int]:
-        """Best-effort text vocab size for the loaded model, or None if it
-        can't be determined (checks are skipped rather than guessed at)."""
-        model = getattr(self, "model", None)
-        if model is None:
-            return None
-        lm = getattr(model, "language_model", model)
-        candidates = (
-            getattr(lm, "vocab_size", None),
-            getattr(getattr(lm, "config", None), "vocab_size", None),
-            getattr(getattr(model, "config", None), "vocab_size", None),
-            getattr(
-                getattr(getattr(model, "config", None), "text_config", None),
-                "vocab_size",
-                None,
-            ),
-        )
-        for vocab_size in candidates:
-            if isinstance(vocab_size, int) and vocab_size > 0:
-                return vocab_size
-        return None
-
     def generate(
         self,
         prompt: str,
@@ -1118,15 +1096,6 @@ class ResponseGenerator:
         if self.draft_model is not None and args.thinking_budget is not None:
             raise ValueError(
                 "thinking_budget is not supported with speculative decoding in the server."
-            )
-        vocab_size = self._model_vocab_size()
-        if vocab_size is not None and args.top_k >= vocab_size:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"top_k={args.top_k} is out of range for this model's "
-                    f"vocabulary ({vocab_size} tokens)."
-                ),
             )
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()

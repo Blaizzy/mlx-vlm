@@ -152,6 +152,15 @@ class _PositionedTargetSampler:
             raise ValueError("_PositionedTargetSampler requires at least one config.")
         self.configs = list(configs)
 
+    def select(self, keep: List[int]) -> "_PositionedTargetSampler":
+        """Restrict to the given config indices (into the current configs).
+
+        Lets a speculative batch that compacts finished rows mid-round keep the
+        sampler's per-row configs aligned to the shrunk logprobs, so mid-round
+        cache compaction stays enabled without breaking the configs-length
+        invariant."""
+        return _PositionedTargetSampler([self.configs[i] for i in keep])
+
     def _arrays(self):
         c = self.configs
         return (

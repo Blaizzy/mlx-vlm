@@ -1823,18 +1823,23 @@ def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
 
 def test_mtp_rounds_batch_positioned_sampler_survives_row_finishing_early():
     """Regression: a per-row positioned sampler is built once at the full batch
-    width (one SamplingConfig per original row). ``_mtp_rounds_batch`` used to
-    compact ``active_idx`` mid-round whenever the caches were filterable and
-    some-but-not-all rows finished, then feed the shrunk ``logprobs`` to the
-    walk -> ``_PositionedTargetSampler.sample_target``'s
-    ``logprobs.shape[0] != len(configs)`` guard raised ValueError on any normal
+    width (one SamplingConfig per row). ``_mtp_rounds_batch`` compacts
+    ``active_idx`` mid-round whenever the caches are filterable and
+    some-but-not-all rows finish; if the sampler is NOT compacted in lockstep it
+    then gets a shrunk ``logprobs`` and ``_PositionedTargetSampler.sample_target``'s
+    ``logprobs.shape[0] != len(configs)`` guard raises ValueError on any normal
     B>=2 continuous-batching run where rows finish at different times.
+
+    The fix keeps compaction enabled and calls ``sampler.select(keep_slots)`` so
+    the configs shrink with the batch. This test proves compaction still happens
+    (finished rows ARE dropped) AND no ValueError is raised. Reverting the
+    ``sampler.select`` line makes it fail with the exact width-mismatch guard.
 
     Drives the REAL ``_mtp_rounds_batch`` + REAL ``_PositionedTargetSampler`` +
     REAL deferred-greedy walk (only the model-forward boundary
     ``_mtp_verify_target`` is faked, matching the singleton-round tests above).
     Row 0 finishes on its first token via ``stop_check`` while row 1 keeps
-    going, forcing a second round at the shrunk width without the fix.
+    going, forcing a compaction to the shrunk width.
     """
     from mlx_vlm.generate.ar import SamplingConfig, _PositionedTargetSampler
 
@@ -1927,10 +1932,11 @@ def test_mtp_rounds_batch_positioned_sampler_survives_row_finishing_early():
             )
         )
 
-    # (a) No ValueError -> the positioned sampler never saw a shrunk width.
-    #     With the fix, positioned samplers disable mid-round compaction, so the
-    #     filterable cache is NOT compacted.
-    assert cache.filter_calls == []
+    # (a) Compaction DID happen (finished row 0 dropped, keeping slot [1]) AND
+    #     no ValueError was raised -> the sampler compacted in lockstep via
+    #     .select(keep_slots), staying aligned to the shrunk logprobs. Reverting
+    #     the sampler.select line raises the width-mismatch guard instead.
+    assert cache.filter_calls == [[1]]
 
     # (b) Both rows produce their tokens: row 0 emits exactly one (then stops),
     #     row 1 keeps decoding across multiple rounds until max_tokens.
