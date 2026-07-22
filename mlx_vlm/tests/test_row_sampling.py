@@ -1,5 +1,6 @@
 import mlx.core as mx
 import pytest
+
 from mlx_vlm.generate.ar import SamplingConfig, batched_row_sample
 from mlx_vlm.sample_utils import apply_top_k
 

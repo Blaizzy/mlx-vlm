@@ -436,20 +436,18 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
 
     cfg0 = SamplingConfig(temperature=2.0, top_p=1.0, top_k=1, min_p=0.0, seed=42)
     cfg1 = SamplingConfig(temperature=0.7, top_p=0.9, top_k=40, min_p=0.6, seed=7)
-    logits = mx.array(
-        [[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32
-    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32)
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-    batched = server_generation._PositionedTargetSampler(
-        [cfg0, cfg1]
-    ).sample_target(logprobs, row_ids=[0, 1], positions=[5, 5])
-    single_0 = server_generation._PositionedTargetSampler(
-        [cfg0]
-    ).sample_target(logprobs[0:1], row_ids=[0], positions=[5])
-    single_1 = server_generation._PositionedTargetSampler(
-        [cfg1]
-    ).sample_target(logprobs[1:2], row_ids=[1], positions=[5])
+    batched = server_generation._PositionedTargetSampler([cfg0, cfg1]).sample_target(
+        logprobs, row_ids=[0, 1], positions=[5, 5]
+    )
+    single_0 = server_generation._PositionedTargetSampler([cfg0]).sample_target(
+        logprobs[0:1], row_ids=[0], positions=[5]
+    )
+    single_1 = server_generation._PositionedTargetSampler([cfg1]).sample_target(
+        logprobs[1:2], row_ids=[1], positions=[5]
+    )
     mx.eval(batched, single_0, single_1)
 
     assert batched.tolist() == [single_0.item(), single_1.item()]
@@ -477,9 +475,7 @@ def test_build_sampling_config_from_args_uses_default_seed_when_unset():
     from mlx_vlm.server.generation import GenerationArguments, _config_from_args
 
     args = GenerationArguments(temperature=0.7, seed=None)
-    assert _config_from_args(args) == SamplingConfig(
-        temperature=0.7, seed=DEFAULT_SEED
-    )
+    assert _config_from_args(args) == SamplingConfig(temperature=0.7, seed=DEFAULT_SEED)
 
 
 def test_speculative_server_dispatches_eagle3_batch_loop():

@@ -31,12 +31,7 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
-from ..generate.ar import (
-    SamplingConfig,
-    _PositionedTargetSampler,
-    _position_keys,
-    _position_seed,
-)
+from ..generate.ar import SamplingConfig, _PositionedTargetSampler
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,

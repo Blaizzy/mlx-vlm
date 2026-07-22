@@ -543,7 +543,9 @@ def test_prompt_processing_batch_first_token_honors_per_row_sampling_config():
     )
 
     gen_batch = batch.generate(
-        lambda logprobs: mx.argmax(logprobs, axis=-1),  # unused: real path is self.sampling
+        lambda logprobs: mx.argmax(
+            logprobs, axis=-1
+        ),  # unused: real path is self.sampling
         stop_criteria=lambda token: False,
     )
 
