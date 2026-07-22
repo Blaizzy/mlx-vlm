@@ -2,7 +2,13 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_vlm.sample_utils import apply_top_n_sigma, make_sampler, top_p_sampling
+from mlx_vlm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_n_sigma,
+    make_sampler,
+    top_p_sampling,
+)
 
 
 def _kept(logits, n_sigma):
@@ -159,6 +165,28 @@ class TestTopNSigma(unittest.TestCase):
         kept = int((out[0] != -float("inf")).sum().item())
         self.assertLess(kept, V)
         self.assertGreater(kept, 0)
+
+
+class TestValidationDoesNotCorruptCompile(unittest.TestCase):
+    """Regression for #1654: a parameter ValueError must be raised from outside
+    the @mx.compile kernel, so it cannot corrupt MLX's trace state for
+    subsequent compiled sampler calls in the same process."""
+
+    def test_min_p_error_then_sampler_works(self):
+        x = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])
+        with self.assertRaises(ValueError):
+            mx.eval(apply_min_p(x, -1.0))
+        toks = make_sampler(temp=1.0, min_p=0.1)(x)
+        mx.eval(toks)
+        self.assertEqual(toks.shape, (1,))
+
+    def test_top_k_error_then_sampler_works(self):
+        x = mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]])
+        with self.assertRaises(ValueError):
+            mx.eval(apply_top_k(x, -5))
+        toks = make_sampler(temp=1.0, top_k=3)(x)
+        mx.eval(toks)
+        self.assertEqual(toks.shape, (1,))
 
 
 if __name__ == "__main__":
