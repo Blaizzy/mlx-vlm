@@ -37,6 +37,7 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -2852,17 +2853,17 @@ class BatchGenerator:
 
 
 def batch_generate(
-    model,
-    processor,
-    images: Union[str, List[str]] = None,
-    audios: Union[str, List[str]] = None,
-    prompts: List[str] = None,
+    model: nn.Module,
+    processor: ProcessorLike,
+    images: Union[str, List[str], None] = None,
+    audios: Union[str, List[str], None] = None,
+    prompts: Optional[List[str]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
-    **kwargs,
-):
+    **kwargs: Unpack[GenerateKwargs],
+) -> BatchResponse:
     """
     Generate responses for the given batch of prompts with variable-sized images.
 
