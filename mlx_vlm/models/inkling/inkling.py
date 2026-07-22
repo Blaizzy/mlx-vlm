@@ -83,10 +83,17 @@ class Model(nn.Module):
         cache: Optional[list] = None,
         **kwargs,
     ):
+        spec_kwargs = {
+            k: kwargs.pop(k)
+            for k in ("return_hidden", "return_shared_kv", "skip_logits")
+            if k in kwargs
+        }
         embeds = self.get_input_embeddings(
             input_ids, pixel_values=pixel_values, **kwargs
         )
-        return self.language_model(inputs_embeds=embeds.inputs_embeds, cache=cache)
+        return self.language_model(
+            inputs_embeds=embeds.inputs_embeds, cache=cache, **spec_kwargs
+        )
 
     _ATTN = {
         "wq_du": "q_proj",

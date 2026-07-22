@@ -2,12 +2,43 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache
 from ..mlp import SwiGLUMLP
 from ..switch_layers import SwitchGLU
 from .config import TextConfig as ModelConfig
+
+
+def _clone_cache_tree(value):
+    if isinstance(value, mx.array):
+        return mx.array(value)
+    if isinstance(value, tuple):
+        return tuple(_clone_cache_tree(v) for v in value)
+    if isinstance(value, list):
+        return [_clone_cache_tree(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _clone_cache_tree(v) for k, v in value.items()}
+    return value
+
+
+def _snapshot_cache_state(caches):
+    """Deep-copy the full state of every cache so a speculative block can be
+    rolled back by replay. Inkling's short-conv slots keep only the last K-1
+    inputs and cannot be trimmed, so we restore-and-replay instead."""
+    snapshot = [None if c is None else _clone_cache_tree(c.state) for c in caches]
+    arrays = [v for _, v in tree_flatten(snapshot) if isinstance(v, mx.array)]
+    if arrays:
+        mx.eval(arrays)
+    return snapshot
+
+
+def _restore_cache_state(caches, snapshot):
+    for c, s in zip(caches, snapshot):
+        if c is not None and s is not None:
+            c.state = _clone_cache_tree(s)
+
 
 _MASK_SRC = r"""
     uint j  = thread_position_in_grid.x;   // key   position [0, S)
@@ -312,13 +343,19 @@ class InklingModel(nn.Module):
             h = self.embed_norm(h)
         return h
 
-    def __call__(self, inputs, cache=None, input_embeddings: Optional[mx.array] = None):
+    def __call__(
+        self,
+        inputs,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+        skip_final_norm: bool = False,
+    ):
         h = input_embeddings if input_embeddings is not None else self.embed(inputs)
         if cache is None:
             cache = [None] * len(self.layers)
         for layer, c in zip(self.layers, cache):
             h = layer(h, cache=c)
-        return self.norm(h)
+        return h if skip_final_norm else self.norm(h)
 
 
 class LanguageModel(nn.Module):
@@ -330,19 +367,7 @@ class LanguageModel(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
-    def __call__(
-        self,
-        inputs=None,
-        cache=None,
-        input_embeddings=None,
-        inputs_embeds=None,
-        **kwargs,
-    ):
-        if inputs is None:
-            inputs = kwargs.get("input_ids")
-        if inputs_embeds is None:
-            inputs_embeds = input_embeddings
-        h = self.model(inputs, cache, inputs_embeds)
+    def _logits_from_norm(self, h):
         h = h / self.config.logits_mup_width_multiplier
         if self.config.tie_word_embeddings:
             logits = self.model.embed_tokens.as_linear(h)
@@ -351,7 +376,63 @@ class LanguageModel(nn.Module):
         uv = self.config.unpadded_vocab_size
         if uv is not None and uv < logits.shape[-1]:
             logits = logits[..., :uv]
-        return LanguageModelOutput(logits=logits)
+        return logits
+
+    def __call__(
+        self,
+        inputs=None,
+        cache=None,
+        input_embeddings=None,
+        inputs_embeds=None,
+        return_hidden: bool = False,
+        return_shared_kv: bool = False,
+        skip_logits: bool = False,
+        **kwargs,
+    ):
+        if inputs is None:
+            inputs = kwargs.get("input_ids")
+        if inputs_embeds is None:
+            inputs_embeds = input_embeddings
+        pre_norm = self.model(inputs, cache, inputs_embeds, skip_final_norm=True)
+        logits = (
+            None if skip_logits else self._logits_from_norm(self.model.norm(pre_norm))
+        )
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=[pre_norm] if return_hidden else None,
+            shared_kv_states={} if return_shared_kv else None,
+        )
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return self._logits_from_norm(self.model.norm(hidden))
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> Optional[mx.array]:
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        snapshot = _snapshot_cache_state(cache)
+        out = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[-1], out.shared_kv_states, (snapshot, inputs)
+
+    def rollback_speculative_cache(
+        self, caches, gdn_states, accepted, block_size
+    ) -> int:
+        if isinstance(accepted, mx.array):
+            accepted = int(accepted.max().item()) if accepted.size else 0
+        elif not isinstance(accepted, int):
+            accepted = max(int(a) for a in accepted)
+        snapshot, verify_inputs = gdn_states
+        _restore_cache_state(caches, snapshot)
+        keep = accepted + 1
+        if keep > 0:
+            self(verify_inputs[:, :keep], cache=caches, skip_logits=True)
+        return accepted
 
     @property
     def layers(self):

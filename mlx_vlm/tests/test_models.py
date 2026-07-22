@@ -10289,3 +10289,127 @@ class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
         reference = self._decode_logits(lm, with_delta_kwarg=False)
         subject = self._decode_logits(lm, with_delta_kwarg=True)
         self.assertTrue(mx.allclose(reference, subject, atol=1e-5).item())
+
+
+class TestInklingMTP(unittest.TestCase):
+    """Inkling multi-token-prediction speculative drafter.
+
+    All checks are synthetic (random-init tiny configs). The forward is
+    inferred from the checkpoint weight names since HF omits the Inkling MTP
+    head; correctness here is guaranteed by target verification regardless of
+    draft quality, so the greedy-invariant and rollback tests validate the
+    machinery, not acceptance rate."""
+
+    TEXT = {
+        "model_type": "inkling",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "vocab_size": 128,
+        "unpadded_vocab_size": None,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": False,
+        "use_embed_norm": True,
+        "logits_mup_width_multiplier": 1.0,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 16,
+        "swa_num_attention_heads": 8,
+        "swa_num_key_value_heads": 4,
+        "swa_head_dim": 16,
+        "sliding_window_size": 32,
+        "layer_types": ["hybrid_sliding", "hybrid"],
+        "d_rel": 16,
+        "rel_extent": 64,
+        "log_scaling_n_floor": None,
+        "log_scaling_alpha": 0.1,
+        "sconv_kernel_size": 4,
+        "mlp_layer_types": ["dense", "sparse"],
+        "intermediate_size": 128,
+        "moe_intermediate_size": 64,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "route_scale": 8.0,
+        "num_mtp_layers": 1,
+        "mtp_local_layer_ids": [0],
+    }
+
+    def _build(self):
+        from mlx_vlm.models.inkling.config import ModelConfig
+        from mlx_vlm.models.inkling.inkling import Model
+        from mlx_vlm.speculative.drafters.inkling_mtp import InklingMTPDraftModel
+        from mlx_vlm.speculative.drafters.inkling_mtp import ModelConfig as MTPConfig
+
+        mx.random.seed(0)
+        vocab = self.TEXT["vocab_size"]
+        target = Model(
+            ModelConfig(text_config=dict(self.TEXT), vocab_size=vocab, eos_token_id=[])
+        )
+        target.eval()
+        mx.eval(target.parameters())
+        drafter = InklingMTPDraftModel(MTPConfig(text_config=dict(self.TEXT)))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        return target, drafter
+
+    def test_drafter_forward_shape(self):
+        target, drafter = self._build()
+        drafter.reset(target)
+        seq = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        hidden = target.language_model(
+            input_ids=seq, cache=target.make_cache(), return_hidden=True
+        ).hidden_states[-1]
+        out = drafter._forward_seq(seq, hidden, 0, mx.int32)
+        logits = drafter._block_logits(out[:, -1:, :])
+        self.assertEqual(logits.shape, (1, 1, self.TEXT["vocab_size"]))
+
+    def _generate(self, target, drafter, use_draft):
+        from mlx_vlm.generate.ar import generate_step
+
+        prompt = mx.array([[10, 20, 30, 40, 50]], dtype=mx.int32)
+        kwargs = dict(max_tokens=40, temperature=0.0, seed=0)
+        if use_draft:
+            kwargs.update(draft_model=drafter, draft_kind="mtp")
+        toks = []
+        for tok, _ in generate_step(prompt, target, None, None, **kwargs):
+            toks.append(
+                int(tok) if isinstance(tok, int) else int(mx.array(tok).reshape(-1)[0])
+            )
+        return toks
+
+    def test_greedy_matches_baseline(self):
+        target, drafter = self._build()
+        baseline = self._generate(target, drafter, use_draft=False)
+        drafter.reset(target)
+        speculative = self._generate(target, drafter, use_draft=True)
+        self.assertEqual(baseline, speculative)
+
+    def test_rollback_restore_replay(self):
+        target, _ = self._build()
+        lm = target.language_model
+        prompt = mx.array([[10, 20, 30, 40, 50]], dtype=mx.int32)
+        verify_input = mx.array([[7, 11, 13, 17]], dtype=mx.int32)
+        accepted = 2
+
+        c1 = lm.make_cache()
+        lm(input_ids=prompt, cache=c1)
+        _, _, gdn = lm.speculative_verify_hidden(verify_input, c1)
+        lm.rollback_speculative_cache(
+            c1, gdn, accepted, block_size=verify_input.shape[1]
+        )
+
+        c2 = lm.make_cache()
+        lm(
+            input_ids=mx.concatenate([prompt, verify_input[:, : accepted + 1]], axis=1),
+            cache=c2,
+        )
+
+        self.assertEqual(c1[0][0].offset, c2[0][0].offset)
+        probe = mx.array([[3]], dtype=mx.int32)
+        l1 = lm(input_ids=probe, cache=c1).logits
+        l2 = lm(input_ids=probe, cache=c2).logits
+        self.assertLess(float(mx.max(mx.abs(l1 - l2))), 1e-4)
+
+
+if __name__ == "__main__":
+    unittest.main()
