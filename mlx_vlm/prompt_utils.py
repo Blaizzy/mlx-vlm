@@ -367,14 +367,6 @@ class MessageFormatter:
         if role == "user" and not skip_audio_token and num_audios > 0:
             content = content + [MessageBuilder.audio_message()] * num_audios
 
-        # video placeholders: without this, num_videos is silently dropped
-        # and video content vanishes from the template entirely (the
-        # processor then computes pixel_values_videos with no token
-        # positions to scatter into) — see #1651 bug 4
-        num_videos = kwargs.get("num_videos", 0)
-        if role == "user" and num_videos > 0:
-            content = content + [{"type": "video"}] * num_videos
-
         return {"role": role, "content": content}
 
     def _format_text_only(
