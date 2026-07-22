@@ -8,9 +8,18 @@ from mlx_vlm.sample_utils import (
     apply_p_less,
     apply_top_k,
     apply_top_n_sigma,
+    make_dry,
+    make_logits_processors,
     make_sampler,
     top_p_sampling,
 )
+
+
+def _dry_out(seq, vocab, **kwargs):
+    proc = make_dry(**kwargs)
+    out = proc(mx.array(seq, dtype=mx.int32), mx.zeros((1, vocab)))
+    mx.eval(out)
+    return np.asarray(out.tolist(), dtype=np.float64)[0]
 
 
 def _np_p_less_keep(logits, temp):
@@ -246,6 +255,77 @@ class TestPLess(unittest.TestCase):
         toks = sampler(mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]] * 16))
         mx.eval(toks)
         self.assertEqual(toks.shape, (16,))
+
+
+class TestDRY(unittest.TestCase):
+    def test_no_penalty_without_repeat(self):
+        """Distinct tokens (no repeated suffix) are left unchanged."""
+        out = _dry_out([1, 2, 3, 4, 5], 8, multiplier=2.0, base=3.0)
+        self.assertTrue(np.all(out == 0.0))
+
+    def test_penalizes_repeated_continuation(self):
+        """[1,2,3,4,1,2,3] -> token 4 continued a length-3 match; penalty is
+        multiplier * base ** (3 - allowed_length)."""
+        out = _dry_out(
+            [1, 2, 3, 4, 1, 2, 3], 8, multiplier=2.0, base=3.0, allowed_length=2
+        )
+        self.assertAlmostEqual(out[4], -6.0, places=5)
+        self.assertTrue(np.all(np.delete(out, 4) == 0.0))
+
+    def test_allowed_length_gating(self):
+        """A length-1 match is not penalized when allowed_length=2."""
+        out = _dry_out([5, 9, 5], 10, multiplier=1.0, base=2.0, allowed_length=2)
+        self.assertTrue(np.all(out == 0.0))
+        out = _dry_out([5, 9, 5], 10, multiplier=1.0, base=2.0, allowed_length=1)
+        self.assertAlmostEqual(out[9], -1.0, places=5)
+
+    def test_penalty_grows_with_match_length(self):
+        short = _dry_out(
+            [1, 2, 8, 1, 2], 10, multiplier=1.0, base=2.0, allowed_length=1
+        )
+        long = _dry_out(
+            [1, 2, 3, 8, 1, 2, 3], 10, multiplier=1.0, base=2.0, allowed_length=1
+        )
+        self.assertLess(long[8], short[8])
+
+    def test_sequence_breaker_resets_match(self):
+        """A breaker token stops backward matching, shrinking the match."""
+        seq = [1, 2, 3, 1, 2, 3]
+        without = _dry_out(seq, 8, multiplier=1.0, base=2.0, allowed_length=2)
+        with_break = _dry_out(
+            seq, 8, multiplier=1.0, base=2.0, allowed_length=2, sequence_breakers=[2]
+        )
+        self.assertLess(without[1], 0.0)
+        self.assertTrue(np.all(with_break == 0.0))
+
+    def test_context_size_limits_search(self):
+        seq = [3, 3, 3, 3]
+        full = _dry_out(seq, 8, multiplier=1.0, base=2.0, allowed_length=2)
+        capped = _dry_out(
+            seq, 8, multiplier=1.0, base=2.0, allowed_length=2, context_size=2
+        )
+        self.assertLess(full[3], 0.0)
+        self.assertTrue(np.all(capped == 0.0))
+
+    def test_make_logits_processors_integration(self):
+        self.assertEqual(len(make_logits_processors(dry_multiplier=0.0)), 0)
+        procs = make_logits_processors(
+            dry_multiplier=2.0, dry_base=3.0, dry_allowed_length=2
+        )
+        self.assertEqual(len(procs), 1)
+        out = procs[0](
+            mx.array([1, 2, 3, 4, 1, 2, 3], dtype=mx.int32), mx.zeros((1, 8))
+        )
+        mx.eval(out)
+        self.assertAlmostEqual(out.tolist()[0][4], -6.0, places=5)
+
+    def test_invalid_raises(self):
+        with self.assertRaises(ValueError):
+            make_dry(-1.0)
+        with self.assertRaises(ValueError):
+            make_dry(1.0, base=0.0)
+        with self.assertRaises(ValueError):
+            make_dry(1.0, allowed_length=0)
 
 
 class TestValidationDoesNotCorruptCompile(unittest.TestCase):

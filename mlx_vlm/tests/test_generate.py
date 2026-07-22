@@ -1770,7 +1770,18 @@ class TestSamplerArgs:
             p_less=False,
         )
         mock_make_logits_processors.assert_called_once_with(
-            {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
+            {3: -0.75},
+            1.15,
+            512,
+            0.2,
+            256,
+            0.3,
+            128,
+            dry_multiplier=0.0,
+            dry_base=1.75,
+            dry_allowed_length=2,
+            dry_sequence_breakers=None,
+            dry_range=0,
         )
 
 

@@ -91,6 +91,11 @@ def make_logits_processors(
     presence_context_size: Optional[int] = 20,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = 20,
+    dry_multiplier: float = 0.0,
+    dry_base: float = 1.75,
+    dry_allowed_length: int = 2,
+    dry_sequence_breakers: Optional[List[int]] = None,
+    dry_range: int = 0,
 ):
     """
     Make logits processors for use with ``generate_step``.
@@ -109,6 +114,8 @@ def make_logits_processors(
           frequency.
         frequency_context_size (int, optional): The number of tokens to consider
           for the frequency penalty. Default: ``20``.
+        dry_multiplier (float, optional): DRY repetition sampler strength. ``0``
+          disables it. See :func:`make_dry`.
         logit_bias (dictionary, optional): Additive logit bias.
 
     Returns:
@@ -136,6 +143,17 @@ def make_logits_processors(
     for make_penalty, penalty, context_size in repetition_penalties:
         if penalty is not None and penalty != 0:
             logits_processors.append(make_penalty(penalty, context_size))
+
+    if dry_multiplier and dry_multiplier > 0:
+        logits_processors.append(
+            make_dry(
+                dry_multiplier,
+                dry_base,
+                dry_allowed_length,
+                dry_sequence_breakers,
+                dry_range,
+            )
+        )
 
     return logits_processors
 
@@ -440,6 +458,72 @@ def make_frequency_penalty(penalty: float, context_size: int = 20):
         return logits
 
     return frequency_penalty_processor
+
+
+def make_dry(
+    multiplier: float,
+    base: float = 1.75,
+    allowed_length: int = 2,
+    sequence_breakers: Optional[List[int]] = None,
+    context_size: int = 0,
+):
+    """Make a DRY (Don't Repeat Yourself) repetition processor.
+
+    If the current suffix matches an earlier span of length
+    ``L >= allowed_length``, the token that continued that span before is
+    penalized by ``multiplier * base ** (L - allowed_length)``.
+    ``sequence_breakers`` (token ids) reset matching; ``context_size`` (>0)
+    caps how far back matches are searched.
+    """
+    if multiplier < 0:
+        raise ValueError(f"`dry_multiplier` must be non-negative, got {multiplier}")
+    if base <= 0:
+        raise ValueError(f"`dry_base` must be positive, got {base}")
+    if allowed_length < 1:
+        raise ValueError(f"`dry_allowed_length` must be >= 1, got {allowed_length}")
+    breakers = set(sequence_breakers or [])
+
+    def dry_processor(tokens, logits):
+        seq = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
+        seq = [int(t) for t in seq]
+        if context_size and context_size > 0:
+            seq = seq[-context_size:]
+        n = len(seq)
+        if n < 2 or seq[-1] in breakers:
+            return logits
+        last = seq[-1]
+        match_lengths = {}
+        for j in range(n - 1):
+            if seq[j] != last:
+                continue
+            length = 1
+            a, b = j - 1, n - 2
+            while (
+                a >= 0
+                and b >= 0
+                and seq[a] == seq[b]
+                and seq[a] not in breakers
+                and seq[b] not in breakers
+            ):
+                length += 1
+                a -= 1
+                b -= 1
+            cont = seq[j + 1]
+            if length >= allowed_length and length > match_lengths.get(cont, 0):
+                match_lengths[cont] = length
+        if not match_lengths:
+            return logits
+        idx = mx.array(list(match_lengths.keys()))
+        pens = mx.array(
+            [
+                multiplier * (base ** (length - allowed_length))
+                for length in match_lengths.values()
+            ],
+            dtype=logits.dtype,
+        )
+        return logits.at[:, idx].subtract(pens)
+
+    return dry_processor
 
 
 def top_p_sampling(logits: mx.array, top_p: float, temperature: float) -> mx.array:
