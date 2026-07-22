@@ -537,16 +537,18 @@ def maybe_quantize_kv_cache(
                 return tuple(quantize_entry(sub_entry) for sub_entry in entry)
             return entry
 
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
+        # Last-layer policy shared with _make_cache / APC warm restore.
+        n = len(prompt_cache)
         for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
+            if not cache.should_quantize_kv_layer(index, n):
                 continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    n = len(prompt_cache)
     for index, layer_cache in enumerate(prompt_cache):
+        if not cache.should_quantize_kv_layer(index, n):
+            continue
         if (
             hasattr(layer_cache, "to_quantized")
             and layer_cache.offset >= quantized_kv_start
@@ -963,6 +965,7 @@ def stream_generate(
                         {
                             "bits": _kv_bits,
                             "group_size": kwargs.get("kv_group_size", 64),
+                            "scheme": kwargs.get("kv_quant_scheme"),
                         }
                         if _kv_bits is not None
                         else None
