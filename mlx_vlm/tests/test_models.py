@@ -10459,6 +10459,99 @@ class TestInklingMTP(unittest.TestCase):
         self.assertLess(float(mx.max(mx.abs(l1 - l2))), 1e-4)
 
 
+class TestTransformerBlock(unittest.TestCase):
+    """Regression guard for the shared config-driven TransformerBlock.
+
+    Golden logits are RNG-free (weights set deterministically), captured from
+    the refactor that was verified bit-identical (max|Δ|=0) to the original
+    per-model implementations of llama, qwen3, and gemma2.
+    """
+
+    CASES = {
+        "llama": dict(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            attention_bias=False,
+            mlp_bias=False,
+            tie_word_embeddings=False,
+            layer_types=["full_attention", "full_attention"],
+            sliding_window=16,
+        ),
+        "qwen3": dict(
+            model_type="qwen3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+        ),
+        "gemma2": dict(
+            model_type="gemma2",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            attn_logit_softcapping=50.0,
+            final_logit_softcapping=30.0,
+            query_pre_attn_scalar=64.0,
+        ),
+    }
+    GOLDEN = {
+        "llama": [-0.000929, 0.009069, 0.016449, 0.019079, 0.016202, 0.008646],
+        "qwen3": [-0.055896, -0.057159, -0.04192, -0.014577, 0.016973, 0.043624],
+        "gemma2": [-0.09723, -0.1632, -0.182053, -0.148346, -0.07181, 0.025459],
+    }
+
+    def _deterministic(self, params):
+        from mlx.utils import tree_unflatten
+
+        out = []
+        for i, (k, v) in enumerate(tree_flatten(params)):
+            vals = mx.sin(mx.arange(v.size, dtype=mx.float32) * 0.017 + i * 0.3) * 0.05
+            out.append((k, vals.reshape(v.shape)))
+        return tree_unflatten(out)
+
+    def test_shared_block_matches_golden(self):
+        for name, cfg_dict in self.CASES.items():
+            cfg = importlib.import_module(
+                f"mlx_vlm.models.{name}.config"
+            ).ModelConfig.from_dict(cfg_dict)
+            lm = importlib.import_module(
+                f"mlx_vlm.models.{name}.language"
+            ).LanguageModel(cfg)
+            lm.update(self._deterministic(lm.parameters()))
+            lm.eval()
+            out = lm(mx.array([[1, 2, 3, 4, 5, 6]]))
+            logits = (out.logits if hasattr(out, "logits") else out)[0, -1, :6]
+            got = [float(v) for v in logits.astype(mx.float32).tolist()]
+            for g, expected in zip(got, self.GOLDEN[name]):
+                self.assertAlmostEqual(g, expected, places=5, msg=f"{name}: {got}")
+
+
 if __name__ == "__main__":
     unittest.main()
 
