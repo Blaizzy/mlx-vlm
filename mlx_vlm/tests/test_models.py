@@ -10661,6 +10661,28 @@ class TestVendoredDenseModels(unittest.TestCase):
             tie_word_embeddings=False,
             partial_rotary_factor=0.5,
         ),
+        "dots1": dict(
+            model_type="dots1",
+            hidden_size=64,
+            num_hidden_layers=3,
+            intermediate_size=128,
+            num_attention_heads=8,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            max_position_embeddings=512,
+            num_key_value_heads=4,
+            first_k_dense_replace=1,
+            moe_intermediate_size=32,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            norm_topk_prob=True,
+            num_experts_per_tok=2,
+            rope_theta=10000.0,
+            routed_scaling_factor=2.5,
+            head_dim=8,
+            n_group=1,
+            topk_group=1,
+        ),
     }
 
     def _run(self, name):
@@ -10712,3 +10734,6 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_solar_open(self):
         self._run("solar_open")
+
+    def test_dots1(self):
+        self._run("dots1")
