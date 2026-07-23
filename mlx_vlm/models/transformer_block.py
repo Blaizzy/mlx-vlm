@@ -2,9 +2,10 @@
 
 A single ``TransformerBlock`` with a pluggable token mixer (attention now; MLA
 and SSM/linear mixers slot into the same ``self_attn`` interface later), a
-switchable gated MLP, a norm-variant selector, and a residual layout selector.
-Behaviour-preserving: submodule names match the per-model implementations it
-replaces so existing checkpoints load unchanged.
+switchable MLP (dense gated MLP or a config-driven mixture-of-experts), a
+norm-variant selector, and a residual layout selector. Behaviour-preserving:
+submodule names match the per-model implementations it replaces so existing
+checkpoints load unchanged.
 """
 
 from dataclasses import dataclass
@@ -14,7 +15,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import scaled_dot_product_attention
-from .mlp import GatedMLP
+from .mlp import GatedMLP, SwiGLUMLP
+from .switch_layers import SwitchGLU
 
 
 class Gemma1pRMSNorm(nn.Module):
@@ -39,6 +41,38 @@ def make_norm(kind: str, dims: int, eps: float) -> nn.Module:
 
 
 @dataclass
+class MoESpec:
+    """Router + expert configuration for a mixture-of-experts feed-forward.
+
+    Covers the simple top-k router (softmax/sigmoid gate, unconditional
+    normalisation) and the DeepSeek-style grouped router (sigmoid gate with an
+    additive score-correction bias, group-limited selection, conditional
+    normalisation, routed-scaling). Experts and shared experts reuse
+    ``switch_layers.SwitchGLU`` and ``mlp.SwiGLUMLP``.
+    """
+
+    hidden_size: int
+    moe_intermediate_size: int
+    num_experts: int
+    num_experts_per_tok: int
+    scoring: str = "softmax"
+    use_correction_bias: bool = False
+    n_group: int = 1
+    topk_group: int = 1
+    norm_topk_prob: bool = True
+    norm_guard_topk: bool = False
+    norm_denom: str = "max"
+    norm_eps: float = 1e-12
+    routed_scaling_factor: float = 1.0
+    expert_attr: str = "switch_mlp"
+    expert_bias: bool = False
+    gate_bias: bool = False
+    num_shared_experts: int = 0
+    shared_intermediate_size: Optional[int] = None
+    shared_bias: bool = False
+
+
+@dataclass
 class BlockSpec:
     hidden_size: int
     num_attention_heads: int
@@ -56,6 +90,7 @@ class BlockSpec:
     mlp_act: Callable = nn.silu
     mlp_bias: bool = False
     use_sliding: bool = False
+    moe: Optional[MoESpec] = None
 
 
 class Attention(nn.Module):
@@ -146,6 +181,97 @@ class Attention(nn.Module):
         return self.o_proj(out)
 
 
+class _MoEGate(nn.Module):
+    """Linear router weight (+ optional bias and score-correction bias)."""
+
+    def __init__(self, spec: MoESpec):
+        super().__init__()
+        self.weight = mx.zeros((spec.num_experts, spec.hidden_size))
+        if spec.gate_bias:
+            self.bias = mx.zeros((spec.num_experts,))
+        if spec.use_correction_bias:
+            self.e_score_correction_bias = mx.zeros((spec.num_experts,))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        g = x @ self.weight.T
+        if "bias" in self:
+            g = g + self.bias
+        return g
+
+
+class MoEMLP(nn.Module):
+    """Config-driven mixture-of-experts feed-forward.
+
+    Reuses ``SwitchGLU`` for the routed experts and ``SwiGLUMLP`` for the
+    optional shared experts; the router matches either the simple top-k or the
+    DeepSeek-style grouped selection described on ``MoESpec``.
+    """
+
+    def __init__(self, spec: MoESpec):
+        super().__init__()
+        self.spec = spec
+        self.gate = _MoEGate(spec)
+        experts = SwitchGLU(
+            spec.hidden_size,
+            spec.moe_intermediate_size,
+            spec.num_experts,
+            bias=spec.expert_bias,
+        )
+        setattr(self, spec.expert_attr, experts)
+        if spec.num_shared_experts > 0:
+            self.shared_experts = SwiGLUMLP(
+                spec.hidden_size,
+                spec.shared_intermediate_size,
+                spec.shared_bias,
+            )
+        else:
+            self.shared_experts = None
+
+    def _route(self, gates: mx.array):
+        spec = self.spec
+        if spec.scoring == "sigmoid":
+            scores = mx.sigmoid(gates.astype(mx.float32))
+        else:
+            scores = mx.softmax(gates.astype(mx.float32), axis=-1)
+        orig = scores
+
+        if spec.use_correction_bias:
+            scores = scores + self.gate.e_score_correction_bias
+
+        if spec.n_group > 1:
+            scores = mx.unflatten(scores, axis=-1, shape=(spec.n_group, -1))
+            group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+            k = spec.n_group - spec.topk_group
+            group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+            scores = mx.put_along_axis(
+                scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+            )
+            scores = mx.flatten(scores, -2, -1)
+
+        k = spec.num_experts_per_tok
+        inds = mx.stop_gradient(mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k])
+        weights = mx.take_along_axis(orig, inds, axis=-1)
+
+        if spec.norm_topk_prob and (not spec.norm_guard_topk or k > 1):
+            denom = weights.sum(axis=-1, keepdims=True)
+            if spec.norm_denom == "add":
+                weights = weights / (denom + spec.norm_eps)
+            else:
+                weights = weights / mx.maximum(denom, spec.norm_eps)
+
+        weights = weights * spec.routed_scaling_factor
+        return inds, weights
+
+    def __call__(self, x: mx.array) -> mx.array:
+        inds, weights = self._route(self.gate(x))
+        experts = getattr(self, self.spec.expert_attr)
+        y = experts(x, inds)
+        y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)
+        return y
+
+
 class TransformerBlock(nn.Module):
     """Decoder block with pre-norm or Gemma2 sandwich residual layout."""
 
@@ -157,12 +283,15 @@ class TransformerBlock(nn.Module):
         self.layout = spec.layout
 
         self.self_attn = Attention(spec)
-        self.mlp = GatedMLP(
-            spec.hidden_size,
-            spec.intermediate_size,
-            act=spec.mlp_act,
-            bias=spec.mlp_bias,
-        )
+        if spec.moe is not None:
+            self.mlp = MoEMLP(spec.moe)
+        else:
+            self.mlp = GatedMLP(
+                spec.hidden_size,
+                spec.intermediate_size,
+                act=spec.mlp_act,
+                bias=spec.mlp_bias,
+            )
 
         n, dim, eps = spec.norm_type, spec.hidden_size, spec.rms_norm_eps
         self.input_layernorm = make_norm(n, dim, eps)
