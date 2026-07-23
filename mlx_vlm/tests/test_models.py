@@ -10770,6 +10770,37 @@ class TestVendoredDenseModels(unittest.TestCase):
             swa_v_head_dim=8,
             partial_rotary_factor=1.0,
         ),
+        "afmoe": dict(
+            model_type="afmoe",
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            num_dense_layers=1,
+            route_norm=True,
+            route_scale=2.826,
+            score_func="sigmoid",
+            n_group=2,
+            topk_group=1,
+            sliding_window=4,
+            mup_enabled=True,
+        ),
     }
 
     def _run(self, name):
@@ -10833,3 +10864,6 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_mimo_v2_flash(self):
         self._run("mimo_v2_flash")
+
+    def test_afmoe(self):
+        self._run("afmoe")
