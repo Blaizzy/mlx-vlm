@@ -10506,6 +10506,118 @@ class TestVendoredDenseModels(unittest.TestCase):
             max_position_embeddings=512,
             tie_word_embeddings=False,
         ),
+        "openelm": dict(
+            model_type="openelm",
+            model_dim=64,
+            num_transformer_layers=2,
+            head_dim=16,
+            vocab_size=128,
+            ffn_dim_divisor=16,
+            num_query_heads=[4, 4],
+            num_kv_heads=[2, 2],
+            ffn_multipliers=[2.0, 2.0],
+            normalize_qk_projections=True,
+            share_input_output_layers=True,
+            rope_freq_constant=10000.0,
+            rms_norm_eps=1e-6,
+        ),
+        "olmo3": dict(
+            model_type="olmo3",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            max_position_embeddings=512,
+            sliding_window=32,
+            rope_theta=10000.0,
+            layer_types=["sliding_attention", "full_attention"],
+            tie_word_embeddings=False,
+        ),
+        "apertus": dict(
+            model_type="apertus",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            mlp_bias=False,
+            num_attention_heads=4,
+            attention_bias=False,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            post_norm=True,
+            qk_norm=True,
+            tie_word_embeddings=False,
+        ),
+        "baichuan_m1": dict(
+            model_type="baichuan_m1",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rope_theta=10000.0,
+            sliding_window=32,
+            sliding_window_layers=[0],
+            conv_window=2,
+            rms_norm_eps=1e-5,
+            num_swa_attention_heads=4,
+            num_swa_key_value_heads=2,
+            tie_word_embeddings=False,
+        ),
+        "hunyuan_v1_dense": dict(
+            model_type="hunyuan_v1_dense",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            attention_bias=False,
+            use_qk_norm=True,
+            head_dim=16,
+            tie_word_embeddings=False,
+        ),
+        "telechat3": dict(
+            model_type="telechat3",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            mlp_bias=False,
+            attention_bias=False,
+            head_dim=16,
+            tie_word_embeddings=False,
+        ),
+        "nemotron_nas": dict(
+            model_type="nemotron-nas",
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=500000.0,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+            block_configs=[
+                {"attention": {"n_heads_in_group": 2}, "ffn": {"ffn_mult": 2.0}},
+                {"attention": {"no_op": True}, "ffn": {"ffn_mult": 2.0}},
+            ],
+        ),
     }
 
     def _run(self, name):
@@ -10530,3 +10642,24 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_mimo(self):
         self._run("mimo")
+
+    def test_openelm(self):
+        self._run("openelm")
+
+    def test_olmo3(self):
+        self._run("olmo3")
+
+    def test_apertus(self):
+        self._run("apertus")
+
+    def test_baichuan_m1(self):
+        self._run("baichuan_m1")
+
+    def test_hunyuan_v1_dense(self):
+        self._run("hunyuan_v1_dense")
+
+    def test_telechat3(self):
+        self._run("telechat3")
+
+    def test_nemotron_nas(self):
+        self._run("nemotron_nas")

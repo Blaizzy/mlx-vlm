@@ -48,6 +48,7 @@ MODEL_REMAPPING = {
     "cohere2moe": "cohere2_moe",
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
+    "nemotron-nas": "nemotron_nas",
 }
 
 MAX_FILE_SIZE_GB = 5
