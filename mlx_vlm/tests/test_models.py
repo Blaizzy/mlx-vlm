@@ -10683,6 +10683,34 @@ class TestVendoredDenseModels(unittest.TestCase):
             n_group=1,
             topk_group=1,
         ),
+        "exaone_moe": dict(
+            model_type="exaone_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=512,
+            sliding_window=4,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            is_moe_layer=[False, True, True, True],
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=2.5,
+            norm_topk_prob=True,
+        ),
     }
 
     def _run(self, name):
@@ -10737,3 +10765,6 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_dots1(self):
         self._run("dots1")
+
+    def test_exaone_moe(self):
+        self._run("exaone_moe")
