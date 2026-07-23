@@ -142,6 +142,46 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
+def _has_decoder(module):
+    if module is None:
+        return False
+    for _, sub in module.named_modules():
+        if getattr(sub, "self_attn", None) is not None and getattr(sub, "mlp", None):
+            return True
+    return False
+
+
+def _apply_awq_calibration(model, processor, target, q_bits, q_group_size):
+    """Calibrate on default text and apply AWQ scaling to the decoder in place."""
+    from .quant import DEFAULT_CALIBRATION_TEXT, apply_awq, collect_activation_stats
+
+    tokenizer = getattr(processor, "tokenizer", processor)
+    language_model = getattr(model, "language_model", None)
+    root = language_model if _has_decoder(language_model) else target
+
+    probe = mx.array([tokenizer.encode(DEFAULT_CALIBRATION_TEXT[0])])
+    forward = None
+    for candidate in (getattr(root, "model", None), root, language_model):
+        if candidate is None:
+            continue
+        try:
+            mx.eval(candidate(probe))
+            forward = candidate
+            break
+        except Exception:
+            continue
+    if forward is None:
+        raise RuntimeError("Could not run a calibration forward pass for AWQ.")
+
+    def run():
+        for text in DEFAULT_CALIBRATION_TEXT:
+            mx.eval(forward(mx.array([tokenizer.encode(text)])))
+
+    stats = collect_activation_stats(root, run)
+    summary = apply_awq(root, stats, bits=q_bits or 4, group_size=q_group_size or 64)
+    print(f"[INFO] AWQ scaling applied: {summary}")
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -149,6 +189,7 @@ def convert(
     q_group_size: int = 64,
     q_bits: int = 4,
     q_mode: str = "affine",
+    quant_method: str = "rtn",
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -214,6 +255,10 @@ def convert(
         _preserve_existing_deepseek_v4_quantization(
             config, target, q_group_size, q_bits, q_mode
         )
+
+        if quant_method == "awq":
+            print("[INFO] Calibrating (AWQ)")
+            _apply_awq_calibration(model, processor, target, q_bits, q_group_size)
 
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
@@ -311,6 +356,13 @@ def configure_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["affine", "mxfp4", "nvfp4", "mxfp8"],
         default="affine",
+    )
+    parser.add_argument(
+        "--quant-method",
+        help="Weight quantization method.",
+        type=str,
+        choices=["rtn", "awq"],
+        default="rtn",
     )
     parser.add_argument(
         "--dtype",
