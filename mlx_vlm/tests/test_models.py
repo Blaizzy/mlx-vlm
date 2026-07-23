@@ -10639,6 +10639,28 @@ class TestVendoredDenseModels(unittest.TestCase):
             moe_layer_interval=1,
             head_dim=None,
         ),
+        "solar_open": dict(
+            model_type="solar_open",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            norm_topk_prob=True,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            partial_rotary_factor=0.5,
+        ),
     }
 
     def _run(self, name):
@@ -10687,3 +10709,6 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_ernie4_5_moe(self):
         self._run("ernie4_5_moe")
+
+    def test_solar_open(self):
+        self._run("solar_open")
