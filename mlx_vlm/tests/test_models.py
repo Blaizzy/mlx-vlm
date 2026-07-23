@@ -10618,6 +10618,27 @@ class TestVendoredDenseModels(unittest.TestCase):
                 {"attention": {"no_op": True}, "ffn": {"ffn_mult": 2.0}},
             ],
         ),
+        "ernie4_5_moe": dict(
+            model_type="ernie4_5_moe",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            use_bias=False,
+            tie_word_embeddings=False,
+            moe_num_experts=8,
+            moe_k=2,
+            moe_intermediate_size=32,
+            moe_num_shared_experts=1,
+            moe_layer_start_index=0,
+            moe_layer_interval=1,
+            head_dim=None,
+        ),
     }
 
     def _run(self, name):
@@ -10663,3 +10684,6 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_nemotron_nas(self):
         self._run("nemotron_nas")
+
+    def test_ernie4_5_moe(self):
+        self._run("ernie4_5_moe")
