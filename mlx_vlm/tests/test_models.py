@@ -10461,3 +10461,72 @@ class TestInklingMTP(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVendoredDenseModels(unittest.TestCase):
+    CFGS = {
+        "ernie4_5": dict(
+            model_type="ernie4_5",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            use_bias=True,
+            tie_word_embeddings=False,
+        ),
+        "seed_oss": dict(
+            model_type="seed_oss",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=512,
+            attention_out_bias=True,
+            tie_word_embeddings=False,
+        ),
+        "mimo": dict(
+            model_type="mimo",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+        ),
+    }
+
+    def _run(self, name):
+        import importlib
+
+        pkg = importlib.import_module(f"mlx_vlm.models.{name}")
+        model = pkg.Model(pkg.ModelConfig.from_dict(dict(self.CFGS[name])))
+        model.eval()
+        mx.eval(model.parameters())
+        ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
+        vocab = self.CFGS[name]["vocab_size"]
+        self.assertEqual(model(ids).logits.shape, (1, 8, vocab))
+        cache = model.language_model.make_cache()
+        model(ids[:, :-1], cache=cache)
+        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, vocab))
+
+    def test_ernie4_5(self):
+        self._run("ernie4_5")
+
+    def test_seed_oss(self):
+        self._run("seed_oss")
+
+    def test_mimo(self):
+        self._run("mimo")
