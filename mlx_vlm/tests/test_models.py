@@ -10542,6 +10542,23 @@ class TestAWQ(unittest.TestCase):
         )
         self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 2e-3)
 
+    def test_synthetic_calibration_media(self):
+        import numpy as np
+
+        from mlx_vlm.quant import (
+            synthetic_calibration_audio,
+            synthetic_calibration_images,
+        )
+
+        imgs = synthetic_calibration_images(4, size=64)
+        self.assertEqual(len(imgs), 4)
+        self.assertEqual(imgs[0].mode, "RGB")
+        self.assertEqual(imgs[0].size, (64, 64))
+        auds = synthetic_calibration_audio(3, seconds=0.1, sample_rate=8000)
+        self.assertEqual(len(auds), 3)
+        self.assertEqual(auds[0].dtype, np.float32)
+        self.assertEqual(int(auds[0].shape[0]), 800)
+
 
 if __name__ == "__main__":
     unittest.main()

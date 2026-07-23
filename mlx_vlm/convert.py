@@ -151,13 +151,110 @@ def _has_decoder(module):
     return False
 
 
-def _apply_awq_calibration(model, processor, target, q_bits, q_group_size):
-    """Calibrate on default text and apply AWQ scaling to the decoder in place."""
+def _build_multimodal_awq_run(model, processor, config, calibration_data):
+    """Build a calibration forward that routes media+text through the full model.
+
+    Returns ``(run, n_samples)``, or ``(None, 0)`` when the model has no
+    vision/audio modality so the caller falls back to text calibration.
+    """
+    from .prompt_utils import apply_chat_template
+    from .quant import (
+        load_calibration_media,
+        synthetic_calibration_audio,
+        synthetic_calibration_images,
+    )
+    from .utils import prepare_inputs
+
+    has_vision = bool(config.get("vision_config")) or (
+        getattr(model, "vision_tower", None) is not None
+    )
+    has_audio = bool(config.get("audio_config")) or (
+        getattr(model, "audio_tower", None) is not None
+    )
+    if not has_vision and not has_audio:
+        return None, 0
+
+    if calibration_data:
+        images, audios = load_calibration_media(calibration_data)
+    else:
+        images = synthetic_calibration_images(8) if has_vision else []
+        audios = synthetic_calibration_audio(8) if has_audio else []
+        print(
+            "[INFO] AWQ: using synthetic calibration media; pass "
+            "--calibration-data for real image/audio samples."
+        )
+
+    samples = [(im, None, 1, 0) for im in images]
+    samples += [(None, au, 0, 1) for au in audios]
+    if not samples:
+        return None, 0
+
+    cfg = model.config
+
+    def run():
+        for image, audio, n_img, n_aud in samples:
+            prompt = (
+                "Describe this image in detail."
+                if n_img
+                else "Describe what you hear in this audio."
+            )
+            formatted = apply_chat_template(
+                processor, cfg, prompt, num_images=n_img, num_audios=n_aud
+            )
+            inputs = prepare_inputs(
+                processor,
+                images=[image] if image is not None else None,
+                audio=[audio] if audio is not None else None,
+                prompts=formatted,
+                image_token_index=getattr(cfg, "image_token_index", None),
+                add_special_tokens=False,
+                pad_to_uniform_size=False,
+            )
+            extra = {
+                k: v
+                for k, v in inputs.items()
+                if k not in ("input_ids", "pixel_values", "attention_mask")
+            }
+            mx.eval(
+                model(
+                    inputs.get("input_ids"),
+                    pixel_values=inputs.get("pixel_values"),
+                    mask=inputs.get("attention_mask"),
+                    **extra,
+                )
+            )
+
+    return run, len(samples)
+
+
+def _apply_awq_calibration(
+    model,
+    processor,
+    config,
+    target,
+    q_bits,
+    q_group_size,
+    calibration="text",
+    calibration_data=None,
+):
+    """Calibrate (text or multimodal) and apply AWQ scaling to the decoder."""
     from .quant import DEFAULT_CALIBRATION_TEXT, apply_awq, collect_activation_stats
 
     tokenizer = getattr(processor, "tokenizer", processor)
     language_model = getattr(model, "language_model", None)
     root = language_model if _has_decoder(language_model) else target
+
+    if calibration == "multimodal":
+        run, n = _build_multimodal_awq_run(model, processor, config, calibration_data)
+        if run is not None:
+            print(f"[INFO] AWQ: multimodal calibration on {n} media samples.")
+            stats = collect_activation_stats(root, run)
+            summary = apply_awq(
+                root, stats, bits=q_bits or 4, group_size=q_group_size or 64
+            )
+            print(f"[INFO] AWQ scaling applied: {summary}")
+            return
+        print("[INFO] AWQ: no vision/audio modality found; using text calibration.")
 
     probe = mx.array([tokenizer.encode(DEFAULT_CALIBRATION_TEXT[0])])
     forward = None
@@ -190,6 +287,8 @@ def convert(
     q_bits: int = 4,
     q_mode: str = "affine",
     quant_method: str = "rtn",
+    calibration: str = "text",
+    calibration_data: Optional[str] = None,
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -258,7 +357,16 @@ def convert(
 
         if quant_method == "awq":
             print("[INFO] Calibrating (AWQ)")
-            _apply_awq_calibration(model, processor, target, q_bits, q_group_size)
+            _apply_awq_calibration(
+                model,
+                processor,
+                config,
+                target,
+                q_bits,
+                q_group_size,
+                calibration=calibration,
+                calibration_data=calibration_data,
+            )
 
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
@@ -363,6 +471,19 @@ def configure_parser() -> argparse.ArgumentParser:
         type=str,
         choices=["rtn", "awq"],
         default="rtn",
+    )
+    parser.add_argument(
+        "--calibration",
+        help="AWQ calibration inputs: text (default) or multimodal (image/audio+text).",
+        type=str,
+        choices=["text", "multimodal"],
+        default="text",
+    )
+    parser.add_argument(
+        "--calibration-data",
+        help="Optional directory of real images/audio for --calibration multimodal.",
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--dtype",
