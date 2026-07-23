@@ -160,6 +160,206 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_laguna_nvfp4_compressed_tensors_config(self):
+        from mlx_vlm.models import laguna
+
+        raw_config = {
+            "model_type": "laguna",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "max_position_embeddings": 128,
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "nvfp4-pack-quantized",
+                        "weights": {"group_size": 16, "num_bits": 4},
+                    }
+                },
+            },
+        }
+        config = laguna.ModelConfig.from_dict(raw_config)
+
+        self.assertEqual(
+            config.quantization,
+            {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        self.assertIs(config.quantization_config, config.quantization)
+        self.assertEqual(raw_config["quantization"], config.quantization)
+        self.assertEqual(raw_config["quantization_config"], config.quantization)
+
+    def test_laguna_stacks_nvfp4_experts_before_scale_folding(self):
+        from unittest.mock import patch
+
+        import mlx_vlm.utils as utils
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        weights = {
+            "model.layers.1.mlp.gate.weight": mx.zeros((3, 16)),
+            "model.layers.1.mlp.experts.e_score_correction_bias": mx.zeros((3,)),
+        }
+        for expert_idx in range(config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
+                fill_value = {
+                    "gate_proj": expert_idx + 1,
+                    "up_proj": expert_idx + 11,
+                    "down_proj": expert_idx + 21,
+                }[proj]
+                weights[f"{prefix}.weight_packed"] = mx.full(
+                    (16, 8), fill_value, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_scale"] = mx.full(
+                    (16, 1), 0x38, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+                weights[f"{prefix}.input_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+
+        with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
+            sanitized = model.language_model.sanitize(weights)
+
+        self.assertEqual(encode.call_count, 2)
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"].shape,
+            (3, 32, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.scales"].shape,
+            (3, 32, 1),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.down_proj.weight"].shape,
+            (3, 16, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.down_proj.scales"].shape,
+            (3, 16, 1),
+        )
+        gate_up = sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"]
+        mx.eval(gate_up)
+        expected_gate = mx.full((16, 8), 1, dtype=mx.uint8).view(mx.uint32)
+        expected_up = mx.full((16, 8), 11, dtype=mx.uint8).view(mx.uint32)
+        self.assertTrue(
+            np.array_equal(np.array(gate_up[0, :16]), np.array(expected_gate))
+        )
+        self.assertTrue(
+            np.array_equal(np.array(gate_up[0, 16:]), np.array(expected_up))
+        )
+        self.assertIn("model.layers.1.mlp.gate.e_score_correction_bias", sanitized)
+        self.assertFalse(any(".weight_packed" in key for key in sanitized))
+        self.assertFalse(any(".weight_scale" in key for key in sanitized))
+        self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
+        self.assertFalse(any(".input_global_scale" in key for key in sanitized))
+
+    def test_laguna_sanitize_drops_input_global_scale(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            num_attention_heads_per_layer=[4],
+            num_experts=0,
+        )
+        model = laguna.Model(config)
+
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mlp.gate_proj.input_global_scale": mx.array(
+                    [1.0], dtype=mx.float32
+                )
+            }
+        )
+
+        self.assertNotIn(
+            "language_model.model.layers.0.mlp.gate_proj.input_global_scale",
+            sanitized,
+        )
+
+    def test_laguna_sanitize_fuses_prefixed_split_switch_gate_up(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+        prefix = "language_model.model.layers.1.mlp.switch_mlp"
+
+        sanitized = model.sanitize(
+            {
+                f"{prefix}.gate_proj.weight": mx.full((2, 16, 2), 1, dtype=mx.uint32),
+                f"{prefix}.up_proj.weight": mx.full((2, 16, 2), 2, dtype=mx.uint32),
+                f"{prefix}.gate_proj.scales": mx.full((2, 16, 1), 0x38, dtype=mx.uint8),
+                f"{prefix}.up_proj.scales": mx.full((2, 16, 1), 0x40, dtype=mx.uint8),
+                f"{prefix}.down_proj.weight": mx.zeros((2, 16, 2), dtype=mx.uint32),
+                f"{prefix}.down_proj.scales": mx.zeros((2, 16, 1), dtype=mx.uint8),
+            }
+        )
+
+        fused_weight = sanitized[f"{prefix}.gate_up_proj.weight"]
+        fused_scales = sanitized[f"{prefix}.gate_up_proj.scales"]
+        mx.eval(fused_weight, fused_scales)
+
+        self.assertEqual(fused_weight.shape, (2, 32, 2))
+        self.assertEqual(fused_scales.shape, (2, 32, 1))
+        self.assertTrue(np.all(np.array(fused_weight[:, :16]) == 1))
+        self.assertTrue(np.all(np.array(fused_weight[:, 16:]) == 2))
+        self.assertTrue(np.all(np.array(fused_scales[:, :16]) == 0x38))
+        self.assertTrue(np.all(np.array(fused_scales[:, 16:]) == 0x40))
+        self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
+
     def test_hrm_text_language_model(self):
         from mlx_vlm.models import hrm_text
 
@@ -6211,6 +6411,108 @@ class TestModels(unittest.TestCase):
         self.assertEqual(features.shape, (1, 4, 3, config.embed_dim))
         self.assertTrue(mx.all(mx.isfinite(features)).item())
 
+    def _tiny_inkling_config(self):
+        from mlx_vlm.models.inkling.config import (
+            AudioConfig,
+            ModelConfig,
+            TextConfig,
+            VisionConfig,
+        )
+
+        text = TextConfig(
+            model_type="inkling",
+            hidden_size=64,
+            num_hidden_layers=2,
+            vocab_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=2,
+            swa_head_dim=16,
+            sliding_window_size=8,
+            layer_types=["hybrid_sliding", "hybrid"],
+            d_rel=4,
+            rel_extent=16,
+            sconv_kernel_size=4,
+            mlp_layer_types=["dense", "sparse"],
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_shared_experts=2,
+            logits_mup_width_multiplier=1.0,
+        )
+        return ModelConfig(
+            model_type="inkling",
+            text_config=text,
+            vision_config=VisionConfig(
+                patch_size=4, temporal_patch_size=2, num_channels=3, n_layers=1
+            ),
+            audio_config=AudioConfig(n_mel_bins=8, mel_vocab_size=4),
+            image_token_id=100,
+            audio_token_id=101,
+            vocab_size=128,
+        )
+
+    def test_inkling_language_model(self):
+        from mlx_vlm.models import inkling
+
+        config = self._tiny_inkling_config()
+        model = inkling.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "CacheList")
+        self.assertEqual(type(cache[0][0]).__name__, "KVCache")
+        self.assertEqual(type(cache[0][1]).__name__, "ArraysCache")
+
+    def test_inkling_towers_and_multimodal(self):
+        from mlx_vlm.models import inkling
+
+        config = self._tiny_inkling_config()
+        hidden = config.text_config.hidden_size
+        model = inkling.Model(config)
+        mx.eval(model.parameters())
+
+        # vision HMLP tower: one soft token per patch, projected into LM space
+        n_patches = 2
+        pixel_values = mx.random.uniform(shape=(n_patches, 2, 4, 4, 3))
+        image_features = model.get_image_features(pixel_values)
+        self.assertEqual(image_features.shape, (n_patches, hidden))
+
+        # dMel audio tower: one embedding per frame
+        n_frames = 3
+        audio_input_ids = mx.zeros((1, n_frames, 8), dtype=mx.int32)
+        audio_features = model.get_audio_features(audio_input_ids)
+        self.assertEqual(audio_features.shape, (n_frames, hidden))
+
+        # multimodal merge: image/audio placeholder tokens replaced by tower features
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        ids = [1, 100, 100, 2, 101, 101, 101, 3]
+        emb = model.get_input_embeddings(
+            mx.array([ids]),
+            pixel_values=pixel_values,
+            audio_input_ids=audio_input_ids,
+        )
+        self.assertIsInstance(emb, InputEmbeddingsFeatures)
+        self.assertEqual(emb.inputs_embeds.shape, (1, len(ids), hidden))
+
+        out = model(
+            mx.array([ids]),
+            pixel_values=pixel_values,
+            audio_input_ids=audio_input_ids,
+        )
+        self.assertEqual(out.logits.shape, (1, len(ids), config.text_config.vocab_size))
+        self.assertTrue(bool(mx.isfinite(out.logits).all()))
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -10078,3 +10380,127 @@ class TestSetGenerationDevice(unittest.TestCase):
                 pass  # must not touch Metal device_info on the cpu device
         finally:
             mx.set_default_device(original_device)
+
+
+class TestInklingMTP(unittest.TestCase):
+    """Inkling multi-token-prediction speculative drafter.
+
+    All checks are synthetic (random-init tiny configs). The forward is
+    inferred from the checkpoint weight names since HF omits the Inkling MTP
+    head; correctness here is guaranteed by target verification regardless of
+    draft quality, so the greedy-invariant and rollback tests validate the
+    machinery, not acceptance rate."""
+
+    TEXT = {
+        "model_type": "inkling",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "vocab_size": 128,
+        "unpadded_vocab_size": None,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": False,
+        "use_embed_norm": True,
+        "logits_mup_width_multiplier": 1.0,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 16,
+        "swa_num_attention_heads": 8,
+        "swa_num_key_value_heads": 4,
+        "swa_head_dim": 16,
+        "sliding_window_size": 32,
+        "layer_types": ["hybrid_sliding", "hybrid"],
+        "d_rel": 16,
+        "rel_extent": 64,
+        "log_scaling_n_floor": None,
+        "log_scaling_alpha": 0.1,
+        "sconv_kernel_size": 4,
+        "mlp_layer_types": ["dense", "sparse"],
+        "intermediate_size": 128,
+        "moe_intermediate_size": 64,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "route_scale": 8.0,
+        "num_mtp_layers": 1,
+        "mtp_local_layer_ids": [0],
+    }
+
+    def _build(self):
+        from mlx_vlm.models.inkling.config import ModelConfig
+        from mlx_vlm.models.inkling.inkling import Model
+        from mlx_vlm.speculative.drafters.inkling_mtp import InklingMTPDraftModel
+        from mlx_vlm.speculative.drafters.inkling_mtp import ModelConfig as MTPConfig
+
+        mx.random.seed(0)
+        vocab = self.TEXT["vocab_size"]
+        target = Model(
+            ModelConfig(text_config=dict(self.TEXT), vocab_size=vocab, eos_token_id=[])
+        )
+        target.eval()
+        mx.eval(target.parameters())
+        drafter = InklingMTPDraftModel(MTPConfig(text_config=dict(self.TEXT)))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        return target, drafter
+
+    def test_drafter_forward_shape(self):
+        target, drafter = self._build()
+        drafter.reset(target)
+        seq = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        hidden = target.language_model(
+            input_ids=seq, cache=target.make_cache(), return_hidden=True
+        ).hidden_states[-1]
+        out = drafter._forward_seq(seq, hidden, 0, mx.int32)
+        logits = drafter._block_logits(out[:, -1:, :])
+        self.assertEqual(logits.shape, (1, 1, self.TEXT["vocab_size"]))
+
+    def _generate(self, target, drafter, use_draft):
+        from mlx_vlm.generate.ar import generate_step
+
+        prompt = mx.array([[10, 20, 30, 40, 50]], dtype=mx.int32)
+        kwargs = dict(max_tokens=40, temperature=0.0, seed=0)
+        if use_draft:
+            kwargs.update(draft_model=drafter, draft_kind="mtp")
+        toks = []
+        for tok, _ in generate_step(prompt, target, None, None, **kwargs):
+            toks.append(
+                int(tok) if isinstance(tok, int) else int(mx.array(tok).reshape(-1)[0])
+            )
+        return toks
+
+    def test_greedy_matches_baseline(self):
+        target, drafter = self._build()
+        baseline = self._generate(target, drafter, use_draft=False)
+        drafter.reset(target)
+        speculative = self._generate(target, drafter, use_draft=True)
+        self.assertEqual(baseline, speculative)
+
+    def test_rollback_restore_replay(self):
+        target, _ = self._build()
+        lm = target.language_model
+        prompt = mx.array([[10, 20, 30, 40, 50]], dtype=mx.int32)
+        verify_input = mx.array([[7, 11, 13, 17]], dtype=mx.int32)
+        accepted = 2
+
+        c1 = lm.make_cache()
+        lm(input_ids=prompt, cache=c1)
+        _, _, gdn = lm.speculative_verify_hidden(verify_input, c1)
+        lm.rollback_speculative_cache(
+            c1, gdn, accepted, block_size=verify_input.shape[1]
+        )
+
+        c2 = lm.make_cache()
+        lm(
+            input_ids=mx.concatenate([prompt, verify_input[:, : accepted + 1]], axis=1),
+            cache=c2,
+        )
+
+        self.assertEqual(c1[0][0].offset, c2[0][0].offset)
+        probe = mx.array([[3]], dtype=mx.int32)
+        l1 = lm(input_ids=probe, cache=c1).logits
+        l2 = lm(input_ids=probe, cache=c2).logits
+        self.assertLess(float(mx.max(mx.abs(l1 - l2))), 1e-4)
+
+
+if __name__ == "__main__":
+    unittest.main()
