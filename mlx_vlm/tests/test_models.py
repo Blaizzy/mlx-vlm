@@ -10711,6 +10711,30 @@ class TestVendoredDenseModels(unittest.TestCase):
             routed_scaling_factor=2.5,
             norm_topk_prob=True,
         ),
+        "bailing_moe": dict(
+            model_type="bailing_moe",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=8,
+            num_experts_per_tok=2,
+            num_hidden_layers=3,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            vocab_size=128,
+            first_k_dense_replace=1,
+            use_qk_norm=True,
+            moe_router_enable_expert_bias=True,
+            n_group=2,
+            topk_group=1,
+            score_function="sigmoid",
+            routed_scaling_factor=2.5,
+        ),
     }
 
     def _run(self, name):
@@ -10768,3 +10792,6 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_exaone_moe(self):
         self._run("exaone_moe")
+
+    def test_bailing_moe(self):
+        self._run("bailing_moe")
