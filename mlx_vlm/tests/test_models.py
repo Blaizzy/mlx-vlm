@@ -434,6 +434,54 @@ class TestModels(unittest.TestCase):
             sanitized,
         )
 
+    def test_laguna_sanitize_fuses_prefixed_split_switch_gate_up(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+        prefix = "language_model.model.layers.1.mlp.switch_mlp"
+
+        sanitized = model.sanitize(
+            {
+                f"{prefix}.gate_proj.weight": mx.full((2, 16, 2), 1, dtype=mx.uint32),
+                f"{prefix}.up_proj.weight": mx.full((2, 16, 2), 2, dtype=mx.uint32),
+                f"{prefix}.gate_proj.scales": mx.full((2, 16, 1), 0x38, dtype=mx.uint8),
+                f"{prefix}.up_proj.scales": mx.full((2, 16, 1), 0x40, dtype=mx.uint8),
+                f"{prefix}.down_proj.weight": mx.zeros((2, 16, 2), dtype=mx.uint32),
+                f"{prefix}.down_proj.scales": mx.zeros((2, 16, 1), dtype=mx.uint8),
+            }
+        )
+
+        fused_weight = sanitized[f"{prefix}.gate_up_proj.weight"]
+        fused_scales = sanitized[f"{prefix}.gate_up_proj.scales"]
+        mx.eval(fused_weight, fused_scales)
+
+        self.assertEqual(fused_weight.shape, (2, 32, 2))
+        self.assertEqual(fused_scales.shape, (2, 32, 1))
+        self.assertTrue(np.all(np.array(fused_weight[:, :16]) == 1))
+        self.assertTrue(np.all(np.array(fused_weight[:, 16:]) == 2))
+        self.assertTrue(np.all(np.array(fused_scales[:, :16]) == 0x38))
+        self.assertTrue(np.all(np.array(fused_scales[:, 16:]) == 0x40))
+        self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
+
     def test_hrm_text_language_model(self):
         from mlx_vlm.models import hrm_text
 
