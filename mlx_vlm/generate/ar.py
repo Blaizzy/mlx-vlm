@@ -161,6 +161,11 @@ def generate_step(
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    dry_multiplier: float = 0.0,
+    dry_base: float = 1.75,
+    dry_allowed_length: int = 2,
+    dry_sequence_breakers: Optional[List[int]] = None,
+    dry_range: int = 0,
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
@@ -285,6 +290,11 @@ def generate_step(
         presence_context_size,
         frequency_penalty,
         frequency_context_size,
+        dry_multiplier=dry_multiplier,
+        dry_base=dry_base,
+        dry_allowed_length=dry_allowed_length,
+        dry_sequence_breakers=dry_sequence_breakers,
+        dry_range=dry_range,
     )
     if logits_processors is not None:
         processors.extend(logits_processors)

@@ -344,6 +344,17 @@ class OpenAIRequest(FlexibleBaseModel):
     p_less: bool = Field(
         False, description="Hyperparameter-free p-less sampling (on/off)."
     )
+    dry_multiplier: float = Field(
+        0.0, description="DRY repetition sampler multiplier. 0 disables."
+    )
+    dry_base: float = Field(1.75, description="DRY penalty growth base.")
+    dry_allowed_length: int = Field(
+        2, description="DRY: repeats up to this length are unpenalized."
+    )
+    dry_sequence_breakers: Optional[List[int]] = Field(
+        None, description="DRY: token ids that reset sequence matching."
+    )
+    dry_range: int = Field(0, description="DRY: history tokens to search (0=all).")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
@@ -730,6 +741,17 @@ class VLMRequest(FlexibleBaseModel):
     p_less: bool = Field(
         False, description="Hyperparameter-free p-less sampling (on/off)."
     )
+    dry_multiplier: float = Field(
+        0.0, description="DRY repetition sampler multiplier. 0 disables."
+    )
+    dry_base: float = Field(1.75, description="DRY penalty growth base.")
+    dry_allowed_length: int = Field(
+        2, description="DRY: repeats up to this length are unpenalized."
+    )
+    dry_sequence_breakers: Optional[List[int]] = Field(
+        None, description="DRY: token ids that reset sequence matching."
+    )
+    dry_range: int = Field(0, description="DRY: history tokens to search (0=all).")
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(

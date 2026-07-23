@@ -5180,6 +5180,7 @@ class TestResponseGenerator:
             presence_context_size,
             frequency_penalty,
             frequency_context_size,
+            **kwargs,
         ):
             calls.append(
                 (
@@ -5228,7 +5229,7 @@ class TestResponseGenerator:
         monkeypatch.setattr(
             server_generation,
             "make_logits_processors",
-            lambda *_args: [repetition_processor],
+            lambda *_args, **_kwargs: [repetition_processor],
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -5260,7 +5261,7 @@ class TestResponseGenerator:
         monkeypatch.setattr(
             server_generation,
             "make_logits_processors",
-            lambda *_args: [],
+            lambda *_args, **_kwargs: [],
         )
 
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)

@@ -684,6 +684,11 @@ class GenerationArguments:
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     frequency_penalty: Optional[float] = None
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    dry_multiplier: float = 0.0
+    dry_base: float = 1.75
+    dry_allowed_length: int = 2
+    dry_sequence_breakers: Optional[List[int]] = None
+    dry_range: int = 0
     max_denoising_steps: Optional[int] = None
     block_length: Optional[int] = None
     num_to_transfer: Optional[int] = None
@@ -760,6 +765,12 @@ class GenerationArguments:
             kw["frequency_penalty"] = self.frequency_penalty
         if self.frequency_context_size is not None:
             kw["frequency_context_size"] = self.frequency_context_size
+        if self.dry_multiplier and self.dry_multiplier > 0:
+            kw["dry_multiplier"] = self.dry_multiplier
+            kw["dry_base"] = self.dry_base
+            kw["dry_allowed_length"] = self.dry_allowed_length
+            kw["dry_sequence_breakers"] = self.dry_sequence_breakers
+            kw["dry_range"] = self.dry_range
         if self.logit_bias is not None:
             kw["logit_bias"] = self.logit_bias
         if self.thinking_budget is not None:
@@ -1441,6 +1452,11 @@ class ResponseGenerator:
             args.presence_context_size,
             args.frequency_penalty,
             args.frequency_context_size,
+            dry_multiplier=args.dry_multiplier,
+            dry_base=args.dry_base,
+            dry_allowed_length=args.dry_allowed_length,
+            dry_sequence_breakers=args.dry_sequence_breakers,
+            dry_range=args.dry_range,
         )
         if args.logits_processors is not None:
             request_processors = args.logits_processors
