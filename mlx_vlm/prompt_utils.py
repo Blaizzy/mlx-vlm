@@ -100,6 +100,7 @@ MODEL_CONFIG = {
     "moondream2": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
+    "plamo2vl": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
     "laguna": MessageFormat.TEXT_ONLY,
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
