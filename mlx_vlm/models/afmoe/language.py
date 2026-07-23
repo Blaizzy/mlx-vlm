@@ -4,13 +4,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -105,25 +105,6 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, args: ModelConfig, intermediate_size: Optional[int] = None):
-        super().__init__()
-
-        dim = args.hidden_size
-        hidden_dim = (
-            intermediate_size
-            if intermediate_size is not None
-            else args.intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class MoERouter(nn.Module):
     """Router module that wraps the gate for proper weight naming."""
 
@@ -161,7 +142,7 @@ class AfmoeMoE(nn.Module):
             shared_intermediate_size = (
                 args.moe_intermediate_size * args.num_shared_experts
             )
-            self.shared_experts = MLP(args, intermediate_size=shared_intermediate_size)
+            self.shared_experts = SwiGLUMLP(args.hidden_size, shared_intermediate_size)
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.router(x)
@@ -220,7 +201,7 @@ class DecoderLayer(nn.Module):
         self.self_attn = Attention(args, is_local_attention=use_sliding)
 
         if layer_idx < args.num_dense_layers:
-            self.mlp = MLP(args)
+            self.mlp = SwiGLUMLP(args.hidden_size, args.intermediate_size)
         else:
             self.mlp = AfmoeMoE(args)
 

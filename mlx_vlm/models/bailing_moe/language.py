@@ -4,13 +4,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -21,29 +21,6 @@ def aggregate_expert_outputs(expert_outputs, scores):
     return (
         (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
     )
-
-
-class BailingMoeMLP(nn.Module):
-    def __init__(self, args: ModelConfig, intermediate_size: Optional[int] = None):
-        super().__init__()
-        self.intermediate_size = (
-            intermediate_size
-            if intermediate_size is not None
-            else args.intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(
-            args.hidden_size, self.intermediate_size, bias=args.use_bias
-        )
-        self.down_proj = nn.Linear(
-            self.intermediate_size, args.hidden_size, bias=args.use_bias
-        )
-        self.up_proj = nn.Linear(
-            args.hidden_size, self.intermediate_size, bias=args.use_bias
-        )
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class BailingMoeAttention(nn.Module):
@@ -213,9 +190,10 @@ class BailingMoeSparseMoeBlock(nn.Module):
             args.moe_shared_expert_intermediate_size or args.moe_intermediate_size
         )
         self.shared_experts = (
-            BailingMoeMLP(
-                args=args,
-                intermediate_size=shared_dim * args.num_shared_experts,
+            SwiGLUMLP(
+                args.hidden_size,
+                shared_dim * args.num_shared_experts,
+                bias=args.use_bias,
             )
             if args.num_shared_experts > 0 and args.moe_router_enable_shared_expert
             else None
@@ -240,7 +218,7 @@ class BailingMoeDecoderLayer(nn.Module):
             if (
                 args.num_experts is not None and layer_idx >= args.first_k_dense_replace
             )
-            else BailingMoeMLP(args)
+            else SwiGLUMLP(args.hidden_size, args.intermediate_size, bias=args.use_bias)
         )
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(

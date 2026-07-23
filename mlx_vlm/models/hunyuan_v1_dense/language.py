@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP
 from .config import ModelConfig
 
 
@@ -111,28 +111,13 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, args: ModelConfig):
-        super().__init__()
-
-        dim = args.hidden_size
-        hidden_dim = args.intermediate_size
-
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class TransformerBlock(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
-        self.mlp = MLP(args)
+        self.mlp = SwiGLUMLP(args.hidden_size, args.intermediate_size)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps

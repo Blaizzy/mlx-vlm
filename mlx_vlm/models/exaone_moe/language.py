@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -76,19 +76,6 @@ class MoEGate(nn.Module):
         )
 
 
-class MLP(nn.Module):
-    def __init__(self, args: ModelConfig, intermediate_size: Optional[int] = None):
-        super().__init__()
-        hidden_size = args.hidden_size
-        intermediate_size = intermediate_size or args.intermediate_size
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-
-    def __call__(self, x):
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class MoE(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -101,9 +88,9 @@ class MoE(nn.Module):
         self.gate = MoEGate(args)
 
         self.shared_experts = (
-            MLP(
-                args,
-                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
+            SwiGLUMLP(
+                args.hidden_size,
+                args.moe_intermediate_size * args.num_shared_experts,
             )
             if args.num_shared_experts is not None and args.num_shared_experts > 0
             else None
@@ -197,7 +184,11 @@ class DecoderLayer(nn.Module):
         super().__init__()
 
         self.self_attn = Attention(args, layer_idx)
-        self.mlp = MoE(args) if args.is_moe_layer[layer_idx] else MLP(args)
+        self.mlp = (
+            MoE(args)
+            if args.is_moe_layer[layer_idx]
+            else SwiGLUMLP(args.hidden_size, args.intermediate_size)
+        )
         self.is_sliding_window = self.self_attn.is_sliding_window
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)

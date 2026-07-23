@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
@@ -97,24 +97,13 @@ class Olmo3Attention(nn.Module):
         return self.o_proj(output)
 
 
-class Olmo3MLP(nn.Module):
-    def __init__(self, args: ModelConfig):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class Olmo3DecoderLayer(nn.Module):
     def __init__(self, args: ModelConfig, layer_idx: int):
         super().__init__()
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
         self.self_attn = Olmo3Attention(args, layer_idx=layer_idx)
-        self.mlp = Olmo3MLP(args)
+        self.mlp = SwiGLUMLP(args.hidden_size, args.intermediate_size)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )

@@ -3,13 +3,13 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP
 from .config import ModelConfig
 
 
@@ -110,28 +110,11 @@ class Attention(nn.Module):
         return self.o_proj(out)
 
 
-class MLP(nn.Module):
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.up_proj = nn.Linear(
-            config.hidden_size, config.intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size, config.hidden_size, bias=False
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class DecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, layer_idx: int):
         super().__init__()
         self.self_attn = Attention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLUMLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps

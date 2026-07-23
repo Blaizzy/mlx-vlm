@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -67,17 +67,6 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class Ernie4_5_MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, use_bias=False):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=use_bias)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class Ernie4_5_MoeMLP(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -104,7 +93,7 @@ class Ernie4_5_MoeMLP(nn.Module):
                 if getattr(args, "moe_intermediate_size", None)
                 else args.intermediate_size * args.moe_num_shared_experts
             )
-            self.shared_experts = Ernie4_5_MLP(
+            self.shared_experts = SwiGLUMLP(
                 args.hidden_size, shared_intermediate_size, args.use_bias
             )
         else:
@@ -163,7 +152,7 @@ class Ernie4_5_DecoderLayer(nn.Module):
         ):
             self.mlp = Ernie4_5_MoeMLP(args)
         else:
-            self.mlp = Ernie4_5_MLP(
+            self.mlp = SwiGLUMLP(
                 args.hidden_size, args.intermediate_size, args.use_bias
             )
 

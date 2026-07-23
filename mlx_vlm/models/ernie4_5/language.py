@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
@@ -62,22 +62,11 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, use_bias=False):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=use_bias)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class DecoderLayer(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size, args.use_bias)
+        self.mlp = SwiGLUMLP(args.hidden_size, args.intermediate_size, args.use_bias)
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps

@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
+from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
@@ -131,31 +131,6 @@ class Dots1TopkRouter(nn.Module):
         )
 
 
-class Dots1MLP(nn.Module):
-    def __init__(
-        self, args: ModelConfig, hidden_size: int = None, intermediate_size: int = None
-    ):
-        super().__init__()
-
-        self.hidden_size = args.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            args.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
-        )
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.mlp_bias
-        )
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class Dots1MoE(nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
@@ -170,9 +145,10 @@ class Dots1MoE(nn.Module):
 
         self.gate = Dots1TopkRouter(args)
 
-        self.shared_experts = Dots1MLP(
-            args=args,
-            intermediate_size=args.moe_intermediate_size * args.n_shared_experts,
+        self.shared_experts = SwiGLUMLP(
+            args.hidden_size,
+            args.moe_intermediate_size * args.n_shared_experts,
+            bias=args.mlp_bias,
         )
 
     def __call__(self, x):
@@ -193,7 +169,9 @@ class Dots1DecoderLayer(nn.Module):
         if layer_idx >= args.first_k_dense_replace:
             self.mlp = Dots1MoE(args)
         else:
-            self.mlp = Dots1MLP(args)
+            self.mlp = SwiGLUMLP(
+                args.hidden_size, args.intermediate_size, bias=args.mlp_bias
+            )
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(

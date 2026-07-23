@@ -3,13 +3,13 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP
 from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
@@ -85,29 +85,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(
-        self,
-        config: ModelConfig,
-        hidden_size: int = None,
-        intermediate_size: int = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-        return down_proj
 
 
 @mx.compile
@@ -189,9 +166,7 @@ class MoE(nn.Module):
         self.gate = MoEGate(config)
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = MLP(
-                config=config, intermediate_size=intermediate_size
-            )
+            self.shared_experts = SwiGLUMLP(config.hidden_size, intermediate_size)
 
     def __call__(self, x):
         inds, scores = self.gate(x)
@@ -207,7 +182,11 @@ class DecoderLayer(nn.Module):
     def __init__(self, config: ModelConfig, is_moe, is_sliding_window):
         super().__init__()
         self.self_attn = Attention(config, is_sliding_window)
-        self.mlp = MoE(config) if is_moe else MLP(config)
+        self.mlp = (
+            MoE(config)
+            if is_moe
+            else SwiGLUMLP(config.hidden_size, config.intermediate_size)
+        )
         self.is_sliding_window = is_sliding_window
         self.input_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.layernorm_epsilon
