@@ -319,12 +319,8 @@ class TestModels(unittest.TestCase):
                 (16, 8), fill_value, dtype=mx.uint8
             )
             weights[f"{prefix}.weight_scale"] = mx.full((16, 1), 0x38, dtype=mx.uint8)
-            weights[f"{prefix}.weight_global_scale"] = mx.array(
-                [1.0], dtype=mx.float32
-            )
-            weights[f"{prefix}.input_global_scale"] = mx.array(
-                [1.0], dtype=mx.float32
-            )
+            weights[f"{prefix}.weight_global_scale"] = mx.array([1.0], dtype=mx.float32)
+            weights[f"{prefix}.input_global_scale"] = mx.array([1.0], dtype=mx.float32)
 
         with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
             sanitized = model.language_model.sanitize(weights)
