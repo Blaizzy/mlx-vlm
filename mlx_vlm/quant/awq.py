@@ -76,7 +76,7 @@ def _fold_into_linear(prev: nn.Module, linears: List[nn.Module], s: mx.array) ->
 
 
 def _norm_ok(norm: nn.Module, linears: List[nn.Module]) -> bool:
-    if norm is None or not hasattr(norm, "weight"):
+    if type(norm) is not nn.RMSNorm:
         return False
     return all(int(norm.weight.shape[-1]) == int(l.weight.shape[-1]) for l in linears)
 

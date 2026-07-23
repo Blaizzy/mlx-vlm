@@ -10509,6 +10509,39 @@ class TestAWQ(unittest.TestCase):
         self.assertEqual(summary["groups"], 0)
         self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 1e-6)
 
+    def test_custom_one_plus_weight_norm_is_not_folded(self):
+        from mlx_vlm.quant import apply_awq, collect_activation_stats
+
+        class OnePlusRMSNorm(nn.Module):
+            def __init__(self, d, eps=1e-5):
+                super().__init__()
+                self.weight = mx.zeros((d,))
+                self.eps = eps
+
+            def __call__(self, x):
+                return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+
+        mx.random.seed(0)
+        block = _AWQBlock()
+        block.input_layernorm = OnePlusRMSNorm(64)
+        block.input_layernorm.weight = mx.random.uniform(-0.1, 0.1, (64,))
+        mx.eval(block.parameters())
+        before = mx.array(block.input_layernorm.weight)
+        x = mx.random.normal((2, 6, 64))
+        y0 = block(x)
+        mx.eval(y0)
+
+        def run():
+            for _ in range(3):
+                mx.eval(block(mx.random.normal((2, 6, 64))))
+
+        stats = collect_activation_stats(block, run)
+        apply_awq(block, stats, bits=4, group_size=32)
+        self.assertLess(
+            float(mx.max(mx.abs(block.input_layernorm.weight - before))), 1e-6
+        )
+        self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 2e-3)
+
 
 if __name__ == "__main__":
     unittest.main()
