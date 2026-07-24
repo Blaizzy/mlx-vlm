@@ -1059,8 +1059,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -1072,8 +1071,7 @@ def upload_to_hub(path: str, upload_repo: str):
         ```bash
         python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()

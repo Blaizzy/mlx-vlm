@@ -208,7 +208,7 @@ class VisionTransformer(nn.Module):
         pos_emb_size = int(pos_emb.shape[0] ** 0.5)
         pos_emb = mx.reshape(pos_emb, (pos_emb_size, pos_emb_size, pos_emb.shape[1]))
 
-        (patch_num_0, patch_num_1) = patch_num
+        patch_num_0, patch_num_1 = patch_num
 
         if pos_emb.shape[0] != patch_num_0 or pos_emb.shape[1] != patch_num_1:
             # Reshape for upsampling (add batch and channel dims)
