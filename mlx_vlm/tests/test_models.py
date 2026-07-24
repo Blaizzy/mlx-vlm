@@ -10464,7 +10464,7 @@ class TestTransformerBlock(unittest.TestCase):
 
     Golden logits are RNG-free (weights set deterministically), captured from
     the refactor that was verified bit-identical (max|Δ|=0) to the original
-    per-model implementations of llama, qwen3, and gemma2.
+    per-model implementations of each covered backbone.
     """
 
     CASES = {
@@ -10519,11 +10519,83 @@ class TestTransformerBlock(unittest.TestCase):
             final_logit_softcapping=30.0,
             query_pre_attn_scalar=64.0,
         ),
+        "olmo2": dict(
+            model_type="olmo2",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+        ),
+        "helium": dict(
+            model_type="helium",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        ),
+        "internlm3": dict(
+            model_type="internlm3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            bias=False,
+            qkv_bias=True,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+        ),
+        "exaone4": dict(
+            model_type="exaone4",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            rope_scaling=None,
+            sliding_window=16,
+            sliding_window_pattern="LG",
+        ),
     }
     GOLDEN = {
         "llama": [-0.000929, 0.009069, 0.016449, 0.019079, 0.016202, 0.008646],
         "qwen3": [-0.055896, -0.057159, -0.04192, -0.014577, 0.016973, 0.043624],
         "gemma2": [-0.09723, -0.1632, -0.182053, -0.148346, -0.07181, 0.025459],
+        "olmo2": [-0.037876, -0.03875, -0.028436, -0.009912, 0.011473, 0.029546],
+        "helium": [-0.000929, 0.009069, 0.016449, 0.019079, 0.016202, 0.008646],
+        "internlm3": [0.009101, 0.003652, -0.002851, -0.008531, -0.011748, -0.011573],
+        "exaone4": [-0.037876, -0.038749, -0.028436, -0.009912, 0.011473, 0.029546],
     }
 
     MOE_CASES = {
