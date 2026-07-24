@@ -281,6 +281,124 @@ class TestModels(unittest.TestCase):
         self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
         self.assertFalse(any(".input_global_scale" in key for key in sanitized))
 
+    def test_laguna_folds_nvfp4_shared_experts(self):
+        from unittest.mock import patch
+
+        import mlx_vlm.utils as utils
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        weights = {}
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            prefix = f"model.layers.1.mlp.shared_expert.{proj}"
+            fill_value = {
+                "gate_proj": 1,
+                "up_proj": 11,
+                "down_proj": 21,
+            }[proj]
+            weights[f"{prefix}.weight_packed"] = mx.full(
+                (16, 8), fill_value, dtype=mx.uint8
+            )
+            weights[f"{prefix}.weight_scale"] = mx.full((16, 1), 0x38, dtype=mx.uint8)
+            weights[f"{prefix}.weight_global_scale"] = mx.array([1.0], dtype=mx.float32)
+            weights[f"{prefix}.input_global_scale"] = mx.array([1.0], dtype=mx.float32)
+
+        with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
+            sanitized = model.language_model.sanitize(weights)
+
+        self.assertEqual(encode.call_count, 3)
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.shared_expert.gate_proj.weight"].shape,
+            (16, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.shared_expert.gate_proj.scales"].shape,
+            (16, 1),
+        )
+        gate = sanitized["model.layers.1.mlp.shared_expert.gate_proj.weight"]
+        mx.eval(gate)
+        expected_gate = mx.full((16, 8), 1, dtype=mx.uint8).view(mx.uint32)
+        self.assertTrue(np.array_equal(np.array(gate), np.array(expected_gate)))
+        self.assertFalse(any(".weight_packed" in key for key in sanitized))
+        self.assertFalse(any(".weight_scale" in key for key in sanitized))
+        self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
+        self.assertFalse(any(".input_global_scale" in key for key in sanitized))
+
+    def test_laguna_fuses_split_switch_gate_up(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        prefix = "model.layers.1.mlp.switch_mlp"
+        weights = {
+            f"{prefix}.gate_proj.weight": mx.full((3, 16, 2), 1, dtype=mx.uint32),
+            f"{prefix}.up_proj.weight": mx.full((3, 16, 2), 2, dtype=mx.uint32),
+            f"{prefix}.gate_proj.scales": mx.full((3, 16, 1), 3, dtype=mx.uint8),
+            f"{prefix}.up_proj.scales": mx.full((3, 16, 1), 4, dtype=mx.uint8),
+        }
+
+        sanitized = model.language_model.sanitize(weights)
+
+        self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.gate_proj.scales", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.scales", sanitized)
+        self.assertEqual(sanitized[f"{prefix}.gate_up_proj.weight"].shape, (3, 32, 2))
+        self.assertEqual(sanitized[f"{prefix}.gate_up_proj.scales"].shape, (3, 32, 1))
+        mx.eval(
+            sanitized[f"{prefix}.gate_up_proj.weight"],
+            sanitized[f"{prefix}.gate_up_proj.scales"],
+        )
+        self.assertTrue(
+            np.array_equal(
+                np.array(sanitized[f"{prefix}.gate_up_proj.weight"][:, :16]),
+                np.ones((3, 16, 2), dtype=np.uint32),
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                np.array(sanitized[f"{prefix}.gate_up_proj.weight"][:, 16:]),
+                np.full((3, 16, 2), 2, dtype=np.uint32),
+            )
+        )
+
     def test_laguna_sanitize_drops_input_global_scale(self):
         from mlx_vlm.models import laguna
 
