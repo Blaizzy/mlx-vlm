@@ -71,8 +71,7 @@ def test_bonsai_variant_aliases_are_ternary_only() -> None:
 
 def test_bonsai_declares_image_generation_model_type(tmp_path: Path) -> None:
     _write_layout(tmp_path)
-    (tmp_path / "manifest.json").write_text(
-        """
+    (tmp_path / "manifest.json").write_text("""
         {
           "files": [
             {"remote_path": "transformer-packed-mflux/diffusion_pytorch_model.safetensors"},
@@ -80,8 +79,7 @@ def test_bonsai_declares_image_generation_model_type(tmp_path: Path) -> None:
             {"remote_path": "tokenizer/tokenizer.json"}
           ]
         }
-        """
-    )
+        """)
 
     assert BonsaiImageGenerationModel.is_image_generation_model
     assert BonsaiImageGenerationModel.model_type == "bonsai"
@@ -97,8 +95,7 @@ def test_bonsai_image_model_class_uses_remote_manifest(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _write_layout(tmp_path)
-    (tmp_path / "manifest.json").write_text(
-        """
+    (tmp_path / "manifest.json").write_text("""
         {
           "files": [
             {"remote_path": "transformer-packed-mflux/diffusion_pytorch_model.safetensors"},
@@ -106,8 +103,7 @@ def test_bonsai_image_model_class_uses_remote_manifest(
             {"remote_path": "tokenizer/tokenizer.json"}
           ]
         }
-        """
-    )
+        """)
 
     def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
         assert repo_id == "example/custom-image-model"

@@ -263,11 +263,7 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
       }
       return scale * accum + sum * bias;
     }
-""".replace(
-        "__BITS__", str(bits)
-    ).replace(
-        "__GS__", str(group_size)
-    )
+""".replace("__BITS__", str(bits)).replace("__GS__", str(group_size))
 
 
 _TARGET_VERIFY_QMV_SOURCE = r"""
