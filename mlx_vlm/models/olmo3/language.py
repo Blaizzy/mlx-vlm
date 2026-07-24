@@ -1,128 +1,41 @@
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
+from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache, RotatingKVCache
-from ..mlp import SwiGLUMLP
 from ..rope_utils import initialize_rope
+from ..transformer_block import BlockSpec, TransformerBlock
 from .config import ModelConfig
 
 
-class Olmo3Attention(nn.Module):
-    def __init__(self, args: ModelConfig, layer_idx: int):
-        super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
-        self.layer_idx = layer_idx
-
-        self.head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
-        self.scale = self.head_dim**-0.5
-
-        self.q_proj = nn.Linear(
-            args.hidden_size,
-            args.num_attention_heads * self.head_dim,
-            bias=args.attention_bias,
+def block_spec(args: ModelConfig, layer_idx: int) -> BlockSpec:
+    head_dim = args.head_dim or args.hidden_size // args.num_attention_heads
+    if args.layer_types[layer_idx] != "full_attention":
+        rope = nn.RoPE(head_dim, traditional=False, base=args.rope_theta)
+    else:
+        rope = initialize_rope(
+            head_dim,
+            traditional=False,
+            base=args.rope_theta,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
-        self.k_proj = nn.Linear(
-            args.hidden_size,
-            args.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            args.hidden_size,
-            args.num_key_value_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            args.num_attention_heads * self.head_dim,
-            args.hidden_size,
-            bias=args.attention_bias,
-        )
-
-        self.q_norm = nn.RMSNorm(
-            args.num_attention_heads * self.head_dim, eps=args.rms_norm_eps
-        )
-        self.k_norm = nn.RMSNorm(
-            args.num_key_value_heads * self.head_dim, eps=args.rms_norm_eps
-        )
-
-        if args.layer_types[layer_idx] != "full_attention":
-            self.rope = nn.RoPE(self.head_dim, traditional=False, base=args.rope_theta)
-        else:
-            self.rope = initialize_rope(
-                self.head_dim,
-                traditional=False,
-                base=args.rope_theta,
-                scaling_config=args.rope_scaling,
-                max_position_embeddings=args.max_position_embeddings,
-            )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
-        queries = self.q_norm(self.q_proj(x))
-        keys = self.k_norm(self.k_proj(x))
-        values = self.v_proj(x)
-
-        queries = queries.reshape(B, L, self.num_attention_heads, -1).transpose(
-            0, 2, 1, 3
-        )
-        keys = keys.reshape(B, L, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
-            0, 2, 1, 3
-        )
-
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
-
-
-class Olmo3DecoderLayer(nn.Module):
-    def __init__(self, args: ModelConfig, layer_idx: int):
-        super().__init__()
-        self.num_attention_heads = args.num_attention_heads
-        self.hidden_size = args.hidden_size
-        self.self_attn = Olmo3Attention(args, layer_idx=layer_idx)
-        self.mlp = SwiGLUMLP(args.hidden_size, args.intermediate_size)
-        self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
-        )
-        self.args = args
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.post_attention_layernorm(self.self_attn(x, mask, cache))
-        h = x + r
-        r = self.post_feedforward_layernorm(self.mlp(h))
-        out = h + r
-        return out
+    return BlockSpec(
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        head_dim=head_dim,
+        scale=head_dim**-0.5,
+        intermediate_size=args.intermediate_size,
+        rope=rope,
+        rms_norm_eps=args.rms_norm_eps,
+        layout="post",
+        attn_bias=args.attention_bias,
+        qk_norm=True,
+        qk_norm_full=True,
+    )
 
 
 class Olmo3Model(nn.Module):
@@ -132,8 +45,7 @@ class Olmo3Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            Olmo3DecoderLayer(args=args, layer_idx=i)
-            for i in range(args.num_hidden_layers)
+            TransformerBlock(block_spec(args, i)) for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 

@@ -10577,6 +10577,305 @@ class TestInklingMTP(unittest.TestCase):
         self.assertLess(float(mx.max(mx.abs(l1 - l2))), 1e-4)
 
 
+class TestTransformerBlock(unittest.TestCase):
+    """Regression guard for the shared config-driven TransformerBlock.
+
+    Golden logits are RNG-free (weights set deterministically), captured from
+    the refactor that was verified bit-identical (max|Δ|=0) to the original
+    per-model implementations of each covered backbone.
+    """
+
+    CASES = {
+        "llama": dict(
+            model_type="llama",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            attention_bias=False,
+            mlp_bias=False,
+            tie_word_embeddings=False,
+            layer_types=["full_attention", "full_attention"],
+            sliding_window=16,
+        ),
+        "qwen3": dict(
+            model_type="qwen3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+        ),
+        "gemma2": dict(
+            model_type="gemma2",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            attn_logit_softcapping=50.0,
+            final_logit_softcapping=30.0,
+            query_pre_attn_scalar=64.0,
+        ),
+        "olmo2": dict(
+            model_type="olmo2",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+        ),
+        "helium": dict(
+            model_type="helium",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        ),
+        "internlm3": dict(
+            model_type="internlm3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            bias=False,
+            qkv_bias=True,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            rope_traditional=False,
+            rope_scaling=None,
+            tie_word_embeddings=False,
+        ),
+        "exaone4": dict(
+            model_type="exaone4",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            rope_scaling=None,
+            sliding_window=16,
+            sliding_window_pattern="LG",
+        ),
+    }
+    GOLDEN = {
+        "llama": [-0.000929, 0.009069, 0.016449, 0.019079, 0.016202, 0.008646],
+        "qwen3": [-0.055896, -0.057159, -0.04192, -0.014577, 0.016973, 0.043624],
+        "gemma2": [-0.09723, -0.1632, -0.182053, -0.148346, -0.07181, 0.025459],
+        "olmo2": [-0.037876, -0.03875, -0.028436, -0.009912, 0.011473, 0.029546],
+        "helium": [-0.000929, 0.009069, 0.016449, 0.019079, 0.016202, 0.008646],
+        "internlm3": [0.009101, 0.003652, -0.002851, -0.008531, -0.011748, -0.011573],
+        "exaone4": [-0.037876, -0.038749, -0.028436, -0.009912, 0.011473, 0.029546],
+    }
+
+    MOE_CASES = {
+        "ernie4_5_moe": dict(
+            model_type="ernie4_5_moe",
+            hidden_size=32,
+            intermediate_size=64,
+            max_position_embeddings=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            rope_theta=10000.0,
+            use_bias=False,
+            tie_word_embeddings=False,
+            moe_num_experts=8,
+            moe_k=2,
+            moe_intermediate_size=16,
+            moe_num_shared_experts=1,
+            moe_layer_start_index=0,
+            moe_layer_interval=1,
+            head_dim=None,
+        ),
+        "dots1": dict(
+            model_type="dots1",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            num_key_value_heads=2,
+            first_k_dense_replace=1,
+            moe_intermediate_size=16,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            norm_topk_prob=True,
+            num_experts_per_tok=2,
+            rope_theta=10000.0,
+            routed_scaling_factor=2.5,
+            head_dim=8,
+            n_group=2,
+            topk_group=1,
+        ),
+        "exaone_moe": dict(
+            model_type="exaone_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=512,
+            sliding_window=4,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            is_moe_layer=[False, True, True, True],
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=2.5,
+            norm_topk_prob=True,
+        ),
+        "qwen3_moe": dict(
+            model_type="qwen3_moe",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            num_experts=8,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[0],
+            moe_intermediate_size=16,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            max_position_embeddings=256,
+            norm_topk_prob=True,
+        ),
+        "olmoe": dict(
+            model_type="olmoe",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            num_experts=8,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            max_position_embeddings=256,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        ),
+    }
+    MOE_GOLDEN = {
+        "ernie4_5_moe": [-0.040216, -0.010885, 0.021588, 0.047828, 0.06026, 0.055295],
+        "dots1": [-0.016876, 0.005456, 0.026214, 0.039403, 0.041216, 0.03113],
+        "exaone_moe": [0.008741, -0.020631, -0.027897, -0.005272, 0.023002, 0.02663],
+        "qwen3_moe": [-0.067243, -0.058123, -0.032221, 0.002983, 0.037326, 0.060892],
+        "olmoe": [-0.069662, -0.049639, -0.015285, 0.023482, 0.055469, 0.071443],
+    }
+
+    def _deterministic(self, params):
+        from mlx.utils import tree_unflatten
+
+        out = []
+        for i, (k, v) in enumerate(tree_flatten(params)):
+            vals = mx.sin(mx.arange(v.size, dtype=mx.float32) * 0.017 + i * 0.3) * 0.05
+            out.append((k, vals.reshape(v.shape)))
+        return tree_unflatten(out)
+
+    def test_shared_block_matches_golden(self):
+        for name, cfg_dict in self.CASES.items():
+            cfg = importlib.import_module(
+                f"mlx_vlm.models.{name}.config"
+            ).ModelConfig.from_dict(cfg_dict)
+            lm = importlib.import_module(
+                f"mlx_vlm.models.{name}.language"
+            ).LanguageModel(cfg)
+            lm.update(self._deterministic(lm.parameters()))
+            lm.eval()
+            out = lm(mx.array([[1, 2, 3, 4, 5, 6]]))
+            logits = (out.logits if hasattr(out, "logits") else out)[0, -1, :6]
+            got = [float(v) for v in logits.astype(mx.float32).tolist()]
+            for g, expected in zip(got, self.GOLDEN[name]):
+                self.assertAlmostEqual(g, expected, places=5, msg=f"{name}: {got}")
+
+    def test_shared_moe_block_matches_golden(self):
+        for name, cfg_dict in self.MOE_CASES.items():
+            cfg = importlib.import_module(
+                f"mlx_vlm.models.{name}.config"
+            ).ModelConfig.from_dict(cfg_dict)
+            lm = importlib.import_module(
+                f"mlx_vlm.models.{name}.language"
+            ).LanguageModel(cfg)
+            lm.update(self._deterministic(lm.parameters()))
+            lm.eval()
+            out = lm(mx.array([[1, 2, 3, 4, 5, 6]]))
+            logits = (out.logits if hasattr(out, "logits") else out)[0, -1, :6]
+            got = [float(v) for v in logits.astype(mx.float32).tolist()]
+            for g, expected in zip(got, self.MOE_GOLDEN[name]):
+                self.assertAlmostEqual(g, expected, places=5, msg=f"{name}: {got}")
+
+
 if __name__ == "__main__":
     unittest.main()
 

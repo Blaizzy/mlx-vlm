@@ -14,6 +14,20 @@ class SwiGLUMLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+class GatedMLP(nn.Module):
+    """Gated MLP ``down(act(gate(x)) * up(x))``; ``act`` defaults to SiLU."""
+
+    def __init__(self, dim, hidden_dim, act=nn.silu, bias=False):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=bias)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=bias)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=bias)
+        self.act = act
+
+    def __call__(self, x):
+        return self.down_proj(self.act(self.gate_proj(x)) * self.up_proj(x))
+
+
 class DeepseekMLP(nn.Module):
     def __init__(self, config, hidden_size=None, intermediate_size=None):
         super().__init__()

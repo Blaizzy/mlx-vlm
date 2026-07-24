@@ -1,14 +1,9 @@
-from typing import Any, Optional
-
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import (
-    LanguageModelOutput,
-    create_attention_mask,
-    scaled_dot_product_attention,
-)
-from ..mlp import SwiGLUMLP as MLP
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
+from ..transformer_block import BlockSpec, TransformerBlock
 from .config import ModelConfig
 
 
@@ -31,7 +26,7 @@ class DynamicNTKScalingRoPE(nn.Module):
         self.scale = scale
 
     def extra_repr(self):
-        return f"{self.dims}, traditional={self.traditional}, max_position_embeddings={self.max_position_embeddings}, scaling_factor={self.scaling_factor}"
+        return f"{self.dims}, traditional={self.traditional}, max_position_embeddings={self.max_position_embeddings}, scaling_factor={self.scale}"
 
     def __call__(self, x, offset: int = 0):
         seq_len = x.shape[1] + offset
@@ -52,90 +47,32 @@ class DynamicNTKScalingRoPE(nn.Module):
         )
 
 
-class Attention(nn.Module):
-    def __init__(self, args: ModelConfig):
-        super().__init__()
-
-        dim = args.hidden_size
-        qkv_bias = args.qkv_bias
-        self.n_heads = n_heads = args.num_attention_heads
-        self.n_kv_heads = n_kv_heads = args.num_key_value_heads
-        self.n_kv_groups = n_heads // args.num_key_value_heads
-
-        self.head_dim = head_dim = args.hidden_size // n_heads
-        self.scale = head_dim**-0.5
-
-        self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=qkv_bias)
-        self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=qkv_bias)
-        self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=qkv_bias)
-        self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=qkv_bias)
-
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None
-            and args.rope_scaling["rope_type"] == "linear"
-            else 2.0
-        )
-
-        self.rope = DynamicNTKScalingRoPE(
-            head_dim,
-            max_position_embeddings=args.max_position_embeddings,
-            traditional=args.rope_traditional,
-            base=args.rope_theta,
-            scale=rope_scale,
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, D = x.shape
-
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
-
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelConfig):
-        super().__init__()
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args.hidden_size, args.intermediate_size, args.bias)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
-        return out
+def block_spec(args: ModelConfig) -> BlockSpec:
+    head_dim = args.hidden_size // args.num_attention_heads
+    rope_scale = (
+        1 / args.rope_scaling["factor"]
+        if args.rope_scaling is not None and args.rope_scaling["rope_type"] == "linear"
+        else 2.0
+    )
+    rope = DynamicNTKScalingRoPE(
+        head_dim,
+        max_position_embeddings=args.max_position_embeddings,
+        traditional=args.rope_traditional,
+        base=args.rope_theta,
+        scale=rope_scale,
+    )
+    return BlockSpec(
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        head_dim=head_dim,
+        scale=head_dim**-0.5,
+        intermediate_size=args.intermediate_size,
+        rope=rope,
+        rms_norm_eps=args.rms_norm_eps,
+        attn_bias=args.qkv_bias,
+        mlp_bias=args.bias,
+    )
 
 
 class InternLM2Model(nn.Module):
@@ -144,7 +81,7 @@ class InternLM2Model(nn.Module):
         assert args.vocab_size > 0
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
+            TransformerBlock(block_spec(args)) for _ in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -188,6 +125,4 @@ class LanguageModel(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        from ..cache import KVCache
-
         return [KVCache() for _ in self.layers]
