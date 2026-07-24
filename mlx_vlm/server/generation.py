@@ -610,6 +610,9 @@ class GenerationArguments:
     top_p: float = DEFAULT_TOP_P
     top_k: int = 0
     min_p: float = 0.0
+    top_n_sigma: float = 0.0
+    p_less: bool = False
+    typical_p: float = 1.0
     seed: Optional[int] = None
     logprobs: bool = False
     repetition_penalty: Optional[float] = None
@@ -676,6 +679,9 @@ class GenerationArguments:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "min_p": self.min_p,
+            "top_n_sigma": self.top_n_sigma,
+            "p_less": self.p_less,
+            "typical_p": self.typical_p,
             "enable_thinking": self.enable_thinking,
         }
         if self.seed is not None:
@@ -731,6 +737,9 @@ def _config_from_args(args: "GenerationArguments") -> SamplingConfig:
         top_k=args.top_k,
         min_p=args.min_p,
         seed=DEFAULT_SEED if args.seed is None else int(args.seed),
+        top_n_sigma=args.top_n_sigma,
+        p_less=args.p_less,
+        typical_p=args.typical_p,
     )
 
 

@@ -37,6 +37,7 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -45,6 +46,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
+DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
@@ -92,6 +94,76 @@ class SamplingConfig:
     top_k: int = 0
     min_p: float = 0.0
     seed: int = 0
+    top_n_sigma: float = 0.0
+    p_less: bool = False
+    typical_p: float = 1.0
+
+
+def _new_modes_keep(
+    work: mx.array,
+    safe_t: mx.array,
+    top_n_sigma: mx.array,
+    p_less: mx.array,
+    typical_p: mx.array,
+) -> mx.array:
+    """Per-row keep mask [B, V] in ORIGINAL (unsorted) space for the three
+    non-rank-based sampling modes, each gated per row.
+
+    Mirrors ``sample_utils.apply_top_n_sigma`` / ``apply_p_less`` /
+    ``apply_typical_p`` so a single active row keeps exactly the tokens those
+    references keep (see test_row_sampling oracle checks). Computed on the
+    un-temperature-scaled log-normalized ``work`` (top-nσ is shift-invariant,
+    typical-p wants the true distribution, p-less applies temperature itself),
+    matching where ``make_sampler`` places these in its chain.
+
+    work: [B, V] log-normalized float32. safe_t: [B] temperature (>=eps).
+    top_n_sigma: [B] float (<=0 disables the row). p_less: [B] bool.
+    typical_p: [B] float (>=1 disables the row).
+    """
+    B, V = work.shape
+    # Statistics run in float32: float16 log-probs overflow mx.std for any real
+    # vocab (the sum is ~V*log(V)), which would silently disable top-nσ.
+    # Upstream's _top_n_sigma casts unconditionally for the same reason.
+    f = work.astype(mx.float32)
+    keep = mx.ones((B, V), dtype=mx.bool_)
+
+    # top-nσ: drop logit < max - n*std (raw logits; shift-invariant so the
+    # log-normalized work gives the same set). Phrased as "not (x < t)" rather
+    # than "x >= t" so a NaN threshold (e.g. a -inf logprob from grammar
+    # masking) keeps the token, matching upstream's mx.where(f < t, -inf, x).
+    ns = top_n_sigma[:, None]
+    threshold = mx.max(f, axis=-1, keepdims=True) - ns * mx.std(
+        f, axis=-1, keepdims=True
+    )
+    keep = keep & mx.where(ns > 0, ~(f < threshold), mx.array(True))
+
+    # p-less: drop prob < collision prob L = sum p^2, p = softmax(work/temp).
+    probs = mx.softmax(f / safe_t[:, None], axis=-1)
+    collision = mx.sum(probs * probs, axis=-1, keepdims=True)
+    keep = keep & mx.where(p_less[:, None], ~(probs < collision), mx.array(True))
+
+    # typical-p: keep tokens by ascending |surprisal - entropy| until their
+    # cumulative prob reaches typical_p (on the true, un-scaled distribution).
+    # Gated on 0 < typical_p < 1 exactly like make_sampler, so out-of-range
+    # values disable the mode instead of filtering everything away.
+    prob = mx.exp(f)
+    entropy = -mx.sum(prob * f, axis=-1, keepdims=True)
+    shifted = mx.abs(-f - entropy)
+    order_tp = mx.argsort(shifted, axis=-1)
+    cum = mx.cumsum(mx.take_along_axis(prob, order_tp, axis=-1), axis=-1)
+    inverse = mx.put_along_axis(
+        mx.zeros_like(order_tp),
+        order_tp,
+        mx.arange(V, dtype=order_tp.dtype),
+        axis=-1,
+    )
+    cum_orig = mx.take_along_axis(cum, inverse, axis=-1)
+    tp = typical_p[:, None]
+    keep = keep & mx.where(
+        (tp > 0.0) & (tp < 1.0), (cum_orig - prob) < tp, mx.array(True)
+    )
+
+    return keep
 
 
 def batched_row_sample(
@@ -102,22 +174,50 @@ def batched_row_sample(
     top_k: mx.array,
     min_p: mx.array,
     keys: mx.array,
+    top_n_sigma: Optional[mx.array] = None,
+    p_less: Optional[mx.array] = None,
+    typical_p: Optional[mx.array] = None,
 ) -> mx.array:
     """Row-heterogeneous sampling in one sorted-space pass.
 
     logprobs: [B, V] log-normalized. temperature/top_p/min_p: [B] float.
     top_k: [B] int (<=0 disables). keys: [B] PRNG keys. Returns [B] token ids.
-    Order: temperature -> top_k (rank cutoff, exactly-k) -> top_p -> min_p.
-    Greedy rows (temperature < eps) return argmax.
+    Order mirrors ``make_sampler``: temperature -> top_n_sigma -> p_less ->
+    typical_p -> top_p -> min_p -> top_k, with the non-rank modes applied first
+    so the rank-based filters see the already-filtered distribution.
+    Greedy rows (temperature < eps) return argmax of the unfiltered logprobs.
     """
     eps = 1e-5
     B, V = logprobs.shape
     work = logprobs.astype(mx.float32) if logprobs.dtype == mx.bfloat16 else logprobs
 
+    # Greedy ignores every filter (make_sampler returns argmax when temp == 0),
+    # so take it from the unfiltered logprobs before any masking below.
+    greedy = mx.argmax(work, axis=-1)
+    safe_t = mx.where(temperature < eps, 1.0, temperature)
+
+    # Chain the non-rank modes first, masking rejected tokens to -inf. Because
+    # top_p/min_p/top_k below are computed on this masked distribution, the
+    # composition matches make_sampler's sequential chain; ANDing masks derived
+    # from the full distribution instead would yield a different candidate set
+    # (and could empty a row whose top_k window typical_p rejected).
+    if top_n_sigma is not None or p_less is not None or typical_p is not None:
+        ns = top_n_sigma if top_n_sigma is not None else mx.zeros((B,), mx.float32)
+        pl = p_less if p_less is not None else mx.zeros((B,), dtype=mx.bool_)
+        tp = typical_p if typical_p is not None else mx.ones((B,), mx.float32)
+        modes_keep = _new_modes_keep(work, safe_t, ns, pl, tp)  # [B, V] original
+        work = mx.where(modes_keep, work, mx.array(-float("inf"), work.dtype))
+
     order = mx.argsort(-work, axis=-1)  # [B, V] descending
     sl = mx.take_along_axis(work, order, axis=-1)  # sorted logprobs
 
-    safe_t = mx.where(temperature < eps, 1.0, temperature)
+    # Renormalized over the tokens the modes left alive, so top_p/min_p act as a
+    # nucleus of the *filtered* distribution. This is identical to the unfiltered
+    # behaviour when no mode is active (verified against apply_top_p/apply_min_p),
+    # and deliberately differs from chaining make_sampler's apply_top_p after a
+    # mode: that path compares cumulative mass against ``1 - top_p`` on a
+    # distribution whose mass no longer sums to 1, which can reject every token
+    # (e.g. top_n_sigma=1.0 + top_p=0.9 leaves an all -inf row upstream).
     p = mx.softmax(sl / safe_t[:, None], axis=-1)
     csum = mx.cumsum(p, axis=-1)
 
@@ -126,7 +226,10 @@ def batched_row_sample(
     keep = ranks < k_eff[:, None]  # top_k, exactly-k by rank
     keep = keep & ((csum - p) <= top_p[:, None])  # top_p (>=1 keeps all)
     keep = keep & (p >= (p[:, :1] * min_p[:, None]))  # min_p (<=0 keeps all)
-    keep = keep | (ranks == 0)  # always keep >=1 token
+    # Always keep >=1 token. After the chain above, rank 0 is the best surviving
+    # token (not necessarily the global argmax), so this never resurrects a
+    # token the modes rejected.
+    keep = keep | (ranks == 0)
 
     masked = mx.where(keep, sl / safe_t[:, None], mx.array(-float("inf"), mx.float32))
     sampled_pos = mx.vmap(
@@ -134,7 +237,6 @@ def batched_row_sample(
     )(masked, keys)
     sampled = mx.take_along_axis(order, sampled_pos[:, None], axis=-1)[:, 0]
 
-    greedy = mx.argmax(work, axis=-1)
     return mx.where(temperature < eps, greedy, sampled)
 
 
@@ -161,13 +263,32 @@ class _PositionedTargetSampler:
         invariant."""
         return _PositionedTargetSampler([self.configs[i] for i in keep])
 
+    def _uses_new_modes(self) -> bool:
+        """True when any row enables top_n_sigma / p_less / typical_p.
+
+        When no row does (the overwhelmingly common case) the extra masks are
+        all-True, so we skip building them entirely rather than pay an argsort
+        + cumsum per decode step for a no-op.
+        """
+        return any(
+            x.top_n_sigma > 0 or bool(x.p_less) or 0.0 < x.typical_p < 1.0
+            for x in self.configs
+        )
+
     def _arrays(self):
         c = self.configs
-        return (
+        base = (
             mx.array([x.temperature for x in c], dtype=mx.float32),
             mx.array([x.top_p for x in c], dtype=mx.float32),
             mx.array([x.top_k for x in c], dtype=mx.int32),
             mx.array([x.min_p for x in c], dtype=mx.float32),
+        )
+        if not self._uses_new_modes():
+            return base + (None, None, None)
+        return base + (
+            mx.array([x.top_n_sigma for x in c], dtype=mx.float32),
+            mx.array([bool(x.p_less) for x in c], dtype=mx.bool_),
+            mx.array([x.typical_p for x in c], dtype=mx.float32),
         )
 
     def __call__(self, logprobs: mx.array) -> mx.array:
@@ -198,7 +319,15 @@ class _PositionedTargetSampler:
         return self._draw(logprobs, keys)
 
     def _draw(self, logprobs: mx.array, keys: mx.array) -> mx.array:
-        temperature, top_p, top_k, min_p = self._arrays()
+        (
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            top_n_sigma,
+            p_less,
+            typical_p,
+        ) = self._arrays()
         return batched_row_sample(
             logprobs,
             temperature=temperature,
@@ -206,6 +335,9 @@ class _PositionedTargetSampler:
             top_k=top_k,
             min_p=min_p,
             keys=keys,
+            top_n_sigma=top_n_sigma,
+            p_less=p_less,
+            typical_p=typical_p,
         )
 
 
@@ -243,6 +375,9 @@ def generate_step(
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
+    top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
+    p_less: bool = False,
+    typical_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -334,6 +469,9 @@ def generate_step(
             and temperature > 0
             and min_p == DEFAULT_MIN_P
             and top_k == DEFAULT_TOP_K
+            and top_n_sigma == DEFAULT_TOP_N_SIGMA
+            and not p_less
+            and typical_p == 1.0
         ):
             sampler = _PositionedTargetSampler(
                 [
@@ -353,6 +491,9 @@ def generate_step(
                 top_p=top_p,
                 min_p=min_p,
                 top_k=top_k,
+                top_n_sigma=top_n_sigma,
+                p_less=p_less,
+                typical_p=typical_p,
             )
 
     processors = _generate_module_override(
@@ -2144,16 +2285,14 @@ class PromptProcessingBatch:
                             )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
-                        new_blocks = _apc.harvest_blocks_from_batch_cache(
+                        _apc.commit_prefix_blocks(
                             self._apc_manager,
                             self.prompt_cache,
-                            batch_idx,
                             meta["full_input_ids"],
+                            batch_idx=batch_idx,
                             extra_hash=meta.get("extra_hash", 0),
                             skip_first_n_tokens=meta.get("prefix_len", 0),
-                        )
-                        self._apc_manager.release(
-                            meta.get("apc_blocks", []) + new_blocks
+                            blocks_in_use=meta.get("apc_blocks", []),
                         )
             except Exception as e:
                 logger.warning("APC harvest failed during batched prefill: %s", e)
@@ -2328,7 +2467,18 @@ class BatchGenerator:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.tenant_scoped_hash(tenant, img)
+        return _apc.semantic_extra_hash(
+            tenant=tenant,
+            image_hash=img,
+            media={
+                "audio": prompt_kwargs.get("input_features"),
+                "video": prompt_kwargs.get("pixel_values_videos"),
+                "embeddings": prompt_kwargs.get("inputs_embeds"),
+                "masks": prompt_kwargs.get("attention_mask"),
+            },
+            model=getattr(self, "model", None),
+            processor=getattr(self, "processor", None),
+        )
 
     def _apc_media_token_ids(self) -> set[int]:
         return _apc.multimodal_token_ids_from_config(self.model.config)
@@ -2369,96 +2519,18 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
-        uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
+        uid, ids_list, max_toks, prompt_kwargs, lps, criteria, sampling = sequence
         if not ids_list or len(ids_list) < 2:
             return None
-        safe_lookup_min = self._apc_safe_prefix_lookup_min(ids_list)
-        extra_hash = self._apc_extra_hash(prompt_kwargs or {})
-        apc_mode = getattr(self, "apc_mode", "block")
-        if apc_mode == "exact":
-            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=safe_lookup_min,
-            )
-            if (
-                exact_cache is not None
-                and exact_prefix_len > 0
-                and exact_prefix_len < len(ids_list)
-            ):
-                if not self._apc_suffix_is_text_only(ids_list, exact_prefix_len):
-                    return None
-                return {
-                    "matched_blocks": [],
-                    "warm_cache": exact_cache,
-                    "prefix_len": exact_prefix_len,
-                    "extra_hash": extra_hash,
-                    "full_input_ids": list(ids_list),
-                }
-            return None
-        matched, prefix_len = self.apc_manager.lookup_prefix(
-            ids_list, extra_hash=extra_hash
+        return _apc.apc_lookup_plan(
+            self.apc_manager,
+            ids_list,
+            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            apc_mode=getattr(self, "apc_mode", "block"),
+            safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
+            suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),
+            prefix_has_media=lambda pl: self._apc_prefix_has_media_tokens(ids_list, pl),
         )
-        if prefix_len > 0 and self._apc_prefix_has_media_tokens(ids_list, prefix_len):
-            self.apc_manager.release(matched)
-            matched = []
-            prefix_len = 0
-        exact_cache = None
-        exact_prefix_len = 0
-        if prefix_len < len(ids_list):
-            exact_cache, exact_prefix_len = self.apc_manager.lookup_exact_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, safe_lookup_min),
-            )
-        warm_cache = None
-        disk_prefix_len = 0
-        if max(prefix_len, exact_prefix_len) < len(ids_list):
-            warm_cache, disk_prefix_len = self.apc_manager.lookup_prefix_disk_cache(
-                ids_list,
-                extra_hash=extra_hash,
-                min_prefix_tokens=max(prefix_len, exact_prefix_len, safe_lookup_min),
-                allow_memory_overlap=max(prefix_len, exact_prefix_len) > 0,
-            )
-        if disk_prefix_len > max(
-            prefix_len, exact_prefix_len
-        ) and disk_prefix_len < len(ids_list):
-            if matched:
-                self.apc_manager.release(matched)
-            if not self._apc_suffix_is_text_only(ids_list, disk_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": warm_cache,
-                "prefix_len": disk_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
-            if matched:
-                self.apc_manager.release(matched)
-            if not self._apc_suffix_is_text_only(ids_list, exact_prefix_len):
-                return None
-            return {
-                "matched_blocks": [],
-                "warm_cache": exact_cache,
-                "prefix_len": exact_prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if prefix_len > 0 and prefix_len < len(ids_list):
-            if not self._apc_suffix_is_text_only(ids_list, prefix_len):
-                self.apc_manager.release(matched)
-                return None
-            return {
-                "matched_blocks": matched,
-                "prefix_len": prefix_len,
-                "extra_hash": extra_hash,
-                "full_input_ids": list(ids_list),
-            }
-        if matched:
-            self.apc_manager.release(matched)
-        return None
 
     def _build_mixed_prompt_batch(
         self, sequences: List[tuple]
@@ -2984,17 +3056,17 @@ class BatchGenerator:
 
 
 def batch_generate(
-    model,
-    processor,
-    images: Union[str, List[str]] = None,
-    audios: Union[str, List[str]] = None,
-    prompts: List[str] = None,
+    model: nn.Module,
+    processor: ProcessorLike,
+    images: Union[str, List[str], None] = None,
+    audios: Union[str, List[str], None] = None,
+    prompts: Optional[List[str]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
-    **kwargs,
-):
+    **kwargs: Unpack[GenerateKwargs],
+) -> BatchResponse:
     """
     Generate responses for the given batch of prompts with variable-sized images.
 

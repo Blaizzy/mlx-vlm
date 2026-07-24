@@ -160,6 +160,324 @@ class TestModels(unittest.TestCase):
         self.assertEqual(type(cache[0]).__name__, "KVCache")
         self.assertEqual(type(cache[1]).__name__, "RotatingKVCache")
 
+    def test_laguna_nvfp4_compressed_tensors_config(self):
+        from mlx_vlm.models import laguna
+
+        raw_config = {
+            "model_type": "laguna",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "max_position_embeddings": 128,
+            "quantization_config": {
+                "quant_method": "compressed-tensors",
+                "format": "nvfp4-pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "format": "nvfp4-pack-quantized",
+                        "weights": {"group_size": 16, "num_bits": 4},
+                    }
+                },
+            },
+        }
+        config = laguna.ModelConfig.from_dict(raw_config)
+
+        self.assertEqual(
+            config.quantization,
+            {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        self.assertIs(config.quantization_config, config.quantization)
+        self.assertEqual(raw_config["quantization"], config.quantization)
+        self.assertEqual(raw_config["quantization_config"], config.quantization)
+
+    def test_laguna_stacks_nvfp4_experts_before_scale_folding(self):
+        from unittest.mock import patch
+
+        import mlx_vlm.utils as utils
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        weights = {
+            "model.layers.1.mlp.gate.weight": mx.zeros((3, 16)),
+            "model.layers.1.mlp.experts.e_score_correction_bias": mx.zeros((3,)),
+        }
+        for expert_idx in range(config.num_experts):
+            for proj in ["gate_proj", "up_proj", "down_proj"]:
+                prefix = f"model.layers.1.mlp.experts.{expert_idx}.{proj}"
+                fill_value = {
+                    "gate_proj": expert_idx + 1,
+                    "up_proj": expert_idx + 11,
+                    "down_proj": expert_idx + 21,
+                }[proj]
+                weights[f"{prefix}.weight_packed"] = mx.full(
+                    (16, 8), fill_value, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_scale"] = mx.full(
+                    (16, 1), 0x38, dtype=mx.uint8
+                )
+                weights[f"{prefix}.weight_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+                weights[f"{prefix}.input_global_scale"] = mx.array(
+                    [1.0], dtype=mx.float32
+                )
+
+        with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
+            sanitized = model.language_model.sanitize(weights)
+
+        self.assertEqual(encode.call_count, 2)
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"].shape,
+            (3, 32, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.scales"].shape,
+            (3, 32, 1),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.down_proj.weight"].shape,
+            (3, 16, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.switch_mlp.down_proj.scales"].shape,
+            (3, 16, 1),
+        )
+        gate_up = sanitized["model.layers.1.mlp.switch_mlp.gate_up_proj.weight"]
+        mx.eval(gate_up)
+        expected_gate = mx.full((16, 8), 1, dtype=mx.uint8).view(mx.uint32)
+        expected_up = mx.full((16, 8), 11, dtype=mx.uint8).view(mx.uint32)
+        self.assertTrue(
+            np.array_equal(np.array(gate_up[0, :16]), np.array(expected_gate))
+        )
+        self.assertTrue(
+            np.array_equal(np.array(gate_up[0, 16:]), np.array(expected_up))
+        )
+        self.assertIn("model.layers.1.mlp.gate.e_score_correction_bias", sanitized)
+        self.assertFalse(any(".weight_packed" in key for key in sanitized))
+        self.assertFalse(any(".weight_scale" in key for key in sanitized))
+        self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
+        self.assertFalse(any(".input_global_scale" in key for key in sanitized))
+
+    def test_laguna_folds_nvfp4_shared_experts(self):
+        from unittest.mock import patch
+
+        import mlx_vlm.utils as utils
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        weights = {}
+        for proj in ["gate_proj", "up_proj", "down_proj"]:
+            prefix = f"model.layers.1.mlp.shared_expert.{proj}"
+            fill_value = {
+                "gate_proj": 1,
+                "up_proj": 11,
+                "down_proj": 21,
+            }[proj]
+            weights[f"{prefix}.weight_packed"] = mx.full(
+                (16, 8), fill_value, dtype=mx.uint8
+            )
+            weights[f"{prefix}.weight_scale"] = mx.full((16, 1), 0x38, dtype=mx.uint8)
+            weights[f"{prefix}.weight_global_scale"] = mx.array([1.0], dtype=mx.float32)
+            weights[f"{prefix}.input_global_scale"] = mx.array([1.0], dtype=mx.float32)
+
+        with patch("mlx_vlm.utils._f32_to_e4m3", wraps=utils._f32_to_e4m3) as encode:
+            sanitized = model.language_model.sanitize(weights)
+
+        self.assertEqual(encode.call_count, 3)
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.shared_expert.gate_proj.weight"].shape,
+            (16, 2),
+        )
+        self.assertEqual(
+            sanitized["model.layers.1.mlp.shared_expert.gate_proj.scales"].shape,
+            (16, 1),
+        )
+        gate = sanitized["model.layers.1.mlp.shared_expert.gate_proj.weight"]
+        mx.eval(gate)
+        expected_gate = mx.full((16, 8), 1, dtype=mx.uint8).view(mx.uint32)
+        self.assertTrue(np.array_equal(np.array(gate), np.array(expected_gate)))
+        self.assertFalse(any(".weight_packed" in key for key in sanitized))
+        self.assertFalse(any(".weight_scale" in key for key in sanitized))
+        self.assertFalse(any(".weight_global_scale" in key for key in sanitized))
+        self.assertFalse(any(".input_global_scale" in key for key in sanitized))
+
+    def test_laguna_fuses_split_switch_gate_up(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=3,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+
+        prefix = "model.layers.1.mlp.switch_mlp"
+        weights = {
+            f"{prefix}.gate_proj.weight": mx.full((3, 16, 2), 1, dtype=mx.uint32),
+            f"{prefix}.up_proj.weight": mx.full((3, 16, 2), 2, dtype=mx.uint32),
+            f"{prefix}.gate_proj.scales": mx.full((3, 16, 1), 3, dtype=mx.uint8),
+            f"{prefix}.up_proj.scales": mx.full((3, 16, 1), 4, dtype=mx.uint8),
+        }
+
+        sanitized = model.language_model.sanitize(weights)
+
+        self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.gate_proj.scales", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.scales", sanitized)
+        self.assertEqual(sanitized[f"{prefix}.gate_up_proj.weight"].shape, (3, 32, 2))
+        self.assertEqual(sanitized[f"{prefix}.gate_up_proj.scales"].shape, (3, 32, 1))
+        mx.eval(
+            sanitized[f"{prefix}.gate_up_proj.weight"],
+            sanitized[f"{prefix}.gate_up_proj.scales"],
+        )
+        self.assertTrue(
+            np.array_equal(
+                np.array(sanitized[f"{prefix}.gate_up_proj.weight"][:, :16]),
+                np.ones((3, 16, 2), dtype=np.uint32),
+            )
+        )
+        self.assertTrue(
+            np.array_equal(
+                np.array(sanitized[f"{prefix}.gate_up_proj.weight"][:, 16:]),
+                np.full((3, 16, 2), 2, dtype=np.uint32),
+            )
+        )
+
+    def test_laguna_sanitize_drops_input_global_scale(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            num_attention_heads_per_layer=[4],
+            num_experts=0,
+        )
+        model = laguna.Model(config)
+
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mlp.gate_proj.input_global_scale": mx.array(
+                    [1.0], dtype=mx.float32
+                )
+            }
+        )
+
+        self.assertNotIn(
+            "language_model.model.layers.0.mlp.gate_proj.input_global_scale",
+            sanitized,
+        )
+
+    def test_laguna_sanitize_fuses_prefixed_split_switch_gate_up(self):
+        from mlx_vlm.models import laguna
+
+        config = laguna.ModelConfig(
+            model_type="laguna",
+            vocab_size=128,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=128,
+            mlp_layer_types=["dense", "sparse"],
+            num_attention_heads_per_layer=[2, 2],
+            num_experts=2,
+            num_experts_per_tok=1,
+            moe_intermediate_size=16,
+            shared_expert_intermediate_size=16,
+            quantization={"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        model = laguna.Model(config)
+        prefix = "language_model.model.layers.1.mlp.switch_mlp"
+
+        sanitized = model.sanitize(
+            {
+                f"{prefix}.gate_proj.weight": mx.full((2, 16, 2), 1, dtype=mx.uint32),
+                f"{prefix}.up_proj.weight": mx.full((2, 16, 2), 2, dtype=mx.uint32),
+                f"{prefix}.gate_proj.scales": mx.full((2, 16, 1), 0x38, dtype=mx.uint8),
+                f"{prefix}.up_proj.scales": mx.full((2, 16, 1), 0x40, dtype=mx.uint8),
+                f"{prefix}.down_proj.weight": mx.zeros((2, 16, 2), dtype=mx.uint32),
+                f"{prefix}.down_proj.scales": mx.zeros((2, 16, 1), dtype=mx.uint8),
+            }
+        )
+
+        fused_weight = sanitized[f"{prefix}.gate_up_proj.weight"]
+        fused_scales = sanitized[f"{prefix}.gate_up_proj.scales"]
+        mx.eval(fused_weight, fused_scales)
+
+        self.assertEqual(fused_weight.shape, (2, 32, 2))
+        self.assertEqual(fused_scales.shape, (2, 32, 1))
+        self.assertTrue(np.all(np.array(fused_weight[:, :16]) == 1))
+        self.assertTrue(np.all(np.array(fused_weight[:, 16:]) == 2))
+        self.assertTrue(np.all(np.array(fused_scales[:, :16]) == 0x38))
+        self.assertTrue(np.all(np.array(fused_scales[:, 16:]) == 0x40))
+        self.assertNotIn(f"{prefix}.gate_proj.weight", sanitized)
+        self.assertNotIn(f"{prefix}.up_proj.weight", sanitized)
+
     def test_hrm_text_language_model(self):
         from mlx_vlm.models import hrm_text
 
@@ -6211,6 +6529,108 @@ class TestModels(unittest.TestCase):
         self.assertEqual(features.shape, (1, 4, 3, config.embed_dim))
         self.assertTrue(mx.all(mx.isfinite(features)).item())
 
+    def _tiny_inkling_config(self):
+        from mlx_vlm.models.inkling.config import (
+            AudioConfig,
+            ModelConfig,
+            TextConfig,
+            VisionConfig,
+        )
+
+        text = TextConfig(
+            model_type="inkling",
+            hidden_size=64,
+            num_hidden_layers=2,
+            vocab_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            swa_num_attention_heads=4,
+            swa_num_key_value_heads=2,
+            swa_head_dim=16,
+            sliding_window_size=8,
+            layer_types=["hybrid_sliding", "hybrid"],
+            d_rel=4,
+            rel_extent=16,
+            sconv_kernel_size=4,
+            mlp_layer_types=["dense", "sparse"],
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            num_experts_per_tok=2,
+            n_shared_experts=2,
+            logits_mup_width_multiplier=1.0,
+        )
+        return ModelConfig(
+            model_type="inkling",
+            text_config=text,
+            vision_config=VisionConfig(
+                patch_size=4, temporal_patch_size=2, num_channels=3, n_layers=1
+            ),
+            audio_config=AudioConfig(n_mel_bins=8, mel_vocab_size=4),
+            image_token_id=100,
+            audio_token_id=101,
+            vocab_size=128,
+        )
+
+    def test_inkling_language_model(self):
+        from mlx_vlm.models import inkling
+
+        config = self._tiny_inkling_config()
+        model = inkling.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        cache = model.make_cache()
+        self.assertEqual(type(cache[0]).__name__, "CacheList")
+        self.assertEqual(type(cache[0][0]).__name__, "KVCache")
+        self.assertEqual(type(cache[0][1]).__name__, "ArraysCache")
+
+    def test_inkling_towers_and_multimodal(self):
+        from mlx_vlm.models import inkling
+
+        config = self._tiny_inkling_config()
+        hidden = config.text_config.hidden_size
+        model = inkling.Model(config)
+        mx.eval(model.parameters())
+
+        # vision HMLP tower: one soft token per patch, projected into LM space
+        n_patches = 2
+        pixel_values = mx.random.uniform(shape=(n_patches, 2, 4, 4, 3))
+        image_features = model.get_image_features(pixel_values)
+        self.assertEqual(image_features.shape, (n_patches, hidden))
+
+        # dMel audio tower: one embedding per frame
+        n_frames = 3
+        audio_input_ids = mx.zeros((1, n_frames, 8), dtype=mx.int32)
+        audio_features = model.get_audio_features(audio_input_ids)
+        self.assertEqual(audio_features.shape, (n_frames, hidden))
+
+        # multimodal merge: image/audio placeholder tokens replaced by tower features
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        ids = [1, 100, 100, 2, 101, 101, 101, 3]
+        emb = model.get_input_embeddings(
+            mx.array([ids]),
+            pixel_values=pixel_values,
+            audio_input_ids=audio_input_ids,
+        )
+        self.assertIsInstance(emb, InputEmbeddingsFeatures)
+        self.assertEqual(emb.inputs_embeds.shape, (1, len(ids), hidden))
+
+        out = model(
+            mx.array([ids]),
+            pixel_values=pixel_values,
+            audio_input_ids=audio_input_ids,
+        )
+        self.assertEqual(out.logits.shape, (1, len(ids), config.text_config.vocab_size))
+        self.assertTrue(bool(mx.isfinite(out.logits).all()))
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -10035,3 +10455,533 @@ class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
         reference = self._decode_logits(lm, with_delta_kwarg=False)
         subject = self._decode_logits(lm, with_delta_kwarg=True)
         self.assertTrue(mx.allclose(reference, subject, atol=1e-5).item())
+
+
+class TestInklingMTP(unittest.TestCase):
+    """Inkling multi-token-prediction speculative drafter.
+
+    All checks are synthetic (random-init tiny configs). The forward is
+    inferred from the checkpoint weight names since HF omits the Inkling MTP
+    head; correctness here is guaranteed by target verification regardless of
+    draft quality, so the greedy-invariant and rollback tests validate the
+    machinery, not acceptance rate."""
+
+    TEXT = {
+        "model_type": "inkling",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "vocab_size": 128,
+        "unpadded_vocab_size": None,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": False,
+        "use_embed_norm": True,
+        "logits_mup_width_multiplier": 1.0,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 16,
+        "swa_num_attention_heads": 8,
+        "swa_num_key_value_heads": 4,
+        "swa_head_dim": 16,
+        "sliding_window_size": 32,
+        "layer_types": ["hybrid_sliding", "hybrid"],
+        "d_rel": 16,
+        "rel_extent": 64,
+        "log_scaling_n_floor": None,
+        "log_scaling_alpha": 0.1,
+        "sconv_kernel_size": 4,
+        "mlp_layer_types": ["dense", "sparse"],
+        "intermediate_size": 128,
+        "moe_intermediate_size": 64,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "n_shared_experts": 1,
+        "route_scale": 8.0,
+        "num_mtp_layers": 1,
+        "mtp_local_layer_ids": [0],
+    }
+
+    def _build(self):
+        from mlx_vlm.models.inkling.config import ModelConfig
+        from mlx_vlm.models.inkling.inkling import Model
+        from mlx_vlm.speculative.drafters.inkling_mtp import InklingMTPDraftModel
+        from mlx_vlm.speculative.drafters.inkling_mtp import ModelConfig as MTPConfig
+
+        mx.random.seed(0)
+        vocab = self.TEXT["vocab_size"]
+        target = Model(
+            ModelConfig(text_config=dict(self.TEXT), vocab_size=vocab, eos_token_id=[])
+        )
+        target.eval()
+        mx.eval(target.parameters())
+        drafter = InklingMTPDraftModel(MTPConfig(text_config=dict(self.TEXT)))
+        drafter.eval()
+        mx.eval(drafter.parameters())
+        return target, drafter
+
+    def test_drafter_forward_shape(self):
+        target, drafter = self._build()
+        drafter.reset(target)
+        seq = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        hidden = target.language_model(
+            input_ids=seq, cache=target.make_cache(), return_hidden=True
+        ).hidden_states[-1]
+        out = drafter._forward_seq(seq, hidden, 0, mx.int32)
+        logits = drafter._block_logits(out[:, -1:, :])
+        self.assertEqual(logits.shape, (1, 1, self.TEXT["vocab_size"]))
+
+    def _generate(self, target, drafter, use_draft):
+        from mlx_vlm.generate.ar import generate_step
+
+        prompt = mx.array([[10, 20, 30, 40, 50]], dtype=mx.int32)
+        kwargs = dict(max_tokens=40, temperature=0.0, seed=0)
+        if use_draft:
+            kwargs.update(draft_model=drafter, draft_kind="mtp")
+        toks = []
+        for tok, _ in generate_step(prompt, target, None, None, **kwargs):
+            toks.append(
+                int(tok) if isinstance(tok, int) else int(mx.array(tok).reshape(-1)[0])
+            )
+        return toks
+
+    def test_greedy_matches_baseline(self):
+        target, drafter = self._build()
+        baseline = self._generate(target, drafter, use_draft=False)
+        drafter.reset(target)
+        speculative = self._generate(target, drafter, use_draft=True)
+        self.assertEqual(baseline, speculative)
+
+    def test_rollback_restore_replay(self):
+        target, _ = self._build()
+        lm = target.language_model
+        prompt = mx.array([[10, 20, 30, 40, 50]], dtype=mx.int32)
+        verify_input = mx.array([[7, 11, 13, 17]], dtype=mx.int32)
+        accepted = 2
+
+        c1 = lm.make_cache()
+        lm(input_ids=prompt, cache=c1)
+        _, _, gdn = lm.speculative_verify_hidden(verify_input, c1)
+        lm.rollback_speculative_cache(
+            c1, gdn, accepted, block_size=verify_input.shape[1]
+        )
+
+        c2 = lm.make_cache()
+        lm(
+            input_ids=mx.concatenate([prompt, verify_input[:, : accepted + 1]], axis=1),
+            cache=c2,
+        )
+
+        self.assertEqual(c1[0][0].offset, c2[0][0].offset)
+        probe = mx.array([[3]], dtype=mx.int32)
+        l1 = lm(input_ids=probe, cache=c1).logits
+        l2 = lm(input_ids=probe, cache=c2).logits
+        self.assertLess(float(mx.max(mx.abs(l1 - l2))), 1e-4)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestVendoredDenseModels(unittest.TestCase):
+    CFGS = {
+        "ernie4_5": dict(
+            model_type="ernie4_5",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            use_bias=True,
+            tie_word_embeddings=False,
+        ),
+        "seed_oss": dict(
+            model_type="seed_oss",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=512,
+            attention_out_bias=True,
+            tie_word_embeddings=False,
+        ),
+        "mimo": dict(
+            model_type="mimo",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+        ),
+        "openelm": dict(
+            model_type="openelm",
+            model_dim=64,
+            num_transformer_layers=2,
+            head_dim=16,
+            vocab_size=128,
+            ffn_dim_divisor=16,
+            num_query_heads=[4, 4],
+            num_kv_heads=[2, 2],
+            ffn_multipliers=[2.0, 2.0],
+            normalize_qk_projections=True,
+            share_input_output_layers=True,
+            rope_freq_constant=10000.0,
+            rms_norm_eps=1e-6,
+        ),
+        "olmo3": dict(
+            model_type="olmo3",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            max_position_embeddings=512,
+            sliding_window=32,
+            rope_theta=10000.0,
+            layer_types=["sliding_attention", "full_attention"],
+            tie_word_embeddings=False,
+        ),
+        "apertus": dict(
+            model_type="apertus",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            mlp_bias=False,
+            num_attention_heads=4,
+            attention_bias=False,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            post_norm=True,
+            qk_norm=True,
+            tie_word_embeddings=False,
+        ),
+        "baichuan_m1": dict(
+            model_type="baichuan_m1",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rope_theta=10000.0,
+            sliding_window=32,
+            sliding_window_layers=[0],
+            conv_window=2,
+            rms_norm_eps=1e-5,
+            num_swa_attention_heads=4,
+            num_swa_key_value_heads=2,
+            tie_word_embeddings=False,
+        ),
+        "hunyuan_v1_dense": dict(
+            model_type="hunyuan_v1_dense",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            attention_bias=False,
+            use_qk_norm=True,
+            head_dim=16,
+            tie_word_embeddings=False,
+        ),
+        "telechat3": dict(
+            model_type="telechat3",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            mlp_bias=False,
+            attention_bias=False,
+            head_dim=16,
+            tie_word_embeddings=False,
+        ),
+        "nemotron_nas": dict(
+            model_type="nemotron-nas",
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=500000.0,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+            block_configs=[
+                {"attention": {"n_heads_in_group": 2}, "ffn": {"ffn_mult": 2.0}},
+                {"attention": {"no_op": True}, "ffn": {"ffn_mult": 2.0}},
+            ],
+        ),
+        "ernie4_5_moe": dict(
+            model_type="ernie4_5_moe",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            use_bias=False,
+            tie_word_embeddings=False,
+            moe_num_experts=8,
+            moe_k=2,
+            moe_intermediate_size=32,
+            moe_num_shared_experts=1,
+            moe_layer_start_index=0,
+            moe_layer_interval=1,
+            head_dim=None,
+        ),
+        "solar_open": dict(
+            model_type="solar_open",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            norm_topk_prob=True,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            partial_rotary_factor=0.5,
+        ),
+        "dots1": dict(
+            model_type="dots1",
+            hidden_size=64,
+            num_hidden_layers=3,
+            intermediate_size=128,
+            num_attention_heads=8,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            max_position_embeddings=512,
+            num_key_value_heads=4,
+            first_k_dense_replace=1,
+            moe_intermediate_size=32,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            norm_topk_prob=True,
+            num_experts_per_tok=2,
+            rope_theta=10000.0,
+            routed_scaling_factor=2.5,
+            head_dim=8,
+            n_group=1,
+            topk_group=1,
+        ),
+        "exaone_moe": dict(
+            model_type="exaone_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=512,
+            sliding_window=4,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            is_moe_layer=[False, True, True, True],
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=2.5,
+            norm_topk_prob=True,
+        ),
+        "bailing_moe": dict(
+            model_type="bailing_moe",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=8,
+            num_experts_per_tok=2,
+            num_hidden_layers=3,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            vocab_size=128,
+            first_k_dense_replace=1,
+            use_qk_norm=True,
+            moe_router_enable_expert_bias=True,
+            n_group=2,
+            topk_group=1,
+            score_function="sigmoid",
+            routed_scaling_factor=2.5,
+        ),
+        "mimo_v2_flash": dict(
+            model_type="mimo_v2_flash",
+            num_experts_per_tok=2,
+            hybrid_layer_pattern=[1, 0, 1, 0],
+            moe_layer_freq=[0, 1, 1, 1],
+            add_swa_attention_sink_bias=True,
+            add_full_attention_sink_bias=True,
+            sliding_window_size=4,
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            max_position_embeddings=512,
+            layernorm_epsilon=1e-5,
+            rope_theta=10000.0,
+            swa_rope_theta=10000.0,
+            swa_num_attention_heads=8,
+            swa_num_key_value_heads=4,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            partial_rotary_factor=1.0,
+        ),
+        "afmoe": dict(
+            model_type="afmoe",
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            num_dense_layers=1,
+            route_norm=True,
+            route_scale=2.826,
+            score_func="sigmoid",
+            n_group=2,
+            topk_group=1,
+            sliding_window=4,
+            mup_enabled=True,
+        ),
+    }
+
+    def _run(self, name):
+        import importlib
+
+        pkg = importlib.import_module(f"mlx_vlm.models.{name}")
+        model = pkg.Model(pkg.ModelConfig.from_dict(dict(self.CFGS[name])))
+        model.eval()
+        mx.eval(model.parameters())
+        ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
+        vocab = self.CFGS[name]["vocab_size"]
+        self.assertEqual(model(ids).logits.shape, (1, 8, vocab))
+        cache = model.language_model.make_cache()
+        model(ids[:, :-1], cache=cache)
+        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, vocab))
+
+    def test_ernie4_5(self):
+        self._run("ernie4_5")
+
+    def test_seed_oss(self):
+        self._run("seed_oss")
+
+    def test_mimo(self):
+        self._run("mimo")
+
+    def test_openelm(self):
+        self._run("openelm")
+
+    def test_olmo3(self):
+        self._run("olmo3")
+
+    def test_apertus(self):
+        self._run("apertus")
+
+    def test_baichuan_m1(self):
+        self._run("baichuan_m1")
+
+    def test_hunyuan_v1_dense(self):
+        self._run("hunyuan_v1_dense")
+
+    def test_telechat3(self):
+        self._run("telechat3")
+
+    def test_nemotron_nas(self):
+        self._run("nemotron_nas")
+
+    def test_ernie4_5_moe(self):
+        self._run("ernie4_5_moe")
+
+    def test_solar_open(self):
+        self._run("solar_open")
+
+    def test_dots1(self):
+        self._run("dots1")
+
+    def test_exaone_moe(self):
+        self._run("exaone_moe")
+
+    def test_bailing_moe(self):
+        self._run("bailing_moe")
+
+    def test_mimo_v2_flash(self):
+        self._run("mimo_v2_flash")
+
+    def test_afmoe(self):
+        self._run("afmoe")

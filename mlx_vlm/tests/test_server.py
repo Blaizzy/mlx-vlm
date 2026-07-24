@@ -467,6 +467,30 @@ def test_build_sampling_config_from_args():
     )
 
 
+def test_build_sampling_config_from_args_carries_new_sampling_modes():
+    # top_n_sigma / p_less / typical_p all default to "disabled", so a config
+    # built without them still compares equal on the other fields -- dropping
+    # them from _config_from_args would be invisible unless asserted directly.
+    # Their per-row values are what makes these modes work per request.
+    from mlx_vlm.generate.ar import SamplingConfig
+    from mlx_vlm.server.generation import GenerationArguments, _config_from_args
+
+    args = GenerationArguments(
+        temperature=0.8, top_n_sigma=1.5, p_less=True, typical_p=0.4
+    )
+    config = _config_from_args(args)
+    assert config.top_n_sigma == 1.5
+    assert config.p_less is True
+    assert config.typical_p == 0.4
+    assert config == SamplingConfig(
+        temperature=0.8,
+        seed=config.seed,
+        top_n_sigma=1.5,
+        p_less=True,
+        typical_p=0.4,
+    )
+
+
 def test_build_sampling_config_from_args_uses_default_seed_when_unset():
     # seed=None means "server picks a seed" (DEFAULT_SEED), not "seed=None"
     # (which would crash mx.random.key downstream in _PositionedTargetSampler).

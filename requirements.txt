@@ -1,6 +1,5 @@
 mlx>=0.32.0
 transformers>=5.14.0
-datasets>=2.19.1
 miniaudio>=1.59
 tqdm>=4.66.2
 Pillow>=10.3.0

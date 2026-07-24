@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import typing
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1989,6 +1990,9 @@ class TestSamplerArgs:
             top_p=0.9,
             min_p=0.05,
             top_k=32,
+            top_n_sigma=0.0,
+            p_less=False,
+            typical_p=1.0,
         )
         mock_make_logits_processors.assert_called_once_with(
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
@@ -2194,6 +2198,24 @@ def test_stream_generate_forwards_verbose_to_generate_step():
         )
 
     assert captured["verbose"] is True
+
+
+def test_public_generation_annotations_match_runtime_results():
+    hints = typing.get_type_hints(dispatch_module.stream_generate)
+
+    assert hints["return"] == typing.Generator[GenerationResult, None, None]
+    assert type(None) in typing.get_args(hints["image"])
+    assert type(None) in typing.get_args(hints["audio"])
+    assert type(None) in typing.get_args(hints["video"])
+
+
+def test_batch_generate_optional_input_annotations_match_defaults():
+    hints = typing.get_type_hints(ar_module.batch_generate)
+
+    assert type(None) in typing.get_args(hints["images"])
+    assert type(None) in typing.get_args(hints["audios"])
+    assert type(None) in typing.get_args(hints["prompts"])
+    assert hints["return"] is BatchResponse
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -2462,6 +2484,26 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert "falling back to cold prefill" in caplog.text
 
 
+def test_apc_pick_for_accepts_the_tuple_insert_actually_builds(
+    mock_model, mock_processor
+):
+    # _apc_pick_for destructures the queued-sequence tuple, so its arity is
+    # coupled to what insert() appends. Per-row sampling added a 7th element
+    # (the SamplingConfig); an unpack still expecting 6 raises ValueError on
+    # every APC-enabled prefill. Feed the real producer's tuple to the real
+    # consumer so the two cannot drift apart again.
+    gen = BatchGenerator(
+        model=mock_model.language_model,
+        processor=mock_processor,
+        max_tokens=16,
+    )
+    gen.insert([[7]])  # 1-token prompt: bails out after the unpack, before APC
+    sequence = gen._unprocessed_sequences[0]
+    gen.apc_manager = object()  # enable the APC path
+
+    assert gen._apc_pick_for(sequence) is None
+
+
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     batch_generator = SimpleNamespace(apc_manager=object())
 
@@ -2678,7 +2720,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None, SamplingConfig()))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)

@@ -38,11 +38,13 @@ from .image import (
     load_image_generation_model,
     load_image_model,
 )
+from .types import GenerateKwargs, ProcessorLike
 
 __all__ = [
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
+    "GenerateKwargs",
     "GenerationResult",
     "ImageEditModel",
     "ImageEditRequest",
@@ -52,6 +54,7 @@ __all__ = [
     "ImageTask",
     "PromptCacheState",
     "PromptProcessingBatch",
+    "ProcessorLike",
     "batch_generate",
     "edit_image",
     "generate",
