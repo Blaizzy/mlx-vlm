@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from ..base import LanguageModelOutput, create_attention_mask
 from ..cache import KVCache
+from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
 
@@ -23,10 +24,12 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=False)
 
         rope_dim = int(head_dim * config.partial_rotary_factor)
-        self.rope = nn.RoPE(
-            rope_dim,
-            traditional=config.rope_traditional,
+        self.rope = initialize_rope(
+            dims=rope_dim,
             base=config.rope_theta,
+            traditional=config.rope_traditional,
+            scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(

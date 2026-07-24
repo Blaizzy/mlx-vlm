@@ -12,6 +12,7 @@ from ..base import (
 from ..mlp import DeepseekMLP as MLP
 from ..pipeline import PipelineMixin
 from ..switch_layers import SwitchGLU
+from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
 
@@ -36,10 +37,12 @@ class Attention(nn.Module):
             self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
             self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
-        self.rope = nn.RoPE(
-            int(head_dim * args.partial_rotary_factor),
-            traditional=False,
+        self.rope = initialize_rope(
+            dims=int(head_dim * args.partial_rotary_factor),
             base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
