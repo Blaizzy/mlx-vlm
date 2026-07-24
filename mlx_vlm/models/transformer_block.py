@@ -56,6 +56,8 @@ class MoESpec:
     num_experts: int
     num_experts_per_tok: int
     scoring: str = "softmax"
+    scoring_precise: bool = False
+    select_order: str = "desc"
     use_correction_bias: bool = False
     n_group: int = 1
     topk_group: int = 1
@@ -261,7 +263,9 @@ class MoEMLP(nn.Module):
         if spec.scoring == "sigmoid":
             scores = mx.sigmoid(gates.astype(mx.float32))
         else:
-            scores = mx.softmax(gates.astype(mx.float32), axis=-1)
+            scores = mx.softmax(
+                gates.astype(mx.float32), axis=-1, precise=spec.scoring_precise
+            )
         orig = scores
 
         if spec.use_correction_bias:
@@ -278,7 +282,12 @@ class MoEMLP(nn.Module):
             scores = mx.flatten(scores, -2, -1)
 
         k = spec.num_experts_per_tok
-        inds = mx.stop_gradient(mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k])
+        if spec.select_order == "asc":
+            inds = mx.stop_gradient(mx.argpartition(scores, kth=-k, axis=-1)[..., -k:])
+        else:
+            inds = mx.stop_gradient(
+                mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            )
         weights = mx.take_along_axis(orig, inds, axis=-1)
 
         if spec.norm_topk_prob and (not spec.norm_guard_topk or k > 1):
