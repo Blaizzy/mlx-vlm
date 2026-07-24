@@ -85,6 +85,7 @@ class BlockSpec:
     rms_norm_eps: float = 1e-6
     layout: str = "pre"
     attn_bias: bool = False
+    attn_out_bias: Optional[bool] = None
     qk_norm: bool = False
     attn_logit_softcapping: Optional[float] = None
     mlp_act: Callable = nn.silu
@@ -107,6 +108,7 @@ class Attention(nn.Module):
         self.softcap = spec.attn_logit_softcapping
         self.rope = spec.rope
 
+        out_bias = spec.attn_bias if spec.attn_out_bias is None else spec.attn_out_bias
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=spec.attn_bias)
         self.k_proj = nn.Linear(
             dim, self.n_kv_heads * self.head_dim, bias=spec.attn_bias
@@ -114,7 +116,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(
             dim, self.n_kv_heads * self.head_dim, bias=spec.attn_bias
         )
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=spec.attn_bias)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=out_bias)
 
         if spec.qk_norm:
             self.q_norm = nn.RMSNorm(self.head_dim, eps=spec.rms_norm_eps)
