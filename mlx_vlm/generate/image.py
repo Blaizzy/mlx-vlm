@@ -152,6 +152,8 @@ def _model_type_from_id(model: str) -> str:
         "flux.2": "flux2",
         "flux2": "flux2",
         "klein": "flux2",
+        "mage": "mage_flow",
+        "mageflow": "mage_flow",
     }.get(model_type, model_type)
 
 
