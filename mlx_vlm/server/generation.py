@@ -1555,6 +1555,11 @@ class ResponseGenerator:
             **data_kwargs,
             **{k: v for k, v in embed.to_dict().items() if v is not None},
         }
+        # APC token hashes already identify the text prefix, while media has
+        # dedicated semantic hashes. Mark these full-prompt tensors as derived
+        # so they do not invalidate prefix reuse solely because text was
+        # appended.
+        gen_kwargs["_apc_derived_sequence_inputs"] = True
         if images is not None:
             gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
         elif pixel_values is not None:

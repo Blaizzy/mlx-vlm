@@ -558,7 +558,11 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "token_type_ids",
 }
 
-APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+APC_PRIVATE_PROMPT_KEYS = (
+    "_apc_tenant",
+    "_apc_image_hash",
+    "_apc_derived_sequence_inputs",
+)
 
 
 def _is_mrope_position_ids_prompt_kwarg(key: str, v: mx.array) -> bool:
@@ -2219,14 +2223,31 @@ class BatchGenerator:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
+        derived_sequence_inputs = bool(
+            prompt_kwargs.get("_apc_derived_sequence_inputs")
+        )
+        # inputs_embeds and attention_mask are derived from the complete
+        # prompt in the continuous server path. Hashing them here would change
+        # the global APC salt whenever text is appended and prevent the token
+        # block lookup from discovering an otherwise identical prefix. Keep
+        # hashing explicitly supplied tensors for callers using BatchGenerator
+        # directly.
         return _apc.semantic_extra_hash(
             tenant=tenant,
             image_hash=img,
             media={
                 "audio": prompt_kwargs.get("input_features"),
                 "video": prompt_kwargs.get("pixel_values_videos"),
-                "embeddings": prompt_kwargs.get("inputs_embeds"),
-                "masks": prompt_kwargs.get("attention_mask"),
+                "embeddings": (
+                    None
+                    if derived_sequence_inputs
+                    else prompt_kwargs.get("inputs_embeds")
+                ),
+                "masks": (
+                    None
+                    if derived_sequence_inputs
+                    else prompt_kwargs.get("attention_mask")
+                ),
             },
             model=getattr(self, "model", None),
             processor=getattr(self, "processor", None),

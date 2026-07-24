@@ -2271,6 +2271,83 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
 
 
+def test_batch_apc_extra_hash_ignores_growing_derived_sequence_tensors():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    common = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+        "_apc_derived_sequence_inputs": True,
+    }
+
+    short_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **common,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    extended_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **common,
+            "inputs_embeds": mx.ones((1, 12, 4)),
+            "attention_mask": mx.ones((1, 12), dtype=mx.int32),
+        },
+    )
+
+    assert short_hash == extended_hash
+
+
+def test_batch_apc_extra_hash_still_tracks_non_text_media():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+        "_apc_derived_sequence_inputs": True,
+        "inputs_embeds": mx.ones((1, 8, 4)),
+        "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.zeros((1, 4, 8))},
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.ones((1, 4, 8))},
+    )
+
+    assert first_hash != second_hash
+
+
+def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.zeros((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+
+    assert first_hash != second_hash
+
+
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     class EmptyGenerationBatch:
         def __len__(self):
