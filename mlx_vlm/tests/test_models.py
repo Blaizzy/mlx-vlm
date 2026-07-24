@@ -10526,6 +10526,56 @@ class TestTransformerBlock(unittest.TestCase):
         "gemma2": [-0.09723, -0.1632, -0.182053, -0.148346, -0.07181, 0.025459],
     }
 
+    MOE_CASES = {
+        "ernie4_5_moe": dict(
+            model_type="ernie4_5_moe",
+            hidden_size=32,
+            intermediate_size=64,
+            max_position_embeddings=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            rope_theta=10000.0,
+            use_bias=False,
+            tie_word_embeddings=False,
+            moe_num_experts=8,
+            moe_k=2,
+            moe_intermediate_size=16,
+            moe_num_shared_experts=1,
+            moe_layer_start_index=0,
+            moe_layer_interval=1,
+            head_dim=None,
+        ),
+        "dots1": dict(
+            model_type="dots1",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=48,
+            max_position_embeddings=256,
+            num_key_value_heads=2,
+            first_k_dense_replace=1,
+            moe_intermediate_size=16,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            norm_topk_prob=True,
+            num_experts_per_tok=2,
+            rope_theta=10000.0,
+            routed_scaling_factor=2.5,
+            head_dim=8,
+            n_group=2,
+            topk_group=1,
+        ),
+    }
+    MOE_GOLDEN = {
+        "ernie4_5_moe": [-0.040216, -0.010885, 0.021588, 0.047828, 0.06026, 0.055295],
+        "dots1": [-0.016876, 0.005456, 0.026214, 0.039403, 0.041216, 0.03113],
+    }
+
     def _deterministic(self, params):
         from mlx.utils import tree_unflatten
 
@@ -10549,6 +10599,22 @@ class TestTransformerBlock(unittest.TestCase):
             logits = (out.logits if hasattr(out, "logits") else out)[0, -1, :6]
             got = [float(v) for v in logits.astype(mx.float32).tolist()]
             for g, expected in zip(got, self.GOLDEN[name]):
+                self.assertAlmostEqual(g, expected, places=5, msg=f"{name}: {got}")
+
+    def test_shared_moe_block_matches_golden(self):
+        for name, cfg_dict in self.MOE_CASES.items():
+            cfg = importlib.import_module(
+                f"mlx_vlm.models.{name}.config"
+            ).ModelConfig.from_dict(cfg_dict)
+            lm = importlib.import_module(
+                f"mlx_vlm.models.{name}.language"
+            ).LanguageModel(cfg)
+            lm.update(self._deterministic(lm.parameters()))
+            lm.eval()
+            out = lm(mx.array([[1, 2, 3, 4, 5, 6]]))
+            logits = (out.logits if hasattr(out, "logits") else out)[0, -1, :6]
+            got = [float(v) for v in logits.astype(mx.float32).tolist()]
+            for g, expected in zip(got, self.MOE_GOLDEN[name]):
                 self.assertAlmostEqual(g, expected, places=5, msg=f"{name}: {got}")
 
 
