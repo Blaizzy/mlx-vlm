@@ -10461,3 +10461,409 @@ class TestInklingMTP(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVendoredDenseModels(unittest.TestCase):
+    CFGS = {
+        "ernie4_5": dict(
+            model_type="ernie4_5",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            use_bias=True,
+            tie_word_embeddings=False,
+        ),
+        "seed_oss": dict(
+            model_type="seed_oss",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=512,
+            attention_out_bias=True,
+            tie_word_embeddings=False,
+        ),
+        "mimo": dict(
+            model_type="mimo",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+        ),
+        "openelm": dict(
+            model_type="openelm",
+            model_dim=64,
+            num_transformer_layers=2,
+            head_dim=16,
+            vocab_size=128,
+            ffn_dim_divisor=16,
+            num_query_heads=[4, 4],
+            num_kv_heads=[2, 2],
+            ffn_multipliers=[2.0, 2.0],
+            normalize_qk_projections=True,
+            share_input_output_layers=True,
+            rope_freq_constant=10000.0,
+            rms_norm_eps=1e-6,
+        ),
+        "olmo3": dict(
+            model_type="olmo3",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            max_position_embeddings=512,
+            sliding_window=32,
+            rope_theta=10000.0,
+            layer_types=["sliding_attention", "full_attention"],
+            tie_word_embeddings=False,
+        ),
+        "apertus": dict(
+            model_type="apertus",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            mlp_bias=False,
+            num_attention_heads=4,
+            attention_bias=False,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            post_norm=True,
+            qk_norm=True,
+            tie_word_embeddings=False,
+        ),
+        "baichuan_m1": dict(
+            model_type="baichuan_m1",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rope_theta=10000.0,
+            sliding_window=32,
+            sliding_window_layers=[0],
+            conv_window=2,
+            rms_norm_eps=1e-5,
+            num_swa_attention_heads=4,
+            num_swa_key_value_heads=2,
+            tie_word_embeddings=False,
+        ),
+        "hunyuan_v1_dense": dict(
+            model_type="hunyuan_v1_dense",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            max_position_embeddings=512,
+            attention_bias=False,
+            use_qk_norm=True,
+            head_dim=16,
+            tie_word_embeddings=False,
+        ),
+        "telechat3": dict(
+            model_type="telechat3",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            mlp_bias=False,
+            attention_bias=False,
+            head_dim=16,
+            tie_word_embeddings=False,
+        ),
+        "nemotron_nas": dict(
+            model_type="nemotron-nas",
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=500000.0,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+            block_configs=[
+                {"attention": {"n_heads_in_group": 2}, "ffn": {"ffn_mult": 2.0}},
+                {"attention": {"no_op": True}, "ffn": {"ffn_mult": 2.0}},
+            ],
+        ),
+        "ernie4_5_moe": dict(
+            model_type="ernie4_5_moe",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            rope_theta=10000.0,
+            use_bias=False,
+            tie_word_embeddings=False,
+            moe_num_experts=8,
+            moe_k=2,
+            moe_intermediate_size=32,
+            moe_num_shared_experts=1,
+            moe_layer_start_index=0,
+            moe_layer_interval=1,
+            head_dim=None,
+        ),
+        "solar_open": dict(
+            model_type="solar_open",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            norm_topk_prob=True,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            partial_rotary_factor=0.5,
+        ),
+        "dots1": dict(
+            model_type="dots1",
+            hidden_size=64,
+            num_hidden_layers=3,
+            intermediate_size=128,
+            num_attention_heads=8,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            max_position_embeddings=512,
+            num_key_value_heads=4,
+            first_k_dense_replace=1,
+            moe_intermediate_size=32,
+            n_routed_experts=8,
+            n_shared_experts=1,
+            norm_topk_prob=True,
+            num_experts_per_tok=2,
+            rope_theta=10000.0,
+            routed_scaling_factor=2.5,
+            head_dim=8,
+            n_group=1,
+            topk_group=1,
+        ),
+        "exaone_moe": dict(
+            model_type="exaone_moe",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=512,
+            sliding_window=4,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            is_moe_layer=[False, True, True, True],
+            n_group=2,
+            topk_group=1,
+            routed_scaling_factor=2.5,
+            norm_topk_prob=True,
+        ),
+        "bailing_moe": dict(
+            model_type="bailing_moe",
+            hidden_size=64,
+            intermediate_size=128,
+            max_position_embeddings=512,
+            moe_intermediate_size=32,
+            num_experts=8,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=8,
+            num_experts_per_tok=2,
+            num_hidden_layers=3,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            vocab_size=128,
+            first_k_dense_replace=1,
+            use_qk_norm=True,
+            moe_router_enable_expert_bias=True,
+            n_group=2,
+            topk_group=1,
+            score_function="sigmoid",
+            routed_scaling_factor=2.5,
+        ),
+        "mimo_v2_flash": dict(
+            model_type="mimo_v2_flash",
+            num_experts_per_tok=2,
+            hybrid_layer_pattern=[1, 0, 1, 0],
+            moe_layer_freq=[0, 1, 1, 1],
+            add_swa_attention_sink_bias=True,
+            add_full_attention_sink_bias=True,
+            sliding_window_size=4,
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=8,
+            routed_scaling_factor=2.5,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            max_position_embeddings=512,
+            layernorm_epsilon=1e-5,
+            rope_theta=10000.0,
+            swa_rope_theta=10000.0,
+            swa_num_attention_heads=8,
+            swa_num_key_value_heads=4,
+            head_dim=8,
+            v_head_dim=8,
+            swa_head_dim=8,
+            swa_v_head_dim=8,
+            partial_rotary_factor=1.0,
+        ),
+        "afmoe": dict(
+            model_type="afmoe",
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+            ],
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=8,
+            max_position_embeddings=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000,
+            num_experts=8,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            num_dense_layers=1,
+            route_norm=True,
+            route_scale=2.826,
+            score_func="sigmoid",
+            n_group=2,
+            topk_group=1,
+            sliding_window=4,
+            mup_enabled=True,
+        ),
+    }
+
+    def _run(self, name):
+        import importlib
+
+        pkg = importlib.import_module(f"mlx_vlm.models.{name}")
+        model = pkg.Model(pkg.ModelConfig.from_dict(dict(self.CFGS[name])))
+        model.eval()
+        mx.eval(model.parameters())
+        ids = mx.array([[1, 5, 9, 13, 2, 7, 11, 3]])
+        vocab = self.CFGS[name]["vocab_size"]
+        self.assertEqual(model(ids).logits.shape, (1, 8, vocab))
+        cache = model.language_model.make_cache()
+        model(ids[:, :-1], cache=cache)
+        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, vocab))
+
+    def test_ernie4_5(self):
+        self._run("ernie4_5")
+
+    def test_seed_oss(self):
+        self._run("seed_oss")
+
+    def test_mimo(self):
+        self._run("mimo")
+
+    def test_openelm(self):
+        self._run("openelm")
+
+    def test_olmo3(self):
+        self._run("olmo3")
+
+    def test_apertus(self):
+        self._run("apertus")
+
+    def test_baichuan_m1(self):
+        self._run("baichuan_m1")
+
+    def test_hunyuan_v1_dense(self):
+        self._run("hunyuan_v1_dense")
+
+    def test_telechat3(self):
+        self._run("telechat3")
+
+    def test_nemotron_nas(self):
+        self._run("nemotron_nas")
+
+    def test_ernie4_5_moe(self):
+        self._run("ernie4_5_moe")
+
+    def test_solar_open(self):
+        self._run("solar_open")
+
+    def test_dots1(self):
+        self._run("dots1")
+
+    def test_exaone_moe(self):
+        self._run("exaone_moe")
+
+    def test_bailing_moe(self):
+        self._run("bailing_moe")
+
+    def test_mimo_v2_flash(self):
+        self._run("mimo_v2_flash")
+
+    def test_afmoe(self):
+        self._run("afmoe")
