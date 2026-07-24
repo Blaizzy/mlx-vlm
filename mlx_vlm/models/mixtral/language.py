@@ -9,6 +9,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..switch_layers import SwitchGLU
+from ..rope_utils import initialize_rope
 from .config import ModelConfig
 
 
@@ -36,10 +37,11 @@ class MixtralAttention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rope = nn.RoPE(
-            self.head_dim,
-            traditional=args.rope_traditional,
+        self.rope = initialize_rope(
+            dims=self.head_dim,
             base=args.rope_theta,
+            traditional=args.rope_traditional,
+            scaling_config=args.rope_scaling,
         )
 
     def __call__(

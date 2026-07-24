@@ -3653,6 +3653,31 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
 
+    def test_mllama_rope_scaling_is_applied(self):
+        from mlx_vlm.models import mllama
+        from mlx_vlm.models.rope_utils import Llama3RoPE
+
+        config = mllama.TextConfig(
+            rope_scaling={
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+            }
+        )
+
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+        self.assertIsInstance(attn.rope, Llama3RoPE)
+
+    def test_mllama_without_rope_scaling_is_plain(self):
+        from mlx_vlm.models import mllama
+
+        attn = mllama.language.MllamaTextSelfAttention(
+            mllama.TextConfig(rope_scaling=None), layer_idx=0
+        )
+        self.assertAlmostEqual(attn.rope.scale, 1.0)
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 
