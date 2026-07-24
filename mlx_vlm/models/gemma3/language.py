@@ -11,6 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -46,14 +47,16 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(dims=head_dim, eps=config.rms_norm_eps)
         self.is_sliding = (layer_idx + 1) % config.sliding_window_pattern != 0
 
-        self.rope = nn.RoPE(
-            head_dim,
-            traditional=config.rope_traditional,
+        self.rope = initialize_rope(
+            dims=head_dim,
             base=(
                 config.rope_local_base_freq
                 if self.is_sliding
                 else config.rope_global_base_freq
             ),
+            traditional=config.rope_traditional,
+            scaling_config=None if self.is_sliding else config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(

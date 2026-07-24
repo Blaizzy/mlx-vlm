@@ -1159,6 +1159,53 @@ class TestModels(unittest.TestCase):
         self.assertEqual(logits.shape, (1, 4, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
 
+    def test_gemma3_rope_scaling_applies_to_global_layers(self):
+        from mlx_vlm.models import gemma3
+
+        config = gemma3.TextConfig(
+            model_type="gemma3",
+            hidden_size=64,
+            num_hidden_layers=6,
+            intermediate_size=128,
+            num_attention_heads=4,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            num_key_value_heads=2,
+            sliding_window=8,
+            sliding_window_pattern=3,
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        model = gemma3.LanguageModel(config)
+
+        for layer in model.model.layers:
+            attn = layer.self_attn
+            expected = 1.0 if attn.is_sliding else 1 / 8.0
+            self.assertAlmostEqual(attn.rope.scale, expected)
+
+    def test_gemma3_without_rope_scaling_is_unscaled(self):
+        from mlx_vlm.models import gemma3
+
+        config = gemma3.TextConfig(
+            model_type="gemma3",
+            hidden_size=64,
+            num_hidden_layers=6,
+            intermediate_size=128,
+            num_attention_heads=4,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=128,
+            num_key_value_heads=2,
+            sliding_window=8,
+            sliding_window_pattern=3,
+        )
+
+        model = gemma3.LanguageModel(config)
+
+        for layer in model.model.layers:
+            self.assertAlmostEqual(layer.self_attn.rope.scale, 1.0)
+
     def test_gemma3_text_language_model(self):
         from mlx_vlm.models import gemma3_text
 
