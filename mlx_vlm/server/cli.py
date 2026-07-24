@@ -45,6 +45,13 @@ def main():
         help="Trust remote code when loading models from Hugging Face Hub.",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        choices=("cpu", "gpu"),
+        default=None,
+        help="Device to run inference on. Defaults to the MLX default device.",
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default=None,
@@ -226,6 +233,10 @@ def main():
         help="Set the logging level (default: INFO).",
     )
     args = parser.parse_args()
+    if args.device:
+        from ..generate.common import set_generation_device
+
+        set_generation_device(args.device)
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:

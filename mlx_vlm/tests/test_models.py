@@ -10457,6 +10457,49 @@ class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
         self.assertTrue(mx.allclose(reference, subject, atol=1e-5).item())
 
 
+class TestSetGenerationDevice(unittest.TestCase):
+    def test_rebinds_streams_in_imported_modules(self):
+        # mlx_vlm.__init__ re-exports the generate *function*, shadowing the
+        # generate package for `import ... as` attribute binding
+        import importlib
+
+        ar = importlib.import_module("mlx_vlm.generate.ar")
+        common = importlib.import_module("mlx_vlm.generate.common")
+        dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
+        set_generation_device = common.set_generation_device
+
+        original_device = mx.default_device()
+        original_stream = common.generation_stream
+        try:
+            set_generation_device("cpu")
+            self.assertEqual(mx.default_device().type, mx.DeviceType.cpu)
+            self.assertEqual(common.generation_stream.device.type, mx.DeviceType.cpu)
+            # every imported mlx_vlm module carrying the binding is rebound
+            for mod in (ar, dispatch):
+                if hasattr(mod, "generation_stream"):
+                    self.assertEqual(
+                        mod.generation_stream.device.type, mx.DeviceType.cpu
+                    )
+                    self.assertIs(mod.generation_stream, common.generation_stream)
+        finally:
+            mx.set_default_device(original_device)
+            for mod in (common, ar, dispatch):
+                if hasattr(mod, "generation_stream"):
+                    mod.generation_stream = original_stream
+
+    def test_wired_limit_noops_on_cpu_device(self):
+        from mlx_vlm.generate.common import wired_limit
+
+        original_device = mx.default_device()
+        try:
+            mx.set_default_device(mx.Device(mx.cpu))
+            model = type("M", (), {"parameters": lambda self: {}})()
+            with wired_limit(model):
+                pass  # must not touch Metal device_info on the cpu device
+        finally:
+            mx.set_default_device(original_device)
+
+
 class TestInklingMTP(unittest.TestCase):
     """Inkling multi-token-prediction speculative drafter.
 

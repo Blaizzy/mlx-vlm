@@ -1,6 +1,5 @@
 import argparse
 import codecs
-import contextlib
 import json
 import logging
 import time
@@ -10,7 +9,6 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
@@ -63,6 +61,13 @@ def parse_arguments():
         type=str,
         default=DEFAULT_MODEL_PATH,
         help="The path to the local model directory or Hugging Face repo.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=("cpu", "gpu"),
+        default=None,
+        help="Device to run inference on. Defaults to the MLX default device.",
     )
     parser.add_argument(
         "--output-modality",
@@ -417,10 +422,11 @@ def parse_arguments():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=DEFAULT_PREFILL_STEP_SIZE,
+        default=None,
         help="Number of tokens to process per prefill step. "
-        "Lower values reduce peak memory usage but may be slower. "
-        "Try 512 or 256 if you hit GPU memory errors during prefill.",
+        f"Defaults to {DEFAULT_PREFILL_STEP_SIZE} on GPU and 256 on CPU "
+        "(CPU prefill is fastest with small activation blocks). "
+        "Lower values also reduce peak memory usage.",
     )
     parser.add_argument(
         "--draft-model",
@@ -498,10 +504,6 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
-
-
 def maybe_quantize_kv_cache(
     prompt_cache,
     quantized_kv_start,
@@ -557,44 +559,6 @@ def maybe_quantize_kv_cache(
                 group_size=kv_group_size,
                 bits=int(kv_bits),
             )
-
-
-@contextlib.contextmanager
-def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
-    """
-    A context manager to temporarily change the wired limit.
-
-    Note, the wired limit should not be changed during an async eval.  If an
-    async eval could be running pass in the streams to synchronize with prior
-    to exiting the context manager.
-    """
-    if not mx.metal.is_available():
-        yield
-        return
-
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
-    )
-    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
-        )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
 
 
 @dataclass
@@ -1232,6 +1196,18 @@ def generate(
 
 def main():
     args = parse_arguments()
+
+    if getattr(args, "device", None):
+        from .common import set_generation_device
+
+        set_generation_device(args.device)
+
+    if getattr(args, "prefill_step_size", None) is None:
+        # CPU prefill is compute-bound and fastest when the activation block
+        # stays cache-resident; 256 measured ~12% faster than 2048 on M-series
+        args.prefill_step_size = (
+            256 if getattr(args, "device", None) == "cpu" else DEFAULT_PREFILL_STEP_SIZE
+        )
 
     if getattr(args, "output_modality", "text") == "image":
         run_image_generation_cli(args)
