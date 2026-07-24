@@ -42,6 +42,10 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
+        weights = {
+            k[len("language_model.") :] if k.startswith("language_model.") else k: v
+            for k, v in weights.items()
+        }
         weights = self.language_model.sanitize(weights)
 
         def transform_key(key):
