@@ -91,6 +91,10 @@ class BlockSpec:
     mlp_act: Callable = nn.silu
     mlp_bias: bool = False
     use_sliding: bool = False
+    use_rope: bool = True
+    qk_norm_full: bool = False
+    qk_norm_post_rope: bool = False
+    qk_norm_names: tuple = ("q_norm", "k_norm")
     moe: Optional[MoESpec] = None
 
 
@@ -106,7 +110,8 @@ class Attention(nn.Module):
         self.head_dim = spec.head_dim
         self.scale = spec.scale
         self.softcap = spec.attn_logit_softcapping
-        self.rope = spec.rope
+        self.use_rope = spec.use_rope
+        self.rope = spec.rope if spec.use_rope else None
 
         out_bias = spec.attn_bias if spec.attn_out_bias is None else spec.attn_out_bias
         self.q_proj = nn.Linear(dim, self.n_heads * self.head_dim, bias=spec.attn_bias)
@@ -118,10 +123,20 @@ class Attention(nn.Module):
         )
         self.o_proj = nn.Linear(self.n_heads * self.head_dim, dim, bias=out_bias)
 
-        if spec.qk_norm:
-            self.q_norm = nn.RMSNorm(self.head_dim, eps=spec.rms_norm_eps)
-            self.k_norm = nn.RMSNorm(self.head_dim, eps=spec.rms_norm_eps)
         self.qk_norm = spec.qk_norm
+        self.qk_norm_full = spec.qk_norm_full
+        self.qk_norm_post_rope = spec.qk_norm_post_rope
+        self._qname, self._kname = spec.qk_norm_names
+        if spec.qk_norm:
+            if spec.qk_norm_full:
+                qdim, kdim = (
+                    self.n_heads * self.head_dim,
+                    self.n_kv_heads * self.head_dim,
+                )
+            else:
+                qdim = kdim = self.head_dim
+            setattr(self, self._qname, nn.RMSNorm(qdim, eps=spec.rms_norm_eps))
+            setattr(self, self._kname, nn.RMSNorm(kdim, eps=spec.rms_norm_eps))
 
     def _softcap_attention(self, q, k, v, mask):
         B, _, L, _ = q.shape
@@ -155,22 +170,34 @@ class Attention(nn.Module):
         B, L, _ = x.shape
         queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
+        if self.qk_norm and self.qk_norm_full:
+            queries = getattr(self, self._qname)(queries)
+            keys = getattr(self, self._kname)(keys)
+
         queries = queries.reshape(B, L, self.n_heads, -1)
         keys = keys.reshape(B, L, self.n_kv_heads, -1)
-        if self.qk_norm:
-            queries = self.q_norm(queries)
-            keys = self.k_norm(keys)
+        if self.qk_norm and not self.qk_norm_full and not self.qk_norm_post_rope:
+            queries = getattr(self, self._qname)(queries)
+            keys = getattr(self, self._kname)(keys)
         queries = queries.transpose(0, 2, 1, 3)
         keys = keys.transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            if self.use_rope:
+                queries = self.rope(queries, offset=cache.offset)
+                keys = self.rope(keys, offset=cache.offset)
+            if self.qk_norm and self.qk_norm_post_rope:
+                queries = getattr(self, self._qname)(queries)
+                keys = getattr(self, self._kname)(keys)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            if self.use_rope:
+                queries = self.rope(queries)
+                keys = self.rope(keys)
+            if self.qk_norm and self.qk_norm_post_rope:
+                queries = getattr(self, self._qname)(queries)
+                keys = getattr(self, self._kname)(keys)
 
         if self.softcap is None:
             out = scaled_dot_product_attention(
@@ -296,11 +323,15 @@ class TransformerBlock(nn.Module):
             )
 
         n, dim, eps = spec.norm_type, spec.hidden_size, spec.rms_norm_eps
-        self.input_layernorm = make_norm(n, dim, eps)
-        self.post_attention_layernorm = make_norm(n, dim, eps)
-        if spec.layout == "sandwich":
-            self.pre_feedforward_layernorm = make_norm(n, dim, eps)
+        if spec.layout == "post":
+            self.post_attention_layernorm = make_norm(n, dim, eps)
             self.post_feedforward_layernorm = make_norm(n, dim, eps)
+        else:
+            self.input_layernorm = make_norm(n, dim, eps)
+            self.post_attention_layernorm = make_norm(n, dim, eps)
+            if spec.layout == "sandwich":
+                self.pre_feedforward_layernorm = make_norm(n, dim, eps)
+                self.post_feedforward_layernorm = make_norm(n, dim, eps)
 
     def __call__(
         self,
@@ -317,6 +348,9 @@ class TransformerBlock(nn.Module):
                 self.mlp(self.pre_feedforward_layernorm(h))
             )
             return h + r
+        if self.layout == "post":
+            h = x + self.post_attention_layernorm(self.self_attn(x, mask, cache))
+            return h + self.post_feedforward_layernorm(self.mlp(h))
         r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
