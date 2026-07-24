@@ -10985,3 +10985,189 @@ class TestVendoredDenseModels(unittest.TestCase):
 
     def test_afmoe(self):
         self._run("afmoe")
+
+
+class TestMixedPrecisionCompressedTensors(unittest.TestCase):
+    """``format: mixed-precision`` compressed-tensors (NVFP4 + channel fp8)."""
+
+    OUT = 32
+    IN = 32
+
+    @staticmethod
+    def _config():
+        # Mirrors unsloth/Qwen3.6-27B-NVFP4: fp8 float-quantized attn/lm_head
+        # in group_0, NVFP4-packed MLP in group_1, one top-level format.
+        return {
+            "quant_method": "compressed-tensors",
+            "format": "mixed-precision",
+            "config_groups": {
+                "group_0": {
+                    "format": "float-quantized",
+                    "weights": {
+                        "num_bits": 8,
+                        "type": "float",
+                        "strategy": "channel",
+                    },
+                },
+                "group_1": {
+                    "format": "nvfp4-pack-quantized",
+                    "weights": {"num_bits": 4, "group_size": 16},
+                },
+            },
+        }
+
+    def _weights(self):
+        out, inp = self.OUT, self.IN
+        rng = np.random.default_rng(0)
+        weights = {}
+        # NVFP4-packed MLP projection (group_1).
+        weights["model.layer.mlp.gate_proj.weight_packed"] = mx.array(
+            rng.integers(0, 256, (out, inp // 2), dtype=np.uint8)
+        )
+        weights["model.layer.mlp.gate_proj.weight_scale"] = mx.full(
+            (out, inp // 16), 0x38, dtype=mx.uint8  # E4M3 1.0
+        )
+        weights["model.layer.mlp.gate_proj.weight_global_scale"] = mx.array(
+            [1.0], dtype=mx.float32
+        )
+        # Metadata with no MLX consumer -- must be dropped.
+        weights["model.layer.mlp.gate_proj.input_global_scale"] = mx.array(
+            [1.0], dtype=mx.float32
+        )
+        weights["model.layer.mlp.gate_proj.weight_shape"] = mx.array(
+            [out, inp], dtype=mx.int64
+        )
+        # Channel-wise fp8 float-quantized attention projection (group_0).
+        fp8_bytes = np.array([[0x38, 0x40] * (inp // 2)] * out, dtype=np.uint8)
+        weights["model.layer.self_attn.q_proj.weight"] = mx.array(fp8_bytes)
+        weights["model.layer.self_attn.q_proj.weight_scale"] = mx.full(
+            (out, 1), 2.0, dtype=mx.bfloat16
+        )
+        weights["model.layer.self_attn.k_scale"] = mx.array([1.0], dtype=mx.float32)
+        # Ignored dense layer (e.g. linear_attn / vision) -- passes through.
+        weights["model.layer.linear_attn.in_proj.weight"] = mx.array(
+            rng.standard_normal((out, inp)), dtype=mx.bfloat16
+        )
+        return weights
+
+    def test_routes_nvfp4_fp8_and_dense(self):
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        weights = self._weights()
+        dense_ref = weights["model.layer.linear_attn.in_proj.weight"]
+        new, quant = _transform_compressed_tensors_weights(weights, self._config())
+
+        # Top-level descriptor drives nn.quantize for the (only) native mode.
+        self.assertEqual(quant, {"group_size": 16, "bits": 4, "mode": "nvfp4"})
+
+        # NVFP4 folded to MLX-native weight/scales.
+        gate = "model.layer.mlp.gate_proj"
+        self.assertEqual(new[f"{gate}.weight"].dtype, mx.uint32)
+        self.assertEqual(new[f"{gate}.weight"].shape, (self.OUT, self.IN // 8))
+        self.assertEqual(new[f"{gate}.scales"].dtype, mx.uint8)
+
+        # fp8 dequantized to a dense weight (no scales -> stays dense at load).
+        qproj = "model.layer.self_attn.q_proj"
+        self.assertEqual(new[f"{qproj}.weight"].shape, (self.OUT, self.IN))
+        self.assertEqual(new[f"{qproj}.weight"].dtype, mx.bfloat16)
+        self.assertNotIn(f"{qproj}.weight_scale", new)
+
+        # Ignored dense layer untouched.
+        self.assertTrue(
+            mx.array_equal(new["model.layer.linear_attn.in_proj.weight"], dense_ref)
+        )
+
+        # All compressed-tensors metadata dropped before strict load.
+        for dropped in (
+            f"{gate}.weight_packed",
+            f"{gate}.weight_global_scale",
+            f"{gate}.input_global_scale",
+            f"{gate}.weight_shape",
+            "model.layer.self_attn.k_scale",
+        ):
+            self.assertNotIn(dropped, new)
+        self.assertFalse(any(k.endswith(".weight_packed") for k in new))
+
+    def test_fp8_dequantized_values(self):
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        new, _ = _transform_compressed_tensors_weights(self._weights(), self._config())
+        w = new["model.layer.self_attn.q_proj.weight"].astype(mx.float32)
+        # bytes 0x38=E4M3(1.0), 0x40=E4M3(2.0); per-channel scale 2.0.
+        expected = mx.tile(mx.array([2.0, 4.0]), (self.OUT, self.IN // 2))
+        self.assertTrue(mx.allclose(w, expected, atol=1e-3).item())
+
+    def test_strict_load_and_selective_quantize(self):
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        new, quant = _transform_compressed_tensors_weights(
+            self._weights(), self._config()
+        )
+
+        # Module tree whose leaf paths match the transformed weight keys.
+        model = _tree_from_paths(
+            {
+                "model.layer.mlp.gate_proj": nn.Linear(self.IN, self.OUT, bias=False),
+                "model.layer.self_attn.q_proj": nn.Linear(
+                    self.IN, self.OUT, bias=False
+                ),
+                "model.layer.linear_attn.in_proj": nn.Linear(
+                    self.IN, self.OUT, bias=False
+                ),
+            }
+        )
+
+        nn.quantize(
+            model,
+            group_size=quant["group_size"],
+            bits=quant["bits"],
+            mode=quant["mode"],
+            class_predicate=lambda p, m: f"{p}.scales" in new,
+        )
+        # The line that used to abort with "parameters not in model" (status 3).
+        model.load_weights(list(new.items()), strict=True)
+        mx.eval(model.parameters())
+
+        # Only the NVFP4 layer is quantized; fp8-dense and ignored stay Linear.
+        self.assertEqual(
+            type(model.model.layer.mlp.gate_proj).__name__, "QuantizedLinear"
+        )
+        self.assertEqual(type(model.model.layer.self_attn.q_proj).__name__, "Linear")
+        self.assertEqual(type(model.model.layer.linear_attn.in_proj).__name__, "Linear")
+
+        y = model.model.layer.mlp.gate_proj(mx.zeros((1, self.IN)))
+        mx.eval(y)
+        self.assertEqual(y.shape, (1, self.OUT))
+
+    def test_rejects_multiple_native_quant_modes(self):
+        from mlx_vlm.utils import _transform_compressed_tensors_weights
+
+        weights = self._weights()
+        # Add an INT4 pack-quantized layer -> nvfp4 + affine both need scales.
+        weights["model.layer.extra.weight_packed"] = mx.array(
+            np.zeros((self.OUT, self.IN // 8), dtype=np.int32)
+        )
+        weights["model.layer.extra.weight_scale"] = mx.ones(
+            (self.OUT, self.IN // 32), dtype=mx.bfloat16
+        )
+        config = self._config()
+        config["config_groups"]["group_2"] = {
+            "format": "pack-quantized",
+            "weights": {"num_bits": 4, "group_size": 32, "type": "int"},
+        }
+        with self.assertRaises(NotImplementedError):
+            _transform_compressed_tensors_weights(weights, config)
+
+
+def _tree_from_paths(leaves):
+    """Build a nested nn.Module tree whose leaf paths equal ``leaves`` keys."""
+    root = nn.Module()
+    for path, leaf in leaves.items():
+        node = root
+        parts = path.split(".")
+        for part in parts[:-1]:
+            if part not in node:
+                setattr(node, part, nn.Module())
+            node = getattr(node, part)
+        setattr(node, parts[-1], leaf)
+    return root
