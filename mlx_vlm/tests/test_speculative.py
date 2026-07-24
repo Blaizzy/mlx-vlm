@@ -1822,6 +1822,135 @@ def test_mtp_rounds_skips_rollback_after_full_accept_with_gdn_states():
     assert rollback_calls == []
 
 
+def test_mtp_rounds_batch_positioned_sampler_survives_row_finishing_early():
+    """Regression: a per-row positioned sampler is built once at the full batch
+    width (one SamplingConfig per row). ``_mtp_rounds_batch`` compacts
+    ``active_idx`` mid-round whenever the caches are filterable and
+    some-but-not-all rows finish; if the sampler is NOT compacted in lockstep it
+    then gets a shrunk ``logprobs`` and ``_PositionedTargetSampler.sample_target``'s
+    ``logprobs.shape[0] != len(configs)`` guard raises ValueError on any normal
+    B>=2 continuous-batching run where rows finish at different times.
+
+    The fix keeps compaction enabled and calls ``sampler.select(keep_slots)`` so
+    the configs shrink with the batch. This test proves compaction still happens
+    (finished rows ARE dropped) AND no ValueError is raised. Reverting the
+    ``sampler.select`` line makes it fail with the exact width-mismatch guard.
+
+    Drives the REAL ``_mtp_rounds_batch`` + REAL ``_PositionedTargetSampler`` +
+    REAL deferred-greedy walk (only the model-forward boundary
+    ``_mtp_verify_target`` is faked, matching the singleton-round tests above).
+    Row 0 finishes on its first token via ``stop_check`` while row 1 keeps
+    going, forcing a compaction to the shrunk width.
+    """
+    from mlx_vlm.generate.ar import SamplingConfig, _PositionedTargetSampler
+
+    V = 8
+    target_token = 1  # dominant logit -> deterministic argmax regardless of temp
+
+    class FakeLM:
+        def __init__(self):
+            self.rollback_calls = 0
+
+        def speculative_logits_from_hidden(self, hidden):
+            # Identity head: hidden IS the logits (shape [B, 1, V]).
+            return hidden
+
+        def rollback_speculative_cache(self, *args):
+            self.rollback_calls += 1
+
+    class FakeDraft:
+        def __init__(self):
+            self.config = SimpleNamespace(block_size=2)
+            self.accept_lens = []
+            self.draft_lens = []
+
+        def reset(self, model):
+            pass
+
+        def set_shared_kv(self, *args, **kwargs):
+            pass
+
+        def draft_block(
+            self, last_bonus, hidden, cache, block_size, sampler, token_dtype
+        ):
+            del cache, sampler
+            # Always draft token 0; target argmax is ``target_token`` (!=0), so
+            # every row rejects at position 0 and emits exactly one token/round.
+            return mx.zeros((hidden.shape[0], block_size - 1), dtype=token_dtype)
+
+    class FilterableCache:
+        def __init__(self, offsets):
+            self.offset = mx.array(offsets, dtype=mx.int32)
+            self.left_padding = None
+            self.filter_calls = []
+
+        def filter(self, keep):
+            self.filter_calls.append([int(x) for x in keep.tolist()])
+            self.offset = self.offset[keep]
+
+    def fake_verify(lm, verify_input, prompt_cache, sampler, *, sample_target_tokens):
+        del lm, prompt_cache, sampler, sample_target_tokens
+        n_active, bs = verify_input.shape
+        logit = mx.where(mx.arange(V) == target_token, 50.0, 0.0)
+        hidden = mx.broadcast_to(logit, (n_active, bs, V))
+        return mtp_utils._MTPVerifyResult(
+            hidden=hidden,
+            shared_kv_states={},
+            target_tokens=None,
+            gdn_states=None,
+        )
+
+    sampler = _PositionedTargetSampler(
+        [
+            SamplingConfig(temperature=0.7, seed=1),
+            SamplingConfig(temperature=1.5, top_k=40, seed=2),
+        ]
+    )
+
+    def stop_check(seq_idx, token_id):
+        del token_id
+        return seq_idx == 0  # row 0 finishes on its first emitted token
+
+    cache = FilterableCache([5, 5])
+
+    with patch.object(mtp_utils, "_mtp_verify_target", side_effect=fake_verify):
+        outputs = list(
+            mtp_utils._mtp_rounds_batch(
+                FakeLM(),
+                FakeDraft(),
+                [cache],
+                mx.zeros((2, 1, V), dtype=mx.float32),
+                {},
+                first_bonus=mx.array([0, 0], dtype=mx.int32),
+                max_tokens=4,
+                sampler=sampler,
+                draft_block_size=2,
+                token_dtype=mx.int32,
+                stop_check=stop_check,
+                eos_token_ids=None,
+                greedy_sampling=False,
+                row_ids=[0, 1],
+            )
+        )
+
+    # (a) Compaction DID happen (finished row 0 dropped, keeping slot [1]) AND
+    #     no ValueError was raised -> the sampler compacted in lockstep via
+    #     .select(keep_slots), staying aligned to the shrunk logprobs. Reverting
+    #     the sampler.select line raises the width-mismatch guard instead.
+    assert cache.filter_calls == [[1]]
+
+    # (b) Both rows produce their tokens: row 0 emits exactly one (then stops),
+    #     row 1 keeps decoding across multiple rounds until max_tokens.
+    row_tokens = {0: [], 1: []}
+    for tokens_out, _meta in outputs:
+        for row, tok in enumerate(tokens_out):
+            if tok is not None:
+                row_tokens[row].append(tok)
+    assert len(row_tokens[0]) == 1
+    assert len(row_tokens[1]) >= 2
+    assert all(tok == target_token for tok in row_tokens[0] + row_tokens[1])
+
+
 def test_mtp_next_block_size_can_prefer_requested_size():
     draft_model = SimpleNamespace(
         accept_lens=[0] * 16, prefer_requested_block_size=True
@@ -3416,6 +3545,26 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
     assert "e_proj.weight" in weights
     assert "e_proj.scales" in weights
     assert "enorm.weight" in weights
+
+
+def test_speculative_batch_builds_per_row_sampler():
+    from mlx_vlm.generate.ar import (
+        SamplingConfig,
+        SpeculativeGenerationBatch,
+        _PositionedTargetSampler,
+    )
+
+    configs = [
+        SamplingConfig(temperature=0.0),
+        SamplingConfig(temperature=1.5, top_k=40),
+    ]
+    b = SpeculativeGenerationBatch.__new__(SpeculativeGenerationBatch)
+    b._all_uids = [10, 11]
+    b.uids = [10, 11]
+    SpeculativeGenerationBatch._init_sampling(b, configs)  # helper under test
+    assert isinstance(b.sampler, _PositionedTargetSampler)
+    assert b.sampler.configs == configs
+    assert b.greedy_sampling is False  # mixed temps -> not all-greedy
 
 
 def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):

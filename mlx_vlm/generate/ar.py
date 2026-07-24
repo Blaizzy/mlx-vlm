@@ -18,7 +18,7 @@ from tqdm import tqdm
 from .. import apc as _apc
 from ..models import cache
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import make_logits_processors, make_sampler
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -84,50 +84,261 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
     )
 
 
-class _PositionedTargetSampler:
-    """Sampler with stateless target draws keyed by generated-token position."""
+@dataclass(frozen=True)
+class SamplingConfig:
+    """Immutable per-row sampling parameters. One per request; rides the batch
+    like logits_processors. Frozen so it is hashable (cheap all-equal checks)."""
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.seed = int(seed)
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    seed: int = 0
+    top_n_sigma: float = 0.0
+    p_less: bool = False
+    typical_p: float = 1.0
+
+
+def _new_modes_keep(
+    work: mx.array,
+    safe_t: mx.array,
+    top_n_sigma: mx.array,
+    p_less: mx.array,
+    typical_p: mx.array,
+) -> mx.array:
+    """Per-row keep mask [B, V] in ORIGINAL (unsorted) space for the three
+    non-rank-based sampling modes, each gated per row.
+
+    Mirrors ``sample_utils.apply_top_n_sigma`` / ``apply_p_less`` /
+    ``apply_typical_p`` so a single active row keeps exactly the tokens those
+    references keep (see test_row_sampling oracle checks). Computed on the
+    un-temperature-scaled log-normalized ``work`` (top-nσ is shift-invariant,
+    typical-p wants the true distribution, p-less applies temperature itself),
+    matching where ``make_sampler`` places these in its chain.
+
+    work: [B, V] log-normalized float32. safe_t: [B] temperature (>=eps).
+    top_n_sigma: [B] float (<=0 disables the row). p_less: [B] bool.
+    typical_p: [B] float (>=1 disables the row).
+    """
+    B, V = work.shape
+    # Statistics run in float32: float16 log-probs overflow mx.std for any real
+    # vocab (the sum is ~V*log(V)), which would silently disable top-nσ.
+    # Upstream's _top_n_sigma casts unconditionally for the same reason.
+    f = work.astype(mx.float32)
+    keep = mx.ones((B, V), dtype=mx.bool_)
+
+    # top-nσ: drop logit < max - n*std (raw logits; shift-invariant so the
+    # log-normalized work gives the same set). Phrased as "not (x < t)" rather
+    # than "x >= t" so a NaN threshold (e.g. a -inf logprob from grammar
+    # masking) keeps the token, matching upstream's mx.where(f < t, -inf, x).
+    ns = top_n_sigma[:, None]
+    threshold = mx.max(f, axis=-1, keepdims=True) - ns * mx.std(
+        f, axis=-1, keepdims=True
+    )
+    keep = keep & mx.where(ns > 0, ~(f < threshold), mx.array(True))
+
+    # p-less: drop prob < collision prob L = sum p^2, p = softmax(work/temp).
+    probs = mx.softmax(f / safe_t[:, None], axis=-1)
+    collision = mx.sum(probs * probs, axis=-1, keepdims=True)
+    keep = keep & mx.where(p_less[:, None], ~(probs < collision), mx.array(True))
+
+    # typical-p: keep tokens by ascending |surprisal - entropy| until their
+    # cumulative prob reaches typical_p (on the true, un-scaled distribution).
+    # Gated on 0 < typical_p < 1 exactly like make_sampler, so out-of-range
+    # values disable the mode instead of filtering everything away.
+    prob = mx.exp(f)
+    entropy = -mx.sum(prob * f, axis=-1, keepdims=True)
+    shifted = mx.abs(-f - entropy)
+    order_tp = mx.argsort(shifted, axis=-1)
+    cum = mx.cumsum(mx.take_along_axis(prob, order_tp, axis=-1), axis=-1)
+    inverse = mx.put_along_axis(
+        mx.zeros_like(order_tp),
+        order_tp,
+        mx.arange(V, dtype=order_tp.dtype),
+        axis=-1,
+    )
+    cum_orig = mx.take_along_axis(cum, inverse, axis=-1)
+    tp = typical_p[:, None]
+    keep = keep & mx.where(
+        (tp > 0.0) & (tp < 1.0), (cum_orig - prob) < tp, mx.array(True)
+    )
+
+    return keep
+
+
+def batched_row_sample(
+    logprobs: mx.array,
+    *,
+    temperature: mx.array,
+    top_p: mx.array,
+    top_k: mx.array,
+    min_p: mx.array,
+    keys: mx.array,
+    top_n_sigma: Optional[mx.array] = None,
+    p_less: Optional[mx.array] = None,
+    typical_p: Optional[mx.array] = None,
+) -> mx.array:
+    """Row-heterogeneous sampling in one sorted-space pass.
+
+    logprobs: [B, V] log-normalized. temperature/top_p/min_p: [B] float.
+    top_k: [B] int (<=0 disables). keys: [B] PRNG keys. Returns [B] token ids.
+    Order mirrors ``make_sampler``: temperature -> top_n_sigma -> p_less ->
+    typical_p -> top_p -> min_p -> top_k, with the non-rank modes applied first
+    so the rank-based filters see the already-filtered distribution.
+    Greedy rows (temperature < eps) return argmax of the unfiltered logprobs.
+    """
+    eps = 1e-5
+    B, V = logprobs.shape
+    work = logprobs.astype(mx.float32) if logprobs.dtype == mx.bfloat16 else logprobs
+
+    # Greedy ignores every filter (make_sampler returns argmax when temp == 0),
+    # so take it from the unfiltered logprobs before any masking below.
+    greedy = mx.argmax(work, axis=-1)
+    safe_t = mx.where(temperature < eps, 1.0, temperature)
+
+    # Chain the non-rank modes first, masking rejected tokens to -inf. Because
+    # top_p/min_p/top_k below are computed on this masked distribution, the
+    # composition matches make_sampler's sequential chain; ANDing masks derived
+    # from the full distribution instead would yield a different candidate set
+    # (and could empty a row whose top_k window typical_p rejected).
+    if top_n_sigma is not None or p_less is not None or typical_p is not None:
+        ns = top_n_sigma if top_n_sigma is not None else mx.zeros((B,), mx.float32)
+        pl = p_less if p_less is not None else mx.zeros((B,), dtype=mx.bool_)
+        tp = typical_p if typical_p is not None else mx.ones((B,), mx.float32)
+        modes_keep = _new_modes_keep(work, safe_t, ns, pl, tp)  # [B, V] original
+        work = mx.where(modes_keep, work, mx.array(-float("inf"), work.dtype))
+
+    order = mx.argsort(-work, axis=-1)  # [B, V] descending
+    sl = mx.take_along_axis(work, order, axis=-1)  # sorted logprobs
+
+    # Renormalized over the tokens the modes left alive, so top_p/min_p act as a
+    # nucleus of the *filtered* distribution. This is identical to the unfiltered
+    # behaviour when no mode is active (verified against apply_top_p/apply_min_p),
+    # and deliberately differs from chaining make_sampler's apply_top_p after a
+    # mode: that path compares cumulative mass against ``1 - top_p`` on a
+    # distribution whose mass no longer sums to 1, which can reject every token
+    # (e.g. top_n_sigma=1.0 + top_p=0.9 leaves an all -inf row upstream).
+    p = mx.softmax(sl / safe_t[:, None], axis=-1)
+    csum = mx.cumsum(p, axis=-1)
+
+    ranks = mx.arange(V, dtype=mx.int32)[None, :]
+    k_eff = mx.where(top_k <= 0, V, top_k)
+    keep = ranks < k_eff[:, None]  # top_k, exactly-k by rank
+    keep = keep & ((csum - p) <= top_p[:, None])  # top_p (>=1 keeps all)
+    keep = keep & (p >= (p[:, :1] * min_p[:, None]))  # min_p (<=0 keeps all)
+    # Always keep >=1 token. After the chain above, rank 0 is the best surviving
+    # token (not necessarily the global argmax), so this never resurrects a
+    # token the modes rejected.
+    keep = keep | (ranks == 0)
+
+    masked = mx.where(keep, sl / safe_t[:, None], mx.array(-float("inf"), mx.float32))
+    sampled_pos = mx.vmap(
+        lambda row, key: mx.random.categorical(row, key=key), in_axes=(0, 0)
+    )(masked, keys)
+    sampled = mx.take_along_axis(order, sampled_pos[:, None], axis=-1)[:, 0]
+
+    return mx.where(temperature < eps, greedy, sampled)
+
+
+class _PositionedTargetSampler:
+    """Row-aware sampler with stateless per-(row,position) RNG keying.
+
+    Built from a per-row list of SamplingConfig. Each row is sampled with its
+    own temperature/top_p/top_k/min_p; the RNG key is derived per row from its
+    own seed + row_id + position, so a row's draw is invariant to batch
+    composition. Keeps the sample_target signature that speculative/mtp.py and
+    _sample_with_positions depend on."""
+
+    def __init__(self, configs: List["SamplingConfig"]):
+        if not configs:
+            raise ValueError("_PositionedTargetSampler requires at least one config.")
+        self.configs = list(configs)
+
+    def select(self, keep: List[int]) -> "_PositionedTargetSampler":
+        """Restrict to the given config indices (into the current configs).
+
+        Lets a speculative batch that compacts finished rows mid-round keep the
+        sampler's per-row configs aligned to the shrunk logprobs, so mid-round
+        cache compaction stays enabled without breaking the configs-length
+        invariant."""
+        return _PositionedTargetSampler([self.configs[i] for i in keep])
+
+    def _uses_new_modes(self) -> bool:
+        """True when any row enables top_n_sigma / p_less / typical_p.
+
+        When no row does (the overwhelmingly common case) the extra masks are
+        all-True, so we skip building them entirely rather than pay an argsort
+        + cumsum per decode step for a no-op.
+        """
+        return any(
+            x.top_n_sigma > 0 or bool(x.p_less) or 0.0 < x.typical_p < 1.0
+            for x in self.configs
+        )
+
+    def _arrays(self):
+        c = self.configs
+        base = (
+            mx.array([x.temperature for x in c], dtype=mx.float32),
+            mx.array([x.top_p for x in c], dtype=mx.float32),
+            mx.array([x.top_k for x in c], dtype=mx.int32),
+            mx.array([x.min_p for x in c], dtype=mx.float32),
+        )
+        if not self._uses_new_modes():
+            return base + (None, None, None)
+        return base + (
+            mx.array([x.top_n_sigma for x in c], dtype=mx.float32),
+            mx.array([bool(x.p_less) for x in c], dtype=mx.bool_),
+            mx.array([x.typical_p for x in c], dtype=mx.float32),
+        )
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        if self.top_p > 0 and self.top_p < 1.0:
-            return top_p_sampling(logprobs, self.top_p, self.temperature)
-        return mx.random.categorical(logprobs * (1 / self.temperature))
+        n = logprobs.shape[0]
+        keys = mx.stack(
+            [
+                mx.random.key(_position_seed(c.seed, i, 0))
+                for i, c in enumerate(self.configs)
+            ]
+        )
+        if n != len(self.configs):
+            raise ValueError("configs length must match logprobs batch size.")
+        return self._draw(logprobs, keys)
 
     def sample_target(
-        self,
-        logprobs: mx.array,
-        *,
-        row_ids: List[int],
-        positions: List[int],
+        self, logprobs: mx.array, *, row_ids: List[int], positions: List[int]
     ) -> mx.array:
-        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
-            raise ValueError("row_ids and positions must match logprobs batch size.")
-        keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
-        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
-
-    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
-
-    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
+        if logprobs.shape[0] != len(self.configs):
+            raise ValueError("configs length must match logprobs batch size.")
+        if len(row_ids) != len(positions) or len(row_ids) != len(self.configs):
+            raise ValueError("row_ids/positions must match configs length.")
+        keys = mx.stack(
+            [
+                mx.random.key(_position_seed(cfg.seed, row, pos))
+                for cfg, row, pos in zip(self.configs, row_ids, positions)
+            ]
         )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
+        return self._draw(logprobs, keys)
+
+    def _draw(self, logprobs: mx.array, keys: mx.array) -> mx.array:
+        (
+            temperature,
+            top_p,
+            top_k,
+            min_p,
+            top_n_sigma,
+            p_less,
+            typical_p,
+        ) = self._arrays()
+        return batched_row_sample(
+            logprobs,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            keys=keys,
+            top_n_sigma=top_n_sigma,
+            p_less=p_less,
+            typical_p=typical_p,
+        )
 
 
 def _generate_module_override(name: str, fallback):
@@ -263,9 +474,16 @@ def generate_step(
             and typical_p == 1.0
         ):
             sampler = _PositionedTargetSampler(
-                temperature=temperature,
-                top_p=top_p,
-                seed=seed,
+                [
+                    SamplingConfig(
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                        min_p=min_p,
+                        seed=seed,
+                    )
+                ]
+                * input_ids.shape[0]
             )
         else:
             sampler = _generate_module_override("make_sampler", make_sampler)(
@@ -908,11 +1126,14 @@ class GenerationBatch:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        sampling: Optional[List["SamplingConfig"]] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
         self.uids = uids
         self.prompt_cache = prompt_cache
+        # Retained for PromptProcessingBatch/SpeculativeGenerationBatch/API
+        # compatibility; _step() now samples per-row via self.sampling, not this.
         self.sampler = sampler
         self.stop_criteria = stop_criteria
         self.max_tokens = max_tokens
@@ -922,6 +1143,7 @@ class GenerationBatch:
         self.greedy_sampling = greedy_sampling
         self.logits_processors = logits_processors or []
         self.thinking_budget_criteria = thinking_budget_criteria or []
+        self.sampling = list(sampling) if sampling is not None else []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
         self._ensure_token_context()
 
@@ -960,6 +1182,13 @@ class GenerationBatch:
             self.token_context.extend([[] for _ in range(missing)])
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
+
+    def _extend_sampling(self, other: "GenerationBatch"):
+        self.sampling.extend(other.sampling)
+
+    def _filter_sampling(self, keep: List[int]):
+        if self.sampling:
+            self.sampling = [self.sampling[idx] for idx in keep]
 
     def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
         if not self.greedy_sampling or self.compute_logprobs or self.top_logprobs_k > 0:
@@ -1039,8 +1268,9 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        sampler = _PositionedTargetSampler(self.sampling)
         sampled = _sample_with_positions(
-            self.sampler,
+            sampler,
             logprobs,
             row_ids=[0] * len(self.uids),
             positions=[n + 1 for n in self._num_tokens],
@@ -1147,6 +1377,10 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
         self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self._extend_sampling(other)
+        # An all-greedy accumulator that absorbs a temperature>0 batch must
+        # drop the greedy fast path; only all-greedy AND all-greedy stays greedy.
+        self.greedy_sampling = self.greedy_sampling and other.greedy_sampling
         self._ensure_logits_processor_slots()
         self._ensure_token_context()
 
@@ -1213,6 +1447,10 @@ class GenerationBatch:
             self.thinking_budget_criteria = [
                 self.thinking_budget_criteria[idx] for idx in keep
             ]
+        self._filter_sampling(keep)
+        self.greedy_sampling = bool(self.sampling) and all(
+            c.temperature == 0 for c in self.sampling
+        )
 
         if not keep:
             self.prompt_cache.clear()
@@ -1226,6 +1464,7 @@ class GenerationBatch:
             self.token_context = []
             self.logits_processors = []
             self.thinking_budget_criteria = []
+            self.sampling = []
         else:
             keep_arr = mx.array(keep, mx.int32)
             for c in self.prompt_cache:
@@ -1329,6 +1568,7 @@ class GenerationBatch:
         batch.token_context = []
         batch.logits_processors = []
         batch.thinking_budget_criteria = []
+        batch.sampling = []
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -1353,7 +1593,6 @@ class SpeculativeGenerationBatch:
         uids: List[int],
         first_tokens: mx.array,
         prompt_cache: List[Any],
-        sampler: Callable[[mx.array], mx.array],
         stop_criteria,
         max_tokens: List[int],
         hidden: mx.array,
@@ -1362,7 +1601,7 @@ class SpeculativeGenerationBatch:
         *,
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
-        greedy_sampling: bool = False,
+        sampling: Optional[List["SamplingConfig"]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1371,7 +1610,6 @@ class SpeculativeGenerationBatch:
         self._all_uids = list(uids)
         self.first_tokens = first_tokens
         self.prompt_cache = prompt_cache
-        self.sampler = sampler
         self.stop_criteria = stop_criteria
         self.max_tokens = list(max_tokens)
         self.hidden = hidden
@@ -1379,11 +1617,18 @@ class SpeculativeGenerationBatch:
         self.prompt_tokens = prompt_tokens
         self.draft_block_size = draft_block_size
         self.token_dtype = token_dtype
-        self.greedy_sampling = greedy_sampling
+        self._init_sampling(sampling)
         self._num_tokens = [0] * len(uids)
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+
+    def _init_sampling(self, sampling):
+        self.sampling = (
+            list(sampling) if sampling else [SamplingConfig()] * len(self._all_uids)
+        )
+        self.sampler = _PositionedTargetSampler(self.sampling)
+        self.greedy_sampling = all(c.temperature == 0 for c in self.sampling)
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1563,6 +1808,7 @@ class PromptProcessingBatch:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        sampling: Optional[List["SamplingConfig"]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1573,6 +1819,7 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        self.sampling = list(sampling) if sampling is not None else []
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -1901,8 +2148,9 @@ class PromptProcessingBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        first_sampler = _PositionedTargetSampler(self.sampling)
         first_tokens = _sample_with_positions(
-            sampler,
+            first_sampler,
             logprobs,
             row_ids=[0] * len(self.uids),
             positions=[0] * len(self.uids),
@@ -1944,7 +2192,6 @@ class PromptProcessingBatch:
                 uids=list(self.uids),
                 first_tokens=first_tokens,
                 prompt_cache=self.prompt_cache,
-                sampler=sampler,
                 stop_criteria=stop_criteria,
                 max_tokens=list(self.max_tokens),
                 hidden=speculative_hidden_state(self.draft_kind, output),
@@ -1954,7 +2201,7 @@ class PromptProcessingBatch:
                 prompt_tokens=self._input_ids,
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
-                greedy_sampling=self.greedy_sampling,
+                sampling=list(self.sampling),
             )
             compute_logprobs = False
         else:
@@ -1971,6 +2218,7 @@ class PromptProcessingBatch:
                 token_context=[list(ctx) for ctx in self._token_context],
                 logits_processors=list(self.logits_processors),
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
+                sampling=list(self.sampling),
             )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -2271,7 +2519,7 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
-        uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
+        uid, ids_list, max_toks, prompt_kwargs, lps, criteria, sampling = sequence
         if not ids_list or len(ids_list) < 2:
             return None
         return _apc.apc_lookup_plan(
@@ -2311,6 +2559,7 @@ class BatchGenerator:
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
         thinking_budget_criteria = [s[5] for s in sequences]
+        sampling_configs = [s[6] for s in sequences]
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -2452,7 +2701,9 @@ class BatchGenerator:
             draft_model=getattr(self, "draft_model", None),
             draft_kind=getattr(self, "draft_kind", None),
             draft_block_size=getattr(self, "draft_block_size", None),
-            greedy_sampling=getattr(self, "greedy_sampling", False),
+            sampling=sampling_configs,
+            # derive per-batch greedy flag from the actual configs (was: request #1)
+            greedy_sampling=all(c.temperature == 0 for c in sampling_configs),
         )
 
     def _build_apc_meta_for_cold(
@@ -2500,6 +2751,7 @@ class BatchGenerator:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        sampling_configs: Optional[List["SamplingConfig"]] = None,
     ):
         uids = []
 
@@ -2516,15 +2768,20 @@ class BatchGenerator:
             thinking_budget_criteria = [None] * len(prompts)
         elif len(thinking_budget_criteria) != len(prompts):
             raise ValueError("Insufficient number of thinking_budget_criteria provided")
+        if sampling_configs is None:
+            sampling_configs = [SamplingConfig()] * len(prompts)
+        elif len(sampling_configs) != len(prompts):
+            raise ValueError("Insufficient number of sampling_configs provided")
 
-        for p, m, kw, lp, tc in zip(
+        for p, m, kw, lp, tc, sc in zip(
             prompts,
             max_tokens,
             prompt_kwargs,
             logits_processors,
             thinking_budget_criteria,
+            sampling_configs,
         ):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc, sc))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2537,7 +2794,9 @@ class BatchGenerator:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _, _, _) in enumerate(
+                self._unprocessed_sequences
+            ):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -2725,6 +2984,7 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
             thinking_budget_criteria = [s[5] for s in sequences]
+            sampling_configs = [s[6] for s in sequences]
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
@@ -2758,7 +3018,9 @@ class BatchGenerator:
                 draft_model=getattr(self, "draft_model", None),
                 draft_kind=getattr(self, "draft_kind", None),
                 draft_block_size=getattr(self, "draft_block_size", None),
-                greedy_sampling=getattr(self, "greedy_sampling", False),
+                sampling=sampling_configs,
+                # derive per-batch greedy flag from the actual configs (was: request #1)
+                greedy_sampling=all(c.temperature == 0 for c in sampling_configs),
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

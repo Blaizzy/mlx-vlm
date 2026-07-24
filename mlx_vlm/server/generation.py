@@ -31,11 +31,12 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
+from ..generate.ar import SamplingConfig, _PositionedTargetSampler
 from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import make_logits_processors
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -212,71 +213,6 @@ def _run_chunked_speculative_prefill(
     with mx.stream(generation_stream):
         out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
     return out, remaining_input_ids
-
-
-def _position_seed(seed: int, row_id: int, position: int) -> int:
-    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
-    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
-    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
-    x ^= x >> 16
-    x = (x * 0x7FEB352D) & 0xFFFFFFFF
-    x ^= x >> 15
-    return int(x & 0xFFFFFFFF)
-
-
-def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
-    return mx.stack(
-        [
-            mx.random.key(_position_seed(seed, row, pos))
-            for row, pos in zip(row_ids, positions)
-        ]
-    )
-
-
-class _PositionedTargetSampler:
-    """Server sampler with stateless target draws for ragged verification."""
-
-    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.seed = DEFAULT_SEED if seed is None else int(seed)
-
-    def __call__(self, logprobs: mx.array) -> mx.array:
-        if self.top_p > 0 and self.top_p < 1.0:
-            return top_p_sampling(logprobs, self.top_p, self.temperature)
-        return mx.random.categorical(logprobs * (1 / self.temperature))
-
-    def sample_target(
-        self,
-        logprobs: mx.array,
-        *,
-        row_ids: List[int],
-        positions: List[int],
-    ) -> mx.array:
-        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
-            raise ValueError("row_ids and positions must match logprobs batch size.")
-        keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
-        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
-
-    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
-
-    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
-        )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
 
 
 def _sample_last_token(
@@ -791,6 +727,20 @@ class GenerationArguments:
         if self.thinking_end_token is not None:
             kw["thinking_end_token"] = self.thinking_end_token
         return kw
+
+
+def _config_from_args(args: "GenerationArguments") -> SamplingConfig:
+    """Build the per-row sampling config admitted with a request."""
+    return SamplingConfig(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        seed=DEFAULT_SEED if args.seed is None else int(args.seed),
+        top_n_sigma=args.top_n_sigma,
+        p_less=args.p_less,
+        typical_p=args.typical_p,
+    )
 
 
 @dataclass
@@ -1411,33 +1361,6 @@ class ResponseGenerator:
             )
         return now
 
-    def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
-        if args.temperature == 0:
-            return None
-        if args.top_n_sigma > 0:
-            return make_sampler(
-                temp=args.temperature,
-                top_p=args.top_p,
-                top_n_sigma=args.top_n_sigma,
-            )
-        if args.p_less:
-            return make_sampler(
-                temp=args.temperature,
-                top_p=args.top_p,
-                p_less=True,
-            )
-        if args.typical_p < 1.0:
-            return make_sampler(
-                temp=args.temperature,
-                top_p=args.top_p,
-                typical_p=args.typical_p,
-            )
-        return _PositionedTargetSampler(
-            temperature=args.temperature,
-            top_p=args.top_p,
-            seed=args.seed,
-        )
-
     def _make_logits_processors(
         self, args: GenerationArguments, input_ids: Optional[mx.array] = None
     ) -> List[Callable[[mx.array, mx.array], mx.array]]:
@@ -1681,11 +1604,16 @@ class ResponseGenerator:
                         request, backend="continuous_batching"
                     )
                     if batch_gen is None:
+                        # No `sampler=` here: the batch samples per-row from
+                        # `sampling_configs` passed to insert() below, so the
+                        # BatchGenerator-level sampler is inert on this path
+                        # (kept only for PromptProcessingBatch/GenerationBatch
+                        # constructor compatibility) — its default argmax
+                        # fallback is harmless.
                         batch_gen = BatchGenerator(
                             self.model.language_model,
                             self.processor,
                             stop_tokens=self.stop_tokens,
-                            sampler=self._make_sampler(args),
                             kv_bits=self.kv_bits,
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
@@ -1697,7 +1625,6 @@ class ResponseGenerator:
                             draft_model=self.draft_model,
                             draft_kind=self.draft_kind,
                             draft_block_size=_get_draft_block_size_from_env(),
-                            greedy_sampling=args.temperature == 0,
                             prefill_step_size=get_prefill_step_size(),
                         )
 
@@ -1731,6 +1658,7 @@ class ResponseGenerator:
                                 self._make_logits_processors(args, input_ids)
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
+                            sampling_configs=[_config_from_args(args)],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -1899,6 +1827,39 @@ class ResponseGenerator:
         finally:
             results.close()
 
+    def _serialize_speculative_batch_by_config(
+        self, pending: List[QueuedGenerationRequest]
+    ) -> Tuple[List[QueuedGenerationRequest], List[SamplingConfig]]:
+        """dflash/eagle3 don't yet thread per-row sampling params through the
+        drafter verify path (that's PR2). Never let one row's params
+        silently win for the whole batch: if `pending` disagrees on
+        sampling config, keep only the requests that match the first one
+        and requeue the rest for the next round.
+
+        Returns (kept, configs): `configs` is uniform and aligned 1:1 with
+        `kept` (which is `pending` unchanged when it was already uniform).
+        """
+        configs = [_config_from_args(request.args) for request in pending]
+        if len(set(configs)) <= 1:
+            return pending, configs
+
+        target_config = configs[0]
+        kept, deferred = [], []
+        for request, config in zip(pending, configs):
+            (kept if config == target_config else deferred).append(request)
+        logger.info(
+            "dflash/eagle3 speculative batch has heterogeneous sampling "
+            "params; serializing by config instead of co-batching (%d of "
+            "%d requests deferred to the next round). Full per-row "
+            "speculative sampling lands in a follow-up PR.",
+            len(deferred),
+            len(pending),
+        )
+        # TODO(PR2): per-row dflash/eagle3 sampling.
+        for request in deferred:
+            self.requests.put(request)
+        return kept, [target_config] * len(kept)
+
     def _run_speculative(self):
         """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
 
@@ -1915,7 +1876,6 @@ class ResponseGenerator:
         is_mtp = draft_kind == "mtp"
         prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
-        sampler = make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
@@ -1932,6 +1892,9 @@ class ResponseGenerator:
 
                 if not pending:
                     continue
+
+                pending, configs = self._serialize_speculative_batch_by_config(pending)
+
                 # --- Phase 2: prefill new batch ---
                 uids = []
                 rqueues = {}
@@ -1974,9 +1937,13 @@ class ResponseGenerator:
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
-                    sampler = self._make_sampler(args) or make_sampler(temp=0)
 
                 B = len(uids)
+                # `configs` is uniform across `pending` at this point (either
+                # it already was, or the heterogeneous-batch check above
+                # serialized it down to one config) — safe to broadcast into
+                # a single row-aware sampler for the whole round.
+                sampler = _PositionedTargetSampler(configs)
                 max_len = max(len(ids) for ids in all_input_ids)
                 left_padding = [max_len - len(ids) for ids in all_input_ids]
                 padded = [

@@ -90,6 +90,44 @@ def test_chat_completions_endpoint_requires_model(client):
 
 
 @pytest.mark.parametrize(
+    "field,value",
+    [
+        ("top_k", -3),
+        ("min_p", -0.1),
+        ("min_p", 1.5),
+        ("top_p", 0.0),
+        ("top_p", 1.5),
+    ],
+)
+def test_out_of_domain_sampling_params_rejected_at_admission(client, field, value):
+    # Out-of-domain sampling params must 422 from request validation before
+    # they ever reach the GPU thread — not silently sample with nonsensical
+    # values, and not 500 from a background-thread crash.
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            field: value,
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_out_of_domain_top_k_rejected_at_admission(client):
+    # top_k negative -> 422 from the request model, not a GPU-thread crash
+    r = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_k": -3,
+        },
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.parametrize(
     "messages",
     [
         [],
@@ -392,36 +430,76 @@ def test_speculative_server_samples_first_bonus_with_positioned_sampler():
 
 
 def test_positioned_target_sampler_is_batch_grouping_invariant():
-    sampler = server_generation._PositionedTargetSampler(
-        temperature=0.7, top_p=1.0, seed=42
-    )
-    logits = mx.array(
-        [
-            [0.0, 1.0, 2.0, 3.0],
-            [3.0, 2.0, 1.0, 0.0],
-        ],
-        dtype=mx.float32,
-    )
+    # Two rows with DISTINCT ids and DISTINCT params: each row's token must be
+    # identical whether drawn alone or co-batched. This is the row-level proof.
+    from mlx_vlm.generate.ar import SamplingConfig
+
+    cfg0 = SamplingConfig(temperature=2.0, top_p=1.0, top_k=1, min_p=0.0, seed=42)
+    cfg1 = SamplingConfig(temperature=0.7, top_p=0.9, top_k=40, min_p=0.6, seed=7)
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32)
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-    batched = sampler.sample_target(
-        logprobs,
-        row_ids=[0, 0],
-        positions=[5, 5],
+    batched = server_generation._PositionedTargetSampler([cfg0, cfg1]).sample_target(
+        logprobs, row_ids=[0, 1], positions=[5, 5]
     )
-    single_0 = sampler.sample_target(
-        logprobs[0:1],
-        row_ids=[0],
-        positions=[5],
+    single_0 = server_generation._PositionedTargetSampler([cfg0]).sample_target(
+        logprobs[0:1], row_ids=[0], positions=[5]
     )
-    single_1 = sampler.sample_target(
-        logprobs[1:2],
-        row_ids=[0],
-        positions=[5],
+    single_1 = server_generation._PositionedTargetSampler([cfg1]).sample_target(
+        logprobs[1:2], row_ids=[1], positions=[5]
     )
     mx.eval(batched, single_0, single_1)
 
     assert batched.tolist() == [single_0.item(), single_1.item()]
+
+
+def test_build_sampling_config_from_args():
+    # _config_from_args is the sole bridge from a request's GenerationArguments
+    # to the per-row SamplingConfig admitted into the batch. If a field is
+    # dropped or mistranslated here, that request silently samples with the
+    # wrong temperature/top_p/top_k/min_p/seed.
+    from mlx_vlm.generate.ar import SamplingConfig
+    from mlx_vlm.server.generation import GenerationArguments, _config_from_args
+
+    args = GenerationArguments(temperature=2.0, top_p=0.9, top_k=40, min_p=0.6, seed=7)
+    assert _config_from_args(args) == SamplingConfig(
+        temperature=2.0, top_p=0.9, top_k=40, min_p=0.6, seed=7
+    )
+
+
+def test_build_sampling_config_from_args_carries_new_sampling_modes():
+    # top_n_sigma / p_less / typical_p all default to "disabled", so a config
+    # built without them still compares equal on the other fields -- dropping
+    # them from _config_from_args would be invisible unless asserted directly.
+    # Their per-row values are what makes these modes work per request.
+    from mlx_vlm.generate.ar import SamplingConfig
+    from mlx_vlm.server.generation import GenerationArguments, _config_from_args
+
+    args = GenerationArguments(
+        temperature=0.8, top_n_sigma=1.5, p_less=True, typical_p=0.4
+    )
+    config = _config_from_args(args)
+    assert config.top_n_sigma == 1.5
+    assert config.p_less is True
+    assert config.typical_p == 0.4
+    assert config == SamplingConfig(
+        temperature=0.8,
+        seed=config.seed,
+        top_n_sigma=1.5,
+        p_less=True,
+        typical_p=0.4,
+    )
+
+
+def test_build_sampling_config_from_args_uses_default_seed_when_unset():
+    # seed=None means "server picks a seed" (DEFAULT_SEED), not "seed=None"
+    # (which would crash mx.random.key downstream in _PositionedTargetSampler).
+    from mlx_vlm.generate import DEFAULT_SEED
+    from mlx_vlm.generate.ar import SamplingConfig
+    from mlx_vlm.server.generation import GenerationArguments, _config_from_args
+
+    args = GenerationArguments(temperature=0.7, seed=None)
+    assert _config_from_args(args) == SamplingConfig(temperature=0.7, seed=DEFAULT_SEED)
 
 
 def test_speculative_server_dispatches_eagle3_batch_loop():
@@ -1417,6 +1495,56 @@ class _RecordingSpeculativeLM:
             hidden_states=[hidden, hidden],
             shared_kv_states=None,
         )
+
+
+def _fake_speculative_request(temperature):
+    return server_generation.QueuedGenerationRequest(
+        rqueue=Queue(),
+        raw_inputs={},
+        prompt_tokens=1,
+        args=server.GenerationArguments(max_tokens=2, temperature=temperature),
+    )
+
+
+def test_serialize_speculative_batch_by_config_is_noop_when_uniform():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    pending = [_fake_speculative_request(0.7), _fake_speculative_request(0.7)]
+
+    kept, configs = gen._serialize_speculative_batch_by_config(pending)
+
+    assert kept is pending
+    assert len(configs) == 2
+    assert configs[0] == configs[1]
+    assert gen.requests.empty()
+
+
+def test_serialize_speculative_batch_by_config_never_silently_last_wins():
+    # dflash/eagle3's single shared `sampler` variable can't hold two
+    # different SamplingConfigs at once. The old code overwrote `sampler`
+    # once per request in a loop, so the *last* request's temperature
+    # silently governed every row's first-bonus and decode-round sampling —
+    # including rows belonging to *other* requests. This must never happen:
+    # a heterogeneous batch keeps only the requests sharing the first
+    # request's config and requeues the rest instead of co-batching them
+    # under the wrong params.
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.requests = Queue()
+    greedy_a = _fake_speculative_request(0.0)
+    greedy_b = _fake_speculative_request(0.0)
+    sampled = _fake_speculative_request(0.9)
+    pending = [greedy_a, sampled, greedy_b]
+
+    kept, configs = gen._serialize_speculative_batch_by_config(pending)
+
+    # Only the requests matching pending[0]'s config are co-batched...
+    assert kept == [greedy_a, greedy_b]
+    assert all(c == configs[0] for c in configs)
+    assert configs[0].temperature == 0.0
+    # ...and the mismatched request is requeued, never dropped and never
+    # silently co-batched under someone else's temperature.
+    assert gen.requests.qsize() == 1
+    assert gen.requests.get_nowait() is sampled
 
 
 def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
@@ -4866,7 +4994,6 @@ class TestResponseGenerator:
         assert kwargs["draft_model"] is draft_model
         assert kwargs["draft_kind"] == "mtp"
         assert kwargs["draft_block_size"] == 6
-        assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
         assert batch_state["instance"].next_active_sizes == [2]
 
@@ -4904,7 +5031,16 @@ class TestResponseGenerator:
 
         assert calls == [(False, 0.037)]
 
-    def test_idle_batch_generator_is_recreated_for_new_sampler(self, monkeypatch):
+    def test_run_co_batches_mixed_temperature_requests_into_one_batch_generator(
+        self, monkeypatch
+    ):
+        """Row-level sampling means a temperature change no longer forces a
+        new BatchGenerator (the rejected one-sampler-per-batch design this
+        test used to encode). Two requests admitted together — one greedy,
+        one sampled — must share a single BatchGenerator and be sampled
+        per-row via the SamplingConfig captured at insert()."""
+        from mlx_vlm.generate.ar import SamplingConfig
+
         created = []
         next_uid = [1]
 
@@ -4923,17 +5059,18 @@ class TestResponseGenerator:
 
         class FakeBatchGenerator:
             def __init__(self, *args, **kwargs):
-                del args
-                self.sampler = kwargs.get("sampler")
+                del args, kwargs
                 self.closed = False
                 self._active = {}
+                self.insert_calls = []
                 created.append(self)
 
             def insert(self, *args, **kwargs):
-                del args, kwargs
+                del args
                 uid = next_uid[0]
                 next_uid[0] += 1
                 self._active[uid] = True
+                self.insert_calls.append(kwargs.get("sampling_configs"))
                 return (uid,)
 
             @property
@@ -4998,7 +5135,6 @@ class TestResponseGenerator:
         gen._load_error = None
         gen._cancelled = set()
         gen._cancel_lock = Lock()
-        gen._make_sampler = lambda args: f"sampler-{args.temperature}"
 
         def fake_initialize_model():
             gen.model = SimpleNamespace(language_model=object())
@@ -5015,11 +5151,14 @@ class TestResponseGenerator:
             {},
         )
 
-        worker = Thread(target=gen._run, daemon=True)
-        worker.start()
-
-        def run_request(request_id, temperature):
+        # Queue both requests *before* starting the GPU thread: they're both
+        # sitting in `gen.requests` by the time `_collect_pending_requests`
+        # runs its first drain, so they arrive together and admit into the
+        # same BatchGenerator instead of two sequential ones.
+        request_queues = []
+        for request_id, temperature in [(1, 0.0), (2, 0.6)]:
             rqueue = Queue()
+            request_queues.append(rqueue)
             gen.requests.put(
                 server_generation.QueuedGenerationRequest(
                     rqueue=rqueue,
@@ -5030,21 +5169,29 @@ class TestResponseGenerator:
                     ),
                 )
             )
-            ctx = rqueue.get(timeout=1)
-            assert isinstance(ctx, server.GenerationContext)
-            item = rqueue.get(timeout=1)
-            assert item.finish_reason == "length"
-            assert rqueue.get(timeout=1) is None
+
+        worker = Thread(target=gen._run, daemon=True)
+        worker.start()
 
         try:
-            run_request(1, 0.0)
-            run_request(2, 0.6)
+            for rqueue in request_queues:
+                ctx = rqueue.get(timeout=1)
+                assert isinstance(ctx, server.GenerationContext)
+                item = rqueue.get(timeout=1)
+                assert item.finish_reason == "length"
+                assert rqueue.get(timeout=1) is None
         finally:
             gen._stop = True
             gen.requests.put(None)
             worker.join(timeout=2)
 
-        assert [bg.sampler for bg in created] == ["sampler-0.0", "sampler-0.6"]
+        # One shared BatchGenerator for both requests, each admitted with
+        # its own row-level SamplingConfig.
+        assert len(created) == 1
+        assert created[0].insert_calls == [
+            [SamplingConfig(temperature=0.0)],
+            [SamplingConfig(temperature=0.6)],
+        ]
         assert created[0].closed is True
 
     def test_step_attaches_prompt_metrics_from_prompt_progress(self):
