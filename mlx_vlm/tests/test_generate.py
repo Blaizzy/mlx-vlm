@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import contextlib
 import logging
 import sys
 import typing
@@ -1974,6 +1975,100 @@ def test_stream_generate_forwards_verbose_to_generate_step():
         )
 
     assert captured["verbose"] is True
+
+
+def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    prepared_mask = mx.ones((1, 4), dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(
+            dispatch_module,
+            "prepare_inputs",
+            return_value={
+                "input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                "attention_mask": prepared_mask,
+            },
+        ),
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="hello",
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is None
+    assert captured["media"]["masks"] is None
+
+
+def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    custom_embeds = mx.ones((1, 4, 3))
+    custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                inputs_embeds=custom_embeds,
+                mask=custom_mask,
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is custom_embeds
+    assert captured["media"]["masks"] is custom_mask
 
 
 def test_public_generation_annotations_match_runtime_results():
