@@ -1168,6 +1168,9 @@ class ResponseGenerator:
             thinking_budget_criteria = self._make_thinking_budget_criteria(
                 args, raw_inputs.get("input_ids")
             )
+        prompt_tokens = _count_prompt_tokens(raw_inputs)
+        _check_configured_context_budget(prompt_tokens, args.max_tokens)
+
         apc_semantic_hash = None
         if getattr(self, "apc_manager", None) is not None:
             pixel_values = raw_inputs.get("pixel_values")
@@ -1186,8 +1189,6 @@ class ResponseGenerator:
                 model=getattr(self.model, "language_model", self.model),
                 processor=self.processor,
             )
-        prompt_tokens = _count_prompt_tokens(raw_inputs)
-        _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         request_id = f"{id(rqueue):x}"
         queued_request = QueuedGenerationRequest(

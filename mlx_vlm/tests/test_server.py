@@ -3977,10 +3977,14 @@ class TestResponseGenerator:
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
         gen.draft_model = None
-        gen._cpu_preprocess = lambda prompt, images, audio: {
-            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        gen.apc_manager = object()
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            "pixel_values": mx.zeros((1, 3, 2, 2), dtype=mx.float32),
         }
         gen.requests = Queue()
+        image_hash = MagicMock(wraps=apc_module.hash_image_payload)
+        monkeypatch.setattr(apc_module, "hash_image_payload", image_hash)
 
         monkeypatch.setenv("MAX_KV_SIZE", "8")
 
@@ -3988,6 +3992,7 @@ class TestResponseGenerator:
             gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
 
         assert gen.requests.empty()
+        image_hash.assert_not_called()
 
     def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
