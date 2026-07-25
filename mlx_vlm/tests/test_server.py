@@ -589,6 +589,7 @@ def _unstarted_response_generator():
     gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
     gen.top_logprobs_k = 0
     gen.apc_manager = None
+    gen.apc_mode = None
     gen.tokenizer = None
     gen.requests = Queue()
     gen._stop = False
@@ -633,6 +634,30 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.processor is processor
     assert gen.draft_model is None
     assert gen.draft_kind is None
+
+
+def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[])
+    language_model = SimpleNamespace()
+    model = SimpleNamespace(language_model=language_model)
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+    gen.apc_manager = object()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    apc_mode = MagicMock(return_value="exact")
+    monkeypatch.setattr(apc_module, "model_apc_mode", apc_mode)
+
+    gen._initialize_model()
+
+    assert gen.apc_mode == "exact"
+    apc_mode.assert_called_once_with(language_model)
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
@@ -3978,6 +4003,7 @@ class TestResponseGenerator:
         gen.wait_until_ready = lambda: None
         gen.draft_model = None
         gen.apc_manager = object()
+        gen.apc_mode = "block"
         gen._preprocess_request = lambda prompt, images, audio, videos: {
             "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
             "pixel_values": mx.zeros((1, 3, 2, 2), dtype=mx.float32),
@@ -4061,6 +4087,7 @@ class TestResponseGenerator:
         gen.wait_until_ready = lambda: None
         gen.draft_model = None
         gen.apc_manager = object()
+        gen.apc_mode = "block"
         gen.model = SimpleNamespace(language_model=SimpleNamespace())
         gen.processor = SimpleNamespace()
         gen._cancel = lambda uid: None
@@ -4114,6 +4141,41 @@ class TestResponseGenerator:
             model=gen.model.language_model,
             processor=gen.processor,
         )
+
+    def test_generate_skips_semantic_hash_for_unsupported_apc_model(self, monkeypatch):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen.apc_manager = object()
+        gen.apc_mode = None
+        gen._cancel = lambda uid: None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+            "pixel_values": mx.zeros((1, 3, 2, 2), dtype=mx.float32),
+        }
+        queued = []
+
+        class Requests:
+            def put(self, request):
+                queued.append(request)
+                request.rqueue.put(server.GenerationContext(uid=1, prompt_tokens=2))
+
+        gen.requests = Requests()
+        image_hash = MagicMock(wraps=apc_module.hash_image_payload)
+        semantic_hash = MagicMock(wraps=apc_module.semantic_extra_hash)
+        monkeypatch.setattr(apc_module, "hash_image_payload", image_hash)
+        monkeypatch.setattr(apc_module, "semantic_extra_hash", semantic_hash)
+
+        _, token_iter = gen.generate(
+            "prompt",
+            images=["image.png"],
+            args=server.GenerationArguments(max_tokens=1),
+        )
+        token_iter.close()
+
+        assert queued[0].apc_semantic_hash is None
+        image_hash.assert_not_called()
+        semantic_hash.assert_not_called()
 
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
