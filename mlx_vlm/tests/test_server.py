@@ -571,9 +571,18 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
-def test_load_model_resources_returns_unsupported_model_error(monkeypatch):
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        ValueError("Model type bert not supported."),
+        RuntimeError("Unable to initialize model."),
+    ],
+)
+def test_load_model_resources_returns_load_failure_as_bad_request(
+    monkeypatch, load_error
+):
     def reject_model(*_args, **_kwargs):
-        raise ValueError("Model type bert not supported.")
+        raise load_error
 
     monkeypatch.setattr(server_generation, "load", reject_model)
 
@@ -584,10 +593,7 @@ def test_load_model_resources_returns_unsupported_model_error(monkeypatch):
         )
 
     assert exc_info.value.status_code == 400
-    assert exc_info.value.detail == (
-        "Unsupported model 'google-bert/bert-base-multilingual-cased': "
-        "Model type bert not supported."
-    )
+    assert exc_info.value.detail == f"Failed to load model: {load_error}"
 
 
 def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
@@ -610,8 +616,7 @@ def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
 
     assert response.status_code == 400
     assert response.json()["detail"] == (
-        "Unsupported model 'google-bert/bert-base-multilingual-cased': "
-        "Model type bert not supported."
+        "Failed to load model: Model type bert not supported."
     )
     assert client.get("/health").status_code == 200
 

@@ -655,15 +655,9 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         config = model.config
         logger.info("Model and processor loaded successfully.")
         return model, processor, config
-    except ValueError as e:
-        logger.warning("Unsupported model %s: %s", model_path, e)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported model {model_path!r}: {e}",
-        ) from e
     except Exception as e:
         logger.exception("Error loading model %s: %s", model_path, e)
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
 
 
 # =============================================================================
