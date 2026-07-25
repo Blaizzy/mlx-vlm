@@ -10577,6 +10577,155 @@ class TestInklingMTP(unittest.TestCase):
         self.assertLess(float(mx.max(mx.abs(l1 - l2))), 1e-4)
 
 
+class _AWQAttn(nn.Module):
+    def __init__(self, d, dk):
+        super().__init__()
+        self.q_proj = nn.Linear(d, dk, bias=False)
+        self.k_proj = nn.Linear(d, dk, bias=False)
+        self.v_proj = nn.Linear(d, dk, bias=False)
+        self.o_proj = nn.Linear(dk, d, bias=False)
+
+
+class _AWQMLP(nn.Module):
+    def __init__(self, d, di):
+        super().__init__()
+        self.gate_proj = nn.Linear(d, di, bias=False)
+        self.up_proj = nn.Linear(d, di, bias=False)
+        self.down_proj = nn.Linear(di, d, bias=False)
+
+
+class _AWQBlock(nn.Module):
+    def __init__(self, d=64, dk=32, di=128, eps=1e-5):
+        super().__init__()
+        self.self_attn = _AWQAttn(d, dk)
+        self.mlp = _AWQMLP(d, di)
+        self.input_layernorm = nn.RMSNorm(d, eps=eps)
+        self.post_attention_layernorm = nn.RMSNorm(d, eps=eps)
+
+    def __call__(self, x):
+        a = self.input_layernorm(x)
+        v = self.self_attn.v_proj(a)
+        v = (
+            v
+            + 0.0 * self.self_attn.q_proj(a).sum()
+            + 0.0 * self.self_attn.k_proj(a).sum()
+        )
+        h = x + self.self_attn.o_proj(v)
+        b = self.post_attention_layernorm(h)
+        return h + self.mlp.down_proj(
+            nn.silu(self.mlp.gate_proj(b)) * self.mlp.up_proj(b)
+        )
+
+
+class TestAWQ(unittest.TestCase):
+    def test_fold_into_norm_is_identity(self):
+        from mlx_vlm.quant.awq import _fold_into_norm
+
+        mx.random.seed(0)
+        d = 32
+        norm = nn.RMSNorm(d)
+        norm.weight = mx.random.uniform(0.5, 1.5, (d,))
+        lin = nn.Linear(d, 8, bias=False)
+        x = mx.random.normal((4, d))
+        y0 = lin(norm(x))
+        s = mx.random.uniform(0.3, 3.0, (d,))
+        _fold_into_norm(norm, [lin], s)
+        self.assertLess(float(mx.max(mx.abs(lin(norm(x)) - y0))), 1e-4)
+
+    def test_fold_into_linear_is_identity(self):
+        from mlx_vlm.quant.awq import _fold_into_linear
+
+        mx.random.seed(0)
+        up = nn.Linear(16, 24, bias=False)
+        down = nn.Linear(24, 16, bias=False)
+        x = mx.random.normal((4, 16))
+        y0 = down(up(x))
+        s = mx.random.uniform(0.3, 3.0, (24,))
+        _fold_into_linear(up, [down], s)
+        self.assertLess(float(mx.max(mx.abs(down(up(x)) - y0))), 1e-4)
+
+    def test_apply_awq_preserves_output_and_transforms_all_groups(self):
+        from mlx_vlm.quant import apply_awq, collect_activation_stats
+
+        mx.random.seed(0)
+        block = _AWQBlock()
+        mx.eval(block.parameters())
+        x = mx.random.normal((2, 6, 64))
+        y0 = block(x)
+        mx.eval(y0)
+
+        def run():
+            for _ in range(3):
+                mx.eval(block(mx.random.normal((2, 6, 64))))
+
+        stats = collect_activation_stats(block, run)
+        summary = apply_awq(block, stats, bits=4, group_size=32)
+        self.assertEqual(summary["groups"], 4)
+        self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 2e-3)
+
+    def test_apply_awq_no_stats_is_noop(self):
+        from mlx_vlm.quant import apply_awq
+
+        mx.random.seed(0)
+        block = _AWQBlock()
+        mx.eval(block.parameters())
+        x = mx.random.normal((2, 6, 64))
+        y0 = block(x)
+        summary = apply_awq(block, {}, bits=4, group_size=32)
+        self.assertEqual(summary["groups"], 0)
+        self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 1e-6)
+
+    def test_custom_one_plus_weight_norm_is_not_folded(self):
+        from mlx_vlm.quant import apply_awq, collect_activation_stats
+
+        class OnePlusRMSNorm(nn.Module):
+            def __init__(self, d, eps=1e-5):
+                super().__init__()
+                self.weight = mx.zeros((d,))
+                self.eps = eps
+
+            def __call__(self, x):
+                return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+
+        mx.random.seed(0)
+        block = _AWQBlock()
+        block.input_layernorm = OnePlusRMSNorm(64)
+        block.input_layernorm.weight = mx.random.uniform(-0.1, 0.1, (64,))
+        mx.eval(block.parameters())
+        before = mx.array(block.input_layernorm.weight)
+        x = mx.random.normal((2, 6, 64))
+        y0 = block(x)
+        mx.eval(y0)
+
+        def run():
+            for _ in range(3):
+                mx.eval(block(mx.random.normal((2, 6, 64))))
+
+        stats = collect_activation_stats(block, run)
+        apply_awq(block, stats, bits=4, group_size=32)
+        self.assertLess(
+            float(mx.max(mx.abs(block.input_layernorm.weight - before))), 1e-6
+        )
+        self.assertLess(float(mx.max(mx.abs(block(x) - y0))), 2e-3)
+
+    def test_synthetic_calibration_media(self):
+        import numpy as np
+
+        from mlx_vlm.quant import (
+            synthetic_calibration_audio,
+            synthetic_calibration_images,
+        )
+
+        imgs = synthetic_calibration_images(4, size=64)
+        self.assertEqual(len(imgs), 4)
+        self.assertEqual(imgs[0].mode, "RGB")
+        self.assertEqual(imgs[0].size, (64, 64))
+        auds = synthetic_calibration_audio(3, seconds=0.1, sample_rate=8000)
+        self.assertEqual(len(auds), 3)
+        self.assertEqual(auds[0].dtype, np.float32)
+        self.assertEqual(int(auds[0].shape[0]), 800)
+
+
 if __name__ == "__main__":
     unittest.main()
 
