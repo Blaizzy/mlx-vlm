@@ -410,6 +410,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-budget 512 \
   --thinking-start-token "<think>" \
   --thinking-end-token "</think>"
+
+# Require bearer authentication for API endpoints
+mlx_vlm.server --api-key <secret-token>
 ```
 
 #### Server Options
@@ -435,6 +438,7 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
 - `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
+- `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
 
 At `INFO`, the server logs request start/completion, chunked-prefill progress,
