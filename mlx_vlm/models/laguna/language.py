@@ -333,6 +333,7 @@ class LanguageModel(nn.Module):
             weights.pop("lm_head.weight", None)
 
         weights = self._stack_compressed_nvfp4_experts(weights)
+        weights = self._fold_compressed_nvfp4_shared_experts(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
@@ -422,6 +423,40 @@ class LanguageModel(nn.Module):
                 weights[f"{prefix}.switch_mlp.down_proj.scales"] = _f32_to_e4m3(
                     down_scales
                 )
+
+        return weights
+
+    def _fold_compressed_nvfp4_shared_experts(self, weights):
+        quantization = self.args.quantization or {}
+        if quantization.get("mode") != "nvfp4":
+            return weights
+        if not any(
+            ".mlp.shared_expert." in key and key.endswith(".weight_packed")
+            for key in weights
+        ):
+            return weights
+
+        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
+
+        packed_suffix = ".weight_packed"
+        for key in list(weights.keys()):
+            if ".mlp.shared_expert." not in key or not key.endswith(packed_suffix):
+                continue
+
+            prefix = key[: -len(packed_suffix)]
+            scale_key = f"{prefix}.weight_scale"
+            global_scale_key = f"{prefix}.weight_global_scale"
+            if scale_key not in weights or global_scale_key not in weights:
+                continue
+
+            packed = weights.pop(key)
+            scale = weights.pop(scale_key)
+            global_scale = weights.pop(global_scale_key).astype(mx.float32)
+            weights.pop(f"{prefix}.input_global_scale", None)
+
+            weights[f"{prefix}.weight"] = packed.view(mx.uint32)
+            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+            weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
 
         return weights
 

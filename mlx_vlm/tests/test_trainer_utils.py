@@ -148,8 +148,7 @@ class TestTrainerUtils(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             adapter_dir = Path(tmpdir) / "adapter"
             adapter_dir.mkdir()
-            (adapter_dir / "adapter_config.json").write_text(
-                """
+            (adapter_dir / "adapter_config.json").write_text("""
                 {
                   "fine_tune_type": "lora",
                   "num_layers": -1,
@@ -160,8 +159,7 @@ class TestTrainerUtils(unittest.TestCase):
                     "keys": ["language_model.proj"]
                   }
                 }
-                """
-            )
+                """)
             (adapter_dir / "adapters.safetensors").touch()
 
             model = DummyModel()
