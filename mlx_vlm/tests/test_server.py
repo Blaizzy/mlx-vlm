@@ -571,6 +571,51 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
+def test_load_model_resources_returns_unsupported_model_error(monkeypatch):
+    def reject_model(*_args, **_kwargs):
+        raise ValueError("Model type bert not supported.")
+
+    monkeypatch.setattr(server_generation, "load", reject_model)
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server_generation.load_model_resources(
+            "google-bert/bert-base-multilingual-cased",
+            None,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == (
+        "Unsupported model 'google-bert/bert-base-multilingual-cased': "
+        "Model type bert not supported."
+    )
+
+
+def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
+    def reject_model(*_args, **_kwargs):
+        raise ValueError("Model type bert not supported.")
+
+    monkeypatch.setattr(server_generation, "load", reject_model)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "google-bert/bert-base-multilingual-cased",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Unsupported model 'google-bert/bert-base-multilingual-cased': "
+        "Model type bert not supported."
+    )
+    assert client.get("/health").status_code == 200
+
+
 def _unstarted_response_generator():
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model_path = "demo"
