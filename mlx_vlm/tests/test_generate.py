@@ -2366,18 +2366,14 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
 
 
-def test_batch_apc_extra_hash_ignores_growing_derived_sequence_tensors():
+def test_batch_apc_extra_hash_returns_precomputed_semantic_hash():
     batch_generator = SimpleNamespace(apc_manager=object())
-    common = {
-        "_apc_image_hash": 123,
-        "_apc_tenant": "tenant-a",
-        "_apc_derived_sequence_inputs": True,
-    }
+    semantic_hash = 7088136067003016882
 
     short_hash = BatchGenerator._apc_extra_hash(
         batch_generator,
         {
-            **common,
+            "_apc_semantic_hash": semantic_hash,
             "inputs_embeds": mx.ones((1, 8, 4)),
             "attention_mask": mx.ones((1, 8), dtype=mx.int32),
         },
@@ -2385,13 +2381,14 @@ def test_batch_apc_extra_hash_ignores_growing_derived_sequence_tensors():
     extended_hash = BatchGenerator._apc_extra_hash(
         batch_generator,
         {
-            **common,
+            "_apc_semantic_hash": semantic_hash,
             "inputs_embeds": mx.ones((1, 12, 4)),
             "attention_mask": mx.ones((1, 12), dtype=mx.int32),
         },
     )
 
-    assert short_hash == extended_hash
+    assert short_hash == semantic_hash
+    assert extended_hash == semantic_hash
 
 
 def test_batch_apc_extra_hash_still_tracks_non_text_media():
@@ -2399,7 +2396,6 @@ def test_batch_apc_extra_hash_still_tracks_non_text_media():
     base = {
         "_apc_image_hash": 123,
         "_apc_tenant": "tenant-a",
-        "_apc_derived_sequence_inputs": True,
         "inputs_embeds": mx.ones((1, 8, 4)),
         "attention_mask": mx.ones((1, 8), dtype=mx.int32),
     }
@@ -2441,6 +2437,46 @@ def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
     )
 
     assert first_hash != second_hash
+
+
+def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
+    manager = apc_module.APCManager(num_blocks=4, block_size=4)
+    manager.exact_cache_guard_tokens = 1
+    semantic_hash = 7088136067003016882
+    short_tokens = list(range(8))
+    extended_tokens = [*short_tokens, 8, 9]
+    layer_keys = [mx.ones((1, 1, len(short_tokens), 2))]
+    layer_values = [mx.ones((1, 1, len(short_tokens), 2)) * 2]
+
+    stored = manager.store_kv_blocks(
+        short_tokens,
+        layer_keys,
+        layer_values,
+        extra_hash=semantic_hash,
+    )
+    manager.release(stored)
+
+    batch_generator = object.__new__(BatchGenerator)
+    batch_generator.apc_manager = manager
+    batch_generator.apc_mode = "block"
+    batch_generator.model = SimpleNamespace(config=SimpleNamespace())
+    batch_generator._wire_stack = None
+
+    pick = batch_generator._apc_pick_for(
+        (
+            1,
+            extended_tokens,
+            1,
+            {"_apc_semantic_hash": semantic_hash},
+            [],
+            None,
+        )
+    )
+
+    assert pick is not None
+    assert pick["prefix_len"] == len(short_tokens)
+    assert pick["extra_hash"] == semantic_hash
+    manager.release(pick["matched_blocks"])
 
 
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
@@ -2581,6 +2617,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "keep_tensor": mx.ones((1, 1)),
                 "_apc_tenant": "tenant-a",
                 "_apc_image_hash": 123,
+                "_apc_semantic_hash": 7,
             },
             [],
             None,
@@ -2623,6 +2660,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert batch is not None
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
+    assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 

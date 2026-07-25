@@ -561,7 +561,7 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
 APC_PRIVATE_PROMPT_KEYS = (
     "_apc_tenant",
     "_apc_image_hash",
-    "_apc_derived_sequence_inputs",
+    "_apc_semantic_hash",
 )
 
 
@@ -2218,36 +2218,22 @@ class BatchGenerator:
             return 0
         if prompt_kwargs is None:
             prompt_kwargs = {}
+        precomputed = prompt_kwargs.get("_apc_semantic_hash")
+        if precomputed is not None:
+            return int(precomputed)
         img = prompt_kwargs.get("_apc_image_hash")
         if img is None:
             pixel_values = prompt_kwargs.get("pixel_values")
             img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
         tenant = prompt_kwargs.get("_apc_tenant")
-        derived_sequence_inputs = bool(
-            prompt_kwargs.get("_apc_derived_sequence_inputs")
-        )
-        # inputs_embeds and attention_mask are derived from the complete
-        # prompt in the continuous server path. Hashing them here would change
-        # the global APC salt whenever text is appended and prevent the token
-        # block lookup from discovering an otherwise identical prefix. Keep
-        # hashing explicitly supplied tensors for callers using BatchGenerator
-        # directly.
         return _apc.semantic_extra_hash(
             tenant=tenant,
             image_hash=img,
             media={
                 "audio": prompt_kwargs.get("input_features"),
                 "video": prompt_kwargs.get("pixel_values_videos"),
-                "embeddings": (
-                    None
-                    if derived_sequence_inputs
-                    else prompt_kwargs.get("inputs_embeds")
-                ),
-                "masks": (
-                    None
-                    if derived_sequence_inputs
-                    else prompt_kwargs.get("attention_mask")
-                ),
+                "embeddings": prompt_kwargs.get("inputs_embeds"),
+                "masks": prompt_kwargs.get("attention_mask"),
             },
             model=getattr(self, "model", None),
             processor=getattr(self, "processor", None),
