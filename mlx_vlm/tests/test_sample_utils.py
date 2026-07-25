@@ -8,6 +8,7 @@ from mlx_vlm.sample_utils import (
     apply_p_less,
     apply_top_k,
     apply_top_n_sigma,
+    apply_typical_p,
     make_sampler,
     top_p_sampling,
 )
@@ -246,6 +247,81 @@ class TestPLess(unittest.TestCase):
         toks = sampler(mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]] * 16))
         mx.eval(toks)
         self.assertEqual(toks.shape, (16,))
+
+
+def _np_typical_keep(logits, typical_p):
+    logp = np.asarray(logits, dtype=np.float64)
+    logp = logp - logp.max()
+    logp = logp - np.log(np.exp(logp).sum())
+    p = np.exp(logp)
+    ent = -(p * logp).sum()
+    shifted = np.abs(-logp - ent)
+    order = np.argsort(shifted, kind="stable")
+    cum_before_sorted = np.cumsum(p[order]) - p[order]
+    keep = np.zeros(len(p), dtype=bool)
+    cum_before = np.zeros(len(p))
+    keep[order] = cum_before_sorted < typical_p
+    cum_before[order] = cum_before_sorted
+    return keep, cum_before
+
+
+class TestTypicalP(unittest.TestCase):
+    def _apply(self, logits, typical_p):
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        out = apply_typical_p(lp, typical_p)
+        mx.eval(out)
+        return np.asarray(out.tolist(), dtype=np.float64)
+
+    def test_matches_numpy_reference(self):
+        """Mask equals the locally-typical set from an independent numpy
+        implementation, away from the single boundary token."""
+        rng = np.random.default_rng(0)
+        for _ in range(40):
+            V = int(rng.integers(8, 200))
+            typical_p = float(rng.choice([0.2, 0.5, 0.9, 0.95]))
+            logits = rng.normal(0, 3, size=V).astype(np.float32)
+            keep_ref, cum_before = _np_typical_keep(logits, typical_p)
+            keep_mlx = np.isfinite(self._apply(mx.array(logits), typical_p))
+            far = np.abs(cum_before - typical_p) > 1e-4
+            self.assertTrue(np.array_equal(keep_ref[far], keep_mlx[far]))
+
+    def test_disabled_keeps_all(self):
+        """typical_p=1.0 masks nothing."""
+        logits = mx.array([[0.0, 1.0, 2.0, 3.0, 4.0]])
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        out = apply_typical_p(lp, 1.0)
+        mx.eval(out)
+        self.assertTrue(bool(mx.all(mx.isfinite(out)).item()))
+
+    def test_smaller_keeps_fewer(self):
+        """Lowering typical_p never grows the kept set."""
+        rng = np.random.default_rng(2)
+        logits = mx.array(rng.normal(0, 2, size=64).astype(np.float32))
+        counts = [
+            int(np.isfinite(self._apply(logits, tp)).sum())
+            for tp in (0.2, 0.5, 0.9, 0.99)
+        ]
+        self.assertEqual(counts, sorted(counts))
+
+    def test_make_sampler_selects_survivor(self):
+        """A sharply peaked distribution collapses to the argmax."""
+        sampler = make_sampler(temp=1.0, typical_p=0.3)
+        toks = sampler(mx.array([[10.0, 0.0, 0.0, 0.0, 0.0]] * 64))
+        mx.eval(toks)
+        self.assertTrue(all(t == 0 for t in toks.tolist()))
+
+    def test_disabled_by_default(self):
+        """typical_p=1.0 (default) leaves the sampler unfiltered."""
+        sampler = make_sampler(temp=1.0)
+        toks = sampler(mx.array([[1.0, 2.0, 3.0, 4.0, 5.0]] * 16))
+        mx.eval(toks)
+        self.assertEqual(toks.shape, (16,))
+
+    def test_invalid_raises(self):
+        x = mx.array([0.0, 1.0, 2.0])
+        for bad in (0.0, -0.1, 1.5):
+            with self.assertRaises(ValueError):
+                mx.eval(apply_typical_p(x, bad))
 
 
 class TestValidationDoesNotCorruptCompile(unittest.TestCase):

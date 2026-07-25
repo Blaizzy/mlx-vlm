@@ -363,7 +363,7 @@ def _speculative_walk_batch_deferred_uniform(
 
 
 def _sampler_supports_positioned_target(
-    sampler: Callable[[mx.array], mx.array]
+    sampler: Callable[[mx.array], mx.array],
 ) -> bool:
     return callable(getattr(sampler, "sample_target", None))
 

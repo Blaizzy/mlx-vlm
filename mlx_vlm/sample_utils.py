@@ -15,6 +15,7 @@ def make_sampler(
     top_k: int = 0,
     top_n_sigma: float = 0.0,
     p_less: bool = False,
+    typical_p: float = 1.0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
     xtc_special_tokens: Optional[List[int]] = None,
@@ -41,6 +42,9 @@ def make_sampler(
           tokens whose probability is at least the collision probability
           (sum of squared probabilities) of the temperature-scaled
           distribution. Default: ``False``.
+        typical_p (float, optional): Locally typical sampling. Keeps the most
+          typical tokens (surprisal closest to the distribution entropy) until
+          their cumulative probability reaches ``typical_p``. ``1.0`` disables.
         xtc_probability (float, optional): The probability of applying XTC
             sampling.
         xtc_threshold (float, optional): The threshold the probs need to reach
@@ -64,6 +68,8 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_top_n_sigma(x, top_n_sigma))
     if p_less:
         sampling_methods.append(lambda x: apply_p_less(x, temp))
+    if typical_p > 0.0 and typical_p < 1.0:
+        sampling_methods.append(lambda x: apply_typical_p(x, typical_p))
     if top_p > 0 and top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
@@ -310,6 +316,33 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
         logprobs,
         -float("inf"),
     )
+
+
+def apply_typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
+    """Locally typical sampling (https://arxiv.org/abs/2202.00666)."""
+    if not (0.0 < typical_p <= 1.0):
+        raise ValueError(
+            f"`typical_p` has to be a float in the (0, 1] interval, but is {typical_p}"
+        )
+    return _typical_p(logprobs, typical_p)
+
+
+@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def _typical_p(logprobs: mx.array, typical_p: float) -> mx.array:
+    p = mx.exp(logprobs)
+    ent = -mx.sum(p * logprobs, axis=-1, keepdims=True)
+    shifted = mx.abs(-logprobs - ent)
+    sorted_indices = mx.argsort(shifted, axis=-1)
+    sorted_probs = mx.take_along_axis(p, sorted_indices, axis=-1)
+    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
+    inverse_indices = mx.put_along_axis(
+        mx.zeros_like(sorted_indices),
+        sorted_indices,
+        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
+        axis=-1,
+    )
+    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
+    return mx.where(cumulative_probs - p < typical_p, logprobs, -float("inf"))
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)

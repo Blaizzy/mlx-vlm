@@ -207,8 +207,8 @@ def main():
         type=str,
         default=None,
         help=(
-            "Optional bearer token required for management endpoints such as "
-            "/health, /metrics, /cache/stats, /cache/reset, and /unload. "
+            "Optional bearer token required for inference, model discovery, and "
+            "management endpoints. "
             "Maps to the MLX_VLM_SERVER_API_KEY env var."
         ),
     )
