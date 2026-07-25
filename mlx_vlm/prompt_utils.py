@@ -820,8 +820,10 @@ def apply_chat_template(
     config = config if isinstance(config, dict) else config.__dict__
     model_type = config["model_type"]
 
-    # Use standard formatting for text-only models.
-    if model_type not in MODEL_CONFIG:
+    # Use standard formatting for text-only models. MODEL_CONFIG is keyed
+    # lowercase and MessageFormatter lowercases too, but config.json is free to
+    # ship any casing, so match the registry's convention here as well.
+    if model_type.lower() not in MODEL_CONFIG:
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, dict):

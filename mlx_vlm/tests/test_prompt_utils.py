@@ -173,6 +173,47 @@ class TestApplyChatTemplateIntegration:
                 }
             ]
 
+    def test_model_type_lookup_is_case_insensitive(self):
+        """A checkpoint's config.json casing must not disable multimodal input.
+
+        ``mlx-community/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-*`` ship
+        ``"model_type": "NemotronH_Nano_Omni_Reasoning_V3"``. A case-sensitive
+        MODEL_CONFIG lookup classified that as text-only, so neither ``<image>``
+        nor ``<so_embedding>`` was emitted and generation died at merge time with
+        ``Image token count (0) does not match feature count (256)``.
+        """
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        as_shipped = "NemotronH_Nano_Omni_Reasoning_V3"
+        expected = apply_chat_template(
+            None,
+            {"model_type": as_shipped.lower()},
+            "Describe the inputs.",
+            return_messages=True,
+            num_images=1,
+            num_audios=1,
+        )
+        # Sanity: the lowercase spelling really does produce multimodal parts.
+        assert [part["type"] for part in expected[0]["content"]] == [
+            "image",
+            "text",
+            "audio",
+        ]
+
+        # Every spelling below lowercases to the same registered key.
+        for spelling in (as_shipped, as_shipped.upper(), as_shipped.lower()):
+            assert (
+                apply_chat_template(
+                    None,
+                    {"model_type": spelling},
+                    "Describe the inputs.",
+                    return_messages=True,
+                    num_images=1,
+                    num_audios=1,
+                )
+                == expected
+            ), spelling
+
     def test_gemma4_unified_formats_image_and_audio_messages(self):
         """Gemma 4 Unified should use typed multimodal content for HF templates."""
         from mlx_vlm.prompt_utils import apply_chat_template
