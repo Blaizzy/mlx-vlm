@@ -1175,6 +1175,70 @@ def test_management_endpoints_require_configured_api_key(
     assert valid.status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/messages"),
+        ("post", "/messages/count_tokens"),
+        ("post", "/responses/input_tokens"),
+        ("get", "/responses/missing"),
+        ("delete", "/responses/missing"),
+        ("post", "/responses/missing/cancel"),
+        ("get", "/responses/missing/input_items"),
+        ("post", "/responses"),
+        ("post", "/chat/completions"),
+        ("post", "/images/generations"),
+        ("post", "/images/edits"),
+        ("post", "/audio/speech"),
+        ("post", "/audio/transcriptions"),
+        ("post", "/audio/translations"),
+        ("get", "/models"),
+        ("post", "/v1/messages"),
+        ("post", "/v1/messages/count_tokens"),
+        ("post", "/v1/responses/input_tokens"),
+        ("get", "/v1/responses/missing"),
+        ("delete", "/v1/responses/missing"),
+        ("post", "/v1/responses/missing/cancel"),
+        ("get", "/v1/responses/missing/input_items"),
+        ("post", "/v1/responses"),
+        ("post", "/v1/chat/completions"),
+        ("post", "/v1/images/generations"),
+        ("post", "/v1/images/edits"),
+        ("post", "/v1/audio/speech"),
+        ("post", "/v1/audio/transcriptions"),
+        ("post", "/v1/audio/translations"),
+        ("get", "/v1/models"),
+    ],
+)
+def test_inference_endpoints_require_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    missing = getattr(client, method)(path)
+    invalid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert missing.headers["WWW-Authenticate"] == "Bearer"
+    assert invalid.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_inference_endpoint_accepts_configured_api_key(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret-token"},
+        json={},
+    )
+
+    assert response.status_code == 422
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
