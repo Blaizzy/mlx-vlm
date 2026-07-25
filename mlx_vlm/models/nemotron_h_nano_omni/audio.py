@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import check_array_shape
 from .config import AudioConfig
 
 
@@ -545,6 +546,18 @@ class SoundFeatureExtractor:
         )
 
 
+def _is_mlx_conv1d_layout(key, shape):
+    """Conv1d: PyTorch [out, in // groups, kW] -> MLX [out, kW, in // groups].
+
+    ``depthwise_conv`` is grouped per channel, so ``in // groups`` is 1 and only
+    the MLX layout puts that 1 last. The pointwise convolutions have ``kW == 1``,
+    so only the MLX layout puts that 1 in the middle.
+    """
+    if key.endswith(".depthwise_conv.weight"):
+        return shape[2] == 1
+    return shape[1] == 1
+
+
 def sanitize_audio_weights(weights):
     sanitized = {}
     for key, value in weights.items():
@@ -552,10 +565,15 @@ def sanitize_audio_weights(weights):
             continue
         if key.endswith(".num_batches_tracked"):
             continue
-        if key.startswith("sound_encoder.encoder."):
-            if key.endswith(".weight") and value.ndim == 3:
+        # Converted checkpoints already store the MLX layout, and sanitize runs
+        # on those too, so the conv transposes below have to be idempotent.
+        if key.startswith("sound_encoder.encoder.") and key.endswith(".weight"):
+            if value.ndim == 3 and not _is_mlx_conv1d_layout(key, value.shape):
                 value = value.transpose(0, 2, 1)
-            elif key.endswith(".weight") and value.ndim == 4:
+            # Conv2d: PyTorch [out, in // groups, kH, kW] -> MLX
+            # [out, kH, kW, in // groups]. Every kernel in the subsampling stack
+            # is square, which is what check_array_shape keys off.
+            elif value.ndim == 4 and not check_array_shape(value):
                 value = value.transpose(0, 2, 3, 1)
         sanitized[key] = value
     return sanitized

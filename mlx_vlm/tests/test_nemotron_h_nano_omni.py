@@ -1,6 +1,7 @@
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.models.nemotron_h_nano_omni.audio import (
     SoundEncoder,
@@ -251,3 +252,46 @@ def test_sanitize_audio_and_projection_weights():
     assert "mlp1.layers.0.weight" in model_sanitized
     assert "mlp1.layers.1.weight" in model_sanitized
     assert "mlp1.layers.3.weight" in model_sanitized
+
+
+def _encoder_conv_shapes(config):
+    """Shapes the encoder's conv weights must have, keyed like a checkpoint."""
+    encoder = SoundEncoder(config)
+    shapes = {
+        f"sound_encoder.encoder.{name}": param.shape
+        for name, param in tree_flatten(encoder.parameters())
+        if name.endswith(".weight") and param.ndim in (3, 4)
+    }
+    assert shapes, "expected the sound encoder to expose conv weights"
+    return shapes
+
+
+@pytest.mark.parametrize("hidden_size", [16, 32])
+def test_sanitize_audio_weights_is_idempotent_for_conv_layouts(hidden_size):
+    """Conv transposes must be no-ops on already-converted MLX checkpoints.
+
+    ``load_model`` sanitizes every checkpoint, including ones mlx-vlm converted
+    itself, which already store the MLX layout. Transposing those a second time
+    produced e.g. ``(256, 3, 1, 3)`` for a subsampling kernel the model expects
+    as ``(256, 3, 3, 1)``.
+    """
+    config = tiny_sound_config(hidden_size=hidden_size)
+    expected = _encoder_conv_shapes(config)
+
+    mlx_layout = {key: mx.zeros(shape) for key, shape in expected.items()}
+    # Invert the sanitizer to synthesize the upstream PyTorch layout.
+    upstream_layout = {
+        key: (
+            value.transpose(0, 2, 1) if value.ndim == 3 else value.transpose(0, 3, 1, 2)
+        )
+        for key, value in mlx_layout.items()
+    }
+
+    from_upstream = sanitize_audio_weights(upstream_layout)
+    from_mlx = sanitize_audio_weights(mlx_layout)
+    twice = sanitize_audio_weights(from_upstream)
+
+    for key, shape in expected.items():
+        assert from_upstream[key].shape == shape, key
+        assert from_mlx[key].shape == shape, key
+        assert twice[key].shape == shape, key
