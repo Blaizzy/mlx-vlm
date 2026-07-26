@@ -11320,3 +11320,121 @@ def _tree_from_paths(leaves):
             node = getattr(node, part)
         setattr(node, parts[-1], leaf)
     return root
+
+
+class TestGptOssMixedQuant(unittest.TestCase):
+    """gpt-oss mixed per-layer quant (mxfp4 experts + 8-bit affine non-experts).
+
+    Regression for the strict-load failure where the non-expert layers' affine
+    ``biases`` had nowhere to land ("parameters not in model"): the per-layer
+    quant config keys (``model.layers.N...``, ``lm_head``) were not remapped
+    onto the wrapped ``language_model.`` module paths, so those layers inherited
+    the top-level mxfp4 mode (no ``biases`` slot). Mirrors the real
+    ``mlx-community/gpt-oss-20b-MXFP4-Q8`` export.
+    """
+
+    @staticmethod
+    def _raw_config():
+        affine = {"group_size": 64, "bits": 8, "mode": "affine"}
+        quant = {
+            "group_size": 32,
+            "bits": 4,
+            "mode": "mxfp4",
+            "model.embed_tokens": dict(affine),
+            "lm_head": dict(affine),
+        }
+        for layer in range(2):
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                quant[f"model.layers.{layer}.self_attn.{proj}"] = dict(affine)
+            quant[f"model.layers.{layer}.mlp.router"] = {"group_size": 64, "bits": 8}
+        return dict(
+            model_type="gpt_oss",
+            num_hidden_layers=2,
+            num_local_experts=2,
+            num_experts_per_tok=1,
+            vocab_size=256,
+            hidden_size=128,
+            intermediate_size=128,
+            head_dim=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            sliding_window=8,
+            rope_theta=150000,
+            layer_types=["sliding_attention", "full_attention"],
+            quantization=quant,
+        )
+
+    def test_sanitize_remaps_per_layer_keys_onto_language_model(self):
+        from mlx_vlm.models import gpt_oss
+
+        q = gpt_oss.ModelConfig.from_dict(self._raw_config()).quantization
+        # Top-level scalars are untouched.
+        self.assertEqual(q["group_size"], 32)
+        self.assertEqual(q["bits"], 4)
+        self.assertEqual(q["mode"], "mxfp4")
+        # Per-layer overrides are moved under ``language_model.``.
+        self.assertIn("language_model.model.layers.0.self_attn.q_proj", q)
+        self.assertIn("language_model.model.embed_tokens", q)
+        self.assertIn("language_model.lm_head", q)
+        self.assertNotIn("model.layers.0.self_attn.q_proj", q)
+
+    def test_mixed_quant_checkpoint_loads(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import gpt_oss
+        from mlx_vlm.utils import load_model
+
+        raw = self._raw_config()
+
+        # Build a correctly-quantized checkpoint: affine non-experts (with
+        # biases), mxfp4 experts. Stored with unwrapped keys, as the real export.
+        gen = gpt_oss.Model(
+            gpt_oss.ModelConfig.from_dict(
+                {k: v for k, v in raw.items() if k != "quantization"}
+            )
+        )
+        mx.eval(gen.parameters())
+        prefixed = {
+            (
+                f"language_model.{k}"
+                if (k.startswith("model.") or k == "lm_head")
+                else k
+            ): v
+            for k, v in raw["quantization"].items()
+            if isinstance(v, dict)
+        }
+
+        def predicate(path, module):
+            if path in prefixed:
+                return prefixed[path]
+            if not hasattr(module, "to_quantized"):
+                return False
+            if hasattr(module, "weight") and module.weight.size % 64 != 0:
+                return False
+            return True  # experts + default -> top-level mxfp4
+
+        nn.quantize(gen, group_size=32, bits=4, mode="mxfp4", class_predicate=predicate)
+        mx.eval(gen.parameters())
+        ckpt = {
+            (k[len("language_model.") :] if k.startswith("language_model.") else k): v
+            for k, v in dict(tree_flatten(gen.parameters())).items()
+        }
+        # The checkpoint carries non-expert affine biases (the ones that used to
+        # have nowhere to land).
+        self.assertTrue(any(k.endswith(".biases") and "experts" not in k for k in ckpt))
+
+        with tempfile.TemporaryDirectory() as d:
+            mx.save_safetensors(f"{d}/model.safetensors", ckpt, {"format": "mlx"})
+            with open(f"{d}/config.json", "w") as fh:
+                json.dump(raw, fh)
+            # Used to raise "Received N parameters not in model".
+            model = load_model(Path(d), lazy=True)
+
+        q_proj = model.language_model.model.layers[0].self_attn.q_proj
+        self.assertEqual(type(q_proj).__name__, "QuantizedLinear")
+        self.assertEqual(q_proj.bits, 8)  # affine 8-bit, not top-level mxfp4
+        self.assertTrue(hasattr(q_proj, "biases"))
