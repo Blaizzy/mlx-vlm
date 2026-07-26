@@ -146,8 +146,15 @@ def test_flux2_declares_image_edit_model_type(
         is Flux2ImageEditModel
     )
     assert image_edit_model_class(tmp_path.as_posix()) is Flux2ImageEditModel
-    assert is_image_edit_model("black-forest-labs/FLUX.2-klein-9b-kv")
-    assert is_image_edit_model("black-forest-labs/FLUX.2-klein-9B")
+    for model_id in (
+        "black-forest-labs/FLUX.2-klein-4B",
+        "black-forest-labs/FLUX.2-klein-9B",
+        "black-forest-labs/FLUX.2-klein-base-4B",
+        "black-forest-labs/FLUX.2-klein-base-9B",
+        "black-forest-labs/FLUX.2-klein-9b-kv",
+    ):
+        assert image_edit_model_class(model_id) is Flux2ImageEditModel
+        assert is_image_edit_model(model_id)
 
 
 def test_flux2_image_model_class_uses_remote_model_index(
