@@ -6,13 +6,16 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx import nn
 from PIL import Image
 
 import mlx_vlm.models.flux2.download as download_module
+import mlx_vlm.models.flux2.weights as weights_module
 from mlx_vlm.generate.edit_image import (
     ImageEditRequest,
     image_edit_model_class,
     is_image_edit_model,
+    load_image_edit_model,
 )
 from mlx_vlm.generate.image import (
     image_generation_model_class,
@@ -175,6 +178,23 @@ def test_flux2_image_model_class_uses_remote_model_index(
     )
 
 
+def test_flux2_image_model_class_uses_component_weight_index(tmp_path: Path) -> None:
+    _write_layout(tmp_path)
+    index = tmp_path / "transformer" / "model.safetensors.index.json"
+    index.write_text("""{
+          "weight_map": {
+            "time_guidance_embed.linear_1.weight": "model.safetensors",
+            "double_stream_modulation_img.linear.weight": "model.safetensors",
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight":
+              "model.safetensors"
+          }
+        }""")
+
+    assert (
+        image_generation_model_class(tmp_path.as_posix()) is Flux2ImageGenerationModel
+    )
+
+
 def test_is_image_generation_model_does_not_probe_remote_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -315,6 +335,127 @@ def test_flux2_edit_model_defaults_to_untiled_vae_decode(
     assert calls[0]["bucketed_seq_len"] is False
     assert calls[1]["tiled_vae"] == "auto"
     assert calls[1]["bucketed_seq_len"] is True
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_flux2_quantization_is_inferred_from_tensor_shapes(bits: int) -> None:
+    class TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(64, 32, bias=False)
+
+    dense = mx.arange(32 * 64, dtype=mx.float32).reshape(32, 64)
+    packed, scales, biases = mx.quantize(dense, group_size=32, bits=bits)
+    model = weights_module._apply_weights(
+        TinyModel(),
+        {
+            "proj.weight": packed,
+            "proj.scales": scales,
+            "proj.biases": biases,
+        },
+        {},
+    )
+
+    assert isinstance(model.proj, nn.QuantizedLinear)
+    assert model.quantization_config == {
+        "bits": bits,
+        "group_size": 32,
+        "mode": "affine",
+    }
+
+
+def test_flux2_text_encoder_accepts_native_quantized_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class TinyTextEncoder(nn.Module):
+        def __init__(self, **kwargs) -> None:  # noqa: ARG002
+            super().__init__()
+            self.embed_tokens = nn.Embedding(4, 64)
+
+    dense = mx.arange(4 * 64, dtype=mx.float32).reshape(4, 64)
+    packed, scales, biases = mx.quantize(dense, group_size=32, bits=8)
+    monkeypatch.setattr(weights_module, "Qwen3TextEncoder", TinyTextEncoder)
+    monkeypatch.setattr(
+        weights_module,
+        "_load_safetensors",
+        lambda directory: (  # noqa: ARG005
+            {
+                "embed_tokens.weight": packed,
+                "embed_tokens.scales": scales,
+                "embed_tokens.biases": biases,
+            },
+            {},
+        ),
+    )
+
+    model = weights_module.load_text_encoder(tmp_path, get_variant("flux2-klein-4b"))
+
+    assert isinstance(model.embed_tokens, nn.QuantizedEmbedding)
+    assert model.quantization_config["bits"] == 8
+
+
+def test_flux2_vae_conv_layout_accepts_source_and_native_shapes() -> None:
+    source = mx.arange(8 * 4 * 3 * 3).reshape(8, 4, 3, 3)
+    native = source.transpose(0, 2, 3, 1)
+
+    converted = weights_module._match_conv_layout(
+        source,
+        target_shape=tuple(native.shape),
+        key="decoder.conv.weight",
+    )
+    unchanged = weights_module._match_conv_layout(
+        native,
+        target_shape=tuple(native.shape),
+        key="decoder.conv.weight",
+    )
+
+    assert np.array_equal(np.array(converted), np.array(native))
+    assert np.array_equal(np.array(unchanged), np.array(native))
+
+
+def test_flux2_quantized_repo_routes_through_resolved_layout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    model_path = (
+        tmp_path
+        / "models--mlx-community--flux2-klein-4b-8bit"
+        / "snapshots"
+        / "9beac1a3ad296d9e5e3f8845674e6577fa8654ec"
+    )
+    _write_layout(model_path)
+    index = model_path / "transformer" / "model.safetensors.index.json"
+    index.write_text("""{
+          "weight_map": {
+            "time_guidance_embed.linear_1.weight": "model.safetensors",
+            "double_stream_modulation_img.linear.weight": "model.safetensors",
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight":
+              "model.safetensors"
+          }
+        }""")
+    calls = {}
+
+    def fake_get_model_path(repo_id: str, **kwargs):  # noqa: ARG001
+        calls["repo_id"] = repo_id
+        return model_path
+
+    def fake_from_pretrained(cls, variant, **kwargs):  # noqa: ARG001
+        calls["variant"] = variant.name
+        calls["model_path"] = kwargs["model_path"]
+        return _fake_edit_pipeline("flux2-klein-4b")
+
+    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
+    monkeypatch.setattr(
+        Flux2ImageEdit, "from_pretrained", classmethod(fake_from_pretrained)
+    )
+
+    model = load_image_edit_model("mlx-community/flux2-klein-4b-8bit")
+
+    assert model.variant == "flux2-klein-4b"
+    assert calls == {
+        "repo_id": "mlx-community/flux2-klein-4b-8bit",
+        "variant": "flux2-klein-4b",
+        "model_path": model_path,
+    }
 
 
 def test_flux2_reference_image_array_keeps_float32_input() -> None:
