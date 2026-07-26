@@ -55,6 +55,7 @@ VARIANTS: dict[str, Flux2Variant] = {
         local_dir_name="FLUX.2-klein-4B",
         transformer_overrides=FLUX2_KLEIN_4B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_4B_TEXT_ENCODER,
+        supports_edit=True,
     ),
     "flux2-klein-9b": Flux2Variant(
         name="flux2-klein-9b",
@@ -86,6 +87,7 @@ VARIANTS: dict[str, Flux2Variant] = {
         local_dir_name="FLUX.2-klein-base-4B",
         transformer_overrides=FLUX2_KLEIN_4B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_4B_TEXT_ENCODER,
+        supports_edit=True,
     ),
     "flux2-klein-base-9b": Flux2Variant(
         name="flux2-klein-base-9b",
@@ -102,6 +104,7 @@ VARIANTS: dict[str, Flux2Variant] = {
         local_dir_name="FLUX.2-klein-base-9B",
         transformer_overrides=FLUX2_KLEIN_9B_TRANSFORMER,
         text_encoder_overrides=FLUX2_KLEIN_9B_TEXT_ENCODER,
+        supports_edit=True,
     ),
     "flux2-klein-9b-kv": Flux2Variant(
         name="flux2-klein-9b-kv",
