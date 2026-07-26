@@ -195,6 +195,52 @@ def test_flux2_image_model_class_uses_component_weight_index(tmp_path: Path) -> 
     )
 
 
+def test_flux2_remote_component_index_is_a_metadata_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    metadata_path = tmp_path / "metadata"
+    metadata_path.mkdir()
+    component_index_path = tmp_path / "component-index"
+    _write_layout(component_index_path)
+    index = component_index_path / "transformer" / "model.safetensors.index.json"
+    index.write_text("""{
+          "weight_map": {
+            "time_guidance_embed.linear_1.weight": "model.safetensors",
+            "double_stream_modulation_img.linear.weight": "model.safetensors",
+            "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight":
+              "model.safetensors"
+          }
+        }""")
+    calls = []
+
+    def fake_get_model_path(repo_id: str, **kwargs):
+        assert repo_id == "example/custom-quantized-model"
+        calls.append(kwargs["allow_patterns"])
+        return metadata_path if len(calls) == 1 else component_index_path
+
+    monkeypatch.setattr(image_module, "get_model_path", fake_get_model_path)
+
+    assert (
+        image_generation_model_class("example/custom-quantized-model")
+        is Flux2ImageGenerationModel
+    )
+    assert calls == [
+        [
+            "model_index.json",
+            "config.json",
+            "manifest.json",
+            "**/config.json",
+        ],
+        [
+            "model_index.json",
+            "config.json",
+            "manifest.json",
+            "**/config.json",
+            "**/model.safetensors.index.json",
+        ],
+    ]
+
+
 def test_is_image_generation_model_does_not_probe_remote_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

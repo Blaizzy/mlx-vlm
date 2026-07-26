@@ -42,6 +42,9 @@ IMAGE_METADATA_DOWNLOAD_PATTERNS = (
     "config.json",
     "manifest.json",
     "**/config.json",
+)
+IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS = (
+    *IMAGE_METADATA_DOWNLOAD_PATTERNS,
     "**/model.safetensors.index.json",
 )
 
@@ -342,14 +345,36 @@ def _resolve_image_model_path(
     )
 
 
-def _resolve_image_model_metadata_path(model: str) -> Path | None:
+def _resolve_image_model_metadata_path(
+    model: str, *, include_component_indexes: bool = False
+) -> Path | None:
     model_path = Path(model).expanduser()
     if model_path.exists():
         return model_path
+    patterns = (
+        IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS
+        if include_component_indexes
+        else IMAGE_METADATA_DOWNLOAD_PATTERNS
+    )
     return get_model_path(
         model,
-        allow_patterns=list(IMAGE_METADATA_DOWNLOAD_PATTERNS),
+        allow_patterns=list(patterns),
     )
+
+
+def _image_generation_model_class_from_path(
+    model: str, resolved_path: Path | None
+) -> type[Any] | None:
+    local_model_types = (
+        _local_image_model_types(str(resolved_path))
+        if resolved_path is not None
+        else ()
+    )
+    for model_type in (*local_model_types, _model_type_from_id(model)):
+        model_class = _image_model_class_for_type(model_type)
+        if model_class is not None and model_class.is_image_generation_model:
+            return model_class
+    return None
 
 
 def image_generation_model_class(model: str | None) -> type[Any] | None:
@@ -364,20 +389,17 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
         resolved_path = _resolve_image_model_metadata_path(model)
     except Exception:
         resolved_path = None
-    local_model_types = (
-        _local_image_model_types(str(resolved_path))
-        if resolved_path is not None
-        else ()
-    )
-    for model_type in (
-        *local_model_types,
-        _model_type_from_id(model),
-    ):
-        model_class = _image_model_class_for_type(model_type)
-        if model_class is not None and model_class.is_image_generation_model:
-            return model_class
+    model_class = _image_generation_model_class_from_path(model, resolved_path)
+    if model_class is not None or Path(model).expanduser().exists():
+        return model_class
 
-    return None
+    try:
+        resolved_path = _resolve_image_model_metadata_path(
+            model, include_component_indexes=True
+        )
+    except Exception:
+        return None
+    return _image_generation_model_class_from_path(model, resolved_path)
 
 
 def is_image_generation_model(model: str | None) -> bool:
