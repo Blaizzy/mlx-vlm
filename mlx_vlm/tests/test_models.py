@@ -1965,6 +1965,68 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_plamo2vl(self):
+        from mlx_vlm.models import plamo2vl
+
+        text_config = plamo2vl.TextConfig(
+            model_type="plamo2",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size_per_head=16,
+            intermediate_size=128,
+            mamba_num_heads=4,
+            mamba_d_state=16,
+            mamba_d_conv=4,
+            mamba_step=2,
+            rms_norm_eps=1e-6,
+            vocab_size=512,
+            rope_theta=1000000.0,
+            rope_local_theta=1000000.0,
+        )
+
+        vision_config = plamo2vl.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            patch_size=16,
+            image_size=64,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+            image_token_id=7,
+            image_feature_size=64,
+            image_proj_hidden_size=32,
+        )
+
+        config = plamo2vl.ModelConfig(
+            model_type="plamo2vl",
+            text_config=text_config,
+            vision_config=vision_config,
+        )
+
+        model = plamo2vl.Model(config)
+
+        self.assertEqual(len(model.layers), text_config.num_hidden_layers)
+        self.assertEqual(sum(1 for l in model.layers if l.is_mamba), 2)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_model,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_paligemma(self):
         from mlx_vlm.models import paligemma
 
