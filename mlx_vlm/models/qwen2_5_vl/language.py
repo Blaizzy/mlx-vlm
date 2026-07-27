@@ -441,6 +441,13 @@ class LanguageModel(nn.Module):
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
 
+        if position_ids is not None and cache_offsets is None:
+            seq_length = inputs.shape[-1]
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
+
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
         if mask is not None and mask.shape[-1] != inputs.shape[-1]:
