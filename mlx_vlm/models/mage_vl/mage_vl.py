@@ -10,6 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig, TextConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -47,7 +48,9 @@ class Model(nn.Module):
         if pixel_values is None:
             pixel_values = kwargs.get("pixel_values_videos", None)
         if pixel_values is None:
-            return self.language_model.model.embed_tokens(input_ids)
+            return InputEmbeddingsFeatures(
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+            )
 
         patch_positions = kwargs.get("patch_positions", None)
         grid_thw = kwargs.get("image_grid_thw", None)
@@ -57,7 +60,9 @@ class Model(nn.Module):
 
         if patch_positions is None:
             if not grid_thw:
-                raise ValueError("mage_vl needs patch_positions or a grid_thw to derive them")
+                raise ValueError(
+                    "mage_vl needs patch_positions or a grid_thw to derive them"
+                )
             patch_positions = _positions_from_grid(grid_thw, self.config.vision_config)
 
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
@@ -71,9 +76,12 @@ class Model(nn.Module):
         mask_expanded = mx.expand_dims(is_image, -1)
         mask_expanded = mx.repeat(mask_expanded, inputs_embeds.shape[-1], axis=-1)
 
-        return masked_scatter(
+        merged = masked_scatter(
             inputs_embeds, mask_expanded, hidden_states.astype(inputs_embeds.dtype)
         )
+        # The generate dispatch consumes `.inputs_embeds` — a bare array is our internal shape,
+        # InputEmbeddingsFeatures is the mlx-vlm interface.
+        return InputEmbeddingsFeatures(inputs_embeds=merged)
 
     def __call__(
         self,
@@ -83,9 +91,12 @@ class Model(nn.Module):
         cache=None,
         **kwargs,
     ):
-        inputs_embeds = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
+        features = self.get_input_embeddings(input_ids, pixel_values, **kwargs)
         return self.language_model(
-            inputs=input_ids, cache=cache, inputs_embeds=inputs_embeds, mask=mask
+            inputs=input_ids,
+            cache=cache,
+            inputs_embeds=features.inputs_embeds,
+            mask=mask,
         )
 
     @property
@@ -110,7 +121,11 @@ class Model(nn.Module):
                 k = "language_model.lm_head." + k[len("lm_head.") :]
             out[k] = v
 
-        vision = {k[len("vision_tower.") :]: v for k, v in out.items() if k.startswith("vision_tower.")}
+        vision = {
+            k[len("vision_tower.") :]: v
+            for k, v in out.items()
+            if k.startswith("vision_tower.")
+        }
         vision = self.vision_tower.sanitize(vision)
         for k, v in vision.items():
             out["vision_tower." + k] = v

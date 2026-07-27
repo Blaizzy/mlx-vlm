@@ -65,7 +65,9 @@ class VisionRotaryEmbedding(nn.Module):
         assert head_dim % 2 == 0, "head_dim must be even for rotary."
         assert head_dim % 16 == 0, "head_dim must be divisible by 16."
         half = head_dim // 2
-        assert half % 16 == 0, "head_dim//2 must also be divisible by 16 to split into 4:6:6."
+        assert (
+            half % 16 == 0
+        ), "head_dim//2 must also be divisible by 16 to split into 4:6:6."
 
         self.head_dim = head_dim
         self.half = half
@@ -77,9 +79,15 @@ class VisionRotaryEmbedding(nn.Module):
         self.w_size = 6 * unit
 
         # NOTE the exponent: arange(size)/size, NOT the conventional arange(0, d, 2)/d.
-        self._inv_freq_t = 1.0 / (base ** (mx.arange(self.t_size, dtype=mx.float32) / self.t_size))
-        self._inv_freq_h = 1.0 / (base ** (mx.arange(self.h_size, dtype=mx.float32) / self.h_size))
-        self._inv_freq_w = 1.0 / (base ** (mx.arange(self.w_size, dtype=mx.float32) / self.w_size))
+        self._inv_freq_t = 1.0 / (
+            base ** (mx.arange(self.t_size, dtype=mx.float32) / self.t_size)
+        )
+        self._inv_freq_h = 1.0 / (
+            base ** (mx.arange(self.h_size, dtype=mx.float32) / self.h_size)
+        )
+        self._inv_freq_w = 1.0 / (
+            base ** (mx.arange(self.w_size, dtype=mx.float32) / self.w_size)
+        )
 
     def forward_from_positions(self, patch_positions: mx.array) -> mx.array:
         """patch_positions: (L, 3) of [t, h, w] -> freqs (L, half)."""
@@ -161,7 +169,9 @@ class MageVLVisionPatchMerger(nn.Module):
             self.pos_emb_h = nn.Embedding(max_position_embeddings, dim)
             self.pos_emb_w = nn.Embedding(max_position_embeddings, dim)
 
-    def __call__(self, x: mx.array, patch_positions: Optional[mx.array] = None) -> mx.array:
+    def __call__(
+        self, x: mx.array, patch_positions: Optional[mx.array] = None
+    ) -> mx.array:
         if patch_positions is not None and patch_positions.ndim == 3:
             patch_positions = patch_positions.squeeze(0)
 
@@ -255,7 +265,9 @@ class MageVLVisionEncoderLayer(nn.Module):
 class MageVLVisionEncoder(nn.Module):
     def __init__(self, config: VisionConfig):
         super().__init__()
-        self.layers = [MageVLVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        self.layers = [
+            MageVLVisionEncoderLayer(config) for _ in range(config.num_hidden_layers)
+        ]
 
     def __call__(
         self,

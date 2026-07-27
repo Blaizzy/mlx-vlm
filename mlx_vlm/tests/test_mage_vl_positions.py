@@ -27,8 +27,14 @@ def test_first_block_is_2x2_row_major():
     pos = _positions([(1, 4, 4)])
     expected_head = np.array(
         [
-            [0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1],  # block (0,0)
-            [0, 0, 2], [0, 0, 3], [0, 1, 2], [0, 1, 3],  # block (0,1)
+            [0, 0, 0],
+            [0, 0, 1],
+            [0, 1, 0],
+            [0, 1, 1],  # block (0,0)
+            [0, 0, 2],
+            [0, 0, 3],
+            [0, 1, 2],
+            [0, 1, 3],  # block (0,1)
         ]
     )
     assert np.array_equal(pos[:8], expected_head)
@@ -38,8 +44,12 @@ def test_every_group_of_four_shares_one_merge_block():
     """The merger folds each run of 4 into one token; they must come from the same 2x2 cell."""
     pos = _positions([(1, 8, 6)])
     blocks = pos.reshape(-1, 4, 3)
-    cells = np.stack([blocks[:, :, 0], blocks[:, :, 1] // 2, blocks[:, :, 2] // 2], axis=-1)
-    assert (cells == cells[:, :1, :]).all(), "a merge group spans more than one 2x2 cell"
+    cells = np.stack(
+        [blocks[:, :, 0], blocks[:, :, 1] // 2, blocks[:, :, 2] // 2], axis=-1
+    )
+    assert (
+        cells == cells[:, :1, :]
+    ).all(), "a merge group spans more than one 2x2 cell"
 
 
 def test_covers_the_grid_exactly_once():
@@ -61,7 +71,9 @@ def test_matches_real_processor_shape_for_dog_example():
     """The dog.jpg case that was verified row-for-row against the reference processor."""
     pos = _positions([(1, 128, 64)])
     assert pos.shape == (8192, 3)
-    assert np.array_equal(pos[:4], np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]]))
+    assert np.array_equal(
+        pos[:4], np.array([[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]])
+    )
 
 
 @pytest.mark.parametrize(

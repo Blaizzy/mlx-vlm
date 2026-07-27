@@ -91,5 +91,7 @@ class ModelConfig(BaseModelConfig):
     def from_dict(cls, params: Dict[str, Any]):
         params = dict(params)
         params["text_config"] = TextConfig.from_dict(params.get("text_config", {}))
-        params["vision_config"] = VisionConfig.from_dict(params.get("vision_config", {}))
+        params["vision_config"] = VisionConfig.from_dict(
+            params.get("vision_config", {})
+        )
         return super().from_dict(params)
