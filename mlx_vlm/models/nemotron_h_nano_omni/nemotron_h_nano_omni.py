@@ -318,14 +318,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         sanitized = {}
-        conv_kernel_size = (
-            self.config.sound_config.conv_kernel_size
-            if self.config.sound_config is not None
-            else 9
-        )
-        for key, value in sanitize_audio_weights(
-            weights, conv_kernel_size=conv_kernel_size
-        ).items():
+        for key, value in sanitize_audio_weights(weights).items():
             if key.startswith("mlp1."):
                 key = key.replace("mlp1.0.", "mlp1.layers.0.")
                 key = key.replace("mlp1.1.", "mlp1.layers.1.")

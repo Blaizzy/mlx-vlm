@@ -545,38 +545,25 @@ class SoundFeatureExtractor:
         )
 
 
-def _conv1d_needs_transpose(shape, conv_kernel_size):
-    # PyTorch conv1d weights are (out, in/groups, K); MLX expects (out, K, in/groups).
-    # Guard so already-converted MLX checkpoints are not transposed twice:
-    # torch depthwise ends with the kernel size, torch pointwise carries the
-    # (large) channel count in dim 1; MLX layouts match neither pattern.
-    _, d1, d2 = shape
-    if d2 == conv_kernel_size and d1 != conv_kernel_size:
-        return True
-    if d2 == 1 and d1 > conv_kernel_size:
-        return True
-    return False
-
-
-def sanitize_audio_weights(weights, conv_kernel_size=9):
+def sanitize_audio_weights(weights):
+    # The PyTorch checkpoint ships feature_extractor buffers that are dropped
+    # below, so their presence distinguishes the PyTorch layout from an
+    # already-converted MLX checkpoint. load_model re-runs sanitize on every
+    # load; without this check the conv weights of MLX checkpoints would be
+    # transposed a second time and fail with a shape mismatch.
+    is_torch_layout = any(
+        key.startswith("sound_encoder.encoder.feature_extractor.") for key in weights
+    )
     sanitized = {}
     for key, value in weights.items():
         if key.startswith("sound_encoder.encoder.feature_extractor."):
             continue
         if key.endswith(".num_batches_tracked"):
             continue
-        if key.startswith("sound_encoder.encoder."):
-            if (
-                key.endswith(".weight")
-                and value.ndim == 3
-                and _conv1d_needs_transpose(value.shape, conv_kernel_size)
-            ):
+        if is_torch_layout and key.startswith("sound_encoder.encoder."):
+            if key.endswith(".weight") and value.ndim == 3:
                 value = value.transpose(0, 2, 1)
             elif key.endswith(".weight") and value.ndim == 4:
-                # PyTorch conv2d weights are (out, in, kH, kW); MLX expects
-                # (out, kH, kW, in). Square kernel dims sit in the middle for
-                # NCHW input, so only transpose when they are at the end.
-                if value.shape[2] == value.shape[3]:
-                    value = value.transpose(0, 2, 3, 1)
+                value = value.transpose(0, 2, 3, 1)
         sanitized[key] = value
     return sanitized
