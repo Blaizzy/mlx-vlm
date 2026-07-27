@@ -6734,6 +6734,51 @@ class TestGetInputEmbeddings(unittest.TestCase):
             mx.array_equal(model.language_model._rope_deltas, stale_rope_deltas).item()
         )
 
+    def _assert_qwen_chunked_prefill_slices_mrope_position_ids(self, model):
+        language_model = model.language_model
+        captured = {}
+
+        class _CapturingModel:
+            class _Embed:
+                @staticmethod
+                def as_linear(x):
+                    return x
+
+            embed_tokens = _Embed()
+
+            def __call__(self, inputs, position_ids=None, **kwargs):
+                captured["position_ids"] = position_ids
+                return mx.zeros(
+                    (
+                        inputs.shape[0],
+                        inputs.shape[1],
+                        model.config.text_config.hidden_size,
+                    )
+                )
+
+        class _StubCache:
+            _idx = 2
+            offset = mx.array(2)
+
+        language_model.model = _CapturingModel()
+        language_model.lm_head = lambda x: x
+
+        full_position_ids = mx.arange(15, dtype=mx.int32).reshape(3, 1, 5)
+        language_model(
+            mx.array([[7, 8]], dtype=mx.int32),
+            inputs_embeds=mx.zeros(
+                (1, 2, model.config.text_config.hidden_size), dtype=mx.float32
+            ),
+            cache=[_StubCache()],
+            position_ids=full_position_ids,
+        )
+
+        self.assertEqual(captured["position_ids"].shape, (3, 1, 2))
+        self.assertEqual(
+            captured["position_ids"].tolist(),
+            full_position_ids[:, :, 2:4].tolist(),
+        )
+
     def test_llava_input_embeddings(self):
         from mlx_vlm.models import llava
 
@@ -6907,6 +6952,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "qwen2_5_vl")
         self._assert_qwen_request_owned_mrope_kwargs(model)
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
 
     def test_qwen3_vl_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl
