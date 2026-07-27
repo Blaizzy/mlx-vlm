@@ -2508,6 +2508,46 @@ class TestBatchTurboQuantizedKVStart:
         kinds = self._cache_kinds()
         assert "BatchTurboQuantKVCache" in kinds
 
+    def test_text_only_wrapper_uses_dense_cache_for_turboquant(self):
+        from mlx_vlm.generate.ar import _make_cache
+
+        class TextOnlyModel(MockModel):
+            pass
+
+        TextOnlyModel.__module__ = "mlx_vlm.models.text_only"
+
+        caches = _make_cache(
+            TextOnlyModel(),
+            [0],
+            kv_bits=3.5,
+            kv_quant_scheme="turboquant",
+        )
+
+        assert {type(c).__name__ for c in caches} == {"BatchKVCache"}
+
+    def test_latent_attention_layer_uses_dense_cache_for_turboquant(self):
+        from mlx_vlm.generate.ar import _make_cache
+
+        class LatentAttention:
+            kv_lora_rank = 512
+            qk_rope_head_dim = 64
+            qk_nope_head_dim = 192
+
+        class LatentLayer:
+            self_attn = LatentAttention()
+
+        class LatentModel(MockModel):
+            layers = [LatentLayer() for _ in range(4)]
+
+        caches = _make_cache(
+            LatentModel(),
+            [0],
+            kv_bits=3.5,
+            kv_quant_scheme="turboquant",
+        )
+
+        assert {type(c).__name__ for c in caches} == {"BatchKVCache"}
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -5011,6 +5011,7 @@ class TurboQuantKVCache(_BaseCache):
         """Fused key+value quantize in 1 dispatch. Returns (key_state, val_state) or (None, None)."""
         if (
             keys.shape[-2] != 1
+            or keys.shape[-1] != values.shape[-1]
             or not isinstance(self.key_codec, _TurboQuantMSECodec)
             or not isinstance(self.value_codec, _TurboQuantMSECodec)
         ):
@@ -5278,8 +5279,9 @@ class TurboQuantKVCache(_BaseCache):
         n_kv_heads = keys_state.norms.shape[1]
         n_repeats = n_q_heads // n_kv_heads
         T = keys_state.norms.shape[2]
+        value_dim = self.value_codec.dim
 
-        if T == 0:
+        if T == 0 or value_dim != D:
             return None  # empty cache, let fallback handle it
 
         val_bits = int(self.value_codec.bits)
@@ -5413,6 +5415,8 @@ class TurboQuantKVCache(_BaseCache):
         H = grouped_queries.shape[1]
         R = grouped_queries.shape[2]
         D = grouped_queries.shape[-1]
+        if self.value_codec.dim != D:
+            return None
         T = keys_state.norms.shape[2]
 
         val_bits = int(self.value_codec.bits)
@@ -5491,6 +5495,8 @@ class TurboQuantKVCache(_BaseCache):
 
         kc = self.key_codec
         vc = self.value_codec
+        if kc.dim != vc.dim:
+            return None
         low_bits = kc.lower_bits
         high_bits = kc.upper_bits
 
@@ -5625,6 +5631,8 @@ class TurboQuantKVCache(_BaseCache):
             grouped_queries.shape[2],
         )
         D = grouped_queries.shape[-1]
+        if self.value_codec.dim != D:
+            return None
         T = keys_state.norms.shape[2]
 
         dims_per_lane = (D + 31) // 32
@@ -5866,6 +5874,7 @@ class TurboQuantKVCache(_BaseCache):
             if (
                 isinstance(self.key_codec, _TurboQuantMSECodec)
                 and isinstance(self.value_codec, _TurboQuantMSECodec)
+                and self.value_codec.dim == D
                 and isinstance(keys_state, TurboQuantMSEState)
                 and isinstance(values_state, TurboQuantMSEState)
             ):
@@ -6140,13 +6149,13 @@ class BatchTurboQuantKVCache(_BaseCache):
     # Codec initialisation (deferred until first update)
     # ------------------------------------------------------------------
 
-    def _ensure_codecs(self, keys: mx.array):
+    def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is not None:
             return
         D = keys.shape[-1]
         # Delegate to a temporary TurboQuantKVCache to get codec setup right
         tmp = TurboQuantKVCache(bits=self.bits, seed=self.seed)
-        tmp._ensure_codecs(keys, keys)  # values have same D
+        tmp._ensure_codecs(keys, values)
         self.key_codec = tmp.key_codec
         self.value_codec = tmp.value_codec
 
@@ -6155,7 +6164,7 @@ class BatchTurboQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        self._ensure_codecs(keys)
+        self._ensure_codecs(keys, values)
         prev = self._idx
 
         new_keys = self.key_codec.quantize(keys)

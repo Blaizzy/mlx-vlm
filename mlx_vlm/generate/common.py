@@ -67,11 +67,16 @@ def maybe_quantize_kv_cache(
     kv_group_size,
     kv_bits,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+    model=None,
 ):
     if kv_bits is None:
         return
 
     if turboquant_enabled(kv_bits, kv_quant_scheme):
+        if model is not None and not cache.model_supports_turboquant_kv_cache(model):
+            return
+
+        layers = list(getattr(model, "layers", [])) if model is not None else []
 
         def quantize_entry(entry):
             if isinstance(entry, TurboQuantKVCache):
@@ -79,6 +84,14 @@ def maybe_quantize_kv_cache(
             if isinstance(entry, cache.RotatingKVCache):
                 return entry
             if isinstance(entry, cache.KVCache):
+                if (
+                    entry.keys is not None
+                    and not cache.kv_tensors_support_kv_cache_quantization(
+                        entry.keys,
+                        entry.values,
+                    )
+                ):
+                    return entry
                 if entry.offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
                     return TurboQuantKVCache(bits=kv_bits)
@@ -102,13 +115,29 @@ def maybe_quantize_kv_cache(
         for index, layer_cache in enumerate(prompt_cache):
             if index == last_idx:
                 continue
+            if index < len(layers) and not cache.layer_supports_kv_cache_quantization(
+                layers[index]
+            ):
+                continue
             prompt_cache[index] = quantize_entry(layer_cache)
         return
 
+    layers = list(getattr(model, "layers", [])) if model is not None else []
     for index, layer_cache in enumerate(prompt_cache):
+        if index < len(layers) and not cache.layer_supports_kv_cache_quantization(
+            layers[index]
+        ):
+            continue
         if (
             hasattr(layer_cache, "to_quantized")
             and layer_cache.offset >= quantized_kv_start
+            and (
+                not isinstance(layer_cache, cache.KVCache)
+                or cache.kv_tensors_support_kv_cache_quantization(
+                    layer_cache.keys,
+                    layer_cache.values,
+                )
+            )
         ):
             prompt_cache[index] = layer_cache.to_quantized(
                 group_size=kv_group_size,
