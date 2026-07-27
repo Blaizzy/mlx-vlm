@@ -241,6 +241,23 @@ class TestBatchCollation(unittest.TestCase):
             mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
         )
 
+    def test_iterate_batches_flattens_multi_image_grid_thw(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((4, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2], [1, 1, 2]]),
+            }
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=32))
+
+        self.assertEqual(batch["image_grid_thw"].shape, (2, 3))
+        self.assertTrue(
+            mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 2]]))
+        )
+
     def test_iterate_batches_pads_completion_mask(self):
         dataset = [
             {

@@ -48,6 +48,13 @@ def _collate_arrays(values):
         raise
 
 
+def _collate_extra_key(key, values):
+    if key == "image_grid_thw":
+        rows = [v.reshape(-1, 3) for v in values]
+        return mx.concatenate(rows, axis=0)
+    return _collate_arrays(values)
+
+
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
@@ -288,7 +295,7 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
                 if isinstance(vals[0], mx.array):
                     try:
-                        batch[k] = _collate_arrays(vals)
+                        batch[k] = _collate_extra_key(k, vals)
                     except Exception:
                         batch[k] = vals[0]
                 else:
