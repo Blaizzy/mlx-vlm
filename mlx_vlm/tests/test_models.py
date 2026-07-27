@@ -7644,7 +7644,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         self.assertEqual(mask, "causal")
 
-    def test_gemma4_unified_audio_tokens_keep_vision_mask_causal(self):
+    def test_gemma4_unified_audio_tokens_keep_vision_overlay(self):
         from mlx_vlm.models import gemma4_unified
         from mlx_vlm.models.gemma4.language import Gemma4TextModel
 
@@ -7670,7 +7670,9 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         mask = model._make_masks(hidden_states, [None], mm_token_type_ids)[0]
 
-        self.assertEqual(mask, "causal")
+        self.assertIsInstance(mask, mx.array)
+        self.assertTrue(bool(mask[0, 0, 1, 2].item()))
+        self.assertFalse(bool(mask[0, 0, 4, 5].item()))
 
     def test_glm4v_input_embeddings(self):
         from mlx_vlm.models import glm4v
