@@ -657,7 +657,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         return model, processor, config
     except Exception as e:
         logger.exception("Error loading model %s: %s", model_path, e)
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
 
 
 # =============================================================================

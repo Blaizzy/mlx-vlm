@@ -43,6 +43,10 @@ IMAGE_METADATA_DOWNLOAD_PATTERNS = (
     "manifest.json",
     "**/config.json",
 )
+IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS = (
+    *IMAGE_METADATA_DOWNLOAD_PATTERNS,
+    "**/model.safetensors.index.json",
+)
 
 ImageOutputFormat = Literal["b64_json", "path"]
 ImageTask = Literal["generate", "edit"]
@@ -233,6 +237,26 @@ def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
     return None
 
 
+def _image_model_type_from_component_indexes(root: Path) -> str | None:
+    transformer_index = _load_json_file(
+        root / "transformer" / "model.safetensors.index.json"
+    )
+    if transformer_index is None:
+        return None
+    weight_map = transformer_index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return None
+    keys = set(weight_map)
+    flux2_markers = {
+        "time_guidance_embed.linear_1.weight",
+        "double_stream_modulation_img.linear.weight",
+        "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+    }
+    if flux2_markers <= keys:
+        return "flux2"
+    return None
+
+
 def _load_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -258,6 +282,7 @@ def _local_image_model_types(model: str) -> tuple[str, ...]:
     manifest = _load_json_file(root / "manifest.json")
     if manifest is not None:
         _add_model_type(candidates, _image_model_type_from_manifest(manifest))
+    _add_model_type(candidates, _image_model_type_from_component_indexes(root))
 
     for config_path in sorted(root.glob("*/config.json")):
         metadata = _load_json_file(config_path)
@@ -320,14 +345,36 @@ def _resolve_image_model_path(
     )
 
 
-def _resolve_image_model_metadata_path(model: str) -> Path | None:
+def _resolve_image_model_metadata_path(
+    model: str, *, include_component_indexes: bool = False
+) -> Path | None:
     model_path = Path(model).expanduser()
     if model_path.exists():
         return model_path
+    patterns = (
+        IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS
+        if include_component_indexes
+        else IMAGE_METADATA_DOWNLOAD_PATTERNS
+    )
     return get_model_path(
         model,
-        allow_patterns=list(IMAGE_METADATA_DOWNLOAD_PATTERNS),
+        allow_patterns=list(patterns),
     )
+
+
+def _image_generation_model_class_from_path(
+    model: str, resolved_path: Path | None
+) -> type[Any] | None:
+    local_model_types = (
+        _local_image_model_types(str(resolved_path))
+        if resolved_path is not None
+        else ()
+    )
+    for model_type in (*local_model_types, _model_type_from_id(model)):
+        model_class = _image_model_class_for_type(model_type)
+        if model_class is not None and model_class.is_image_generation_model:
+            return model_class
+    return None
 
 
 def image_generation_model_class(model: str | None) -> type[Any] | None:
@@ -342,20 +389,17 @@ def image_generation_model_class(model: str | None) -> type[Any] | None:
         resolved_path = _resolve_image_model_metadata_path(model)
     except Exception:
         resolved_path = None
-    local_model_types = (
-        _local_image_model_types(str(resolved_path))
-        if resolved_path is not None
-        else ()
-    )
-    for model_type in (
-        *local_model_types,
-        _model_type_from_id(model),
-    ):
-        model_class = _image_model_class_for_type(model_type)
-        if model_class is not None and model_class.is_image_generation_model:
-            return model_class
+    model_class = _image_generation_model_class_from_path(model, resolved_path)
+    if model_class is not None or Path(model).expanduser().exists():
+        return model_class
 
-    return None
+    try:
+        resolved_path = _resolve_image_model_metadata_path(
+            model, include_component_indexes=True
+        )
+    except Exception:
+        return None
+    return _image_generation_model_class_from_path(model, resolved_path)
 
 
 def is_image_generation_model(model: str | None) -> bool:
