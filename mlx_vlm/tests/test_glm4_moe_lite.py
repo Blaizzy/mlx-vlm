@@ -1,8 +1,7 @@
 import mlx.core as mx
 
 from mlx_vlm.models import base
-from mlx_vlm.models.glm4_moe_lite import Model, ModelConfig
-from mlx_vlm.models.glm4_moe_lite import language
+from mlx_vlm.models.glm4_moe_lite import Model, ModelConfig, language
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
 
