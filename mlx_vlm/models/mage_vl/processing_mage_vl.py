@@ -49,14 +49,17 @@ class MageVLProcessor(ProcessorMixin):
 
         kwargs.pop("use_fast", None)
         kwargs.pop("trust_remote_code", None)
+        # trust_remote_code=False EXPLICITLY on both loads: the checkpoint's configs carry
+        # auto_map entries, and leaving the argument unset makes transformers prompt
+        # interactively. This processor exists precisely so no remote code is needed.
         tokenizer = AutoTokenizer.from_pretrained(
-            pretrained_model_name_or_path, **kwargs
+            pretrained_model_name_or_path, trust_remote_code=False, **kwargs
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
         # preprocessor_config.json declares Qwen2VLImageProcessor (patch 16, merge 2,
         # temporal_patch_size 1, CLIP statistics) — framework-agnostic, numpy-native.
         image_processor = AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path, use_fast=False
+            pretrained_model_name_or_path, use_fast=False, trust_remote_code=False
         )
         return cls(image_processor=image_processor, tokenizer=tokenizer)
 
