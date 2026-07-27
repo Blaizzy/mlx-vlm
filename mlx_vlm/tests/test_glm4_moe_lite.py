@@ -32,9 +32,12 @@ def _tiny_config():
 
 def test_glm4_moe_lite_routes_to_native_mlx_vlm_model():
     architecture, model_type = get_model_and_args({"model_type": "glm4_moe_lite"})
+    config = _tiny_config()
+    model = Model(config)
 
     assert model_type == "glm4_moe_lite"
     assert architecture.Model is Model
+    assert model.language_model.config is config
     assert language.scaled_dot_product_attention is base.scaled_dot_product_attention
 
 

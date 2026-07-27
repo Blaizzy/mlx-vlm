@@ -365,6 +365,7 @@ class Glm4MoeLiteModel(PipelineMixin, nn.Module):
 class LanguageModel(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.config = config
         self.args = config
         self.model_type = config.model_type
         self.model = Glm4MoeLiteModel(config)
