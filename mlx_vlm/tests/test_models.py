@@ -6736,9 +6736,12 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
     def _assert_qwen_chunked_prefill_slices_mrope_position_ids(self, model):
         language_model = model.language_model
+        hidden_size = language_model.args.hidden_size
         captured = {}
 
         class _CapturingModel:
+            fa_idx = 0
+
             class _Embed:
                 @staticmethod
                 def as_linear(x):
@@ -6752,7 +6755,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
                     (
                         inputs.shape[0],
                         inputs.shape[1],
-                        model.config.text_config.hidden_size,
+                        hidden_size,
                     )
                 )
 
@@ -6766,9 +6769,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
         full_position_ids = mx.arange(15, dtype=mx.int32).reshape(3, 1, 5)
         language_model(
             mx.array([[7, 8]], dtype=mx.int32),
-            inputs_embeds=mx.zeros(
-                (1, 2, model.config.text_config.hidden_size), dtype=mx.float32
-            ),
+            inputs_embeds=mx.zeros((1, 2, hidden_size), dtype=mx.float32),
             cache=[_StubCache()],
             position_ids=full_position_ids,
         )
@@ -6916,6 +6917,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "qwen2_vl")
         self._assert_qwen_request_owned_mrope_kwargs(model)
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
 
     def test_qwen2_5_vl_input_embeddings(self):
         from mlx_vlm.models import qwen2_5_vl
@@ -6991,6 +6993,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "qwen3_vl")
         self._assert_qwen_request_owned_mrope_kwargs(model)
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
 
     def test_paligemma_input_embeddings(self):
         from mlx_vlm.models import paligemma
@@ -8352,6 +8355,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "qwen3_vl_moe")
         self._assert_qwen_request_owned_mrope_kwargs(model)
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
 
     def test_qwen3_5_input_embeddings_owns_mrope_kwargs(self):
         from mlx_vlm.models import qwen3_5
@@ -8387,6 +8391,45 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._assert_qwen_request_owned_mrope_kwargs(model)
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
+
+    def test_qwen3_5_moe_chunked_prefill_slices_mrope_position_ids(self):
+        from mlx_vlm.models import qwen3_5_moe
+
+        model = qwen3_5_moe.Model(
+            qwen3_5_moe.ModelConfig(
+                text_config=qwen3_5_moe.TextConfig(
+                    model_type="qwen3_5_moe",
+                    hidden_size=16,
+                    linear_num_value_heads=2,
+                    linear_num_key_heads=2,
+                    linear_key_head_dim=8,
+                    linear_value_head_dim=8,
+                    linear_conv_kernel_dim=3,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    num_experts=2,
+                    num_experts_per_tok=1,
+                    shared_expert_intermediate_size=32,
+                    moe_intermediate_size=16,
+                    rms_norm_eps=1e-5,
+                    vocab_size=32,
+                    num_key_value_heads=2,
+                    max_position_embeddings=128,
+                    head_dim=8,
+                ),
+                vision_config=qwen3_5_moe.VisionConfig(
+                    model_type="qwen3_5_moe",
+                    depth=1,
+                    hidden_size=16,
+                    intermediate_size=32,
+                    out_hidden_size=16,
+                    num_heads=2,
+                ),
+                model_type="qwen3_5_moe",
+            )
+        )
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
 
     def test_qwen3_omni_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_omni_moe
@@ -8448,6 +8491,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
         )
         self._check_returns_input_embeddings_features(model, "qwen3_omni_moe")
         self._assert_qwen_request_owned_mrope_kwargs(model)
+        self._assert_qwen_chunked_prefill_slices_mrope_position_ids(model)
 
     def test_qwen3_omni_audio_sanitize_is_idempotent_for_conv2d_weights(self):
         from mlx_vlm.models import qwen3_omni_moe
