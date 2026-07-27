@@ -248,7 +248,6 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
-        model=getattr(model, "language_model", model),
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
@@ -740,10 +739,7 @@ def _make_cache(
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
     """
-    requested_turbo = kv_bits is not None and turboquant_enabled(
-        kv_bits, kv_quant_scheme
-    )
-    use_turbo = requested_turbo and cache.model_supports_turboquant_kv_cache(model)
+    use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
 
     defer_turbo = (
         use_turbo and quantized_kv_start > 0 and prefill_length < quantized_kv_start
@@ -754,14 +750,11 @@ def _make_cache(
             if defer_turbo:
                 return cache.BatchKVCache(lp)
             return BatchTurboQuantKVCache(lp, bits=kv_bits)
-        if requested_turbo:
-            return cache.BatchKVCache(lp)
         return cache.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
         )
 
-    def to_batch_cache(c, quantize=True, layer=None):
-        quantize = quantize and cache.layer_supports_kv_cache_quantization(layer)
+    def to_batch_cache(c, quantize=True):
         # Caches that ship their own batch-conversion (e.g. MiniMax M3 sparse
         # index-key side cache) know how to build the correct batch cache.
         if hasattr(c, "to_batch") and not isinstance(c, cache.KVCache):
@@ -786,26 +779,17 @@ def _make_cache(
                 raise ValueError("RotatingKVCache with keep tokens is not supported.")
             return cache.BatchRotatingKVCache(c.max_size, left_padding)
         elif isinstance(c, cache.CacheList):
-            return cache.CacheList(
-                *(to_batch_cache(sub_c, quantize=quantize) for sub_c in c.caches)
-            )
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         elif isinstance(c, tuple):
-            return cache.CacheList(
-                *(to_batch_cache(sub_c, quantize=quantize) for sub_c in c)
-            )
+            return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
     if hasattr(model, "make_cache"):
         model_cache = model.make_cache()
         n = len(model_cache)
-        layers = list(getattr(model, "layers", []))
         return [
-            to_batch_cache(
-                c,
-                quantize=cache.should_quantize_kv_layer(i, n),
-                layer=layers[i] if i < len(layers) else None,
-            )
+            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
             for i, c in enumerate(model_cache)
         ]
     else:
@@ -815,7 +799,6 @@ def _make_cache(
                 (
                     _make_quant_cache(left_padding)
                     if cache.should_quantize_kv_layer(i, n)
-                    and cache.layer_supports_kv_cache_quantization(model.layers[i])
                     else cache.BatchKVCache(left_padding)
                 )
                 for i in range(n)

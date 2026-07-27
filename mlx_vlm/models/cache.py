@@ -21,57 +21,6 @@ def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     return layer_idx < num_layers - 1
 
 
-def _kv_quant_attention_modules(layer: Any) -> List[Any]:
-    if layer is None:
-        return []
-    modules = [layer]
-    for attr in ("self_attn", "attn", "attention"):
-        module = getattr(layer, attr, None)
-        if module is not None:
-            modules.append(module)
-    return modules
-
-
-def layer_supports_kv_cache_quantization(layer: Any) -> bool:
-    """Whether a model layer uses ordinary K/V cache tensors.
-
-    Quantized cache classes return packed/proxy cache state and rely on generic
-    SDPA helpers. MLA-style layers cache compressed latent state plus rope PE,
-    then run model-specific projections after ``update_and_fetch``. Attention
-    sinks are also unsupported by quantized SDPA, so keep those caches dense.
-    """
-    for module in _kv_quant_attention_modules(layer):
-        if getattr(module, "supports_kv_cache_quantization", True) is False:
-            return False
-        if hasattr(module, "attn_sink"):
-            return False
-        if hasattr(module, "kv_lora_rank") and (
-            hasattr(module, "qk_rope_head_dim") or hasattr(module, "qk_nope_head_dim")
-        ):
-            return False
-        if all(
-            hasattr(module, attr) for attr in ("kv_lora_rank", "embed_q", "unembed_out")
-        ):
-            return False
-    return True
-
-
-def model_supports_turboquant_kv_cache(model: Any) -> bool:
-    """Whether ``model`` can consume mlx-vlm TurboQuant cache states directly."""
-    if getattr(model, "supports_turboquant_kv_cache", True) is False:
-        return False
-    # Text-only wrappers delegate attention to mlx-lm, whose SDPA helper only
-    # understands dense caches and MLX uniform quantized tuples.
-    if type(model).__module__ == "mlx_vlm.models.text_only":
-        return False
-    return True
-
-
-def kv_tensors_support_kv_cache_quantization(keys: mx.array, values: mx.array) -> bool:
-    """Conservative shape gate for quantizing already-materialized K/V tensors."""
-    return values.shape[-1] > 0 and keys.shape[-1] == values.shape[-1]
-
-
 def create_causal_mask(
     N: int,
     offset: int = 0,

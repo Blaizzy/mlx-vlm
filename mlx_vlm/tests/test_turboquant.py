@@ -129,25 +129,6 @@ def test_turboquant_skips_non_kv_cache_entries():
     assert isinstance(prompt_cache[1], TurboQuantKVCache)
 
 
-def test_maybe_quantize_skips_asymmetric_kv_cache_entries():
-    layer_cache = KVCache()
-    layer_cache.update_and_fetch(
-        mx.random.normal((1, 1, 8, 32)),
-        mx.random.normal((1, 1, 8, 8)),
-    )
-    prompt_cache = [layer_cache]
-
-    maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=0,
-        kv_group_size=64,
-        kv_bits=3.5,
-        kv_quant_scheme="turboquant",
-    )
-
-    assert isinstance(prompt_cache[0], KVCache)
-
-
 def test_batch_turboquant_extend_supports_uniform_single_item_offsets():
     keys = mx.ones((1, 2, 3, 8), dtype=mx.float16)
     values = mx.ones((1, 2, 3, 8), dtype=mx.float16)
@@ -237,19 +218,6 @@ def test_batch_turboquant_make_mask_matches_batch_kv_cache_with_left_padding():
 
     assert mask.shape == reference_mask.shape
     assert mx.all(mask == reference_mask).item()
-
-
-def test_batch_turboquant_uses_values_shape_for_value_codec():
-    cache = BatchTurboQuantKVCache([0], bits=3.5)
-    keys = mx.random.normal((1, 1, 1, 32))
-    values = mx.random.normal((1, 1, 1, 8))
-
-    cache.update_and_fetch(keys, values)
-
-    assert cache.key_codec.dim == 32
-    assert cache.value_codec.dim == 8
-    assert cache.keys.indices.shape[-1] == 3
-    assert cache.values.indices.shape[-1] == 1
 
 
 def test_turboquant_cache_preserves_attention_shape_and_compresses_memory():

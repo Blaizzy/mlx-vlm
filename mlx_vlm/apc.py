@@ -3507,13 +3507,8 @@ def _fill_stream_layer_cache(
     TurboQuant for fractional bits / scheme, else uniform ``QuantizedKVCache``.
     """
     from .models.cache import KVCache, QuantizedKVCache
-    from .models.cache import kv_tensors_support_kv_cache_quantization
 
-    if (
-        quantize
-        and kv_quant_config is not None
-        and kv_tensors_support_kv_cache_quantization(merged_k, merged_v)
-    ):
+    if quantize and kv_quant_config is not None:
         bits = kv_quant_config["bits"]
         scheme = kv_quant_config.get("scheme")
         from .turboquant import TurboQuantKVCache, turboquant_enabled
@@ -3562,13 +3557,8 @@ def _fill_batch_layer_cache(
     otherwise uniform ``BatchQuantizedKVCache`` with integer bits.
     """
     from .models.cache import BatchKVCache, BatchQuantizedKVCache
-    from .models.cache import kv_tensors_support_kv_cache_quantization
 
-    if (
-        quantize
-        and kv_quant_config is not None
-        and kv_tensors_support_kv_cache_quantization(merged_k, merged_v)
-    ):
+    if quantize and kv_quant_config is not None:
         bits = kv_quant_config["bits"]
         scheme = kv_quant_config.get("scheme")
         from .turboquant import BatchTurboQuantKVCache, turboquant_enabled

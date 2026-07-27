@@ -1361,22 +1361,6 @@ class TestTurboQuantWarmRestoreLayout:
         assert isinstance(c, BatchTurboQuantKVCache)
         assert float(c.bits) == 3.5
 
-    def test_fill_batch_layer_keeps_dense_for_asymmetric_turboquant_tensors(self):
-        from mlx_vlm.apc import _fill_batch_layer_cache
-
-        k = mx.random.normal((1, H, 16, 32))
-        v = mx.random.normal((1, H, 16, 8))
-        mx.eval(k, v)
-        c = _fill_batch_layer_cache(
-            k,
-            v,
-            left_padding=[0],
-            offset=[16],
-            quantize=True,
-            kv_quant_config=TQ_CFG,
-        )
-        assert isinstance(c, BatchKVCache)
-
     def test_fill_batch_layer_uniform_unchanged_for_int_bits(self):
         from mlx_vlm.apc import _fill_batch_layer_cache
 
