@@ -2907,5 +2907,23 @@ class TestProcessorRegistration(unittest.TestCase):
                 importlib.import_module(module)
 
 
+class TestTrustRemoteCodePassthrough(unittest.TestCase):
+    """Regression test for #1724 — an explicit trust_remote_code must not be overridden."""
+
+    def test_molmo_point_honors_explicit_false(self):
+        from mlx_vlm.models.molmo_point import processing_molmo_point
+
+        with (
+            patch("transformers.AutoTokenizer.from_pretrained") as from_pretrained,
+            patch.object(processing_molmo_point, "load_chat_template"),
+        ):
+            processing_molmo_point.MolmoPointProcessor.from_pretrained(
+                "/tmp/model", trust_remote_code=False
+            )
+
+        _, kwargs = from_pretrained.call_args
+        self.assertFalse(kwargs["trust_remote_code"])
+
+
 if __name__ == "__main__":
     unittest.main()
