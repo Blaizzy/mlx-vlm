@@ -6183,14 +6183,10 @@ class BatchTurboQuantKVCache(_BaseCache):
 
         ks = _slice_state(self.keys, self._idx)
         vs = _slice_state(self.values, self._idx)
-
-        # MLX-LM attention layers consume the tensors returned by the cache
-        # directly. Keep the persistent state quantized, but materialize the
-        # current tensors so wrappers and latent-cache layers receive the same
-        # interface as BatchKVCache.
+        n_heads = keys.shape[1]
         return (
-            self.key_codec.dequantize(ks).astype(keys.dtype),
-            self.value_codec.dequantize(vs).astype(values.dtype),
+            _QuantizedStateProxy(ks, self._idx, n_heads),
+            _QuantizedStateProxy(vs, self._idx, n_heads),
         )
 
     def zero_row_tail(self, bi: int, start: int, end: int):
@@ -6297,8 +6293,6 @@ class BatchTurboQuantKVCache(_BaseCache):
         if keys_state is None or values_state is None:
             keys_state = _slice_state(self.keys, self._idx)
             values_state = _slice_state(self.values, self._idx)
-        if isinstance(keys_state, mx.array) and isinstance(values_state, mx.array):
-            return keys_state, values_state
         if isinstance(keys_state, _QuantizedStateProxy):
             keys_state = keys_state._state
         if isinstance(values_state, _QuantizedStateProxy):
