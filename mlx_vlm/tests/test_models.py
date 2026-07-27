@@ -1912,6 +1912,59 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+    def test_llmjpvl(self):
+        from mlx_vlm.models import llmjpvl
+
+        text_config = llmjpvl.TextConfig(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-6,
+            vocab_size=1024,
+            rope_theta=500000.0,
+            max_position_embeddings=4096,
+        )
+
+        vision_config = llmjpvl.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=64,
+            num_hidden_layers=3,
+            intermediate_size=128,
+            num_attention_heads=4,
+            patch_size=16,
+            image_size=64,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+
+        config = llmjpvl.ModelConfig(
+            model_type="llmjpvl",
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_index=14,
+            downsample_ratio=0.5,
+        )
+
+        model = llmjpvl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_backbone,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+        )
+
     def test_plamo2vl(self):
         from mlx_vlm.models import plamo2vl
 
