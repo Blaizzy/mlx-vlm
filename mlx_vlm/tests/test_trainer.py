@@ -241,6 +241,49 @@ class TestBatchCollation(unittest.TestCase):
             mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
         )
 
+    def test_iterate_batches_preserves_multi_image_grid_rows(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((5, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2], [1, 1, 3]]),
+            }
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=1, max_seq_length=32))
+
+        self.assertEqual(batch["image_grid_thw"].shape, (2, 3))
+        self.assertTrue(
+            mx.array_equal(batch["image_grid_thw"], mx.array([[1, 1, 2], [1, 1, 3]]))
+        )
+
+    def test_iterate_batches_concatenates_mixed_image_grid_rows(self):
+        dataset = [
+            {
+                "input_ids": mx.array([1, 2, 3]),
+                "attention_mask": mx.array([1, 1, 1]),
+                "pixel_values": mx.zeros((2, 4)),
+                "image_grid_thw": mx.array([[1, 1, 2]]),
+            },
+            {
+                "input_ids": mx.array([4, 5]),
+                "attention_mask": mx.array([1, 1]),
+                "pixel_values": mx.ones((7, 4)),
+                "image_grid_thw": mx.array([[1, 1, 3], [1, 2, 2]]),
+            },
+        ]
+
+        batch = next(iterate_batches(dataset, batch_size=2, max_seq_length=32))
+
+        self.assertEqual(batch["image_grid_thw"].shape, (3, 3))
+        self.assertTrue(
+            mx.array_equal(
+                batch["image_grid_thw"],
+                mx.array([[1, 1, 2], [1, 1, 3], [1, 2, 2]]),
+            )
+        )
+
     def test_iterate_batches_pads_completion_mask(self):
         dataset = [
             {
