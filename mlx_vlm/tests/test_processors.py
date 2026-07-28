@@ -2329,29 +2329,6 @@ class TestLagunaProcessor(unittest.TestCase):
         self.assertFalse(should_add_special_tokens("laguna", processor))
         self.assertTrue(should_add_special_tokens("llama", processor))
 
-    def test_load_processor_fixes_mistral_tokenizer_regex(self):
-        import json
-        import tempfile
-        from pathlib import Path
-
-        from mlx_vlm.utils import load_processor
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            Path(tmpdir, "config.json").write_text(json.dumps({"model_type": "laguna"}))
-            with patch("mlx_vlm.utils.AutoProcessor.from_pretrained") as load:
-                load.return_value = object()
-                load_processor(
-                    tmpdir,
-                    add_detokenizer=False,
-                    trust_remote_code=True,
-                )
-
-        load.assert_called_once_with(
-            tmpdir,
-            trust_remote_code=True,
-            fix_mistral_regex=True,
-        )
-
 
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 

@@ -776,10 +776,7 @@ def test_load_delegates_adapter_loading_to_trainer_entrypoint():
 
 
 def test_load_processor_propagates_auto_processor_errors():
-    with (
-        patch("mlx_vlm.utils.load_config", return_value={}),
-        patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError),
-    ):
+    with patch("mlx_vlm.utils.AutoProcessor.from_pretrained", side_effect=ValueError):
         with pytest.raises(ValueError):
             load_processor(Path("/tmp/model"), eos_token_ids=2)
 
