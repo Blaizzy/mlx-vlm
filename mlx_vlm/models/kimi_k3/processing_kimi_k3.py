@@ -11,6 +11,7 @@ processor pre-expands the placeholders at the prompt level instead so the
 model-side merge is 1:1.
 """
 
+import inspect
 import json
 import math
 from pathlib import Path
@@ -27,6 +28,9 @@ from transformers.processing_utils import ProcessorMixin
 
 IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 MEDIA_PAD = "<|media_pad|>"
+
+# prompt_utils selects a chat renderer only when chat_template is non-None.
+_CHAT_TEMPLATE_SENTINEL = "<kimi-k3-native-python-chat-renderer>"
 
 
 class KimiK3ImageProcessor(BaseImageProcessor):
@@ -179,8 +183,25 @@ class KimiK3Processor(ProcessorMixin):
         if image_processor is None:
             image_processor = KimiK3ImageProcessor()
         super().__init__(image_processor, tokenizer, **kwargs)
+        if (
+            self.chat_template is None
+            and getattr(self.tokenizer, "chat_template", None) is None
+        ):
+            self.chat_template = _CHAT_TEMPLATE_SENTINEL
 
     def apply_chat_template(self, conversation, **kwargs):
+        kwargs.pop("chat_template", None)
+        try:
+            parameters = inspect.signature(
+                self.tokenizer.apply_chat_template
+            ).parameters
+        except (TypeError, ValueError):
+            parameters = None
+        if parameters is not None and not any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs = {key: value for key, value in kwargs.items() if key in parameters}
         return self.tokenizer.apply_chat_template(conversation, **kwargs)
 
     def make_image_prompt(self, width: int, height: int, num_tokens: int) -> str:
@@ -261,6 +282,15 @@ class KimiK3Processor(ProcessorMixin):
                 self.tokenizer.convert_tokens_to_ids(self.image_token)
             )
         return BatchFeature(data=data)
+
+    def save_pretrained(self, *args, **kwargs):
+        if self.chat_template != _CHAT_TEMPLATE_SENTINEL:
+            return super().save_pretrained(*args, **kwargs)
+        self.chat_template = None
+        try:
+            return super().save_pretrained(*args, **kwargs)
+        finally:
+            self.chat_template = _CHAT_TEMPLATE_SENTINEL
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
