@@ -6746,6 +6746,83 @@ class TestModels(unittest.TestCase):
         self.assertEqual(out.logits.shape, (1, len(ids), config.text_config.vocab_size))
         self.assertTrue(bool(mx.isfinite(out.logits).all()))
 
+    def test_kimi_k3(self):
+        from mlx_vlm.models import kimi_k3
+
+        text_config = kimi_k3.TextConfig(
+            vocab_size=1000,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=96,
+            rms_norm_eps=1e-5,
+            hidden_act="situ",
+            activation_situ_beta=4.0,
+            activation_situ_linear_beta=25.0,
+            attn_res_block_size=2,
+            q_lora_rank=24,
+            kv_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+            mla_use_output_gate=True,
+            num_experts=8,
+            num_experts_per_token=2,
+            num_shared_experts=2,
+            moe_intermediate_size=32,
+            routed_expert_hidden_size=48,
+            latent_moe_use_norm=True,
+            first_k_dense_replace=1,
+            linear_attn_config=dict(
+                num_heads=2,
+                head_dim=32,
+                short_conv_kernel_size=4,
+                gate_lower_bound=-5.0,
+                use_full_rank_gate=True,
+                kda_layers=[1, 2, 3],
+                full_attn_layers=[4],
+            ),
+        )
+
+        vision_config = kimi_k3.VisionConfig(
+            patch_size=14,
+            init_pos_emb_height=8,
+            init_pos_emb_width=8,
+            init_pos_emb_time=2,
+            vt_num_attention_heads=2,
+            vt_num_hidden_layers=2,
+            vt_hidden_size=32,
+            vt_intermediate_size=64,
+            qkv_hidden_size=48,
+            mm_hidden_size=32,
+            text_hidden_size=64,
+        )
+
+        config = kimi_k3.ModelConfig(
+            model_type="kimi_k3",
+            text_config=text_config,
+            vision_config=vision_config,
+            vocab_size=1000,
+            media_placeholder_token_id=999,
+        )
+
+        model = kimi_k3.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        patches = mx.random.uniform(shape=(16, 14, 14, 3))
+        features = model.vision_tower(patches, [[1, 4, 4]])
+        self.assertEqual(features.shape, (4, 4, 32))
+        projected = model.mm_projector(features)
+        self.assertEqual(projected.shape, (4, 64))
+        self.assertTrue(mx.isfinite(projected).all().item())
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
