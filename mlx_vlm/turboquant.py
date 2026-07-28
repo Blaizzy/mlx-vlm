@@ -3496,14 +3496,23 @@ class TurboQuantSplitState(NamedTuple):
     high: object
 
 
-def _validate_bits(bits: float) -> float:
+def _validate_bits(bits) -> float:
+    if isinstance(bits, str) and '.' in bits:
+        parts = bits.split('.')
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            key_b = int(parts[0])
+            val_b = int(parts[1])
+            if key_b < 1 or val_b < 1:
+                raise ValueError(f"TurboQuant requires kv_bits >= 1, got {bits}.")
+            return float(f"{key_b}.{val_b}")
+
     bits = float(bits)
     if bits < 1:
         raise ValueError("TurboQuant requires kv_bits >= 1.")
     rounded = round(bits * 2) / 2
     if not math.isclose(bits, rounded, abs_tol=1e-6):
         raise ValueError(
-            f"TurboQuant currently supports integer and .5 bit-widths, got {bits}."
+            f"TurboQuant currently supports integer, .5, and X.Y bit-widths (e.g., 4.2 for 4-bit keys, 2-bit values), got {bits}."
         )
     return rounded
 
@@ -4988,21 +4997,29 @@ class TurboQuantKVCache(_BaseCache):
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is None:
-            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
-            # for values instead of SplitCodec. Both stay as fast integer codecs
-            # with single-tile kernel support. Values benefit more from extra bits.
-            key_bits = (
-                math.floor(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
-            )
+            bits_str = str(self.bits)
+            if '.' in bits_str:
+                parts = bits_str.split('.')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and len(parts[1]) == 1:
+                    key_bits = int(parts[0])
+                    val_bits = int(parts[1])
+                else:
+                    key_bits = math.floor(self.bits)
+                    val_bits = math.ceil(self.bits)
+            else:
+                key_bits = self.bits
+                val_bits = self.bits
             self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
-            val_bits = (
-                math.ceil(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
-            )
+            bits_str = str(self.bits)
+            if '.' in bits_str:
+                parts = bits_str.split('.')
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and len(parts[1]) == 1:
+                    val_bits = int(parts[1])
+                else:
+                    val_bits = math.ceil(self.bits)
+            else:
+                val_bits = self.bits
             self.value_codec = _build_codec(
                 values, val_bits, mode="mse", seed=self.seed + 1
             )
