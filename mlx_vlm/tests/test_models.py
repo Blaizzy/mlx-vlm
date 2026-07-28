@@ -2027,6 +2027,16 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
         )
 
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((2, 2)),
+                "lm_head.weight": mx.zeros((2, 2)),
+                "language_model.lm_head.weight": mx.zeros((2, 2)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+
     def test_paligemma(self):
         from mlx_vlm.models import paligemma
 

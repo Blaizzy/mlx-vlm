@@ -2770,7 +2770,7 @@ class TestPlamo2VLPatch(unittest.TestCase):
 
         from transformers import AutoProcessor
 
-        module = importlib.import_module("mlx_vlm.models.plamo2vl.processing")
+        module = importlib.import_module("mlx_vlm.models.plamo2vl")
         sentinel = object()
 
         def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
