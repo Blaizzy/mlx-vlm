@@ -43,23 +43,69 @@ class MageVLProcessor(ProcessorMixin):
         self.spatial_merge_size = getattr(image_processor, "merge_size", 2)
         self.image_token = IMAGE_PAD
 
+    # The subset of preprocessor_config.json Qwen3VLImageProcessor consumes.
+    _IMAGE_PROCESSOR_KEYS = (
+        "patch_size",
+        "temporal_patch_size",
+        "merge_size",
+        "min_pixels",
+        "max_pixels",
+        "do_rescale",
+        "rescale_factor",
+        "do_normalize",
+        "image_mean",
+        "image_std",
+        "do_convert_rgb",
+    )
+
+    @staticmethod
+    def _load_preprocessor_config(pretrained_model_name_or_path) -> dict:
+        import json
+        from pathlib import Path
+
+        path = Path(pretrained_model_name_or_path)
+        if path.is_dir():
+            cfg = path / "preprocessor_config.json"
+            return json.loads(cfg.read_text()) if cfg.exists() else {}
+        try:
+            from huggingface_hub import hf_hub_download
+
+            return json.loads(
+                Path(
+                    hf_hub_download(
+                        str(pretrained_model_name_or_path), "preprocessor_config.json"
+                    )
+                ).read_text()
+            )
+        except Exception:
+            return {}
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from transformers import AutoImageProcessor, AutoTokenizer
+        from transformers import AutoTokenizer
+
+        from ..qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
 
         kwargs.pop("use_fast", None)
         kwargs.pop("trust_remote_code", None)
-        # trust_remote_code=False EXPLICITLY on both loads: the checkpoint's configs carry
-        # auto_map entries, and leaving the argument unset makes transformers prompt
-        # interactively. This processor exists precisely so no remote code is needed.
+        # trust_remote_code=False EXPLICITLY: the checkpoint's configs carry auto_map entries,
+        # and leaving the argument unset makes transformers prompt interactively.
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path, trust_remote_code=False, **kwargs
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)
-        # preprocessor_config.json declares Qwen2VLImageProcessor (patch 16, merge 2,
-        # temporal_patch_size 1, CLIP statistics) — framework-agnostic, numpy-native.
-        image_processor = AutoImageProcessor.from_pretrained(
-            pretrained_model_name_or_path, use_fast=False, trust_remote_code=False
+
+        # Construct the image processor DIRECTLY — no AutoImageProcessor. On a torch-free
+        # install (the standard MLX setup) AutoImageProcessor resolves to a torchvision-backed
+        # class and raises ImportError, which the AutoProcessor patch dispatcher swallows,
+        # silently falling back to the checkpoint's torch remote-code processor — the exact
+        # failure this class exists to prevent. Reported by @ismaelvega on PR #1745 and
+        # mlx-community/Mage-VL-8bit discussion #1. Qwen3VLImageProcessor is the in-repo
+        # numpy/PIL port with the same schema (Mage-VL's config: patch 16, merge 2,
+        # temporal_patch_size 1, CLIP statistics).
+        config = cls._load_preprocessor_config(pretrained_model_name_or_path)
+        image_processor = Qwen3VLImageProcessor(
+            **{k: config[k] for k in cls._IMAGE_PROCESSOR_KEYS if k in config}
         )
         return cls(image_processor=image_processor, tokenizer=tokenizer)
 
