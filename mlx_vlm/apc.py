@@ -2779,6 +2779,14 @@ class APCManager:
         self._exact_cache_max = max(
             0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
         )
+        # Bound exact/hybrid cache snapshots by logical prefix tokens as well
+        # as entry count. Entry-only limits are unsafe for long-context models:
+        # four 250k-token snapshots retain roughly four times the intended KV
+        # reserve even though the LRU appears to contain only four objects.
+        # Zero preserves the historical unbounded-by-token behavior.
+        self._exact_cache_max_tokens = max(
+            0, int(os.environ.get("APC_EXACT_CACHE_MAX_TOKENS", "0"))
+        )
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
         )
@@ -2885,6 +2893,40 @@ class APCManager:
                 self._release_one(b)
 
     # ---------- Public API ----------
+    def _exact_cache_tokens_locked(self) -> int:
+        return sum(len(entry.token_ids) for entry in self._exact_cache.values())
+
+    def _put_exact_cache_entry_locked(
+        self,
+        key: int,
+        entry: APCExactCacheEntry,
+    ) -> bool:
+        """Insert one exact snapshot and enforce both LRU limits.
+
+        Callers hold ``self.lock``. A snapshot larger than the entire token
+        budget is never retained in memory; disk persistence remains available
+        to callers that configured it.
+        """
+        if self._exact_cache_max <= 0:
+            return False
+        if (
+            self._exact_cache_max_tokens > 0
+            and len(entry.token_ids) > self._exact_cache_max_tokens
+        ):
+            return False
+        self._exact_cache[key] = entry
+        self._exact_cache.move_to_end(key)
+        while (
+            len(self._exact_cache) > self._exact_cache_max
+            or (
+                self._exact_cache_max_tokens > 0
+                and self._exact_cache_tokens_locked()
+                > self._exact_cache_max_tokens
+            )
+        ):
+            self._exact_cache.popitem(last=False)
+        return key in self._exact_cache
+
     def lookup_exact_cache(
         self,
         token_ids: Sequence[int],
@@ -2987,20 +3029,15 @@ class APCManager:
                                     self.stats.hits += 1
                                     self.stats.matched_tokens += disk_prefix_len
                                     if promote_key not in self._exact_cache:
-                                        self._exact_cache[promote_key] = (
+                                        self._put_exact_cache_entry_locked(
+                                            promote_key,
                                             APCExactCacheEntry(
                                                 token_ids=stored_tokens,
                                                 extra_hash=int(extra_hash),
                                                 prompt_cache=storage_copy,
                                                 last_used=time.time(),
-                                            )
+                                            ),
                                         )
-                                        self._exact_cache.move_to_end(promote_key)
-                                        while (
-                                            len(self._exact_cache)
-                                            > self._exact_cache_max
-                                        ):
-                                            self._exact_cache.popitem(last=False)
                                 return prompt_cache, disk_prefix_len
                         with self.lock:
                             self.stats.exact_hits += 1
@@ -3041,16 +3078,15 @@ class APCManager:
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
-                self._exact_cache[key] = APCExactCacheEntry(
-                    token_ids=token_tuple,
-                    extra_hash=int(extra_hash),
-                    prompt_cache=copied,
-                    last_used=time.time(),
+                stored = self._put_exact_cache_entry_locked(
+                    key,
+                    APCExactCacheEntry(
+                        token_ids=token_tuple,
+                        extra_hash=int(extra_hash),
+                        prompt_cache=copied,
+                        last_used=time.time(),
+                    ),
                 )
-                self._exact_cache.move_to_end(key)
-                while len(self._exact_cache) > self._exact_cache_max:
-                    self._exact_cache.popitem(last=False)
-                stored = True
         if self.disk is not None:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
@@ -3230,17 +3266,17 @@ class APCManager:
                 )
                 if copied is not None:
                     key = _sequence_hash(token_tuple, extra_hash, self.block_size)
-                    self._exact_cache[key] = APCExactCacheEntry(
-                        token_ids=token_tuple,
-                        extra_hash=int(extra_hash),
-                        prompt_cache=copied,
-                        last_used=time.time(),
+                    layer_major_stored = self._put_exact_cache_entry_locked(
+                        key,
+                        APCExactCacheEntry(
+                            token_ids=token_tuple,
+                            extra_hash=int(extra_hash),
+                            prompt_cache=copied,
+                            last_used=time.time(),
+                        ),
                     )
-                    self._exact_cache.move_to_end(key)
-                    while len(self._exact_cache) > self._exact_cache_max:
-                        self._exact_cache.popitem(last=False)
-                    self.stats.exact_stores += 1
-                    layer_major_stored = True
+                    if layer_major_stored:
+                        self.stats.exact_stores += 1
             parent = SEED_PARENT_HASH
             # Recompute hash chain over already-cached prefix to get parent for first new block.
             for i in range(skip_full):
@@ -3338,6 +3374,10 @@ class APCManager:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
+            snap["exact_cache_entries"] = len(self._exact_cache)
+            snap["exact_cache_tokens"] = self._exact_cache_tokens_locked()
+            snap["exact_cache_max_entries"] = self._exact_cache_max
+            snap["exact_cache_max_tokens"] = self._exact_cache_max_tokens
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes

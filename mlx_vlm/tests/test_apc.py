@@ -558,6 +558,50 @@ def test_exact_cache_supports_mixed_kv_and_arrays_cache():
     )
 
 
+def test_exact_cache_enforces_total_token_budget(monkeypatch):
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "8")
+    monkeypatch.setenv("APC_EXACT_CACHE_MAX_TOKENS", "64")
+    manager = APCManager(num_blocks=4, block_size=16)
+
+    assert manager.store_exact_cache(
+        list(range(16)),
+        _make_exact_row_cache(16),
+        extra_hash=1,
+    )
+    assert manager.store_exact_cache(
+        list(range(24)),
+        _make_exact_row_cache(24),
+        extra_hash=2,
+    )
+    assert manager.store_exact_cache(
+        list(range(32)),
+        _make_exact_row_cache(32),
+        extra_hash=3,
+    )
+
+    stats = manager.stats_snapshot()
+    assert stats["exact_cache_entries"] == 2
+    assert stats["exact_cache_tokens"] == 56
+    assert stats["exact_cache_max_entries"] == 8
+    assert stats["exact_cache_max_tokens"] == 64
+    assert manager.lookup_exact_cache(
+        list(range(17)),
+        extra_hash=1,
+    )[1] == 0
+    assert manager.lookup_exact_cache(
+        list(range(25)),
+        extra_hash=2,
+    )[1] == 24
+
+    # A single snapshot larger than the full reserve is not retained.
+    assert not manager.store_exact_cache(
+        list(range(65)),
+        _make_exact_row_cache(65),
+        extra_hash=4,
+    )
+    assert manager.stats_snapshot()["exact_cache_tokens"] == 56
+
+
 def test_exact_cache_supports_rotating_and_chunked_kv_cache():
     from mlx_lm.models.cache import ChunkedKVCache, KVCache, RotatingKVCache
 
