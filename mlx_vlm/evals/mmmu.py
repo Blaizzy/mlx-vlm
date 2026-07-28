@@ -6,7 +6,12 @@ import random
 import re
 from json import dump
 
-from datasets import load_dataset
+try:
+    from datasets import load_dataset
+except ModuleNotFoundError as e:  # optional 'train' extra
+    raise ImportError(
+        "Evaluation requires the 'train' extra: pip install 'mlx-vlm[train]'"
+    ) from e
 from tqdm import tqdm
 
 from mlx_vlm import load

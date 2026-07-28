@@ -2,7 +2,7 @@
 
 PLaMo 2.1 VL is a family of Japanese-English vision-language models from
 Preferred Networks, Inc. The models combine a PLaMo 2 language backbone with a
-SigLIP2 vision encoder and a simple MLP image adapter for visual question
+SigLIP vision encoder and a simple MLP image adapter for visual question
 answering, visual grounding, and natural-image understanding.
 
 ## Models
@@ -16,7 +16,7 @@ answering, visual grounding, and natural-image understanding.
 
 | | |
 |---|---|
-| **Architecture** | PLaMo 2 language model + SigLIP2 vision encoder + MLP image adapter |
+| **Architecture** | PLaMo 2 language model + SigLIP vision encoder + MLP image adapter |
 | **Languages** | Japanese, English |
 | **Modalities** | Text, single image |
 | **Tasks** | Visual question answering, visual grounding, image description |
@@ -88,7 +88,7 @@ print(result.text)
 
 ## Architecture
 
-- **Vision**: SigLIP2-style image encoder using dynamic image tiling. Images are
+- **Vision**: SigLIP image encoder using dynamic image tiling. Images are
   split into tiles before encoding so non-square inputs can retain more detail.
 - **Projector**: MLP image adapter that normalizes vision features, applies GELU,
   and maps them into the PLaMo 2 hidden size.

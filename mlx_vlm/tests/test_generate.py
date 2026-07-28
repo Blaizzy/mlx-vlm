@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import typing
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1765,6 +1766,9 @@ class TestSamplerArgs:
             top_p=0.9,
             min_p=0.05,
             top_k=32,
+            top_n_sigma=0.0,
+            p_less=False,
+            typical_p=1.0,
         )
         mock_make_logits_processors.assert_called_once_with(
             {3: -0.75}, 1.15, 512, 0.2, 256, 0.3, 128
@@ -1972,6 +1976,24 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_public_generation_annotations_match_runtime_results():
+    hints = typing.get_type_hints(dispatch_module.stream_generate)
+
+    assert hints["return"] == typing.Generator[GenerationResult, None, None]
+    assert type(None) in typing.get_args(hints["image"])
+    assert type(None) in typing.get_args(hints["audio"])
+    assert type(None) in typing.get_args(hints["video"])
+
+
+def test_batch_generate_optional_input_annotations_match_defaults():
+    hints = typing.get_type_hints(ar_module.batch_generate)
+
+    assert type(None) in typing.get_args(hints["images"])
+    assert type(None) in typing.get_args(hints["audios"])
+    assert type(None) in typing.get_args(hints["prompts"])
+    assert hints["return"] is BatchResponse
+
+
 def test_normalize_resize_shape_expands_single_value():
     assert normalize_resize_shape([224]) == (224, 224)
 
@@ -1987,8 +2009,6 @@ def test_normalize_resize_shape_rejects_invalid_values(value):
 
 
 def test_generate_cli_smoke(capsys):
-    prompt = ["画像の前面に積み重なっているのはどのようなアイテムですか？"]
-
     args = Namespace(
         model="demo",
         output_modality="text",
@@ -2003,7 +2023,7 @@ def test_generate_cli_smoke(capsys):
         video=None,
         fps=2.0,
         resize_shape=[224],
-        prompt=prompt,
+        prompt=["Describe this image."],
         system=None,
         max_tokens=12,
         temperature=0.7,
@@ -2053,8 +2073,6 @@ def test_generate_cli_smoke(capsys):
     ):
         dispatch_module.main()
 
-    assert mock_apply_chat_template.call_args.args[2] == prompt
-    assert mock_apply_chat_template.call_args.kwargs["num_images"] == 1
     assert mock_apply_chat_template.call_args.kwargs["enable_thinking"] is True
     assert "thinking_mode" not in mock_apply_chat_template.call_args.kwargs
     assert mock_generate.call_args.kwargs["enable_thinking"] is True

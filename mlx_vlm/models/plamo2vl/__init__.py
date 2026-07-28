@@ -1,11 +1,4 @@
-from .plamo2vl import (
-    LanguageModel,
-    Model,
-    ModelConfig,
-    TextConfig,
-    VisionConfig,
-    VisionModel,
-)
-from .processing import Plamo2VLProcessor
-
-Processor = Plamo2VLProcessor
+from .config import ModelConfig, TextConfig, VisionConfig
+from .language import LanguageModel
+from .plamo2vl import Model
+from .vision import VisionModel

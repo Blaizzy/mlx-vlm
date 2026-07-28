@@ -14,6 +14,10 @@ from mlx_vlm.models.qwen3_omni_moe.config import (
 )
 from mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe import Model
 
+IMAGE_TOKEN = 60
+VISION_START = 63
+VISION_END = 59
+
 
 def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
     return TextConfig(
@@ -36,11 +40,12 @@ def _tiny_text_config(model_type="qwen3_omni_moe_text_encoder"):
     )
 
 
-def _tiny_model():
+def _tiny_model(vision_config=None, **thinker_kwargs):
     text_config = _tiny_text_config()
     thinker_config = ThinkerConfig(
         text_config=text_config,
-        vision_config=VisionConfig(
+        vision_config=vision_config
+        or VisionConfig(
             depth=0,
             hidden_size=16,
             intermediate_size=32,
@@ -68,6 +73,7 @@ def _tiny_model():
         image_token_id=60,
         video_token_id=61,
         audio_token_id=62,
+        **thinker_kwargs,
     )
     talker_config = TalkerConfig(
         text_config=_tiny_text_config("qwen3_omni_moe_talker_text"),
@@ -116,6 +122,39 @@ def _tiny_model():
     )
 
 
+def _tiny_vision_model():
+    return _tiny_model(
+        vision_config=VisionConfig(
+            depth=2,
+            hidden_size=16,
+            intermediate_size=32,
+            out_hidden_size=16,
+            num_heads=2,
+            image_size=8,
+            patch_size=2,
+            spatial_patch_size=2,
+            spatial_merge_size=2,
+            in_channels=3,
+            in_chans=3,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[0, 1],
+        ),
+        vision_start_token_id=VISION_START,
+        vision_end_token_id=VISION_END,
+    )
+
+
+def _image_inputs():
+    # grid 1x4x4 patches, merge 2 -> 4 visual tokens
+    mx.random.seed(7)
+    pixel_values = mx.random.normal((16, 24))
+    input_ids = mx.array(
+        [[1, 2, VISION_START] + [IMAGE_TOKEN] * 4 + [VISION_END, 3, 4, 5]],
+        dtype=mx.int32,
+    )
+    return input_ids, pixel_values, mx.array([[1, 4, 4]])
+
+
 class Qwen3OmniMoeTest(unittest.TestCase):
     def test_thinker_generation_keeps_hidden_states_aligned(self):
         model = _tiny_model()
@@ -160,6 +199,69 @@ class Qwen3OmniMoeTest(unittest.TestCase):
                     atol=1e-6,
                 ).item()
             )
+        )
+
+    def test_deepstack_embeds_reach_language_model(self):
+        model = _tiny_vision_model()
+        input_ids, pixel_values, grid = _image_inputs()
+
+        features = model.thinker.get_input_embeddings(
+            input_ids, pixel_values=pixel_values, image_grid_thw=grid
+        )
+        embeds = features.deepstack_visual_embeds
+        self.assertIsNotNone(embeds)
+        self.assertEqual(len(embeds), 2)
+        for e in embeds:
+            self.assertEqual(tuple(e.shape), (4, 16))
+
+        with_injection = model(input_ids, pixel_values, image_grid_thw=grid).logits
+        model_cls = type(model.thinker.language_model.model)
+        orig = model_cls._deepstack_process
+        model_cls._deepstack_process = (
+            lambda self, hidden_states, *a, **k: hidden_states
+        )
+        try:
+            without_injection = model(
+                input_ids, pixel_values, image_grid_thw=grid
+            ).logits
+        finally:
+            model_cls._deepstack_process = orig
+        mx.eval(with_injection, without_injection)
+        self.assertFalse(
+            bool(mx.allclose(with_injection, without_injection, atol=1e-6).item())
+        )
+
+    def test_deepstack_injection_is_batch_safe(self):
+        model = _tiny_vision_model()
+        input_ids, pixel_values, grid = _image_inputs()
+        text_ids = mx.array([[1, 2, 3, 4, 5, 6, 12, 13, 14, 15, 16]], dtype=mx.int32)
+
+        solo_image = model(input_ids, pixel_values, image_grid_thw=grid).logits
+        solo_text = model(text_ids).logits
+        batch = model(
+            mx.concatenate([input_ids, text_ids], axis=0),
+            pixel_values,
+            image_grid_thw=grid,
+        ).logits
+        mx.eval(solo_image, solo_text, batch)
+
+        self.assertTrue(
+            bool(mx.allclose(batch[0:1], solo_image, rtol=1e-4, atol=1e-5).item())
+        )
+        self.assertTrue(
+            bool(mx.allclose(batch[1:2], solo_text, rtol=1e-4, atol=1e-5).item())
+        )
+
+    def test_quant_predicate_forwarded_to_top_level_model(self):
+        model = _tiny_model()
+        predicate = model.quant_predicate
+        self.assertIsNotNone(predicate)
+        self.assertEqual(
+            predicate("thinker.language_model.model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertTrue(
+            predicate("thinker.language_model.model.layers.0.self_attn.q_proj", None)
         )
 
 
