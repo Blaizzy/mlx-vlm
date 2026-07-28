@@ -62,6 +62,7 @@ MODEL_CONFIG = {
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k3": MessageFormat.LIST_WITH_IMAGE,
     "locateanything": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
@@ -760,6 +761,25 @@ def get_chat_template(
                 or getattr(processor, "chat_template", None) is not None
             ):
                 template_processor = processor
+
+        if template_processor is None and processor is not None:
+            # Tokenizers with a custom python chat renderer (an overridden
+            # apply_chat_template) have no jinja chat_template string but do
+            # support chat rendering (e.g. Kimi K3's XTML encoder).
+            from transformers.processing_utils import ProcessorMixin
+            from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+            for candidate in (getattr(processor, "tokenizer", None), processor):
+                if candidate is None:
+                    continue
+                method = getattr(type(candidate), "apply_chat_template", None)
+                if (
+                    method is not None
+                    and method is not PreTrainedTokenizerBase.apply_chat_template
+                    and not isinstance(candidate, ProcessorMixin)
+                ):
+                    template_processor = candidate
+                    break
 
         if template_processor is None:
             return _messages_to_plain_prompt()
