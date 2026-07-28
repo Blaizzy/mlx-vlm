@@ -255,6 +255,144 @@ def _transform_compressed_tensors_int4_weights(
     return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
 
 
+# Compressed-tensors auxiliary tensors with no MLX consumer. They carry
+# activation / kv-cache / shape metadata; left in place they reach
+# ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
+_COMPRESSED_TENSORS_DROP_SUFFIXES = (
+    ".weight_shape",
+    ".weight_global_scale",  # folded into ``.scales`` alongside ``.weight_packed``
+    ".weight_zero_point",
+    ".input_global_scale",
+    ".input_scale",
+    ".k_scale",
+    ".v_scale",
+)
+
+
+def _compressed_tensors_group_weights(
+    quantization_config: Dict[str, Any], ct_format: str
+) -> Dict[str, Any]:
+    """Return the ``weights`` sub-config of the first group with ``ct_format``."""
+    for group in (quantization_config.get("config_groups") or {}).values():
+        if isinstance(group, dict) and group.get("format") == ct_format:
+            return group.get("weights") or {}
+    return {}
+
+
+def _dequantize_compressed_tensors_fp8_weight(
+    weight: mx.array, scale: mx.array
+) -> mx.array:
+    """Dequantize a channel-wise fp8 ``float-quantized`` weight to dense.
+
+    ``float-quantized`` (``num_bits: 8``, ``strategy: channel``) stores the
+    weight as ``float8_e4m3fn`` -- which ``mx.load`` surfaces as raw ``uint8``
+    E4M3 bytes -- plus a per-output-channel ``weight_scale``. MLX has no
+    per-channel fp8 quantization mode, so we decode the E4M3 codes with the
+    shared LUT and rescale into a dense tensor: ``w = E4M3(byte) * weight_scale``.
+    The dense weight is emitted in ``weight_scale``'s dtype (the checkpoint's
+    compute dtype, typically ``bfloat16``).
+    """
+    out_dtype = scale.dtype if scale.dtype != mx.float32 else mx.bfloat16
+    decoded = _E4M3_DECODE_LUT[weight.astype(mx.uint32)]  # float32 [out, in]
+    scale = scale.astype(mx.float32)
+    if scale.ndim == 1:
+        scale = scale[:, None]
+    return (decoded * scale).astype(out_dtype)
+
+
+def _transform_compressed_tensors_mixed_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Route a compressed-tensors ``mixed-precision`` checkpoint per group.
+
+    A ``mixed-precision`` export keeps a single top-level ``format`` and puts
+    the real formats in per-group ``config_groups``. Rather than match each
+    group's regex ``targets``/``ignore`` against module paths (fragile -- the
+    HF names differ from MLX's), we route every quantized Linear by the tensors
+    it actually carries, which is exactly what the group assignment produced:
+
+    - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
+      (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
+    - ``.weight_packed`` alone -> INT4 ``pack-quantized`` (folded to ``affine``)
+    - ``.weight_scale`` without ``.weight_packed`` -> channel-wise fp8
+      ``float-quantized`` (dequantized to a dense weight)
+
+    Layers under ``ignore`` (vision, ``linear_attn``, ``mtp``) carry a plain
+    ``.weight`` with no scale and pass through untouched, so the later
+    ``nn.quantize`` pass -- which only quantizes modules that have a ``.scales``
+    tensor -- leaves them dense.
+
+    Only one MLX-native quantized mode may coexist with the dense/fp8 layers
+    (``nn.quantize`` applies a single ``group_size``/``bits``/``mode``). The
+    reported models pair NVFP4 with dense fp8, so this holds; a checkpoint that
+    mixes e.g. NVFP4 and INT4 raises rather than silently mis-quantizing.
+    """
+    packed_prefixes = {
+        key[: -len(".weight_packed")]
+        for key in weights
+        if key.endswith(".weight_packed")
+    }
+    # A ``.weight_scale`` with no packed sibling is a float-quantized fp8 layer.
+    fp8_prefixes = {
+        key[: -len(".weight_scale")] for key in weights if key.endswith(".weight_scale")
+    } - packed_prefixes
+
+    int4_cfg = _compressed_tensors_group_weights(quantization_config, "pack-quantized")
+    int4_bits = int4_cfg.get("num_bits", 4)
+    int4_group_size = int4_cfg.get("group_size", 32)
+
+    new_weights: Dict[str, mx.array] = {}
+    native_quant: Dict[str, Dict[str, Any]] = {}
+
+    for key, value in weights.items():
+        if key.endswith(".weight_packed"):
+            prefix = key[: -len(".weight_packed")]
+            scale = weights[f"{prefix}.weight_scale"]
+            global_key = f"{prefix}.weight_global_scale"
+            if global_key in weights:  # NVFP4
+                global_scale = weights[global_key].astype(mx.float32)
+                new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
+                decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+                new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+                native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            else:  # INT4 symmetric pack-quantized
+                new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
+                new_weights[f"{prefix}.scales"] = scale
+                new_weights[f"{prefix}.biases"] = -(2 ** (int4_bits - 1)) * scale
+                native_quant["affine"] = {
+                    "group_size": int4_group_size,
+                    "bits": int4_bits,
+                    "mode": "affine",
+                }
+            continue
+        if key.endswith(".weight_scale"):
+            prefix = key[: -len(".weight_scale")]
+            if prefix in fp8_prefixes:
+                new_weights[f"{prefix}.weight"] = (
+                    _dequantize_compressed_tensors_fp8_weight(
+                        weights[f"{prefix}.weight"], value
+                    )
+                )
+            # NVFP4 / INT4 scales are consumed with their ``.weight_packed``.
+            continue
+        if key.endswith(".weight") and key[: -len(".weight")] in fp8_prefixes:
+            continue  # emitted (dequantized to dense) at its ``.weight_scale``
+        if any(key.endswith(suffix) for suffix in _COMPRESSED_TENSORS_DROP_SUFFIXES):
+            continue
+        new_weights[key] = value
+
+    if not native_quant:
+        return new_weights, None
+    if len(native_quant) > 1:
+        raise NotImplementedError(
+            "mixed-precision compressed-tensors checkpoint mixes multiple "
+            f"MLX-native quantized modes {sorted(native_quant)}; only one native "
+            "mode alongside dense/fp8 layers is supported."
+        )
+    return new_weights, next(iter(native_quant.values()))
+
+
 def _transform_compressed_tensors_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
@@ -268,6 +406,12 @@ def _transform_compressed_tensors_weights(
         return weights, None
     if quantization_config.get("quant_method") != "compressed-tensors":
         return weights, None
+
+    # ``mixed-precision`` puts the real formats in per-group ``config_groups``;
+    # route per group (some groups may be dense fp8 with no ``.weight_packed``).
+    if quantization_config.get("format") == "mixed-precision":
+        return _transform_compressed_tensors_mixed_weights(weights, quantization_config)
+
     if not any(key.endswith(".weight_packed") for key in weights):
         return weights, None
 
@@ -1063,8 +1207,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -1076,8 +1219,7 @@ def upload_to_hub(path: str, upload_repo: str):
         ```bash
         python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()

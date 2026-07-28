@@ -284,6 +284,31 @@ def _adapter_path_or_inherit(request):
     )
 
 
+def _normalize_response_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str],
+) -> Optional[str]:
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
+
+
 def _decode_input_audio_data(input_audio: InputAudio):
     data = input_audio["data"]
     if not isinstance(data, str):
@@ -783,10 +808,10 @@ async def responses_input_tokens_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        if openai_request.instructions:
-            chat_messages.insert(
-                0, {"role": "system", "content": openai_request.instructions}
-            )
+        _normalize_response_instruction_messages(
+            chat_messages,
+            openai_request.instructions,
+        )
         _ensure_effective_input(chat_messages, images=images)
 
         model, processor, config = get_cached_model(
@@ -944,11 +969,10 @@ async def responses_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = openai_request.instructions
-        if instructions:
-            chat_messages.insert(0, {"role": "system", "content": instructions})
-        elif chat_messages and chat_messages[0].get("role") in ("system", "developer"):
-            instructions = chat_messages[0].get("content")
+        instructions = _normalize_response_instruction_messages(
+            chat_messages,
+            openai_request.instructions,
+        )
         _ensure_effective_input(chat_messages, images=images)
 
         # Get model, processor, config - loading if necessary
