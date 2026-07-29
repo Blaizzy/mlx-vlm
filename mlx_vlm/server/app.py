@@ -634,10 +634,13 @@ def get_cached_model(
                 detail="Adapters are not supported for embedding models.",
             )
         logger.info("Loading embedding model: %s", model_path)
+        from ..models.pooling import read_pooling_config
+        from ..utils import get_model_path
         from ..utils import load as load_embedding_model
 
         try:
-            model, processor = load_embedding_model(model_path)
+            model_dir = get_model_path(model_path)
+            model, processor = load_embedding_model(model_dir)
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -654,6 +657,7 @@ def get_cached_model(
             raise HTTPException(
                 status_code=500, detail=f"Failed to load embedding model: {e}"
             ) from e
+        model.pooling_config = read_pooling_config(model_dir)
         config = SimpleNamespace(
             model_type=getattr(model, "model_type", "embedding"),
             text_config=None,

@@ -1,4 +1,6 @@
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
@@ -127,3 +129,11 @@ def pool_by_config(
         f"Unknown pooling mode {mode!r}. "
         f"Supported modes: {sorted(_SUPPORTED_POOL_MODES)}."
     )
+
+
+def read_pooling_config(model_dir):
+    path = Path(model_dir) / "1_Pooling" / "config.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)

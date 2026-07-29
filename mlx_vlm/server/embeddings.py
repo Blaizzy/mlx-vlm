@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -32,11 +33,12 @@ def _normalize_input(value: Union[str, List[str]]) -> List[str]:
 
 def _embed(model, processor, texts: List[str]):
     tok = getattr(processor, "tokenizer", processor)
+    max_length = min(int(getattr(tok, "model_max_length", 512) or 512), 8192)
     enc = tok(
         texts,
         padding=True,
         truncation=True,
-        max_length=512,
+        max_length=max_length,
         return_tensors="np",
     )
     out = model(
@@ -70,8 +72,14 @@ def register_routes(app, deps):
         )
         try:
             texts = _normalize_input(body.input)
-            model, processor, *_ = get_cached_model(model_id, model_kind="embedding")
-            vectors, prompt_tokens = _embed(model, processor, texts)
+
+            def _work():
+                model, processor, *_ = get_cached_model(
+                    model_id, model_kind="embedding"
+                )
+                return _embed(model, processor, texts)
+
+            vectors, prompt_tokens = await asyncio.to_thread(_work)
         except ValueError as exc:
             runtime.metrics.record_failure(
                 endpoint="/v1/embeddings", model=model_id, stream=False, error=str(exc)
