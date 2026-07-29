@@ -233,6 +233,40 @@ class TestApplyChatTemplateIntegration:
             }
         ]
 
+    def test_gemma4_unified_formats_video_and_audio_messages(self):
+        """Video prompts should retain audio placeholders when audio is present."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video and audio.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {"type": "audio"},
+                    {
+                        "type": "text",
+                        "text": "Describe the video and audio.",
+                        "content": "Describe the video and audio.",
+                    },
+                ],
+            }
+        ]
+
     def test_text_only_formats_regular_chat_message(self):
         """Text-only models should use regular role/content messages with no image tokens."""
         from mlx_vlm.prompt_utils import apply_chat_template
