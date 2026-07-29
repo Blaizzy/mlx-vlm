@@ -17,7 +17,7 @@ row-identical to the reference processor's output by ``test_mage_vl_positions.py
 
 from typing import List, Optional, Union
 
-import numpy as np
+import mlx.core as mx
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
@@ -132,20 +132,18 @@ class MageVLProcessor(ProcessorMixin):
             image_inputs = dict(
                 self.image_processor(images=images, return_tensors="np")
             )
-            grids = np.asarray(image_inputs["image_grid_thw"])
+            grids = mx.array(image_inputs["image_grid_thw"]).tolist()
 
             # Expand each <|image_pad|> placeholder to its grid's merged-token count
             # (t*h*w / merge^2) — mirrors the reference processor's `_expand_image_pads`.
             merge = self.spatial_merge_size
-            counts = (grids[:, 0] * grids[:, 1] * grids[:, 2]) // (merge * merge)
+            counts = [(t * h * w) // (merge * merge) for t, h, w in grids]
             img_idx = 0
 
             def expand(s: str) -> str:
                 nonlocal img_idx
                 while IMAGE_PAD in s and img_idx < len(counts):
-                    s = s.replace(
-                        IMAGE_PAD, "<|placeholder|>" * int(counts[img_idx]), 1
-                    )
+                    s = s.replace(IMAGE_PAD, "<|placeholder|>" * counts[img_idx], 1)
                     img_idx += 1
                 return s.replace("<|placeholder|>", IMAGE_PAD)
 

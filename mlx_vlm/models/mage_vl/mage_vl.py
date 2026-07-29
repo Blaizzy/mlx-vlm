@@ -8,7 +8,6 @@ from typing import List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig, VisionConfig
@@ -22,12 +21,10 @@ def masked_scatter(
     scaled_image_features: mx.array,
 ) -> mx.array:
     shape = final_embedding.shape
-    flat_features = mx.flatten(scaled_image_features)
     flat_embedding = mx.flatten(final_embedding)
-    flat_mask = mx.flatten(image_mask_expanded)
-
-    positions = mx.array(np.where(np.array(flat_mask))[0], mx.uint32)
-    flat_embedding[positions] = flat_features
+    flat_embedding[mx.flatten(image_mask_expanded).astype(mx.bool_)] = mx.flatten(
+        scaled_image_features
+    )
     return mx.reshape(flat_embedding, shape)
 
 
@@ -135,9 +132,10 @@ class Model(nn.Module):
 def _as_grid_list(grid_thw) -> List[Tuple[int, int, int]]:
     if grid_thw is None:
         return []
-    if isinstance(grid_thw, mx.array):
-        grid_thw = np.array(grid_thw)
-    return [tuple(int(x) for x in row) for row in np.atleast_2d(np.array(grid_thw))]
+    rows = mx.array(grid_thw).tolist()
+    if rows and not isinstance(rows[0], list):
+        rows = [rows]  # a single (3,) grid rather than (N, 3)
+    return [tuple(int(x) for x in row) for row in rows]
 
 
 def _positions_from_grid(
@@ -159,4 +157,4 @@ def _positions_from_grid(
                     for dh in range(m):
                         for dw in range(m):
                             rows.append((ti, hb * m + dh, wb * m + dw))
-    return mx.array(np.array(rows, dtype=np.int32))
+    return mx.array(rows, dtype=mx.int32)

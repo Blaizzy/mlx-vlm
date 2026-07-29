@@ -88,6 +88,8 @@ class VisionRotaryEmbedding(nn.Module):
         self._inv_freq_w = 1.0 / (
             base ** (mx.arange(self.w_size, dtype=mx.float32) / self.w_size)
         )
+        # Evaluate at init so the caches don't carry a lazy graph across streams.
+        mx.eval(self._inv_freq_t, self._inv_freq_h, self._inv_freq_w)
 
     def forward_from_positions(self, patch_positions: mx.array) -> mx.array:
         """patch_positions: (L, 3) of [t, h, w] -> freqs (L, half)."""

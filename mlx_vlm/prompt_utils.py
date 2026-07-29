@@ -46,8 +46,6 @@ MODEL_CONFIG = {
     "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
-    # Mage-VL's chat template emits <|vision_start|><|image_pad|><|vision_end|> for structured
-    # {"type": "image"} content, exactly like the Qwen-VL family it reuses.
     "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
