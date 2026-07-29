@@ -11,7 +11,7 @@ import mlx.nn as nn
 import numpy as np
 
 from ..base import InputEmbeddingsFeatures
-from .config import ModelConfig, TextConfig, VisionConfig
+from .config import ModelConfig, VisionConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
