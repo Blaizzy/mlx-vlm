@@ -26,7 +26,12 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
-from mlx_vlm.models.cache import BatchKVCache, KVCache
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -2272,6 +2277,82 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+class TestPrefixCacheReuseTrim:
+    """Prompt-cache prefix reuse must trim each cache through its own trim()
+    contract. A raw ``keys[..., :prefix_len, :]`` slice corrupts rotating
+    (sliding-window) ring buffers -- silent wrong output, or a shape crash once
+    speculative decoding wraps them (mlx-vlm issue #1715)."""
+
+    @staticmethod
+    def _fill(cache, n, marker=False, heads=1, dim=4):
+        for i in range(n):
+            v = (
+                mx.full((1, heads, 1, dim), float(i))
+                if marker
+                else mx.zeros((1, heads, 1, dim))
+            )
+            cache.update_and_fetch(v, v)
+        return cache
+
+    def test_flat_cache_trims_to_prefix(self):
+        c = self._fill(KVCache(), 20, marker=True)
+        n_drop = dispatch_module._prefix_cache_trim_amount([c], 8)
+        assert n_drop == 12
+        c.trim(n_drop)
+        keys, _ = c.state
+        assert c.offset == 8 and keys.shape[2] == 8
+        assert bool(mx.array_equal(keys[0, 0, :, 0], mx.arange(8, dtype=keys.dtype)))
+
+    def test_full_prefix_needs_no_trim(self):
+        c = self._fill(KVCache(), 12)
+        assert dispatch_module._prefix_cache_trim_amount([c], 12) == 0
+
+    def test_empty_cache_is_reusable(self):
+        assert dispatch_module._prefix_cache_trim_amount([], 0) == 0
+
+    def test_unwrapped_rotating_trims_and_stays_usable(self):
+        c = self._fill(RotatingKVCache(max_size=512), 100)
+        assert c.offset == 100  # window has not wrapped
+        n_drop = dispatch_module._prefix_cache_trim_amount([c], 40)
+        assert n_drop == 60
+        c.trim(n_drop)
+        assert c.offset == 40 and c._idx == 40
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        assert c.offset == 41
+
+    def test_wrapped_rotating_is_not_reusable(self):
+        c = self._fill(RotatingKVCache(max_size=8), 20)  # ring has wrapped
+        assert c.offset > c.max_size
+        assert dispatch_module._prefix_cache_trim_amount([c], 3) is None
+
+    def test_mixed_flat_and_wrapped_rotating_is_not_reusable(self):
+        flat = self._fill(KVCache(), 20)
+        wrapped = self._fill(RotatingKVCache(max_size=8), 20)
+        assert dispatch_module._prefix_cache_trim_amount([flat, wrapped], 3) is None
+
+    def test_wrapped_buffered_rotating_declined_and_survives_next_step(self):
+        # BufferedRotatingKVCache is what speculative decoding installs; the old
+        # raw slice desynced its ring index and crashed on the next update. When
+        # reuse is declined the cache stays intact, so generation continues.
+        c = BufferedRotatingKVCache.from_cache(
+            self._fill(RotatingKVCache(max_size=8), 20), buffer_size=16
+        )
+        assert dispatch_module._prefix_cache_trim_amount([c], 2) is None
+        c.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+
+    def test_unwrapped_buffered_rotating_trims(self):
+        # A buffered cache that has not evicted anything (start_position == 0) is
+        # still rollback-able even though is_trimmable() is unconditionally True.
+        c = BufferedRotatingKVCache(max_size=512, buffer_size=16)
+        self._fill(c, 100)
+        assert c.start_position == 0
+        assert dispatch_module._prefix_cache_trim_amount([c], 40) == 60
+        c.trim(60)
+        assert c.offset == 40
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        assert c.offset == 41
 
 
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():

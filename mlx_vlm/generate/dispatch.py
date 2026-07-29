@@ -700,6 +700,45 @@ def _prime_cached_prefix_rope_state(
     return True
 
 
+def _cache_fully_retained(c: Any) -> bool:
+    """Whether ``c`` still holds its whole sequence from position 0.
+
+    Only such a cache can be rolled back to an earlier prefix. Note this is not
+    ``is_trimmable()``: ``BufferedRotatingKVCache`` reports itself trimmable even
+    after it has evicted early tokens, and trimming it then would only clamp to
+    its retained window and desync ``offset`` from the flat layers.
+    """
+    children = getattr(c, "caches", None)
+    if children is not None:  # CacheList
+        return all(_cache_fully_retained(x) for x in children)
+    start_position = getattr(c, "start_position", None)
+    if start_position is not None:  # Buffered/Chunked: evicts by advancing start
+        return int(start_position) == 0
+    max_size = getattr(c, "max_size", None)
+    if max_size is not None:  # RotatingKVCache: reusable until the window wraps
+        return int(getattr(c, "offset", 0) or 0) <= int(max_size)
+    return True  # KVCache / QuantizedKVCache retain the whole sequence
+
+
+def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[int]:
+    """Trailing tokens to drop so ``kv_cache`` keeps only its first ``prefix_len``.
+
+    The old reuse path sliced key/value arrays directly --
+    ``keys[..., :prefix_len, :]`` -- which is only valid for a flat cache. On a
+    rotating (sliding-window) cache it slices a ring buffer by a logical length,
+    taking an arbitrary rotation of the window and leaving the ring index stale:
+    silent output corruption, or a broadcast crash once speculative decoding wraps
+    the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
+    (``0`` when the whole cache is reusable), or ``None`` when an entry has already
+    evicted part of the prefix and the caller must cold-prefill instead.
+    """
+    cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+    n_drop = max(0, cached_len - prefix_len)
+    if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
+        return None
+    return n_drop
+
+
 from .ar import generate_step
 
 
@@ -866,27 +905,26 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
-                model, input_ids, mask, kwargs
-            ):
-                reused_prefix_len = prefix_len
-                # Trim to only new tokens
-                input_ids = input_ids[:, prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length)
-                kv_cache = prompt_cache_state.cache
-                # Trim cache to prefix_len in case it includes generated tokens
-                for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
-                kwargs["prompt_cache"] = kv_cache
+        kv_cache = prompt_cache_state.cache
+        # None => a cache can't be trimmed back to the shared prefix (wrapped
+        # rotating window); reusing it would corrupt state, so cold-prefill instead.
+        n_drop = _prefix_cache_trim_amount(kv_cache, prefix_len)
+        if (
+            0 < prefix_len < input_ids.shape[1]
+            and n_drop is not None
+            and _apc_suffix_is_text_only(prefix_len)
+            and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+        ):
+            # Drop cached tokens past the shared prefix via each cache's own trim().
+            for c in kv_cache:
+                if n_drop:
+                    c.trim(n_drop)
+            reused_prefix_len = prefix_len
+            # Trim to only new tokens
+            input_ids = input_ids[:, prefix_len:]
+            pixel_values = None
+            kwargs.pop("cached_image_features", None)
+            kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
