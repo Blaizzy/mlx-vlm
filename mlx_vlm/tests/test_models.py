@@ -11826,3 +11826,34 @@ class TestQwen3Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestGemma3Embedding(unittest.TestCase):
+    def test_gemma3_embedding_forward(self):
+        from mlx_vlm.models import gemma3_embedding
+
+        config = gemma3_embedding.ModelConfig(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=37,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=99,
+            sliding_window=8,
+            sliding_window_pattern=2,
+            query_pre_attn_scalar=8,
+            max_position_embeddings=64,
+        )
+        model = gemma3_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())

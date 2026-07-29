@@ -54,6 +54,7 @@ MODEL_REMAPPING = {
 
 EMBEDDING_MODEL_REMAPPING = {
     "qwen3": "qwen3_embedding",
+    "gemma3_text": "gemma3_embedding",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -685,6 +686,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = {}
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
+
+    if embedding:
+        for wf in sorted(glob.glob(str(model_path / "*" / "*.safetensors"))):
+            folder = Path(wf).parent.name
+            for k, v in _load_safetensors(wf).items():
+                weights[f"{folder}.{k}"] = v
 
     model_class, _ = get_model_and_args(config=config, embedding=embedding)
 
