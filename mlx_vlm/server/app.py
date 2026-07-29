@@ -639,7 +639,7 @@ def get_cached_model(
 
         try:
             model_dir = get_model_path(model_path)
-            model = load_model(model_dir)
+            model = load_model(model_dir, embedding=True)
             processor = load_processor(model_dir, add_detokenizer=False)
         except RepositoryNotFoundError as e:
             raise HTTPException(
