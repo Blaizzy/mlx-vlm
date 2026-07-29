@@ -49,6 +49,7 @@ MODEL_REMAPPING = {
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
     "nemotron-nas": "nemotron_nas",
+    "xlm-roberta": "xlm_roberta",
 }
 
 MAX_FILE_SIZE_GB = 5

@@ -11745,3 +11745,28 @@ class TestBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestXLMRoberta(unittest.TestCase):
+    def test_xlm_roberta_embedding_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm-roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(2, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
