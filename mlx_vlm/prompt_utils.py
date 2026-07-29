@@ -63,6 +63,7 @@ MODEL_CONFIG = {
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k3": MessageFormat.LIST_WITH_IMAGE,
     "locateanything": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
