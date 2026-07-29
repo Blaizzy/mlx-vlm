@@ -81,6 +81,7 @@ class ShortConv(nn.Module):
         self.layer_idx = layer_idx
         self.L_cache = args.conv_L_cache
         self.bias = args.conv_bias
+        self.causal = getattr(args, "conv_causal", True)
 
         self.conv = nn.Conv1d(
             in_channels=args.hidden_size,
@@ -122,8 +123,11 @@ class ShortConv(nn.Module):
             else:
                 cache[0] = Bx[:, -n_keep:, :]
             cache.advance(t)
-        else:
+        elif self.causal:
             Bx = mx.pad(Bx, [(0, 0), (self.L_cache - 1, 0), (0, 0)])
+        else:
+            pad = self.L_cache // 2
+            Bx = mx.pad(Bx, [(0, 0), (pad, pad), (0, 0)])
 
         conv_out = self.conv(Bx)
 

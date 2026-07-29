@@ -55,6 +55,7 @@ MODEL_REMAPPING = {
 EMBEDDING_MODEL_REMAPPING = {
     "qwen3": "qwen3_embedding",
     "gemma3_text": "gemma3_embedding",
+    "lfm2": "lfm2_embedding",
 }
 
 MAX_FILE_SIZE_GB = 5
