@@ -166,6 +166,20 @@ def mock_processor():
     return MockProcessor()
 
 
+def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
+    model = SimpleNamespace(
+        language_model=MockLanguageModel(),
+        make_cache=lambda: [KVCache()],
+    )
+    generator = ar_module.BatchGenerator(
+        model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+    )
+
+    assert generator._apc_media_token_ids() == set()
+
+
 # ============================================================================
 # Tests for Dataclasses
 # ============================================================================

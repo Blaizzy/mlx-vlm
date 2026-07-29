@@ -2233,7 +2233,10 @@ class BatchGenerator:
         )
 
     def _apc_media_token_ids(self) -> set[int]:
-        return _apc.multimodal_token_ids_from_config(self.model.config)
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return set()
+        return _apc.multimodal_token_ids_from_config(config)
 
     def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
