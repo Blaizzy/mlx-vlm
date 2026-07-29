@@ -26,6 +26,7 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
     PromptTooLongError,
@@ -369,6 +370,13 @@ async def lifespan(app):
             model_kind=model_kind,
         )
         logger.info("%s ready.", label.capitalize())
+    embedding_model_path = os.environ.get("MLX_VLM_PRELOAD_EMBEDDING_MODEL")
+    if embedding_model_path:
+        logger.info("Pre-loading embedding model: %s", embedding_model_path)
+        from .embeddings import load_embedding_model
+
+        load_embedding_model(embedding_model_path)
+        logger.info("Embedding model ready.")
     try:
         yield
     finally:
@@ -734,6 +742,7 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
+register_embeddings_routes(inference_router, _protocol_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)
