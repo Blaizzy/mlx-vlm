@@ -67,6 +67,8 @@ def _count_prompt_tokens(processor, texts: List[str]) -> int:
 
 
 def register_routes(app, deps):
+    build_metrics_envelope = deps.build_metrics_envelope
+
     @app.post("/v1/embeddings")
     async def create_embeddings(body: EmbeddingsRequest):
         model_id = body.model or _default_embedding_model()
@@ -79,6 +81,7 @@ def register_routes(app, deps):
                 ),
             )
 
+        request_start = time.perf_counter()
         runtime.metrics.begin_request(
             endpoint="/v1/embeddings", model=model_id, stream=False
         )
@@ -102,21 +105,18 @@ def register_routes(app, deps):
             raise HTTPException(status_code=500, detail=str(exc))
 
         runtime.metrics.record_success(
-            {
-                "endpoint": "/v1/embeddings",
-                "model": model_id,
-                "stream": False,
-                "backend": "mlx-embeddings",
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": 0,
-                "generated_tokens": 0,
-                "request_elapsed_s": 0.0,
-                "decode_elapsed_s": 0.0,
-                "prefill_tok_s": 0.0,
-                "decode_tok_s": 0.0,
-                "finish_reason": "stop",
-                "timestamp_unix": time.time(),
-            }
+            build_metrics_envelope(
+                endpoint="/v1/embeddings",
+                model=model_id,
+                stream=False,
+                backend="mlx-embeddings",
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                generated_tokens=0,
+                request_elapsed_s=time.perf_counter() - request_start,
+                request_started_s=request_start,
+                finish_reason="stop",
+            )
         )
         return {
             "object": "list",
