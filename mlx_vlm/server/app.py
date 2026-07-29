@@ -635,12 +635,12 @@ def get_cached_model(
             )
         logger.info("Loading embedding model: %s", model_path)
         from ..models.pooling import read_pooling_config
-        from ..utils import get_model_path
-        from ..utils import load as load_embedding_model
+        from ..utils import get_model_path, load_model, load_processor
 
         try:
             model_dir = get_model_path(model_path)
-            model, processor = load_embedding_model(model_dir)
+            model = load_model(model_dir)
+            processor = load_processor(model_dir, add_detokenizer=False)
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
