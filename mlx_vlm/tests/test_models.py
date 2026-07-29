@@ -11770,3 +11770,29 @@ class TestXLMRoberta(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestModernBert(unittest.TestCase):
+    def test_modernbert_embedding_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+        )
+        model = modernbert.Model(config)
+
+        batch, seq = 2, 6
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
