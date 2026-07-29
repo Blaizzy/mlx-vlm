@@ -501,6 +501,13 @@ class LanguageModel(nn.Module):
             if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
                 cache_offset_array = c0.offset
 
+        if position_ids is not None and cache_offset_array is None:
+            seq_length = inputs.shape[-1]
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
+
         if (
             visual_pos_masks is not None
             and visual_pos_masks.shape[-1] != inputs.shape[-1]

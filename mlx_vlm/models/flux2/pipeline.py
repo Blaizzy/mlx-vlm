@@ -52,6 +52,9 @@ class Flux2Image:
         self.runtime_config = runtime_config or Flux2RuntimeConfig()
         self.tokenizer = Flux2Tokenizer(self.model_path)
         self.text_encoder = load_text_encoder(self.model_path, self.variant)
+        self.quantization_config = getattr(
+            self.text_encoder, "quantization_config", None
+        )
         self.transformer = None
         self.vae = None
         self.prompt_cache: dict[tuple[str, int, bool], tuple[mx.array, mx.array]] = {}
