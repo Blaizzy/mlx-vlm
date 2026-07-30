@@ -11797,3 +11797,175 @@ class TestGptOssMixedQuant(unittest.TestCase):
         self.assertEqual(type(q_proj).__name__, "QuantizedLinear")
         self.assertEqual(q_proj.bits, 8)  # affine 8-bit, not top-level mxfp4
         self.assertTrue(hasattr(q_proj, "biases"))
+
+
+class TestBert(unittest.TestCase):
+    def test_bert_embedding_forward(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestXLMRoberta(unittest.TestCase):
+    def test_xlm_roberta_embedding_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm-roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(2, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestModernBert(unittest.TestCase):
+    def test_modernbert_embedding_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+        )
+        model = modernbert.Model(config)
+
+        batch, seq = 2, 6
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestQwen3Embedding(unittest.TestCase):
+    def test_qwen3_embedding_forward(self):
+        from mlx_vlm.models import qwen3_embedding
+
+        config = qwen3_embedding.ModelConfig(
+            model_type="qwen3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=37,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=99,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            rope_theta=1000000.0,
+            head_dim=8,
+            tie_word_embeddings=True,
+        )
+        model = qwen3_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestGemma3Embedding(unittest.TestCase):
+    def test_gemma3_embedding_forward(self):
+        from mlx_vlm.models import gemma3_embedding
+
+        config = gemma3_embedding.ModelConfig(
+            model_type="gemma3_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=37,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            rms_norm_eps=1e-6,
+            vocab_size=99,
+            sliding_window=8,
+            sliding_window_pattern=2,
+            query_pre_attn_scalar=8,
+            max_position_embeddings=64,
+        )
+        model = gemma3_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestLfm2Embedding(unittest.TestCase):
+    def test_lfm2_embedding_forward(self):
+        from mlx_vlm.models import lfm2_embedding
+
+        config = lfm2_embedding.ModelConfig(
+            model_type="lfm2",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=64,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=3,
+            block_dim=32,
+            block_ff_dim=64,
+            block_multiple_of=16,
+            block_ffn_dim_multiplier=1.0,
+            block_auto_adjust_ff_dim=True,
+            layer_types=["conv", "full_attention"],
+            tie_word_embeddings=True,
+        )
+        model = lfm2_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
