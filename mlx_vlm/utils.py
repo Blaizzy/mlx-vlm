@@ -49,13 +49,6 @@ MODEL_REMAPPING = {
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
     "nemotron-nas": "nemotron_nas",
-    "xlm-roberta": "xlm_roberta",
-}
-
-EMBEDDING_MODEL_REMAPPING = {
-    "qwen3": "qwen3_embedding",
-    "gemma3_text": "gemma3_embedding",
-    "lfm2": "lfm2_embedding",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -520,7 +513,7 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
     return predicate
 
 
-def get_model_and_args(config: dict, embedding: bool = False):
+def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
 
@@ -535,10 +528,7 @@ def get_model_and_args(config: dict, embedding: bool = False):
         raise KeyError("model_type")
     model_type = raw_model_type.lower()
 
-    if embedding and model_type in EMBEDDING_MODEL_REMAPPING:
-        model_type = EMBEDDING_MODEL_REMAPPING[model_type]
-    else:
-        model_type = MODEL_REMAPPING.get(model_type, model_type)
+    model_type = MODEL_REMAPPING.get(model_type, model_type)
 
     is_dflash = config.get("dflash_config", None) is not None
     if is_dflash:
@@ -615,9 +605,7 @@ def get_model_path(
     return model_path
 
 
-def load_model(
-    model_path: Path, lazy: bool = False, embedding: bool = False, **kwargs
-) -> nn.Module:
+def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
 
@@ -688,13 +676,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
 
-    if embedding:
-        for wf in sorted(glob.glob(str(model_path / "*" / "*.safetensors"))):
-            folder = Path(wf).parent.name
-            for k, v in _load_safetensors(wf).items():
-                weights[f"{folder}.{k}"] = v
-
-    model_class, _ = get_model_and_args(config=config, embedding=embedding)
+    model_class, _ = get_model_and_args(config=config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
