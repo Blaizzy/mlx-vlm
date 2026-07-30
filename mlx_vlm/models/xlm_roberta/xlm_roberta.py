@@ -133,7 +133,9 @@ class Model(nn.Module):
         h = self.embeddings(input_ids, token_type_ids)
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
-        mask = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * -1e9
+        mask = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * mx.finfo(
+            h.dtype
+        ).min
         h = self.encoder(h, mask.astype(h.dtype))
         pooling_config = getattr(self, "pooling_config", None) or {
             "pooling_mode": "mean"

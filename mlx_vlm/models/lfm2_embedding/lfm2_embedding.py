@@ -26,7 +26,9 @@ class Model(nn.Module):
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
         h = self.model.embed_tokens(input_ids)
-        attn_mask = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * -1e9
+        attn_mask = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * mx.finfo(
+            h.dtype
+        ).min
         for layer in self.model.layers:
             mask = attn_mask if layer.is_attention_layer else None
             h = layer(h, mask, None)

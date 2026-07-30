@@ -18,8 +18,9 @@ class Model(nn.Module):
         h = self.model.embed_tokens(input_ids)
         if attention_mask is None:
             attention_mask = mx.ones((B, L))
-        causal = mx.triu(mx.full((L, L), -1e9, dtype=h.dtype), k=1)
-        pad = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * -1e9
+        min_value = mx.finfo(h.dtype).min
+        causal = mx.triu(mx.full((L, L), min_value, dtype=h.dtype), k=1)
+        pad = (1.0 - attention_mask[:, None, None, :].astype(h.dtype)) * min_value
         mask = causal[None, None, :, :] + pad
         for layer in self.model.layers:
             h = layer(h, mask, None)
