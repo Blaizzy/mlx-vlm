@@ -1116,6 +1116,18 @@ def load_processor(
             or getattr(tokenizer_obj, "eos_token_id", None)
         )
 
+        # Some tokenizers (e.g. Inkling) expose neither a pad nor an eos token string
+        if getattr(tokenizer_obj, "pad_token", None) is None and final_eos_token_ids:
+            eid = (
+                final_eos_token_ids[0]
+                if isinstance(final_eos_token_ids, (list, tuple))
+                else final_eos_token_ids
+            )
+            try:
+                tokenizer_obj.pad_token = tokenizer_obj.convert_ids_to_tokens(eid)
+            except Exception:
+                tokenizer_obj.pad_token_id = eid
+
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(final_eos_token_ids, tokenizer_obj)
         if hasattr(processor, "tokenizer"):
