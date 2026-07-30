@@ -7,7 +7,7 @@ from mlx.utils import tree_flatten
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache
 from ..mlp import SwiGLUMLP
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 from .config import TextConfig as ModelConfig
 
 
@@ -235,11 +235,40 @@ class InklingDenseMLP(SwiGLUMLP):
     """Dense SwiGLU MLP (shared ``SwiGLUMLP``) with a learned output scale."""
 
     def __init__(self, config: ModelConfig):
-        super().__init__(config.hidden_size, config.intermediate_size)
+        super().__init__(config.hidden_size, config.dense_intermediate_size)
         self.global_scale = mx.ones((1,))
 
     def __call__(self, x):
         return super().__call__(x) * self.global_scale
+
+
+class InklingSwitchGLU(SwitchGLU):
+    def __init__(self, input_dims, hidden_dims, num_experts, **kwargs):
+        super().__init__(input_dims, hidden_dims, num_experts, **kwargs)
+        self.gate_scale = mx.ones((num_experts,))  # s13 (fused gate/up scale2)
+        self.out_scale = mx.ones((num_experts,))  # s13 * s2
+
+    def _per_expert(self, scale, idx, like):
+        s = scale[idx].astype(like.dtype)
+        return s.reshape(s.shape + (1,) * (like.ndim - s.ndim))
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        x_gate = x_gate * self._per_expert(self.gate_scale, idx, x_gate)
+        x = self.down_proj(
+            self.activation(x_up, x_gate), idx, sorted_indices=do_sort
+        )
+        x = x * self._per_expert(self.out_scale, idx, x)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
 
 
 class InklingSparseMoE(nn.Module):
@@ -255,11 +284,11 @@ class InklingSparseMoE(nn.Module):
         self.gate_weight = mx.zeros((self.n_routed + self.n_shared, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed,))
         self.global_scale = mx.ones((1,))
-        self.switch_mlp = SwitchGLU(
-            config.hidden_size, config.moe_intermediate_size, self.n_routed
+        self.switch_mlp = InklingSwitchGLU(
+            config.hidden_size, config.intermediate_size, self.n_routed
         )
         self.shared_experts = SwitchGLU(
-            config.hidden_size, config.moe_intermediate_size, self.n_shared
+            config.hidden_size, config.intermediate_size, self.n_shared
         )
 
     def __call__(self, x):

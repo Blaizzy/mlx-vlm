@@ -49,6 +49,7 @@ MODEL_REMAPPING = {
     "unlimited-ocr": "unlimited_ocr",
     "mistral": "llama",
     "nemotron-nas": "nemotron_nas",
+    "inkling_mm_model": "inkling",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -734,6 +735,19 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             quantization_config = text_config.get("quantization_config", None)
             if quantization_config is not None:
                 config["quantization_config"] = quantization_config
+
+        if quantization_config is None:
+            hf_quant_path = model_path / "hf_quant_config.json"
+            if hf_quant_path.exists():
+                with open(hf_quant_path) as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                if hf_quant.get("quant_algo") == "NVFP4":
+                    # nvfp4 implies group_size=16
+                    config["quantization"] = config["quantization_config"] = {
+                        "group_size": 16,
+                        "bits": 4,
+                        "mode": "nvfp4",
+                    }
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")

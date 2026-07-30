@@ -27,10 +27,13 @@ def masked_scatter(input_tensor, mask, source):
 
 
 def _split_gate_up(v):
-    """De-interleave a fused [..., 2*inter, hidden] gate/up weight into (gate, up)."""
+    """De-interleave a fused [..., 2*inter, hidden] gate/up weight into (gate, up).
+
+    Return contiguous halves for performance; `gather_mm / `gather_qmm` are much slower when fed strided views
+    """
     *lead, two_i, hidden = v.shape
     w = v.reshape(*lead, two_i // 2, 2, hidden)
-    return w[..., 0, :], w[..., 1, :]
+    return mx.contiguous(w[..., 0, :]), mx.contiguous(w[..., 1, :])
 
 
 class Model(nn.Module):
@@ -38,6 +41,8 @@ class Model(nn.Module):
         super().__init__()
         self.model_type = config.model_type
         self.config = config
+        config.vision_config.text_hidden_size = config.text_config.hidden_size
+        config.audio_config.text_hidden_size = config.text_config.hidden_size
         self.language_model = LanguageModel(config.text_config)
         self.vision_tower = VisionModel(config.vision_config)
         self.audio_tower = AudioModel(config.audio_config)
@@ -134,12 +139,6 @@ class Model(nn.Module):
                 out[p + "e_score_correction_bias"] = v
             elif m in ("gate.global_scale", "global_scale"):
                 out[p + "global_scale"] = v
-            elif m == "experts.w13_weight":
-                g, u = _split_gate_up(v)
-                out[p + "switch_mlp.gate_proj.weight"] = g
-                out[p + "switch_mlp.up_proj.weight"] = u
-            elif m == "experts.w2_weight":
-                out[p + "switch_mlp.down_proj.weight"] = v
             elif m == "shared_experts.shared_w13_weight":
                 g, u = _split_gate_up(v)
                 out[p + "shared_experts.gate_proj.weight"] = g
@@ -158,10 +157,63 @@ class Model(nn.Module):
             out[base + sub] = v
         return out
 
+    def _map_experts(self, i, buf):
+        """Emit MLX-native switch-MLP weights for one MoE layer.
+
+        ``buf`` maps ``"w13"``/``"w2"`` to a dict of the raw checkpoint tensors
+        (``weight`` plus, when NVFP4-quantized, ``scale``/``scale2``). NVFP4
+        experts are stored as ModelOpt two-level nvfp4: uint8-packed E2M1 codes
+        (bit-identical to MLX's uint32 layout via ``view``), per-block E4M3
+        ``scale`` (already MLX's ``.scales`` byte layout), and a per-expert
+        ``scale2``. We pass the codes and block scales through untouched and
+        route ``scale2`` to ``InklingSwitchGLU`` (``gate_scale``/``out_scale``).
+        Layer ``dense_mlp_idx`` (the first MoE layer) is excluded from
+        quantization and arrives as bf16, handled by the plain-split branch.
+        """
+        out = {}
+        p = f"language_model.model.layers.{i}.mlp.switch_mlp."
+        w13, w2 = buf["w13"], buf["w2"]
+        quantized = w13["weight"].dtype == mx.uint8
+        if quantized:
+            gw, uw = _split_gate_up(w13["weight"].view(mx.uint32))
+            gs, us = _split_gate_up(w13["scale"])
+            out[p + "gate_proj.weight"] = gw
+            out[p + "gate_proj.scales"] = gs
+            out[p + "up_proj.weight"] = uw
+            out[p + "up_proj.scales"] = us
+            out[p + "down_proj.weight"] = w2["weight"].view(mx.uint32)
+            out[p + "down_proj.scales"] = w2["scale"]
+            s13 = w13["scale2"].astype(mx.float32)
+            s2 = w2["scale2"].astype(mx.float32)
+            out[p + "gate_scale"] = s13
+            out[p + "out_scale"] = s13 * s2
+        else:
+            gw, uw = _split_gate_up(w13["weight"])
+            out[p + "gate_proj.weight"] = gw
+            out[p + "up_proj.weight"] = uw
+            out[p + "down_proj.weight"] = w2["weight"]
+            n = gw.shape[0]
+            out[p + "gate_scale"] = mx.ones((n,))
+            out[p + "out_scale"] = mx.ones((n,))
+        return out
+
     def sanitize(self, weights):
         out = {}
+        experts = {}  # layer index -> {"w13"|"w2": {"weight"|"scale"|"scale2": array}}
         for k, v in weights.items():
             if ".mtp" in k or k.startswith("model.mtp") or k.endswith("training_args"):
+                continue
+            # Routed-expert tensors (base weight + NVFP4 sidecars) are buffered and
+            # folded per layer once both w13 and w2 are seen; input_amax /
+            # original_shape are calibration metadata with no inference use.
+            if ".mlp.experts.w13_weight" in k or ".mlp.experts.w2_weight" in k:
+                head, tail = k.split(".mlp.experts.")
+                i = head.split("layers.")[1]
+                which = "w13" if tail.startswith("w13") else "w2"
+                leaf = tail.split("_weight", 1)[1].lstrip(".") or "weight"
+                if leaf in ("input_amax", "original_shape"):
+                    continue
+                experts.setdefault(i, {}).setdefault(which, {})[leaf] = v
                 continue
             if k == "model.llm.embed.weight":
                 out["language_model.model.embed_tokens.weight"] = v
@@ -194,6 +246,8 @@ class Model(nn.Module):
                     out["audio_tower." + sub] = v
             else:
                 out[k] = v
+        for i, buf in experts.items():
+            out.update(self._map_experts(i, buf))
         return out
 
     def make_cache(self):
