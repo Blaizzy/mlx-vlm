@@ -262,9 +262,7 @@ class InklingSwitchGLU(SwitchGLU):
         x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x_gate = x_gate * self._per_expert(self.gate_scale, idx, x_gate)
-        x = self.down_proj(
-            self.activation(x_up, x_gate), idx, sorted_indices=do_sort
-        )
+        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
         x = x * self._per_expert(self.out_scale, idx, x)
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
