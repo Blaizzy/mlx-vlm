@@ -2320,6 +2320,16 @@ class TestNemotronHNanoOmniProcessor(unittest.TestCase):
         self.assertGreater(int(result["num_tokens"][0].item()), 0)
 
 
+class TestLagunaProcessor(unittest.TestCase):
+    def test_chat_template_owns_laguna_special_tokens(self):
+        from mlx_vlm.utils import should_add_special_tokens
+
+        processor = SimpleNamespace(chat_template="{{ messages }}")
+
+        self.assertFalse(should_add_special_tokens("laguna", processor))
+        self.assertTrue(should_add_special_tokens("llama", processor))
+
+
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
 

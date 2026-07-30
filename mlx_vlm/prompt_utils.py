@@ -46,6 +46,7 @@ MODEL_CONFIG = {
     "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -280,7 +281,15 @@ class MessageFormatter:
             "minicpmv4_6",
             "minimax_m3_vl",
         ] and kwargs.get("video"):
-            return self._format_video_message(prompt, role, **kwargs)
+            return self._format_video_message(
+                prompt,
+                role,
+                skip_image_token,
+                skip_audio_token,
+                num_images,
+                num_audios,
+                **kwargs,
+            )
 
         # Route to appropriate formatter
         formatter_map = {
@@ -516,6 +525,8 @@ class MessageFormatter:
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
         ]
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content.extend([MessageBuilder.audio_message()] * num_audios)
         content.append(MessageBuilder.text_message(prompt))
         return {"role": role, "content": content}
 

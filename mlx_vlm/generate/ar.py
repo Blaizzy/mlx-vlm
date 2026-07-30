@@ -27,7 +27,7 @@ from ..speculative.utils import (
     speculative_prefill_kwargs,
 )
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
-from ..utils import group_images_by_shape, prepare_inputs
+from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -2233,7 +2233,10 @@ class BatchGenerator:
         )
 
     def _apc_media_token_ids(self) -> set[int]:
-        return _apc.multimodal_token_ids_from_config(self.model.config)
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return set()
+        return _apc.multimodal_token_ids_from_config(config)
 
     def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
@@ -3043,11 +3046,7 @@ def _generate_batch(
         for i, p in enumerate(prompts)
     ]
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-        else True
-    )
+    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)

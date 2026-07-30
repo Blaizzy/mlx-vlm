@@ -2648,6 +2648,81 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(embeddings.inputs_embeds.shape, (1, 3, 64))
 
+    def test_mage_vl(self):
+        from mlx_vlm.models import mage_vl
+
+        text_config = mage_vl.TextConfig(
+            model_type="qwen3",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=10_000,
+            rope_theta=1000.0,
+            max_position_embeddings=1000,
+            tie_word_embeddings=False,
+        )
+        # hidden_size / heads must satisfy the 4:6:6 rope split (head_dim % 32 == 0).
+        vision_config = mage_vl.VisionConfig(
+            model_type="mage_vl_vision",
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            intermediate_size=256,
+            patch_size=16,
+            num_channels=3,
+            spatial_merge_size=2,
+            out_hidden_size=128,
+            frame_windows_size=4,
+            use_head=False,
+        )
+        config = mage_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="mage_vl",
+            image_token_id=151655,
+            video_token_id=151656,
+        )
+
+        model = mage_vl.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        # Image case: patches arrive pre-extracted in 2x2 block order,
+        # (num_patches, C * temporal_patch_size * patch_size^2) with tps = 1.
+        grid = [(1, 8, 8)]
+        num_patches = 8 * 8
+        pixel_values = mx.random.uniform(
+            shape=(num_patches, 3 * vision_config.patch_size**2)
+        )
+        positions = mage_vl.mage_vl._positions_from_grid(grid, vision_config)
+        hidden_states = model.vision_tower(pixel_values, positions, grid)
+        self.assertEqual(
+            hidden_states.shape,
+            (num_patches // 4, vision_config.out_hidden_size),
+        )
+
+        # Video case (t > 1) exercises the 4-frame block-diagonal attention windows.
+        grid = [(8, 4, 4)]
+        num_patches = 8 * 4 * 4
+        pixel_values = mx.random.uniform(
+            shape=(num_patches, 3 * vision_config.patch_size**2)
+        )
+        positions = mage_vl.mage_vl._positions_from_grid(grid, vision_config)
+        hidden_states = model.vision_tower(pixel_values, positions, grid)
+        self.assertEqual(
+            hidden_states.shape,
+            (num_patches // 4, vision_config.out_hidden_size),
+        )
+
     def test_qwen3_vl(self):
         from mlx_vlm.models import qwen3_vl
 
@@ -7885,7 +7960,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         self.assertEqual(mask, "causal")
 
-    def test_gemma4_unified_audio_tokens_keep_vision_mask_causal(self):
+    def test_gemma4_unified_audio_tokens_keep_vision_overlay(self):
         from mlx_vlm.models import gemma4_unified
         from mlx_vlm.models.gemma4.language import Gemma4TextModel
 
@@ -7911,7 +7986,9 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         mask = model._make_masks(hidden_states, [None], mm_token_type_ids)[0]
 
-        self.assertEqual(mask, "causal")
+        self.assertIsInstance(mask, mx.array)
+        self.assertTrue(bool(mask[0, 0, 1, 2].item()))
+        self.assertFalse(bool(mask[0, 0, 4, 5].item()))
 
     def test_glm4v_input_embeddings(self):
         from mlx_vlm.models import glm4v
