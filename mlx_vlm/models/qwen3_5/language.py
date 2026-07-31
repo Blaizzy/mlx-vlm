@@ -718,6 +718,14 @@ def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
     )
 
 
+def _qwen3_5_fully_padded_row_output(
+    hidden_states: mx.array, row: int, pad: int
+) -> mx.array:
+    """Return a shape-preserving placeholder for a row with no query tokens."""
+    empty_row = hidden_states[row : row + 1, pad:]
+    return _pad_row_time(empty_row, pad, hidden_states.shape[1])
+
+
 def _qwen3_5_left_padding_info(cache):
     left_padding = getattr(cache, "left_padding", None)
     if not (
@@ -1872,14 +1880,21 @@ class Qwen3_5Model(nn.Module):
                         else:
                             current_cache.append(_extract_row_cache(cache_entry, row))
 
-                    row_out = self(
-                        row_inputs,
-                        inputs_embeds=row_embeds,
-                        cache=current_cache,
-                        position_ids=row_position_ids,
-                    )
-                    if pad > 0:
-                        row_out = _pad_row_time(row_out, pad, h.shape[1])
+                    if pad >= h.shape[1]:
+                        # An exact APC hit can leave a row with no uncached query
+                        # tokens while another row in the same batch still needs
+                        # prefill. Do not recursively forward a zero-length sequence:
+                        # Qwen3.5 linear attention cannot infer its reshape dimension.
+                        row_out = _qwen3_5_fully_padded_row_output(h, row, pad)
+                    else:
+                        row_out = self(
+                            row_inputs,
+                            inputs_embeds=row_embeds,
+                            cache=current_cache,
+                            position_ids=row_position_ids,
+                        )
+                        if pad > 0:
+                            row_out = _pad_row_time(row_out, pad, h.shape[1])
                     row_outputs.append(row_out)
                     for i, cache_entry in enumerate(current_cache):
                         row_caches[i].append(cache_entry)
