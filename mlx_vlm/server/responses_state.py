@@ -415,6 +415,44 @@ def _response_call_to_chat_tool_call(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _response_tool_output_to_text(output: Any, images: List[Any]) -> str:
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return json.dumps(output, ensure_ascii=False)
+
+    text_parts = []
+    remaining_parts = []
+    image_count = 0
+    for part in output:
+        part = _as_plain_dict(part)
+        if not isinstance(part, dict):
+            remaining_parts.append(part)
+            continue
+        part_type = part.get("type")
+        if part_type in ("input_text", "output_text", "text"):
+            text_parts.append(str(part.get("text", "")))
+        elif part_type == "input_image":
+            image = part.get("image_url") or part.get("file_id")
+            if image:
+                images.append(image)
+                image_count += 1
+        elif part_type == "image_url":
+            image_url = part.get("image_url")
+            image = image_url.get("url") if isinstance(image_url, dict) else image_url
+            if image:
+                images.append(image)
+                image_count += 1
+        else:
+            remaining_parts.append(part)
+
+    if remaining_parts:
+        text_parts.append(json.dumps(remaining_parts, ensure_ascii=False))
+    if image_count and not any(part.strip() for part in text_parts):
+        text_parts.append("[Image output attached]")
+    return "\n".join(part for part in text_parts if part)
+
+
 def _append_response_item_to_prompt(
     item: Dict[str, Any],
     chat_messages: List[Dict[str, Any]],
@@ -465,8 +503,7 @@ def _append_response_item_to_prompt(
         "tool_result",
     ):
         output = item.get("output", item.get("content", ""))
-        if not isinstance(output, str):
-            output = json.dumps(output, ensure_ascii=False)
+        output = _response_tool_output_to_text(output, images)
         chat_messages.append(
             {
                 "role": "tool",
