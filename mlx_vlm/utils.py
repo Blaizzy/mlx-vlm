@@ -54,6 +54,10 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+# Tensors evaluated per mx.eval call while writing shards. Keeps each Metal
+# command buffer small enough to stay inside the IOGPU watchdog window.
+DEFAULT_EVAL_EVERY = 16
+
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
 SAFETENSORS_DTYPE_FALLBACKS = {"F8_E8M0": "U8"}
@@ -1274,16 +1278,38 @@ def save_weights(
     model: nn.Module,
     *,
     donate_weights: bool = False,
+    shard_gb: int = MAX_FILE_SIZE_GB,
+    eval_every: Optional[int] = DEFAULT_EVAL_EVERY,
 ) -> None:
-    """Save model weights into specified directory."""
+    """Save model weights into specified directory.
+
+    Args:
+        save_path: Directory to write the shards and index into.
+        model: Module whose parameters are saved.
+        donate_weights: Drop the model's references to its parameters so memory
+            can be reclaimed while shards are written.
+        shard_gb: Maximum size of each safetensors shard, in gigabytes.
+        eval_every: Number of tensors to force-evaluate per ``mx.eval`` call
+            before a shard is handed to ``mx.save_safetensors``. Lazily
+            quantized weights are otherwise all evaluated by the save itself,
+            as a single Metal command buffer that can exceed the IOGPU
+            watchdog window on large models. Pass ``None`` to skip the
+            incremental evaluation.
+    """
     if isinstance(save_path, str):
         save_path = Path(save_path)
+
+    if shard_gb < 1:
+        raise ValueError(f"shard_gb must be >= 1, got {shard_gb}")
+
+    if eval_every is not None and eval_every < 1:
+        raise ValueError(f"eval_every must be >= 1, got {eval_every}")
 
     weights = dict(tree_flatten(model.parameters()))
 
     save_path.mkdir(parents=True, exist_ok=True)
 
-    shards = make_shards(weights)
+    shards = make_shards(weights, max_file_size_gb=shard_gb)
     shards_count = len(shards)
     shard_file_format = (
         "model-{:05d}-of-{:05d}.safetensors"
@@ -1307,6 +1333,17 @@ def save_weights(
         shards[i] = None
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
+
+        # Evaluate the shard's tensors in small batches so that no single Metal
+        # command buffer is large enough to trip the GPU watchdog. Without this,
+        # mx.save_safetensors evaluates every lazily quantized tensor in the
+        # shard at once, which fails on large models with:
+        #   [METAL] Command buffer execution failed: Caused GPU Timeout
+        if eval_every is not None:
+            shard_arrays = list(shard.values())
+            for start in range(0, len(shard_arrays), eval_every):
+                mx.eval(shard_arrays[start : start + eval_every])
+            del shard_arrays
 
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 

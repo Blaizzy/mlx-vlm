@@ -9,6 +9,8 @@ import mlx.nn as nn
 from mlx.utils import tree_map_with_path
 
 from .utils import (
+    DEFAULT_EVAL_EVERY,
+    MAX_FILE_SIZE_GB,
     MODEL_CONVERSION_DTYPES,
     create_model_card,
     fetch_from_hub,
@@ -295,6 +297,8 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    shard_gb: int = MAX_FILE_SIZE_GB,
+    eval_every: Optional[int] = DEFAULT_EVAL_EVERY,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -388,7 +392,13 @@ def convert(
     if isinstance(mlx_path, str):
         mlx_path = Path(mlx_path)
 
-    save_weights(mlx_path, target, donate_weights=True)
+    save_weights(
+        mlx_path,
+        target,
+        donate_weights=True,
+        shard_gb=shard_gb,
+        eval_every=eval_every,
+    )
 
     # Copy Python and JSON files from the model path to the MLX path
     for pattern in ["*.py", "*.json"]:
@@ -534,6 +544,19 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Trust remote code.",
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--shard-gb",
+        help="Maximum size of each safetensors shard, in gigabytes.",
+        type=int,
+        default=MAX_FILE_SIZE_GB,
+    )
+    parser.add_argument(
+        "--eval-every",
+        help="Tensors to evaluate per batch while writing shards. Lower this if"
+        " saving a large model hits a Metal GPU timeout.",
+        type=int,
+        default=DEFAULT_EVAL_EVERY,
     )
     return parser
 

@@ -10,10 +10,12 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
+    MAX_FILE_SIZE_GB,
     StoppingCriteria,
     _load_safetensors,
     apply_generation_config_defaults,
@@ -23,9 +25,11 @@ from mlx_vlm.utils import (
     load_image,
     load_model,
     load_processor,
+    make_shards,
     prepare_inputs,
     process_inputs_with_fallback,
     sanitize_weights,
+    save_weights,
     update_module_configs,
 )
 
@@ -927,3 +931,126 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestSaveWeights:
+    """Covers shard sizing and the incremental evaluation that keeps Metal
+    command buffers inside the IOGPU watchdog window (see #1448)."""
+
+    @staticmethod
+    def _model(n_layers=5, dims=64):
+        class Stack(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = [nn.Linear(dims, dims) for _ in range(n_layers)]
+
+        return Stack()
+
+    def test_make_shards_respects_max_file_size(self):
+        gb = 1 << 30
+        weights = {f"w{i}": SimpleNamespace(nbytes=gb // 2) for i in range(6)}
+
+        assert len(make_shards(weights, max_file_size_gb=1)) == 3
+        assert len(make_shards(weights, max_file_size_gb=3)) == 1
+
+    def test_shard_gb_is_forwarded_to_make_shards(self, tmp_path):
+        model = self._model()
+
+        with patch("mlx_vlm.utils.make_shards", side_effect=make_shards) as mock_shards:
+            save_weights(tmp_path, model, shard_gb=2)
+
+        assert mock_shards.call_args.kwargs["max_file_size_gb"] == 2
+
+    def test_shard_gb_defaults_to_max_file_size_gb(self, tmp_path):
+        model = self._model()
+
+        with patch("mlx_vlm.utils.make_shards", side_effect=make_shards) as mock_shards:
+            save_weights(tmp_path, model)
+
+        assert mock_shards.call_args.kwargs["max_file_size_gb"] == MAX_FILE_SIZE_GB
+
+    def test_tensors_are_evaluated_in_batches(self, tmp_path):
+        # 5 Linear layers -> 10 tensors (weight + bias each).
+        model = self._model(n_layers=5)
+
+        with patch("mlx_vlm.utils.mx.eval", side_effect=mx.eval) as mock_eval:
+            save_weights(tmp_path, model, eval_every=4)
+
+        batch_sizes = [len(call.args[0]) for call in mock_eval.call_args_list]
+        assert batch_sizes == [4, 4, 2]
+
+    def test_eval_every_none_skips_incremental_eval(self, tmp_path):
+        model = self._model()
+
+        with patch("mlx_vlm.utils.mx.eval", side_effect=mx.eval) as mock_eval:
+            save_weights(tmp_path, model, eval_every=None)
+
+        mock_eval.assert_not_called()
+        assert (tmp_path / "model.safetensors").exists()
+
+    @pytest.mark.parametrize("eval_every", [0, -1])
+    def test_invalid_eval_every_raises(self, tmp_path, eval_every):
+        with pytest.raises(ValueError, match="eval_every must be >= 1"):
+            save_weights(tmp_path, self._model(), eval_every=eval_every)
+
+    @pytest.mark.parametrize("shard_gb", [0, -1])
+    def test_invalid_shard_gb_raises(self, tmp_path, shard_gb):
+        # make_shards would otherwise emit a leading empty shard.
+        with pytest.raises(ValueError, match="shard_gb must be >= 1"):
+            save_weights(tmp_path, self._model(), shard_gb=shard_gb)
+
+    def test_written_weights_do_not_depend_on_eval_every(self, tmp_path):
+        model = self._model()
+        expected = dict(tree_flatten(model.parameters()))
+
+        for eval_every in (None, 1, 3, 1000):
+            out = tmp_path / f"eval_{eval_every}"
+            save_weights(out, model, eval_every=eval_every)
+
+            written = mx.load(str(out / "model.safetensors"))
+            assert written.keys() == expected.keys()
+            for key, value in expected.items():
+                assert mx.array_equal(written[key], value), key
+
+    def test_index_and_metadata_are_written(self, tmp_path):
+        model = self._model()
+        weights = dict(tree_flatten(model.parameters()))
+
+        save_weights(tmp_path, model)
+
+        with open(tmp_path / "model.safetensors.index.json") as f:
+            index = json.load(f)
+
+        assert index["metadata"]["total_size"] == sum(
+            v.nbytes for v in weights.values()
+        )
+        assert set(index["weight_map"]) == set(weights)
+        assert set(index["weight_map"].values()) == {"model.safetensors"}
+        assert list(index["weight_map"]) == sorted(index["weight_map"])
+
+    def test_incremental_eval_works_with_donated_weights(self, tmp_path):
+        """convert() saves with donate_weights=True; the shard references must
+        still be evaluable after the model drops its own parameters."""
+        model = self._model()
+        expected = dict(tree_flatten(model.parameters()))
+
+        save_weights(tmp_path, model, donate_weights=True, eval_every=1)
+
+        written = mx.load(str(tmp_path / "model.safetensors"))
+        for key, value in expected.items():
+            assert mx.array_equal(written[key], value), key
+
+    def test_quantized_weights_survive_incremental_eval(self, tmp_path):
+        """The failing path in #1448: lazily quantized tensors are what
+        mx.save_safetensors would otherwise evaluate in one command buffer."""
+        model = self._model(n_layers=3)
+        nn.quantize(model, group_size=64, bits=4)
+        expected = dict(tree_flatten(model.parameters()))
+
+        save_weights(tmp_path, model, eval_every=2)
+
+        written = mx.load(str(tmp_path / "model.safetensors"))
+        assert any(k.endswith("scales") for k in written)
+        assert written.keys() == expected.keys()
+        for key, value in expected.items():
+            assert mx.array_equal(written[key], value), key
