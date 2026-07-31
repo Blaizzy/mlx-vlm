@@ -137,7 +137,9 @@ class InklingProcessor(ProcessorMixin):
     image_processor_class = "InklingImageProcessor"
     tokenizer_class = "AutoTokenizer"
 
-    def __init__(self, image_processor=None, tokenizer=None, chat_template=None, **kwargs):
+    def __init__(
+        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
+    ):
         self.image_token = IMAGE_TOKEN
         if image_processor is None:
             image_processor = InklingImageProcessor()
@@ -208,7 +210,9 @@ class InklingProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        names = self.tokenizer.model_input_names + self.image_processor.model_input_names
+        names = (
+            self.tokenizer.model_input_names + self.image_processor.model_input_names
+        )
         return list(dict.fromkeys(names))
 
     @classmethod
