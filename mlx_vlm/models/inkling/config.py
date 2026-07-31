@@ -32,8 +32,9 @@ class TextConfig(BaseModelConfig):
     sconv_kernel_size: int = 4
     dense_mlp_idx: int = 0
     mlp_layer_types: Optional[List[str]] = None
+    # inkling nomenclature uses intermediate_size for MoE, then dense_intermediate_size
     intermediate_size: int = 24576
-    moe_intermediate_size: int = 3072
+    dense_intermediate_size: Optional[int] = None
     n_routed_experts: int = 256
     num_experts_per_tok: int = 6
     n_shared_experts: int = 2
