@@ -1,4 +1,5 @@
 import mlx.core as mx
+import pytest
 
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.models.cache import ArraysCache, BatchKVCache, CacheList
@@ -167,3 +168,62 @@ def test_mtp_eval_state_skips_empty_kv_caches():
     state = drafter.draft_eval_state()
 
     assert len(state) == 4
+
+
+def test_dmel_bins_match_reference():
+    torch = pytest.importorskip("torch")
+    try:
+        from transformers.models.inkling.processing_inkling import (
+            InklingProcessor as HFInklingProcessor,
+        )
+    except Exception:
+        pytest.skip("transformers without inkling")
+    import numpy as np
+
+    from mlx_vlm.models.inkling.processing_inkling import (
+        DMEL_MAX_VALUE,
+        DMEL_MIN_VALUE,
+        NUM_DMEL_BINS,
+        dmel_bin_centers,
+        extract_dmel_bins,
+    )
+
+    centers = dmel_bin_centers()
+
+    class Reference:
+        bin_centers = torch.linspace(
+            DMEL_MIN_VALUE, DMEL_MAX_VALUE, NUM_DMEL_BINS, dtype=torch.float64
+        )
+        dmel_min_value = DMEL_MIN_VALUE
+        dmel_max_value = DMEL_MAX_VALUE
+
+    rng = np.random.default_rng(0)
+    random_mel = rng.normal(-2.0, 3.0, size=(2, 40, 80)).astype(np.float32)
+    # exact bin centers, values a hair off the midpoints, and out-of-range
+    # values that exercise the clamp (exact midpoints are excluded: numpy and
+    # torch linspace centers differ in the last ulp, and no clamped log-mel
+    # feature can land on a midpoint)
+    edges = np.concatenate(
+        [
+            centers,
+            (centers[:-1] + centers[1:]) / 2 + 1e-3,
+            (centers[:-1] + centers[1:]) / 2 - 1e-3,
+            [DMEL_MIN_VALUE - 5.0, DMEL_MAX_VALUE + 5.0],
+        ]
+    ).astype(np.float32)
+    for mel in (random_mel, edges.reshape(1, 1, -1)):
+        ours = extract_dmel_bins(mel, centers)
+        theirs = HFInklingProcessor._extract_dmel_bins(
+            Reference(), torch.from_numpy(mel)
+        )
+        assert ours.dtype == np.int32
+        assert np.array_equal(ours, theirs.numpy())
+
+
+def test_processor_audio_requires_feature_extractor():
+    from mlx_vlm.models.inkling.processing_inkling import InklingProcessor
+
+    proc = InklingProcessor.__new__(InklingProcessor)
+    proc.feature_extractor = None
+    with pytest.raises(ValueError, match="audio input is unavailable"):
+        InklingProcessor.__call__(proc, text="hi", audio=[[0.0] * 16000])

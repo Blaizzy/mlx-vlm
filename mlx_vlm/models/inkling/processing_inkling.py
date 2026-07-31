@@ -10,6 +10,7 @@ from typing import List, Optional, Union
 
 import mlx.core as mx
 import numpy as np
+import transformers
 from PIL import Image
 from transformers import AutoTokenizer
 from transformers.feature_extraction_utils import BatchFeature
@@ -24,6 +25,38 @@ OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
 IMAGE_TOKEN = "<|unused_200054|>"
 IMAGE_BOS_TOKEN = "<|content_image|>"
+AUDIO_TOKEN = "<|unused_200053|>"
+
+# dMel quantization defaults (match processor_config.json).
+NUM_DMEL_BINS = 16
+DMEL_MIN_VALUE = -7.0
+DMEL_MAX_VALUE = 2.0
+
+
+def dmel_bin_centers(
+    num_bins: int = NUM_DMEL_BINS,
+    min_value: float = DMEL_MIN_VALUE,
+    max_value: float = DMEL_MAX_VALUE,
+) -> np.ndarray:
+    return np.linspace(min_value, max_value, num_bins, dtype=np.float64)
+
+
+def extract_dmel_bins(
+    features,
+    bin_centers: np.ndarray,
+    min_value: float = DMEL_MIN_VALUE,
+    max_value: float = DMEL_MAX_VALUE,
+) -> np.ndarray:
+    """Quantize log-mel features to nearest-bin dMel token ids.
+
+    Same arithmetic as the reference processor (clamp then nearest bin center,
+    computed in float64), but in numpy so audio input does not require torch.
+    numpy and torch linspace centers can differ in their last ulp, which could
+    only matter for a feature value exactly midway between two centers; real
+    log-mel features never sit on that measure-zero set.
+    """
+    mel = np.clip(np.asarray(features, dtype=np.float64), min_value, max_value)
+    return np.abs(mel[..., None] - bin_centers).argmin(axis=-1).astype(np.int32)
 
 
 def divide_to_patches(image: np.ndarray, patch_size: int) -> List[np.ndarray]:
@@ -124,12 +157,13 @@ class InklingImageProcessor(BaseImageProcessor):
 
 
 class InklingProcessor(ProcessorMixin):
-    """Wraps the Inkling image processor and tokenizer.
+    """Wraps the Inkling image processor, audio feature extractor and tokenizer.
 
-    ``__call__`` expands the single image placeholder emitted by the chat
-    template into one ``image_token`` per patch, and tokenizes via ``encode``
-    (+ manual left/right padding) so it does not depend on the tokenizer having a
-    pad token configured.
+    ``__call__`` expands the single image (audio) placeholder emitted by the
+    chat template into one ``image_token`` per patch (``audio_token`` per dMel
+    frame), and tokenizes via ``encode`` (+ manual left/right padding) so it
+    does not depend on the tokenizer having a pad token configured. Audio is
+    quantized to dMel token ids in numpy; torch is not required.
     """
 
     attributes = ["image_processor", "tokenizer"]
@@ -138,17 +172,44 @@ class InklingProcessor(ProcessorMixin):
     tokenizer_class = "AutoTokenizer"
 
     def __init__(
-        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
+        self,
+        image_processor=None,
+        tokenizer=None,
+        chat_template=None,
+        audio_extractor=None,
+        num_dmel_bins: int = NUM_DMEL_BINS,
+        dmel_min_value: float = DMEL_MIN_VALUE,
+        dmel_max_value: float = DMEL_MAX_VALUE,
+        **kwargs,
     ):
         self.image_token = IMAGE_TOKEN
+        self.audio_token = AUDIO_TOKEN
+        self.num_dmel_bins = num_dmel_bins
+        self.dmel_min_value = dmel_min_value
+        self.dmel_max_value = dmel_max_value
+        self.bin_centers = dmel_bin_centers(
+            num_dmel_bins, dmel_min_value, dmel_max_value
+        )
         if image_processor is None:
             image_processor = InklingImageProcessor()
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        # Stored under the conventional name (callers probe
+        # `processor.feature_extractor` for the sampling rate), but the
+        # parameter must not be called that: ProcessorMixin derives its
+        # required arguments from modality keywords in the __init__ signature,
+        # and would demand a feature extractor for every checkpoint.
+        self.feature_extractor = audio_extractor
+
+    def _extract_dmel_bins(self, input_features) -> np.ndarray:
+        return extract_dmel_bins(
+            input_features, self.bin_centers, self.dmel_min_value, self.dmel_max_value
+        )
 
     def __call__(
         self,
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput]] = None,
+        audio=None,
         padding_side: str = "left",
         **kwargs,
     ) -> BatchFeature:
@@ -161,6 +222,34 @@ class InklingProcessor(ProcessorMixin):
         if images is not None:
             image_inputs = self.image_processor(images)
             num_patches = image_inputs.pop("num_patches")
+
+        audio_inputs = {}
+        num_audio_tokens = None
+        if audio is not None:
+            if self.feature_extractor is None:
+                raise ValueError(
+                    "This processor has no audio feature extractor (the "
+                    "checkpoint ships none, or the installed transformers "
+                    "predates Inkling); audio input is unavailable."
+                )
+            if not isinstance(audio, list):
+                audio = [audio]
+            fe_out = self.feature_extractor(
+                audio,
+                sampling_rate=getattr(self.feature_extractor, "sampling_rate", None),
+                return_tensors="np",
+            )
+            bins = self._extract_dmel_bins(fe_out["input_features"])
+            mask = fe_out.get("input_features_mask", fe_out.get("attention_mask"))
+            audio_inputs = {"audio_input_ids": mx.array(bins)}
+            if mask is not None:
+                mask = np.asarray(mask)
+                audio_inputs["audio_input_ids_mask"] = mx.array(mask)
+            # One audio soft token per valid dMel frame.
+            num_audio_tokens = [
+                int(mask[i].sum()) if mask is not None else int(bins[i].shape[-2])
+                for i in range(bins.shape[0])
+            ]
 
         if isinstance(text, str):
             text = [text]
@@ -181,6 +270,19 @@ class InklingProcessor(ProcessorMixin):
                     idx += 1
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
+        # Audio placeholders expand the same way, one token per dMel frame.
+        if num_audio_tokens is not None and text is not None:
+            idx = 0
+            for i in range(len(text)):
+                while self.audio_token in text[i]:
+                    text[i] = text[i].replace(
+                        self.audio_token,
+                        "<|placeholder|>" * num_audio_tokens[idx],
+                        1,
+                    )
+                    idx += 1
+                text[i] = text[i].replace("<|placeholder|>", self.audio_token)
+
         text_inputs = {}
         if text is not None:
             all_ids = [self.tokenizer.encode(t) for t in text]
@@ -200,7 +302,7 @@ class InklingProcessor(ProcessorMixin):
                 "attention_mask": mx.array(attention),
             }
 
-        return BatchFeature(data={**text_inputs, **image_inputs})
+        return BatchFeature(data={**text_inputs, **image_inputs, **audio_inputs})
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -249,10 +351,35 @@ class InklingProcessor(ProcessorMixin):
                 chat_template = jinja_path.read_text(encoding="utf-8")
                 tokenizer.chat_template = chat_template
 
+        # Audio: the checkpoint nests the feature-extractor config inside
+        # processor_config.json. Resolve the class from transformers by name;
+        # when it is missing (transformers predating Inkling) the processor
+        # still loads and raises a clear error only if audio arrives.
+        feature_extractor = None
+        dmel_kwargs = {}
+        proc_cfg_path = model_path / "processor_config.json"
+        if proc_cfg_path.exists():
+            proc_cfg = json.loads(proc_cfg_path.read_text())
+            dmel_kwargs = {
+                key: proc_cfg[key]
+                for key in ("num_dmel_bins", "dmel_min_value", "dmel_max_value")
+                if key in proc_cfg
+            }
+            fe_cfg = proc_cfg.get("feature_extractor")
+            if isinstance(fe_cfg, dict):
+                fe_cfg = dict(fe_cfg)
+                fe_cls = getattr(
+                    transformers, fe_cfg.pop("feature_extractor_type", ""), None
+                )
+                if fe_cls is not None:
+                    feature_extractor = fe_cls(**fe_cfg)
+
         return cls(
             image_processor=InklingImageProcessor(),
             tokenizer=tokenizer,
             chat_template=chat_template,
+            audio_extractor=feature_extractor,
+            **dmel_kwargs,
         )
 
 
