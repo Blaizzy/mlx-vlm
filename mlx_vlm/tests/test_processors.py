@@ -2320,6 +2320,16 @@ class TestNemotronHNanoOmniProcessor(unittest.TestCase):
         self.assertGreater(int(result["num_tokens"][0].item()), 0)
 
 
+class TestLagunaProcessor(unittest.TestCase):
+    def test_chat_template_owns_laguna_special_tokens(self):
+        from mlx_vlm.utils import should_add_special_tokens
+
+        processor = SimpleNamespace(chat_template="{{ messages }}")
+
+        self.assertFalse(should_add_special_tokens("laguna", processor))
+        self.assertTrue(should_add_special_tokens("llama", processor))
+
+
 # ── AutoProcessor patch tests ─────────────────────────────────────────────────
 
 
@@ -2377,6 +2387,161 @@ class TestKimiVLPatch(unittest.TestCase):
             "mlx_vlm.models.kimi_vl.processing_kimi_vl",
             "KimiVLProcessor",
         )
+
+
+class TestKimiK3Patch(unittest.TestCase):
+    def test_patch_intercepts(self):
+        _assert_patch_intercepts(
+            self,
+            "kimi_k3",
+            "mlx_vlm.models.kimi_k3.processing_kimi_k3",
+            "KimiK3Processor",
+        )
+
+
+class TestKimiK3Processor(unittest.TestCase):
+    @staticmethod
+    def _make_tokenizer():
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        class _Tokenizer(PreTrainedTokenizerBase):
+            """Mimics the K3 tokenizer: python chat renderer, no jinja template."""
+
+            model_input_names = ["input_ids", "attention_mask"]
+
+            def __init__(self):
+                super().__init__()
+                self.last_call = None
+
+            def convert_tokens_to_ids(self, token):
+                return 0
+
+            def encode(self, text):
+                return [1, 2, 3]
+
+            def apply_chat_template(
+                self, conversation, tokenize=False, add_generation_prompt=True
+            ):
+                self.last_call = {
+                    "tokenize": tokenize,
+                    "add_generation_prompt": add_generation_prompt,
+                }
+                return "rendered"
+
+            def save_pretrained(self, save_directory, **kwargs):
+                return ()
+
+        return _Tokenizer()
+
+    def _make_processor(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        return KimiK3Processor(tokenizer=self._make_tokenizer())
+
+    def test_advertises_chat_rendering_without_jinja_template(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _CHAT_TEMPLATE_SENTINEL
+
+        processor = self._make_processor()
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_no_sentinel_when_tokenizer_has_real_template(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        tokenizer.chat_template = "{{ messages }}"
+        processor = KimiK3Processor(tokenizer=tokenizer)
+        self.assertIsNone(processor.chat_template)
+
+    def test_apply_chat_template_drops_kwargs_the_renderer_cannot_take(self):
+        processor = self._make_processor()
+        result = processor.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        self.assertEqual(result, "rendered")
+        self.assertEqual(
+            processor.tokenizer.last_call,
+            {"tokenize": False, "add_generation_prompt": True},
+        )
+
+    def test_apply_chat_template_ignores_explicit_template_override(self):
+        processor = self._make_processor()
+        result = processor.apply_chat_template(
+            [{"role": "user", "content": "hi"}],
+            chat_template="{{ messages }}",
+        )
+        self.assertEqual(result, "rendered")
+        self.assertEqual(
+            processor.tokenizer.last_call,
+            {"tokenize": False, "add_generation_prompt": True},
+        )
+
+    def test_apply_chat_template_passes_kwargs_to_var_keyword_renderer(self):
+        processor = self._make_processor()
+        tokenizer = processor.tokenizer
+
+        def renderer(
+            conversation, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            tokenizer.last_call = {"enable_thinking": kwargs.get("enable_thinking")}
+            return "rendered"
+
+        tokenizer.apply_chat_template = renderer
+        processor.apply_chat_template(
+            [{"role": "user", "content": "hi"}], enable_thinking=False
+        )
+        self.assertEqual(tokenizer.last_call, {"enable_thinking": False})
+
+    def test_prompt_utils_uses_python_renderer_not_plain_fallback(self):
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        processor = self._make_processor()
+        result = apply_chat_template(
+            processor,
+            {"model_type": "kimi_k3"},
+            "Describe this image.",
+            num_images=1,
+        )
+        self.assertEqual(result, "rendered")
+
+    def test_save_pretrained_does_not_persist_the_sentinel(self):
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _CHAT_TEMPLATE_SENTINEL
+
+        processor = self._make_processor()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor.save_pretrained(tmpdir)
+            offenders = [f for f in os.listdir(tmpdir) if "chat_template" in f]
+            contents = {
+                name: (Path(tmpdir) / name).read_text()
+                for name in os.listdir(tmpdir)
+                if (Path(tmpdir) / name).is_file()
+            }
+        self.assertEqual(offenders, [])
+        for name, text in contents.items():
+            self.assertNotIn(_CHAT_TEMPLATE_SENTINEL, text, name)
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_save_pretrained_restores_sentinel_on_failure(self):
+        import tempfile
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _CHAT_TEMPLATE_SENTINEL
+
+        processor = self._make_processor()
+
+        def boom(save_directory, **kwargs):
+            raise RuntimeError("disk full")
+
+        processor.tokenizer.save_pretrained = boom
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaises(RuntimeError):
+                processor.save_pretrained(tmpdir)
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
 
 
 class TestPhi3VPatch(unittest.TestCase):

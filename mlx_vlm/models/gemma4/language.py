@@ -487,10 +487,6 @@ class Gemma4TextModel(nn.Module):
         """Create attention masks, deduplicated by layer type."""
         mask = {}
         masks = []
-        has_audio_tokens = (
-            mm_token_type_ids is not None
-            and int(mx.sum(mm_token_type_ids == 3).item()) > 0
-        )
         has_visual_tokens = (
             mm_token_type_ids is not None
             and int(mx.sum((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
@@ -502,7 +498,6 @@ class Gemma4TextModel(nn.Module):
             getattr(self.config, "use_bidirectional_attention", None) == "vision"
             and mm_token_type_ids is not None
             and has_visual_tokens
-            and not has_audio_tokens
             and h.shape[1] > 1
         )
         for l, c in zip(self.layers, cache):

@@ -649,6 +649,56 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        ValueError("Model type bert not supported."),
+        RuntimeError("Unable to initialize model."),
+    ],
+)
+def test_load_model_resources_returns_load_failure_as_bad_request(
+    monkeypatch, load_error
+):
+    def reject_model(*_args, **_kwargs):
+        raise load_error
+
+    monkeypatch.setattr(server_generation, "load", reject_model)
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server_generation.load_model_resources(
+            "google-bert/bert-base-multilingual-cased",
+            None,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == f"Failed to load model: {load_error}"
+
+
+def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
+    def reject_model(*_args, **_kwargs):
+        raise ValueError("Model type bert not supported.")
+
+    monkeypatch.setattr(server_generation, "load", reject_model)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "google-bert/bert-base-multilingual-cased",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Failed to load model: Model type bert not supported."
+    )
+    assert client.get("/health").status_code == 200
+
+
 def _unstarted_response_generator():
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model_path = "demo"
@@ -1227,6 +1277,70 @@ def test_management_endpoints_require_configured_api_key(
     assert valid.status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/messages"),
+        ("post", "/messages/count_tokens"),
+        ("post", "/responses/input_tokens"),
+        ("get", "/responses/missing"),
+        ("delete", "/responses/missing"),
+        ("post", "/responses/missing/cancel"),
+        ("get", "/responses/missing/input_items"),
+        ("post", "/responses"),
+        ("post", "/chat/completions"),
+        ("post", "/images/generations"),
+        ("post", "/images/edits"),
+        ("post", "/audio/speech"),
+        ("post", "/audio/transcriptions"),
+        ("post", "/audio/translations"),
+        ("get", "/models"),
+        ("post", "/v1/messages"),
+        ("post", "/v1/messages/count_tokens"),
+        ("post", "/v1/responses/input_tokens"),
+        ("get", "/v1/responses/missing"),
+        ("delete", "/v1/responses/missing"),
+        ("post", "/v1/responses/missing/cancel"),
+        ("get", "/v1/responses/missing/input_items"),
+        ("post", "/v1/responses"),
+        ("post", "/v1/chat/completions"),
+        ("post", "/v1/images/generations"),
+        ("post", "/v1/images/edits"),
+        ("post", "/v1/audio/speech"),
+        ("post", "/v1/audio/transcriptions"),
+        ("post", "/v1/audio/translations"),
+        ("get", "/v1/models"),
+    ],
+)
+def test_inference_endpoints_require_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    missing = getattr(client, method)(path)
+    invalid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert missing.headers["WWW-Authenticate"] == "Bearer"
+    assert invalid.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_inference_endpoint_accepts_configured_api_key(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret-token"},
+        json={},
+    )
+
+    assert response.status_code == 422
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
@@ -1760,6 +1874,61 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_budget"] == 24
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
     assert mock_generate.call_args.kwargs["thinking_end_token"] == "</think>"
+
+
+def test_responses_endpoint_merges_developer_message_with_instructions(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "instructions": "Top-level instructions.",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Developer instructions.",
+                            }
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Hello"}],
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2] == [
+        {
+            "role": "system",
+            "content": "Top-level instructions.\n\nDeveloper instructions.",
+        },
+        {"role": "user", "content": "Hello"},
+    ]
 
 
 @pytest.mark.parametrize(
