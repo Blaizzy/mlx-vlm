@@ -109,6 +109,14 @@ def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent):
     """rel: [B, LQ, H, d_rel]; proj: [d_rel, rel_extent] -> additive mask [B, H, LQ, S]."""
     B, LQ, H, d_rel = rel.shape
     dtype = rel.dtype
+    # Metal template args must be Python int/bool/Dtype. Batch engines (e.g.
+    # omlx) hand cache offsets over as numpy/mx scalars; coerce or the kernel
+    # rejects the template. Scalar Q_OFF also means a batch must share one
+    # offset — true today (per-request rows are padded to a common offset).
+    q_offset = int(q_offset)
+    S = int(S)
+    sliding = int(sliding)
+    rel_extent = int(rel_extent)
     if mx.default_device() == mx.gpu:
         return _mask_kernel(
             inputs=[rel, proj],
@@ -238,10 +246,16 @@ class InklingAttention(nn.Module):
         k = self.k_norm(k.reshape(B, L, self.n_kv, self.head_dim)).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.n_kv, self.head_dim).transpose(0, 2, 1, 3)
 
-        offset = kv.offset if kv is not None else 0
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         S = k.shape[2]
+        # Query positions derive from the post-update key length: the queries
+        # are always the last L of the S cached positions. Do NOT trust
+        # kv.offset here — batch cache implementations (e.g. an engine's
+        # BatchKVCache) disagree with plain KVCache by one on whether the
+        # in-flight token is counted, which shifts the whole relative-position
+        # band during decode and derails generation.
+        offset = S - L
 
         mask = banded_additive_mask(
             r, self.rel_proj.astype(x.dtype), offset, S, self.sliding, self.rel_extent
