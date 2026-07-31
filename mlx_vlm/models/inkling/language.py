@@ -327,17 +327,16 @@ class InklingAttention(nn.Module):
         self.log_floor = None if self.is_sliding else config.log_scaling_n_floor
         self.log_alpha = config.log_scaling_alpha
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, self.n_heads * self.head_dim, bias=False
+        # q/k/v/r share the input row; their weights are stacked at load
+        # (see fuse_qkvr) so decode does one matmul instead of four.
+        self.qkvr_dims = (
+            self.n_heads * self.head_dim,
+            self.n_kv * self.head_dim,
+            self.n_kv * self.head_dim,
+            self.n_heads * self.d_rel,
         )
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.n_kv * self.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.n_kv * self.head_dim, bias=False
-        )
-        self.r_proj = nn.Linear(
-            config.hidden_size, self.n_heads * self.d_rel, bias=False
+        self.qkvr_proj = nn.Linear(
+            config.hidden_size, sum(self.qkvr_dims), bias=False
         )
         self.o_proj = nn.Linear(
             self.n_heads * self.head_dim, config.hidden_size, bias=False
@@ -357,20 +356,25 @@ class InklingAttention(nn.Module):
         kv = cache[0] if cache is not None else None
         conv = cache[1] if cache is not None else None
 
-        q = self.q_proj(x)
-        k = self.k_sconv(self.k_proj(x), cache=conv, mask=conv_mask)
-        v = self.v_sconv(self.v_proj(x), cache=conv, mask=conv_mask)
-        r = self.r_proj(x).reshape(B, L, self.n_heads, self.d_rel)
-
-        q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
-            0, 2, 1, 3
+        qkvr = self.qkvr_proj(x)
+        dq, dk, dv, _ = self.qkvr_dims
+        k = self.k_sconv(qkvr[..., dq : dq + dk], cache=conv, mask=conv_mask)
+        v = self.v_sconv(
+            qkvr[..., dq + dk : dq + dk + dv], cache=conv, mask=conv_mask
         )
+
         k = self.k_norm(k.reshape(B, L, self.n_kv, self.head_dim)).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.n_kv, self.head_dim).transpose(0, 2, 1, 3)
 
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         S = k.shape[2]
+
+        q = qkvr[..., :dq]
+        r = qkvr[..., dq + dk + dv :].reshape(B, L, self.n_heads, self.d_rel)
+        q = self.q_norm(q.reshape(B, L, self.n_heads, self.head_dim)).transpose(
+            0, 2, 1, 3
+        )
         offset = S - L
 
         mask = banded_additive_mask(
@@ -596,6 +600,26 @@ class InklingSharedExpertsDense(nn.Module):
 
     def __call__(self, x, gamma):
         return self.down_proj(_swiglu_scaled(self.gate_proj(x), self.up_proj(x), gamma))
+
+
+def fuse_qkvr(weights):
+    """Stack per-layer q/k/v/r projection tensors (rows, plus scales/biases for
+    quantized checkpoints) into the single ``qkvr_proj``. Row-concat of
+    quantized matrices is exact: each output row keeps its own groups."""
+    out = dict(weights)
+    prefixes = {
+        k[: -len("q_proj.weight")]
+        for k in weights
+        if k.endswith(".self_attn.q_proj.weight")
+    }
+    for p in prefixes:
+        for leaf in ("weight", "scales", "biases"):
+            parts = [out.pop(f"{p}{n}_proj.{leaf}", None) for n in "qkvr"]
+            if all(v is not None for v in parts):
+                out[f"{p}qkvr_proj.{leaf}"] = mx.concatenate(parts, axis=0)
+            elif any(v is not None for v in parts):
+                raise ValueError(f"partial q/k/v/r {leaf} set under {p}")
+    return out
 
 
 def shared_experts_to_dense(weights):

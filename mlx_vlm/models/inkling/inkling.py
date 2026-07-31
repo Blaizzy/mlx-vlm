@@ -7,7 +7,7 @@ import numpy as np
 from ..base import InputEmbeddingsFeatures
 from .audio import AudioModel
 from .config import ModelConfig
-from .language import LanguageModel, shared_experts_to_dense
+from .language import LanguageModel, fuse_qkvr, shared_experts_to_dense
 from .vision import VisionModel
 
 
@@ -248,7 +248,7 @@ class Model(nn.Module):
                 out[k] = v
         for i, buf in experts.items():
             out.update(self._map_experts(i, buf))
-        return shared_experts_to_dense(out)
+        return fuse_qkvr(shared_experts_to_dense(out))
 
     def make_cache(self):
         return self.language_model.make_cache()

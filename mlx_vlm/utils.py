@@ -807,6 +807,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
+            # Projections fused at load (e.g. inkling qkvr_proj) inherit the
+            # per-path entry of their first constituent from checkpoints saved
+            # before the fusion existed.
+            if p.endswith(".qkvr_proj"):
+                alias = p[: -len("qkvr_proj")] + "q_proj"
+                if alias in config["quantization"]:
+                    return config["quantization"][alias]
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64

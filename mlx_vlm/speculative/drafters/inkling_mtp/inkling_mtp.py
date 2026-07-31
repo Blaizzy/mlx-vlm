@@ -10,6 +10,7 @@ from ....models.inkling.language import (
     InklingDecoderLayer,
     _restore_cache_state,
     _snapshot_cache_state,
+    fuse_qkvr,
     shared_experts_to_dense,
 )
 from .config import InklingMTPConfig
@@ -381,4 +382,4 @@ class InklingMTPDraftModel(nn.Module):
                     out[base + sub] = v
             else:
                 out[key] = v
-        return shared_experts_to_dense(out)
+        return fuse_qkvr(shared_experts_to_dense(out))
