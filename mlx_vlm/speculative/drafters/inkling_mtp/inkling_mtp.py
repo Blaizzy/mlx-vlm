@@ -176,7 +176,10 @@ class InklingMTPDraftModel(nn.Module):
     def draft_eval_state(self):
         state = [self._seed_token, self._seed_hidden]
         for cache in self._cache:
-            state.append(cache.state)
+            for subcache in cache.caches:
+                if getattr(subcache, "keys", False) is None:
+                    continue
+                state.append(subcache.state)
         return state
 
     def set_shared_kv(
