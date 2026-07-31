@@ -2,19 +2,23 @@ import asyncio
 import logging
 import os
 import time
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from fastapi import HTTPException
 from pydantic import BaseModel
 
+from ..prompt_utils import get_chat_template
+from ..utils import load_image, prepare_inputs
 from .runtime import runtime
 
 logger = logging.getLogger(__name__)
 
+InputItem = Union[str, Dict[str, Any]]
+
 
 class EmbeddingsRequest(BaseModel):
-    input: Union[str, List[str]]
+    input: Union[str, Dict[str, Any], List[InputItem]]
     model: Optional[str] = None
     encoding_format: Optional[str] = "float"
 
@@ -23,12 +27,41 @@ def _default_embedding_model() -> Optional[str]:
     return os.environ.get("MLX_VLM_PRELOAD_EMBEDDING_MODEL") or None
 
 
-def _normalize_input(value: Union[str, List[str]]) -> List[str]:
-    if isinstance(value, str):
+def _extract_image_url(item: InputItem) -> Optional[str]:
+    if isinstance(item, str):
+        return item if item.startswith("data:image/") else None
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        if item_type in ("image_url", "input_image"):
+            url = item.get("image_url", item.get("url"))
+            return url.get("url") if isinstance(url, dict) else url
+        if item_type == "image":
+            return item.get("image") or item.get("url")
+        if "image_url" in item:
+            url = item["image_url"]
+            return url.get("url") if isinstance(url, dict) else url
+        if "url" in item:
+            return item["url"]
+    return None
+
+
+def _normalize_input(value: Union[InputItem, List[InputItem]]) -> List[Tuple[str, str]]:
+    if isinstance(value, (str, dict)):
         value = [value]
-    if not value or any(not isinstance(item, str) for item in value):
-        raise ValueError("`input` must be a non-empty string or list of strings.")
-    return value
+    if not value:
+        raise ValueError("`input` must be a non-empty string, image, or list.")
+    items: List[Tuple[str, str]] = []
+    for item in value:
+        image_url = _extract_image_url(item)
+        if image_url is not None:
+            items.append(("image", image_url))
+        elif isinstance(item, str):
+            items.append(("text", item))
+        else:
+            raise ValueError(
+                "`input` items must be strings or image objects with a URL."
+            )
+    return items
 
 
 def _embed(model, processor, texts: List[str]):
@@ -51,6 +84,47 @@ def _embed(model, processor, texts: List[str]):
     return embeds.tolist(), int(enc["attention_mask"].sum())
 
 
+def _embed_image(model, processor, image_url: str):
+    if getattr(processor, "image_processor", None) is None:
+        raise ValueError("The loaded embedding model does not support image inputs.")
+    image = load_image(image_url)
+    messages = [{"role": "user", "content": [{"type": "image"}]}]
+    prompt = get_chat_template(processor, messages, add_generation_prompt=True)
+    image_token_index = getattr(
+        getattr(model, "config", None), "image_token_index", None
+    )
+    inputs = prepare_inputs(
+        processor,
+        images=[image],
+        prompts=prompt,
+        image_token_index=image_token_index,
+    )
+    if inputs.get("pixel_values") is None:
+        raise ValueError("The loaded embedding model does not support image inputs.")
+    out = model(**inputs)
+    embeds = getattr(out, "text_embeds", None)
+    if embeds is None:
+        raise ValueError("The loaded embedding model does not support image inputs.")
+    mx.eval(embeds)
+    mask = inputs.get("attention_mask")
+    tokens = int(mask.sum()) if mask is not None else 0
+    return embeds[0].tolist(), tokens
+
+
+def _embed_items(model, processor, items: List[Tuple[str, str]]):
+    vectors: List[Any] = [None] * len(items)
+    prompt_tokens = 0
+    for index, (kind, value) in enumerate(items):
+        if kind == "image":
+            vector, tokens = _embed_image(model, processor, value)
+        else:
+            batch, tokens = _embed(model, processor, [value])
+            vector = batch[0]
+        vectors[index] = vector
+        prompt_tokens += tokens
+    return vectors, prompt_tokens
+
+
 def register_routes(app, deps):
     get_cached_model = deps.get_cached_model
     build_metrics_envelope = deps.build_metrics_envelope
@@ -71,13 +145,15 @@ def register_routes(app, deps):
             endpoint="/v1/embeddings", model=model_id, stream=False
         )
         try:
-            texts = _normalize_input(body.input)
+            items = _normalize_input(body.input)
 
             def _work():
                 model, processor, *_ = get_cached_model(
                     model_id, model_kind="embedding"
                 )
-                return _embed(model, processor, texts)
+                if all(kind == "text" for kind, _ in items):
+                    return _embed(model, processor, [value for _, value in items])
+                return _embed_items(model, processor, items)
 
             vectors, prompt_tokens = await asyncio.to_thread(_work)
         except ValueError as exc:
