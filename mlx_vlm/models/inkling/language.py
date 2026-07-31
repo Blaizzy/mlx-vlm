@@ -184,6 +184,52 @@ def _next_conv_state(state, inputs, mask):
     return mx.take_along_axis(combined, indices, axis=1)
 
 
+_SCONV_SRC = r"""
+    uint c = thread_position_in_grid.x;   // channel
+    uint b = thread_position_in_grid.y;   // batch row
+    if (c >= C || b >= B) return;
+    float w0 = (float)w[c * K + 0];
+    float w1 = (float)w[c * K + 1];
+    float w2 = (float)w[c * K + 2];
+    float w3 = (float)w[c * K + 3];
+    // Virtual padded input xp = [state (K-1 rows, fp32); x (L rows, T)].
+    for (uint i = 0; i < L; ++i) {
+        float acc = 0.0f;
+        for (uint k = 0; k < K; ++k) {
+            int r = (int)(i + k) - (int)(K - 1);  // row into x; negative -> state
+            float v = (r < 0)
+                ? state[(b * (K - 1) + (uint)(r + (int)(K - 1))) * C + c]
+                : (float)x[(b * L + (uint)r) * C + c];
+            float wk = (k == 0) ? w0 : (k == 1) ? w1 : (k == 2) ? w2 : w3;
+            acc += wk * v;
+        }
+        // Match the unfused path's rounding: the conv emits bf16 (rounded)
+        // before the fp32 residual add; the layer residual is a second bf16
+        // add on top (as the decoder layer's x + sconv(r) was).
+        float conv_r = (float)((T)acc);
+        T inner = (T)(conv_r + (float)x[(b * L + i) * C + c]);
+        if (HAS_RES) {
+            out[(b * L + i) * C + c] =
+                (T)((float)inner + (float)res[(b * L + i) * C + c]);
+        } else {
+            out[(b * L + i) * C + c] = inner;
+        }
+    }
+    for (uint s = 0; s < K - 1; ++s) {
+        int r = (int)(L + s) - (int)(K - 1);
+        nstate[(b * (K - 1) + s) * C + c] = (r < 0)
+            ? state[(b * (K - 1) + (uint)(r + (int)(K - 1))) * C + c]
+            : (float)x[(b * L + (uint)r) * C + c];
+    }
+"""
+_sconv_kernel = mx.fast.metal_kernel(
+    name="inkling_sconv_decode",
+    input_names=["x", "state", "w", "res"],
+    output_names=["out", "nstate"],
+    source=_SCONV_SRC,
+)
+
+
 class InklingShortConvolution(nn.Module):
     """Depthwise causal 1-D conv over the previous ``kernel_size - 1`` states, plus a
     residual add. Kept in fp32 for stability (matches the reference). ``conv_idx`` selects
@@ -197,13 +243,52 @@ class InklingShortConvolution(nn.Module):
             channels, channels, kernel_size, groups=channels, bias=False
         )
 
-    def __call__(self, x: mx.array, cache=None, mask: Optional[mx.array] = None):
+    def __call__(
+        self,
+        x: mx.array,
+        cache=None,
+        mask: Optional[mx.array] = None,
+        residual: Optional[mx.array] = None,
+    ):
         dt = x.dtype
+        K = self.kernel_size
+        if (
+            cache is not None
+            and mask is None
+            and K == 4
+            and x.shape[1] <= 8
+            and mx.default_device() == mx.gpu
+        ):
+            B, L, C = x.shape
+            state = cache[self.conv_idx]
+            if state is None:
+                state = mx.zeros((B, K - 1, C), dtype=mx.float32)
+            out, nstate = _sconv_kernel(
+                inputs=[
+                    x,
+                    state,
+                    self.conv.weight.reshape(-1),
+                    residual if residual is not None else x,
+                ],
+                template=[
+                    ("T", dt),
+                    ("B", B),
+                    ("L", L),
+                    ("C", C),
+                    ("K", K),
+                    ("HAS_RES", residual is not None),
+                ],
+                grid=(_rup(C, 32), B, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(B, L, C), (B, K - 1, C)],
+                output_dtypes=[dt, mx.float32],
+            )
+            cache[self.conv_idx] = nstate
+            return out
         xf = x.astype(mx.float32)
         res = xf
         if mask is not None:
             xf = mx.where(mask[..., None], xf, 0)
-        K = self.kernel_size
         if cache is not None:
             state = cache[self.conv_idx]
             if state is None:
@@ -213,7 +298,8 @@ class InklingShortConvolution(nn.Module):
         else:
             xp = mx.pad(xf, [(0, 0), (K - 1, 0), (0, 0)])
         out = self.conv(xp.astype(self.conv.weight.dtype)).astype(mx.float32)
-        return (out + res).astype(dt)
+        out = (out + res).astype(dt)
+        return out if residual is None else residual + out
 
 
 class InklingAttention(nn.Module):
@@ -424,9 +510,9 @@ class InklingDecoderLayer(nn.Module):
         if conv_mask is None:
             conv_mask = _cache_padding_mask(conv, x.shape[1])
         r = self.self_attn(self.input_layernorm(x), cache=cache, conv_mask=conv_mask)
-        h = x + self.attn_sconv(r, cache=conv, mask=conv_mask)
+        h = self.attn_sconv(r, cache=conv, mask=conv_mask, residual=x)
         r = self.mlp(self.post_attention_layernorm(h))
-        out = h + self.mlp_sconv(r, cache=conv, mask=conv_mask)
+        out = self.mlp_sconv(r, cache=conv, mask=conv_mask, residual=h)
         if conv is not None:
             conv.advance(x.shape[1])
         return out
