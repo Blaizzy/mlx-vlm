@@ -23,11 +23,33 @@ def _clone_cache_tree(value):
     return value
 
 
+# Sentinel marking a KVCache that was empty (keys is None) at snapshot time.
+# KVCache.state raises on empty caches, and the deep-8 MTP drafter legitimately
+# snapshots blocks whose caches have never been written (only block 0 is fed
+# during prefill), so empties must round-trip through snapshot/restore.
+_EMPTY_KV = object()
+
+
+def _subcaches(c):
+    return getattr(c, "caches", None) or [c]
+
+
 def _snapshot_cache_state(caches):
     """Deep-copy the full state of every cache so a speculative block can be
     rolled back by replay. Inkling's short-conv slots keep only the last K-1
     inputs and cannot be trimmed, so we restore-and-replay instead."""
-    snapshot = [None if c is None else _clone_cache_tree(c.state) for c in caches]
+    snapshot = []
+    for c in caches:
+        if c is None:
+            snapshot.append(None)
+            continue
+        subs = []
+        for sc in _subcaches(c):
+            if getattr(sc, "keys", False) is None:
+                subs.append(_EMPTY_KV)
+            else:
+                subs.append(_clone_cache_tree(sc.state))
+        snapshot.append(subs)
     arrays = [v for _, v in tree_flatten(snapshot) if isinstance(v, mx.array)]
     if arrays:
         mx.eval(arrays)
@@ -36,8 +58,15 @@ def _snapshot_cache_state(caches):
 
 def _restore_cache_state(caches, snapshot):
     for c, s in zip(caches, snapshot):
-        if c is not None and s is not None:
-            c.state = _clone_cache_tree(s)
+        if c is None or s is None:
+            continue
+        for sc, ss in zip(_subcaches(c), s):
+            if ss is _EMPTY_KV:
+                sc.keys = None
+                sc.values = None
+                sc.offset = 0
+            else:
+                sc.state = _clone_cache_tree(ss)
 
 
 _MASK_SRC = r"""

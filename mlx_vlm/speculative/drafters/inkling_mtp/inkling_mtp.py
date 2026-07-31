@@ -176,7 +176,13 @@ class InklingMTPDraftModel(nn.Module):
     def draft_eval_state(self):
         state = [self._seed_token, self._seed_hidden]
         for cache in self._cache:
-            state.append(cache.state)
+            for c in cache.caches:
+                # KVCache.state raises on an empty cache (keys is None), and
+                # the first draft round runs before anything is appended —
+                # skip empties; there is nothing to synchronize on yet.
+                if getattr(c, "keys", False) is None:
+                    continue
+                state.append(c.state)
         return state
 
     def set_shared_kv(
