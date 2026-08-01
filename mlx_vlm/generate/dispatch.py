@@ -163,6 +163,13 @@ def parse_arguments():
         help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
+        "--video-max-frames",
+        type=int,
+        default=16,
+        help="Cap on frames sent when video falls back to ordered images "
+        "(long clips are re-sampled evenly to this count).",
+    )
+    parser.add_argument(
         "--resize-shape",
         type=int,
         nargs="+",
@@ -1382,9 +1389,22 @@ def main():
                             _np.transpose(f, (1, 2, 0)).astype("uint8")
                         )
                     )
+            sampled = len(frames)
+            max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
+            if sampled > max_frames:
+                # Long clips: keep frames evenly spaced across the full clip.
+                # Beyond a couple dozen near-identical frames, models start
+                # describing a static scene mixture instead of the sequence,
+                # so more frames costs tokens and loses the temporal thread.
+                idxs = [
+                    round(i * (sampled - 1) / (max_frames - 1))
+                    for i in range(max_frames)
+                ]
+                frames = [frames[i] for i in idxs]
             print(
                 f"{processor.__class__.__name__} has no native video support; "
-                f"sending {len(frames)} sampled frames as ordered images."
+                f"sending {len(frames)} of {sampled} sampled frames as "
+                f"ordered images."
             )
             args.image = (args.image or []) + frames
             args.video = None
