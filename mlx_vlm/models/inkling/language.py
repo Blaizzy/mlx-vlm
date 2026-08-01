@@ -403,9 +403,7 @@ class InklingAttention(nn.Module):
             self.n_kv * self.head_dim,
             self.n_heads * self.d_rel,
         )
-        self.qkvr_proj = nn.Linear(
-            config.hidden_size, sum(self.qkvr_dims), bias=False
-        )
+        self.qkvr_proj = nn.Linear(config.hidden_size, sum(self.qkvr_dims), bias=False)
         self.o_proj = nn.Linear(
             self.n_heads * self.head_dim, config.hidden_size, bias=False
         )
@@ -427,9 +425,7 @@ class InklingAttention(nn.Module):
         qkvr = self.qkvr_proj(x)
         dq, dk, dv, _ = self.qkvr_dims
         k = self.k_sconv(qkvr[..., dq : dq + dk], cache=conv, mask=conv_mask)
-        v = self.v_sconv(
-            qkvr[..., dq + dk : dq + dk + dv], cache=conv, mask=conv_mask
-        )
+        v = self.v_sconv(qkvr[..., dq + dk : dq + dk + dv], cache=conv, mask=conv_mask)
 
         k = self.k_norm(k.reshape(B, L, self.n_kv, self.head_dim)).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.n_kv, self.head_dim).transpose(0, 2, 1, 3)
