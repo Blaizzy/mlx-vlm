@@ -2153,7 +2153,13 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         draft_block_size=None,
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
-    processor = SimpleNamespace()
+    # A processor with native video support (a declared ``videos`` kwarg plus a
+    # video_processor component) forwards --video untouched; anything less
+    # diverts into the frames fallback.
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
 
     with (
         patch.object(dispatch_module, "parse_arguments", return_value=args),
@@ -2174,6 +2180,88 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
     assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
+
+
+def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+
+    args = Namespace(
+        model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
+        adapter_path=None,
+        image=None,
+        audio=None,
+        video=["clip.mp4"],
+        fps=1.0,
+        resize_shape=None,
+        prompt=["Describe this video."],
+        system=None,
+        max_tokens=8,
+        temperature=0.0,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        kv_quant_scheme="uniform",
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision=None,
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        gen_kwargs={},
+        prefill_step_size=None,
+        enable_thinking=False,
+        thinking_mode=None,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind=None,
+        draft_block_size=None,
+        video_max_frames=4,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    processor = SimpleNamespace()
+    frames = [object() for _ in range(6)]
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
+        patch.object(video_module, "sample_video_frames", return_value=(frames, 2.0)),
+        patch.object(
+            dispatch_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            dispatch_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        dispatch_module.main()
+
+    # 6 sampled frames capped to 4, sent as ordered images; --video is spent.
+    assert mock_apply_chat_template.call_args.kwargs["num_images"] == 4
+    assert "video" not in mock_apply_chat_template.call_args.kwargs
+    assert len(mock_generate.call_args.kwargs["image"]) == 4
+    assert mock_generate.call_args.kwargs["video"] is None
+    out = capsys.readouterr().out
+    assert "no native video support" in out
+    assert "4 of 6 sampled frames" in out
 
 
 def test_generate_image_cli_routes_before_vlm_load():
