@@ -24,6 +24,75 @@ OPENAI_CLIP_STD = [0.26862954, 0.26130258, 0.27577711]
 
 IMAGE_TOKEN = "<|unused_200054|>"
 IMAGE_BOS_TOKEN = "<|content_image|>"
+AUDIO_TOKEN = "<|unused_200053|>"
+AUDIO_BOS_TOKEN = "<|content_audio_input|>"
+
+NUM_DMEL_BINS = 16
+DMEL_MIN_VALUE = -7.0
+DMEL_MAX_VALUE = 2.0
+
+
+def dmel_bin_centers(
+    num_bins: int = NUM_DMEL_BINS,
+    min_value: float = DMEL_MIN_VALUE,
+    max_value: float = DMEL_MAX_VALUE,
+) -> np.ndarray:
+    return np.linspace(min_value, max_value, num_bins, dtype=np.float64)
+
+
+def dmel_bin_boundaries(
+    num_bins: int = NUM_DMEL_BINS,
+    min_value: float = DMEL_MIN_VALUE,
+    max_value: float = DMEL_MAX_VALUE,
+) -> mx.array:
+    centers = dmel_bin_centers(num_bins, min_value, max_value)
+    midpoints = (centers[:-1] + centers[1:]) / 2
+    boundaries = midpoints.astype(np.float32)
+
+    # Metal has no float64. Use the largest float32 value at or below each
+    # midpoint so a strict comparison preserves the reference's lower-bin ties.
+    rounded_up = boundaries.astype(np.float64) > midpoints
+    boundaries[rounded_up] = np.nextafter(boundaries[rounded_up], np.float32(-np.inf))
+    return mx.array(boundaries)
+
+
+def extract_dmel_bins(
+    input_features,
+    bin_boundaries: Optional[mx.array] = None,
+    min_value: float = DMEL_MIN_VALUE,
+    max_value: float = DMEL_MAX_VALUE,
+    max_frames_per_chunk: int = 1024,
+) -> mx.array:
+    if max_frames_per_chunk <= 0:
+        raise ValueError("max_frames_per_chunk must be positive")
+
+    boundaries = (
+        dmel_bin_boundaries(min_value=min_value, max_value=max_value)
+        if bin_boundaries is None
+        else bin_boundaries
+    )
+    mel = (
+        input_features
+        if isinstance(input_features, mx.array)
+        else mx.array(input_features)
+    )
+    mel = mx.clip(mel.astype(mx.float32), min_value, max_value)
+
+    def quantize(chunk):
+        bins = mx.zeros(chunk.shape, dtype=mx.int32)
+        for boundary in boundaries:
+            bins = bins + (chunk > boundary)
+        return bins
+
+    if mel.ndim < 2 or mel.shape[-2] <= max_frames_per_chunk:
+        return quantize(mel)
+
+    chunks = []
+    for start in range(0, mel.shape[-2], max_frames_per_chunk):
+        bins = quantize(mel[..., start : start + max_frames_per_chunk, :])
+        mx.eval(bins)
+        chunks.append(bins)
+    return mx.concatenate(chunks, axis=-2)
 
 
 def divide_to_patches(image: np.ndarray, patch_size: int) -> List[np.ndarray]:
@@ -124,12 +193,11 @@ class InklingImageProcessor(BaseImageProcessor):
 
 
 class InklingProcessor(ProcessorMixin):
-    """Wraps the Inkling image processor and tokenizer.
+    """Wraps Inkling audio/image preprocessing and tokenization.
 
-    ``__call__`` expands the single image placeholder emitted by the chat
-    template into one ``image_token`` per patch, and tokenizes via ``encode``
-    (+ manual left/right padding) so it does not depend on the tokenizer having a
-    pad token configured.
+    ``__call__`` expands media placeholders to match their image patches or
+    audio frames. Text is tokenized via ``encode`` with manual padding so no
+    tokenizer pad token is required.
     """
 
     attributes = ["image_processor", "tokenizer"]
@@ -138,22 +206,51 @@ class InklingProcessor(ProcessorMixin):
     tokenizer_class = "AutoTokenizer"
 
     def __init__(
-        self, image_processor=None, tokenizer=None, chat_template=None, **kwargs
+        self,
+        image_processor=None,
+        tokenizer=None,
+        chat_template=None,
+        image_token: str = IMAGE_TOKEN,
+        audio_token: str = AUDIO_TOKEN,
+        image_bos_token: str = IMAGE_BOS_TOKEN,
+        audio_bos_token: str = AUDIO_BOS_TOKEN,
+        num_dmel_bins: int = NUM_DMEL_BINS,
+        dmel_min_value: float = DMEL_MIN_VALUE,
+        dmel_max_value: float = DMEL_MAX_VALUE,
+        **kwargs,
     ):
-        self.image_token = IMAGE_TOKEN
+        from .audio_feature_extractor import InklingAudioFeatureExtractor
+
+        feature_extractor = kwargs.pop("feature_extractor", None)
+        self.image_token = image_token
+        self.audio_token = audio_token
+        self.image_bos_token = image_bos_token
+        self.audio_bos_token = audio_bos_token
+        self.num_dmel_bins = num_dmel_bins
+        self.dmel_min_value = dmel_min_value
+        self.dmel_max_value = dmel_max_value
+        self.bin_boundaries = dmel_bin_boundaries(
+            num_dmel_bins, dmel_min_value, dmel_max_value
+        )
         if image_processor is None:
             image_processor = InklingImageProcessor()
+        if feature_extractor is None:
+            feature_extractor = InklingAudioFeatureExtractor()
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
+        self.feature_extractor = feature_extractor
 
     def __call__(
         self,
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput]] = None,
+        audio=None,
         padding_side: str = "left",
         **kwargs,
     ) -> BatchFeature:
-        if images is None and text is None:
-            raise ValueError("You have to specify at least one of `images` or `text`.")
+        if images is None and text is None and audio is None:
+            raise ValueError(
+                "You have to specify at least one of `images`, `text`, or `audio`."
+            )
         kwargs.pop("return_tensors", None)
 
         image_inputs = {}
@@ -161,6 +258,38 @@ class InklingProcessor(ProcessorMixin):
         if images is not None:
             image_inputs = self.image_processor(images)
             num_patches = image_inputs.pop("num_patches")
+
+        audio_inputs = {}
+        num_audio_tokens = None
+        if audio is not None:
+            audio_kwargs = {
+                key: kwargs[key]
+                for key in (
+                    "sampling_rate",
+                    "padding",
+                    "max_length",
+                    "truncation",
+                    "pad_to_multiple_of",
+                )
+                if key in kwargs
+            }
+            extracted = self.feature_extractor(audio, **audio_kwargs)
+            audio_mask = extracted.get("input_features_mask")
+            audio_inputs = {
+                "audio_input_ids": extract_dmel_bins(
+                    extracted["input_features"],
+                    self.bin_boundaries,
+                    self.dmel_min_value,
+                    self.dmel_max_value,
+                ),
+                "audio_input_ids_mask": audio_mask,
+            }
+            if audio_mask is not None:
+                num_audio_tokens = audio_mask.sum(axis=1).tolist()
+            else:
+                num_audio_tokens = [
+                    audio_inputs["audio_input_ids"].shape[-2]
+                ] * audio_inputs["audio_input_ids"].shape[0]
 
         if isinstance(text, str):
             text = [text]
@@ -181,6 +310,18 @@ class InklingProcessor(ProcessorMixin):
                     idx += 1
                 text[i] = text[i].replace("<|placeholder|>", self.image_token)
 
+        if num_audio_tokens is not None and text is not None:
+            idx = 0
+            for i in range(len(text)):
+                while self.audio_token in text[i]:
+                    text[i] = text[i].replace(
+                        self.audio_token,
+                        "<|audio_placeholder|>" * int(num_audio_tokens[idx]),
+                        1,
+                    )
+                    idx += 1
+                text[i] = text[i].replace("<|audio_placeholder|>", self.audio_token)
+
         text_inputs = {}
         if text is not None:
             all_ids = [self.tokenizer.encode(t) for t in text]
@@ -200,7 +341,7 @@ class InklingProcessor(ProcessorMixin):
                 "attention_mask": mx.array(attention),
             }
 
-        return BatchFeature(data={**text_inputs, **image_inputs})
+        return BatchFeature(data={**text_inputs, **image_inputs, **audio_inputs})
 
     def batch_decode(self, *args, **kwargs):
         return self.tokenizer.batch_decode(*args, **kwargs)
@@ -210,13 +351,18 @@ class InklingProcessor(ProcessorMixin):
 
     @property
     def model_input_names(self):
-        names = (
-            self.tokenizer.model_input_names + self.image_processor.model_input_names
-        )
+        names = [
+            "audio_input_ids",
+            "audio_input_ids_mask",
+            *self.tokenizer.model_input_names,
+            *self.image_processor.model_input_names,
+        ]
         return list(dict.fromkeys(names))
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        from .audio_feature_extractor import InklingAudioFeatureExtractor
+
         kwargs.pop("trust_remote_code", None)
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
@@ -249,10 +395,38 @@ class InklingProcessor(ProcessorMixin):
                 chat_template = jinja_path.read_text(encoding="utf-8")
                 tokenizer.chat_template = chat_template
 
+        processor_config = {}
+        processor_config_path = model_path / "processor_config.json"
+        if processor_config_path.exists():
+            processor_config = json.loads(processor_config_path.read_text())
+        elif not is_local:
+            try:
+                from huggingface_hub import hf_hub_download
+
+                processor_config_path = Path(
+                    hf_hub_download(
+                        pretrained_model_name_or_path, "processor_config.json"
+                    )
+                )
+                processor_config = json.loads(processor_config_path.read_text())
+            except Exception:
+                pass
+
+        feature_config = dict(processor_config.get("feature_extractor", {}))
+        feature_config.pop("feature_extractor_type", None)
+
         return cls(
             image_processor=InklingImageProcessor(),
             tokenizer=tokenizer,
             chat_template=chat_template,
+            feature_extractor=InklingAudioFeatureExtractor(**feature_config),
+            image_token=processor_config.get("image_token", IMAGE_TOKEN),
+            audio_token=processor_config.get("audio_token", AUDIO_TOKEN),
+            image_bos_token=processor_config.get("image_bos_token", IMAGE_BOS_TOKEN),
+            audio_bos_token=processor_config.get("audio_bos_token", AUDIO_BOS_TOKEN),
+            num_dmel_bins=processor_config.get("num_dmel_bins", NUM_DMEL_BINS),
+            dmel_min_value=processor_config.get("dmel_min_value", DMEL_MIN_VALUE),
+            dmel_max_value=processor_config.get("dmel_max_value", DMEL_MAX_VALUE),
         )
 
 
