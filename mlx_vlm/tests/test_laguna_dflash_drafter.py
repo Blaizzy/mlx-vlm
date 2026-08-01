@@ -4,8 +4,6 @@ import pytest
 
 from mlx_vlm.speculative.drafters.laguna_dflash import ModelConfig
 from mlx_vlm.speculative.drafters.laguna_dflash.config import (
-    LAGUNA_DFLASH_AUX_LAYER_IDS,
-    LAGUNA_DFLASH_TARGET_LAYERS,
     expected_laguna_dflash_weight_shapes,
     validate_laguna_dflash_target,
     validate_laguna_dflash_weights,
@@ -30,12 +28,12 @@ def _config_dict():
         "sliding_windows": [512] * 6,
         "sliding_window": 512,
         "gating": "per-head",
-        "eagle_aux_hidden_state_layer_ids": LAGUNA_DFLASH_AUX_LAYER_IDS,
+        "eagle_aux_hidden_state_layer_ids": [2, 11, 20, 30, 39, 48],
         "dflash_config": {
             "block_size": 16,
             "mask_token_id": 12,
             "num_target_layers": 48,
-            "target_layer_ids": LAGUNA_DFLASH_TARGET_LAYERS,
+            "target_layer_ids": [1, 10, 19, 29, 38, 47],
             "causal": True,
         },
     }
@@ -59,38 +57,69 @@ def test_poolside_config_is_exact_and_has_six_aux_norms():
     assert len(config.aux_hidden_state_layer_ids) == 6
 
 
+def test_checkpoint_values_drive_the_contract_and_weight_shapes():
+    params = _config_dict()
+    params.update(
+        {
+            "hidden_size": 4096,
+            "intermediate_size": 16384,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 100480,
+            "draft_vocab_size": 100480,
+            "layer_types": ["sliding_attention"] * 4,
+            "sliding_windows": [1024] * 4,
+            "sliding_window": 1024,
+            "eagle_aux_hidden_state_layer_ids": [2, 18, 34, 50],
+        }
+    )
+    params["dflash_config"].update(
+        {
+            "block_size": 8,
+            "mask_token_id": 17,
+            "num_target_layers": 64,
+            "target_layer_ids": [1, 17, 33, 49],
+        }
+    )
+
+    config = ModelConfig.from_dict(params)
+
+    assert config.hidden_size == 4096
+    assert config.num_hidden_layers == 4
+    assert config.target_layer_ids == [1, 17, 33, 49]
+    assert expected_laguna_dflash_weight_shapes(config)["fc.weight"] == (4096, 16384)
+
+
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("mutate", "message"),
     [
-        ("hidden_size", 3076),
-        ("num_hidden_layers", 5),
-        ("num_attention_heads", 64),
-        ("num_key_value_heads", 4),
-        ("head_dim", 64),
-        ("sliding_window", 256),
-        ("gating", "per-element"),
-        ("block_size", 8),
-        ("mask_token_id", 0),
-        ("num_target_layers", 47),
-        ("vocab_size", 100351),
-        ("draft_vocab_size", 100350),
-        ("layer_types", ["full_attention"] * 6),
-        ("target_layer_ids", [1, 10, 19, 29, 38, 46]),
+        (
+            lambda params: params.pop("hidden_size"),
+            "missing checkpoint fields: hidden_size",
+        ),
+        (
+            lambda params: params["dflash_config"].pop("target_layer_ids"),
+            "missing dflash_config fields: target_layer_ids",
+        ),
+        (
+            lambda params: params.update({"layer_types": ["full_attention"] * 6}),
+            "sliding_attention",
+        ),
+        (
+            lambda params: params["dflash_config"].update(
+                {"target_layer_ids": [1, 10, 19, 29, 38, 48]}
+            ),
+            "target_layer_ids",
+        ),
     ],
 )
-def test_config_mismatch_is_rejected(field, value):
+def test_malformed_checkpoint_contract_is_rejected(mutate, message):
     params = _config_dict()
-    if field in {
-        "block_size",
-        "mask_token_id",
-        "num_target_layers",
-        "target_layer_ids",
-    }:
-        params["dflash_config"][field] = value
-    else:
-        params[field] = value
+    mutate(params)
 
-    with pytest.raises(ValueError, match="Laguna S 2.1 DFlash"):
+    with pytest.raises(ValueError, match=message):
         ModelConfig.from_dict(params)
 
 

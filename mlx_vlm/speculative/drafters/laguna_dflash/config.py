@@ -4,19 +4,31 @@ from typing import Any, Mapping, Optional
 
 from ....models.base import BaseModelConfig
 
-LAGUNA_DFLASH_HIDDEN_SIZE = 3072
-LAGUNA_DFLASH_INTERMEDIATE_SIZE = 12288
-LAGUNA_DFLASH_NUM_LAYERS = 6
-LAGUNA_DFLASH_NUM_ATTENTION_HEADS = 72
-LAGUNA_DFLASH_NUM_KV_HEADS = 8
-LAGUNA_DFLASH_HEAD_DIM = 128
-LAGUNA_DFLASH_SLIDING_WINDOW = 512
-LAGUNA_DFLASH_VOCAB_SIZE = 100352
-LAGUNA_DFLASH_BLOCK_SIZE = 16
-LAGUNA_DFLASH_MASK_TOKEN_ID = 12
-LAGUNA_DFLASH_TARGET_LAYERS = [1, 10, 19, 29, 38, 47]
-LAGUNA_DFLASH_TARGET_LAYER_COUNT = 48
-LAGUNA_DFLASH_AUX_LAYER_IDS = [2, 11, 20, 30, 39, 48]
+_REQUIRED_CHECKPOINT_FIELDS = {
+    "model_type",
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "vocab_size",
+    "draft_vocab_size",
+    "max_position_embeddings",
+    "rope_theta",
+    "layer_types",
+    "sliding_windows",
+    "sliding_window",
+    "gating",
+    "eagle_aux_hidden_state_layer_ids",
+}
+_REQUIRED_DFLASH_FIELDS = {
+    "block_size",
+    "mask_token_id",
+    "target_layer_ids",
+    "num_target_layers",
+    "causal",
+}
 
 
 def _value(source: Any, key: str, default: Any = None) -> Any:
@@ -39,6 +51,12 @@ def _target_vocab_size(config: Any) -> Optional[int]:
         if value is not None:
             return int(value)
     return None
+
+
+def _is_strictly_increasing_ints(values: list[int]) -> bool:
+    return all(isinstance(value, int) for value in values) and values == sorted(
+        set(values)
+    )
 
 
 def validate_laguna_dflash_target(
@@ -74,93 +92,102 @@ def validate_laguna_dflash_target(
 
 @dataclass
 class DFlashConfig(BaseModelConfig):
-    """Exact configuration contract for Poolside Laguna S 2.1 DFlash."""
+    """Validated DFlash checkpoint metadata for a Laguna target."""
 
-    model_type: str = "laguna"
-    hidden_size: int = LAGUNA_DFLASH_HIDDEN_SIZE
-    intermediate_size: int = LAGUNA_DFLASH_INTERMEDIATE_SIZE
-    num_hidden_layers: int = LAGUNA_DFLASH_NUM_LAYERS
-    num_attention_heads: int = LAGUNA_DFLASH_NUM_ATTENTION_HEADS
-    num_key_value_heads: int = LAGUNA_DFLASH_NUM_KV_HEADS
-    head_dim: int = LAGUNA_DFLASH_HEAD_DIM
+    model_type: str = ""
+    hidden_size: int = 0
+    intermediate_size: int = 0
+    num_hidden_layers: int = 0
+    num_attention_heads: int = 0
+    num_key_value_heads: int = 0
+    head_dim: int = 0
     rms_norm_eps: float = 1e-6
-    vocab_size: int = LAGUNA_DFLASH_VOCAB_SIZE
-    draft_vocab_size: int = LAGUNA_DFLASH_VOCAB_SIZE
-    max_position_embeddings: int = 1048576
-    rope_theta: float = 500000.0
+    vocab_size: int = 0
+    draft_vocab_size: int = 0
+    max_position_embeddings: int = 0
+    rope_theta: float = 0.0
     rope_parameters: Optional[dict[str, Any]] = None
-    layer_types: list[str] = field(
-        default_factory=lambda: ["sliding_attention"] * LAGUNA_DFLASH_NUM_LAYERS
-    )
-    sliding_windows: list[int] = field(
-        default_factory=lambda: [LAGUNA_DFLASH_SLIDING_WINDOW]
-        * LAGUNA_DFLASH_NUM_LAYERS
-    )
-    sliding_window: int = LAGUNA_DFLASH_SLIDING_WINDOW
-    gating: str = "per-head"
-    block_size: int = LAGUNA_DFLASH_BLOCK_SIZE
-    mask_token_id: int = LAGUNA_DFLASH_MASK_TOKEN_ID
-    target_layer_ids: list[int] = field(
-        default_factory=lambda: list(LAGUNA_DFLASH_TARGET_LAYERS)
-    )
-    num_target_layers: int = LAGUNA_DFLASH_TARGET_LAYER_COUNT
-    aux_hidden_state_layer_ids: list[int] = field(
-        default_factory=lambda: list(LAGUNA_DFLASH_AUX_LAYER_IDS)
-    )
-    causal: bool = True
+    layer_types: list[str] = field(default_factory=list)
+    sliding_windows: list[int] = field(default_factory=list)
+    sliding_window: int = 0
+    gating: str = ""
+    block_size: int = 0
+    mask_token_id: int = -1
+    target_layer_ids: list[int] = field(default_factory=list)
+    num_target_layers: int = 0
+    aux_hidden_state_layer_ids: list[int] = field(default_factory=list)
+    causal: bool = False
     attention_bias: bool = False
     qkv_bias: bool = False
     tie_word_embeddings: bool = True
 
     def validate(self) -> None:
-        expected = {
-            "hidden_size": LAGUNA_DFLASH_HIDDEN_SIZE,
-            "intermediate_size": LAGUNA_DFLASH_INTERMEDIATE_SIZE,
-            "num_hidden_layers": LAGUNA_DFLASH_NUM_LAYERS,
-            "num_attention_heads": LAGUNA_DFLASH_NUM_ATTENTION_HEADS,
-            "num_key_value_heads": LAGUNA_DFLASH_NUM_KV_HEADS,
-            "head_dim": LAGUNA_DFLASH_HEAD_DIM,
-            "sliding_window": LAGUNA_DFLASH_SLIDING_WINDOW,
-            "gating": "per-head",
-            "block_size": LAGUNA_DFLASH_BLOCK_SIZE,
-            "mask_token_id": LAGUNA_DFLASH_MASK_TOKEN_ID,
-            "num_target_layers": LAGUNA_DFLASH_TARGET_LAYER_COUNT,
-            "vocab_size": LAGUNA_DFLASH_VOCAB_SIZE,
-            "draft_vocab_size": LAGUNA_DFLASH_VOCAB_SIZE,
-        }
-        for key, expected_value in expected.items():
-            actual = getattr(self, key)
-            if actual != expected_value:
-                raise ValueError(
-                    f"Laguna S 2.1 DFlash {key} mismatch: expected "
-                    f"{expected_value!r}, got {actual!r}."
-                )
-
         if self.model_type != "laguna":
             raise ValueError(
-                f"Laguna S 2.1 DFlash requires model_type='laguna', got {self.model_type!r}."
+                f"Laguna DFlash requires model_type='laguna', got {self.model_type!r}."
             )
-        if self.layer_types != ["sliding_attention"] * LAGUNA_DFLASH_NUM_LAYERS:
+        positive_fields = (
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "vocab_size",
+            "draft_vocab_size",
+            "max_position_embeddings",
+            "sliding_window",
+            "block_size",
+            "num_target_layers",
+        )
+        for key in positive_fields:
+            if not isinstance(getattr(self, key), int) or getattr(self, key) <= 0:
+                raise ValueError(f"Laguna DFlash requires a positive integer {key}.")
+        if not 0 <= self.mask_token_id < self.vocab_size:
             raise ValueError(
-                "Laguna S 2.1 DFlash requires all six draft layers to use "
-                "sliding_attention."
+                "Laguna DFlash mask_token_id must be inside the draft vocabulary."
             )
-        if (
-            self.sliding_windows
-            != [LAGUNA_DFLASH_SLIDING_WINDOW] * LAGUNA_DFLASH_NUM_LAYERS
+        if self.num_key_value_heads > self.num_attention_heads:
+            raise ValueError(
+                "Laguna DFlash num_key_value_heads cannot exceed num_attention_heads."
+            )
+        if self.gating != "per-head":
+            raise ValueError("Laguna DFlash currently supports per-head gating only.")
+        if len(self.layer_types) != self.num_hidden_layers or any(
+            layer_type != "sliding_attention" for layer_type in self.layer_types
         ):
             raise ValueError(
-                "Laguna S 2.1 DFlash requires a 512 sliding window for every draft layer."
+                "Laguna DFlash requires one sliding_attention layer type per draft layer."
             )
-        if self.target_layer_ids != LAGUNA_DFLASH_TARGET_LAYERS:
+        if len(self.sliding_windows) != self.num_hidden_layers or any(
+            window != self.sliding_window for window in self.sliding_windows
+        ):
             raise ValueError(
-                "Laguna S 2.1 DFlash target_layer_ids mismatch: expected "
-                f"{LAGUNA_DFLASH_TARGET_LAYERS}, got {self.target_layer_ids}."
+                "Laguna DFlash requires one matching sliding window per draft layer."
             )
-        if self.aux_hidden_state_layer_ids != LAGUNA_DFLASH_AUX_LAYER_IDS:
+        if (
+            len(self.target_layer_ids) != self.num_hidden_layers
+            or not _is_strictly_increasing_ints(self.target_layer_ids)
+            or any(
+                layer_id < 0 or layer_id >= self.num_target_layers
+                for layer_id in self.target_layer_ids
+            )
+        ):
             raise ValueError(
-                "Laguna S 2.1 DFlash auxiliary layer IDs mismatch: expected "
-                f"{LAGUNA_DFLASH_AUX_LAYER_IDS}, got {self.aux_hidden_state_layer_ids}."
+                "Laguna DFlash target_layer_ids must be unique, increasing target-layer "
+                "indices with one capture per draft layer."
+            )
+        if (
+            len(self.aux_hidden_state_layer_ids) != self.num_hidden_layers
+            or not _is_strictly_increasing_ints(self.aux_hidden_state_layer_ids)
+            or any(
+                layer_id < 0 or layer_id > self.num_target_layers
+                for layer_id in self.aux_hidden_state_layer_ids
+            )
+        ):
+            raise ValueError(
+                "Laguna DFlash auxiliary layer IDs must be unique, increasing, and "
+                "compatible with the target-layer count."
             )
         if not self.causal:
             raise ValueError("Laguna S 2.1 DFlash requires causal block attention.")
@@ -176,6 +203,18 @@ class DFlashConfig(BaseModelConfig):
         dflash = raw.pop("dflash_config", None)
         if not isinstance(dflash, Mapping):
             raise ValueError("Laguna DFlash config requires a dflash_config object.")
+        missing = sorted(_REQUIRED_CHECKPOINT_FIELDS - set(raw))
+        if missing:
+            raise ValueError(
+                "Laguna DFlash config is missing checkpoint fields: "
+                f"{', '.join(missing)}."
+            )
+        missing = sorted(_REQUIRED_DFLASH_FIELDS - set(dflash))
+        if missing:
+            raise ValueError(
+                "Laguna DFlash config is missing dflash_config fields: "
+                f"{', '.join(missing)}."
+            )
 
         merged = dict(raw)
         for key in (
