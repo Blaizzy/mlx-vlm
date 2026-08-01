@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mlx_vlm.speculative.drafters import validate_drafter_compatibility
 from mlx_vlm.speculative.drafters.laguna_dflash import ModelConfig
 from mlx_vlm.speculative.drafters.laguna_dflash.config import (
     expected_laguna_dflash_weight_shapes,
@@ -144,6 +145,30 @@ def test_target_layer_count_and_tokenizer_length_are_checked():
             target_model_config=target,
             target_tokenizer_length=100351,
         )
+
+
+def test_generic_drafter_gate_invokes_laguna_target_validation():
+    from mlx_vlm.speculative.drafters.laguna_dflash import LagunaDFlashDraftModel
+
+    draft = LagunaDFlashDraftModel(ModelConfig.from_dict(_config_dict()))
+    target = SimpleNamespace(
+        config=SimpleNamespace(num_hidden_layers=48, vocab_size=100352),
+        model=SimpleNamespace(layers=[object()] * 48),
+    )
+
+    validate_drafter_compatibility(target, draft, "dflash")
+    target.model.layers.pop()
+    with pytest.raises(ValueError, match="layer count"):
+        validate_drafter_compatibility(target, draft, "dflash")
+
+
+def test_generic_model_loader_selects_laguna_dflash_backend():
+    from mlx_vlm.utils import get_model_and_args
+
+    architecture, model_type = get_model_and_args(_config_dict())
+
+    assert model_type == "laguna_dflash"
+    assert architecture.Model.__name__ == "LagunaDFlashDraftModel"
 
 
 def test_published_weight_keys_and_shapes_are_explicit():
