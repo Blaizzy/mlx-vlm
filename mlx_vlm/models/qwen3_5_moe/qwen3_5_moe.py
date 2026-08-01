@@ -23,10 +23,10 @@ class Model(Qwen3_5Model):
         self.language_model = LanguageModel(config.text_config, config)
 
     def sanitize(self, weights):
-        shift_norm_weights = should_shift_norm_weights(weights)
-
-        # ignore mtp weights
+        # The MTP draft shard is separate from the base model. Its presence
+        # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
