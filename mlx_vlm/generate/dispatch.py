@@ -1361,6 +1361,7 @@ def main():
     # kwarg, and the model hallucinated an answer with no visual input at all.
     # Fall back to sampling the video into frames and sending them as ordered
     # images, which any image-capable model handles.
+    gen_kwargs_extra = {}
     if args.video:
         import inspect as _inspect
 
@@ -1391,22 +1392,57 @@ def main():
                     )
             sampled = len(frames)
             max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
-            if sampled > max_frames:
-                # Long clips: keep frames evenly spaced across the full clip.
-                # Beyond a couple dozen near-identical frames, models start
-                # describing a static scene mixture instead of the sequence,
-                # so more frames costs tokens and loses the temporal thread.
-                idxs = [
-                    round(i * (sampled - 1) / (max_frames - 1))
-                    for i in range(max_frames)
+            if getattr(model.config, "model_type", "") == "inkling_mm_model":
+                # Inkling's patches are temporal pairs [P, T=2, H, W, C] and
+                # the image processor duplicates a still into both slots.
+                # Feed the video natively instead: consecutive frame pairs
+                # become one image entity each (even frame goes through the
+                # standard still path; the odd frame's patches are spliced
+                # into temporal slot 1 by the model). Halves the token cost
+                # of the plain fallback and gives the encoder real motion.
+                # Pair ADJACENT sampled frames (small displacement between
+                # the two temporal slots, matching how consecutive video
+                # frames relate) at evenly spaced anchor points across the
+                # FULL sampled sequence. Pairing temporally distant frames
+                # into one patch reads as a double exposure instead of motion.
+                if len(frames) % 2:
+                    frames.append(frames[-1])
+                n_pairs = max(2, min(max_frames, len(frames) // 2))
+                anchors = [
+                    min(round(i * (len(frames) - 2) / max(n_pairs - 1, 1)), len(frames) - 2)
+                    for i in range(n_pairs)
                 ]
-                frames = [frames[i] for i in idxs]
-            print(
-                f"{processor.__class__.__name__} has no native video support; "
-                f"sending {len(frames)} of {sampled} sampled frames as "
-                f"ordered images."
-            )
-            args.image = (args.image or []) + frames
+                evens = [frames[a] for a in anchors]
+                odds = [frames[a + 1] for a in anchors]
+                odd_feats = processor.image_processor.preprocess(
+                    images=odds, return_tensors="np"
+                )["pixel_values"]
+                gen_kwargs_extra["video_temporal_pixels"] = mx.array(
+                    _np.asarray(odd_feats)[:, 0]
+                )
+                args.image = (args.image or []) + evens
+                print(
+                    f"inkling native video: {len(evens)} temporal pairs "
+                    f"({odd_feats.shape[0]} patches carry frame 2 of each pair)."
+                )
+            else:
+                if sampled > max_frames:
+                    # Long clips: keep frames evenly spaced across the clip.
+                    # Beyond a couple dozen near-identical frames, models
+                    # start describing a static scene mixture instead of the
+                    # sequence, so more frames costs tokens and loses the
+                    # temporal thread.
+                    idxs = [
+                        round(i * (sampled - 1) / (max_frames - 1))
+                        for i in range(max_frames)
+                    ]
+                    frames = [frames[i] for i in idxs]
+                print(
+                    f"{processor.__class__.__name__} has no native video "
+                    f"support; sending {len(frames)} of {sampled} sampled "
+                    f"frames as ordered images."
+                )
+                args.image = (args.image or []) + frames
             args.video = None
 
     num_images = len(args.image) if args.image is not None else 0
@@ -1519,6 +1555,7 @@ def main():
 
     else:
         gen_kwargs = {
+            **gen_kwargs_extra,
             "image": args.image,
             "audio": args.audio,
             "video": args.video,

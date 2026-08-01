@@ -63,6 +63,24 @@ class Model(nn.Module):
         h = self.language_model.model.embed(input_ids)
 
         if pixel_values is not None:
+            # Native video: pixel_values rows carry a temporal pair per patch
+            # [P, T=2, H, W, C], and the image processor duplicates the frame
+            # into both slots for stills. A caller that patchified the SECOND
+            # frame of each consecutive pair can pass those patches here to
+            # overwrite slot 1 of the LAST N rows (video entities are appended
+            # after still images), turning duplicated stills into true
+            # temporal pairs with no other bookkeeping changes.
+            video_slot1 = kwargs.get("video_temporal_pixels", None)
+            if video_slot1 is not None:
+                n = video_slot1.shape[0]
+                head = pixel_values[:-n] if n < pixel_values.shape[0] else None
+                tail = pixel_values[-n:]
+                tail = mx.stack(
+                    [tail[:, 0], video_slot1.astype(tail.dtype)], axis=1
+                )
+                pixel_values = (
+                    tail if head is None else mx.concatenate([head, tail], axis=0)
+                )
             feats = self.get_image_features(pixel_values).astype(h.dtype)
             mask = mx.broadcast_to(
                 (input_ids == self.config.image_token_id)[..., None], h.shape
