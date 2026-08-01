@@ -14,7 +14,6 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import requests
-import safetensors
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten, tree_map
 from PIL import Image, ImageOps
@@ -22,6 +21,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -50,6 +50,10 @@ MODEL_REMAPPING = {
     "pp_ocrv6_medium_det": "pp_ocrv6",
     "pp_ocrv6_tiny_rec": "pp_ocrv6",
     "pp_ocrv6_small_rec": "pp_ocrv6",
+    "unlimited-ocr": "unlimited_ocr",
+    "mistral": "llama",
+    "nemotron-nas": "nemotron_nas",
+    "inkling_mm_model": "inkling",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -256,6 +260,144 @@ def _transform_compressed_tensors_int4_weights(
     return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
 
 
+# Compressed-tensors auxiliary tensors with no MLX consumer. They carry
+# activation / kv-cache / shape metadata; left in place they reach
+# ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
+_COMPRESSED_TENSORS_DROP_SUFFIXES = (
+    ".weight_shape",
+    ".weight_global_scale",  # folded into ``.scales`` alongside ``.weight_packed``
+    ".weight_zero_point",
+    ".input_global_scale",
+    ".input_scale",
+    ".k_scale",
+    ".v_scale",
+)
+
+
+def _compressed_tensors_group_weights(
+    quantization_config: Dict[str, Any], ct_format: str
+) -> Dict[str, Any]:
+    """Return the ``weights`` sub-config of the first group with ``ct_format``."""
+    for group in (quantization_config.get("config_groups") or {}).values():
+        if isinstance(group, dict) and group.get("format") == ct_format:
+            return group.get("weights") or {}
+    return {}
+
+
+def _dequantize_compressed_tensors_fp8_weight(
+    weight: mx.array, scale: mx.array
+) -> mx.array:
+    """Dequantize a channel-wise fp8 ``float-quantized`` weight to dense.
+
+    ``float-quantized`` (``num_bits: 8``, ``strategy: channel``) stores the
+    weight as ``float8_e4m3fn`` -- which ``mx.load`` surfaces as raw ``uint8``
+    E4M3 bytes -- plus a per-output-channel ``weight_scale``. MLX has no
+    per-channel fp8 quantization mode, so we decode the E4M3 codes with the
+    shared LUT and rescale into a dense tensor: ``w = E4M3(byte) * weight_scale``.
+    The dense weight is emitted in ``weight_scale``'s dtype (the checkpoint's
+    compute dtype, typically ``bfloat16``).
+    """
+    out_dtype = scale.dtype if scale.dtype != mx.float32 else mx.bfloat16
+    decoded = _E4M3_DECODE_LUT[weight.astype(mx.uint32)]  # float32 [out, in]
+    scale = scale.astype(mx.float32)
+    if scale.ndim == 1:
+        scale = scale[:, None]
+    return (decoded * scale).astype(out_dtype)
+
+
+def _transform_compressed_tensors_mixed_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Optional[Dict[str, Any]]]:
+    """Route a compressed-tensors ``mixed-precision`` checkpoint per group.
+
+    A ``mixed-precision`` export keeps a single top-level ``format`` and puts
+    the real formats in per-group ``config_groups``. Rather than match each
+    group's regex ``targets``/``ignore`` against module paths (fragile -- the
+    HF names differ from MLX's), we route every quantized Linear by the tensors
+    it actually carries, which is exactly what the group assignment produced:
+
+    - ``.weight_packed`` + ``.weight_global_scale`` -> NVFP4
+      (folded to MLX-native ``nvfp4``, as ``_transform_..._nvfp4_weights`` does)
+    - ``.weight_packed`` alone -> INT4 ``pack-quantized`` (folded to ``affine``)
+    - ``.weight_scale`` without ``.weight_packed`` -> channel-wise fp8
+      ``float-quantized`` (dequantized to a dense weight)
+
+    Layers under ``ignore`` (vision, ``linear_attn``, ``mtp``) carry a plain
+    ``.weight`` with no scale and pass through untouched, so the later
+    ``nn.quantize`` pass -- which only quantizes modules that have a ``.scales``
+    tensor -- leaves them dense.
+
+    Only one MLX-native quantized mode may coexist with the dense/fp8 layers
+    (``nn.quantize`` applies a single ``group_size``/``bits``/``mode``). The
+    reported models pair NVFP4 with dense fp8, so this holds; a checkpoint that
+    mixes e.g. NVFP4 and INT4 raises rather than silently mis-quantizing.
+    """
+    packed_prefixes = {
+        key[: -len(".weight_packed")]
+        for key in weights
+        if key.endswith(".weight_packed")
+    }
+    # A ``.weight_scale`` with no packed sibling is a float-quantized fp8 layer.
+    fp8_prefixes = {
+        key[: -len(".weight_scale")] for key in weights if key.endswith(".weight_scale")
+    } - packed_prefixes
+
+    int4_cfg = _compressed_tensors_group_weights(quantization_config, "pack-quantized")
+    int4_bits = int4_cfg.get("num_bits", 4)
+    int4_group_size = int4_cfg.get("group_size", 32)
+
+    new_weights: Dict[str, mx.array] = {}
+    native_quant: Dict[str, Dict[str, Any]] = {}
+
+    for key, value in weights.items():
+        if key.endswith(".weight_packed"):
+            prefix = key[: -len(".weight_packed")]
+            scale = weights[f"{prefix}.weight_scale"]
+            global_key = f"{prefix}.weight_global_scale"
+            if global_key in weights:  # NVFP4
+                global_scale = weights[global_key].astype(mx.float32)
+                new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
+                decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+                new_weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+                native_quant["nvfp4"] = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            else:  # INT4 symmetric pack-quantized
+                new_weights[f"{prefix}.weight"] = value.view(mx.uint32)
+                new_weights[f"{prefix}.scales"] = scale
+                new_weights[f"{prefix}.biases"] = -(2 ** (int4_bits - 1)) * scale
+                native_quant["affine"] = {
+                    "group_size": int4_group_size,
+                    "bits": int4_bits,
+                    "mode": "affine",
+                }
+            continue
+        if key.endswith(".weight_scale"):
+            prefix = key[: -len(".weight_scale")]
+            if prefix in fp8_prefixes:
+                new_weights[f"{prefix}.weight"] = (
+                    _dequantize_compressed_tensors_fp8_weight(
+                        weights[f"{prefix}.weight"], value
+                    )
+                )
+            # NVFP4 / INT4 scales are consumed with their ``.weight_packed``.
+            continue
+        if key.endswith(".weight") and key[: -len(".weight")] in fp8_prefixes:
+            continue  # emitted (dequantized to dense) at its ``.weight_scale``
+        if any(key.endswith(suffix) for suffix in _COMPRESSED_TENSORS_DROP_SUFFIXES):
+            continue
+        new_weights[key] = value
+
+    if not native_quant:
+        return new_weights, None
+    if len(native_quant) > 1:
+        raise NotImplementedError(
+            "mixed-precision compressed-tensors checkpoint mixes multiple "
+            f"MLX-native quantized modes {sorted(native_quant)}; only one native "
+            "mode alongside dense/fp8 layers is supported."
+        )
+    return new_weights, next(iter(native_quant.values()))
+
+
 def _transform_compressed_tensors_weights(
     weights: Dict[str, mx.array],
     quantization_config: Optional[Dict[str, Any]],
@@ -269,6 +411,12 @@ def _transform_compressed_tensors_weights(
         return weights, None
     if quantization_config.get("quant_method") != "compressed-tensors":
         return weights, None
+
+    # ``mixed-precision`` puts the real formats in per-group ``config_groups``;
+    # route per group (some groups may be dense fp8 with no ``.weight_packed``).
+    if quantization_config.get("format") == "mixed-precision":
+        return _transform_compressed_tensors_mixed_weights(weights, quantization_config)
+
     if not any(key.endswith(".weight_packed") for key in weights):
         return weights, None
 
@@ -340,6 +488,7 @@ def skip_multimodal_module(path: str) -> bool:
         "code_predictor",
         "img_projector",
         "multi_modal_projector",
+        "patch_merge_mlp",
     )
     return any(module in path for module in multimodal_modules)
 
@@ -486,12 +635,25 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    index_file = model_path / "model.safetensors.index.json"
+    weight_files = []
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            weight_files = [
+                str(model_path / shard)
+                for shard in sorted(set(weight_map.values()))
+                if (model_path / shard).exists()
+            ]
+        except (ValueError, OSError):
+            weight_files = []
+    if not weight_files:
+        weight_files = [
+            wf
+            for wf in glob.glob(str(model_path / "*.safetensors"))
+            if not wf.endswith("consolidated.safetensors")
+        ]
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
@@ -518,9 +680,6 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     weights = {}
     for wf in weight_files:
         weights.update(_load_safetensors(wf))
-
-    with safetensors.safe_open(weight_files[0], framework="np") as f:
-        is_mlx_format = f.metadata() and f.metadata().get("format") == "mlx"
 
     model_class, _ = get_model_and_args(config=config)
 
@@ -554,30 +713,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
-    if not is_mlx_format:
-        # Sanitize weights
-        weights = sanitize_weights(model, weights)
+    # Sanitize weights
+    weights = sanitize_weights(model, weights)
 
-        if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
-            weights = sanitize_weights(model.thinker, weights)
-            weights = sanitize_weights(model.thinker.vision_tower, weights)
-            weights = sanitize_weights(model.thinker.audio_tower, weights)
-            weights = sanitize_weights(model.thinker.language_model, weights)
-            weights = sanitize_weights(model.code2wav, weights)
-            weights = sanitize_weights(model.talker, weights)
-        else:
-            if hasattr(model_class, "VisionModel"):
-                weights = sanitize_weights(
-                    model_class.VisionModel, weights, model_config.vision_config
-                )
-            if hasattr(model_class, "LanguageModel"):
-                weights = sanitize_weights(
-                    model_class.LanguageModel, weights, model_config.text_config
-                )
-            if hasattr(model_class, "AudioModel"):
-                weights = sanitize_weights(
-                    model_class.AudioModel, weights, model_config.audio_config
-                )
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
+            weights = sanitize_weights(
+                model_class.VisionModel, weights, model_config.vision_config
+            )
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
+            weights = sanitize_weights(
+                model_class.LanguageModel, weights, model_config.text_config
+            )
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
+            weights = sanitize_weights(
+                model_class.AudioModel, weights, model_config.audio_config
+            )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -587,11 +740,27 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_config is not None:
                 config["quantization_config"] = quantization_config
 
+        if quantization_config is None:
+            hf_quant_path = model_path / "hf_quant_config.json"
+            if hf_quant_path.exists():
+                with open(hf_quant_path) as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                if hf_quant.get("quant_algo") == "NVFP4":
+                    # nvfp4 implies group_size=16
+                    config["quantization"] = config["quantization_config"] = {
+                        "group_size": 16,
+                        "bits": 4,
+                        "mode": "nvfp4",
+                    }
+
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
             quantization = None
             if quant_method == "compressed-tensors":
-                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+                if quantization_config.get("format") == "mxfp4-pack-quantized":
+                    quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+                else:
+                    quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
@@ -624,6 +793,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             else model
         )
 
+        # Stock MLX rejects bits=1; route those layers to our Metal kernel.
+        replace_one_bit_modules(quantized_model, quantization, weights)
+
         def get_class_predicate(p, m):
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
@@ -632,6 +804,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and skip_vision
                 and not _has_quantized_weights(p, weights)
             ):
+                return False
+            # Skip 1-bit layers already replaced above.
+            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
             # Handle custom per layer quantizations
             if p in config["quantization"]:
@@ -1049,8 +1224,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -1062,8 +1236,7 @@ def upload_to_hub(path: str, upload_repo: str):
         ```bash
         python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
@@ -1181,7 +1354,7 @@ def save_config(
         json.dump(config, fid, indent=4)
 
 
-def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
+def load_image(image_source: Union[str, Path, BytesIO, Image.Image], timeout: int = 10):
     """
     Helper function to load an image from either a URL, file path, data URI,
     or BytesIO object.
@@ -1190,23 +1363,30 @@ def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
 
     original_source = image_source
     try:
-        if not isinstance(image_source, (str, Path, BytesIO)):
+        if isinstance(image_source, Image.Image):
+            image = image_source
+        elif not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
                 f"Unsupported image source type: {type(image_source).__name__}"
             )
-        if isinstance(image_source, str) and image_source.startswith("data:image/"):
-            if "," not in image_source:
-                raise ValueError("Invalid data URI format - missing comma separator")
-            _, data = image_source.split(",", 1)
-            image_source = BytesIO(base64.b64decode(data))
-        if isinstance(image_source, str) and image_source.startswith(
-            ("http://", "https://")
-        ):
-            with requests.get(image_source, stream=True, timeout=timeout) as response:
-                response.raise_for_status()
-                image_source = BytesIO(response.content)
+        else:
+            if isinstance(image_source, str) and image_source.startswith("data:image/"):
+                if "," not in image_source:
+                    raise ValueError(
+                        "Invalid data URI format - missing comma separator"
+                    )
+                _, data = image_source.split(",", 1)
+                image_source = BytesIO(base64.b64decode(data))
+            if isinstance(image_source, str) and image_source.startswith(
+                ("http://", "https://")
+            ):
+                with requests.get(
+                    image_source, stream=True, timeout=timeout
+                ) as response:
+                    response.raise_for_status()
+                    image_source = BytesIO(response.content)
 
-        image = Image.open(image_source)
+            image = Image.open(image_source)
     except ValueError:
         raise
     except Exception as e:
@@ -1411,11 +1591,6 @@ def load_audio(
         audio = resample_audio(audio, sample_rate, sr)
     audio = np.asarray(audio, dtype=np.float32)
     return audio.mean(axis=1) if audio.ndim > 1 else audio
-
-
-def normalize_audio_features(features: mx.array) -> mx.array:
-    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
-    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
 
 
 def load_video(
@@ -1664,28 +1839,9 @@ def prepare_inputs(
                 images = padded_images
 
     # Process audio
-    audio_inputs = None
-    audio_feature_lengths = None
-    is_qwen3_omni_moe = False
-    processor_class_name = (
-        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
-    )
-    if (
-        "qwen3" in processor_class_name.lower()
-        and "omni" in processor_class_name.lower()
-    ):
-        is_qwen3_omni_moe = True
-
-    is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
-
-        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
-        lossy_extensions = {".mp3", ".m4a"}
-        is_lossy_audio = any(
-            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
-        )
 
         if len(audio) > 1:
             print(
@@ -1693,37 +1849,13 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        if is_qwen3_omni_moe:
-            audio_arrays = [
-                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                for audio_file in audio
-            ]
-            audio_arrays = [
-                audio_array.astype(np.float32) for audio_array in audio_arrays
-            ]
-
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is None:
-                raise ValueError("Processor missing feature_extractor for audio prep.")
-
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
-
-            audio_feature_lengths = np.sum(
-                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
-            )
-        else:
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            sr = (
-                getattr(feature_extractor, "sampling_rate", 16000)
-                if feature_extractor is not None
-                else 16000
-            )
-            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        sr = (
+            getattr(feature_extractor, "sampling_rate", 16000)
+            if feature_extractor is not None
+            else 16000
+        )
+        audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
     if has_videos:
@@ -1798,8 +1930,11 @@ def prepare_inputs(
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
+        attention_mask = inputs.get("attention_mask")
         model_inputs["attention_mask"] = (
-            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+            attention_mask
+            if attention_mask is None or isinstance(attention_mask, mx.array)
+            else mx.array(attention_mask)
         )
 
         # Convert inputs to model_inputs with mx.array if present
@@ -1811,24 +1946,6 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
-
-    if audio_inputs is not None:
-        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
-        model_inputs["feature_attention_mask"] = mx.array(
-            audio_inputs["attention_mask"]
-        ).astype(mx.int32)
-        model_inputs["audio_feature_lengths"] = mx.array(
-            audio_feature_lengths, dtype=mx.int32
-        )
-
-    if is_lossy_audio and "input_features" in model_inputs:
-        f = model_inputs["input_features"]
-        if isinstance(f, list):
-            model_inputs["input_features"] = [
-                normalize_audio_features(mx.array(x)) for x in f
-            ]
-        else:
-            model_inputs["input_features"] = normalize_audio_features(f)
 
     return model_inputs
 
@@ -1931,7 +2048,7 @@ class StoppingCriteria:
             eos_token_ids = [eos_token_ids]
 
         if self.eos_token_ids != eos_token_ids:
-            self.eos_token_ids = eos_token_ids
+            self.eos_token_ids = list(eos_token_ids)
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
@@ -2011,12 +2128,14 @@ class ThinkingBudgetCriteria:
         self.forced_token_id = None
         return None
 
-    def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
-        if self.forced_token_id is not None and self.enable_thinking:
-            next_y = mx.array([self.forced_token_id])
-            self.forced_token_id = None
-            return next_y
-        return next_y
+    def pop_forced_token_id(self) -> Optional[int]:
+        """Return and clear the pending forced token ID, if any."""
+        if self.forced_token_id is None or not self.enable_thinking:
+            return None
+
+        forced_token_id = self.forced_token_id
+        self.forced_token_id = None
+        return forced_token_id
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
@@ -2054,3 +2173,17 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
             print(f" '{key}': {repr(value)},")
     print("}")
     return report
+
+
+def should_add_special_tokens(model_type: str, processor) -> bool:
+    """Return whether tokenization should add markers outside the chat template."""
+    template_owns_markers = {
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "gemma4_unified",
+        "laguna",
+    }
+    if model_type not in template_owns_markers:
+        return True
+    return getattr(processor, "chat_template", None) is None

@@ -4,9 +4,9 @@ import pytest
 from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
-from mlx_vlm.models.gemma4.rope_utils import ProportionalRoPE
 from mlx_vlm.models.rope_utils import (
     MRoPERotaryEmbedding,
+    ProportionalRoPE,
     apply_mrope_frequency_layout,
     apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_even_odd,
@@ -88,6 +88,33 @@ def test_proportional_rope_evals_private_helper_arrays_on_init(monkeypatch):
     assert eager_arrays[0] is host.rope.freqs
     assert len(eval_args) == 1
     assert eval_args[0][0] is eager_arrays[0]
+
+
+# TODO: Refactor this file into separate test classes for each RoPE variant.
+def test_proportional_rope_matches_zero_padded_rotate_half_layout():
+    x = (mx.arange(2 * 3 * 8).reshape(1, 2, 3, 8) / 10).astype(mx.float32)
+    rope = ProportionalRoPE(
+        dims=8,
+        base=10000,
+        scaling_config={"partial_rotary_factor": 0.5, "factor": 2.0},
+    )
+
+    actual = rope(x, offset=4)
+
+    inv_freq = 1.0 / mx.power(10000, mx.arange(0, 4, 2, dtype=mx.float32) / 8)
+    inv_freq = mx.concatenate([inv_freq / 2.0, mx.zeros((2,), dtype=mx.float32)])
+    positions = mx.arange(3, dtype=mx.float32) + 4
+    freqs = positions[:, None] * inv_freq
+    emb = mx.concatenate([freqs, freqs], axis=-1)
+    cos = mx.cos(emb).reshape(1, 1, 3, 8)
+    sin = mx.sin(emb).reshape(1, 1, 3, 8)
+    rotated = mx.concatenate([-x[..., 4:], x[..., :4]], axis=-1)
+    expected = (x * cos) + (rotated * sin)
+
+    mx.eval(actual, expected)
+    assert _max_diff(actual, expected) < 1e-5
+    assert _max_diff(actual[..., 2:4], x[..., 2:4]) < 1e-5
+    assert _max_diff(actual[..., 6:8], x[..., 6:8]) < 1e-5
 
 
 @pytest.mark.parametrize(

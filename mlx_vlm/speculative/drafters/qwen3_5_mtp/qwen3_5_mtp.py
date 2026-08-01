@@ -493,9 +493,10 @@ class Qwen3_5MTPDraftModel(nn.Module):
             "pre_fc_norm_hidden.weight",
         )
         for key, value in weights.items():
-            if key.startswith("mtp."):
+            is_hf_layout = key.startswith("mtp.")
+            if is_hf_layout:
                 key = key[len("mtp.") :]
-            if any(key.endswith(suffix) for suffix in norm_suffixes):
+            if is_hf_layout and any(key.endswith(suffix) for suffix in norm_suffixes):
                 if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating):
                     value = value + 1.0
             out[key] = value

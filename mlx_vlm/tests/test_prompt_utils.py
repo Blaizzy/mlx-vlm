@@ -233,6 +233,40 @@ class TestApplyChatTemplateIntegration:
             }
         ]
 
+    def test_gemma4_unified_formats_video_and_audio_messages(self):
+        """Video prompts should retain audio placeholders when audio is present."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video and audio.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {"type": "audio"},
+                    {
+                        "type": "text",
+                        "text": "Describe the video and audio.",
+                        "content": "Describe the video and audio.",
+                    },
+                ],
+            }
+        ]
+
     def test_text_only_formats_regular_chat_message(self):
         """Text-only models should use regular role/content messages with no image tokens."""
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -613,6 +647,62 @@ def test_apply_chat_template_preserves_explicit_thinking_enabled():
 
     assert processor.kwargs["enable_thinking"] is True
     assert result.endswith("<think>\n")
+
+
+def test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates():
+    class ThinkingModeProcessor:
+        chat_template = "{% if thinking_mode == 'enabled' %}<mm:think>{% endif %}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            del messages, tokenize, add_generation_prompt
+            self.kwargs = kwargs
+            return "prompt"
+
+    processor = ThinkingModeProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "minimax_m3_vl"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert result == "prompt"
+    assert processor.kwargs["enable_thinking"] is True
+    assert processor.kwargs["thinking_mode"] == "enabled"
+
+
+def test_apply_chat_template_keeps_enable_thinking_only_for_other_templates():
+    class EnableThinkingProcessor:
+        chat_template = "{% if enable_thinking %}<think>{% endif %}"
+
+        def __init__(self):
+            self.kwargs = None
+
+        def apply_chat_template(
+            self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+        ):
+            del messages, tokenize, add_generation_prompt
+            self.kwargs = kwargs
+            return "prompt"
+
+    processor = EnableThinkingProcessor()
+    result = apply_chat_template(
+        processor,
+        {"model_type": "qwen3_5_moe"},
+        "Describe this image.",
+        num_images=1,
+        enable_thinking=True,
+    )
+
+    assert result == "prompt"
+    assert processor.kwargs["enable_thinking"] is True
+    assert "thinking_mode" not in processor.kwargs
 
 
 class TestModelSpecificPromptContracts:

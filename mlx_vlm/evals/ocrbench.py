@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
-from datasets import load_dataset
+
+try:
+    from datasets import load_dataset
+except ModuleNotFoundError as e:  # optional 'train' extra
+    raise ImportError(
+        "Evaluation requires the 'train' extra: pip install 'mlx-vlm[train]'"
+    ) from e
 from tqdm import tqdm
 
 from mlx_vlm import load

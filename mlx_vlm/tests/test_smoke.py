@@ -241,8 +241,7 @@ def main():
     console.print(
         Panel(
             title="System Information",
-            renderable=textwrap.dedent(
-                f"""{platform.machine() == 'arm64' and f'''
+            renderable=textwrap.dedent(f"""{platform.machine() == 'arm64' and f'''
             MAC OS:       v{platform.mac_ver()[0]}
             Python:       v{sys.version.split()[0]}
             MLX:          v{version('mlx')}
@@ -254,8 +253,7 @@ def main():
             • RAM:        {psutil.virtual_memory().total / (1024 ** 3):.1f} GB
             • CPU Cores:  {psutil.cpu_count(logical=False)}
             • GPU Cores:  {device_info['SPDisplaysDataType'][0]['sppci_cores']}
-            ''' or 'Not running on Apple Silicon'}"""
-            ),
+            ''' or 'Not running on Apple Silicon'}"""),
             style="bold blue",
         )
     )

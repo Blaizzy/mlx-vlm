@@ -24,6 +24,7 @@ from .generation import (
 from .responses_state import (
     ThinkingStreamState,
     process_tool_calls,
+    prompt_has_open_thinking,
     suppress_tool_call_content,
 )
 from .runtime import runtime
@@ -484,6 +485,8 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
         except Exception as e:
             return _anthropic_error_response(400, str(e))
+        if tools and tool_module is not None:
+            gen_args.skip_special_tokens = False
 
         template_kwargs = gen_args.to_template_kwargs()
         if tool_choice is not None:
@@ -538,7 +541,12 @@ async def anthropic_messages_endpoint(http_request: Request):
                 full_output = ""
                 text_output = ""
                 thinking_state = ThinkingStreamState(
-                    gen_args.enable_thinking,
+                    prompt_has_open_thinking(
+                        formatted_prompt,
+                        gen_args.enable_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    ),
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )

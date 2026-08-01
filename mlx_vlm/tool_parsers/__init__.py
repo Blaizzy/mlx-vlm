@@ -1,32 +1,37 @@
 """
 Tool parser utilities for mlx-vlm.
 
-Re-exports mlx_lm's _infer_tool_parser with additional model support,
-and loads parsers from both mlx_lm.tool_parsers and mlx_vlm.tool_parsers.
+Infers the tool parser type from chat template markers and loads the
+matching parser module from ``mlx_vlm.tool_parsers``.
 """
 
 import importlib
 
-from mlx_lm.tokenizer_utils import _infer_tool_parser as _mlx_lm_infer_tool_parser
-
-# Additional patterns not covered by mlx_lm
-_EXTRA_PATTERNS = [
-    ("<|tool_call>", "gemma4"),
-    ("<|START_ACTION|>", "cohere2_moe"),
+_TEMPLATE_MARKERS = [
+    (("<|tool_call>",), "gemma4"),
+    (("<|START_ACTION|>",), "cohere2_moe"),
+    (("]<]minimax[>[<tool_call>",), "minimax_m3"),
+    (("<mm:think>",), "minimax_m3"),
+    (("<minimax:tool_call>",), "minimax_m2"),
+    (("<start_function_call>",), "function_gemma"),
+    (("<longcat_tool_call>",), "longcat"),
+    (("<arg_key>",), "glm47"),
+    (("<|tool_list_start|>",), "pythonic"),
+    (("<tool_call>\\n<function=",), "qwen3_coder"),
+    (("<tool_call>\n<function=",), "qwen3_coder"),
+    (("<|tool_calls_section_begin|>",), "kimi_k2"),
+    (("[TOOL_CALLS]",), "mistral"),
+    (("<tool_call>", "tool_call.name"), "json_tools"),
 ]
 
 
 def _infer_tool_parser(chat_template):
-    """Infer tool parser type, checking mlx_lm patterns first then extras."""
-    result = _mlx_lm_infer_tool_parser(chat_template)
-    if result is not None:
-        return result
-
+    """Infer the tool parser type from the chat template."""
     if not isinstance(chat_template, str):
         return None
 
-    for marker, parser_type in _EXTRA_PATTERNS:
-        if marker in chat_template:
+    for markers, parser_type in _TEMPLATE_MARKERS:
+        if all(marker in chat_template for marker in markers):
             return parser_type
 
     return None
@@ -43,7 +48,11 @@ def _infer_tool_parser_from_processor(processor):
 
 
 def load_tool_module(tool_parser_type):
-    """Load a tool parser module from mlx_vlm.tool_parsers or mlx_lm.tool_parsers."""
-    if importlib.util.find_spec(f"mlx_vlm.tool_parsers.{tool_parser_type}"):
-        return importlib.import_module(f"mlx_vlm.tool_parsers.{tool_parser_type}")
-    return importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
+    """Load a tool parser module from mlx_vlm.tool_parsers."""
+    module_name = f"mlx_vlm.tool_parsers.{tool_parser_type}"
+    try:
+        return importlib.import_module(module_name)
+    except ModuleNotFoundError as e:
+        if e.name == module_name:
+            raise ValueError(f"Unknown tool parser type: {tool_parser_type!r}") from e
+        raise

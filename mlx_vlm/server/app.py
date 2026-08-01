@@ -8,28 +8,25 @@ import time
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple
 
 import mlx.core as mx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 
 from .. import apc as _apc
-from ..generate import (
-    DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_P,
-)
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
+from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
     PromptTooLongError,
@@ -41,11 +38,6 @@ from .generation import (
     get_kv_quant_scheme,
     get_quantized_kv_bits,
     get_quantized_kv_start,
-    get_server_enable_thinking,
-    get_server_max_tokens,
-    get_server_thinking_budget,
-    get_server_thinking_end_token,
-    get_server_thinking_start_token,
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
@@ -58,6 +50,8 @@ DEFAULT_SERVER_PORT = 8080
 SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
 
 logger = logging.getLogger("mlx_vlm.server")
+
+_as_plain_dict = _request_normalization._as_plain_dict
 
 
 def _server_api_key() -> Optional[str]:
@@ -92,6 +86,8 @@ def _cache_group_for_cache(cache: dict) -> str:
         return "stt"
     if model_kind == "audio":
         return "audio"
+    if model_kind == "embedding":
+        return "embedding"
     return "text_generation"
 
 
@@ -166,86 +162,13 @@ def _server_runtime_snapshot() -> dict:
 def _build_gen_args(
     request, processor=None, tenant_id: Optional[str] = None
 ) -> GenerationArguments:
-    """Build GenerationArguments from an OpenAIRequest or ChatRequest."""
-    max_tokens = getattr(request, "max_tokens", None)
-    if max_tokens is None:
-        max_tokens = getattr(request, "max_output_tokens", None)
-    if max_tokens is None:
-        max_tokens = get_server_max_tokens()
-    logit_bias = getattr(request, "logit_bias", None)
-    if logit_bias is not None and isinstance(logit_bias, dict):
-        logit_bias = {int(k): v for k, v in logit_bias.items()}
-    enable_thinking = _request_field_or_default(
+    """Build GenerationArguments from a compatible API request."""
+    return _request_normalization._build_gen_args(
         request,
-        "enable_thinking",
-        get_server_enable_thinking(),
-    )
-    default_temperature = _model_config_field_or_default(
-        processor, "temperature", DEFAULT_TEMPERATURE
-    )
-    default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
-    default_top_k = _model_config_field_or_default(processor, "top_k", 0)
-    if _model_config_field_or_default(processor, "do_sample", None) is False:
-        default_temperature = 0.0
-    args = GenerationArguments(
-        max_tokens=max_tokens,
-        temperature=_request_field_or_default(
-            request, "temperature", default_temperature
-        ),
-        top_p=_request_field_or_default(request, "top_p", default_top_p),
-        top_k=_request_field_or_default(request, "top_k", default_top_k),
-        min_p=getattr(request, "min_p", 0.0),
-        seed=getattr(request, "seed", None),
-        logprobs=bool(getattr(request, "logprobs", False)),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
-        repetition_context_size=_request_field_or_default(
-            request,
-            "repetition_context_size",
-            DEFAULT_REPETITION_CONTEXT_SIZE,
-        ),
-        presence_penalty=getattr(request, "presence_penalty", None),
-        presence_context_size=_request_field_or_default(
-            request,
-            "presence_context_size",
-            DEFAULT_REPETITION_CONTEXT_SIZE,
-        ),
-        frequency_penalty=getattr(request, "frequency_penalty", None),
-        frequency_context_size=_request_field_or_default(
-            request,
-            "frequency_context_size",
-            DEFAULT_REPETITION_CONTEXT_SIZE,
-        ),
-        logit_bias=logit_bias,
-        enable_thinking=enable_thinking,
-        thinking_budget=_request_field_or_default(
-            request, "thinking_budget", get_server_thinking_budget()
-        ),
-        thinking_start_token=_request_field_or_default(
-            request, "thinking_start_token", get_server_thinking_start_token()
-        ),
-        thinking_end_token=_request_field_or_default(
-            request, "thinking_end_token", get_server_thinking_end_token()
-        ),
+        processor=processor,
         tenant_id=tenant_id,
+        structured_logits_processor_builder=_build_structured_logits_processors,
     )
-    if processor is not None:
-        args.logits_processors = _build_structured_logits_processors(request, processor)
-    return args
-
-
-def _request_field_or_default(request, field_name: str, default):
-    fields_set = getattr(request, "model_fields_set", None)
-    if fields_set is not None and field_name not in fields_set:
-        return default
-    value = getattr(request, field_name, default)
-    return default if value is None else value
-
-
-def _model_config_field_or_default(processor, field_name: str, default):
-    config = runtime.model_cache.get("config")
-    if config is None and processor is not None:
-        config = getattr(processor, "config", None)
-    return getattr(config, field_name, default)
 
 
 def _read_tenant_id(http_request) -> Optional[str]:
@@ -266,18 +189,20 @@ async def _preflight_stream_context_budget(
     prompt: str,
     images: Optional[List] = None,
     audio: Optional[List] = None,
+    videos: Optional[List] = None,
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
     if runtime.response_generator is None:
         return
     try:
+        validate_kwargs = {"images": images, "audio": audio, "args": args}
+        if videos is not None:
+            validate_kwargs["videos"] = videos
         await asyncio.to_thread(
             runtime.response_generator.validate_context_budget,
             prompt,
-            images,
-            audio,
-            args,
+            **validate_kwargs,
         )
     except PromptTooLongError as e:
         runtime.metrics.record_failure(
@@ -291,56 +216,20 @@ async def _preflight_stream_context_budget(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-def _as_plain_dict(value):
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return value
-    if hasattr(value, "model_dump"):
-        return value.model_dump(exclude_none=True)
-    return value
-
-
-def _extract_response_format_schema(request) -> Optional[Union[str, dict]]:
-    response_format = _as_plain_dict(getattr(request, "response_format", None))
-
-    text_config = _as_plain_dict(getattr(request, "text", None))
-    if response_format is None and isinstance(text_config, dict):
-        response_format = _as_plain_dict(text_config.get("format"))
-
-    if response_format is None:
-        return None
-
-    format_type = response_format.get("type")
-    if format_type in (None, "text"):
-        return None
-    if format_type in ("json_object", "object"):
-        return {"type": "object"}
-    if format_type != "json_schema":
-        raise ValueError(f"Unsupported response_format type: {format_type!r}")
-
-    json_schema = _as_plain_dict(response_format.get("json_schema"))
-    if json_schema is None:
-        # Responses API text.format places schema directly on the format object.
-        json_schema = response_format
-
-    schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
-    if schema is None:
-        raise ValueError("response_format json_schema must include a schema field")
-    return schema
-
-
 def _build_structured_logits_processors(request, processor):
-    schema = _extract_response_format_schema(request)
-    if schema is None:
-        return None
+    return _request_normalization._build_structured_logits_processors(
+        request,
+        processor,
+        logits_processor_factory=_server_package_attr(
+            "build_json_schema_logits_processor",
+            build_json_schema_logits_processor,
+        ),
+    )
 
-    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
-    logits_processor = _server_package_attr(
-        "build_json_schema_logits_processor",
-        build_json_schema_logits_processor,
-    )(tokenizer, schema)
-    return [logits_processor]
+
+def _extract_response_format_schema(request):
+    """Retain the package-level compatibility alias for schema extraction."""
+    return _request_normalization._extract_response_format_schema(request)
 
 
 def _count_thinking_tag_tokens(
@@ -472,6 +361,12 @@ async def lifespan(app):
             "audio_stt",
             "speech-to-text model",
         ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_EMBEDDING_MODEL", None),
+            None,
+            "embedding",
+            "embedding model",
+        ),
     )
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
         if not preload_model_path:
@@ -497,6 +392,9 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+inference_router = APIRouter(
+    dependencies=[Depends(_require_management_api_key)],
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -518,14 +416,16 @@ def _unload_model_cache_group(cache_group: str) -> bool:
     if not cache:
         return False
 
-    print(
-        f"Unloading {cache_group} model: {cache.get('model_path')}, "
-        f"Adapter: {cache.get('adapter_path')}"
+    logger.info(
+        "Unloading %s model: %s (adapter=%s)",
+        cache_group,
+        cache.get("model_path"),
+        cache.get("adapter_path"),
     )
 
     response_generator = cache.get("response_generator")
     if response_generator is not None:
-        print("Stopping ResponseGenerator...")
+        logger.info("Stopping response generator.")
         response_generator.stop_and_join()
         if runtime.response_generator is response_generator:
             runtime.response_generator = None
@@ -569,6 +469,7 @@ def get_cached_model(
     """
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
+    load_as_embedding = model_kind == "embedding"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -578,6 +479,9 @@ def get_cached_model(
     elif load_as_audio:
         cache_group = _audio_cache_group(model_kind)
         effective_model_kind = model_kind
+    elif load_as_embedding:
+        cache_group = "embedding"
+        effective_model_kind = "embedding"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -599,7 +503,7 @@ def get_cached_model(
         if cache_group == "text_generation":
             runtime.response_generator = cached_cache.get("response_generator")
             runtime.apc_manager = cached_cache.get("apc_manager")
-        print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
+        logger.debug("Using cached model: %s (adapter=%s)", model_path, adapter_path)
         return (
             cached_cache["model"],
             cached_cache["processor"],
@@ -608,7 +512,7 @@ def get_cached_model(
 
     # If this kind has a different model cached, clear only that cache group.
     if cached_cache:
-        print(f"New {cache_group} model request, clearing existing cache...")
+        logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
 
     if load_as_edit:
@@ -617,7 +521,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for image edit models.",
             )
-        print(f"Loading image edit model from: {model_path}")
+        logger.info("Loading image edit model: %s", model_path)
         try:
             model = load_image_edit_model(model_path)
         except ValueError as e:
@@ -651,7 +555,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for image generation models.",
             )
-        print(f"Loading image generation model from: {model_path}")
+        logger.info("Loading image generation model: %s", model_path)
         try:
             model = load_image_generation_model(model_path)
         except ValueError as e:
@@ -685,7 +589,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for audio models.",
             )
-        print(f"Loading audio model from: {model_path}")
+        logger.info("Loading audio model: %s", model_path)
         try:
             model = _server_package_attr("load_audio_model", load_audio_model)(
                 model_path
@@ -723,17 +627,73 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, None, config
 
+    if load_as_embedding:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for embedding models.",
+            )
+        logger.info("Loading embedding model: %s", model_path)
+        from ..embedding_loader import load_embedding_model
+        from ..models.pooling import read_pooling_config
+        from ..utils import get_model_path, load_processor
+
+        try:
+            model_dir = get_model_path(model_path)
+            model = load_embedding_model(model_dir)
+            processor = load_processor(model_dir, add_detokenizer=False)
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported embedding model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load embedding model: {e}"
+            ) from e
+        model.pooling_config = read_pooling_config(model_dir)
+        config = SimpleNamespace(
+            model_type=getattr(model, "model_type", "embedding"),
+            text_config=None,
+        )
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "model_kind": "embedding",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, config
+
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
-
-    # APC: build a shared block pool if opted in via env var.
-    runtime.apc_manager = _apc.from_env(model_namespace=model_path)
 
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
+
+    runtime.apc_manager = _apc.from_env(
+        model_namespace=_apc.apc_disk_namespace(
+            model_path,
+            adapter_path=adapter_path,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            kv_quant_scheme=kv_quant_scheme,
+            quantized_kv_start=quantized_kv_start,
+        )
+    )
 
     response_generator = ResponseGenerator(
         model_path=model_path,
@@ -752,6 +712,13 @@ def get_cached_model(
         response_generator.stop_and_join()
         vision_cache.clear()
         raise
+
+    # Dry-run APC layout when the shared pool is enabled (log-only; never blocks serve).
+    if runtime.apc_manager is not None:
+        try:
+            _apc.self_check_model_apc(model, kv_bits=kv_bits)
+        except Exception as exc:
+            logger.warning("APC self-check raised unexpectedly: %s", exc)
 
     cache = {
         "cache_key": cache_key,
@@ -780,7 +747,7 @@ def unload_model_sync():
             runtime.audio_queue, "is_worker_thread", lambda: False
         )
         if not is_audio_worker():
-            print("Stopping AudioRequestQueue...")
+            logger.info("Stopping audio request queue.")
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
             unloaded_any = True
@@ -794,7 +761,7 @@ def unload_model_sync():
     gc.collect()
     mx.clear_cache()
     if unloaded_any:
-        print("Model caches cleared.")
+        logger.info("Model caches cleared.")
     return unloaded_any
 
 
@@ -825,13 +792,18 @@ _protocol_deps = SimpleNamespace(
     make_logprob_content=_make_logprob_content,
     build_metrics_envelope=_build_metrics_envelope,
 )
-register_anthropic_routes(app, _protocol_deps)
-register_openai_routes(app, _protocol_deps)
-register_audio_routes(app, _protocol_deps)
+register_anthropic_routes(inference_router, _protocol_deps)
+register_openai_routes(inference_router, _protocol_deps)
+register_audio_routes(inference_router, _protocol_deps)
+register_embeddings_routes(inference_router, _protocol_deps)
 
 
-@app.get("/models", response_model=ModelsResponse)
-@app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
+@inference_router.get("/models", response_model=ModelsResponse)
+@inference_router.get(
+    "/v1/models",
+    response_model=ModelsResponse,
+    include_in_schema=False,
+)
 def models_endpoint():
     """
     Return list of locally downloaded MLX models.
@@ -881,6 +853,9 @@ def models_endpoint():
     response = {"object": "list", "data": models}
 
     return response
+
+
+app.include_router(inference_router)
 
 
 # MLX_VLM API endpoints

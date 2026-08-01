@@ -6,6 +6,7 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache
@@ -122,7 +123,7 @@ class Attention(nn.Module):
                 elif mask.ndim == 3:
                     mask = mask[:, None, :, :]
 
-                mask = mask[..., : keys.shape[-2]]
+                mask = mask[..., : kv_sequence_length(keys)]
                 if mask.dtype not in (mx.float16, mx.bfloat16, mx.float32):
                     mask = mask.astype(scores.dtype)
                     mask = (1.0 - mask) * mx.finfo(scores.dtype).min

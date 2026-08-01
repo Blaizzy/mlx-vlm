@@ -341,7 +341,7 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
 
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path) if is_local else pretrained_model_name_or_path,
-        trust_remote_code=True,
+        trust_remote_code=False,
         local_files_only=is_local,
     )
     if is_local:

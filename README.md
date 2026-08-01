@@ -11,12 +11,15 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Speculative Decoding](#speculative-decoding)
     - [DFlash (Qwen3.5)](#dflash-qwen35)
     - [Gemma 4 MTP](#gemma-4-mtp)
+    - [Gemma 4 EAGLE-3](#gemma-4-eagle-3)
+    - [MiniMax M3 EAGLE-3](#minimax-m3-eagle-3)
   - [Chat UI with Gradio](#chat-ui-with-gradio)
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
     - [Continuous Batching](#continuous-batching)
     - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
     - [KV Cache Quantization](#kv-cache-quantization)
+- [1-bit Affine Inference](#1-bit-affine-inference)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
   - [Supported Models](#supported-models)
@@ -35,6 +38,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 |-------|---------------|
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
+| Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
 | DOTS-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | DOTS-MOCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/dots_ocr/README.md) |
 | ERNIE 4.5 VL | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/ernie4_5_moe_vl/README.md) |
@@ -49,6 +53,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 | Moondream2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream2/README.md) |
 | Moondream3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/moondream3/README.md) |
 | Gemma 4 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/gemma4/README.md) |
+| MiniMax M3 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/minimax_m3_vl/README.md) |
 | Falcon-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/falcon_ocr/README.md) |
 | Granite Vision 3.2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite_vision/README.md) |
 | Granite 4.0 Vision | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/granite4_vision/README.md) |
@@ -61,6 +66,16 @@ The easiest way to get started is to install the `mlx-vlm` package using pip:
 ```sh
 pip install -U mlx-vlm
 ```
+
+The [Gradio chat UI](#chat-ui-with-gradio) needs an extra dependency that is not
+part of the base install:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Quote the package name so that shells which expand square brackets, such as
+`zsh`, do not treat `[ui]` as a glob pattern.
 
 ## Usage
 
@@ -129,7 +144,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 | Flag | Description |
 |------|-------------|
 | `--draft-model` | HuggingFace repo or local path for the drafter |
-| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4) |
+| `--draft-kind` | Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP) |
 | `--draft-block-size` | Override the drafter's configured block size |
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
@@ -231,9 +246,51 @@ mlx_vlm.server --model mlx-community/gemma-4-31B-it-bf16 \
   --draft-model RedHatAI/gemma-4-31B-it-speculator.eagle3
 ```
 
+#### MiniMax M3 EAGLE-3
+
+MiniMax M3 supports the released `Inferact/MiniMax-M3-EAGLE3` drafter. Convert
+the target with `mlx_vlm.convert` because `mlx_lm.convert` does not know the
+`minimax_m3_vl` model type.
+
+```sh
+mlx_vlm.convert \
+  --hf-path MiniMaxAI/MiniMax-M3 \
+  --mlx-path ~/MiniMax-M3-4bit \
+  --quantize --q-bits 4 \
+  --trust-remote-code
+
+mlx_vlm.convert \
+  --hf-path Inferact/MiniMax-M3-EAGLE3 \
+  --mlx-path ~/MiniMax-M3-EAGLE3
+
+mlx_vlm.generate \
+  --model ~/MiniMax-M3-4bit \
+  --draft-model ~/MiniMax-M3-EAGLE3 \
+  --draft-kind eagle3 \
+  --draft-block-size 3 \
+  --prompt "Explain MiniMax Sparse Attention in one paragraph." \
+  --max-tokens 256 --temperature 0
+```
+
+The public MiniMax M3 BF16 checkpoint advertises MTP metadata but does not
+publish `mtp` or `nextn` tensors, so use the released EAGLE-3 drafter for that
+checkpoint.
+
+MiniMax M3 also supports image/video prompts, MiniMax thinking tags, MiniMax
+tool-call parsing, MSA index caches, and MXFP8 config loading. See
+[`mlx_vlm/models/minimax_m3_vl/README.md`](mlx_vlm/models/minimax_m3_vl/README.md)
+for model-specific conversion and runtime notes.
+
 ### Chat UI with Gradio
 
-Launch a chat interface using Gradio:
+The Gradio chat UI requires the optional `ui` extra, which the base `mlx-vlm`
+install does not include:
+
+```sh
+pip install -U 'mlx-vlm[ui]'
+```
+
+Then launch the chat interface:
 
 ```sh
 mlx_vlm.chat_ui --model mlx-community/Qwen2-VL-2B-Instruct-4bit
@@ -354,6 +411,9 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --thinking-budget 512 \
   --thinking-start-token "<think>" \
   --thinking-end-token "</think>"
+
+# Require bearer authentication for API endpoints
+mlx_vlm.server --api-key <secret-token>
 ```
 
 #### Server Options
@@ -362,9 +422,10 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--image-model`: Preload an image generation model at server startup
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
+- `--embedding-model`: Preload an embedding model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
-- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`) — enables speculative decoding for ~2× or higher throughput
-- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (Gemma 4)
+- `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
+- `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
 - `--draft-block-size`: Override the drafter's configured block size
 - `--host`: Host address (default: `0.0.0.0`)
 - `--port`: Port number (default: `8080`)
@@ -378,7 +439,23 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
+- `--log-progress-interval`: Decoded tokens between progress log messages; `0` disables periodic decode progress (default: `10`)
+- `--api-key`: Bearer token required for inference, model discovery, and management endpoints
 - `--log-level`: Logging level — `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (default: `INFO`)
+
+At `INFO`, the server logs request start/completion, chunked-prefill progress,
+time to first token, periodic decode throughput, and the final token counts. Set
+`--log-level DEBUG` to emit decode progress for every token and add its token
+number, token ID, and decoded text to the same log entry. Decode progress uses
+`rate` for the instantaneous inter-token rate; decode completion uses the same
+field name for aggregate decode throughput measured across completed token
+intervals.
+
+OpenAI-compatible streaming responses expose throughput under
+`timings.predicted_per_second`. Token-bearing SSE chunks report the instantaneous
+inter-token rate, while terminal and usage chunks report the aggregate rate as
+`(tokens - 1) / (last_token_time - first_token_time)`. The first token reports
+`null` because it has no preceding token interval.
 
 You can also set trust remote code via environment variable:
 ```sh
@@ -686,6 +763,14 @@ APC_NUM_BLOCKS=4096 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
 ```
 
+APC works with KV-cache quantization (`--kv-bits`):
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 8 --port 8080
+```
+
 Enable the persistent disk tier:
 
 ```sh
@@ -735,12 +820,14 @@ Common APC environment variables:
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |
 | `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
+| `APC_TRACE` | unset | Set to `1` for greppable store/reject/self-check log lines |
 
-APC is disabled automatically for models that use a custom cache layout. On the server, APC is also skipped when KV-cache quantization is enabled.
+APC is disabled automatically for models that use a custom cache layout. APC works with `--kv-bits` (including TurboQuant): the live KV cache stays quantized; the reusable APC pool stores dequantized float K/V, so pool size does not shrink with quant.
+When APC is enabled on the server, a non-fatal layout self-check runs at model load.
 
 #### KV Cache Quantization
 
-Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported:
+Reduce KV cache memory during continuous batching with `--kv-bits`. Both uniform quantization and TurboQuant are supported. Compatible with Automatic Prefix Caching (`APC_ENABLED=1`).
 
 ```sh
 # Uniform 8-bit KV cache quantization
@@ -900,6 +987,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/models` and `/v1/models` - List models available locally
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
+- `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
@@ -914,6 +1002,19 @@ Structured outputs are not currently supported with speculative decoding.
 ```sh
 curl "http://localhost:8080/models"
 ```
+
+##### Embeddings
+
+```sh
+curl -X POST "http://localhost:8080/v1/embeddings" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "input": ["The quick brown fox.", "A fast auburn fox."]
+  }'
+```
+
+Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
 
 ##### Text Input
 
@@ -1066,6 +1167,38 @@ curl -X POST "http://localhost:8080/responses" \
 - `thinking_end_token`: Token that closes a thinking block
 - `stream`: Enable streaming responses
 
+## 1-bit Affine Inference
+
+MLX-VLM can load existing affine 1-bit MLX checkpoints without a custom MLX
+build. When a checkpoint declares `"bits": 1`, compatible `Linear` and
+`Embedding` layers are replaced automatically with an inference-only module
+that JIT-compiles its Metal kernel from Python.
+
+The checkpoint must use MLX's packed `uint32` weight layout, include `scales`
+and `biases`, and declare a group size of `32`, `64`, or `128`:
+
+```json
+{
+  "quantization": {
+    "group_size": 64,
+    "bits": 1,
+    "mode": "affine"
+  }
+}
+```
+
+Load and generate normally; no extra inference flag is needed:
+
+```python
+from mlx_vlm import generate, load
+
+model, processor = load("path/to/1bit-model")
+result = generate(model, processor, "Describe this image", image=["image.jpg"])
+```
+
+This path is for inference from an already quantized checkpoint. Converting a
+floating-point model to 1-bit still requires a quantizer that can produce the
+packed weights and affine parameters.
 
 ## Activation Quantization (CUDA)
 
@@ -1150,6 +1283,7 @@ The following models support video chat:
 2. Qwen2.5-VL
 3. Idefics3
 4. LLaVA
+5. MiniMax M3
 
 With more coming soon.
 
@@ -1157,9 +1291,8 @@ With more coming soon.
 
 #### Command Line
 ```sh
-mlx_vlm.video_generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --max-pixels 224 224 --fps 1.0
+mlx_vlm.generate --model mlx-community/Qwen2-VL-2B-Instruct-4bit --max-tokens 100 --prompt "Describe this video" --video path/to/video.mp4 --fps 1.0
 ```
-
 
 These examples demonstrate how to use multiple images with MLX-VLM for more complex visual reasoning tasks.
 
@@ -1326,7 +1459,12 @@ See [docs/usage.md](https://github.com/Blaizzy/mlx-vlm/blob/main/docs/usage.md#d
 
 # Fine-tuning
 
-MLX-VLM supports fine-tuning models with LoRA and QLoRA.
+MLX-VLM supports fine-tuning models with LoRA and QLoRA. Fine-tuning (and the
+eval scripts) need the training extra, which is not installed by default:
+
+```bash
+pip install "mlx-vlm[train]"
+```
 
 ## LoRA & QLoRA
 

@@ -163,7 +163,17 @@ class Sam3Predictor:
 
         box_input = None
         if boxes is not None:
-            box_input = mx.array(boxes)[None]  # (1, N, 4)
+            boxes_arr = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+            if isinstance(image, Image.Image):
+                img_w, img_h = image.size
+            else:
+                img_h, img_w = image.shape[:2]
+            x1 = boxes_arr[:, 0] / img_w
+            y1 = boxes_arr[:, 1] / img_h
+            x2 = boxes_arr[:, 2] / img_w
+            y2 = boxes_arr[:, 3] / img_h
+            cxcywh = np.stack([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1], axis=-1)
+            box_input = mx.array(cxcywh)[None]
 
         # Run detection (text encoding skipped via cache)
         outputs = self.model.detect(

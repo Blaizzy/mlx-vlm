@@ -6,9 +6,11 @@ import mlx.nn as nn
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
+    kv_sequence_length,
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..mlp import SwiGLUMLP as MLP
 from .config import TextConfig
 
 
@@ -67,7 +69,7 @@ class Attention(nn.Module):
             keys, values = cache.update_and_fetch(keys, values)
 
         if self.use_sliding_window and mask is not None and isinstance(mask, mx.array):
-            key_len = keys.shape[-2]
+            key_len = kv_sequence_length(keys)
             if mask.shape[-1] != key_len:
                 mask = mask[..., -key_len:]
 
@@ -77,17 +79,6 @@ class Attention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-
-    def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 class TransformerBlock(nn.Module):

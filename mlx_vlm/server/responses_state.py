@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import uuid
@@ -8,6 +9,8 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+
+logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
@@ -161,6 +164,25 @@ class ThinkingStreamState:
         return text
 
 
+def prompt_has_open_thinking(
+    prompt: Any,
+    enable_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> bool:
+    """Return whether generation starts inside a prompt-opened thinking block."""
+    if not isinstance(prompt, str):
+        return False
+
+    stripped_prompt = prompt.rstrip()
+    for start_marker, _ in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        if stripped_prompt.endswith(start_marker):
+            return True
+    return False
+
+
 response_store: Dict[str, StoredResponse] = {}
 response_store_order: deque = deque()
 response_store_lock = Lock()
@@ -232,7 +254,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                             },
                         )
                 except Exception:
-                    print(f"Invalid tool call: {call}")
+                    logger.warning("Invalid tool call: %s", call)
     return dict(calls=called_tools, remaining_text=remaining)
 
 
@@ -303,10 +325,12 @@ def _response_output_items_from_text(
     tool_registry: Dict[str, str],
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    reasoning_item_id: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text, thinking_start_token, thinking_end_token
     )
+    reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
         tc = process_tool_calls(full_text, tool_module, chat_tools)
         if tc["calls"]:
@@ -319,7 +343,7 @@ def _response_output_items_from_text(
                 thinking_end_token,
             )
             remaining = re.sub(r"<\|[^>]+\|>|<[^>]+>", "", remaining).strip()
-            return items, remaining, reasoning, "tool_calls"
+            return reasoning_items + items, remaining, reasoning, "tool_calls"
     item = {
         "id": message_id,
         "type": "message",
@@ -329,7 +353,22 @@ def _response_output_items_from_text(
     }
     if reasoning:
         item["reasoning"] = reasoning
-    return [item], content, reasoning, "stop"
+    return reasoning_items + [item], content, reasoning, "stop"
+
+
+def _reasoning_output_items(
+    reasoning: Optional[str],
+    item_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not reasoning:
+        return []
+    return [
+        {
+            "id": item_id or f"rs_{uuid.uuid4().hex}",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": reasoning}],
+        }
+    ]
 
 
 def _normalize_response_input(input_value: Any) -> List[Dict[str, Any]]:

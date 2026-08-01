@@ -7,6 +7,7 @@ from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchQuantizedKVCache,
     StaticPrefixKVCache,
+    should_quantize_kv_layer,
 )
 
 B, H, D = 2, 4, 64  # batch, heads, head_dim
@@ -210,6 +211,70 @@ class TestMakeMask:
         assert mx.all(mask == reference_mask).item()
 
 
+class TestPrepareFinalize:
+    """Multi-row right-pad lifecycle parity with BatchKVCache (#1567 / #1562)."""
+
+    def test_prepare_finalize_methods_exist(self):
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        assert callable(getattr(cache, "prepare", None))
+        assert callable(getattr(cache, "finalize", None))
+
+    def test_prepare_stores_right_padding(self):
+        cache = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        cache.prepare(right_padding=[3, 0])
+        assert cache._right_padding is not None
+        assert cache._right_padding.tolist() == [3, 0]
+
+    def test_finalize_updates_left_padding_like_batch_kv(self):
+        right_padding = [2, 0]
+        quant = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        ref = BatchKVCache([0, 0])
+
+        quant.prepare(right_padding=right_padding)
+        ref.prepare(right_padding=right_padding)
+
+        k, v = _rand_kv(B, 6)
+        quant.update_and_fetch(k, v)
+        ref.update_and_fetch(k, v)
+
+        quant.finalize()
+        ref.finalize()
+
+        assert quant._right_padding is None
+        assert quant.left_padding.tolist() == ref.left_padding.tolist()
+        assert quant.offset.tolist() == ref.offset.tolist()
+
+    def test_finalize_noop_without_prepare(self):
+        cache = BatchQuantizedKVCache([1, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(B, 4)
+        cache.update_and_fetch(k, v)
+        before = cache.left_padding.tolist()
+        cache.finalize()
+        assert cache.left_padding.tolist() == before
+
+
+class TestShouldQuantizeKvLayerPolicy:
+    """Shared last-layer quant policy used by _make_cache / APC warm / stream."""
+
+    def test_shallow_stack_quantizes_all(self):
+        assert should_quantize_kv_layer(0, 1) is True
+        assert should_quantize_kv_layer(0, 2) is True
+        assert should_quantize_kv_layer(1, 2) is True
+
+    def test_deep_stack_skips_last(self):
+        n = 4
+        assert [should_quantize_kv_layer(i, n) for i in range(n)] == [
+            True,
+            True,
+            True,
+            False,
+        ]
+
+    def test_deep_stack_boundary(self):
+        assert should_quantize_kv_layer(26, 28) is True
+        assert should_quantize_kv_layer(27, 28) is False
+
+
 class TestMakeCache:
     """Test that _make_cache creates BatchQuantizedKVCache when kv_bits is set."""
 
@@ -243,6 +308,28 @@ class TestMakeCache:
         caches = _make_cache(FakeModel(), [0, 0])
         for c in caches:
             assert isinstance(c, BatchKVCache)
+
+    def test_make_cache_uses_should_quantize_kv_layer_policy(self):
+        from mlx_vlm.generate import _make_cache
+
+        class FakeLayer:
+            pass
+
+        class FakeModelDeep:
+            layers = [FakeLayer() for _ in range(4)]
+
+        class FakeModelShallow:
+            layers = [FakeLayer() for _ in range(2)]
+
+        deep = _make_cache(FakeModelDeep(), [0], kv_bits=8, kv_group_size=64)
+        assert [type(c).__name__ for c in deep] == [
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+            "BatchQuantizedKVCache",
+            "BatchKVCache",
+        ]
+        shallow = _make_cache(FakeModelShallow(), [0], kv_bits=8, kv_group_size=64)
+        assert all(type(c).__name__ == "BatchQuantizedKVCache" for c in shallow)
 
 
 class TestStaticPrefixKVCache:

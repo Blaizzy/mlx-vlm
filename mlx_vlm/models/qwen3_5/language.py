@@ -3,8 +3,8 @@ from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
 
+from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
@@ -72,12 +72,13 @@ def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
     return out.astype(conv_input.dtype)[:, None, :]
 
 
-_TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
-    name="qwen3_5_target_verify_gemv",
-    input_names=["x", "weight"],
-    output_names=["out"],
-    header="#include <metal_simdgroup>\nusing namespace metal;\n",
-    source=r"""
+_TARGET_VERIFY_GEMV = (
+    mx.fast.metal_kernel(
+        name="qwen3_5_target_verify_gemv",
+        input_names=["x", "weight"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=r"""
         uint lane = thread_position_in_grid.x;
         uint out_block = thread_position_in_grid.y;
         uint row = thread_position_in_grid.z;
@@ -145,12 +146,16 @@ _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
             }
         }
     """,
+    )
+    if mx.metal.is_available()
+    else None
 )
 
 
 def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
     return (
-        target_verify
+        _TARGET_VERIFY_GEMV is not None
+        and target_verify
         and x.ndim == 3
         and x.shape[1] > 1
         and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
@@ -258,11 +263,7 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
       }
       return scale * accum + sum * bias;
     }
-""".replace(
-        "__BITS__", str(bits)
-    ).replace(
-        "__GS__", str(group_size)
-    )
+""".replace("__BITS__", str(bits)).replace("__GS__", str(group_size))
 
 
 _TARGET_VERIFY_QMV_SOURCE = r"""
@@ -432,6 +433,15 @@ _TARGET_VERIFY_QARGMAX_SOURCE = r"""
     }
 """
 
+_TARGET_VERIFY_MASKED_QARGMAX_SOURCE = _TARGET_VERIFY_QARGMAX_SOURCE.replace(
+    "if (n < N_SIZE) {",
+    """if (
+          n < N_SIZE &&
+          ((as_type<uint>(mask[
+                (int(b_idx) * VERIFY_T + t) * mask_shape[1] + (n >> 5)]) >>
+            (n & 31)) & 1u) != 0u) {""",
+)
+
 
 @lru_cache(maxsize=None)
 def _target_verify_qmv_kernel(bits, group_size, dtype, verify_t, k_size, n_size):
@@ -463,25 +473,50 @@ def _target_verify_qargmax_kernel(bits, group_size, dtype, verify_t, k_size, n_s
     )
 
 
-def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+@lru_cache(maxsize=None)
+def _target_verify_masked_qargmax_kernel(
+    bits, group_size, dtype, verify_t, k_size, n_size
+):
+    dtype_name = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
+    return mx.fast.metal_kernel(
+        name=(
+            "qwen3_5_target_verify_masked_qargmax_"
+            f"b{bits}_gs{group_size}_t{verify_t}_k{k_size}_n{n_size}_{dtype_name}"
+        ),
+        input_names=["x", "w", "scales", "biases", "mask"],
+        output_names=["tile_values", "tile_indices"],
+        header=_target_verify_qlinear_header(bits, group_size),
+        source=_TARGET_VERIFY_MASKED_QARGMAX_SOURCE,
+    )
+
+
+def _can_target_verify_quantized_head(linear) -> bool:
     if (
         not isinstance(linear, nn.QuantizedLinear)
-        or x.ndim != 3
-        or x.shape[1] < 1
         or linear.bits not in (4, 5)
         or linear.mode != "affine"
         or linear.biases is None
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
+        or linear.scales.dtype not in (mx.bfloat16, mx.float16)
+        or linear.biases.dtype != linear.scales.dtype
     ):
         return False
 
-    _, _, K = x.shape
+    K = linear.weight.shape[1] * 32 // linear.bits
     N = linear.weight.shape[0]
-    return (
-        K == linear.weight.shape[1] * 32 // linear.bits and K % 512 == 0 and N % 8 == 0
-    )
+    return K % 512 == 0 and N % 8 == 0
+
+
+def _can_target_verify_quantized(linear, x: mx.array) -> bool:
+    if (
+        not _can_target_verify_quantized_head(linear)
+        or x.ndim != 3
+        or x.shape[1] < 1
+        or x.dtype != linear.scales.dtype
+    ):
+        return False
+
+    K = linear.weight.shape[1] * 32 // linear.bits
+    return x.shape[-1] == K
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -564,13 +599,17 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
-def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
+def _target_verify_quantized_argmax(
+    linear, x: mx.array, token_mask: Optional[mx.array] = None
+) -> Optional[mx.array]:
     if not _can_target_verify_quantized(linear, x) or "bias" in linear:
         return None
 
     B, T, K = x.shape
     if T == 1 and 1 < B <= 4:
-        out = _target_verify_quantized_argmax(linear, x.transpose(1, 0, 2))
+        out = _target_verify_quantized_argmax(
+            linear, x.transpose(1, 0, 2), token_mask=token_mask
+        )
         if out is not None:
             return out.transpose(1, 0)
 
@@ -578,11 +617,27 @@ def _target_verify_quantized_argmax(linear, x: mx.array) -> Optional[mx.array]:
     num_tiles = N // 8
 
     x = mx.contiguous(x)
-    kernel = _target_verify_qargmax_kernel(
-        linear.bits, linear.group_size, x.dtype, T, K, N
+    kernel_factory = (
+        _target_verify_masked_qargmax_kernel
+        if token_mask is not None
+        else _target_verify_qargmax_kernel
     )
+    kernel = kernel_factory(linear.bits, linear.group_size, x.dtype, T, K, N)
+    inputs = [x, linear.weight, linear.scales, linear.biases]
+    if token_mask is not None:
+        if token_mask.ndim == 1:
+            token_mask = token_mask[None, :]
+        if (
+            token_mask.dtype != mx.int32
+            or token_mask.shape[0] != B * T
+            or token_mask.shape[1] < (N + 31) // 32
+        ):
+            raise ValueError(
+                "packed token mask must be int32 with one complete row per token"
+            )
+        inputs.append(token_mask)
     tile_values, tile_indices = kernel(
-        inputs=[x, linear.weight, linear.scales, linear.biases],
+        inputs=inputs,
         template=[
             ("T", x.dtype),
             ("VERIFY_T", int(T)),
@@ -709,6 +764,20 @@ def _pad_row_time(x: mx.array, pad: int, target_length: int) -> mx.array:
         ],
         axis=1,
     )
+
+
+def _restore_batch_padding_metadata(cache_entry, offsets, steps: int):
+    if offsets is None:
+        return cache_entry
+    if not (
+        hasattr(cache_entry, "offset")
+        and hasattr(cache_entry, "left_padding")
+        and hasattr(cache_entry, "_idx")
+    ):
+        return cache_entry
+    cache_entry.offset = offsets + steps
+    cache_entry.left_padding = cache_entry._idx - cache_entry.offset
+    return cache_entry
 
 
 def _qwen3_5_left_padding_info(cache):
@@ -1203,6 +1272,10 @@ def _qwen3_5_ragged_decode_attention(
     pads: List[int],
     scale: float,
 ) -> Optional[mx.array]:
+    # Metal-only fast path; on other backends (e.g. CUDA) return None so the
+    # caller falls back to portable per-pad-group scaled_dot_product_attention.
+    if not mx.metal.is_available():
+        return None
     if (
         queries.ndim != 4
         or keys.ndim != 4
@@ -1843,8 +1916,30 @@ class Qwen3_5Model(nn.Module):
             if has_left_padding or int(query_left_padding.max().item()) > 0:
                 row_outputs = []
                 row_caches = [[] for _ in cache]
+                batch_offsets = []
+                for cache_entry in cache:
+                    offsets = getattr(cache_entry, "offset", None)
+                    if (
+                        isinstance(offsets, mx.array)
+                        and offsets.ndim > 0
+                        and offsets.size >= h.shape[0]
+                    ):
+                        batch_offsets.append(offsets[: h.shape[0]])
+                    else:
+                        batch_offsets.append(None)
                 for row, pad in enumerate(query_left_padding.tolist()):
                     pad = min(max(int(pad), 0), h.shape[1])
+                    current_cache = []
+                    for cache_entry in cache:
+                        if cache_entry is None:
+                            current_cache.append(None)
+                        else:
+                            current_cache.append(_extract_row_cache(cache_entry, row))
+                    if pad == h.shape[1]:
+                        row_outputs.append(mx.zeros_like(h[row : row + 1]))
+                        for i, cache_entry in enumerate(current_cache):
+                            row_caches[i].append(cache_entry)
+                        continue
                     row_inputs = inputs[row : row + 1, pad:]
                     row_embeds = h[row : row + 1, pad:]
                     row_position_ids = None
@@ -1853,12 +1948,6 @@ class Qwen3_5Model(nn.Module):
                             row_position_ids = position_ids[row : row + 1, pad:]
                         else:
                             row_position_ids = position_ids[:, row : row + 1, pad:]
-                    current_cache = []
-                    for cache_entry in cache:
-                        if cache_entry is None:
-                            current_cache.append(None)
-                        else:
-                            current_cache.append(_extract_row_cache(cache_entry, row))
 
                     row_out = self(
                         row_inputs,
@@ -1876,7 +1965,11 @@ class Qwen3_5Model(nn.Module):
                     if cache[i] is None:
                         continue
                     if hasattr(cache[i].__class__, "merge"):
-                        cache[i] = cache[i].__class__.merge(entries)
+                        cache[i] = _restore_batch_padding_metadata(
+                            cache[i].__class__.merge(entries),
+                            batch_offsets[i],
+                            h.shape[1],
+                        )
                 return mx.concatenate(row_outputs, axis=0)
 
         fa_mask = _create_qwen3_5_attention_mask(h, cache[self.fa_idx])
@@ -1985,44 +2078,45 @@ class LanguageModel(nn.Module):
                 valid_ends_mx = mx.array(valid_ends_list, dtype=mx.int32)
             return valid_ends_mx
 
-        # Separate trimmable (KV) caches from SSM caches.
+        def _is_ssm_cache(c):
+            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
+
         ssm_caches = []
         for c in caches:
             if c is None:
                 continue
-            if c.is_trimmable():
-                if trim > 0:
-                    c.trim(trim)
-                right_trimmed = False
-                if is_batch and max_a > 0:
-                    extra_trim_list = [max_a - a for a in accepted_list]
-                    if any(extra_trim_list):
-                        prepare = getattr(c, "prepare", None)
-                        finalize = getattr(c, "finalize", None)
-                        if (
-                            c.keys is not None
-                            and callable(prepare)
-                            and callable(finalize)
-                        ):
-                            prepare(right_padding=extra_trim_list)
-                            finalize()
-                            right_trimmed = True
-                if (
-                    is_batch
-                    and not right_trimmed
-                    and hasattr(c, "_idx")
-                    and c.keys is not None
-                    and max_a > 0
-                ):
-                    kv_len = c._idx
-                    verify_start = kv_len - n
-                    for bi, ve in enumerate(valid_ends_list):
-                        start = verify_start + ve
-                        if start < kv_len:
+            if _is_ssm_cache(c):
+                ssm_caches.append(c)
+                continue
+            if c.is_trimmable() and trim > 0:
+                c.trim(trim)
+            right_trimmed = False
+            if is_batch and max_a > 0:
+                extra_trim_list = [max_a - a for a in accepted_list]
+                if any(extra_trim_list):
+                    prepare = getattr(c, "prepare", None)
+                    finalize = getattr(c, "finalize", None)
+                    if c.keys is not None and callable(prepare) and callable(finalize):
+                        prepare(right_padding=extra_trim_list)
+                        finalize()
+                        right_trimmed = True
+            if (
+                is_batch
+                and not right_trimmed
+                and hasattr(c, "_idx")
+                and c.keys is not None
+                and max_a > 0
+            ):
+                kv_len = c._idx
+                verify_start = kv_len - n
+                for bi, ve in enumerate(valid_ends_list):
+                    start = verify_start + ve
+                    if start < kv_len:
+                        if hasattr(c, "zero_row_tail"):
+                            c.zero_row_tail(bi, start, kv_len)
+                        else:
                             c.keys[bi, :, start:kv_len, :] = 0
                             c.values[bi, :, start:kv_len, :] = 0
-            else:
-                ssm_caches.append(c)
 
         if not ssm_caches:
             return max_a
@@ -2353,6 +2447,10 @@ class LanguageModel(nn.Module):
 
                     llm_pos_ids_list.append(t_index + st_idx)
 
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
+
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()
                 padded_positions = [[1] * total_input_ids.shape[1] for _ in range(3)]
@@ -2434,6 +2532,9 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
+
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         c0 = None
@@ -2446,6 +2547,13 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
+
+        if position_ids is not None and cache_offsets is None:
+            seq_length = inputs.shape[-1]
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
 
         if (
             mask is None
@@ -2534,6 +2642,15 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
+                    position_ids = position_ids[None, ...]
+                    position_ids = mx.broadcast_to(
+                        position_ids, (3, batch_size, seq_length)
+                    )
 
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
@@ -2585,6 +2702,65 @@ class LanguageModel(nn.Module):
                 return out
         logits = self.speculative_logits_from_hidden(hidden)
         return mx.argmax(logits, axis=-1)
+
+    def supports_fused_greedy_logits_processors(self, logits_processors) -> bool:
+        return (
+            len(logits_processors) <= 4
+            and all(
+                processors
+                and len(processors) == 1
+                and callable(getattr(processors[0], "prepare_next_token_mask", None))
+                for processors in logits_processors
+            )
+            and not self.args.tie_word_embeddings
+            and _can_target_verify_quantized_head(self.lm_head)
+            and "bias" not in self.lm_head
+        )
+
+    def fused_greedy_decode(
+        self,
+        inputs: mx.array,
+        cache=None,
+        logits_processors=None,
+        **kwargs,
+    ):
+        if (
+            self.args.tie_word_embeddings
+            or not _can_target_verify_quantized_head(self.lm_head)
+            or "bias" in self.lm_head
+        ):
+            return None
+
+        token_mask = None
+        if logits_processors:
+            if not self.supports_fused_greedy_logits_processors(logits_processors):
+                return None
+            token_mask = mx.concatenate(
+                [
+                    processors[0].prepare_next_token_mask(token)
+                    for processors, token in zip(
+                        logits_processors, inputs[:, -1].tolist()
+                    )
+                ],
+                axis=0,
+            )
+
+        output = self(
+            inputs,
+            cache=cache,
+            return_hidden=True,
+            skip_logits=True,
+            **kwargs,
+        )
+        hidden = output.hidden_states[-1]
+        sampled = _target_verify_quantized_argmax(
+            self.lm_head, hidden, token_mask=token_mask
+        )
+        if sampled is not None:
+            return sampled
+        if token_mask is not None:
+            raise RuntimeError("masked fused greedy decode became unsupported")
+        return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
 
     def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
         out = self(

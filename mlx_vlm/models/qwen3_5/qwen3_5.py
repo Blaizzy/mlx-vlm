@@ -24,6 +24,28 @@ def sanitize_key(key):
     return key
 
 
+NORM_WEIGHT_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+
+def should_shift_norm_weights(weights):
+    has_mtp_weights = any("mtp." in key for key in weights)
+    has_unsanitized_conv1d = any(
+        "conv1d.weight" in key and value.shape[-1] != 1
+        for key, value in weights.items()
+    )
+    return has_mtp_weights or has_unsanitized_conv1d
+
+
+def should_offset_norm_weight(original_key, shift_norm_weights):
+    return shift_norm_weights or not original_key.startswith("language_model.")
+
+
 class Model(Qwen3VLModel):
 
     def __init__(self, config: ModelConfig):
@@ -48,9 +70,13 @@ class Model(Qwen3VLModel):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            self.language_model._position_ids = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, attention_mask=mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=position_ids,
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -81,16 +107,14 @@ class Model(Qwen3VLModel):
             self.config.video_token_index,
         )
 
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod
@@ -118,28 +142,25 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
-        # ignore mtp weights
+        # The MTP draft shard is separate from the base model. Its presence
+        # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
+        shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-
         sanitized_weights = {}
         for key, value in weights.items():
+            original_key = key
             key = sanitize_key(key)
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
-                if value.ndim == 1:
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                if value.ndim == 1 and should_offset_norm_weight(
+                    original_key, shift_norm_weights
+                ):
                     value += 1.0
 
             sanitized_weights[key] = value

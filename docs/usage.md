@@ -59,6 +59,23 @@ python -m mlx_vlm.generate \
     --max-tokens 256 --temperature 0
 ```
 
+MiniMax M3 uses the same `eagle3` path with the released
+`Inferact/MiniMax-M3-EAGLE3` drafter:
+
+```bash
+python -m mlx_vlm.generate \
+    --model ~/MiniMax-M3-4bit \
+    --draft-model ~/MiniMax-M3-EAGLE3 \
+    --draft-kind eagle3 \
+    --draft-block-size 3 \
+    --prompt "Write a concise note about MiniMax Sparse Attention." \
+    --max-tokens 256 --temperature 0
+```
+
+The public MiniMax M3 BF16 checkpoint advertises MTP metadata but does not
+publish `mtp` or `nextn` tensors; use `Inferact/MiniMax-M3-EAGLE3` for that
+checkpoint.
+
 Works with images too:
 
 ```bash
@@ -108,7 +125,7 @@ from mlx_vlm.generate import (
 )
 from mlx_vlm.speculative.drafters import load_drafter
 from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_lm.sample_utils import make_sampler
+from mlx_vlm.sample_utils import make_sampler
 
 model, processor = load("Qwen/Qwen3.5-4B")
 drafter = load_drafter("z-lab/Qwen3.5-4B-DFlash")
@@ -175,8 +192,12 @@ for i in range(B):
 | Target | Drafter | Notes |
 |--------|---------|-------|
 | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
+| `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
 
-The drafter is loaded via the shared `load_model` path — any model with a `dflash_config` key in its HF config is automatically detected.
+The drafter is loaded via the shared `load_model` path. DFlash checkpoints are
+detected from `dflash_config`; EAGLE-3 checkpoints are detected from
+`speculators_model_type` or EAGLE-3 architecture metadata. Native MTP sidecars
+for supported model families are detected from their `model_type`.
 
 ## Server (FastAPI)
 

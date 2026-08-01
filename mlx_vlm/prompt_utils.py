@@ -19,6 +19,7 @@ class MessageFormat(Enum):
     IMAGE_PATCH_TOKEN = "image_patch_token"
     START_IMAGE_TOKEN = "start_image_token"
     IMAGE_TOKEN_NEWLINE = "image_token_newline"
+    SINGLE_IMAGE_TOKEN = "single_image_token"
     IMAGE_TOKEN_WRAPPED = "image_token_wrapped"
     NUMBERED_IMAGE_TOKENS = "numbered_image_tokens"
     PROMPT_ONLY = "prompt_only"
@@ -45,6 +46,7 @@ MODEL_CONFIG = {
     "zaya1_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "mage_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -57,10 +59,12 @@ MODEL_CONFIG = {
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
+    "llmjpvl": MessageFormat.IMAGE_TOKEN,
     "nemotron_h_nano_omni": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "nemotronh_nano_omni_reasoning_v3": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
     "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k3": MessageFormat.LIST_WITH_IMAGE,
     "locateanything": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
@@ -78,6 +82,7 @@ MODEL_CONFIG = {
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
+    "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -88,11 +93,15 @@ MODEL_CONFIG = {
     "deepseek_vl_v2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr_2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "deepseekocr": MessageFormat.IMAGE_TOKEN_NEWLINE,
+    "unlimited-ocr": MessageFormat.SINGLE_IMAGE_TOKEN,
     "phi4-siglip": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "hunyuan_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "youtu_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "inkling_mm_model": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
+    "plamo2vl": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
     "moondream2": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
@@ -102,6 +111,7 @@ MODEL_CONFIG = {
     "nemotron_labs_diffusion": MessageFormat.TEXT_ONLY,
     "deepseek_v4": MessageFormat.TEXT_ONLY,
     "hrm_text": MessageFormat.TEXT_ONLY,
+    "minimax_m3": MessageFormat.TEXT_ONLY,
 }
 
 # Models that don't support multi-image
@@ -269,9 +279,19 @@ class MessageFormatter:
             "qwen3_omni_moe",
             "gemma4",
             "gemma4_unified",
+            "diffusion_gemma",
             "minicpmv4_6",
+            "minimax_m3_vl",
         ] and kwargs.get("video"):
-            return self._format_video_message(prompt, role, **kwargs)
+            return self._format_video_message(
+                prompt,
+                role,
+                skip_image_token,
+                skip_audio_token,
+                num_images,
+                num_audios,
+                **kwargs,
+            )
 
         # Route to appropriate formatter
         formatter_map = {
@@ -305,6 +325,9 @@ class MessageFormatter:
             ),
             MessageFormat.IMAGE_TOKEN_NEWLINE: partial(
                 self._format_with_token, token="<image>\n"
+            ),
+            MessageFormat.SINGLE_IMAGE_TOKEN: partial(
+                self._format_with_token, token="<image>", repeat_image_token=False
             ),
             MessageFormat.IMAGE_TOKEN_WRAPPED: partial(
                 self._format_with_token, token="(<image>./</image>)\n"
@@ -423,13 +446,14 @@ class MessageFormatter:
         num_audios: int,
         token: str,
         image_first: bool = True,
+        repeat_image_token: bool = True,
         **kwargs,
     ) -> Dict[str, Any]:
         """Format with image tokens in the text."""
         content = prompt
 
         if role == "user" and not skip_image_token and num_images > 0:
-            prefix = token * num_images
+            prefix = token * num_images if repeat_image_token else token
             content = f"{prefix}{content}" if image_first else f"{content}{prefix}"
 
         if role == "user" and not skip_audio_token and num_audios > 0:
@@ -503,6 +527,8 @@ class MessageFormatter:
             MessageBuilder.video_message(v, max_pixels, f)
             for v, f in zip(videos, fps_list)
         ]
+        if role == "user" and not skip_audio_token and num_audios > 0:
+            content.extend([MessageBuilder.audio_message()] * num_audios)
         content.append(MessageBuilder.text_message(prompt))
         return {"role": role, "content": content}
 
@@ -570,14 +596,35 @@ def get_chat_template(
 
         return "<image>"
 
-    def _flatten_content(content: Any, image_token: str) -> str:
+    def _get_video_token() -> str:
+        if processor is None:
+            return "<video>"
+
+        video_token = getattr(processor, "video_token", None)
+        if isinstance(video_token, str) and video_token:
+            return video_token
+
+        tokenizer = getattr(processor, "tokenizer", None)
+        video_token = getattr(tokenizer, "video_token", None)
+        if isinstance(video_token, str) and video_token:
+            return video_token
+
+        return "<video>"
+
+    def _flatten_content(content: Any, image_token: str, video_token: str) -> str:
         if isinstance(content, str):
             return content
 
         if isinstance(content, list):
             parts = []
             audio_marker = kwargs.get("audio_token", "<audio>")
-            multimodal_markers = {image_token, audio_marker, "<audio>", "<video>"}
+            multimodal_markers = {
+                image_token,
+                video_token,
+                audio_marker,
+                "<audio>",
+                "<video>",
+            }
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")
@@ -589,8 +636,8 @@ def get_chat_template(
                         parts.append(image_token)
                     elif item_type in ("audio", "input_audio"):
                         parts.append("<audio>")
-                    elif item_type == "video":
-                        parts.append("<video>")
+                    elif item_type in ("video", "input_video", "video_url"):
+                        parts.append(video_token)
                     else:
                         text = item.get("text", "") or item.get("content", "")
                         if text:
@@ -619,6 +666,7 @@ def get_chat_template(
 
     def _messages_to_plain_prompt() -> str:
         image_token = _get_image_token()
+        video_token = _get_video_token()
         normalized = []
 
         for message in messages:
@@ -631,7 +679,7 @@ def get_chat_template(
                     {
                         "role": message.get("role", "user"),
                         "content": _flatten_content(
-                            message.get("content", ""), image_token
+                            message.get("content", ""), image_token, video_token
                         ),
                     }
                 )
@@ -680,6 +728,26 @@ def get_chat_template(
             for parameter in signature.parameters.values()
         )
 
+    def _template_references_kw(template_processor: Any, name: str) -> bool:
+        templates = [
+            chat_template_override,
+            getattr(template_processor, "chat_template", None),
+            getattr(
+                getattr(template_processor, "tokenizer", None),
+                "chat_template",
+                None,
+            ),
+        ]
+
+        for template in templates:
+            if isinstance(template, str) and name in template:
+                return True
+            if isinstance(template, dict) and any(
+                isinstance(value, str) and name in value for value in template.values()
+            ):
+                return True
+        return False
+
     try:
         template_processor = None
         if (
@@ -717,6 +785,12 @@ def get_chat_template(
             template_processor, "enable_thinking"
         ):
             template_kwargs["enable_thinking"] = False
+        if (
+            "thinking_mode" not in template_kwargs
+            and template_kwargs.get("enable_thinking") is True
+            and _template_references_kw(template_processor, "thinking_mode")
+        ):
+            template_kwargs["thinking_mode"] = "enabled"
 
         try:
             return template_processor.apply_chat_template(

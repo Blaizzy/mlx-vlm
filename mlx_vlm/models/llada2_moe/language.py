@@ -4,12 +4,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
-from mlx_lm.models.switch_layers import SwitchGLU
 
+from ...generate.common import GenerationResult
+from ..activations import swiglu
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import KVCache, StaticPrefixKVCache
 from ..diffusion_visualizer import DiffusionUnmaskingVisualizer
+from ..switch_layers import SwitchGLU
 from .config import ModelConfig
 
 
@@ -365,8 +366,10 @@ class LanguageModel(nn.Module):
         visualize: bool = False,
         tokenizer: Optional[Any] = None,
         skip_special_tokens: bool = False,
+        skip_special_token_ids=None,
         stats: Optional[Dict[str, float]] = None,
         on_block: Optional[Callable[[List[int]], bool]] = None,
+        on_result: Optional[Callable[[GenerationResult], bool]] = None,
         **kwargs,
     ) -> mx.array:
         generation_mode = kwargs.pop("generation_mode", None)
@@ -426,7 +429,74 @@ class LanguageModel(nn.Module):
         display_end = prompt_length + gen_length
         prompt_tic = time.perf_counter()
         recorded_prompt_time = False
+        generation_tic = prompt_tic
+        emitted_text = ""
+        callback_stopped = False
         prefix_cache = [StaticPrefixKVCache(total_length) for _ in self.layers]
+
+        def decode_generated(tokens: List[int]) -> str:
+            if not tokens:
+                return ""
+            if tokenizer is not None:
+                return tokenizer.decode(
+                    tokens,
+                    skip_special_tokens=skip_special_tokens,
+                )
+            return " ".join(str(token_id) for token_id in tokens)
+
+        def emit_result(
+            tokens: List[int],
+            *,
+            diffusion_block_complete: bool = False,
+            finish_reason: Optional[str] = None,
+        ) -> bool:
+            nonlocal emitted_text
+            if on_result is None:
+                return True
+
+            text = decode_generated(tokens)
+            if text.startswith(emitted_text):
+                delta = text[len(emitted_text) :]
+            elif not emitted_text:
+                delta = text
+            else:
+                delta = "" if finish_reason is None else text
+
+            if not delta and finish_reason is None and not diffusion_block_complete:
+                return True
+
+            if text.startswith(emitted_text):
+                emitted_text = text
+
+            prompt_time = (stats or {}).get("prompt_time") or 0.0
+            generation_time = max(
+                time.perf_counter() - generation_tic - prompt_time,
+                1e-9,
+            )
+            generated_tokens = len(tokens)
+            return bool(
+                on_result(
+                    GenerationResult(
+                        text=delta,
+                        token=tokens[-1] if tokens else None,
+                        logprobs=None,
+                        prompt_tokens=inputs.size,
+                        generation_tokens=generated_tokens,
+                        total_tokens=inputs.size + generated_tokens,
+                        prompt_tps=(
+                            inputs.size / prompt_time if prompt_time > 0 else 0.0
+                        ),
+                        generation_tps=generated_tokens / generation_time,
+                        peak_memory=mx.get_peak_memory() / 1e9,
+                        finish_reason=finish_reason,
+                        diffusion_canvas_tokens=generated_tokens,
+                        diffusion_block_complete=diffusion_block_complete,
+                        text_already_printed=bool(
+                            (stats or {}).get("text_already_printed")
+                        ),
+                    )
+                )
+            )
 
         def project_hidden(hidden_states: mx.array) -> mx.array:
             if self.config.tie_word_embeddings:
@@ -567,7 +637,7 @@ class LanguageModel(nn.Module):
             mx.eval(
                 self.model(x[:, block_start:current_window_end], cache=prefix_cache)
             )
-            if on_block is not None:
+            if on_result is not None or on_block is not None:
                 # Report the generated tokens so far (clipped at the first
                 # EOS, like the final return); a False return stops early.
                 block_end = min(current_window_end, prompt_length + gen_length)
@@ -580,7 +650,14 @@ class LanguageModel(nn.Module):
                     ),
                     None,
                 )
-                if not on_block(so_far[:eos_cut] if eos_cut is not None else so_far):
+                so_far = so_far[:eos_cut] if eos_cut is not None else so_far
+                keep_going = (
+                    emit_result(so_far, diffusion_block_complete=True)
+                    if on_result is not None
+                    else on_block(so_far)
+                )
+                if not keep_going:
+                    callback_stopped = True
                     break
             if eos_early_stop:
                 generated = x[0, prompt_length:current_window_end]
@@ -610,6 +687,13 @@ class LanguageModel(nn.Module):
             print(final_text, end="", flush=True)
             if stats is not None:
                 stats["text_already_printed"] = True
+        if on_result is not None and not callback_stopped:
+            finish_reason = (
+                "stop"
+                if end > 0 and generated_ids[end - 1] in eos_token_ids
+                else "length"
+            )
+            emit_result(generated_ids[:end], finish_reason=finish_reason)
         return generated[:, :end]
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

@@ -147,6 +147,14 @@ _tool_call_regex = re.compile(
 
 
 def parse_tool_call(text, tools=None):
+    text = (
+        text.strip().removeprefix(tool_call_start).removesuffix(tool_call_end).strip()
+    )
+    if text.startswith(":"):
+        text = f"call{text}"
+    elif not text.startswith("call:") and re.match(r"^[\w.:-]+\{", text):
+        text = f"call:{text}"
+
     # Try recursive-group regex first for well-formed calls
     match = _tool_call_regex.search(text)
     if not match:
