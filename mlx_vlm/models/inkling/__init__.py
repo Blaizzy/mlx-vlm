@@ -1,3 +1,4 @@
+from .audio_feature_extractor import InklingAudioFeatureExtractor
 from .config import AudioConfig, ModelConfig, TextConfig, VisionConfig
 from .inkling import Model
 from .language import LanguageModel
@@ -9,6 +10,7 @@ __all__ = [
     "TextConfig",
     "VisionConfig",
     "AudioConfig",
+    "InklingAudioFeatureExtractor",
     "LanguageModel",
     "InklingProcessor",
     "InklingImageProcessor",

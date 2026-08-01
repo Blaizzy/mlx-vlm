@@ -92,6 +92,7 @@ class AudioConfig(BaseModelConfig):
     mel_vocab_size: int = 16
     text_hidden_size: int = 6144
     rms_norm_eps: float = 1e-6
+    max_frames_per_chunk: int = 256
 
 
 @dataclass
