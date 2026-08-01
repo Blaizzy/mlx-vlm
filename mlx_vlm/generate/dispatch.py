@@ -1349,6 +1349,46 @@ def main():
             prompt if isinstance(prompt, list) else [prompt]
         )
 
+    # Processors without native video support (no `videos` parameter) used to
+    # drop --video silently: the frames were loaded, the processor ignored the
+    # kwarg, and the model hallucinated an answer with no visual input at all.
+    # Fall back to sampling the video into frames and sending them as ordered
+    # images, which any image-capable model handles.
+    if args.video:
+        import inspect as _inspect
+
+        import numpy as _np
+        from PIL import Image as _PILImage
+
+        from ..utils import load_video as _load_video
+
+        # A `videos` parameter in the signature is not enough: the generic HF
+        # processor skeleton accepts videos but only processes them when a
+        # video_processor component exists, and silently discards them
+        # otherwise. Check for the component, not the parameter.
+        _proc_method = getattr(processor, "process", processor)
+        try:
+            _proc_params = _inspect.signature(_proc_method).parameters
+        except (TypeError, ValueError):
+            _proc_params = {}
+        _has_video_component = getattr(processor, "video_processor", None) is not None
+        if "videos" not in _proc_params or not _has_video_component:
+            frames = []
+            for v in args.video:
+                arr, _ = _load_video(str(v), fps=args.fps or 2.0)
+                for f in arr:
+                    frames.append(
+                        _PILImage.fromarray(
+                            _np.transpose(f, (1, 2, 0)).astype("uint8")
+                        )
+                    )
+            print(
+                f"{processor.__class__.__name__} has no native video support; "
+                f"sending {len(frames)} sampled frames as ordered images."
+            )
+            args.image = (args.image or []) + frames
+            args.video = None
+
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
