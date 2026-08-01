@@ -50,6 +50,19 @@ class Model(nn.Module):
     def get_image_features(self, pixel_values):
         return self.vision_tower(pixel_values)
 
+    def prepare_video_frame_pairs(self, processor, second_frames):
+        """Capability hook for the frames fallback (see generate/video.py):
+        inkling patches are temporal pairs [P, T=2, H, W, C] and the image
+        processor duplicates a still into both slots. The first frame of each
+        pair goes through the standard still path; these second frames'
+        patches are spliced into temporal slot 1 by ``get_input_embeddings``,
+        halving the token cost of independent stills and giving the encoder
+        real motion."""
+        pixels = processor.image_processor.preprocess(images=second_frames)[
+            "pixel_values"
+        ]
+        return {"video_temporal_pixels": pixels[:, 0]}
+
     def get_audio_features(self, audio_input_ids, audio_input_ids_mask=None):
         if audio_input_ids_mask is not None:
             flat = audio_input_ids.reshape(-1, audio_input_ids.shape[-1])
@@ -63,6 +76,22 @@ class Model(nn.Module):
         h = self.language_model.model.embed(input_ids)
 
         if pixel_values is not None:
+            # Native video: pixel_values rows carry a temporal pair per patch
+            # [P, T=2, H, W, C], and the image processor duplicates the frame
+            # into both slots for stills. A caller that patchified the SECOND
+            # frame of each consecutive pair can pass those patches here to
+            # overwrite slot 1 of the LAST N rows (video entities are appended
+            # after still images), turning duplicated stills into true
+            # temporal pairs with no other bookkeeping changes.
+            video_slot1 = kwargs.get("video_temporal_pixels", None)
+            if video_slot1 is not None:
+                n = video_slot1.shape[0]
+                head = pixel_values[:-n] if n < pixel_values.shape[0] else None
+                tail = pixel_values[-n:]
+                tail = mx.stack([tail[:, 0], video_slot1.astype(tail.dtype)], axis=1)
+                pixel_values = (
+                    tail if head is None else mx.concatenate([head, tail], axis=0)
+                )
             feats = self.get_image_features(pixel_values).astype(h.dtype)
             mask = mx.broadcast_to(
                 (input_ids == self.config.image_token_id)[..., None], h.shape

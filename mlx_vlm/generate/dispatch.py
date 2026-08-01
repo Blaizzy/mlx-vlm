@@ -163,6 +163,13 @@ def parse_arguments():
         help="Frames-per-second to sample from --video.",
     )
     parser.add_argument(
+        "--video-max-frames",
+        type=int,
+        default=16,
+        help="Cap on frames sent when video falls back to ordered images "
+        "(long clips are re-sampled evenly to this count).",
+    )
+    parser.add_argument(
         "--resize-shape",
         type=int,
         nargs="+",
@@ -1349,6 +1356,62 @@ def main():
             prompt if isinstance(prompt, list) else [prompt]
         )
 
+    # Processors without native video support used to drop --video silently:
+    # the frames were loaded, the processor ignored the kwarg, and the model
+    # hallucinated an answer with no visual input at all. Fall back to sending
+    # sampled frames as ordered images (see generate/video.py).
+    gen_kwargs_extra = {}
+    video_prompt = None
+    if args.video:
+        from .video import (
+            pair_adjacent_frames,
+            processor_handles_video,
+            sample_video_frames,
+            subsample_evenly,
+            timestamped_frame_messages,
+        )
+
+        if not processor_handles_video(processor):
+            frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
+            sampled = len(frames)
+            max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
+            pair_hook = getattr(model, "prepare_video_frame_pairs", None)
+            if pair_hook is not None:
+                anchors, first_frames, second_frames = pair_adjacent_frames(
+                    frames, max_frames
+                )
+                gen_kwargs_extra.update(pair_hook(processor, second_frames))
+                still_count = len(args.image or [])
+                args.image = (args.image or []) + first_frames
+                user_text = (
+                    " ".join(args.prompt)
+                    if isinstance(args.prompt, list)
+                    else str(args.prompt)
+                )
+                msgs = timestamped_frame_messages(
+                    user_text,
+                    args.system,
+                    still_count,
+                    [a / max(frame_fps, 1e-6) for a in anchors],
+                )
+                _tok = (
+                    processor.tokenizer
+                    if hasattr(processor, "tokenizer")
+                    else processor
+                )
+                video_prompt = _tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=False
+                )
+            else:
+                frames = subsample_evenly(frames, max_frames)
+                print(
+                    f"{processor.__class__.__name__} has no native video "
+                    f"support; sending {len(frames)} of {sampled} sampled "
+                    f"frames as ordered images."
+                )
+                args.image = (args.image or []) + frames
+            args.video = None
+
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
@@ -1359,14 +1422,17 @@ def main():
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
-    prompt = apply_chat_template(
-        processor,
-        config,
-        prompt,
-        num_images=num_images,
-        num_audios=num_audios,
-        **chat_template_kwargs,
-    )
+    if video_prompt is not None:
+        prompt = video_prompt
+    else:
+        prompt = apply_chat_template(
+            processor,
+            config,
+            prompt,
+            num_images=num_images,
+            num_audios=num_audios,
+            **chat_template_kwargs,
+        )
 
     kwargs = {}
 
@@ -1459,6 +1525,7 @@ def main():
 
     else:
         gen_kwargs = {
+            **gen_kwargs_extra,
             "image": args.image,
             "audio": args.audio,
             "video": args.video,
