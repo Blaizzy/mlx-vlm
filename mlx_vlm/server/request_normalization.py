@@ -178,6 +178,7 @@ def _build_gen_args(
         min_p=getattr(request, "min_p", 0.0),
         top_n_sigma=getattr(request, "top_n_sigma", 0.0),
         p_less=getattr(request, "p_less", False),
+        typical_p=getattr(request, "typical_p", 1.0),
         seed=getattr(request, "seed", None),
         logprobs=bool(getattr(request, "logprobs", False)),
         repetition_penalty=getattr(request, "repetition_penalty", None),

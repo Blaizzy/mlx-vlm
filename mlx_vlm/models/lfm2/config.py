@@ -22,6 +22,7 @@ class ModelConfig(BaseModelConfig):
     block_ffn_dim_multiplier: float
     block_auto_adjust_ff_dim: bool
     rope_theta: float = 1000000.0
+    conv_causal: bool = True
     rope_parameters: Optional[Dict[str, Any]] = None
     full_attn_idxs: Optional[List[int]] = None
     layer_types: Optional[List[str]] = None

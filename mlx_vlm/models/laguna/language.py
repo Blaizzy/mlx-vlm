@@ -333,9 +333,11 @@ class LanguageModel(nn.Module):
             weights.pop("lm_head.weight", None)
 
         weights = self._stack_compressed_nvfp4_experts(weights)
+        weights = self._fold_compressed_nvfp4_shared_experts(weights)
         weights = self._unpack_compressed_tensors(weights)
         weights = self._remap_router_weights(weights)
         weights = self._stack_experts(weights)
+        weights = self._fuse_split_switch_gate_up(weights)
         return {
             k: v
             for k, v in weights.items()
@@ -424,6 +426,40 @@ class LanguageModel(nn.Module):
 
         return weights
 
+    def _fold_compressed_nvfp4_shared_experts(self, weights):
+        quantization = self.args.quantization or {}
+        if quantization.get("mode") != "nvfp4":
+            return weights
+        if not any(
+            ".mlp.shared_expert." in key and key.endswith(".weight_packed")
+            for key in weights
+        ):
+            return weights
+
+        from ...utils import _E4M3_DECODE_LUT, _f32_to_e4m3
+
+        packed_suffix = ".weight_packed"
+        for key in list(weights.keys()):
+            if ".mlp.shared_expert." not in key or not key.endswith(packed_suffix):
+                continue
+
+            prefix = key[: -len(packed_suffix)]
+            scale_key = f"{prefix}.weight_scale"
+            global_scale_key = f"{prefix}.weight_global_scale"
+            if scale_key not in weights or global_scale_key not in weights:
+                continue
+
+            packed = weights.pop(key)
+            scale = weights.pop(scale_key)
+            global_scale = weights.pop(global_scale_key).astype(mx.float32)
+            weights.pop(f"{prefix}.input_global_scale", None)
+
+            weights[f"{prefix}.weight"] = packed.view(mx.uint32)
+            decoded = _E4M3_DECODE_LUT[scale.astype(mx.uint32)]
+            weights[f"{prefix}.scales"] = _f32_to_e4m3(decoded / global_scale)
+
+        return weights
+
     def _remap_router_weights(self, weights):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{layer_idx}.mlp"
@@ -470,6 +506,23 @@ class LanguageModel(nn.Module):
                             weights.pop(f"{prefix}.experts.{e}.{proj}.{suffix}")
                             for e in range(self.args.num_experts)
                         ]
+                    )
+        return weights
+
+    def _fuse_split_switch_gate_up(self, weights):
+        for layer_idx in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}.mlp.switch_mlp"
+            for suffix in ["weight", "scales", "biases"]:
+                gate_key = f"{prefix}.gate_proj.{suffix}"
+                up_key = f"{prefix}.up_proj.{suffix}"
+                fused_key = f"{prefix}.gate_up_proj.{suffix}"
+
+                if fused_key in weights:
+                    weights.pop(gate_key, None)
+                    weights.pop(up_key, None)
+                elif gate_key in weights and up_key in weights:
+                    weights[fused_key] = mx.concatenate(
+                        [weights.pop(gate_key), weights.pop(up_key)], axis=1
                     )
         return weights
 

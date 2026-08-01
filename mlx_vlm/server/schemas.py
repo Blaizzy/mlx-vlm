@@ -344,6 +344,9 @@ class OpenAIRequest(FlexibleBaseModel):
     p_less: bool = Field(
         False, description="Hyperparameter-free p-less sampling (on/off)."
     )
+    typical_p: float = Field(
+        1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     repetition_context_size: Optional[int] = Field(
         None, description="Repetition penalty context size."
@@ -729,6 +732,9 @@ class VLMRequest(FlexibleBaseModel):
     )
     p_less: bool = Field(
         False, description="Hyperparameter-free p-less sampling (on/off)."
+    )
+    typical_p: float = Field(
+        1.0, description="Locally typical sampling. 1.0 disables; typical ~0.2-0.95."
     )
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")

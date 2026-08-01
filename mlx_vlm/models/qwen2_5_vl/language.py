@@ -90,7 +90,7 @@ class Attention(nn.Module):
             kv_seq_len += cache.offset + 1
             position_ids = mx.arange(cache.offset, cache.offset + L)
             position_ids = mx.expand_dims(position_ids, axis=0)
-            position_ids = mx.tile(position_ids, (3, 1, 1))
+            position_ids = mx.tile(position_ids, (3, B, 1))
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
@@ -440,6 +440,13 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
+
+        if position_ids is not None and cache_offsets is None:
+            seq_length = inputs.shape[-1]
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask

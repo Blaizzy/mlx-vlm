@@ -4,14 +4,12 @@ from mlx_vlm.tool_parsers.cohere2_moe import parse_tool_call
 
 
 def test_cohere_action_array_parses_to_openai_tool_calls():
-    result = parse_tool_call(
-        """
+    result = parse_tool_call("""
         [
           {"tool_call_id": "1", "tool_name": "grep", "parameters": {"pattern": "<\\|channel>"}},
           {"tool_call_id_id": "2", "tool_name": "read", "parameters": {"path": "file.py"}}
         ]
-        """
-    )
+        """)
 
     assert [call["name"] for call in result] == ["grep", "read"]
     assert json.loads(result[0]["arguments"]) == {"pattern": "<|channel>"}

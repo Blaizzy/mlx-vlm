@@ -7,7 +7,7 @@ from mlx.utils import tree_flatten
 from ..base import LanguageModelOutput, scaled_dot_product_attention
 from ..cache import ArraysCache, CacheList, KVCache
 from ..mlp import SwiGLUMLP
-from ..switch_layers import SwitchGLU
+from ..switch_layers import SwitchGLU, _gather_sort, _scatter_unsort
 from .config import TextConfig as ModelConfig
 
 
@@ -23,11 +23,30 @@ def _clone_cache_tree(value):
     return value
 
 
+_CACHE_DICT_STATE = object()
+
+
+def _subcaches(cache):
+    return getattr(cache, "caches", None) or (cache,)
+
+
 def _snapshot_cache_state(caches):
-    """Deep-copy the full state of every cache so a speculative block can be
-    rolled back by replay. Inkling's short-conv slots keep only the last K-1
-    inputs and cannot be trimmed, so we restore-and-replay instead."""
-    snapshot = [None if c is None else _clone_cache_tree(c.state) for c in caches]
+    """Copy cache state for speculative restore-and-replay."""
+    snapshot = []
+    for cache in caches:
+        if cache is None:
+            snapshot.append(None)
+            continue
+        states = []
+        for subcache in _subcaches(cache):
+            if (
+                isinstance(subcache, ArraysCache)
+                or getattr(subcache, "keys", False) is None
+            ):
+                states.append((_CACHE_DICT_STATE, _clone_cache_tree(vars(subcache))))
+            else:
+                states.append(_clone_cache_tree(subcache.state))
+        snapshot.append(states)
     arrays = [v for _, v in tree_flatten(snapshot) if isinstance(v, mx.array)]
     if arrays:
         mx.eval(arrays)
@@ -35,9 +54,15 @@ def _snapshot_cache_state(caches):
 
 
 def _restore_cache_state(caches, snapshot):
-    for c, s in zip(caches, snapshot):
-        if c is not None and s is not None:
-            c.state = _clone_cache_tree(s)
+    for cache, states in zip(caches, snapshot):
+        if cache is None or states is None:
+            continue
+        for subcache, state in zip(_subcaches(cache), states):
+            if isinstance(state, tuple) and state and state[0] is _CACHE_DICT_STATE:
+                subcache.__dict__.clear()
+                subcache.__dict__.update(_clone_cache_tree(state[1]))
+            else:
+                subcache.state = _clone_cache_tree(state)
 
 
 _MASK_SRC = r"""
@@ -76,12 +101,18 @@ def _rup(a, m):
     return ((a + m - 1) // m) * m
 
 
-def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent):
+def banded_additive_mask(
+    rel, proj, q_offset, S, sliding, rel_extent, left_padding=None
+):
     """rel: [B, LQ, H, d_rel]; proj: [d_rel, rel_extent] -> additive mask [B, H, LQ, S]."""
     B, LQ, H, d_rel = rel.shape
     dtype = rel.dtype
+    q_offset = int(q_offset)
+    S = int(S)
+    sliding = int(sliding)
+    rel_extent = int(rel_extent)
     if mx.default_device() == mx.gpu:
-        return _mask_kernel(
+        mask = _mask_kernel(
             inputs=[rel, proj],
             template=[
                 ("T", dtype),
@@ -99,17 +130,58 @@ def banded_additive_mask(rel, proj, q_offset, S, sliding, rel_extent):
             output_shapes=[(B, H, LQ, S)],
             output_dtypes=[dtype],
         )[0]
-    rl = (rel @ proj).transpose(0, 2, 1, 3)
-    qp = mx.arange(LQ) + q_offset
-    kp = mx.arange(S)
-    dist = qp[:, None] - kp[None, :]
-    gidx = mx.broadcast_to(mx.clip(dist, 0, rel_extent - 1)[None, None], (B, H, LQ, S))
-    pb = mx.take_along_axis(rl, gidx, axis=-1)
-    pb = mx.where((dist >= rel_extent)[None, None], mx.array(0.0, dtype), pb)
-    neg = dist < 0
-    if sliding > 0:
-        neg = neg | (dist >= sliding)
-    return mx.where(neg[None, None], mx.array(-1e30, dtype), pb).astype(dtype)
+    else:
+        rl = (rel @ proj).transpose(0, 2, 1, 3)
+        qp = mx.arange(LQ) + q_offset
+        kp = mx.arange(S)
+        dist = qp[:, None] - kp[None, :]
+        gidx = mx.broadcast_to(
+            mx.clip(dist, 0, rel_extent - 1)[None, None], (B, H, LQ, S)
+        )
+        pb = mx.take_along_axis(rl, gidx, axis=-1)
+        pb = mx.where((dist >= rel_extent)[None, None], mx.array(0.0, dtype), pb)
+        masked = dist < 0
+        if sliding > 0:
+            masked = masked | (dist >= sliding)
+        mask = mx.where(masked[None, None], mx.array(-1e30, dtype), pb)
+
+    if left_padding is not None:
+        valid = mx.arange(S)[None, :] >= left_padding[:, None]
+        mask = mx.where(valid[:, None, None, :], mask, mx.array(-1e30, dtype))
+    return mask.astype(dtype)
+
+
+def _cache_padding_mask(cache, length):
+    if cache is None:
+        return None
+    positions = mx.arange(length)[None, :]
+    mask = None
+    left_padding = getattr(cache, "left_padding", None)
+    if left_padding is not None:
+        mask = positions >= left_padding[:, None]
+    lengths = getattr(cache, "lengths", None)
+    if lengths is not None:
+        length_mask = positions < lengths[:, None]
+        mask = length_mask if mask is None else mask & length_mask
+    return mask
+
+
+def _next_conv_state(state, inputs, mask):
+    state_size = state.shape[1]
+    if state_size == 0:
+        return state
+    if mask is None:
+        return mx.concatenate([state, inputs], axis=1)[:, -state_size:]
+
+    valid_count = mx.sum(mask, axis=1).astype(mx.int32)
+    valid_start = mx.argmax(mask.astype(mx.int32), axis=1)
+    logical = mx.arange(state_size)[None, :] + valid_count[:, None] - state_size
+    state_indices = state_size + logical
+    input_indices = state_size + valid_start[:, None] + mx.maximum(logical, 0)
+    indices = mx.where(logical >= 0, input_indices, state_indices)
+    combined = mx.concatenate([state, inputs], axis=1)
+    indices = mx.broadcast_to(indices[..., None], (*indices.shape, inputs.shape[-1]))
+    return mx.take_along_axis(combined, indices, axis=1)
 
 
 class InklingShortConvolution(nn.Module):
@@ -137,7 +209,7 @@ class InklingShortConvolution(nn.Module):
             if state is None:
                 state = mx.zeros((xf.shape[0], K - 1, xf.shape[-1]), dtype=xf.dtype)
             xp = mx.concatenate([state, xf], axis=1)
-            cache[self.conv_idx] = xp[:, -(K - 1) :, :]
+            cache[self.conv_idx] = _next_conv_state(state, xf, mask)
         else:
             xp = mx.pad(xf, [(0, 0), (K - 1, 0), (0, 0)])
         out = self.conv(xp.astype(self.conv.weight.dtype)).astype(mx.float32)
@@ -209,13 +281,19 @@ class InklingAttention(nn.Module):
         k = self.k_norm(k.reshape(B, L, self.n_kv, self.head_dim)).transpose(0, 2, 1, 3)
         v = v.reshape(B, L, self.n_kv, self.head_dim).transpose(0, 2, 1, 3)
 
-        offset = kv.offset if kv is not None else 0
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         S = k.shape[2]
+        offset = S - L
 
         mask = banded_additive_mask(
-            r, self.rel_proj.astype(x.dtype), offset, S, self.sliding, self.rel_extent
+            r,
+            self.rel_proj.astype(x.dtype),
+            offset,
+            S,
+            self.sliding,
+            self.rel_extent,
+            left_padding=getattr(kv, "left_padding", None),
         )
         if self.log_floor is not None:
             qpos = (mx.arange(L) + offset + 1).astype(mx.float32)
@@ -235,11 +313,38 @@ class InklingDenseMLP(SwiGLUMLP):
     """Dense SwiGLU MLP (shared ``SwiGLUMLP``) with a learned output scale."""
 
     def __init__(self, config: ModelConfig):
-        super().__init__(config.hidden_size, config.intermediate_size)
+        super().__init__(config.hidden_size, config.dense_intermediate_size)
         self.global_scale = mx.ones((1,))
 
     def __call__(self, x):
         return super().__call__(x) * self.global_scale
+
+
+class InklingSwitchGLU(SwitchGLU):
+    def __init__(self, input_dims, hidden_dims, num_experts, **kwargs):
+        super().__init__(input_dims, hidden_dims, num_experts, **kwargs)
+        self.gate_scale = mx.ones((num_experts,))  # s13 (fused gate/up scale2)
+        self.out_scale = mx.ones((num_experts,))  # s13 * s2
+
+    def _per_expert(self, scale, idx, like):
+        s = scale[idx].astype(like.dtype)
+        return s.reshape(s.shape + (1,) * (like.ndim - s.ndim))
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        x_gate = x_gate * self._per_expert(self.gate_scale, idx, x_gate)
+        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
+        x = x * self._per_expert(self.out_scale, idx, x)
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
 
 
 class InklingSparseMoE(nn.Module):
@@ -255,11 +360,11 @@ class InklingSparseMoE(nn.Module):
         self.gate_weight = mx.zeros((self.n_routed + self.n_shared, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed,))
         self.global_scale = mx.ones((1,))
-        self.switch_mlp = SwitchGLU(
-            config.hidden_size, config.moe_intermediate_size, self.n_routed
+        self.switch_mlp = InklingSwitchGLU(
+            config.hidden_size, config.intermediate_size, self.n_routed
         )
         self.shared_experts = SwitchGLU(
-            config.hidden_size, config.moe_intermediate_size, self.n_shared
+            config.hidden_size, config.intermediate_size, self.n_shared
         )
 
     def __call__(self, x):
@@ -316,10 +421,15 @@ class InklingDecoderLayer(nn.Module):
 
     def __call__(self, x, cache=None, conv_mask=None):
         conv = cache[1] if cache is not None else None
+        if conv_mask is None:
+            conv_mask = _cache_padding_mask(conv, x.shape[1])
         r = self.self_attn(self.input_layernorm(x), cache=cache, conv_mask=conv_mask)
         h = x + self.attn_sconv(r, cache=conv, mask=conv_mask)
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + self.mlp_sconv(r, cache=conv, mask=conv_mask)
+        out = h + self.mlp_sconv(r, cache=conv, mask=conv_mask)
+        if conv is not None:
+            conv.advance(x.shape[1])
+        return out
 
 
 class InklingModel(nn.Module):
