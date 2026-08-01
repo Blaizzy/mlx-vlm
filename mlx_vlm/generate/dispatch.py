@@ -1356,133 +1356,54 @@ def main():
             prompt if isinstance(prompt, list) else [prompt]
         )
 
-    # Processors without native video support (no `videos` parameter) used to
-    # drop --video silently: the frames were loaded, the processor ignored the
-    # kwarg, and the model hallucinated an answer with no visual input at all.
-    # Fall back to sampling the video into frames and sending them as ordered
-    # images, which any image-capable model handles.
+    # Processors without native video support used to drop --video silently:
+    # the frames were loaded, the processor ignored the kwarg, and the model
+    # hallucinated an answer with no visual input at all. Fall back to sending
+    # sampled frames as ordered images (see generate/video.py).
     gen_kwargs_extra = {}
-    inkling_video_prompt = None
+    video_prompt = None
     if args.video:
-        import inspect as _inspect
+        from .video import (
+            pair_adjacent_frames,
+            processor_handles_video,
+            sample_video_frames,
+            subsample_evenly,
+            timestamped_frame_messages,
+        )
 
-        import numpy as _np
-        from PIL import Image as _PILImage
-
-        from ..utils import load_video as _load_video
-
-        # A `videos` parameter in the signature is not enough: the generic HF
-        # processor skeleton accepts videos but only processes them when a
-        # video_processor component exists, and silently discards them
-        # otherwise. Check for the component, not the parameter.
-        _proc_method = getattr(processor, "process", processor)
-        try:
-            _proc_params = _inspect.signature(_proc_method).parameters
-        except (TypeError, ValueError):
-            _proc_params = {}
-        _has_video_component = getattr(processor, "video_processor", None) is not None
-        if "videos" not in _proc_params or not _has_video_component:
-            frames = []
-            frame_fps = args.fps or 2.0
-            for v in args.video:
-                arr, _sfps = _load_video(str(v), fps=args.fps or 2.0)
-                frame_fps = _sfps or frame_fps
-                for f in arr:
-                    frames.append(
-                        _PILImage.fromarray(
-                            _np.transpose(f, (1, 2, 0)).astype("uint8")
-                        )
-                    )
+        if not processor_handles_video(processor):
+            frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
             sampled = len(frames)
             max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
-            if getattr(model.config, "model_type", "") == "inkling_mm_model":
-                # Inkling's patches are temporal pairs [P, T=2, H, W, C] and
-                # the image processor duplicates a still into both slots.
-                # Feed the video natively instead: consecutive frame pairs
-                # become one image entity each (even frame goes through the
-                # standard still path; the odd frame's patches are spliced
-                # into temporal slot 1 by the model). Halves the token cost
-                # of the plain fallback and gives the encoder real motion.
-                # Pair ADJACENT sampled frames (small displacement between
-                # the two temporal slots, matching how consecutive video
-                # frames relate) at evenly spaced anchor points across the
-                # FULL sampled sequence. Pairing temporally distant frames
-                # into one patch reads as a double exposure instead of motion.
-                if len(frames) % 2:
-                    frames.append(frames[-1])
-                n_pairs = max(2, min(max_frames, len(frames) // 2))
-                anchors = [
-                    min(round(i * (len(frames) - 2) / max(n_pairs - 1, 1)), len(frames) - 2)
-                    for i in range(n_pairs)
-                ]
-                evens = [frames[a] for a in anchors]
-                odds = [frames[a + 1] for a in anchors]
-                odd_feats = processor.image_processor.preprocess(
-                    images=odds, return_tensors="np"
-                )["pixel_values"]
-                gen_kwargs_extra["video_temporal_pixels"] = mx.array(
-                    _np.asarray(odd_feats)[:, 0]
+            pair_hook = getattr(model, "prepare_video_frame_pairs", None)
+            if pair_hook is not None:
+                anchors, first_frames, second_frames = pair_adjacent_frames(
+                    frames, max_frames
                 )
-                user_still_count = len(args.image or [])
-                args.image = (args.image or []) + evens
-                # Timestamped single-message prompt. Bare image entities in
-                # separate messages read as a slideshow ("a sequence of still
-                # images"); labeling each pair with its clip time makes the
-                # model ground observations chronologically and track how
-                # positions change. The template renders interleaved
-                # text/image parts natively, so this stays template-faithful.
+                gen_kwargs_extra.update(pair_hook(processor, second_frames))
+                still_count = len(args.image or [])
+                args.image = (args.image or []) + first_frames
                 user_text = (
                     " ".join(args.prompt)
                     if isinstance(args.prompt, list)
                     else str(args.prompt)
                 )
-                parts = [{"type": "image"} for _ in range(user_still_count)]
-                parts.append(
-                    {
-                        "type": "text",
-                        "text": "Here is a video as a sequence of frames "
-                        "in chronological order.",
-                    }
+                msgs = timestamped_frame_messages(
+                    user_text,
+                    args.system,
+                    still_count,
+                    [a / max(frame_fps, 1e-6) for a in anchors],
                 )
-                for a in anchors:
-                    parts.append(
-                        {
-                            "type": "text",
-                            "text": f"frame at t={a / max(frame_fps, 1e-6):.1f}s:",
-                        }
-                    )
-                    parts.append({"type": "image"})
-                parts.append({"type": "text", "text": user_text})
-                msgs = (
-                    [{"role": "system", "content": args.system}]
-                    if args.system
-                    else []
-                ) + [{"role": "user", "content": parts}]
                 _tok = (
                     processor.tokenizer
                     if hasattr(processor, "tokenizer")
                     else processor
                 )
-                inkling_video_prompt = _tok.apply_chat_template(
+                video_prompt = _tok.apply_chat_template(
                     msgs, add_generation_prompt=True, tokenize=False
                 )
-                print(
-                    f"inkling native video: {len(evens)} timestamped temporal "
-                    f"pairs ({odd_feats.shape[0]} patches carry frame 2 of "
-                    f"each pair)."
-                )
             else:
-                if sampled > max_frames:
-                    # Long clips: keep frames evenly spaced across the clip.
-                    # Beyond a couple dozen near-identical frames, models
-                    # start describing a static scene mixture instead of the
-                    # sequence, so more frames costs tokens and loses the
-                    # temporal thread.
-                    idxs = [
-                        round(i * (sampled - 1) / (max_frames - 1))
-                        for i in range(max_frames)
-                    ]
-                    frames = [frames[i] for i in idxs]
+                frames = subsample_evenly(frames, max_frames)
                 print(
                     f"{processor.__class__.__name__} has no native video "
                     f"support; sending {len(frames)} of {sampled} sampled "
@@ -1501,8 +1422,8 @@ def main():
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
-    if inkling_video_prompt is not None:
-        prompt = inkling_video_prompt
+    if video_prompt is not None:
+        prompt = video_prompt
     else:
         prompt = apply_chat_template(
             processor,
