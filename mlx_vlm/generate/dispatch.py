@@ -1362,6 +1362,7 @@ def main():
     # Fall back to sampling the video into frames and sending them as ordered
     # images, which any image-capable model handles.
     gen_kwargs_extra = {}
+    inkling_video_prompt = None
     if args.video:
         import inspect as _inspect
 
@@ -1382,8 +1383,10 @@ def main():
         _has_video_component = getattr(processor, "video_processor", None) is not None
         if "videos" not in _proc_params or not _has_video_component:
             frames = []
+            frame_fps = args.fps or 2.0
             for v in args.video:
-                arr, _ = _load_video(str(v), fps=args.fps or 2.0)
+                arr, _sfps = _load_video(str(v), fps=args.fps or 2.0)
+                frame_fps = _sfps or frame_fps
                 for f in arr:
                     frames.append(
                         _PILImage.fromarray(
@@ -1420,10 +1423,53 @@ def main():
                 gen_kwargs_extra["video_temporal_pixels"] = mx.array(
                     _np.asarray(odd_feats)[:, 0]
                 )
+                user_still_count = len(args.image or [])
                 args.image = (args.image or []) + evens
+                # Timestamped single-message prompt. Bare image entities in
+                # separate messages read as a slideshow ("a sequence of still
+                # images"); labeling each pair with its clip time makes the
+                # model ground observations chronologically and track how
+                # positions change. The template renders interleaved
+                # text/image parts natively, so this stays template-faithful.
+                user_text = (
+                    " ".join(args.prompt)
+                    if isinstance(args.prompt, list)
+                    else str(args.prompt)
+                )
+                parts = [{"type": "image"} for _ in range(user_still_count)]
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": "Here is a video as a sequence of frames "
+                        "in chronological order.",
+                    }
+                )
+                for a in anchors:
+                    parts.append(
+                        {
+                            "type": "text",
+                            "text": f"frame at t={a / max(frame_fps, 1e-6):.1f}s:",
+                        }
+                    )
+                    parts.append({"type": "image"})
+                parts.append({"type": "text", "text": user_text})
+                msgs = (
+                    [{"role": "system", "content": args.system}]
+                    if args.system
+                    else []
+                ) + [{"role": "user", "content": parts}]
+                _tok = (
+                    processor.tokenizer
+                    if hasattr(processor, "tokenizer")
+                    else processor
+                )
+                inkling_video_prompt = _tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=False
+                )
                 print(
-                    f"inkling native video: {len(evens)} temporal pairs "
-                    f"({odd_feats.shape[0]} patches carry frame 2 of each pair)."
+                    f"inkling native video: {len(evens)} timestamped temporal "
+                    f"pairs ({odd_feats.shape[0]} patches carry frame 2 of "
+                    f"each pair)."
                 )
             else:
                 if sampled > max_frames:
@@ -1455,14 +1501,17 @@ def main():
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
-    prompt = apply_chat_template(
-        processor,
-        config,
-        prompt,
-        num_images=num_images,
-        num_audios=num_audios,
-        **chat_template_kwargs,
-    )
+    if inkling_video_prompt is not None:
+        prompt = inkling_video_prompt
+    else:
+        prompt = apply_chat_template(
+            processor,
+            config,
+            prompt,
+            num_images=num_images,
+            num_audios=num_audios,
+            **chat_template_kwargs,
+        )
 
     kwargs = {}
 
