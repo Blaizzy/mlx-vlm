@@ -55,9 +55,7 @@ def subsample_evenly(frames, max_frames):
     temporal thread."""
     if len(frames) <= max_frames:
         return frames
-    idxs = [
-        round(i * (len(frames) - 1) / (max_frames - 1)) for i in range(max_frames)
-    ]
+    idxs = [round(i * (len(frames) - 1) / (max_frames - 1)) for i in range(max_frames)]
     return [frames[i] for i in idxs]
 
 
