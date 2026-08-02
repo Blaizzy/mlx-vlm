@@ -232,14 +232,27 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         v = self.tokenmap[token]
         # if the token starts with space
         if self._byte_decoder[v[0]] == 32:
-            current_text = bytearray(
-                self._byte_decoder[c] for c in self._unflushed
-            ).decode("utf-8", errors="replace")
+            raw = bytearray(self._byte_decoder[c] for c in self._unflushed)
+            try:
+                current_text = raw.decode("utf-8")
+                kept = ""
+            except UnicodeDecodeError as e:
+                if e.end == len(raw):
+                    # An incomplete multi-byte sequence at the buffer edge:
+                    # flush the clean head and keep the trailing bytes
+                    # buffered so they can complete with the next token,
+                    # instead of mangling them into replacement chars.
+                    current_text = raw[: e.start].decode("utf-8", errors="replace")
+                    kept = self._unflushed[e.start :]
+                else:
+                    # Genuinely invalid bytes mid-buffer: replace and move on.
+                    current_text = raw.decode("utf-8", errors="replace")
+                    kept = ""
             if self.text or not self.trim_space:
                 self.text += current_text
             else:
                 self.text += _remove_space(current_text)
-            self._unflushed = v
+            self._unflushed = kept + v
         else:
             self._unflushed += v
 
