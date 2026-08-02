@@ -184,7 +184,7 @@ def _run_chunked_speculative_prefill(
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
-        and remaining_embeds.shape[1] > prefill_step_size
+        and remaining_embeds.shape[1] > 1
     ):
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
