@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import re
 import threading
 import unittest
 from types import SimpleNamespace
@@ -11971,9 +11972,10 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
 
 
-class TestApertus1p5Text(unittest.TestCase):
-    """Apertus 1.5 text backbone: split vocabulary + multimodal checkpoint layout."""
+class TestApertus1p5(unittest.TestCase):
+    """Apertus 1.5 Omni: split vocabulary, discrete code fusion, checkpoint layout."""
 
+    XIELU_SUFFIXES = (".alpha_p", ".alpha_n", ".beta", ".eps")
     ROPE_PARAMETERS = {
         "factor": 32.0,
         "high_freq_factor": 4.0,
@@ -11983,105 +11985,500 @@ class TestApertus1p5Text(unittest.TestCase):
         "rope_type": "llama3",
     }
 
-    def _config(self, **overrides):
-        from mlx_vlm.models.apertus1p5_text import ModelConfig
+    def _config(self, text=None, vision=None, audio=None, **overrides):
+        from mlx_vlm.models.apertus1p5 import ModelConfig
 
         params = dict(
-            model_type="apertus1p5_text",
-            hidden_size=64,
-            num_hidden_layers=2,
-            intermediate_size=128,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            rms_norm_eps=1e-5,
-            vocab_size=256,
-            output_vocab_size=128,
-            max_position_embeddings=512,
-            post_norm=False,
-            qk_norm=True,
-            tie_word_embeddings=False,
-            rope_parameters=dict(self.ROPE_PARAMETERS),
+            model_type="apertus1p5",
+            text_config=dict(
+                model_type="apertus1p5_text",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-5,
+                vocab_size=300,
+                output_vocab_size=100,
+                max_position_embeddings=512,
+                post_norm=False,
+                qk_norm=True,
+                tie_word_embeddings=False,
+                rope_parameters=dict(self.ROPE_PARAMETERS),
+            ),
+            vision_tokenizer_config=dict(
+                codebook_size=150,
+                embed_dim=8,
+                latent_channels=8,
+                base_channels=16,
+                channel_multiplier=[1, 2],
+                num_res_blocks=1,
+                attn_resolutions=[8],
+                resolution=16,
+                num_groups=4,
+            ),
+            audio_tokenizer_config=dict(
+                codebook_size=50,
+                codebook_dim=16,
+                hidden_size=16,
+                num_filters=4,
+                upsampling_ratios=[3, 2],
+                num_lstm_layers=1,
+            ),
+            # 100 text ids, then 150 image codes, then 50 audio codes = 300.
+            image_token_id=5,
+            audio_token_id=6,
+            image_token_offset=100,
+            audio_token_offset=250,
         )
+        for key, override in (
+            ("text_config", text),
+            ("vision_tokenizer_config", vision),
+            ("audio_tokenizer_config", audio),
+        ):
+            params[key].update(override or {})
         params.update(overrides)
         return ModelConfig.from_dict(params)
 
     def _model(self, **overrides):
-        from mlx_vlm.models.apertus1p5_text import Model
+        from mlx_vlm.models.apertus1p5 import Model
 
         model = Model(self._config(**overrides))
         model.eval()
         mx.eval(model.parameters())
         return model
 
+    # ---- language tower ----------------------------------------------------
+
     def test_rope_parameters_are_split(self):
         """`rope_parameters` feeds `rope_theta` + `rope_scaling` for the trunk."""
         from mlx_vlm.models.rope_utils import Llama3RoPE
 
-        config = self._config()
-        self.assertEqual(config.rope_theta, 4000000.0)
-        self.assertEqual(config.rope_scaling["rope_type"], "llama3")
-        self.assertEqual(config.rope_scaling["factor"], 32.0)
+        text_config = self._config().text_config
+        self.assertEqual(text_config.rope_theta, 4000000.0)
+        self.assertEqual(text_config.rope_scaling["rope_type"], "llama3")
+        self.assertEqual(text_config.rope_scaling["factor"], 32.0)
         # `rope_theta` is consumed, not left behind in the scaling config.
-        self.assertNotIn("rope_theta", config.rope_scaling)
-
-        model = self._model()
-        self.assertIsInstance(model.layers[0].self_attn.rope, Llama3RoPE)
+        self.assertNotIn("rope_theta", text_config.rope_scaling)
+        self.assertIsInstance(self._model().layers[0].self_attn.rope, Llama3RoPE)
 
     def test_pruned_head_accepts_extended_vocab_ids(self):
-        """Inputs span 266752-style ids; logits only cover the generatable prefix."""
+        """Inputs span the extended vocabulary; logits cover only text ids."""
         model = self._model()
         # Ids beyond `output_vocab_size` are valid inputs (image / audio codes).
-        ids = mx.array([[1, 5, 130, 200, 255, 9, 42, 3]])
-        logits = model(ids).logits
-        self.assertEqual(logits.shape, (1, 8, 128))
+        ids = mx.array([[1, 5, 130, 260, 299, 9, 42, 3]])
+        self.assertEqual(model(ids).logits.shape, (1, 8, 100))
 
         cache = model.language_model.make_cache()
         model(ids[:, :-1], cache=cache)
-        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, 128))
+        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, 100))
 
     def test_tied_embeddings_use_full_width(self):
         """A tied head cannot be pruned, so it falls back to the full vocabulary."""
-        model = self._model(tie_word_embeddings=True, output_vocab_size=None)
+        model = self._model(text=dict(tie_word_embeddings=True, output_vocab_size=None))
         self.assertFalse(hasattr(model.language_model, "lm_head"))
-        logits = model(mx.array([[1, 5, 130]])).logits
-        self.assertEqual(logits.shape, (1, 3, 256))
+        self.assertEqual(model(mx.array([[1, 5, 130]])).logits.shape, (1, 3, 300))
 
-    def _checkpoint_keys(self, model):
-        """Map module parameter paths back to `swiss-ai/Apertus-v1.5-8B` key names."""
-        keys = []
-        for path, _ in tree_flatten(model.parameters()):
-            path = path[len("language_model.") :]
-            if path.startswith("model."):
-                path = "model.language_model." + path[len("model.") :]
-            keys.append(path)
-        return keys
+    # ---- vision tokenizer --------------------------------------------------
+
+    def test_vision_grid_and_code_range(self):
+        """Codes form an `H/factor x W/factor` grid inside the codebook."""
+        tokenizer = self._model().vision_tokenizer
+        factor = tokenizer.spatial_scale_factor
+        self.assertEqual(factor, 2)
+        for height, width in ((8, 4), (16, 16), (2, 6)):
+            codes = tokenizer.encode(mx.zeros((1, height, width, 3)))
+            self.assertEqual(codes.shape, (1, height // factor, width // factor))
+            self.assertTrue((codes >= 0).all().item())
+            self.assertTrue((codes < 150).all().item())
+
+    def test_vision_attention_matches_reference(self):
+        """The NHWC attention reproduces the reference's NCHW `bmm` algebra."""
+        from mlx_vlm.models.apertus1p5.config import VisionConfig
+        from mlx_vlm.models.apertus1p5.vision import AttnBlock
+
+        channels, height, width = 8, 3, 4
+        block = AttnBlock(VisionConfig(num_groups=4), channels)
+        mx.eval(block.parameters())
+        x = mx.array(
+            np.random.RandomState(0)
+            .randn(1, height, width, channels)
+            .astype(np.float32)
+        )
+        got = np.array(block(x)).transpose(0, 3, 1, 2)
+
+        def conv1x1(module, tensor):
+            weight = np.array(module.weight)[:, 0, 0, :]
+            bias = np.array(module.bias)
+            return (
+                np.einsum("oc,bchw->bohw", weight, tensor) + bias[None, :, None, None]
+            )
+
+        normed = np.array(block.norm(x)).transpose(0, 3, 1, 2)
+        query, key, value = (conv1x1(m, normed) for m in (block.q, block.k, block.v))
+        b, c, h, w = query.shape
+        query = query.reshape(b, c, h * w).transpose(0, 2, 1)
+        key = key.reshape(b, c, h * w)
+        scores = (query @ key) * c**-0.5
+        scores = np.exp(scores - scores.max(-1, keepdims=True))
+        scores = scores / scores.sum(-1, keepdims=True)
+        value = value.reshape(b, c, h * w)
+        attended = (value @ scores.transpose(0, 2, 1)).reshape(b, c, h, w)
+        expected = np.array(x).transpose(0, 3, 1, 2) + conv1x1(block.proj_out, attended)
+
+        self.assertTrue(np.allclose(got, expected, atol=1e-5))
+
+    # ---- audio tokenizer ---------------------------------------------------
+
+    def test_audio_code_count_matches_hop(self):
+        """The convolution padding chain yields exactly `ceil(length / hop)`."""
+        tokenizer = self._model().audio_tokenizer
+        self.assertEqual(tokenizer.hop_length, 6)
+        for length in (6, 7, 18, 61):
+            codes = tokenizer.encode(mx.zeros((1, length, 1)))
+            self.assertEqual(codes.shape, (1, tokenizer.num_codes(length)))
+            self.assertTrue((codes < 50).all().item())
+
+    # ---- discrete code fusion ---------------------------------------------
+
+    def _media(self):
+        """One 8x4 image (8 codes) and one 18-sample clip (3 codes)."""
+        return dict(
+            pixel_values=mx.zeros((1, 8, 4, 3)),
+            image_sizes=mx.array([[8, 4]]),
+            input_features=mx.zeros((1, 18, 1)),
+            feature_attention_mask=mx.ones((1, 18), dtype=mx.int32),
+        )
+
+    def _prompt(self):
+        return mx.array([[1, 2] + [5] * 8 + [3] + [6] * 3 + [4]])
+
+    def test_code_ids_land_in_their_vocabulary_bands(self):
+        model = self._model()
+        media = self._media()
+
+        image_ids, image_counts = model.get_image_tokens(
+            media["pixel_values"], media["image_sizes"]
+        )
+        self.assertEqual(image_counts, [8])
+        self.assertTrue((image_ids >= 100).all().item())
+        self.assertTrue((image_ids < 250).all().item())
+
+        audio_ids, audio_counts = model.get_audio_tokens(
+            media["input_features"], media["feature_attention_mask"]
+        )
+        self.assertEqual(audio_counts, [3])
+        self.assertTrue((audio_ids >= 250).all().item())
+        self.assertTrue((audio_ids < 300).all().item())
+
+    def test_placeholders_receive_code_embeddings(self):
+        model = self._model()
+        input_ids = self._prompt()
+        fused = model.get_input_embeddings(input_ids=input_ids, **self._media())
+        plain = model.language_model.model.embed_tokens(input_ids)
+
+        # Placeholder slots now hold code embeddings, text slots are untouched.
+        for position in (2, 9, 11):
+            self.assertFalse(
+                mx.allclose(fused.inputs_embeds[0, position], plain[0, position]).item()
+            )
+        for position in (0, 1, 10, 14):
+            self.assertTrue(
+                mx.allclose(fused.inputs_embeds[0, position], plain[0, position]).item()
+            )
+
+        logits = model(input_ids, **self._media()).logits
+        self.assertEqual(logits.shape, (1, input_ids.shape[1], 100))
+
+    def test_placeholder_count_mismatch_is_rejected(self):
+        model = self._model()
+        media = self._media()
+        with self.assertRaisesRegex(ValueError, "placeholder"):
+            model(
+                mx.array([[1, 5, 5, 2]]),
+                pixel_values=media["pixel_values"],
+                image_sizes=media["image_sizes"],
+            )
+
+    def test_image_sizes_are_required(self):
+        model = self._model()
+        with self.assertRaisesRegex(ValueError, "image_sizes"):
+            model(self._prompt(), pixel_values=self._media()["pixel_values"])
+
+    # ---- checkpoint layout -------------------------------------------------
+
+    def _checkpoint(self, model):
+        """Rebuild the published checkpoint layout from the module parameters."""
+        params = dict(tree_flatten(model.parameters()))
+        weights = {}
+        for name, value in params.items():
+            if name.startswith("language_model."):
+                rest = name[len("language_model.") :]
+                key = (
+                    "model.language_model." + rest[len("model.") :]
+                    if rest.startswith("model.")
+                    else rest  # `lm_head.weight` sits at the top level
+                )
+                if key.endswith(self.XIELU_SUFFIXES):
+                    value = mx.zeros((1,))  # shipped as (1,)-shaped tensors
+                weights[key] = value
+            elif name.startswith("vision_tokenizer."):
+                key = "model.vision_tokenizer." + name[len("vision_tokenizer.") :]
+                # PyTorch conv2d weights are NCHW.
+                weights[key] = value.transpose(0, 3, 1, 2) if value.ndim == 4 else value
+            elif name.startswith("audio_tokenizer."):
+                rest = name[len("audio_tokenizer.") :]
+                base = "model.audio_tokenizer."
+                lstm = re.fullmatch(r"(.*\.lstm)\.(\d+)\.(Wx|Wh|bias)", rest)
+                if lstm:
+                    prefix, layer, kind = lstm.groups()
+                    gate = {"Wx": "ih", "Wh": "hh"}.get(kind)
+                    if gate:
+                        weights[f"{base}{prefix}.weight_{gate}_l{layer}"] = value
+                    else:
+                        # PyTorch splits the LSTM bias into two halves.
+                        weights[f"{base}{prefix}.bias_ih_l{layer}"] = value / 2
+                        weights[f"{base}{prefix}.bias_hh_l{layer}"] = value / 2
+                elif rest.endswith("conv.weight"):
+                    out_channels, kernel, in_channels = value.shape
+                    prefix = f"{base}{rest[: -len('.weight')]}.parametrizations.weight"
+                    weights[f"{prefix}.original0"] = mx.ones((out_channels, 1, 1))
+                    weights[f"{prefix}.original1"] = mx.zeros(
+                        (out_channels, in_channels, kernel)
+                    )
+                else:
+                    weights[f"{base}{rest}"] = value
+
+        # Codebook EMA buffers and the Vocos decoder, both dropped on load.
+        for buffer in ("cluster_size", "embed_avg", "inited"):
+            weights[f"model.audio_tokenizer.quantizer.codebook.{buffer}"] = mx.zeros(
+                (1,)
+            )
+        weights["model.audio_tokenizer.backbone.embed.weight"] = mx.zeros((1,))
+        weights["model.audio_tokenizer.head.linear.weight"] = mx.zeros((1,))
+        # The vision tokenizer's own decoder is not shipped, but be defensive.
+        return weights, params
 
     def test_sanitize_matches_checkpoint_layout(self):
         model = self._model()
-        weights = {}
-        for key in self._checkpoint_keys(model):
-            # xIELU parameters ship as (1,)-shaped tensors.
-            shape = (
-                (1,)
-                if key.endswith((".alpha_p", ".alpha_n", ".beta", ".eps"))
-                else (2,)
-            )
-            weights[key] = mx.zeros(shape)
-        # The checkpoint also carries the image / audio code tokenizers.
-        weights["model.vision_tokenizer.encoder.conv_in.weight"] = mx.zeros((2,))
-        weights["model.audio_tokenizer.backbone.embed.weight"] = mx.zeros((2,))
+        weights, params = self._checkpoint(model)
 
         sanitized = model.sanitize(weights)
 
-        expected = {path for path, _ in tree_flatten(model.parameters())}
-        self.assertEqual(set(sanitized), expected)
-        self.assertIn("language_model.lm_head.weight", sanitized)
-        for key, value in sanitized.items():
-            if key.endswith((".alpha_p", ".alpha_n", ".beta", ".eps")):
-                self.assertEqual(value.shape, ())
+        self.assertEqual(set(sanitized), set(params))
+        for name, value in sanitized.items():
+            self.assertEqual(value.shape, params[name].shape, name)
+        # xIELU scalars are squeezed out of their (1,)-shaped tensors.
+        for name in sanitized:
+            if name.endswith(self.XIELU_SUFFIXES):
+                self.assertEqual(sanitized[name].shape, ())
+        # Both code tokenizers stay in float32: their argmax is not robust to
+        # half precision.
+        for name, value in sanitized.items():
+            if name.startswith(("vision_tokenizer.", "audio_tokenizer.")):
+                self.assertEqual(value.dtype, mx.float32, name)
+
+    def test_sanitize_folds_weight_norm(self):
+        """`original0 * original1 / ||original1||` reproduces the conv weight."""
+        model = self._model()
+        key = "model.audio_tokenizer.encoder.layers.0.conv"
+        direction = mx.array(np.random.RandomState(1).randn(4, 1, 7).astype(np.float32))
+        magnitude = mx.array(np.full((4, 1, 1), 3.0, dtype=np.float32))
+        weights, _ = self._checkpoint(model)
+        weights[f"{key}.parametrizations.weight.original0"] = magnitude
+        weights[f"{key}.parametrizations.weight.original1"] = direction
+
+        sanitized = model.sanitize(weights)
+        folded = sanitized["audio_tokenizer.encoder.layers.0.conv.weight"]
+
+        norm = mx.sqrt((direction**2).sum(axis=(1, 2), keepdims=True))
+        expected = (magnitude * direction / norm).transpose(0, 2, 1)
+        self.assertTrue(mx.allclose(folded, expected, atol=1e-6).item())
 
     def test_sanitize_is_idempotent(self):
-        """Already-namespaced weights (e.g. an mlx-vlm conversion) pass through."""
+        """Already-namespaced weights (an mlx-vlm conversion) pass through."""
         model = self._model()
-        weights = {path: mx.zeros((2,)) for path, _ in tree_flatten(model.parameters())}
-        self.assertEqual(set(model.sanitize(dict(weights))), set(weights))
+        params = dict(tree_flatten(model.parameters()))
+        self.assertEqual(set(model.sanitize(dict(params))), set(params))
+
+    def test_quant_predicate_skips_tokenizers(self):
+        model = self._model()
+        self.assertFalse(
+            model.quant_predicate("vision_tokenizer.encoder.conv_in", nn.Identity())
+        )
+        self.assertFalse(
+            model.quant_predicate("audio_tokenizer.quantizer.codebook", nn.Identity())
+        )
+        self.assertTrue(model.quant_predicate("language_model.lm_head", nn.Identity()))
+
+    def test_config_rejects_inconsistent_offsets(self):
+        """The code vocabularies must sit back to back inside the embedding."""
+        with self.assertRaisesRegex(ValueError, "audio_token_offset"):
+            self._config(audio_token_offset=999)
+        with self.assertRaisesRegex(ValueError, "extended"):
+            self._config(text=dict(vocab_size=260))
+
+
+class TestApertus1p5Processor(unittest.TestCase):
+    """Placeholder expansion and media preprocessing for Apertus 1.5."""
+
+    def test_smart_resize_clamps_area_to_the_code_grid(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import smart_resize
+
+        # Small images are upscaled to `min_pixels`, large ones downscaled.
+        self.assertEqual(smart_resize(64, 64), (256, 256))
+        self.assertEqual(smart_resize(100, 100), (256, 256))
+        for height, width in ((2000, 3000), (17, 999), (513, 289)):
+            new_height, new_width = smart_resize(height, width)
+            self.assertEqual(new_height % 16, 0)
+            self.assertEqual(new_width % 16, 0)
+            self.assertLessEqual(new_height * new_width, 1400 * 1400 * 1.05)
+            self.assertGreaterEqual(new_height, 16)
+            self.assertGreaterEqual(new_width, 16)
+
+    def test_image_processor_pads_the_batch_and_reports_true_sizes(self):
+        from PIL import Image
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+        )
+
+        processor = Apertus1p5ImageProcessor(min_pixels=32 * 32, max_pixels=64 * 64)
+        outputs = processor.preprocess(
+            [Image.new("RGB", (40, 30), (255, 0, 0)), Image.new("RGB", (64, 64))]
+        )
+
+        self.assertEqual(outputs["image_sizes"].tolist(), [[32, 48], [64, 64]])
+        self.assertEqual(outputs["image_grids"].tolist(), [[2, 3], [4, 4]])
+        # Padded to the largest image in the batch; the model crops it away.
+        self.assertEqual(outputs["pixel_values"].shape, (2, 64, 64, 3))
+        self.assertTrue(np.all(outputs["pixel_values"][0, 32:, :] == 0))
+        # Normalized to [-1, 1].
+        self.assertGreaterEqual(float(outputs["pixel_values"].min()), -1.0)
+        self.assertLessEqual(float(outputs["pixel_values"].max()), 1.0)
+        self.assertEqual(
+            processor.get_number_of_image_patches(30, 40),
+            int(np.prod(outputs["image_grids"][0])),
+        )
+
+    def test_audio_feature_extractor_normalizes_and_masks(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5AudioFeatureExtractor,
+        )
+
+        extractor = Apertus1p5AudioFeatureExtractor(hop_length=600)
+        outputs = extractor(
+            [np.ones(1500, dtype=np.float32) * 0.01, np.ones(600, dtype=np.float32)]
+        )
+
+        self.assertEqual(outputs["input_features"].shape, (2, 1500, 1))
+        self.assertEqual(outputs["num_audio_codes"], [3, 1])
+        self.assertEqual(
+            outputs["feature_attention_mask"].sum(axis=1).tolist(), [1500, 600]
+        )
+        # Every clip is peak-normalized to -3 dBFS regardless of input scale.
+        peak = float(np.abs(outputs["input_features"][0]).max())
+        self.assertAlmostEqual(peak, 10.0 ** (-3.0 / 20.0), places=4)
+
+    def test_placeholder_expansion_layout(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import Apertus1p5Processor
+
+        processor = Apertus1p5Processor.__new__(Apertus1p5Processor)
+        processor.image_token = "<|image|>"
+        processor.audio_token = "<|audio|>"
+        processor.boi_token = "<|img_start|>"
+        processor.eoi_token = "<|img_end|>"
+        processor.image_wrapper_token = "<|img_token_start|>"
+        processor.eol_token = "<|img_end_of_row|>"
+        processor.boa_token = "<|audio_start|>"
+        processor.eoa_token = "<|audio_end|>"
+
+        run = processor.replace_image_token([[2, 3]], 0)
+        self.assertEqual(
+            run,
+            "<|img_start|>2*3<|img_token_start|>"
+            "<|image|><|image|><|image|>"
+            "<|img_end_of_row|>"
+            "<|image|><|image|><|image|>"
+            "<|img_end|>",
+        )
+        # One placeholder per code, and row separators between rows only.
+        self.assertEqual(run.count("<|image|>"), 6)
+        self.assertEqual(run.count("<|img_end_of_row|>"), 1)
+
+        self.assertEqual(
+            processor.replace_audio_token([2], 0),
+            "<|audio_start|><|audio|><|audio|><|audio_end|>",
+        )
+
+        # Replacements are consumed in batch-sample then left-to-right order.
+        expanded = processor._expand(
+            ["a <|image|> b <|image|>", "c <|image|>"], "<|image|>", ["X", "Y", "Z"]
+        )
+        self.assertEqual(expanded, ["a X b Y", "c Z"])
+        with self.assertRaisesRegex(ValueError, "placeholders"):
+            processor._expand(["<|image|>"], "<|image|>", ["X", "Y"])
+
+
+class TestApertus1p5Text(unittest.TestCase):
+    """The text-only sibling package, for language-tower conversions."""
+
+    def _model(self, **overrides):
+        from mlx_vlm.models.apertus1p5_text import Model, ModelConfig
+
+        params = dict(
+            model_type="apertus1p5_text",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=300,
+            output_vocab_size=100,
+            max_position_embeddings=512,
+            post_norm=False,
+            qk_norm=True,
+            tie_word_embeddings=False,
+        )
+        params.update(overrides)
+        model = Model(ModelConfig.from_dict(params))
+        model.eval()
+        mx.eval(model.parameters())
+        return model
+
+    def test_shares_the_multimodal_language_tower(self):
+        from mlx_vlm.models.apertus1p5.language import LanguageModel
+
+        model = self._model()
+        self.assertIsInstance(model.language_model, LanguageModel)
+        ids = mx.array([[1, 5, 130, 260, 299, 9, 42, 3]])
+        self.assertEqual(model(ids).logits.shape, (1, 8, 100))
+
+        cache = model.language_model.make_cache()
+        model(ids[:, :-1], cache=cache)
+        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, 100))
+
+    def test_sanitize_drops_the_code_tokenizers(self):
+        """The full multimodal checkpoint loads, keeping only the text tower."""
+        model = self._model()
+        params = dict(tree_flatten(model.parameters()))
+        weights = {}
+        for name, value in params.items():
+            rest = name[len("language_model.") :]
+            key = (
+                "model.language_model." + rest[len("model.") :]
+                if rest.startswith("model.")
+                else rest
+            )
+            if key.endswith((".alpha_p", ".alpha_n", ".beta", ".eps")):
+                value = mx.zeros((1,))
+            weights[key] = value
+        weights["model.vision_tokenizer.encoder.conv_in.weight"] = mx.zeros((2,))
+        weights["model.audio_tokenizer.encoder.layers.0.conv.bias"] = mx.zeros((2,))
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(set(sanitized), set(params))
+        for name, value in sanitized.items():
+            self.assertEqual(value.shape, params[name].shape, name)

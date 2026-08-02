@@ -6,7 +6,7 @@ import mlx.nn as nn
 from ..apertus.language import ApertusModel
 from ..base import LanguageModelOutput
 from ..cache import KVCache
-from .config import ModelConfig
+from .config import TextConfig
 
 # xIELU parameters are stored as ``(1,)``-shaped tensors in the checkpoint while
 # ``XieLU`` holds them as scalars.
@@ -14,12 +14,19 @@ XIELU_PARAMS = (".alpha_p", ".alpha_n", ".beta", ".eps")
 
 
 class LanguageModel(nn.Module):
-    def __init__(self, args: ModelConfig):
+    """Apertus decoder with an extended input vocabulary and a pruned head.
+
+    The trunk is reused verbatim from ``models/apertus``; only the head width
+    differs. The embedding spans the extended vocabulary (text + visual + audio
+    codes) while the head is physically pruned to the text-only prefix, because
+    code tokens are input-only and never generated.
+    """
+
+    def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
         self.config = args
         self.model_type = args.model_type
-        # The trunk embeds over the extended vocabulary (`vocab_size`).
         self.model = ApertusModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(

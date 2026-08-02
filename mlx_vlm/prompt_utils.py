@@ -32,6 +32,7 @@ class MessageFormat(Enum):
 # Model configuration mapping
 MODEL_CONFIG = {
     # List with image format models
+    "apertus1p5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "jina_vlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "jvlm": MessageFormat.IMAGE_TOKEN_PIPE,
     "idefics2": MessageFormat.LIST_WITH_IMAGE,

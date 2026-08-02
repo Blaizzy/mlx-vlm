@@ -1,25 +1,12 @@
 """Apertus 1.5 text backbone.
 
-Apertus 1.5 (``swiss-ai/Apertus-v1.5-8B``) is an early-fusion, discrete-token
-multimodal model: images and audio are encoded to code tokens that live in the
-same vocabulary as text. Its language tower is a plain Apertus decoder (xIELU
-MLP, qk-norm attention, llama3 RoPE), so the trunk is reused verbatim from
-``..apertus``. Two things differ:
+The language tower of ``swiss-ai/Apertus-v1.5-8B`` on its own, for text-only
+conversions. The implementation lives in ``models/apertus1p5``; this package
+just wraps it, the way ``gemma3_text`` wraps ``gemma3``.
 
-1. Split vocabulary. The input embedding spans the *extended* vocabulary
-   (``vocab_size`` = 266752: text + visual + audio codes) while the LM head is
-   physically pruned to the text-only prefix (``output_vocab_size`` = 131072).
-   Code tokens are input-only and never generated, so the pruned head covers
-   exactly the generatable range.
-
-2. Checkpoint layout. Text weights live under ``model.language_model.*`` (the
-   multimodal wrapper's submodule), the head is a top-level ``lm_head.weight``,
-   and rope config is a single ``rope_parameters`` dict rather than the legacy
-   ``rope_theta`` + ``rope_scaling`` pair.
-
-This module covers the text tower only; the vision/audio code tokenizers
-(``model.vision_tokenizer.*``, ``model.audio_tokenizer.*``) are dropped when
-loading and image/audio input is not supported yet.
+``sanitize`` accepts the multimodal checkpoint layout directly: text weights
+under ``model.language_model.*`` with a top-level ``lm_head.weight``, and the
+image / audio code tokenizers dropped.
 """
 
 from typing import Optional
@@ -27,14 +14,12 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..apertus1p5.apertus1p5 import AUDIO_PREFIX, LANGUAGE_PREFIX, VISION_PREFIX
+from ..apertus1p5.language import LanguageModel
 from ..base import InputEmbeddingsFeatures, LanguageModelOutput
 from .config import ModelConfig
-from .language import LanguageModel
 
-# Submodules of the multimodal wrapper that this text-only model does not use.
-CODE_TOKENIZER_PREFIXES = ("model.vision_tokenizer.", "model.audio_tokenizer.")
-
-WRAPPER_PREFIX = "model.language_model."
+CODE_TOKENIZER_PREFIXES = (VISION_PREFIX, AUDIO_PREFIX)
 
 
 class Model(nn.Module):
@@ -70,8 +55,8 @@ class Model(nn.Module):
         weights = {
             # Strip the multimodal wrapper so keys line up with the trunk.
             (
-                "model." + k[len(WRAPPER_PREFIX) :]
-                if k.startswith(WRAPPER_PREFIX)
+                "model." + k[len(LANGUAGE_PREFIX) :]
+                if k.startswith(LANGUAGE_PREFIX)
                 else k
             ): v
             for k, v in weights.items()
