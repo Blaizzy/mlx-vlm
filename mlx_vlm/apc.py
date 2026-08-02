@@ -190,6 +190,123 @@ def model_key_dependencies(model: Any = None, processor: Any = None) -> Tuple[in
     return tuple(deps)
 
 
+def resolve_apc_image_hash(
+    prompt_kwargs: Optional[dict],
+    *,
+    image_ref: Any = None,
+) -> int:
+    """Image salt from precomputed hash, ``pixel_values``, or image path ref."""
+    kw = prompt_kwargs or {}
+    img = kw.get("_apc_image_hash")
+    if img is not None:
+        return int(img)
+    pixel_values = kw.get("pixel_values")
+    return hash_image_payload(pixel_values=pixel_values, image_ref=image_ref)
+
+
+def apc_prefix_invariant_media(
+    prompt_kwargs: Optional[dict],
+    *,
+    audio_ref: Any = None,
+    video_ref: Any = None,
+) -> Dict[str, Any]:
+    """Source multimodal inputs for APC identity — not derived full-sequence tensors."""
+    kw = prompt_kwargs or {}
+    audio = kw.get("input_features")
+    if audio is None:
+        audio = audio_ref
+    video = kw.get("pixel_values_videos")
+    if video is None:
+        video = video_ref
+    return {
+        "audio": audio,
+        "video": video,
+    }
+
+
+def apc_legacy_media(
+    prompt_kwargs: Optional[dict],
+    *,
+    audio_ref: Any = None,
+    video_ref: Any = None,
+    attention_mask: Any = None,
+) -> Dict[str, Any]:
+    """Pre-fix media dict including full-sequence embeds/masks (0.6.8–)."""
+    media = apc_prefix_invariant_media(
+        prompt_kwargs, audio_ref=audio_ref, video_ref=video_ref
+    )
+    kw = prompt_kwargs or {}
+    media["embeddings"] = kw.get("inputs_embeds")
+    mask = kw.get("attention_mask")
+    if mask is None:
+        mask = attention_mask
+    media["masks"] = mask
+    return media
+
+
+def compute_apc_extra_hash(
+    prompt_kwargs: Optional[dict],
+    *,
+    tenant: Optional[str] = None,
+    model: Any = None,
+    processor: Any = None,
+    legacy: bool = False,
+    audio_ref: Any = None,
+    video_ref: Any = None,
+    attention_mask: Any = None,
+    image_ref: Any = None,
+) -> int:
+    """APC ``extra_hash`` from prefix-invariant (default) or legacy media inputs."""
+    kw = prompt_kwargs or {}
+    if tenant is None:
+        tenant = kw.get("_apc_tenant")
+    image_hash = resolve_apc_image_hash(kw, image_ref=image_ref)
+    if legacy:
+        media = apc_legacy_media(
+            kw,
+            audio_ref=audio_ref,
+            video_ref=video_ref,
+            attention_mask=attention_mask,
+        )
+    else:
+        media = apc_prefix_invariant_media(kw, audio_ref=audio_ref, video_ref=video_ref)
+    return semantic_extra_hash(
+        tenant=tenant,
+        image_hash=image_hash,
+        media=media,
+        model=model,
+        processor=processor,
+    )
+
+
+def apc_extra_hash_candidates(
+    prompt_kwargs: Optional[dict],
+    *,
+    tenant: Optional[str] = None,
+    model: Any = None,
+    processor: Any = None,
+    audio_ref: Any = None,
+    video_ref: Any = None,
+    attention_mask: Any = None,
+    image_ref: Any = None,
+) -> Tuple[int, ...]:
+    """Stable hash first, then legacy when they differ (lookup fallback)."""
+    common = {
+        "tenant": tenant,
+        "model": model,
+        "processor": processor,
+        "audio_ref": audio_ref,
+        "video_ref": video_ref,
+        "attention_mask": attention_mask,
+        "image_ref": image_ref,
+    }
+    stable = compute_apc_extra_hash(prompt_kwargs, legacy=False, **common)
+    legacy = compute_apc_extra_hash(prompt_kwargs, legacy=True, **common)
+    if stable == legacy:
+        return (stable,)
+    return (stable, legacy)
+
+
 def semantic_extra_hash(
     *,
     tenant: Optional[str] = None,
@@ -200,10 +317,12 @@ def semantic_extra_hash(
 ) -> int:
     """Complete APC salt: tenant + image + non-token media inputs + model/processor deps.
 
-    ``media`` maps a semantic-input name (audio/video/embeddings/masks/
-    rope_deltas/...) to its payload; entries fold in sorted-key order so the
-    result is order-independent. Reduces exactly to
-    ``tenant_scoped_hash(tenant, image_hash)`` when no extra inputs are present.
+    ``media`` maps source semantic-input names (audio/video/...) to payloads;
+    entries fold in sorted-key order so the result is order-independent. Do not
+    pass derived full-sequence ``inputs_embeds`` or ``attention_mask`` here —
+    use :func:`compute_apc_extra_hash` for the supported APC identity contract.
+    Reduces exactly to ``tenant_scoped_hash(tenant, image_hash)`` when no extra
+    inputs are present.
     """
     folded = int(image_hash)
     if media:
@@ -4124,13 +4243,48 @@ def apc_lookup_plan(
     manager: "APCManager",
     ids_list: Sequence[int],
     *,
-    extra_hash: int,
+    extra_hash: int = 0,
+    extra_hashes: Optional[Sequence[int]] = None,
     apc_mode: str,
     safe_lookup_min: int,
     suffix_is_text_only,
     prefix_has_media,
 ) -> Optional[dict]:
     """Pick the best APC prefix (disk > exact > block); shared by both generate paths, releases losers, callers apply."""
+    hashes: Tuple[int, ...]
+    if extra_hashes is not None:
+        hashes = tuple(int(h) for h in extra_hashes)
+    else:
+        hashes = (int(extra_hash),)
+    if not hashes:
+        hashes = (0,)
+
+    for eh in hashes:
+        plan = _apc_lookup_plan_for_extra_hash(
+            manager,
+            ids_list,
+            extra_hash=eh,
+            apc_mode=apc_mode,
+            safe_lookup_min=safe_lookup_min,
+            suffix_is_text_only=suffix_is_text_only,
+            prefix_has_media=prefix_has_media,
+        )
+        if plan is not None:
+            return plan
+    return None
+
+
+def _apc_lookup_plan_for_extra_hash(
+    manager: "APCManager",
+    ids_list: Sequence[int],
+    *,
+    extra_hash: int,
+    apc_mode: str,
+    safe_lookup_min: int,
+    suffix_is_text_only,
+    prefix_has_media,
+) -> Optional[dict]:
+    """Single-extra_hash APC lookup (internal helper for :func:`apc_lookup_plan`)."""
     n = len(ids_list)
     if not ids_list or n < 2:
         return None

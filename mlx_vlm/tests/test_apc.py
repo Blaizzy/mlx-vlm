@@ -15,6 +15,8 @@ from mlx_vlm.apc import (
     DiskBlockStore,
     _copy_mlx_array,
     _hash_tokens,
+    apc_lookup_plan,
+    compute_apc_extra_hash,
     extract_prompt_cache_from_batch,
     from_env,
     harvest_blocks_from_batch_cache,
@@ -24,6 +26,7 @@ from mlx_vlm.apc import (
     make_warm_batch_kv_cache_multi,
     make_warm_kv_cache,
     model_apc_mode,
+    semantic_extra_hash,
     tenant_scoped_hash,
 )
 
@@ -1168,3 +1171,98 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def test_apc_extra_hash_stable_when_prompt_grows():
+    short_embeds = mx.zeros((1, 128, 64))
+    long_embeds = mx.zeros((1, 2048, 64))
+    kw_short = {
+        "inputs_embeds": short_embeds,
+        "attention_mask": mx.ones((1, 128)),
+        "_apc_tenant": "tenant-a",
+    }
+    kw_long = {
+        "inputs_embeds": long_embeds,
+        "attention_mask": mx.ones((1, 2048)),
+        "_apc_tenant": "tenant-a",
+    }
+    assert compute_apc_extra_hash(kw_short, legacy=False) == compute_apc_extra_hash(
+        kw_long, legacy=False
+    )
+
+    zeros = mx.zeros((1, 3, 8, 8))
+    ones = mx.ones((1, 3, 8, 8))
+    assert compute_apc_extra_hash(
+        {"pixel_values": zeros, "_apc_tenant": "tenant-a"}, legacy=False
+    ) != compute_apc_extra_hash(
+        {"pixel_values": ones, "_apc_tenant": "tenant-a"}, legacy=False
+    )
+
+
+def test_apc_legacy_extra_hash_matches_full_sequence_media():
+    embeds = mx.zeros((1, 64, 32))
+    mask = mx.ones((1, 64))
+    kw = {"inputs_embeds": embeds, "attention_mask": mask}
+    legacy = compute_apc_extra_hash(kw, legacy=True)
+    manual = semantic_extra_hash(
+        image_hash=0,
+        media={
+            "audio": None,
+            "video": None,
+            "embeddings": embeds,
+            "masks": mask,
+        },
+    )
+    assert legacy == manual
+
+    kw_longer = {
+        "inputs_embeds": mx.zeros((1, 128, 32)),
+        "attention_mask": mx.ones((1, 128)),
+    }
+    assert compute_apc_extra_hash(kw, legacy=True) != compute_apc_extra_hash(
+        kw_longer, legacy=True
+    )
+
+
+def test_apc_lookup_plan_falls_back_to_legacy_extra_hash():
+    from mlx_vlm.models.cache import KVCache
+
+    token_ids = list(range(32))
+    kv = KVCache()
+    kv.keys = mx.ones((1, 1, len(token_ids), 4))
+    kv.values = mx.ones((1, 1, len(token_ids), 4)) * 2
+    kv.offset = len(token_ids)
+
+    embeds = mx.zeros((1, 64, 16))
+    mask = mx.ones((1, 64))
+    kw = {"inputs_embeds": embeds, "attention_mask": mask}
+    stable = compute_apc_extra_hash(kw, legacy=False)
+    legacy = compute_apc_extra_hash(kw, legacy=True)
+    assert stable != legacy
+
+    manager = APCManager(num_blocks=4, block_size=16)
+    assert manager.store_exact_cache(token_ids, [kv], extra_hash=legacy)
+
+    plan_stable_only = apc_lookup_plan(
+        manager,
+        token_ids + [999],
+        extra_hash=stable,
+        apc_mode="exact",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda pl: True,
+        prefix_has_media=lambda pl: False,
+    )
+    assert plan_stable_only is None
+
+    plan_candidates = apc_lookup_plan(
+        manager,
+        token_ids + [999],
+        extra_hashes=(stable, legacy),
+        apc_mode="exact",
+        safe_lookup_min=0,
+        suffix_is_text_only=lambda pl: True,
+        prefix_has_media=lambda pl: False,
+    )
+    assert plan_candidates is not None
+    assert plan_candidates["prefix_len"] == len(token_ids)
+    assert plan_candidates["extra_hash"] == legacy

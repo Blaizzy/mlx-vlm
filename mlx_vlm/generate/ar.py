@@ -2209,25 +2209,21 @@ class BatchGenerator:
     _APC_PRIVATE_KEYS = APC_PRIVATE_PROMPT_KEYS
 
     def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
-        """Salt for the APC hash chain."""
+        """Salt for the APC hash chain (stable prefix-invariant media)."""
         if self.apc_manager is None:
             return 0
-        if prompt_kwargs is None:
-            prompt_kwargs = {}
-        img = prompt_kwargs.get("_apc_image_hash")
-        if img is None:
-            pixel_values = prompt_kwargs.get("pixel_values")
-            img = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=None)
-        tenant = prompt_kwargs.get("_apc_tenant")
-        return _apc.semantic_extra_hash(
-            tenant=tenant,
-            image_hash=img,
-            media={
-                "audio": prompt_kwargs.get("input_features"),
-                "video": prompt_kwargs.get("pixel_values_videos"),
-                "embeddings": prompt_kwargs.get("inputs_embeds"),
-                "masks": prompt_kwargs.get("attention_mask"),
-            },
+        return _apc.compute_apc_extra_hash(
+            prompt_kwargs,
+            model=getattr(self, "model", None),
+            processor=getattr(self, "processor", None),
+            legacy=False,
+        )
+
+    def _apc_extra_hash_candidates(self, prompt_kwargs: dict) -> Tuple[int, ...]:
+        if self.apc_manager is None:
+            return (0,)
+        return _apc.apc_extra_hash_candidates(
+            prompt_kwargs,
             model=getattr(self, "model", None),
             processor=getattr(self, "processor", None),
         )
@@ -2280,7 +2276,7 @@ class BatchGenerator:
         return _apc.apc_lookup_plan(
             self.apc_manager,
             ids_list,
-            extra_hash=self._apc_extra_hash(prompt_kwargs or {}),
+            extra_hashes=self._apc_extra_hash_candidates(prompt_kwargs or {}),
             apc_mode=getattr(self, "apc_mode", "block"),
             safe_lookup_min=self._apc_safe_prefix_lookup_min(ids_list),
             suffix_is_text_only=lambda pl: self._apc_suffix_is_text_only(ids_list, pl),

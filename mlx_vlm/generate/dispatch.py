@@ -864,7 +864,6 @@ def stream_generate(
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
-    apc_extra_hash = 0
     apc_mode: Optional[str] = None
 
     multimodal_token_ids = _apc.multimodal_token_ids_from_config(model.config)
@@ -893,21 +892,34 @@ def stream_generate(
         if apc_mode is None:
             apc_manager = None
 
+    apc_extra_hash = 0
+    apc_extra_hashes: Tuple[int, ...] = (0,)
     if apc_manager is not None:
-        image_hash = _apc.hash_image_payload(pixel_values=pixel_values, image_ref=image)
-        audio_features = kwargs.get("input_features")
-        video_features = kwargs.get("pixel_values_videos")
-        apc_extra_hash = _apc.semantic_extra_hash(
+        prompt_kwargs_for_apc = dict(kwargs)
+        if mask is not None:
+            prompt_kwargs_for_apc.setdefault("attention_mask", mask)
+        if pixel_values is not None:
+            prompt_kwargs_for_apc.setdefault("pixel_values", pixel_values)
+        apc_extra_hash = _apc.compute_apc_extra_hash(
+            prompt_kwargs_for_apc,
             tenant=apc_tenant,
-            image_hash=image_hash,
-            media={
-                "audio": audio_features if audio_features is not None else audio,
-                "video": video_features if video_features is not None else video,
-                "embeddings": kwargs.get("inputs_embeds"),
-                "masks": mask,
-            },
             model=model,
             processor=processor,
+            legacy=False,
+            audio_ref=audio,
+            video_ref=video,
+            attention_mask=mask,
+            image_ref=image,
+        )
+        apc_extra_hashes = _apc.apc_extra_hash_candidates(
+            prompt_kwargs_for_apc,
+            tenant=apc_tenant,
+            model=model,
+            processor=processor,
+            audio_ref=audio,
+            video_ref=video,
+            attention_mask=mask,
+            image_ref=image,
         )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
@@ -939,7 +951,7 @@ def stream_generate(
         plan = _apc.apc_lookup_plan(
             apc_manager,
             full_input_ids_list,
-            extra_hash=apc_extra_hash,
+            extra_hashes=apc_extra_hashes,
             apc_mode=apc_mode,
             safe_lookup_min=apc_safe_prefix_lookup_min,
             suffix_is_text_only=_apc_suffix_is_text_only,
