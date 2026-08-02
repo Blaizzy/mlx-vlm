@@ -11969,3 +11969,119 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestApertus1p5Text(unittest.TestCase):
+    """Apertus 1.5 text backbone: split vocabulary + multimodal checkpoint layout."""
+
+    ROPE_PARAMETERS = {
+        "factor": 32.0,
+        "high_freq_factor": 4.0,
+        "low_freq_factor": 1.0,
+        "original_max_position_embeddings": 256,
+        "rope_theta": 4000000.0,
+        "rope_type": "llama3",
+    }
+
+    def _config(self, **overrides):
+        from mlx_vlm.models.apertus1p5_text import ModelConfig
+
+        params = dict(
+            model_type="apertus1p5_text",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=256,
+            output_vocab_size=128,
+            max_position_embeddings=512,
+            post_norm=False,
+            qk_norm=True,
+            tie_word_embeddings=False,
+            rope_parameters=dict(self.ROPE_PARAMETERS),
+        )
+        params.update(overrides)
+        return ModelConfig.from_dict(params)
+
+    def _model(self, **overrides):
+        from mlx_vlm.models.apertus1p5_text import Model
+
+        model = Model(self._config(**overrides))
+        model.eval()
+        mx.eval(model.parameters())
+        return model
+
+    def test_rope_parameters_are_split(self):
+        """`rope_parameters` feeds `rope_theta` + `rope_scaling` for the trunk."""
+        from mlx_vlm.models.rope_utils import Llama3RoPE
+
+        config = self._config()
+        self.assertEqual(config.rope_theta, 4000000.0)
+        self.assertEqual(config.rope_scaling["rope_type"], "llama3")
+        self.assertEqual(config.rope_scaling["factor"], 32.0)
+        # `rope_theta` is consumed, not left behind in the scaling config.
+        self.assertNotIn("rope_theta", config.rope_scaling)
+
+        model = self._model()
+        self.assertIsInstance(model.layers[0].self_attn.rope, Llama3RoPE)
+
+    def test_pruned_head_accepts_extended_vocab_ids(self):
+        """Inputs span 266752-style ids; logits only cover the generatable prefix."""
+        model = self._model()
+        # Ids beyond `output_vocab_size` are valid inputs (image / audio codes).
+        ids = mx.array([[1, 5, 130, 200, 255, 9, 42, 3]])
+        logits = model(ids).logits
+        self.assertEqual(logits.shape, (1, 8, 128))
+
+        cache = model.language_model.make_cache()
+        model(ids[:, :-1], cache=cache)
+        self.assertEqual(model(ids[:, -1:], cache=cache).logits.shape, (1, 1, 128))
+
+    def test_tied_embeddings_use_full_width(self):
+        """A tied head cannot be pruned, so it falls back to the full vocabulary."""
+        model = self._model(tie_word_embeddings=True, output_vocab_size=None)
+        self.assertFalse(hasattr(model.language_model, "lm_head"))
+        logits = model(mx.array([[1, 5, 130]])).logits
+        self.assertEqual(logits.shape, (1, 3, 256))
+
+    def _checkpoint_keys(self, model):
+        """Map module parameter paths back to `swiss-ai/Apertus-v1.5-8B` key names."""
+        keys = []
+        for path, _ in tree_flatten(model.parameters()):
+            path = path[len("language_model.") :]
+            if path.startswith("model."):
+                path = "model.language_model." + path[len("model.") :]
+            keys.append(path)
+        return keys
+
+    def test_sanitize_matches_checkpoint_layout(self):
+        model = self._model()
+        weights = {}
+        for key in self._checkpoint_keys(model):
+            # xIELU parameters ship as (1,)-shaped tensors.
+            shape = (
+                (1,)
+                if key.endswith((".alpha_p", ".alpha_n", ".beta", ".eps"))
+                else (2,)
+            )
+            weights[key] = mx.zeros(shape)
+        # The checkpoint also carries the image / audio code tokenizers.
+        weights["model.vision_tokenizer.encoder.conv_in.weight"] = mx.zeros((2,))
+        weights["model.audio_tokenizer.backbone.embed.weight"] = mx.zeros((2,))
+
+        sanitized = model.sanitize(weights)
+
+        expected = {path for path, _ in tree_flatten(model.parameters())}
+        self.assertEqual(set(sanitized), expected)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        for key, value in sanitized.items():
+            if key.endswith((".alpha_p", ".alpha_n", ".beta", ".eps")):
+                self.assertEqual(value.shape, ())
+
+    def test_sanitize_is_idempotent(self):
+        """Already-namespaced weights (e.g. an mlx-vlm conversion) pass through."""
+        model = self._model()
+        weights = {path: mx.zeros((2,)) for path, _ in tree_flatten(model.parameters())}
+        self.assertEqual(set(model.sanitize(dict(weights))), set(weights))
