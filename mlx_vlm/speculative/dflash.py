@@ -156,9 +156,6 @@ def _dflash_rounds(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
 
-        # Drop this round's per-layer hidden/gdn capture (~GBs) before the next
-        # verify allocates its own; async_eval + a 256-token clear let dozens of
-        # rounds' captures stack into a multi-10GB spike otherwise.
         verify_out = None
         mx.clear_cache()
 
@@ -316,9 +313,6 @@ def _dflash_rounds_batch(
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
 
-        # Drop this round's per-layer hidden/gdn capture (~GBs) before the next
-        # verify allocates its own; async_eval + a 256-token clear let dozens of
-        # rounds' captures stack into a multi-10GB spike otherwise.
         verify_out = None
         mx.clear_cache()
         total_emitted = sum(emitted)
