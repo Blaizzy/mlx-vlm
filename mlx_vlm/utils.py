@@ -606,6 +606,20 @@ def get_model_path(
     return model_path
 
 
+def _resolve_skip_vision(config: Dict[str, Any]) -> bool:
+    """Read the legacy ``skip_vision`` flag from ``config["vision_config"]``.
+
+    Text-only quants of unified VLM families (e.g. ``gemma4_unified``) strip the
+    vision tower and set ``vision_config`` to ``null``. The model class handles
+    ``None`` (it skips the tower), but this legacy quantization flag must tolerate
+    ``None`` instead of crashing with ``AttributeError``.
+    """
+    vision_config = config.get("vision_config")
+    if not isinstance(vision_config, dict):
+        return False
+    return vision_config.get("skip_vision", False)
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -782,7 +796,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if (quantization := config.get("quantization", None)) is not None:
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        skip_vision = _resolve_skip_vision(config)
         quantized_model = (
             model.language_model._model
             if getattr(model, "_is_text_model", False)
