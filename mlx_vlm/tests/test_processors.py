@@ -1494,6 +1494,56 @@ class TestIdefics3Processor(_ProcessorTestBase, unittest.TestCase):
         self.assertIn("<row_1_col_1>", result)
         self.assertIn("<row_2_col_2>", result)
 
+    def test_end_of_utterance_is_added_to_stopping_criteria(self):
+        from mlx_vlm.models.idefics3.processing_idefics3 import Idefics3Processor
+        from mlx_vlm.utils import load_processor
+
+        processor = Idefics3Processor.__new__(Idefics3Processor)
+        processor.end_of_utterance_token = "<end_of_utterance>"
+        processor.tokenizer = SimpleNamespace(
+            eos_token_ids=[128001, 128008, 128009],
+            convert_tokens_to_ids=lambda token: (
+                128258 if token == "<end_of_utterance>" else None
+            ),
+        )
+        self.assertEqual(processor.additional_eos_token_ids, [128258])
+
+        class _Detokenizer:
+            def __init__(self, tokenizer):
+                self.tokenizer = tokenizer
+
+        with (
+            patch(
+                "mlx_vlm.utils.AutoProcessor.from_pretrained",
+                return_value=processor,
+            ),
+            patch("mlx_vlm.utils.load_tokenizer", return_value=_Detokenizer),
+        ):
+            loaded = load_processor("unused-model-path")
+            self.assertIs(loaded, processor)
+            loaded_eos_token_ids = list(
+                loaded.tokenizer.stopping_criteria.eos_token_ids
+            )
+            loaded.tokenizer.stopping_criteria.reset([128001, 128008, 128009])
+            reset_eos_token_ids = list(loaded.tokenizer.stopping_criteria.eos_token_ids)
+            loaded_with_existing_token = load_processor(
+                "unused-model-path",
+                eos_token_ids=[128001, 128008, 128009, 128258],
+            )
+
+        self.assertEqual(
+            loaded_eos_token_ids,
+            [128001, 128008, 128009, 128258],
+        )
+        self.assertEqual(
+            reset_eos_token_ids,
+            [128001, 128008, 128009, 128258],
+        )
+        self.assertEqual(
+            loaded_with_existing_token.tokenizer.stopping_criteria.eos_token_ids,
+            [128001, 128008, 128009, 128258],
+        )
+
 
 class TestAyaVisionProcessor(_ProcessorTestBase, unittest.TestCase):
     def _make_processor(self):
