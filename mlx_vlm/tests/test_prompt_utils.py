@@ -141,6 +141,22 @@ class TestApplyChatTemplateIntegration:
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
 
+    def test_molmo_builds_chat_message_for_processor_template(self):
+        """Molmo must go through its processor's ``User: ... Assistant:`` chat
+        template rather than the raw-prompt shortcut: raw prompts can read as
+        complete documents, making greedy decoding emit EOS immediately."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "molmo"},
+            "Describe this image briefly.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "Describe this image briefly."}]
+
     def test_nemotron_omni_formats_image_and_audio_messages(self):
         """Nemotron Omni should use typed multimodal content for HF templates."""
         from mlx_vlm.prompt_utils import apply_chat_template

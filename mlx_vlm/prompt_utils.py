@@ -102,7 +102,9 @@ MODEL_CONFIG = {
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,
-    "molmo": MessageFormat.PROMPT_ONLY,
+    # molmo is chat-formatted: its processor's template wraps the prompt as
+    # "User: ... Assistant:", which the raw-prompt path used to skip.
+    "molmo": MessageFormat.TEXT_ONLY,
     "moondream2": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
     "falcon_ocr": MessageFormat.PROMPT_ONLY,
@@ -949,7 +951,7 @@ def apply_chat_template(
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
+    if model_type in ["paligemma", "florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
