@@ -156,8 +156,8 @@ def _dflash_rounds(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
 
-        if emitted % 256 == 0:
-            mx.clear_cache()
+        verify_out = None
+        mx.clear_cache()
 
 
 def _dflash_rounds_batch(
@@ -313,7 +313,6 @@ def _dflash_rounds_batch(
             # Update active index mapping
             active_idx = [active_idx[j] for j in keep_slots]
 
-        new_total = sum(emitted)
-        if new_total // 256 > total_emitted // 256:
-            mx.clear_cache()
-        total_emitted = new_total
+        verify_out = None
+        mx.clear_cache()
+        total_emitted = sum(emitted)
