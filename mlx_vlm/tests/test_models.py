@@ -6902,6 +6902,60 @@ class TestModels(unittest.TestCase):
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
 
+    def test_molmo_image_feature_scatter_skips_padded_slots(self):
+        """Each valid patch feature lands on exactly its token position; padded
+        slots (image_input_idx < 0) are skipped rather than wrapping around."""
+        from mlx_vlm.models import molmo
+
+        text_config = molmo.TextConfig(
+            d_model=32,
+            n_heads=4,
+            n_kv_heads=2,
+            n_layers=1,
+            mlp_hidden_size=64,
+            vocab_size=128,
+            embedding_size=128,
+            additional_vocab_size=8,
+        )
+        vision_config = molmo.VisionConfig(
+            hidden_size=64,
+            image_emb_dim=32,
+            image_num_heads=2,
+            image_num_key_value_heads=2,
+            image_num_layers=1,
+            image_head_dim=16,
+            image_mlp_dim=64,
+            d_model=32,
+        )
+        config = molmo.ModelConfig(text_config=text_config, vision_config=vision_config)
+        model = molmo.Model(config)
+
+        batch_size, seq_len, num_image, num_patch, dim = 1, 16, 2, 3, 32
+        input_ids = mx.arange(seq_len, dtype=mx.int32)[None, :]
+        # Two padded slots: -1 and -100 (Molmo's real padding value).
+        image_input_idx = mx.array([[[3, 4, -1], [7, 8, -100]]], dtype=mx.int32)
+        features = mx.random.normal((batch_size, num_image, num_patch, dim))
+        dummy_pixels = mx.zeros((batch_size, num_image, num_patch, 4))
+
+        out = model.get_input_embeddings(
+            input_ids,
+            pixel_values=dummy_pixels,
+            image_input_idx=image_input_idx,
+            cached_image_features=features,
+        ).inputs_embeds
+
+        expected = np.array(model.language_model.model.wte(input_ids), dtype=np.float32)
+        flat_idx = np.array(image_input_idx).reshape(-1)
+        flat_feats = np.array(features, dtype=np.float32).reshape(-1, dim)
+        for pos, feat in zip(flat_idx, flat_feats):
+            if pos >= 0:
+                expected[0, pos] += feat
+
+        self.assertTrue(
+            np.allclose(np.array(out, dtype=np.float32), expected, atol=1e-5),
+            "image features must be added only at their valid token positions",
+        )
+
     def _check_returns_input_embeddings_features(self, model, model_name):
         """Helper to test get_input_embeddings returns InputEmbeddingsFeatures."""
         from mlx_vlm.models.base import InputEmbeddingsFeatures
