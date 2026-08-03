@@ -102,8 +102,6 @@ MODEL_CONFIG = {
     # Prompt-only models
     "florence2": MessageFormat.PROMPT_ONLY,
     "plamo2vl": MessageFormat.PROMPT_ONLY,
-    # molmo is chat-formatted: its processor's template wraps the prompt as
-    # "User: ... Assistant:", which the raw-prompt path used to skip.
     "molmo": MessageFormat.TEXT_ONLY,
     "moondream2": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
