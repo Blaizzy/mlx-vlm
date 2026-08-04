@@ -10,6 +10,8 @@ from .common import (
     _speculative_walk,
     _speculative_walk_batch,
     _speculative_walk_batch_uniform_acceptance,
+    speculative_stats_since,
+    speculative_stats_snapshot,
 )
 from .dflash import (
     _dflash_committed_hidden_segments,
@@ -61,6 +63,8 @@ __all__ = [
     "run_speculative_server_rounds",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
+    "speculative_stats_since",
+    "speculative_stats_snapshot",
 ]
 
 
