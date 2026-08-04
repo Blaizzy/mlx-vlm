@@ -804,9 +804,17 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Skip 1-bit layers already replaced above.
             if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            # Handle custom per layer quantizations. Config keys from the
+            # underlying text checkpoint omit the mlx-vlm ``language_model.``
+            # wrapper prefix that loaded module paths carry, so also match with
+            # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
+            override = config["quantization"].get(p)
+            if override is None and p.startswith("language_model."):
+                override = config["quantization"].get(
+                    p[len("language_model.") :]
+                )
+            if isinstance(override, dict):
+                return override
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64
