@@ -2573,43 +2573,152 @@ class TestKimiK3Processor(unittest.TestCase):
                 processor.save_pretrained(tmpdir)
         self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
 
-    def test_from_pretrained_loads_pinned_fast_tokenizer_without_remote_code(self):
+    def test_from_pretrained_uses_local_fast_tokenizer_without_remote_code(self):
         import json
         import tempfile
         from pathlib import Path
 
-        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import (
-            KIMI_K3_TOKENIZER_REPO,
-            KIMI_K3_TOKENIZER_REVISION,
-            KimiK3Processor,
-        )
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
 
         tokenizer = self._make_tokenizer()
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = Path(tmpdir)
+            (model_path / "tokenizer.json").write_text("{}")
             (model_path / "preprocessor_config.json").write_text(
                 json.dumps({"media_proc_cfg": {"patch_size": 16}})
             )
-            with patch(
-                "mlx_vlm.models.kimi_k3.processing_kimi_k3."
-                "PreTrainedTokenizerFast.from_pretrained",
-                return_value=tokenizer,
-            ) as tokenizer_from_pretrained:
+            with (
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "PreTrainedTokenizerFast.from_pretrained",
+                    return_value=tokenizer,
+                ) as tokenizer_from_pretrained,
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "_convert_kimi_k3_tiktoken"
+                ) as convert_tiktoken,
+            ):
+                processor = KimiK3Processor.from_pretrained(model_path)
+
+        self.assertIsInstance(processor, KimiK3Processor)
+        self.assertEqual(tokenizer_from_pretrained.call_args.args[0], str(model_path))
+        tokenizer_kwargs = tokenizer_from_pretrained.call_args.kwargs
+        self.assertTrue(tokenizer_kwargs["local_files_only"])
+        self.assertFalse(tokenizer_kwargs["trust_remote_code"])
+        self.assertNotIn("revision", tokenizer_kwargs)
+        convert_tiktoken.assert_not_called()
+        self.assertEqual(processor.image_processor.patch_size, 16)
+
+    def test_from_pretrained_uses_remote_fast_tokenizer_when_available(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            tokenizer_json = tmp_path / "tokenizer.json"
+            tokenizer_json.write_text("{}")
+            preprocessor_config = tmp_path / "preprocessor_config.json"
+            preprocessor_config.write_text(
+                json.dumps({"media_proc_cfg": {"patch_size": 18}})
+            )
+
+            def download(repo_id, filename, **kwargs):
+                self.assertEqual(repo_id, "moonshotai/Kimi-K3")
+                self.assertEqual(kwargs["revision"], "model-revision")
+                return {
+                    "tokenizer.json": tokenizer_json,
+                    "preprocessor_config.json": preprocessor_config,
+                }[filename]
+
+            with (
+                patch("huggingface_hub.hf_hub_download", side_effect=download),
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "PreTrainedTokenizerFast.from_pretrained",
+                    return_value=tokenizer,
+                ) as tokenizer_from_pretrained,
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "_convert_kimi_k3_tiktoken"
+                ) as convert_tiktoken,
+            ):
                 processor = KimiK3Processor.from_pretrained(
-                    model_path,
-                    trust_remote_code=False,
-                    local_files_only=True,
+                    "moonshotai/Kimi-K3",
+                    revision="model-revision",
                 )
 
         self.assertIsInstance(processor, KimiK3Processor)
         self.assertEqual(
-            tokenizer_from_pretrained.call_args.args[0], KIMI_K3_TOKENIZER_REPO
+            tokenizer_from_pretrained.call_args.args[0], "moonshotai/Kimi-K3"
         )
         tokenizer_kwargs = tokenizer_from_pretrained.call_args.kwargs
-        self.assertTrue(tokenizer_kwargs["local_files_only"])
-        self.assertEqual(tokenizer_kwargs["revision"], KIMI_K3_TOKENIZER_REVISION)
-        self.assertNotIn("trust_remote_code", tokenizer_kwargs)
-        self.assertEqual(processor.image_processor.patch_size, 16)
+        self.assertEqual(tokenizer_kwargs["revision"], "model-revision")
+        self.assertFalse(tokenizer_kwargs["trust_remote_code"])
+        convert_tiktoken.assert_not_called()
+        self.assertEqual(processor.image_processor.patch_size, 18)
+
+    def test_from_pretrained_converts_local_tiktoken_model(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir)
+            vocab_file = model_path / "tiktoken.model"
+            vocab_file.write_text("tiktoken ranks")
+            tokenizer_config = model_path / "tokenizer_config.json"
+            tokenizer_config.write_text(json.dumps({"added_tokens_decoder": {}}))
+            (model_path / "preprocessor_config.json").write_text("{}")
+            with (
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "_convert_kimi_k3_tiktoken",
+                    return_value=tokenizer,
+                ) as convert_tiktoken,
+                patch(
+                    "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                    "PreTrainedTokenizerFast.from_pretrained"
+                ) as tokenizer_from_pretrained,
+            ):
+                processor = KimiK3Processor.from_pretrained(model_path)
+
+        self.assertIsInstance(processor, KimiK3Processor)
+        convert_tiktoken.assert_called_once_with(vocab_file, tokenizer_config)
+        tokenizer_from_pretrained.assert_not_called()
+
+    def test_tiktoken_conversion_requires_optional_dependency(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _convert_kimi_k3_tiktoken
+
+        with patch("importlib.util.find_spec", return_value=None):
+            with self.assertRaisesRegex(
+                ImportError, "Install `tiktoken`.*tokenizer.json"
+            ):
+                _convert_kimi_k3_tiktoken("tiktoken.model", "tokenizer_config.json")
+
+    def test_runtime_conversion_restores_all_control_token_slots(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import _kimi_k3_control_tokens
+
+        config = {
+            "added_tokens_decoder": {
+                "100": {"content": "[BOS]"},
+                "103": {"content": "<|open|>"},
+                "355": {"content": "[PAD]"},
+            }
+        }
+        tokens = _kimi_k3_control_tokens(config, base_vocab_size=100)
+
+        self.assertEqual(len(tokens), 256)
+        self.assertEqual(tokens[0], "[BOS]")
+        self.assertEqual(tokens[1], "<|reserved_token_101|>")
+        self.assertEqual(tokens[3], "<|open|>")
+        self.assertEqual(tokens[-1], "[PAD]")
 
 
 class TestPhi3VPatch(unittest.TestCase):
