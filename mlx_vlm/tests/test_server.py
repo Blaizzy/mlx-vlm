@@ -3039,6 +3039,95 @@ def test_generation_metrics_reports_chunk_and_aggregate_rates():
     assert metrics.rate == pytest.approx(12.0)
 
 
+def test_generation_timings_include_speculative_stats():
+    metrics = SimpleNamespace(
+        cached_tokens=0,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+        peak_memory=0.0,
+        draft_kind="mtp",
+        draft_rounds=5,
+        draft_n_accepted=12,
+        draft_n=20,
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 17)
+
+    assert timings.draft_kind == "mtp"
+    assert timings.draft_rounds == 5
+    assert timings.draft_n_accepted == 12
+    assert timings.draft_n == 20
+    assert timings.draft_n_accepted / timings.draft_n == pytest.approx(0.6)
+
+
+def test_generation_timings_speculative_stats_default_to_none():
+    metrics = SimpleNamespace(
+        cached_tokens=0,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+        peak_memory=0.0,
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
+
+    assert timings.draft_kind is None
+    assert timings.draft_rounds is None
+    assert timings.draft_n_accepted is None
+    assert timings.draft_n is None
+
+
+def test_generation_metrics_record_speculative_stats():
+    metrics = server_generation.GenerationMetrics()
+
+    metrics.record_chunk(SimpleNamespace(generation_tokens=1, emitted_at=10.0))
+    metrics.record_chunk(
+        SimpleNamespace(
+            generation_tokens=6,
+            emitted_at=10.5,
+            draft_kind="dflash",
+            draft_rounds=3,
+            draft_n_accepted=4,
+            draft_n=9,
+        )
+    )
+
+    assert metrics.draft_kind == "dflash"
+    assert metrics.draft_rounds == 3
+    assert metrics.draft_n_accepted == 4
+    assert metrics.draft_n == 9
+
+
+def test_speculative_lifetime_counters_survive_reset():
+    from mlx_vlm.speculative.common import (
+        _record_speculative_round,
+        speculative_stats_since,
+        speculative_stats_snapshot,
+    )
+
+    drafter = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert speculative_stats_since(drafter, speculative_stats_snapshot(drafter)) == (
+        None,
+        None,
+        None,
+    )
+
+    snapshot = speculative_stats_snapshot(drafter)
+    _record_speculative_round(drafter, 3, 7)
+    _record_speculative_round(drafter, 2.5, 7)
+    drafter.accept_lens = []
+    drafter.draft_lens = []
+    _record_speculative_round(drafter, 1.5, 7)
+
+    rounds, accepted, drafted = speculative_stats_since(drafter, snapshot)
+    assert (rounds, accepted, drafted) == (3, 7, 21)
+
+    later_snapshot = speculative_stats_snapshot(drafter)
+    _record_speculative_round(drafter, 2, 7)
+    rounds, accepted, drafted = speculative_stats_since(drafter, later_snapshot)
+    assert (rounds, accepted, drafted) == (1, 2, 7)
+
+
 def test_chat_completions_returns_timings(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()

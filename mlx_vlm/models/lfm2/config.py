@@ -31,6 +31,12 @@ class ModelConfig(BaseModelConfig):
     eos_token_id: Optional[Union[int, List[int]]] = None
     pad_token_id: Optional[int] = None
 
+    @classmethod
+    def from_dict(cls, params):
+        if params and "block_ff_dim" not in params and "intermediate_size" in params:
+            params = {**params, "block_ff_dim": params["intermediate_size"]}
+        return super().from_dict(params)
+
     def __post_init__(self):
         if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
             self.rope_theta = self.rope_parameters["rope_theta"]
