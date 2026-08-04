@@ -1146,6 +1146,25 @@ curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
   -F response_format=json
 ```
 
+Use the OpenAI-compatible `prompt` field for a portable transcription hint, or
+repeat `hotwords` for a structured vocabulary list. For example, Fun-ASR-Nano
+receives the list through its native `hotwords` parameter:
+
+```sh
+curl -X POST "http://localhost:8080/v1/audio/transcriptions" \
+  -F model=mlx-community/Fun-ASR-Nano-2512 \
+  -F file=@/path/to/audio.mp3 \
+  -F language=zh \
+  -F hotwords=MLX \
+  -F 'hotwords=Apple Silicon'
+```
+
+Pass only one of `prompt`, `context`, or `hotwords`. Vocabulary is routed only
+through parameters explicitly declared by the selected backend, including
+`system_prompt` (Qwen3-ASR), `initial_prompt` (Whisper), `prompt` (MOSS),
+`hotwords` (Fun-ASR-Nano), and `context` (VibeVoice ASR). Unsupported backends
+return HTTP 400 instead of silently ignoring the hint.
+
 ##### Multi-Modal (Image + Audio)
 
 ```sh

@@ -69,6 +69,7 @@ class AudioTranscriptionRequest(FlexibleBaseModel):
     frame_threshold: int = 25
     stream: bool = False
     context: Optional[str] = None
+    hotwords: Optional[List[str]] = None
     prefill_step_size: int = 2048
     text: Optional[str] = None
     word_timestamps: bool = False
@@ -392,6 +393,9 @@ async def _parse_transcription_request(
     timestamp_granularities = _form_list(form, "timestamp_granularities")
     if not timestamp_granularities:
         timestamp_granularities = _form_list(form, "timestamp_granularities[]")
+    hotwords = _form_list(form, "hotwords")
+    if not hotwords:
+        hotwords = _form_list(form, "hotwords[]")
 
     payload = AudioTranscriptionRequest(
         model=model,
@@ -405,6 +409,7 @@ async def _parse_transcription_request(
         frame_threshold=_form_int(form.get("frame_threshold"), default=25),
         stream=_form_bool(form.get("stream"), default=False),
         context=_clean_form_value(form.get("context")),
+        hotwords=hotwords or None,
         prefill_step_size=_form_int(form.get("prefill_step_size"), default=2048),
         text=_clean_form_value(form.get("text")),
         word_timestamps=_form_bool(form.get("word_timestamps"), default=False),
@@ -558,16 +563,12 @@ def _build_stt_generate_kwargs(
     translate: bool,
 ) -> Dict[str, Any]:
     kwargs = request.model_dump(
-        exclude={"model", "response_format", "prompt"}, exclude_none=True
+        exclude={"model", "response_format", "prompt", "context", "hotwords"},
+        exclude_none=True,
     )
-    prompt = request.prompt
     accepted = _callable_parameters(model.generate)
-
-    if prompt:
-        if _accepts_parameter(accepted, "context"):
-            kwargs.setdefault("context", prompt)
-        elif _accepts_parameter(accepted, "text"):
-            kwargs.setdefault("text", prompt)
+    for name, value in _build_stt_vocabulary_kwargs(accepted, request).items():
+        kwargs.setdefault(name, value)
 
     if translate:
         if _accepts_parameter(accepted, "task"):
@@ -584,6 +585,64 @@ def _build_stt_generate_kwargs(
         model.generate,
         kwargs,
         extra_allowed={"word_timestamps", "timestamp_granularities"},
+    )
+
+
+def _build_stt_vocabulary_kwargs(
+    accepted,
+    request: AudioTranscriptionRequest,
+) -> Dict[str, Any]:
+    hotwords = [word.strip() for word in request.hotwords or [] if word.strip()]
+    supplied = sum(bool(value) for value in (request.prompt, request.context, hotwords))
+    if supplied > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Pass only one of prompt, context, or hotwords.",
+        )
+
+    if hotwords:
+        if _explicitly_accepts_parameter(accepted, "hotwords"):
+            return {"hotwords": hotwords}
+        return _route_stt_prompt(
+            accepted,
+            f"Preferred vocabulary: {', '.join(hotwords)}",
+        )
+
+    if request.context:
+        if _explicitly_accepts_parameter(accepted, "context"):
+            return {"context": request.context}
+        raise _unsupported_stt_vocabulary()
+
+    if request.prompt:
+        return _route_stt_prompt(accepted, request.prompt)
+
+    return {}
+
+
+def _route_stt_prompt(accepted, prompt: str) -> Dict[str, str]:
+    for parameter in (
+        "system_prompt",
+        "initial_prompt",
+        "prompt",
+        "context",
+        "text",
+    ):
+        if _explicitly_accepts_parameter(accepted, parameter):
+            return {parameter: prompt}
+    raise _unsupported_stt_vocabulary()
+
+
+def _explicitly_accepts_parameter(accepted, name: str) -> bool:
+    return accepted is not None and name in accepted.get("params", set())
+
+
+def _unsupported_stt_vocabulary() -> HTTPException:
+    return HTTPException(
+        status_code=400,
+        detail=(
+            "Selected model does not explicitly support transcription vocabulary "
+            "through prompt, context, or hotwords."
+        ),
     )
 
 
