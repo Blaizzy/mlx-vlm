@@ -2235,7 +2235,9 @@ class ResponseGenerator:
                                 prompt_tps=prompt_tps_map.get(uid),
                                 token_count=0,
                                 emitted_at=emitted_at,
-                                spec_draft_kind=draft_kind,
+                                spec_draft_kind=(
+                                    draft_kind if rounds is not None else None
+                                ),
                                 spec_rounds=rounds,
                                 spec_accepted_tokens=accepted,
                                 spec_drafted_tokens=drafted,
