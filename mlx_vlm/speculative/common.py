@@ -218,21 +218,23 @@ def _record_speculative_round(
     # Monotonic lifetime counters for per-request attribution. Unlike the
     # ``accept_lens`` history, these survive ``reset()`` between requests,
     # so callers can snapshot-and-diff across a request's lifetime.
-    draft_model.spec_total_rounds = getattr(draft_model, "spec_total_rounds", 0) + 1
-    draft_model.spec_total_accepted = getattr(
-        draft_model, "spec_total_accepted", 0.0
+    draft_model.speculative_total_rounds = (
+        getattr(draft_model, "speculative_total_rounds", 0) + 1
+    )
+    draft_model.speculative_total_accepted = getattr(
+        draft_model, "speculative_total_accepted", 0.0
     ) + float(accepted)
-    draft_model.spec_total_drafted = getattr(
-        draft_model, "spec_total_drafted", 0
+    draft_model.speculative_total_drafted = getattr(
+        draft_model, "speculative_total_drafted", 0
     ) + int(draft_count)
 
 
 def speculative_stats_snapshot(draft_model: nn.Module) -> Tuple[int, float, int]:
     """Capture the drafter's lifetime round counters for later diffing."""
     return (
-        getattr(draft_model, "spec_total_rounds", 0),
-        getattr(draft_model, "spec_total_accepted", 0.0),
-        getattr(draft_model, "spec_total_drafted", 0),
+        getattr(draft_model, "speculative_total_rounds", 0),
+        getattr(draft_model, "speculative_total_accepted", 0.0),
+        getattr(draft_model, "speculative_total_drafted", 0),
     )
 
 
@@ -245,11 +247,11 @@ def speculative_stats_since(
     shared across concurrent requests otherwise.
     """
     rounds0, accepted0, drafted0 = snapshot
-    rounds = getattr(draft_model, "spec_total_rounds", 0) - rounds0
+    rounds = getattr(draft_model, "speculative_total_rounds", 0) - rounds0
     if rounds <= 0:
         return None, None, None
-    accepted = getattr(draft_model, "spec_total_accepted", 0.0) - accepted0
-    drafted = getattr(draft_model, "spec_total_drafted", 0) - drafted0
+    accepted = getattr(draft_model, "speculative_total_accepted", 0.0) - accepted0
+    drafted = getattr(draft_model, "speculative_total_drafted", 0) - drafted0
     return rounds, int(round(accepted)), int(drafted)
 
 

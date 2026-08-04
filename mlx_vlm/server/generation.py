@@ -832,10 +832,10 @@ class GenerationMetrics:
     last_chunk_rate: Optional[float] = None
     generated_tokens: int = 0
     first_chunk_tokens: int = 0
-    spec_draft_kind: Optional[str] = None
-    spec_rounds: Optional[int] = None
-    spec_accepted_tokens: Optional[int] = None
-    spec_drafted_tokens: Optional[int] = None
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
+    draft_n: Optional[int] = None
 
     def record_chunk(self, chunk) -> Optional[float]:
         now = getattr(chunk, "emitted_at", None) or time.perf_counter()
@@ -881,18 +881,18 @@ class GenerationMetrics:
         cached_tokens = getattr(result, "cached_tokens", None)
         if cached_tokens is not None:
             self.cached_tokens = max(self.cached_tokens, int(cached_tokens))
-        spec_draft_kind = getattr(result, "spec_draft_kind", None)
-        if spec_draft_kind is not None:
-            self.spec_draft_kind = spec_draft_kind
-        spec_rounds = getattr(result, "spec_rounds", None)
-        if spec_rounds is not None:
-            self.spec_rounds = int(spec_rounds)
-        spec_accepted_tokens = getattr(result, "spec_accepted_tokens", None)
-        if spec_accepted_tokens is not None:
-            self.spec_accepted_tokens = int(spec_accepted_tokens)
-        spec_drafted_tokens = getattr(result, "spec_drafted_tokens", None)
-        if spec_drafted_tokens is not None:
-            self.spec_drafted_tokens = int(spec_drafted_tokens)
+        draft_kind = getattr(result, "draft_kind", None)
+        if draft_kind is not None:
+            self.draft_kind = draft_kind
+        draft_rounds = getattr(result, "draft_rounds", None)
+        if draft_rounds is not None:
+            self.draft_rounds = int(draft_rounds)
+        draft_n_accepted = getattr(result, "draft_n_accepted", None)
+        if draft_n_accepted is not None:
+            self.draft_n_accepted = int(draft_n_accepted)
+        draft_n = getattr(result, "draft_n", None)
+        if draft_n is not None:
+            self.draft_n = int(draft_n)
 
 
 @dataclass
@@ -910,10 +910,10 @@ class StreamingToken:
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
     generation_tps: Optional[float] = None
-    spec_draft_kind: Optional[str] = None
-    spec_rounds: Optional[int] = None
-    spec_accepted_tokens: Optional[int] = None
-    spec_drafted_tokens: Optional[int] = None
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
+    draft_n: Optional[int] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
     token_count: int = 1
@@ -2184,10 +2184,10 @@ class ResponseGenerator:
                                 peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
                                 emitted_at=emitted_at,
-                                spec_draft_kind=draft_kind if finish else None,
-                                spec_rounds=rounds,
-                                spec_accepted_tokens=accepted,
-                                spec_drafted_tokens=drafted,
+                                draft_kind=draft_kind if finish else None,
+                                draft_rounds=rounds,
+                                draft_n_accepted=accepted,
+                                draft_n=drafted,
                             )
                         )
 
@@ -2235,12 +2235,10 @@ class ResponseGenerator:
                                 prompt_tps=prompt_tps_map.get(uid),
                                 token_count=0,
                                 emitted_at=emitted_at,
-                                spec_draft_kind=(
-                                    draft_kind if rounds is not None else None
-                                ),
-                                spec_rounds=rounds,
-                                spec_accepted_tokens=accepted,
-                                spec_drafted_tokens=drafted,
+                                draft_kind=(draft_kind if rounds is not None else None),
+                                draft_rounds=rounds,
+                                draft_n_accepted=accepted,
+                                draft_n=drafted,
                             )
                         )
                         rqueues[uid].put(None)
@@ -2298,14 +2296,14 @@ class ResponseGenerator:
                 token_count=token_count,
             )
 
-            spec_rounds = spec_accepted = spec_drafted = None
-            spec_kind = None
+            draft_rounds = draft_accepted = draft_total = None
+            request_draft_kind = None
             if r.finish_reason is not None and info.get("spec_snapshot") is not None:
-                spec_rounds, spec_accepted, spec_drafted = speculative_stats_since(
+                draft_rounds, draft_accepted, draft_total = speculative_stats_since(
                     self.draft_model, info["spec_snapshot"]
                 )
-                if spec_rounds is not None:
-                    spec_kind = self.draft_kind
+                if draft_rounds is not None:
+                    request_draft_kind = self.draft_kind
 
             rqueue.put(
                 StreamingToken(
@@ -2315,10 +2313,10 @@ class ResponseGenerator:
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     prompt_tps=info.get("prompt_tps"),
-                    spec_draft_kind=spec_kind,
-                    spec_rounds=spec_rounds,
-                    spec_accepted_tokens=spec_accepted,
-                    spec_drafted_tokens=spec_drafted,
+                    draft_kind=request_draft_kind,
+                    draft_rounds=draft_rounds,
+                    draft_n_accepted=draft_accepted,
+                    draft_n=draft_total,
                     top_logprobs=getattr(r, "top_logprobs", None),
                     cached_tokens=info.get("cached_tokens", 0),
                     token_count=token_count,

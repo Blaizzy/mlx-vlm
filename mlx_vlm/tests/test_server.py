@@ -3046,18 +3046,18 @@ def test_generation_timings_include_speculative_stats():
         generation_tps=8.0,
         token_times=[],
         peak_memory=0.0,
-        spec_draft_kind="mtp",
-        spec_rounds=5,
-        spec_accepted_tokens=12,
-        spec_drafted_tokens=20,
+        draft_kind="mtp",
+        draft_rounds=5,
+        draft_n_accepted=12,
+        draft_n=20,
     )
     timings = server.GenerationTimings.from_metrics(metrics, 10, 17)
 
     assert timings.draft_kind == "mtp"
-    assert timings.spec_rounds == 5
-    assert timings.spec_accepted_tokens == 12
-    assert timings.spec_drafted_tokens == 20
-    assert timings.spec_acceptance_rate == pytest.approx(0.6)
+    assert timings.draft_rounds == 5
+    assert timings.draft_n_accepted == 12
+    assert timings.draft_n == 20
+    assert timings.draft_n_accepted / timings.draft_n == pytest.approx(0.6)
 
 
 def test_generation_timings_speculative_stats_default_to_none():
@@ -3071,10 +3071,9 @@ def test_generation_timings_speculative_stats_default_to_none():
     timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
 
     assert timings.draft_kind is None
-    assert timings.spec_rounds is None
-    assert timings.spec_accepted_tokens is None
-    assert timings.spec_drafted_tokens is None
-    assert timings.spec_acceptance_rate is None
+    assert timings.draft_rounds is None
+    assert timings.draft_n_accepted is None
+    assert timings.draft_n is None
 
 
 def test_generation_metrics_record_speculative_stats():
@@ -3085,17 +3084,17 @@ def test_generation_metrics_record_speculative_stats():
         SimpleNamespace(
             generation_tokens=6,
             emitted_at=10.5,
-            spec_draft_kind="dflash",
-            spec_rounds=3,
-            spec_accepted_tokens=4,
-            spec_drafted_tokens=9,
+            draft_kind="dflash",
+            draft_rounds=3,
+            draft_n_accepted=4,
+            draft_n=9,
         )
     )
 
-    assert metrics.spec_draft_kind == "dflash"
-    assert metrics.spec_rounds == 3
-    assert metrics.spec_accepted_tokens == 4
-    assert metrics.spec_drafted_tokens == 9
+    assert metrics.draft_kind == "dflash"
+    assert metrics.draft_rounds == 3
+    assert metrics.draft_n_accepted == 4
+    assert metrics.draft_n == 9
 
 
 def test_speculative_lifetime_counters_survive_reset():
