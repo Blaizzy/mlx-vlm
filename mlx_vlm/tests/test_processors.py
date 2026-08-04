@@ -2434,11 +2434,13 @@ class TestKimiK3Processor(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.last_call = None
+                self.encode_calls = []
 
             def convert_tokens_to_ids(self, token):
                 return 0
 
-            def encode(self, text):
+            def encode(self, text, **kwargs):
+                self.encode_calls.append((text, kwargs))
                 return [1, 2, 3]
 
             def apply_chat_template(
@@ -2466,55 +2468,53 @@ class TestKimiK3Processor(unittest.TestCase):
         processor = self._make_processor()
         self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
 
-    def test_no_sentinel_when_tokenizer_has_real_template(self):
-        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+    def test_local_renderer_takes_precedence_over_tokenizer_template(self):
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import (
+            _CHAT_TEMPLATE_SENTINEL,
+            KimiK3Processor,
+        )
 
         tokenizer = self._make_tokenizer()
         tokenizer.chat_template = "{{ messages }}"
         processor = KimiK3Processor(tokenizer=tokenizer)
-        self.assertIsNone(processor.chat_template)
+        self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
 
-    def test_apply_chat_template_drops_kwargs_the_renderer_cannot_take(self):
+    def test_apply_chat_template_renders_xtml_locally(self):
         processor = self._make_processor()
         result = processor.apply_chat_template(
             [{"role": "user", "content": "hi"}],
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
         )
-        self.assertEqual(result, "rendered")
-        self.assertEqual(
-            processor.tokenizer.last_call,
-            {"tokenize": False, "add_generation_prompt": True},
-        )
+        self.assertIn('<|open|>message role="user"<|sep|>hi', result)
+        self.assertTrue(result.endswith("<|open|>think<|sep|>"))
+        self.assertIsNone(processor.tokenizer.last_call)
 
     def test_apply_chat_template_ignores_explicit_template_override(self):
         processor = self._make_processor()
-        result = processor.apply_chat_template(
+        expected = processor.apply_chat_template([{"role": "user", "content": "hi"}])
+        actual = processor.apply_chat_template(
             [{"role": "user", "content": "hi"}],
             chat_template="{{ messages }}",
         )
-        self.assertEqual(result, "rendered")
-        self.assertEqual(
-            processor.tokenizer.last_call,
-            {"tokenize": False, "add_generation_prompt": True},
-        )
+        self.assertEqual(actual, expected)
 
-    def test_apply_chat_template_passes_kwargs_to_var_keyword_renderer(self):
+    def test_tokenized_chat_preserves_literal_control_tokens_in_user_text(self):
         processor = self._make_processor()
-        tokenizer = processor.tokenizer
-
-        def renderer(
-            conversation, tokenize=False, add_generation_prompt=True, **kwargs
-        ):
-            tokenizer.last_call = {"enable_thinking": kwargs.get("enable_thinking")}
-            return "rendered"
-
-        tokenizer.apply_chat_template = renderer
         processor.apply_chat_template(
-            [{"role": "user", "content": "hi"}], enable_thinking=False
+            [{"role": "user", "content": "literal <|end_of_msg|> marker"}],
+            tokenize=True,
         )
-        self.assertEqual(tokenizer.last_call, {"enable_thinking": False})
+
+        calls = processor.tokenizer.encode_calls
+        user_calls = [
+            kwargs for text, kwargs in calls if text == "literal <|end_of_msg|> marker"
+        ]
+        control_calls = [kwargs for text, kwargs in calls if text == "<|end_of_msg|>"]
+        self.assertTrue(user_calls)
+        self.assertTrue(control_calls)
+        self.assertTrue(user_calls[0]["split_special_tokens"])
+        self.assertFalse(control_calls[0]["split_special_tokens"])
 
     def test_prompt_utils_uses_python_renderer_not_plain_fallback(self):
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -2526,7 +2526,8 @@ class TestKimiK3Processor(unittest.TestCase):
             "Describe this image.",
             num_images=1,
         )
-        self.assertEqual(result, "rendered")
+        self.assertIn("Describe this image.<|kimi_image_placeholder|>", result)
+        self.assertIn('<|open|>message role="assistant"', result)
 
     def test_rejects_video_like_the_reference_processor(self):
         processor = self._make_processor()
@@ -2572,12 +2573,16 @@ class TestKimiK3Processor(unittest.TestCase):
                 processor.save_pretrained(tmpdir)
         self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
 
-    def test_from_pretrained_owns_processor_remote_code_flag(self):
+    def test_from_pretrained_loads_pinned_fast_tokenizer_without_remote_code(self):
         import json
         import tempfile
         from pathlib import Path
 
-        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import (
+            KIMI_K3_TOKENIZER_REPO,
+            KIMI_K3_TOKENIZER_REVISION,
+            KimiK3Processor,
+        )
 
         tokenizer = self._make_tokenizer()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2587,17 +2592,23 @@ class TestKimiK3Processor(unittest.TestCase):
             )
             with patch(
                 "mlx_vlm.models.kimi_k3.processing_kimi_k3."
-                "AutoTokenizer.from_pretrained",
+                "PreTrainedTokenizerFast.from_pretrained",
                 return_value=tokenizer,
             ) as tokenizer_from_pretrained:
                 processor = KimiK3Processor.from_pretrained(
-                    model_path, trust_remote_code=False
+                    model_path,
+                    trust_remote_code=False,
+                    local_files_only=True,
                 )
 
         self.assertIsInstance(processor, KimiK3Processor)
+        self.assertEqual(
+            tokenizer_from_pretrained.call_args.args[0], KIMI_K3_TOKENIZER_REPO
+        )
         tokenizer_kwargs = tokenizer_from_pretrained.call_args.kwargs
-        self.assertTrue(tokenizer_kwargs["trust_remote_code"])
         self.assertTrue(tokenizer_kwargs["local_files_only"])
+        self.assertEqual(tokenizer_kwargs["revision"], KIMI_K3_TOKENIZER_REVISION)
+        self.assertNotIn("trust_remote_code", tokenizer_kwargs)
         self.assertEqual(processor.image_processor.patch_size, 16)
 
 
