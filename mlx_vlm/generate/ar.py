@@ -328,6 +328,8 @@ def generate_step(
         step_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+        if getattr(model.language_model, "supports_logits_to_keep", False):
+            step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in step_kwargs:
@@ -433,12 +435,15 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_len
                     ):
                         n_to_process = checkpoint_len - processed_tokens
+                    chunk_kwargs = kwargs
+                    if getattr(model.language_model, "supports_logits_to_keep", False):
+                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
-                        **kwargs,
+                        **chunk_kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
