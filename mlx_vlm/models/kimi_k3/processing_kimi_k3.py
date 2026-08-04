@@ -210,7 +210,10 @@ class KimiK3Processor(ProcessorMixin):
             f"<|media_content|>{MEDIA_PAD * num_tokens}<|media_end|>"
         )
 
-    def __call__(self, images=None, text=None, **kwargs):
+    def __call__(self, images=None, text=None, videos=None, **kwargs):
+        if videos is not None:
+            raise ValueError("unsupported media type: video")
+
         if images is None and text is None:
             raise ValueError("You have to specify at least one of `images` or `text`.")
 

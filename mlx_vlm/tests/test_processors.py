@@ -2528,6 +2528,13 @@ class TestKimiK3Processor(unittest.TestCase):
         )
         self.assertEqual(result, "rendered")
 
+    def test_rejects_video_like_the_reference_processor(self):
+        processor = self._make_processor()
+        video = np.zeros((2, 16, 24, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "unsupported media type: video"):
+            processor(videos=[video], text="Describe this video.")
+
     def test_save_pretrained_does_not_persist_the_sentinel(self):
         import os
         import tempfile
