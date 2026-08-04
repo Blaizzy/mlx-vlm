@@ -3039,6 +3039,65 @@ def test_generation_metrics_reports_chunk_and_aggregate_rates():
     assert metrics.rate == pytest.approx(12.0)
 
 
+def test_generation_timings_include_speculative_stats():
+    metrics = SimpleNamespace(
+        cached_tokens=0,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+        peak_memory=0.0,
+        spec_draft_kind="mtp",
+        spec_rounds=5,
+        spec_accepted_tokens=12,
+        spec_drafted_tokens=20,
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 17)
+
+    assert timings.draft_kind == "mtp"
+    assert timings.spec_rounds == 5
+    assert timings.spec_accepted_tokens == 12
+    assert timings.spec_drafted_tokens == 20
+    assert timings.spec_acceptance_rate == pytest.approx(0.6)
+
+
+def test_generation_timings_speculative_stats_default_to_none():
+    metrics = SimpleNamespace(
+        cached_tokens=0,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+        peak_memory=0.0,
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
+
+    assert timings.draft_kind is None
+    assert timings.spec_rounds is None
+    assert timings.spec_accepted_tokens is None
+    assert timings.spec_drafted_tokens is None
+    assert timings.spec_acceptance_rate is None
+
+
+def test_generation_metrics_record_speculative_stats():
+    metrics = server_generation.GenerationMetrics()
+
+    metrics.record_chunk(SimpleNamespace(generation_tokens=1, emitted_at=10.0))
+    metrics.record_chunk(
+        SimpleNamespace(
+            generation_tokens=6,
+            emitted_at=10.5,
+            spec_draft_kind="dflash",
+            spec_rounds=3,
+            spec_accepted_tokens=4,
+            spec_drafted_tokens=9,
+        )
+    )
+
+    assert metrics.spec_draft_kind == "dflash"
+    assert metrics.spec_rounds == 3
+    assert metrics.spec_accepted_tokens == 4
+    assert metrics.spec_drafted_tokens == 9
+
+
 def test_chat_completions_returns_timings(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
