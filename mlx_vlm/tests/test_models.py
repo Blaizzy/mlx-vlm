@@ -12072,3 +12072,91 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestCohereCompass(unittest.TestCase):
+    def _tiny_model(self):
+        from mlx_vlm.models import cohere_compass
+
+        text_config = cohere_compass.TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            norm_type="layer_norm",
+            transformer_block_type="parallel",
+            tie_word_embeddings=True,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={"mrope_section": [2, 1, 1]},
+            rope_style="interleave",
+            rope_on_all_layers=False,
+        )
+        vision_config = cohere_compass.VisionConfig(
+            depth=2,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[0],
+        )
+        config = cohere_compass.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=63,
+            vision_start_token_id=62,
+            vision_end_token_id=61,
+        )
+        return cohere_compass.Model(config)
+
+    def test_forward_and_cache(self):
+        model = self._tiny_model()
+        input_ids = mx.array([[1, 62, 63, 63, 63, 63, 61, 2]])
+        pixel_values = mx.random.normal((16, 24))
+        image_grid_thw = mx.array([[1, 4, 4]])
+
+        cache = model.language_model.make_cache()
+        output = model(
+            input_ids,
+            pixel_values,
+            cache=cache,
+            image_grid_thw=image_grid_thw,
+        )
+        mx.eval(output.logits)
+        self.assertEqual(output.logits.shape, (1, 8, 64))
+
+        next_output = model(mx.array([[2]]), cache=cache)
+        mx.eval(next_output.logits)
+        self.assertEqual(next_output.logits.shape, (1, 1, 64))
+
+    def test_processor_patch_layout(self):
+        from PIL import Image
+
+        from mlx_vlm.models.cohere_compass.processing_cohere_compass import (
+            CohereCompassImageProcessor,
+        )
+
+        processor = CohereCompassImageProcessor(
+            patch_size=2,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=16 * 16,
+            max_pixels=32 * 32,
+        )
+        output = processor(Image.new("RGB", (12, 10)))
+        self.assertEqual(output["pixel_values"].shape[-1], 24)
+        self.assertEqual(output["image_grid_thw"].tolist(), [[1, 8, 10]])
