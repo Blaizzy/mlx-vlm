@@ -31,7 +31,7 @@ from .encoding_k3 import build_chat_segments, is_batched_conversation
 IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 MEDIA_PAD = "<|media_pad|>"
 KIMI_K3_TOKENIZER_REPO = "prince-canuma/Kimi-K3-tokenizer"
-KIMI_K3_TOKENIZER_REVISION = "3d11f5c6be3db0ed30b958a3dd20c837b67e2ba4"
+KIMI_K3_TOKENIZER_REVISION = "2f96d6c6680924c9a756475baa0571a71118798b"
 
 # prompt_utils selects a chat renderer only when chat_template is non-None.
 _CHAT_TEMPLATE_SENTINEL = "<kimi-k3-native-python-chat-renderer>"
