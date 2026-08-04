@@ -215,6 +215,42 @@ def _record_speculative_round(
     draft_model.accept_lens.append(accepted)
     if hasattr(draft_model, "draft_lens"):
         draft_model.draft_lens.append(int(draft_count))
+    # Monotonic lifetime counters for per-request attribution. Unlike the
+    # ``accept_lens`` history, these survive ``reset()`` between requests,
+    # so callers can snapshot-and-diff across a request's lifetime.
+    draft_model.spec_total_rounds = getattr(draft_model, "spec_total_rounds", 0) + 1
+    draft_model.spec_total_accepted = getattr(
+        draft_model, "spec_total_accepted", 0.0
+    ) + float(accepted)
+    draft_model.spec_total_drafted = getattr(
+        draft_model, "spec_total_drafted", 0
+    ) + int(draft_count)
+
+
+def speculative_stats_snapshot(draft_model: nn.Module) -> Tuple[int, float, int]:
+    """Capture the drafter's lifetime round counters for later diffing."""
+    return (
+        getattr(draft_model, "spec_total_rounds", 0),
+        getattr(draft_model, "spec_total_accepted", 0.0),
+        getattr(draft_model, "spec_total_drafted", 0),
+    )
+
+
+def speculative_stats_since(
+    draft_model: nn.Module, snapshot: Tuple[int, float, int]
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return (rounds, accepted, drafted) recorded since ``snapshot``.
+
+    Rounds are batch-wide, so the attribution is exact for batch size 1 and
+    shared across concurrent requests otherwise.
+    """
+    rounds0, accepted0, drafted0 = snapshot
+    rounds = getattr(draft_model, "spec_total_rounds", 0) - rounds0
+    if rounds <= 0:
+        return None, None, None
+    accepted = getattr(draft_model, "spec_total_accepted", 0.0) - accepted0
+    drafted = getattr(draft_model, "spec_total_drafted", 0) - drafted0
+    return rounds, int(round(accepted)), int(drafted)
 
 
 def _dflash_block_total(draft_model: nn.Module, draft_block_size: Optional[int]) -> int:

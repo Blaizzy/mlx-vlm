@@ -41,6 +41,8 @@ from ..speculative.utils import (
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
+    speculative_stats_since,
+    speculative_stats_snapshot,
 )
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
@@ -1766,6 +1768,11 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        "spec_snapshot": (
+                            speculative_stats_snapshot(self.draft_model)
+                            if self.draft_model is not None
+                            else None
+                        ),
                         **log_state,
                     }
 
@@ -2116,21 +2123,10 @@ class ResponseGenerator:
                         return True
                     return False
 
-                # Per-request acceptance stats: slice the drafter's lifetime
-                # accept/draft histories from here. Rounds are batch-wide, so
-                # the split is exact for B=1 and shared across the batch.
-                accept_start = len(getattr(drafter, "accept_lens", None) or [])
-                draft_start = len(getattr(drafter, "draft_lens", None) or [])
+                spec_snapshot = speculative_stats_snapshot(drafter)
 
                 def spec_summary():
-                    accepts = (getattr(drafter, "accept_lens", None) or [])[
-                        accept_start:
-                    ]
-                    if not accepts:
-                        return None, None, None
-                    drafts = (getattr(drafter, "draft_lens", None) or [])[draft_start:]
-                    drafted = int(sum(drafts)) if len(drafts) == len(accepts) else None
-                    return len(accepts), int(sum(accepts)), drafted
+                    return speculative_stats_since(drafter, spec_snapshot)
 
                 rounds_iter = run_speculative_server_rounds(
                     self.model,
@@ -2300,6 +2296,15 @@ class ResponseGenerator:
                 token_count=token_count,
             )
 
+            spec_rounds = spec_accepted = spec_drafted = None
+            spec_kind = None
+            if r.finish_reason is not None and info.get("spec_snapshot") is not None:
+                spec_rounds, spec_accepted, spec_drafted = speculative_stats_since(
+                    self.draft_model, info["spec_snapshot"]
+                )
+                if spec_rounds is not None:
+                    spec_kind = self.draft_kind
+
             rqueue.put(
                 StreamingToken(
                     text=text,
@@ -2308,6 +2313,10 @@ class ResponseGenerator:
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     prompt_tps=info.get("prompt_tps"),
+                    spec_draft_kind=spec_kind,
+                    spec_rounds=spec_rounds,
+                    spec_accepted_tokens=spec_accepted,
+                    spec_drafted_tokens=spec_drafted,
                     top_logprobs=getattr(r, "top_logprobs", None),
                     cached_tokens=info.get("cached_tokens", 0),
                     token_count=token_count,

@@ -3098,6 +3098,37 @@ def test_generation_metrics_record_speculative_stats():
     assert metrics.spec_drafted_tokens == 9
 
 
+def test_speculative_lifetime_counters_survive_reset():
+    from mlx_vlm.speculative.common import (
+        _record_speculative_round,
+        speculative_stats_since,
+        speculative_stats_snapshot,
+    )
+
+    drafter = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert speculative_stats_since(drafter, speculative_stats_snapshot(drafter)) == (
+        None,
+        None,
+        None,
+    )
+
+    snapshot = speculative_stats_snapshot(drafter)
+    _record_speculative_round(drafter, 3, 7)
+    _record_speculative_round(drafter, 2.5, 7)
+    drafter.accept_lens = []
+    drafter.draft_lens = []
+    _record_speculative_round(drafter, 1.5, 7)
+
+    rounds, accepted, drafted = speculative_stats_since(drafter, snapshot)
+    assert (rounds, accepted, drafted) == (3, 7, 21)
+
+    later_snapshot = speculative_stats_snapshot(drafter)
+    _record_speculative_round(drafter, 2, 7)
+    rounds, accepted, drafted = speculative_stats_since(drafter, later_snapshot)
+    assert (rounds, accepted, drafted) == (1, 2, 7)
+
+
 def test_chat_completions_returns_timings(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
