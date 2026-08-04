@@ -296,12 +296,29 @@ class KimiK3Processor(ProcessorMixin):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from huggingface_hub import hf_hub_download
 
+        # The processor is implemented locally. Keep the caller's remote-code
+        # policy from leaking back into AutoProcessor while loading the K3
+        # tokenizer through its separate, official custom-code path.
+        kwargs.pop("trust_remote_code", None)
+        kwargs.pop("use_fast", None)
+
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
+        hub_keys = (
+            "cache_dir",
+            "force_download",
+            "local_files_only",
+            "revision",
+            "token",
+        )
+        hub_kwargs = {key: kwargs[key] for key in hub_keys if key in kwargs}
+        if is_local:
+            hub_kwargs["local_files_only"] = True
+
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path) if is_local else pretrained_model_name_or_path,
             trust_remote_code=True,
-            local_files_only=is_local,
+            **hub_kwargs,
         )
 
         image_processor_config = {}
@@ -311,7 +328,9 @@ class KimiK3Processor(ProcessorMixin):
             else:
                 preproc_path = Path(
                     hf_hub_download(
-                        pretrained_model_name_or_path, "preprocessor_config.json"
+                        pretrained_model_name_or_path,
+                        "preprocessor_config.json",
+                        **hub_kwargs,
                     )
                 )
             if preproc_path.exists():

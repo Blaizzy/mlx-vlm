@@ -2398,6 +2398,28 @@ class TestKimiK3Patch(unittest.TestCase):
             "KimiK3Processor",
         )
 
+    def test_patch_intercepts_with_trust_remote_code_false(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from transformers import AutoProcessor
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        sentinel = object()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps({"model_type": "kimi_k3"})
+            )
+            with patch.object(
+                KimiK3Processor, "from_pretrained", return_value=sentinel
+            ) as from_pretrained:
+                result = AutoProcessor.from_pretrained(tmpdir, trust_remote_code=False)
+
+        self.assertIs(result, sentinel)
+        self.assertFalse(from_pretrained.call_args.kwargs["trust_remote_code"])
+
 
 class TestKimiK3Processor(unittest.TestCase):
     @staticmethod
@@ -2542,6 +2564,34 @@ class TestKimiK3Processor(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 processor.save_pretrained(tmpdir)
         self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
+
+    def test_from_pretrained_owns_processor_remote_code_flag(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        tokenizer = self._make_tokenizer()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir)
+            (model_path / "preprocessor_config.json").write_text(
+                json.dumps({"media_proc_cfg": {"patch_size": 16}})
+            )
+            with patch(
+                "mlx_vlm.models.kimi_k3.processing_kimi_k3."
+                "AutoTokenizer.from_pretrained",
+                return_value=tokenizer,
+            ) as tokenizer_from_pretrained:
+                processor = KimiK3Processor.from_pretrained(
+                    model_path, trust_remote_code=False
+                )
+
+        self.assertIsInstance(processor, KimiK3Processor)
+        tokenizer_kwargs = tokenizer_from_pretrained.call_args.kwargs
+        self.assertTrue(tokenizer_kwargs["trust_remote_code"])
+        self.assertTrue(tokenizer_kwargs["local_files_only"])
+        self.assertEqual(processor.image_processor.patch_size, 16)
 
 
 class TestPhi3VPatch(unittest.TestCase):
