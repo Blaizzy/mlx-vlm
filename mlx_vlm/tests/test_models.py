@@ -578,6 +578,10 @@ class TestModels(unittest.TestCase):
         )
 
         model = lfm2.Model(config)
+        self.assertEqual(
+            model.language_model.model.layers[0].feed_forward.w1.weight.shape,
+            (96, 64),
+        )
 
         self.language_test_runner(
             model.language_model,
@@ -593,6 +597,51 @@ class TestModels(unittest.TestCase):
         cache = model.make_cache()
         self.assertEqual(type(cache[0]).__name__, "ArraysCache")
         self.assertEqual(type(cache[1]).__name__, "KVCache")
+
+    def test_lfm2_config_feed_forward_dim_compatibility(self):
+        from mlx_vlm.models import lfm2
+
+        base_config = {
+            "model_type": "lfm2",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "norm_eps": 1e-5,
+            "conv_bias": False,
+            "conv_L_cache": 3,
+            "block_dim": 64,
+            "block_multiple_of": 16,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_auto_adjust_ff_dim": False,
+            "layer_types": ["full_attention"],
+        }
+
+        current_config = lfm2.ModelConfig.from_dict(
+            {**base_config, "intermediate_size": 192}
+        )
+        self.assertEqual(current_config.block_ff_dim, 192)
+        current_model = lfm2.Model(current_config)
+        self.assertEqual(
+            current_model.language_model.model.layers[0].feed_forward.w1.weight.shape,
+            (192, 64),
+        )
+
+        legacy_config = lfm2.ModelConfig.from_dict(
+            {
+                **base_config,
+                "intermediate_size": 192,
+                "block_ff_dim": 128,
+            }
+        )
+        self.assertEqual(legacy_config.block_ff_dim, 128)
+        legacy_model = lfm2.Model(legacy_config)
+        self.assertEqual(
+            legacy_model.language_model.model.layers[0].feed_forward.w1.weight.shape,
+            (128, 64),
+        )
 
     def test_lfm2_moe_language_model(self):
         from mlx_vlm.models import lfm2_moe
