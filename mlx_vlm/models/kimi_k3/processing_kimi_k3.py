@@ -488,6 +488,8 @@ class KimiK3Processor(ProcessorMixin):
         return BatchFeature(data=data)
 
     def save_pretrained(self, *args, **kwargs):
+        # As with Gemma4, ProcessorMixin.save_pretrained delegates to the
+        # tokenizer and persists an in-memory conversion as tokenizer.json.
         if self.chat_template != _CHAT_TEMPLATE_SENTINEL:
             return super().save_pretrained(*args, **kwargs)
         self.chat_template = None

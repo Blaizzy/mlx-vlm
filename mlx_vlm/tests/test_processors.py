@@ -2573,6 +2573,45 @@ class TestKimiK3Processor(unittest.TestCase):
                 processor.save_pretrained(tmpdir)
         self.assertEqual(processor.chat_template, _CHAT_TEMPLATE_SENTINEL)
 
+    def test_save_pretrained_persists_fast_tokenizer_for_local_reload(self):
+        import tempfile
+        from pathlib import Path
+
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import Whitespace
+        from transformers import PreTrainedTokenizerFast
+
+        from mlx_vlm.models.kimi_k3.processing_kimi_k3 import KimiK3Processor
+
+        backend = Tokenizer(
+            WordLevel(
+                {"[UNK]": 0, "[PAD]": 1, "hello": 2},
+                unk_token="[UNK]",
+            )
+        )
+        backend.pre_tokenizer = Whitespace()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+        )
+        processor = KimiK3Processor(tokenizer=tokenizer)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            processor.save_pretrained(tmpdir)
+            self.assertTrue((Path(tmpdir) / "tokenizer.json").is_file())
+            with patch(
+                "mlx_vlm.models.kimi_k3.processing_kimi_k3._convert_kimi_k3_tiktoken"
+            ) as convert_tiktoken:
+                reloaded = KimiK3Processor.from_pretrained(tmpdir)
+
+        convert_tiktoken.assert_not_called()
+        self.assertEqual(
+            reloaded.tokenizer.encode("hello", add_special_tokens=False),
+            [2],
+        )
+
     def test_from_pretrained_uses_local_fast_tokenizer_without_remote_code(self):
         import json
         import tempfile
