@@ -41,7 +41,8 @@ class Model(nn.Module):
     ):
         if pixel_values is None or self.vision_tower is None:
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                attention_mask=kwargs.get("mask"),
             )
 
         image_grid_thw = kwargs.get("image_grid_thw")
@@ -81,6 +82,7 @@ class Model(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
             position_ids=position_ids,
             rope_deltas=rope_deltas,
+            attention_mask=kwargs.get("mask"),
         )
 
     @property

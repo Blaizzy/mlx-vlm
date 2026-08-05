@@ -220,7 +220,13 @@ class CohereCompassProcessor(ProcessorMixin):
         self.vision_end_token = getattr(tokenizer, "vision_end_token", "<|VISION_END|>")
         super().__init__(image_processor, tokenizer, chat_template=chat_template)
 
-    def __call__(self, images=None, text=None, **kwargs):
+    def __call__(
+        self,
+        images=None,
+        text=None,
+        padding_side: str = "left",
+        **kwargs,
+    ):
         if text is None:
             raise ValueError("You have to specify text.")
         text = text.copy() if isinstance(text, list) else [text]
@@ -245,7 +251,16 @@ class CohereCompassProcessor(ProcessorMixin):
                 raise ValueError("More images than image placeholders")
 
         return_tensors = kwargs.pop("return_tensors", None)
-        text_inputs = self.tokenizer(text, **kwargs)
+        if padding_side is not None:
+            kwargs["padding_side"] = padding_side
+        old_padding_side = getattr(self.tokenizer, "padding_side", None)
+        if padding_side is not None and old_padding_side is not None:
+            self.tokenizer.padding_side = padding_side
+        try:
+            text_inputs = self.tokenizer(text, **kwargs)
+        finally:
+            if padding_side is not None and old_padding_side is not None:
+                self.tokenizer.padding_side = old_padding_side
         return BatchFeature(
             data=to_mlx({**text_inputs, **image_inputs}), tensor_type=return_tensors
         )

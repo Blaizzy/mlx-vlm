@@ -110,6 +110,13 @@ def make_norm(config: TextConfig):
     return CompassLayerNorm(config.hidden_size, config.layer_norm_eps)
 
 
+def _rowwise_batch(module, x: mx.array) -> mx.array:
+    """Keep each row's numerics independent of the batch size."""
+    if x.ndim >= 3 and x.shape[0] > 1:
+        return mx.concatenate([module(x[row : row + 1]) for row in range(x.shape[0])])
+    return module(x)
+
+
 class Attention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int):
         super().__init__()
@@ -156,13 +163,13 @@ class Attention(nn.Module):
         position_embeddings=None,
     ) -> mx.array:
         batch_size, sequence_length, _ = hidden_states.shape
-        queries = self.q_proj(hidden_states).reshape(
+        queries = _rowwise_batch(self.q_proj, hidden_states).reshape(
             batch_size, sequence_length, self.n_heads, self.head_dim
         )
-        keys = self.k_proj(hidden_states).reshape(
+        keys = _rowwise_batch(self.k_proj, hidden_states).reshape(
             batch_size, sequence_length, self.n_kv_heads, self.head_dim
         )
-        values = self.v_proj(hidden_states).reshape(
+        values = _rowwise_batch(self.v_proj, hidden_states).reshape(
             batch_size, sequence_length, self.n_kv_heads, self.head_dim
         )
         queries = queries.transpose(0, 2, 1, 3)
@@ -189,11 +196,65 @@ class Attention(nn.Module):
             if mask.shape[-1] != key_length:
                 mask = mask[..., -key_length:]
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        left_padding = getattr(cache, "left_padding", None)
+        padding_rows = left_padding.tolist() if left_padding is not None else []
+        if (
+            isinstance(keys, mx.array)
+            and left_padding is not None
+            and (batch_size > 1 or any(int(padding) > 0 for padding in padding_rows))
+        ):
+            # Batch caches keep rows at a common physical length.  Compact
+            # each row to the same logical K/V range used by a single-row
+            # cache, then run the identical fused attention kernel.
+            offsets = cache.offset.tolist()
+            outputs = []
+            for row, padding in enumerate(padding_rows):
+                padding = int(padding)
+                initial_prefill = sequence_length == keys.shape[-2]
+                if padding > 0:
+                    start = padding
+                    end = start + int(offsets[row])
+                    row_keys = keys[row : row + 1, ..., start:end, :]
+                    row_values = values[row : row + 1, ..., start:end, :]
+                    query_start = start if initial_prefill else 0
+                    row_queries = queries[row : row + 1, ..., query_start:, :]
+                    if sequence_length == 1:
+                        row_mask = None
+                    elif isinstance(mask, mx.array):
+                        row_mask = mask[row : row + 1]
+                        row_mask = row_mask[..., query_start:, start:end]
+                    else:
+                        row_mask = mask
+                else:
+                    query_start = 0
+                    row_queries = queries[row : row + 1]
+                    row_keys = keys[row : row + 1]
+                    row_values = values[row : row + 1]
+                    row_mask = (
+                        mask[row : row + 1] if isinstance(mask, mx.array) else mask
+                    )
+                outputs.append(
+                    scaled_dot_product_attention(
+                        row_queries,
+                        row_keys,
+                        row_values,
+                        cache=None,
+                        scale=self.scale,
+                        mask=row_mask,
+                    )
+                )
+                if query_start:
+                    outputs[-1] = mx.pad(
+                        outputs[-1],
+                        [(0, 0), (0, 0), (query_start, 0), (0, 0)],
+                    )
+            output = mx.concatenate(outputs, axis=0)
+        else:
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, sequence_length, -1)
-        return self.o_proj(output)
+        return _rowwise_batch(self.o_proj, output)
 
     @staticmethod
     def _apply_precomputed(q, k, position_embeddings):
@@ -242,8 +303,8 @@ class DecoderLayer(nn.Module):
         )
         if hasattr(self, "post_attention_layernorm"):
             h = residual + attention
-            return h + self.mlp(self.post_attention_layernorm(h))
-        return residual + attention + self.mlp(h)
+            return h + _rowwise_batch(self.mlp, self.post_attention_layernorm(h))
+        return residual + attention + _rowwise_batch(self.mlp, h)
 
 
 class TextModel(nn.Module):
@@ -493,6 +554,7 @@ class LanguageModel(nn.Module):
         visual_pos_masks = kwargs.pop("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.pop("deepstack_visual_embeds", None)
         rope_deltas = kwargs.pop("rope_deltas", None)
+        attention_mask = kwargs.pop("attention_mask", None)
 
         if pixel_values is not None:
             self._rope_deltas = None
@@ -500,9 +562,36 @@ class LanguageModel(nn.Module):
         if rope_deltas is not None:
             self._rope_deltas = rope_deltas
 
+        if (
+            cache
+            and isinstance(attention_mask, mx.array)
+            and hasattr(cache[0], "left_padding")
+            and cache[0].empty()
+        ):
+            left_padding = []
+            for row in attention_mask.tolist():
+                try:
+                    left_padding.append(row.index(1))
+                except ValueError:
+                    left_padding.append(len(row))
+            if any(left_padding):
+                for layer_cache in cache:
+                    prepare = getattr(layer_cache, "prepare", None)
+                    if callable(prepare):
+                        prepare(left_padding=left_padding)
+
         cache_offset = 0
         if cache and cache[0] is not None:
-            cache_offset = cache[0].offset
+            first_cache = cache[0]
+            # Batched caches advance every row through a shared physical
+            # timeline.  Use that timeline for RoPE so filtering out the
+            # longest row does not shift the positions of surviving padded
+            # rows.  ``offset`` remains the right source for regular caches.
+            cache_offset = getattr(first_cache, "_offset", None)
+            if cache_offset is None and hasattr(first_cache, "left_padding"):
+                cache_offset = getattr(first_cache, "_idx", None)
+            if cache_offset is None:
+                cache_offset = first_cache.offset
             if isinstance(cache_offset, mx.array):
                 cache_offset = int(cache_offset.max().item())
             else:
@@ -537,10 +626,13 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
-        logits = (
-            self.model.embed_tokens.as_linear(hidden_states)
-            if self.config.tie_word_embeddings
-            else self.lm_head(hidden_states)
+        logits = _rowwise_batch(
+            (
+                self.model.embed_tokens.as_linear
+                if self.config.tie_word_embeddings
+                else self.lm_head
+            ),
+            hidden_states,
         )
         if self.config.logit_scale is not None:
             logits = logits * self.config.logit_scale

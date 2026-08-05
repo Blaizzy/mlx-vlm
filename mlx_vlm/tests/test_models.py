@@ -12143,6 +12143,147 @@ class TestCohereCompass(unittest.TestCase):
         mx.eval(next_output.logits)
         self.assertEqual(next_output.logits.shape, (1, 1, 64))
 
+    def test_batched_padding_matches_single_rows(self):
+        from mlx_vlm.generate.ar import _make_cache
+
+        model = self._tiny_model()
+        model.update(
+            tree_map(lambda value: value.astype(mx.bfloat16), model.parameters())
+        )
+        language_model = model.language_model
+        rows = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11, 12, 13]]
+        max_length = max(map(len, rows))
+        padding = [max_length - len(row) for row in rows]
+        input_ids = mx.array([[0] * pad + row for row, pad in zip(rows, padding)])
+        attention_mask = mx.array(
+            [[0] * pad + [1] * len(row) for row, pad in zip(rows, padding)]
+        )
+        position_ids, rope_deltas = language_model.get_rope_index(
+            input_ids, attention_mask=attention_mask
+        )
+
+        single_caches = []
+        single_logits = []
+        single_deltas = []
+        for row in rows:
+            row_ids = mx.array([row])
+            row_mask = mx.ones_like(row_ids)
+            row_positions, row_delta = language_model.get_rope_index(
+                row_ids, attention_mask=row_mask
+            )
+            row_cache = language_model.make_cache()
+            output = language_model(
+                row_ids,
+                cache=row_cache,
+                position_ids=row_positions,
+                rope_deltas=row_delta,
+            )
+            mx.eval(output.logits, [entry.state for entry in row_cache])
+            single_caches.append(row_cache)
+            single_logits.append(output.logits[:, -1])
+            single_deltas.append(row_delta)
+
+        batch_cache = _make_cache(language_model, [0, 0])
+        output = language_model(
+            input_ids,
+            cache=batch_cache,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            attention_mask=attention_mask,
+        )
+        mx.eval(output.logits, [entry.state for entry in batch_cache])
+        for row, expected in enumerate(single_logits):
+            self.assertTrue(
+                mx.allclose(
+                    output.logits[row : row + 1, -1], expected, atol=0, rtol=0
+                ).item()
+            )
+
+        first_tokens = mx.concatenate(
+            [mx.argmax(logits, axis=-1) for logits in single_logits]
+        )
+        expected_next = []
+        for row, row_cache in enumerate(single_caches):
+            next_output = language_model(
+                first_tokens[row : row + 1, None],
+                cache=row_cache,
+                rope_deltas=single_deltas[row],
+            )
+            mx.eval(next_output.logits, [entry.state for entry in row_cache])
+            expected_next.append(next_output.logits[:, -1])
+
+        batch_next = language_model(
+            first_tokens[:, None],
+            cache=batch_cache,
+            rope_deltas=rope_deltas,
+        )
+        mx.eval(batch_next.logits, [entry.state for entry in batch_cache])
+        for row, expected in enumerate(expected_next):
+            self.assertEqual(
+                mx.argmax(batch_next.logits[row, -1]).item(),
+                mx.argmax(expected).item(),
+            )
+
+        keep = mx.array([0], dtype=mx.int32)
+        for entry in batch_cache:
+            entry.filter(keep)
+        filtered_delta = rope_deltas[keep]
+        next_token = mx.argmax(expected_next[0], axis=-1)
+        expected_filtered = language_model(
+            next_token[:, None],
+            cache=single_caches[0],
+            rope_deltas=single_deltas[0],
+        )
+        actual_filtered = language_model(
+            next_token[:, None],
+            cache=batch_cache,
+            rope_deltas=filtered_delta,
+        )
+        mx.eval(expected_filtered.logits, actual_filtered.logits)
+        self.assertEqual(
+            mx.argmax(actual_filtered.logits[0, -1]).item(),
+            mx.argmax(expected_filtered.logits[0, -1]).item(),
+        )
+
+    def test_vision_batch_matches_individual_images(self):
+        model = self._tiny_model()
+        pixels = mx.random.normal((32, 24))
+        image_features, deepstack_features = model.vision_tower(
+            pixels,
+            mx.array([[1, 4, 4], [1, 4, 4]]),
+        )
+        first_features, first_deepstack = model.vision_tower(
+            pixels[:16], mx.array([[1, 4, 4]])
+        )
+        second_features, second_deepstack = model.vision_tower(
+            pixels[16:], mx.array([[1, 4, 4]])
+        )
+        mx.eval(
+            image_features,
+            first_features,
+            second_features,
+            *(deepstack_features or []),
+            *(first_deepstack or []),
+            *(second_deepstack or []),
+        )
+        self.assertTrue(
+            mx.allclose(
+                image_features,
+                mx.concatenate([first_features, second_features], axis=0),
+                atol=1e-5,
+            ).item()
+        )
+        for batched, first, second in zip(
+            deepstack_features, first_deepstack, second_deepstack
+        ):
+            self.assertTrue(
+                mx.allclose(
+                    batched,
+                    mx.concatenate([first, second], axis=0),
+                    atol=1e-5,
+                ).item()
+            )
+
     def test_processor_patch_layout(self):
         from PIL import Image
 
@@ -12160,3 +12301,33 @@ class TestCohereCompass(unittest.TestCase):
         output = processor(Image.new("RGB", (12, 10)))
         self.assertEqual(output["pixel_values"].shape[-1], 24)
         self.assertEqual(output["image_grid_thw"].tolist(), [[1, 8, 10]])
+
+    def test_processor_uses_left_padding_for_batched_prompts(self):
+        from mlx_vlm.models.cohere_compass.processing_cohere_compass import (
+            CohereCompassProcessor,
+        )
+
+        class Tokenizer:
+            image_token = "<|IMAGE_PAD|>"
+            image_token_id = 63
+            vision_start_token = "<|VISION_START|>"
+            vision_end_token = "<|VISION_END|>"
+
+            def __call__(self, text, **kwargs):
+                self.last_kwargs = kwargs
+                return {"input_ids": [[1] * len(value) for value in text]}
+
+            def convert_tokens_to_ids(self, token):
+                return self.image_token_id
+
+        processor = CohereCompassProcessor.__new__(CohereCompassProcessor)
+        processor.tokenizer = Tokenizer()
+        processor.image_processor = None
+        processor.image_token = processor.tokenizer.image_token
+        processor.image_token_id = processor.tokenizer.image_token_id
+        processor.vision_start_token = processor.tokenizer.vision_start_token
+        processor.vision_end_token = processor.tokenizer.vision_end_token
+
+        processor(text=["short", "longer"], padding=True)
+
+        self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")

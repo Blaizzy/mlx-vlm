@@ -267,7 +267,7 @@ class VisionModel(nn.Module):
             [freq_table[pos_ids[:, 0]], freq_table[pos_ids[:, 1]]], axis=-1
         )
 
-    def __call__(self, hidden_states: mx.array, grid_thw: mx.array, **kwargs):
+    def _forward_single(self, hidden_states: mx.array, grid_thw: mx.array):
         hidden_states = self.patch_embed(hidden_states)
         hidden_states = hidden_states + self.fast_pos_embed_interpolate(
             grid_thw
@@ -294,6 +294,34 @@ class VisionModel(nn.Module):
                 )
 
         return self.merger(hidden_states), deepstack_features
+
+    def __call__(self, hidden_states: mx.array, grid_thw: mx.array, **kwargs):
+        if grid_thw.shape[0] == 1:
+            return self._forward_single(hidden_states, grid_thw)
+
+        # Keep each image's attention graph independent.  The flattened
+        # multi-image path uses split views inside fused SDPA; on bfloat16
+        # hardware, that changes accumulation order enough for small visual
+        # errors to compound through the 27-layer tower and alter decoding.
+        image_lengths = [int(t) * int(h) * int(w) for t, h, w in grid_thw.tolist()]
+        image_splits = mx.split(
+            hidden_states,
+            list(accumulate(image_lengths[:-1])),
+            axis=0,
+        )
+        visual_features = []
+        deepstack_features = [[] for _ in self.deepstack_visual_indexes]
+        for image_hidden_states, image_grid in zip(image_splits, grid_thw):
+            features, image_deepstack = self._forward_single(
+                image_hidden_states, image_grid[None]
+            )
+            visual_features.append(features)
+            for index, feature in enumerate(image_deepstack):
+                deepstack_features[index].append(feature)
+
+        return mx.concatenate(visual_features, axis=0), [
+            mx.concatenate(features, axis=0) for features in deepstack_features
+        ]
 
     def sanitize(self, weights):
         sanitized = {}
