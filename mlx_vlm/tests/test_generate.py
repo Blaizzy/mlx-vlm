@@ -2444,6 +2444,53 @@ class TestPrefixCacheReuseTrim:
         assert c.offset == 41
 
 
+class TestGemma4LogitsToKeep:
+    class _FakeTextModel:
+        def __init__(self, hidden):
+            self.hidden = hidden
+
+        def __call__(
+            self, inputs=None, inputs_embeds=None, input_embeddings=None, **kwargs
+        ):
+            seq = next(
+                t for t in (inputs, inputs_embeds, input_embeddings) if t is not None
+            )
+            return mx.zeros((1, seq.shape[1], self.hidden))
+
+    def _gemma4_lm(self, hidden):
+        from mlx_vlm.models.gemma4.language import LanguageModel
+
+        lm = LanguageModel.__new__(LanguageModel)
+        lm.model = self._FakeTextModel(hidden)
+        lm.logits_from_hidden = lambda h: h
+        return LanguageModel, lm
+
+    def _gemma4_text_lm(self, hidden):
+        from mlx_vlm.models.gemma4_text.language import LanguageModel
+
+        lm = LanguageModel.__new__(LanguageModel)
+        lm.model = self._FakeTextModel(hidden)
+        lm.tie_word_embeddings = False
+        lm.lm_head = lambda h: h
+        lm.final_logit_softcapping = None
+        return LanguageModel, lm
+
+    def test_gemma4_slices_before_lm_head(self):
+        cls, lm = self._gemma4_lm(hidden=8)
+        ids = mx.zeros((1, 6), dtype=mx.int32)
+        assert cls.supports_logits_to_keep is True
+        assert lm(ids).logits.shape == (1, 6, 8)
+        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
+        assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
+
+    def test_gemma4_text_slices_before_lm_head(self):
+        cls, lm = self._gemma4_text_lm(hidden=8)
+        ids = mx.zeros((1, 6), dtype=mx.int32)
+        assert cls.supports_logits_to_keep is True
+        assert lm(ids).logits.shape == (1, 6, 8)
+        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
+
+
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     batch_generator = SimpleNamespace(apc_manager=object())
 

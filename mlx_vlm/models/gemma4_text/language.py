@@ -496,6 +496,8 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_logits_to_keep = True
+
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
@@ -515,12 +517,15 @@ class LanguageModel(nn.Module):
         mask=None,
         **kwargs,
     ):
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
         out = self.model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
         )
+        if logits_to_keep:
+            out = out[:, -int(logits_to_keep) :, :]
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
