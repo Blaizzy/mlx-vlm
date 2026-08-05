@@ -599,6 +599,23 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     return tuple(mx.split(output, split_indices, axis=-1))
 
 
+def _pad_token_mask_to_head(token_mask: mx.array, n_size: int) -> mx.array:
+    """Widen a packed token bitmask to cover every lm_head output row.
+
+    llguidance packs its bitmask over the tokenizer vocabulary, which can be
+    smaller than the checkpoint's padded ``vocab_size`` (Qwen3.5 pads 248077
+    real tokens up to 248320 rows). The masked argmax kernel indexes mask words
+    by output row without bounds-checking, so the tail words have to exist, and
+    have to read as disallowed so the padding rows can never be sampled.
+    """
+    required = (n_size + 31) // 32
+    missing = required - token_mask.shape[1]
+    if missing <= 0:
+        return token_mask
+    pad = mx.zeros((token_mask.shape[0], missing), dtype=token_mask.dtype)
+    return mx.concatenate([token_mask, pad], axis=1)
+
+
 def _target_verify_quantized_argmax(
     linear, x: mx.array, token_mask: Optional[mx.array] = None
 ) -> Optional[mx.array]:
@@ -2813,6 +2830,9 @@ class LanguageModel(nn.Module):
                     )
                 ],
                 axis=0,
+            )
+            token_mask = _pad_token_mask_to_head(
+                token_mask, self.lm_head.weight.shape[0]
             )
 
         output = self(

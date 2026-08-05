@@ -10829,6 +10829,109 @@ class TestQwen35NormSanitization(unittest.TestCase):
         self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
 
 
+class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
+    """Structured output must not be capped at the tokenizer vocab width (#1797).
+
+    llguidance packs its token bitmask over the tokenizer vocabulary, but the
+    masked argmax kernel indexes mask words by lm_head row without bounds
+    checking. Checkpoints whose ``vocab_size`` is padded above the tokenizer
+    vocab (Qwen3.5: 248077 tokens, 248320 rows) therefore built a mask 7 words
+    short, and constrained decoding died with "packed token mask must be int32
+    with one complete row per token".
+    """
+
+    # Word-aligned so the mask covers exactly [0, VOCAB) and every lm_head row
+    # at or above VOCAB falls in the padding words. llguidance zeroes the
+    # unused bits of its final partial word, so this matches real masks.
+    VOCAB = 960  # tokenizer vocab -> 30 packed words
+    N = 1024  # padded lm_head rows -> 32 packed words required
+    K = 512
+
+    def _head(self):
+        import mlx.nn as nn
+
+        mx.random.seed(0)
+        linear = nn.Linear(self.K, self.N, bias=False)
+        # Let the padding rows win an unconstrained argmax, so sampling a real
+        # token proves the padding words were actually treated as disallowed.
+        weight = mx.zeros((self.N, self.K))
+        weight[self.VOCAB :, :] = 4.0
+        linear.weight = weight.astype(mx.bfloat16)
+        return nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
+
+    def _mask(self, rows, words):
+        return mx.full((rows, words), -1, dtype=mx.int32)
+
+    def _narrow(self, rows=1):
+        return self._mask(rows, (self.VOCAB + 31) // 32)
+
+    def test_pad_widens_mask_and_disallows_padding_rows(self):
+        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+
+        narrow = self._narrow()
+        padded = _pad_token_mask_to_head(narrow, self.N)
+
+        self.assertEqual(padded.shape, (1, (self.N + 31) // 32))
+        self.assertEqual(padded.dtype, mx.int32)
+        self.assertTrue(mx.all(padded[:, : narrow.shape[1]] == -1).item())
+        self.assertTrue(mx.all(padded[:, narrow.shape[1] :] == 0).item())
+
+    def test_pad_is_noop_when_already_wide_enough(self):
+        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+
+        wide = self._mask(1, (self.N + 31) // 32)
+        self.assertIs(_pad_token_mask_to_head(wide, self.N), wide)
+
+    def test_narrow_mask_still_rejected(self):
+        from mlx_vlm.models.qwen3_5.language import _target_verify_quantized_argmax
+
+        head = self._head()
+        x = mx.zeros((1, 1, self.K), dtype=mx.bfloat16)
+        with self.assertRaises(ValueError):
+            _target_verify_quantized_argmax(head, x, token_mask=self._narrow())
+
+    def test_padded_mask_samples_within_the_real_vocabulary(self):
+        from mlx_vlm.models.qwen3_5.language import (
+            _pad_token_mask_to_head,
+            _target_verify_quantized_argmax,
+        )
+
+        head = self._head()
+        mx.random.seed(1)
+        x = (mx.random.normal((1, 1, self.K)) * 0.1).astype(mx.bfloat16)
+
+        logits = head(x).astype(mx.float32)
+        self.assertGreaterEqual(
+            int(mx.argmax(logits, axis=-1).reshape(-1)[0]), self.VOCAB
+        )
+
+        padded = _pad_token_mask_to_head(self._narrow(), self.N)
+        sampled = _target_verify_quantized_argmax(head, x, token_mask=padded)
+        self.assertIsNotNone(sampled)
+        token = int(sampled.reshape(-1)[0])
+
+        self.assertLess(token, self.VOCAB)
+        expected = mx.argmax(logits[..., : self.VOCAB], axis=-1)
+        self.assertEqual(token, int(expected.reshape(-1)[0]))
+
+    def test_padded_mask_handles_multi_row_batch(self):
+        from mlx_vlm.models.qwen3_5.language import (
+            _pad_token_mask_to_head,
+            _target_verify_quantized_argmax,
+        )
+
+        head = self._head()
+        mx.random.seed(2)
+        x = (mx.random.normal((2, 1, self.K)) * 0.1).astype(mx.bfloat16)
+        padded = _pad_token_mask_to_head(self._narrow(rows=2), self.N)
+
+        sampled = _target_verify_quantized_argmax(head, x, token_mask=padded)
+        self.assertIsNotNone(sampled)
+        self.assertEqual(sampled.shape, (2, 1))
+        for token in sampled.reshape(-1).tolist():
+            self.assertLess(int(token), self.VOCAB)
+
+
 class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
     """Regression tests for MRoPE decode positions in plain generation.
 
