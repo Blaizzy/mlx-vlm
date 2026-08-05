@@ -1,112 +1,90 @@
 # MiniMax-H3
 
-This directory contains the MLX-native MiniMax-H3 Base implementation for joint
-24 FPS video and 32 kHz stereo-audio generation. It supports:
+[MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) generates 24 FPS
+video with synchronized 32 kHz stereo audio. Three workflows are supported:
 
-- T2VA and first/last-frame conditioning with the `fl2va` transformer;
-- ordered image, video, audio, and video-with-soundtrack references with the
-  `ref2va` transformer;
-- strict loading from an official local checkpoint or a converted MLX
-  directory;
-- MLX-native resize, normalization, patchification, frame resampling, waveform
-  resampling, sequence packing, transformer, VisualVAE, and AudioVAE math.
+- **T2VA**: text-to-video-and-audio generation;
+- **FL2VA**: generation conditioned on a first frame, last frame, or both;
+- **Ref2VA**: generation from ordered image, video, and audio references.
 
-Pillow, OpenCV, `mlx-audio`, `ffprobe`/`ffmpeg`, and the tokenizer backend are
-used only at media or tokenizer I/O boundaries. `ffmpeg` decodes an embedded
-soundtrack when a Ref2VA video path carries one and encodes/muxes generated RGB
-frames and stereo audio into MP4 output. Runtime code does not import PyTorch,
-Diffusers, torchvision, torchaudio, or librosa.
+MiniMax-H3 weights are covered by the MiniMax H3 Community License. Review the
+model card and license restrictions before downloading or running the model.
 
-## License boundary
+## Install
 
-MiniMax-H3 weights use the MiniMax H3 Community License. Review the checkpoint
-license and its territory/use restrictions before downloading, converting, or
-running weights. The implementation and tests in this repository use only tiny
-synthetic weights and do not download the checkpoint.
-
-## Convert one partition
-
-Conversion accepts a local official snapshot and never uploads artifacts. It
-copies only one selected transformer, trims Qwen3-VL after decoder layer 50,
-removes its final norm and LM head, and folds AudioVAE weight normalization.
-
-Download the public Diffusers layout by selecting one workflow first. This
-fetches the shared components once and only `transformer/` for `t2va`/`fl2va`
-or `transformer_ref/` for `ref2va`; it never enters the duplicated legacy
-`FL2VA/` and `Ref2VA/` trees.
-
-```python
-from mlx_vlm.models.minimax_h3 import download_model
-
-source = download_model(workflow="fl2va")
-print(source)
+```sh
+pip install -U mlx-vlm
 ```
 
-```bash
-python -m mlx_vlm.models.minimax_h3.convert \
-  --source MiniMaxAI/MiniMax-H3 \
-  --output /path/to/h3-fl2va-mlx \
-  --workflow fl2va
+`ffmpeg` and `ffprobe` must be available on `PATH` to extract embedded
+soundtracks and write MP4 output. For example, on macOS:
+
+```sh
+brew install ffmpeg
 ```
 
-`--source` also accepts an already downloaded local snapshot. For a T2VA-only
-artifact, add `--text-only` to omit the Qwen vision tower. A Ref2VA conversion
-always retains vision. Source dtypes are preserved unless `--dtype` is supplied.
-Use `--dry-run` to validate the selected files and report their byte size without
-writing output.
+The selected workflow downloads only its required transformer partition plus
+the shared model components. You can also pass a local MiniMax-H3 snapshot or
+converted MLX directory as the model path.
 
-## Load and generate
+## Generic API and CLI
 
-```python
-from mlx_vlm.models.minimax_h3 import (
-    MiniMaxH3GenerationRequest,
-    load_pipeline,
-)
+### CLI
 
-pipeline = load_pipeline("/path/to/h3-fl2va-mlx")
-result = pipeline.generate(
-    MiniMaxH3GenerationRequest(
-        prompt="A paper boat crossing a rain puddle",
-        num_frames=124,
-        num_inference_steps=30,
-    )
-)
+Text-to-video-and-audio:
+
+```sh
+mlx_vlm.generate \
+  --output-modality video \
+  --model MiniMaxAI/MiniMax-H3 \
+  --prompt "A paper boat crossing a rain puddle" \
+  --num-frames 124 \
+  --steps 30 \
+  --output outputs/paper-boat.mp4
 ```
 
-An official Hub repository can be loaded directly. Remote loading requires a
-Diffusers-style workflow so it cannot accidentally fetch both 61.7 GB
-transformers:
+First/last-frame conditioning:
 
-```python
-pipeline = load_pipeline(
-    "MiniMaxAI/MiniMax-H3",
-    workflow="t2va",  # or "fl2va" / "ref2va"
-)
+```sh
+mlx_vlm.generate \
+  --output-modality video \
+  --model MiniMaxAI/MiniMax-H3 \
+  --prompt "The scene changes from dawn to dusk" \
+  --image first.png \
+  --last-image last.png \
+  --output outputs/fl2va.mp4
 ```
 
-Pass `image` and/or `last_image` for frame conditioning. Ref2VA uses a converted
-`ref2va` directory and `MiniMaxH3Reference` objects in the request's
-`references` list. Images may be paths, Pillow images, NumPy arrays, or MLX
-arrays. Video/audio references may be decoded arrays or local container paths.
-Generation is intentionally hardware-neutral: no automatic offload, streaming,
-quantization recipe, or minimum-memory claim is imposed.
+Ordered references:
 
-Before denoising, the pipeline now materializes each block's AdaLN modulation
-using the exact per-step timestep tensor that the uncached forward would use.
-The cache preserves its shape, ordering, and dtype, and is fully evaluated
-before the roughly 13B per-block AdaLN projection parameters are released. The
-same loaded pipeline can be reused with the same schedule and conditioning
-mode. After the projection weights have been released, changing the number of
-steps or switching to a mode with a different timestep table requires reloading
-the pipeline. Python callers that need to retain a mutable/reusable transformer
-can set `drop_adaln_weights=False`; set `cache_adaln=False` as well to exercise
-the original live path.
+```sh
+mlx_vlm.generate \
+  --output-modality video \
+  --model MiniMaxAI/MiniMax-H3 \
+  --prompt "Keep the subject, motion, and soundtrack" \
+  --reference image=subject.png \
+  --reference video=motion.mp4 \
+  --reference audio=soundtrack.wav \
+  --output outputs/ref2va.mp4
+```
 
-### Generic API and CLI
+The workflow is inferred from the conditioning arguments. It can also be set
+explicitly with `--workflow t2va`, `--workflow fl2va`, or
+`--workflow ref2va`. Reference order is significant, so repeat `--reference`
+in the intended semantic order. A video reference automatically uses its
+embedded soundtrack when present.
 
-Video generation is also available through the public generation API. The
-workflow is selected when the model is loaded so only its required transformer
-partition is downloaded:
+Use `--size WIDTHxHEIGHT` to select a canvas; both dimensions must be multiples
+of 32. Video duration must be between 5 and 15 seconds, and frame counts are
+aligned to the model's `17n+5` frame grid. When Ref2VA receives exactly one
+audio-bearing reference, its duration can be inferred by omitting
+`--num-frames`.
+
+Generated files use H.264 video and AAC audio in an MP4 container. Without
+`--output`, the CLI writes `outputs/video-<seed>.mp4`. Add `--verbose` for a
+progress bar and effective frames-per-second reporting.
+
+### Python
 
 ```python
 from mlx_vlm.generate import (
@@ -119,74 +97,36 @@ model = load_video_generation_model(
     "MiniMaxAI/MiniMax-H3",
     workflow="t2va",
 )
+
 result = generate_video(
     model,
     VideoGenerationRequest(
         prompt="A paper boat crossing a rain puddle",
         num_frames=124,
         steps=30,
+        seed=42,
     ),
     output_path="outputs/paper-boat.mp4",
 )
+
+print(result.path, result.frames.shape, result.audio.shape)
 ```
 
-The regular generator accepts `--output-modality video`; `generate_video` is a
-convenience subcommand for the same path. The mode is inferred from the supplied
-conditioning, or it can be selected explicitly with `--workflow`:
+For FL2VA, load with `workflow="fl2va"` and set `image` and/or `last_image` on
+the request. For Ref2VA, load with `workflow="ref2va"` and pass ordered
+`VideoReference` objects:
 
-```bash
-# T2VA: no frame or reference conditioning
-mlx_vlm.generate \
-  --output-modality video \
-  --model MiniMaxAI/MiniMax-H3 \
-  --prompt "A paper boat crossing a rain puddle" \
-  --num-frames 124 \
-  --verbose \
-  --output outputs/t2va.mp4
+```python
+from mlx_vlm.generate import VideoReference
 
-# FL2VA: first frame, last frame, or both
-python -m mlx_vlm generate_video \
-  --model MiniMaxAI/MiniMax-H3 \
-  --prompt "The scene changes from dawn to dusk" \
-  --image first.png \
-  --last-image last.png \
-  --output outputs/fl2va.mp4
-
-# Ref2VA: repeat --reference to preserve semantic order
-mlx_vlm.generate \
-  --output-modality video \
-  --model MiniMaxAI/MiniMax-H3 \
-  --prompt "Keep the subject, motion, and soundtrack" \
-  --reference image=subject.png \
-  --reference video=motion.mp4 \
-  --reference audio=soundtrack.wav \
-  --output outputs/ref2va.mp4
+request = VideoGenerationRequest(
+    prompt="Keep the subject and soundtrack",
+    references=(
+        VideoReference("image", "subject.png"),
+        VideoReference("audio", "soundtrack.wav"),
+    ),
+)
 ```
 
-Generated files use H.264 video and AAC audio in an MP4 container. `ffmpeg` must
-be installed and visible on `PATH`. Without `--output`, the CLI writes
-`outputs/video-<seed>.mp4`.
-
-Pass `--verbose` to display a phase-aware tqdm progress bar. It reports model
-loading, conditioning preparation, AdaLN cache construction, every denoising
-update, audio/video decode, and MP4 encoding. During generation, `frames/s` is
-the effective output-frame throughput through the completed fraction of
-denoising; the final summary reports end-to-end `generation_fps`. The progress
-bar is off by default. H3 denoises the complete clip jointly, so frames are not
-emitted one at a time.
-
-## Synthetic parity
-
-The focused tests cover exact layouts and scheduler behavior plus numeric
-goldens produced from the pinned references:
-
-- Diffusers MiniMax-H3 transformer;
-- Diffusers VisualVAE encode/decode, temporal chunking, and spatial tiling;
-- Diffusers AudioVAE encode/decode;
-- Transformers Qwen3-VL pre-final-norm decoder hidden states;
-- Transformers/Pillow processor behavior;
-- full tiny FL2VA and Ref2VA denoising requests;
-- official-key-layout conversion and strict reload for both partitions.
-
-Reference revisions are recorded in `PLAN.md` and every converted
-`h3_manifest.json`.
+A loaded model is tied to one workflow. Reuse it with the same inference step
+count, or reload it before changing workflows or step counts.
