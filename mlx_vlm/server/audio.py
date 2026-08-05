@@ -393,23 +393,34 @@ async def _parse_transcription_request(
     if not timestamp_granularities:
         timestamp_granularities = _form_list(form, "timestamp_granularities[]")
 
-    payload = AudioTranscriptionRequest(
-        model=model,
-        language=_clean_form_value(form.get("language")),
-        prompt=_clean_form_value(form.get("prompt")),
-        temperature=_form_float(form.get("temperature")),
-        response_format=_clean_form_value(form.get("response_format")) or "json",
-        verbose=_form_bool(form.get("verbose"), default=False),
-        max_tokens=_form_int(form.get("max_tokens"), default=1024),
-        chunk_duration=_form_float(form.get("chunk_duration"), default=30.0),
-        frame_threshold=_form_int(form.get("frame_threshold"), default=25),
-        stream=_form_bool(form.get("stream"), default=False),
-        context=_clean_form_value(form.get("context")),
-        prefill_step_size=_form_int(form.get("prefill_step_size"), default=2048),
-        text=_clean_form_value(form.get("text")),
-        word_timestamps=_form_bool(form.get("word_timestamps"), default=False),
-        timestamp_granularities=timestamp_granularities or None,
-    )
+    # Only materialize fields the form actually carried so that
+    # ``model_fields_set`` distinguishes client-provided values from request
+    # defaults; downstream kwarg filtering relies on that distinction.
+    values: Dict[str, Any] = {
+        "model": model,
+        "response_format": _clean_form_value(form.get("response_format")) or "json",
+    }
+    form_parsers: Dict[str, Any] = {
+        "language": _clean_form_value,
+        "prompt": _clean_form_value,
+        "context": _clean_form_value,
+        "text": _clean_form_value,
+        "temperature": _form_float,
+        "chunk_duration": _form_float,
+        "max_tokens": lambda value: _form_int(value, default=1024),
+        "frame_threshold": lambda value: _form_int(value, default=25),
+        "prefill_step_size": lambda value: _form_int(value, default=2048),
+        "verbose": lambda value: _form_bool(value, default=False),
+        "stream": lambda value: _form_bool(value, default=False),
+        "word_timestamps": lambda value: _form_bool(value, default=False),
+    }
+    for key, parse in form_parsers.items():
+        if _clean_form_value(form.get(key)) is not None:
+            values[key] = parse(form.get(key))
+    if timestamp_granularities:
+        values["timestamp_granularities"] = timestamp_granularities
+
+    payload = AudioTranscriptionRequest(**values)
     if translate and payload.response_format == "verbose_json":
         # Matches OpenAI's accepted response formats, while still allowing verbose
         # output for models that return segments.
@@ -562,6 +573,20 @@ def _build_stt_generate_kwargs(
     )
     prompt = request.prompt
     accepted = _callable_parameters(model.generate)
+
+    # Family-specific request defaults (e.g. Parakeet's ``frame_threshold``)
+    # must not leak through a ``**kwargs`` catch-all into another family's
+    # decoder — Whisper forwards unknown keys into ``DecodingOptions`` and
+    # raises. Defaults only apply when the model declares the parameter;
+    # values the client explicitly sent always pass through.
+    if accepted is not None and accepted.get("**kwargs"):
+        declared = accepted.get("params", set())
+        provided = request.model_fields_set
+        kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in declared or key in provided
+        }
 
     if prompt:
         if _accepts_parameter(accepted, "context"):

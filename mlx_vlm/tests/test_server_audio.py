@@ -352,3 +352,107 @@ def _drain(handle, timeout=2.0):
         elif chunk.kind == "done":
             return chunks
     raise TimeoutError("timed out waiting for audio queue results")
+
+
+class FakeWhisperSTTModel:
+    model_type = "whisper"
+
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def generate(
+        self,
+        path,
+        *,
+        language=None,
+        task="transcribe",
+        chunk_duration=1.0,
+        word_timestamps=False,
+        **decode_options,
+    ):
+        allowed = {"temperature", "verbose", "stream", "context", "text"}
+        unexpected = set(decode_options) - allowed
+        if unexpected:
+            raise TypeError(
+                "DecodingOptions.__init__() got an unexpected keyword argument "
+                f"{sorted(unexpected)[0]!r}"
+            )
+        self.calls.append(
+            {
+                "path": path,
+                "language": language,
+                "chunk_duration": chunk_duration,
+                **decode_options,
+            }
+        )
+        return self.result
+
+
+def test_audio_transcriptions_defaults_not_forwarded_to_whisper(client, monkeypatch):
+    fake_model = FakeWhisperSTTModel({"text": "ok"})
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
+    )
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
+        data={"model": "fake-whisper", "language": "en"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"text": "ok"}
+    call = fake_model.calls[0]
+    assert call["language"] == "en"
+    assert call["chunk_duration"] == pytest.approx(30.0)
+    assert "frame_threshold" not in call
+    assert "max_tokens" not in call
+    assert "prefill_step_size" not in call
+
+
+def test_audio_transcriptions_explicit_values_reach_var_kwargs(client, monkeypatch):
+    fake_model = FakeSTTModel({"text": "ok"})
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: (fake_model, None, SimpleNamespace(model_type="audio")),
+    )
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
+
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
+        data={"model": "fake-stt", "frame_threshold": "30"},
+    )
+
+    assert response.status_code == 200
+    assert fake_model.calls[0]["frame_threshold"] == 30
+
+
+def test_build_stt_kwargs_keeps_defaults_for_declared_parameters():
+    class FakeParakeetModel:
+        def generate(self, path, *, frame_threshold=10, chunk_duration=1.0):
+            raise AssertionError("not called")
+
+    request = server_audio.AudioTranscriptionRequest(model="fake-parakeet")
+    kwargs = server_audio._build_stt_generate_kwargs(
+        FakeParakeetModel(), request, translate=False
+    )
+
+    assert kwargs["frame_threshold"] == 25
+    assert kwargs["chunk_duration"] == pytest.approx(30.0)
+    assert "max_tokens" not in kwargs
