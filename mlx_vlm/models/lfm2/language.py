@@ -255,6 +255,10 @@ class Lfm2DecoderLayer(nn.Module):
 
 
 class Lfm2Model(nn.Module):
+    # Preserve the singleton BF16 numerical path until prompt caches are ready;
+    # continuous batching can merge the completed caches for decode afterward.
+    requires_single_row_prefill = True
+
     def __init__(self, args):
         super().__init__()
         self.args = args

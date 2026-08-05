@@ -524,6 +524,29 @@ class TestLeftPadPrompts:
 class TestBatchGenerator:
     """Tests for BatchGenerator class."""
 
+    def test_prefill_next_does_not_decode_ready_sequences(self):
+        class ReadyGenerationBatch:
+            logits_processors = []
+
+            def __len__(self):
+                return 1
+
+            def next(self):
+                raise AssertionError("prefill-only step must not decode")
+
+        batch = BatchGenerator.__new__(BatchGenerator)
+        batch._generation_batch = ReadyGenerationBatch()
+        batch._prompt_batch = None
+        batch._unprocessed_sequences = []
+        batch.completion_batch_size = 32
+        batch.prefill_batch_size = 1
+        batch._wire_stack = None
+
+        prompt_responses, generation_responses = batch._next(prefill_only=True)
+
+        assert prompt_responses == []
+        assert generation_responses == []
+
     def test_initialization(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
@@ -879,7 +902,12 @@ class TestBatchGenerator:
         )
         batch.compute_logprobs = False
 
-        first = batch.next()
+        with patch.object(
+            generate_module.mx,
+            "logsumexp",
+            side_effect=AssertionError("greedy decode must not normalize logits"),
+        ):
+            first = batch.next()
         assert [r.token for r in first] == [5]
         assert batch._next_tokens.tolist() == [2]
         assert model.calls == [{}]

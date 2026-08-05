@@ -1043,13 +1043,23 @@ class GenerationBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        sampled = _sample_with_positions(
-            self.sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
-            positions=[n + 1 for n in self._num_tokens],
-        )
+        if (
+            self.greedy_sampling
+            and not self.compute_logprobs
+            and self.top_logprobs_k == 0
+        ):
+            # argmax(logits) == argmax(log_softmax(logits)); avoid normalizing
+            # the full vocabulary when the caller did not request logprobs.
+            logprobs = None
+            sampled = mx.argmax(logits, axis=-1)
+        else:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            sampled = _sample_with_positions(
+                self.sampler,
+                logprobs,
+                row_ids=[0] * len(self.uids),
+                positions=[n + 1 for n in self._num_tokens],
+            )
 
         self._next_tokens = sampled
         prev_top_idx = self._next_top_idx
@@ -1905,13 +1915,17 @@ class PromptProcessingBatch:
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
-        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-        first_tokens = _sample_with_positions(
-            sampler,
-            logprobs,
-            row_ids=[0] * len(self.uids),
-            positions=[0] * len(self.uids),
-        )
+        if self.greedy_sampling and not compute_logprobs and top_logprobs_k == 0:
+            logprobs = None
+            first_tokens = mx.argmax(logits, axis=-1)
+        else:
+            logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+            first_tokens = _sample_with_positions(
+                sampler,
+                logprobs,
+                row_ids=[0] * len(self.uids),
+                positions=[0] * len(self.uids),
+            )
 
         mx.async_eval(first_tokens)
 
@@ -2620,7 +2634,7 @@ class BatchGenerator:
         else:
             self._generation_batch.extend(gen_batch)
 
-    def _next(self, **kwargs):
+    def _next(self, *, prefill_only: bool = False, **kwargs):
         generation_responses = []
         prompt_responses = []
 
@@ -2630,7 +2644,7 @@ class BatchGenerator:
             for processors in getattr(self._generation_batch, "logits_processors", [])
             for processor in processors or []
         )
-        if len(self._generation_batch) > 0:
+        if not prefill_only and len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
@@ -2799,6 +2813,11 @@ class BatchGenerator:
     def next(self, **kwargs):
         with mx.stream(self._stream):
             return self._next(**kwargs)
+
+    def prefill_next(self, **kwargs):
+        """Advance prompt work without decoding ready sequences."""
+        with mx.stream(self._stream):
+            return self._next(prefill_only=True, **kwargs)
 
 
 def batch_generate(
