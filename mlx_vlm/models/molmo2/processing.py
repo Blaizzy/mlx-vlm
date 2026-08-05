@@ -677,7 +677,7 @@ class Molmo2Processor(ProcessorMixin):
         from huggingface_hub import hf_hub_download
         from transformers import AutoTokenizer
 
-        kwargs.pop("trust_remote_code", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
 
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
@@ -685,7 +685,7 @@ class Molmo2Processor(ProcessorMixin):
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path) if is_local else pretrained_model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             local_files_only=is_local,
         )
 
