@@ -23,13 +23,19 @@ class Attention(nn.Module):
 
         self.repeats = n_heads // n_kv_heads
 
-        head_dim = config.hidden_size // n_heads
+        head_dim = getattr(config, "head_dim", None) or config.hidden_size // n_heads
         self.scale = head_dim**-0.5
 
         if config.model_type == "qwen2":
             attention_bias = True
         else:
             attention_bias = False
+
+        # qwen3 applies per-head RMSNorm to q/k (e.g. Jagle-VL's Qwen3-1.7B backbone)
+        self.use_qk_norm = config.model_type == "qwen3"
+        if self.use_qk_norm:
+            self.q_norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(head_dim, eps=config.rms_norm_eps)
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=attention_bias)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=attention_bias)
@@ -63,6 +69,10 @@ class Attention(nn.Module):
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        if self.use_qk_norm:
+            queries = self.q_norm(queries)
+            keys = self.k_norm(keys)
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
@@ -148,9 +158,9 @@ class LanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.model_type = config.model_type
-        if self.model_type not in ["llama", "qwen2"]:
+        if self.model_type not in ["llama", "qwen2", "qwen3"]:
             raise ValueError(
-                f"Model type {self.model_type} not supported. Supported types: 'llama', 'qwen2'"
+                f"Model type {self.model_type} not supported. Supported types: 'llama', 'qwen2', 'qwen3'"
             )
         self.model = Llama(config)
         if not config.tie_word_embeddings:
