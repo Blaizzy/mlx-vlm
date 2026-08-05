@@ -5149,8 +5149,10 @@ class TestResponseGenerator:
             gen.draft_kind = "mtp"
             gen.tokenizer = SimpleNamespace()
 
-        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
-            del idle_timeout
+        def fake_collect_pending_requests(
+            *, active, idle_timeout=0.1, coalesce_s=0.0, capacity=None
+        ):
+            del idle_timeout, capacity
             calls.append((active, coalesce_s))
             return [], True
 
