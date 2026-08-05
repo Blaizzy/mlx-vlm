@@ -1803,6 +1803,82 @@ def test_responses_endpoint_merges_developer_message_with_instructions(client):
     ]
 
 
+def test_responses_endpoint_places_function_output_image_after_tool_result(
+    client, monkeypatch
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    image_url = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "view_image",
+                        "arguments": "{}",
+                        "call_id": "call_view_image",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_view_image",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": image_url,
+                                "detail": "high",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.kwargs["prompt"]
+    assert prompt.index("Tool:") < prompt.index("<image>")
+    assert image_url not in prompt
+    assert mock_generate.call_args.kwargs["image"] == [image_url]
+
+
+def test_responses_endpoint_rejects_image_file_id(client):
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "demo",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_view_image",
+                    "output": [{"type": "input_image", "file_id": "file-image"}],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "input_image.file_id is not supported by this server. "
+        "Provide image_url instead."
+    )
+
+
 @pytest.mark.parametrize(
     ("include_adapter", "adapter_path", "expected_adapter"),
     [
