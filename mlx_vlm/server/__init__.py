@@ -52,6 +52,7 @@ from .audio import (
     audio_translations_endpoint,
 )
 from .generation import (
+    DEFAULT_BATCH_COALESCE_MS,
     DEFAULT_ENABLE_THINKING,
     DEFAULT_LOG_PROGRESS_INTERVAL,
     DEFAULT_SPECULATIVE_BATCH_COALESCE_MS,
@@ -71,6 +72,7 @@ from .generation import (
     _get_draft_block_size_from_env,
     _make_cache,
     get_configured_context_limit,
+    get_batch_coalesce_s,
     get_kv_group_size,
     get_kv_quant_scheme,
     get_log_progress_interval,

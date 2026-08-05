@@ -501,7 +501,7 @@ The server provides multiple endpoints for different use cases and supports dyna
 
 ### Continuous Batching
 
-The server supports continuous batching for higher throughput when handling multiple concurrent requests. New requests join the active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
+The server supports continuous batching for higher throughput when handling multiple concurrent requests. When idle, it uses a 20 ms admission window so simultaneous requests enter the first batch together; set `MLX_VLM_BATCH_COALESCE_MS=0` to disable it or provide another duration in milliseconds. New requests join an active batch immediately without waiting for existing requests to finish, and mixed batches of image and text-only requests are supported.
 
 Continuous batching is enabled automatically when the server loads a model. You can pre-load a model at startup so it's ready to serve immediately:
 

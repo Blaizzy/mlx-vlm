@@ -18,6 +18,7 @@ from ..generate import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
+    DEFAULT_PREFILL_BATCH_SIZE,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
@@ -52,6 +53,7 @@ from .runtime import runtime
 logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_BATCH_COALESCE_MS = 20.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
@@ -113,6 +115,15 @@ def get_speculative_batch_coalesce_s():
         return DEFAULT_SPECULATIVE_BATCH_COALESCE_MS / 1000.0
 
 
+def get_batch_coalesce_s():
+    """Idle request coalescing window for continuous batching."""
+    raw = os.environ.get("MLX_VLM_BATCH_COALESCE_MS", str(DEFAULT_BATCH_COALESCE_MS))
+    try:
+        return max(0.0, float(raw)) / 1000.0
+    except ValueError:
+        return DEFAULT_BATCH_COALESCE_MS / 1000.0
+
+
 def get_log_progress_interval():
     """Number of decoded tokens between INFO progress messages (0 disables)."""
     raw = os.environ.get(
@@ -127,6 +138,16 @@ def get_log_progress_interval():
             DEFAULT_LOG_PROGRESS_INTERVAL,
         )
         return DEFAULT_LOG_PROGRESS_INTERVAL
+
+
+def _requires_single_row_prefill(model) -> bool:
+    """Whether batched prefill can change the model's numerical path."""
+    candidates = (model, getattr(model, "model", None))
+    return any(
+        bool(getattr(candidate, "requires_single_row_prefill", False))
+        for candidate in candidates
+        if candidate is not None
+    )
 
 
 def _sequence_aligned_prefill_keys(
@@ -1655,15 +1676,13 @@ class ResponseGenerator:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
                 active_batch = bool(active)
-                coalesce_s = (
-                    get_speculative_batch_coalesce_s()
-                    if (
-                        not active_batch
-                        and self.draft_model is not None
-                        and self.draft_kind == "mtp"
+                coalesce_s = 0.0
+                if not active_batch:
+                    coalesce_s = (
+                        get_speculative_batch_coalesce_s()
+                        if self.draft_model is not None and self.draft_kind == "mtp"
+                        else get_batch_coalesce_s()
                     )
-                    else 0.0
-                )
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
                     coalesce_s=coalesce_s,
@@ -1721,6 +1740,13 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=get_prefill_step_size(),
+                            prefill_batch_size=(
+                                1
+                                if _requires_single_row_prefill(
+                                    self.model.language_model
+                                )
+                                else DEFAULT_PREFILL_BATCH_SIZE
+                            ),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1775,6 +1801,15 @@ class ResponseGenerator:
                         ),
                         **log_state,
                     }
+
+                if (
+                    not active_batch
+                    and len(new_items) > 1
+                    and batch_gen is not None
+                    and _requires_single_row_prefill(self.model.language_model)
+                ):
+                    while batch_gen.has_pending_prompts:
+                        self._step(batch_gen, active, prefill_only=True)
 
                 if not active or batch_gen is None:
                     continue
@@ -2253,10 +2288,11 @@ class ResponseGenerator:
                 mx.clear_cache()
                 gc.collect()
 
-    def _step(self, batch_gen, active, gen_kwargs=None):
+    def _step(self, batch_gen, active, gen_kwargs=None, *, prefill_only=False):
         """One batch generation step: prefill + decode."""
         kwargs = gen_kwargs or {}
-        prompt_responses, responses = batch_gen.next(**kwargs)
+        step = batch_gen.prefill_next if prefill_only else batch_gen.next
+        prompt_responses, responses = step(**kwargs)
         self._log_prefill_progress(batch_gen, active)
         for prompt_response in prompt_responses:
             if prompt_response.uid in active:
