@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -3508,6 +3508,20 @@ def _validate_bits(bits: float) -> float:
     return rounded
 
 
+def resolve_kv_bits(
+    bits: float,
+    key_bits: Optional[float] = None,
+    value_bits: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    bits = _validate_bits(bits)
+    fractional = not math.isclose(bits, round(bits), abs_tol=1e-6)
+    if key_bits is None:
+        key_bits = math.floor(bits) if fractional else bits
+    if value_bits is None:
+        value_bits = math.ceil(bits) if fractional else bits
+    return bits, _validate_bits(key_bits), _validate_bits(value_bits)
+
+
 def turboquant_enabled(bits: Optional[float], scheme: Optional[str] = None) -> bool:
     if bits is None:
         return False
@@ -4963,8 +4977,16 @@ class TurboQuantKVCache(_BaseCache):
     prefill_query_block_size = 16
     cache_step = 256
 
-    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
-        self.bits = _validate_bits(bits)
+    def __init__(
+        self,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+    ):
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            bits, key_bits, value_bits
+        )
         self.seed = seed
         self.offset = 0
         self.keys = None
@@ -4978,9 +5000,16 @@ class TurboQuantKVCache(_BaseCache):
 
     @classmethod
     def from_cache(
-        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+        cls,
+        cache,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed)
+        turbo_cache = cls(
+            bits=bits, seed=seed, key_bits=key_bits, value_bits=value_bits
+        )
         keys, values = cache.state
         if keys is not None:
             turbo_cache.update_and_fetch(keys, values)
@@ -4988,23 +5017,12 @@ class TurboQuantKVCache(_BaseCache):
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is None:
-            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
-            # for values instead of SplitCodec. Both stay as fast integer codecs
-            # with single-tile kernel support. Values benefit more from extra bits.
-            key_bits = (
-                math.floor(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
+            self.key_codec = _build_codec(
+                keys, self.key_bits, mode="mse", seed=self.seed
             )
-            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
-            val_bits = (
-                math.ceil(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
-            )
             self.value_codec = _build_codec(
-                values, val_bits, mode="mse", seed=self.seed + 1
+                values, self.value_bits, mode="mse", seed=self.seed + 1
             )
 
     def _try_fused_kv_quantize(self, keys, values):
@@ -6069,13 +6087,23 @@ class TurboQuantKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.bits, self.seed)))
+        return tuple(
+            map(
+                str,
+                (self.offset, self.bits, self.seed, self.key_bits, self.value_bits),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, value):
         self.offset = int(value[0])
         self.bits = float(value[1])
         self.seed = int(value[2])
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            self.bits,
+            float(value[3]) if len(value) > 3 else None,
+            float(value[4]) if len(value) > 4 else None,
+        )
 
     def is_trimmable(self):
         return True
@@ -6125,8 +6153,12 @@ class BatchTurboQuantKVCache(_BaseCache):
         left_padding: list,
         bits: float,
         seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
     ):
-        self.bits = _validate_bits(bits)
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            bits, key_bits, value_bits
+        )
         self.seed = seed
         self.keys = None
         self.values = None
@@ -6145,7 +6177,12 @@ class BatchTurboQuantKVCache(_BaseCache):
             return
         D = keys.shape[-1]
         # Delegate to a temporary TurboQuantKVCache to get codec setup right
-        tmp = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        tmp = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
         tmp._ensure_codecs(keys, keys)  # values have same D
         self.key_codec = tmp.key_codec
         self.value_codec = tmp.value_codec
@@ -6313,7 +6350,12 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     def extract(self, idx):
         """Extract one batch row as a single-sequence TurboQuantKVCache."""
-        cache = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        cache = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
         if self.keys is None or self._idx == 0:
             return cache
         cache.key_codec = self.key_codec
@@ -6354,13 +6396,23 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self._idx, self.bits, self.seed)))
+        return tuple(
+            map(
+                str,
+                (self._idx, self.bits, self.seed, self.key_bits, self.value_bits),
+            )
+        )
 
     @meta_state.setter
     def meta_state(self, v):
         self._idx = int(v[0])
         self.bits = float(v[1])
         self.seed = int(v[2])
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            self.bits,
+            float(v[3]) if len(v) > 3 else None,
+            float(v[4]) if len(v) > 4 else None,
+        )
 
     def is_trimmable(self):
         return True

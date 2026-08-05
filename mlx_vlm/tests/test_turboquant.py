@@ -10,6 +10,7 @@ from mlx_vlm.turboquant import (
     _build_codec,
     _TurboQuantMSECodec,
     _TurboQuantProdCodec,
+    resolve_kv_bits,
     turboquant_enabled,
 )
 
@@ -502,3 +503,74 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     diff = mx.max(mx.abs(reference - quantized)).item()
     assert quantized.shape == reference.shape
     assert diff < 1e-4
+
+
+def test_resolve_kv_bits_defaults_split_fractional_budget():
+    assert resolve_kv_bits(3.5) == (3.5, 3.0, 4.0)
+    assert resolve_kv_bits(4) == (4.0, 4.0, 4.0)
+
+
+def test_resolve_kv_bits_overrides_each_side_independently():
+    assert resolve_kv_bits(3.5, 8, None) == (3.5, 8.0, 4.0)
+    assert resolve_kv_bits(3.5, None, 2) == (3.5, 3.0, 2.0)
+    assert resolve_kv_bits(3.5, 8, 3) == (3.5, 8.0, 3.0)
+
+
+def test_resolve_kv_bits_validates_overrides():
+    with pytest.raises(ValueError):
+        resolve_kv_bits(4, 0.5, None)
+    with pytest.raises(ValueError):
+        resolve_kv_bits(4, None, 3.25)
+
+
+def test_asymmetric_bits_build_matching_codecs():
+    cache = TurboQuantKVCache(bits=4, key_bits=8, value_bits=3)
+    keys = mx.random.normal((1, 4, 1, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 1, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+    assert int(cache.key_codec.bits) == 8
+    assert int(cache.value_codec.bits) == 3
+
+
+def test_asymmetric_attention_matches_dequantized_reference():
+    cache = TurboQuantKVCache(bits=4, key_bits=8, value_bits=3)
+    keys = mx.random.normal((1, 4, 128, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 128, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+
+    queries = mx.random.normal((1, 16, 1, 256)).astype(mx.bfloat16)
+    scale = 256**-0.5
+    out = cache.quantized_attention(queries, scale=scale, mask=None)
+
+    deq_keys, deq_values = cache.dequantize()
+    reference = scaled_dot_product_attention(
+        queries, deq_keys, deq_values, cache=None, scale=scale, mask=None
+    )
+    error = mx.sqrt(
+        mx.sum((out.astype(mx.float32) - reference.astype(mx.float32)) ** 2)
+        / mx.sum(reference.astype(mx.float32) ** 2)
+    ).item()
+    assert error < 0.02
+
+
+def test_meta_state_round_trips_asymmetric_bits():
+    cache = TurboQuantKVCache(bits=3.5, key_bits=8, value_bits=3)
+    restored = TurboQuantKVCache(bits=3.5)
+    restored.meta_state = cache.meta_state
+    assert (restored.key_bits, restored.value_bits) == (8.0, 3.0)
+
+
+def test_meta_state_accepts_legacy_three_tuple():
+    cache = TurboQuantKVCache(bits=3.5)
+    cache.meta_state = ("0", "3.5", "1234")
+    assert (cache.key_bits, cache.value_bits) == (3.0, 4.0)
+    assert cache.seed == 1234
+
+
+def test_batch_cache_propagates_asymmetric_bits_to_extracted_rows():
+    cache = BatchTurboQuantKVCache([0], bits=4, key_bits=8, value_bits=3)
+    keys = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, values)
+    extracted = cache.extract(0)
+    assert (extracted.key_bits, extracted.value_bits) == (8.0, 3.0)
