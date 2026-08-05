@@ -34,8 +34,8 @@ Partition = Literal["fl2va", "ref2va"]
 FORMAT_NAME = "mlx-vlm-minimax-h3"
 FORMAT_VERSION = 1
 SOURCE_REPO_ID = "MiniMaxAI/MiniMax-H3"
-SOURCE_REVISION = "73372e6cf53e414edd3ab03e357717fb0602e758"
-DIFFUSERS_REVISION = "abc5e9bf71fd38f53cd471bc3acaa84bc5ecbfdc"
+SOURCE_REVISION = "b3c7290e66afdf293bef3b9077b7a266ef421f34"
+DIFFUSERS_REVISION = "9f169d98d0bce392a889c3b6524d0d97734dfc0e"
 MLX_VIDEO_REVISION = "87db56a51758fefb748a359b90a5283bb8ba4837"
 
 _DTYPES = {
@@ -412,14 +412,48 @@ def load_conditioner(
 def load_pipeline(
     model_path: str | Path,
     *,
+    workflow: Literal["t2va", "fl2va", "ref2va"] | None = None,
     partition: Partition | None = None,
     text_only: bool | None = None,
+    revision: str | None = None,
+    local_dir: str | Path | None = None,
+    token: str | None = None,
+    force_download: bool = False,
+    max_workers: int = 16,
 ) -> MiniMaxH3Pipeline:
-    root = Path(model_path).expanduser()
+    """Load a local H3 checkpoint or one selectively downloaded from the Hub.
+
+    Remote repositories require an explicit workflow so loading never fetches
+    both task transformers. ``t2va`` and ``fl2va`` select the shared FL2VA
+    partition; ``ref2va`` selects the reference transformer.
+    """
+    from .download import partition_for_workflow, resolve_model_path
+
+    if workflow is not None:
+        workflow_partition = partition_for_workflow(workflow)
+        if partition is not None and partition != workflow_partition:
+            raise ValueError(
+                f"workflow {workflow!r} uses the {workflow_partition!r} "
+                f"partition, not {partition!r}"
+            )
+        partition = workflow_partition
+    root = resolve_model_path(
+        model_path,
+        workflow=workflow,
+        partition=partition,
+        revision=revision,
+        local_dir=local_dir,
+        token=token,
+        force_download=force_download,
+        max_workers=max_workers,
+    )
     manifest = _manifest(root)
     if partition is None:
         if manifest is None:
-            raise ValueError("partition is required for an official-format checkpoint")
+            raise ValueError(
+                "workflow is required for an official-format checkpoint; choose "
+                "'t2va', 'fl2va', or 'ref2va'"
+            )
         partition = manifest.get("partition")
     partition = _validate_partition(partition)
     if text_only and partition == "ref2va":

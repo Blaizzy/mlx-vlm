@@ -9,7 +9,15 @@ from .config import (
     MiniMaxH3TransformerConfig,
     MiniMaxH3VideoVAEConfig,
 )
-from .download import MiniMaxH3DownloadPlan, download_model, download_plan
+from .download import (
+    MiniMaxH3DownloadPlan,
+    MiniMaxH3Partition,
+    MiniMaxH3Workflow,
+    download_model,
+    download_plan,
+    partition_for_workflow,
+    resolve_model_path,
+)
 from .packing import (
     MiniMaxH3PackedSequence,
     align_num_frames,
@@ -41,7 +49,11 @@ from .references import (
     validate_references,
 )
 from .scheduler import MiniMaxH3Scheduler
-from .transformer import MiniMaxH3Transformer, MiniMaxH3TransformerOutput
+from .transformer import (
+    MiniMaxH3AdaLNCache,
+    MiniMaxH3Transformer,
+    MiniMaxH3TransformerOutput,
+)
 from .visual_vae import (
     MiniMaxH3DiagonalGaussianDistribution,
     MiniMaxH3VideoVAE,
@@ -65,10 +77,13 @@ __all__ = [
     "MiniMaxH3AudioVAE",
     "MiniMaxH3AudioVAEConfig",
     "MiniMaxH3AudioVAEOutput",
+    "MiniMaxH3AdaLNCache",
     "MiniMaxH3Conditioner",
     "MiniMaxH3ConditioningOutput",
     "MiniMaxH3ConversionReport",
     "MiniMaxH3DownloadPlan",
+    "MiniMaxH3Partition",
+    "MiniMaxH3Workflow",
     "MiniMaxH3GenerationRequest",
     "MiniMaxH3Pipeline",
     "MiniMaxH3PipelineOutput",
@@ -101,7 +116,9 @@ __all__ = [
     "load_transformer",
     "load_video_vae",
     "patchify_video_latents",
+    "partition_for_workflow",
     "resolve_canvas_size",
+    "resolve_model_path",
     "resolve_reference_image_size",
     "trim_reference_num_frames",
     "unpack_audio_tokens",

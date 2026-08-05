@@ -2335,6 +2335,7 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.output_modality == "text"
     assert args.task == "generate"
     assert args.size is None
+    assert args.verbose is False
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):

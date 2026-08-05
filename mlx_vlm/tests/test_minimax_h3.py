@@ -8,6 +8,7 @@ import pytest
 from mlx.utils import tree_flatten
 from PIL import Image
 
+import mlx_vlm.models.minimax_h3.download as h3_download_module
 import mlx_vlm.models.minimax_h3.pipeline as h3_pipeline_module
 import mlx_vlm.models.minimax_h3.processing as h3_processing_module
 from mlx_vlm.models.minimax_h3 import (
@@ -79,6 +80,17 @@ class _SyntheticConditioner:
     def encode_fl2va(self, prompt, images=None):
         assert prompt == "synthetic"
         assert not images
+        return MiniMaxH3ConditioningOutput(
+            hidden_states=mx.arange(10, dtype=mx.float32).reshape(1, 2, 5) * 0.01,
+            token_tags=mx.array([1, 1], dtype=mx.int32),
+            input_ids=mx.array([[1, 2]], dtype=mx.int32),
+        )
+
+
+class _SyntheticFLConditioner:
+    def encode_fl2va(self, prompt, images=None):
+        assert prompt == "synthetic-fl"
+        assert len(images) == 1
         return MiniMaxH3ConditioningOutput(
             hidden_states=mx.arange(10, dtype=mx.float32).reshape(1, 2, 5) * 0.01,
             token_tags=mx.array([1, 1], dtype=mx.int32),
@@ -837,6 +849,69 @@ def test_tiny_transformer_matches_diffusers_synthetic_golden():
     )
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+def test_tiny_transformer_adaln_cache_is_bitwise_identical_after_drop(dtype):
+    config = _tiny_transformer_config()
+    model = MiniMaxH3Transformer(config)
+    _load_canonical_synthetic_weights(model)
+    model.set_dtype(dtype)
+    layout = build_packed_sequence(
+        mx.array([1, 1]),
+        num_latent_frames=1,
+        latent_height=2,
+        latent_width=2,
+        num_audio_latents=1,
+        patch_size=config.patch_size,
+    )
+    timesteps, timestep_indices = build_row_timesteps(
+        layout,
+        video_timestep=0.25,
+        audio_timestep=0.5,
+        condition_video_timestep=0.999,
+        condition_audio_timestep=1.0,
+    )
+    args = (
+        (mx.arange(4, dtype=mx.float32).reshape(1, 4, 1) - 1.5) * 0.1,
+        (mx.arange(4, dtype=mx.float32).reshape(1, 2, 2) - 1.5) * 0.1,
+        (mx.arange(10, dtype=mx.float32).reshape(1, 2, 5) - 4.5) * 0.05,
+        timesteps,
+        timestep_indices,
+        layout.token_tags,
+        layout.position_ids,
+        layout.video_indices,
+        layout.audio_indices,
+        layout.text_indices,
+    )
+
+    with mx.stream(mx.cpu):
+        live = model(*args)
+        mx.eval(live.sample, live.audio_sample)
+        cache = model.build_adaln_cache(timesteps)
+        cached = model(*args, cache)
+        mx.eval(cached.sample, cached.audio_sample)
+        other = MiniMaxH3Transformer(config)
+        _load_canonical_synthetic_weights(other)
+        other.set_dtype(dtype)
+        with pytest.raises(ValueError, match="different transformer"):
+            other(*args, cache)
+        freed = model.drop_adaln_weights()
+        dropped = model(*args, cache)
+        mx.eval(dropped.sample, dropped.audio_sample)
+
+    assert freed > 0
+    assert cache.nbytes > 0
+    assert not model.adaln_weights_available
+    remaining_keys = {key for key, _ in tree_flatten(model.parameters())}
+    assert "transformer_blocks.0.adaln_proj.linear.weight" not in remaining_keys
+    assert "norm_out.linear.weight" not in remaining_keys
+    assert mx.array_equal(live.sample, cached.sample).item()
+    assert mx.array_equal(live.audio_sample, cached.audio_sample).item()
+    assert mx.array_equal(live.sample, dropped.sample).item()
+    assert mx.array_equal(live.audio_sample, dropped.audio_sample).item()
+    with pytest.raises(RuntimeError, match="AdaLN projection weights were dropped"):
+        model(*args)
+
+
 def test_tiny_video_vae_matches_diffusers_synthetic_golden():
     model = MiniMaxH3VideoVAE(_tiny_video_vae_config())
     _load_canonical_video_vae_weights(model)
@@ -1047,6 +1122,7 @@ def test_tiny_t2va_pipeline_runs_joint_denoise_to_latents():
     )
     num_video_latents = video_latent_num_frames(124)
     num_audio_latents = audio_latent_num_frames(124)
+    progress_events = []
     request = MiniMaxH3GenerationRequest(
         prompt="synthetic",
         height=32,
@@ -1056,6 +1132,7 @@ def test_tiny_t2va_pipeline_runs_joint_denoise_to_latents():
         output_type="latent",
         latents=mx.zeros((1, 1, num_video_latents, 1, 1), mx.float32),
         audio_latents=mx.zeros((2, 2, num_audio_latents), mx.float32),
+        progress_callback=lambda *event: progress_events.append(event),
     )
     with mx.stream(mx.cpu):
         output = pipeline.generate(request)
@@ -1063,8 +1140,68 @@ def test_tiny_t2va_pipeline_runs_joint_denoise_to_latents():
     assert output.video.shape == (1, 1, num_video_latents, 1, 1)
     assert output.audio.shape == (2, 2, num_audio_latents)
     assert output.metadata["partition"] == "fl2va"
+    assert [event[:3] for event in progress_events] == [
+        ("prepare", 0, 2),
+        ("cache_adaln", 0, 2),
+        ("cache_adaln", 1, 2),
+        ("cache_adaln", 2, 2),
+        ("denoise", 0, 1),
+        ("denoise", 1, 1),
+        ("decode", 1, 1),
+        ("decoded", 1, 1),
+    ]
+    assert all(event[3] == 124 for event in progress_events)
+    assert output.metadata["adaln_cached"]
+    assert output.metadata["adaln_weights_dropped"]
+    assert output.metadata["adaln_cache_bytes"] > 0
+    assert output.metadata["adaln_weights_freed_bytes"] > 0
     assert mx.all(mx.isfinite(output.video)).item()
     assert mx.all(mx.isfinite(output.audio)).item()
+
+    with mx.stream(mx.cpu):
+        repeated = pipeline.generate(replace(request, progress_callback=None))
+        mx.eval(repeated.video, repeated.audio)
+    assert mx.array_equal(output.video, repeated.video).item()
+    assert mx.array_equal(output.audio, repeated.audio).item()
+
+    with pytest.raises(RuntimeError, match="reload the pipeline"):
+        pipeline.generate(
+            replace(request, num_inference_steps=3, progress_callback=None)
+        )
+
+
+def test_tiny_fl2va_cached_trajectory_is_bitwise_identical():
+    transformer, video_vae, audio_vae = _tiny_pipeline_modules()
+    pipeline = MiniMaxH3Pipeline(
+        transformer=transformer,
+        conditioner=_SyntheticFLConditioner(),
+        video_vae=video_vae,
+        audio_vae=audio_vae,
+    )
+    num_video_latents = video_latent_num_frames(124)
+    num_audio_latents = audio_latent_num_frames(124)
+    request = MiniMaxH3GenerationRequest(
+        prompt="synthetic-fl",
+        image=mx.zeros((64, 64, 3), mx.uint8),
+        height=64,
+        width=64,
+        num_frames=124,
+        num_inference_steps=3,
+        output_type="latent",
+        latents=mx.zeros((1, 1, num_video_latents, 2, 2), mx.float32),
+        audio_latents=mx.zeros((2, 2, num_audio_latents), mx.float32),
+    )
+    with mx.stream(mx.cpu):
+        live = pipeline.generate(
+            replace(request, cache_adaln=False, drop_adaln_weights=False)
+        )
+        mx.eval(live.video, live.audio)
+        cached = pipeline.generate(request)
+        mx.eval(cached.video, cached.audio)
+
+    assert mx.array_equal(live.video, cached.video).item()
+    assert mx.array_equal(live.audio, cached.audio).item()
+    assert cached.metadata["adaln_weights_dropped"]
 
 
 def test_tiny_ref2va_pipeline_runs_conditioned_joint_denoise():
@@ -1088,17 +1225,24 @@ def test_tiny_ref2va_pipeline_runs_conditioned_joint_denoise():
         height=64,
         width=64,
         num_frames=124,
-        num_inference_steps=2,
+        num_inference_steps=3,
         output_type="latent",
         latents=mx.zeros((1, 1, num_video_latents, 2, 2), mx.float32),
         audio_latents=mx.zeros((2, 2, num_audio_latents), mx.float32),
     )
     with mx.stream(mx.cpu):
+        live = pipeline.generate(
+            replace(request, cache_adaln=False, drop_adaln_weights=False)
+        )
+        mx.eval(live.video, live.audio)
         output = pipeline.generate(request)
         mx.eval(output.video, output.audio)
     assert output.video.shape == (1, 1, num_video_latents, 2, 2)
     assert output.audio.shape == (2, 2, num_audio_latents)
     assert output.metadata["partition"] == "ref2va"
+    assert mx.array_equal(live.video, output.video).item()
+    assert mx.array_equal(live.audio, output.audio).item()
+    assert output.metadata["adaln_weights_dropped"]
     assert mx.all(mx.isfinite(output.video)).item()
     assert mx.all(mx.isfinite(output.audio)).item()
 
@@ -1241,13 +1385,63 @@ def _write_tiny_official_h3(root):
     (root / "LICENSE").write_text("synthetic license fixture\n")
 
 
-def test_official_layout_conversion_and_strict_reload(tmp_path):
+def test_official_layout_conversion_and_strict_reload(tmp_path, monkeypatch):
     source = tmp_path / "official"
     _write_tiny_official_h3(source)
 
-    plan = download_plan("fl2va")
-    assert "transformer/*.safetensors" in plan.patterns
-    assert not any(pattern.startswith("transformer_ref/") for pattern in plan.patterns)
+    t2_plan = download_plan("t2va")
+    fl_plan = download_plan("fl2va")
+    ref_plan = download_plan("ref2va")
+    assert t2_plan.revision == "b3c7290e66afdf293bef3b9077b7a266ef421f34"
+    assert download_plan("t2va", repo_id="test-org/minimax-h3").revision is None
+    assert t2_plan.partition == "fl2va"
+    assert t2_plan.components == fl_plan.components
+    assert t2_plan.patterns == fl_plan.patterns
+    assert "transformer" in fl_plan.components
+    assert "transformer_ref" not in fl_plan.components
+    assert "transformer_ref" in ref_plan.components
+    assert "transformer" not in ref_plan.components
+    assert "model_index.json" in fl_plan.patterns
+    assert "modular_model_index.json" in fl_plan.patterns
+    assert not any(
+        pattern.startswith(("FL2VA/", "Ref2VA/"))
+        for pattern in (*fl_plan.patterns, *ref_plan.patterns)
+    )
+    with pytest.raises(ValueError, match="workflow is required"):
+        download_plan()
+    with pytest.raises(ValueError, match="workflow must be"):
+        download_plan("unknown")
+
+    download_calls = []
+
+    def fake_snapshot_download(**kwargs):
+        download_calls.append(kwargs)
+        return str(source)
+
+    monkeypatch.setattr(h3_download_module, "snapshot_download", fake_snapshot_download)
+    remote_pipeline = load_pipeline(
+        "test-org/minimax-h3",
+        workflow="t2va",
+        text_only=True,
+        revision="test-revision",
+    )
+    assert remote_pipeline.partition == "fl2va"
+    assert download_calls[0]["revision"] == "test-revision"
+    assert "transformer/**" in download_calls[0]["allow_patterns"]
+    assert "transformer_ref/**" not in download_calls[0]["allow_patterns"]
+
+    ref_download = h3_download_module.download_model(
+        workflow="ref2va",
+        repo_id="test-org/minimax-h3",
+        revision="test-revision",
+    )
+    assert ref_download == source
+    assert "transformer_ref/**" in download_calls[1]["allow_patterns"]
+    assert "transformer/**" not in download_calls[1]["allow_patterns"]
+
+    with pytest.raises(ValueError, match="uses the 'fl2va' partition"):
+        load_pipeline(source, workflow="t2va", partition="ref2va")
+
     official_pipeline = load_pipeline(
         source,
         partition="fl2va",

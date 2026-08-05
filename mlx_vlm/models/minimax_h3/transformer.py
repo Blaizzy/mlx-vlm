@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -14,6 +15,40 @@ from .constants import MINIMAX_H3_MODALITY_NUM
 class MiniMaxH3TransformerOutput:
     sample: mx.array
     audio_sample: mx.array
+
+
+@dataclass(frozen=True, slots=True)
+class MiniMaxH3AdaLNCache:
+    """Materialized AdaLN outputs for one exact per-step timestep table."""
+
+    _owner_token: object
+    timestep_values: tuple[float, ...]
+    block_modulations: tuple[tuple[mx.array, ...], ...]
+    output_modulation: tuple[mx.array, mx.array]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            value.nbytes
+            for modulation in self.block_modulations
+            for value in modulation
+        ) + sum(value.nbytes for value in self.output_modulation)
+
+    def validate(
+        self,
+        owner_token: object,
+        timesteps: mx.array,
+        num_blocks: int,
+    ) -> None:
+        if self._owner_token is not owner_token:
+            raise ValueError("AdaLN cache belongs to a different transformer")
+        values = tuple(float(value) for value in timesteps.tolist())
+        if values != self.timestep_values:
+            raise ValueError(
+                "AdaLN cache timestep values do not match this transformer call"
+            )
+        if len(self.block_modulations) != num_blocks:
+            raise ValueError("AdaLN cache block count does not match this transformer")
 
 
 def timestep_embedding(timesteps: mx.array, embedding_dim: int) -> mx.array:
@@ -109,17 +144,28 @@ class MiniMaxH3AdaLayerNormOut(nn.Module):
         self.norm = nn.RMSNorm(hidden_size, eps=eps)
         self.linear = nn.Linear(time_embed_dim, 2 * hidden_size, bias=True)
 
+    def project(self, temb: mx.array) -> tuple[mx.array, mx.array]:
+        modulation = self.linear(nn.silu(temb).astype(self.linear.weight.dtype))
+        return tuple(mx.split(modulation, 2, axis=-1))
+
+    def apply(
+        self,
+        hidden_states: mx.array,
+        modulation: tuple[mx.array, mx.array],
+        timestep_indices: mx.array,
+    ) -> mx.array:
+        shift, scale = modulation
+        shift = mx.take(shift, timestep_indices, axis=0)
+        scale = mx.take(scale, timestep_indices, axis=0)
+        return self.norm(hidden_states) * (1.0 + scale) + shift
+
     def __call__(
         self,
         hidden_states: mx.array,
         temb: mx.array,
         timestep_indices: mx.array,
     ) -> mx.array:
-        modulation = self.linear(nn.silu(temb).astype(self.linear.weight.dtype))
-        shift, scale = mx.split(modulation, 2, axis=-1)
-        shift = mx.take(shift, timestep_indices, axis=0)
-        scale = mx.take(scale, timestep_indices, axis=0)
-        return self.norm(hidden_states) * (1.0 + scale) + shift
+        return self.apply(hidden_states, self.project(temb), timestep_indices)
 
 
 class MiniMaxH3Attention(nn.Module):
@@ -285,7 +331,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        temb: mx.array,
+        modulation: tuple[mx.array, ...],
         adaln_indices: mx.array,
         rotary_emb: tuple[mx.array, mx.array],
         attention_mask: mx.array | None = None,
@@ -297,7 +343,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             shift_mlp,
             scale_mlp,
             gate_mlp,
-        ) = self.adaln_proj(temb)
+        ) = modulation
         shift_msa = mx.take(shift_msa, adaln_indices, axis=0)
         scale_msa = mx.take(scale_msa, adaln_indices, axis=0)
         gate_msa = mx.take(gate_msa, adaln_indices, axis=0)
@@ -371,6 +417,72 @@ class MiniMaxH3Transformer(nn.Module):
             config.audio_in_channels,
             bias=True,
         )
+        self._adaln_cache_token = object()
+
+    @property
+    def adaln_weights_available(self) -> bool:
+        linears = [block.adaln_proj.linear for block in self.transformer_blocks]
+        linears.append(self.norm_out.linear)
+        return all(hasattr(linear, "weight") for linear in linears)
+
+    def _embed_timesteps(self, timesteps: mx.array) -> mx.array:
+        temb = timestep_embedding(timesteps, self.config.freq_dim)
+        return self.time_embedder(temb.astype(self.time_embedder.linear_1.weight.dtype))
+
+    def build_adaln_cache(
+        self,
+        timesteps: mx.array,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> MiniMaxH3AdaLNCache:
+        """Project and materialize AdaLN for one unchanged timestep tensor."""
+        if not self.adaln_weights_available:
+            raise RuntimeError(
+                "AdaLN projection weights were dropped; this timestep table "
+                "cannot be cached without reloading the transformer"
+            )
+        if timesteps.ndim != 1:
+            raise ValueError(
+                f"timesteps must be one-dimensional, got {timesteps.shape}"
+            )
+
+        # Preserve the live path's shape, order, and dtypes. Evaluating each
+        # table severs its lazy graph from the projection before those weights
+        # can be released.
+        temb = self._embed_timesteps(timesteps)
+        mx.eval(temb)
+        block_modulations = []
+        total = len(self.transformer_blocks) + 1
+        if progress_callback is not None:
+            progress_callback(0, total)
+        for block_index, block in enumerate(self.transformer_blocks, start=1):
+            modulation = block.adaln_proj(temb)
+            mx.eval(modulation)
+            block_modulations.append(modulation)
+            if progress_callback is not None:
+                progress_callback(block_index, total)
+        output_modulation = self.norm_out.project(temb)
+        mx.eval(output_modulation)
+        if progress_callback is not None:
+            progress_callback(total, total)
+        return MiniMaxH3AdaLNCache(
+            _owner_token=self._adaln_cache_token,
+            timestep_values=tuple(float(value) for value in timesteps.tolist()),
+            block_modulations=tuple(block_modulations),
+            output_modulation=output_modulation,
+        )
+
+    def drop_adaln_weights(self) -> int:
+        """Drop projections only after every required cache is materialized."""
+        freed = 0
+        linears = [block.adaln_proj.linear for block in self.transformer_blocks]
+        linears.append(self.norm_out.linear)
+        for linear in linears:
+            for name in ("weight", "bias", "scales", "biases"):
+                value = getattr(linear, name, None)
+                if isinstance(value, mx.array):
+                    freed += value.nbytes
+                    delattr(linear, name)
+        return freed
 
     def __call__(
         self,
@@ -384,6 +496,7 @@ class MiniMaxH3Transformer(nn.Module):
         video_indices: mx.array,
         audio_indices: mx.array,
         text_indices: mx.array,
+        adaln_cache: MiniMaxH3AdaLNCache | None = None,
     ) -> MiniMaxH3TransformerOutput:
         if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
             raise ValueError(
@@ -396,6 +509,20 @@ class MiniMaxH3Transformer(nn.Module):
             raise ValueError(
                 "token_tags and timestep_indices must match the packed sequence length"
             )
+        if adaln_cache is None:
+            if not self.adaln_weights_available:
+                raise RuntimeError(
+                    "AdaLN projection weights were dropped; pass the matching "
+                    "materialized AdaLN cache"
+                )
+            temb = self._embed_timesteps(timestep)
+        else:
+            adaln_cache.validate(
+                self._adaln_cache_token,
+                timestep,
+                len(self.transformer_blocks),
+            )
+            temb = None
         rotary_emb = self.rope(position_ids)
 
         video_embeds = self.proj_in(hidden_states.astype(self.proj_in.weight.dtype))
@@ -414,8 +541,6 @@ class MiniMaxH3Transformer(nn.Module):
         packed = packed.at[:, video_indices, :].add(video_embeds.astype(packed.dtype))
         packed = packed.at[:, audio_indices, :].add(audio_embeds.astype(packed.dtype))
 
-        temb = timestep_embedding(timestep, self.config.freq_dim)
-        temb = self.time_embedder(temb.astype(self.time_embedder.linear_1.weight.dtype))
         adaln_indices = (
             timestep_indices * MINIMAX_H3_MODALITY_NUM + mx.maximum(token_tags, 0)
         ).astype(mx.int32)
@@ -424,16 +549,30 @@ class MiniMaxH3Transformer(nn.Module):
         if bool(mx.any(is_padding).item()):
             attention_mask = is_padding[None, :] == is_padding[:, None]
 
-        for block in self.transformer_blocks:
+        for block_index, block in enumerate(self.transformer_blocks):
+            modulation = (
+                block.adaln_proj(temb)
+                if adaln_cache is None
+                else adaln_cache.block_modulations[block_index]
+            )
             packed = block(
                 packed,
-                temb,
+                modulation,
                 adaln_indices,
                 rotary_emb,
                 attention_mask,
             )
 
-        packed = self.norm_out(packed, temb, timestep_indices.astype(mx.int32))
+        output_modulation = (
+            self.norm_out.project(temb)
+            if adaln_cache is None
+            else adaln_cache.output_modulation
+        )
+        packed = self.norm_out.apply(
+            packed,
+            output_modulation,
+            timestep_indices.astype(mx.int32),
+        )
         packed = packed.astype(self.proj_out.weight.dtype)
         video_output = mx.take(self.proj_out(packed), video_indices, axis=1)
         audio_output = mx.take(
@@ -448,6 +587,7 @@ class MiniMaxH3Transformer(nn.Module):
 
 
 __all__ = [
+    "MiniMaxH3AdaLNCache",
     "MiniMaxH3AdaLayerNormModulation",
     "MiniMaxH3AdaLayerNormOut",
     "MiniMaxH3Attention",

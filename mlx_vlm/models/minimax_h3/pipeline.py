@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Callable, Literal
 
 import mlx.core as mx
 
@@ -50,7 +51,7 @@ from .references import (
     validate_references,
 )
 from .scheduler import MiniMaxH3Scheduler
-from .transformer import MiniMaxH3Transformer
+from .transformer import MiniMaxH3AdaLNCache, MiniMaxH3Transformer
 from .visual_vae import MiniMaxH3DiagonalGaussianDistribution, MiniMaxH3VideoVAE
 
 
@@ -68,6 +69,9 @@ class MiniMaxH3GenerationRequest:
     output_type: Literal["array", "latent"] = "array"
     latents: mx.array | None = None
     audio_latents: mx.array | None = None
+    progress_callback: Callable[[str, int, int, int | None], None] | None = None
+    cache_adaln: bool = True
+    drop_adaln_weights: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +115,9 @@ class MiniMaxH3Pipeline:
         self.partition = partition
         self.scheduler = scheduler or MiniMaxH3Scheduler(shift=12.0)
         self.audio_scheduler = audio_scheduler or MiniMaxH3Scheduler(shift=3.0)
+        self._adaln_cache_key: tuple[tuple[float, ...], ...] | None = None
+        self._adaln_caches: tuple[MiniMaxH3AdaLNCache, ...] | None = None
+        self._adaln_weights_freed_bytes = 0
 
     @property
     def patch_size(self) -> tuple[int, int, int]:
@@ -526,9 +533,18 @@ class MiniMaxH3Pipeline:
         conditioning: MiniMaxH3ConditioningOutput,
         layout,
         num_inference_steps: int,
+        num_frames: int,
+        progress_callback: Callable[[str, int, int, int | None], None] | None,
+        cache_adaln: bool,
+        drop_adaln_weights: bool,
     ) -> tuple[mx.array, mx.array]:
         self.scheduler.set_timesteps(num_inference_steps)
         self.audio_scheduler.set_timesteps(num_inference_steps)
+        denoising_steps = min(
+            int(self.scheduler.timesteps.size),
+            int(self.audio_scheduler.timesteps.size),
+        )
+        plan = []
         for video_timestep, audio_timestep in zip(
             self.scheduler.timesteps, self.audio_scheduler.timesteps
         ):
@@ -539,6 +555,70 @@ class MiniMaxH3Pipeline:
                 max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),
                 1.0,
             )
+            plan.append((video_timestep, audio_timestep, timesteps, timestep_indices))
+
+        adaln_caches = None
+        if cache_adaln:
+            cache_work_per_step = len(self.transformer.transformer_blocks) + 1
+            total_cache_work = denoising_steps * cache_work_per_step
+            cache_key = tuple(
+                tuple(float(value) for value in timesteps.tolist())
+                for _, _, timesteps, _ in plan
+            )
+            if self._adaln_caches is not None and self._adaln_cache_key == cache_key:
+                adaln_caches = self._adaln_caches
+                if progress_callback is not None:
+                    progress_callback(
+                        "cache_adaln",
+                        total_cache_work,
+                        total_cache_work,
+                        num_frames,
+                    )
+            else:
+                if not self.transformer.adaln_weights_available:
+                    raise RuntimeError(
+                        "AdaLN weights were dropped for a different denoising "
+                        "schedule or conditioning mode; reload the pipeline"
+                    )
+                if progress_callback is not None:
+                    progress_callback("cache_adaln", 0, total_cache_work, num_frames)
+                built = []
+                for cache_step, (_, _, timesteps, _) in enumerate(plan):
+
+                    def report_cache_progress(completed: int, total: int) -> None:
+                        if progress_callback is not None and completed:
+                            progress_callback(
+                                "cache_adaln",
+                                cache_step * total + completed,
+                                total_cache_work,
+                                num_frames,
+                            )
+
+                    built.append(
+                        self.transformer.build_adaln_cache(
+                            timesteps,
+                            progress_callback=report_cache_progress,
+                        )
+                    )
+                adaln_caches = tuple(built)
+                self._adaln_caches = adaln_caches
+                self._adaln_cache_key = cache_key
+
+            if drop_adaln_weights and self.transformer.adaln_weights_available:
+                self._adaln_weights_freed_bytes += self.transformer.drop_adaln_weights()
+                # Every cached output has already been materialized, so no
+                # retained lazy graph can keep a projection alive here.
+                gc.collect()
+                mx.clear_cache()
+
+        if progress_callback is not None:
+            progress_callback("denoise", 0, denoising_steps, num_frames)
+        for step, (
+            video_timestep,
+            audio_timestep,
+            timesteps,
+            timestep_indices,
+        ) in enumerate(plan, start=1):
             output = self.transformer(
                 video_rows[None],
                 audio_rows[None],
@@ -550,6 +630,7 @@ class MiniMaxH3Pipeline:
                 layout.video_indices,
                 layout.audio_indices,
                 layout.text_indices,
+                adaln_cache=(None if adaln_caches is None else adaln_caches[step - 1]),
             )
             video_start = layout.num_condition_video_rows
             audio_start = layout.num_condition_audio_rows
@@ -570,6 +651,8 @@ class MiniMaxH3Pipeline:
                 [audio_rows[:audio_start], updated_audio], axis=0
             )
             mx.eval(video_rows, audio_rows)
+            if progress_callback is not None:
+                progress_callback("denoise", step, denoising_steps, num_frames)
         return video_rows, audio_rows
 
     def _decode(
@@ -627,10 +710,19 @@ class MiniMaxH3Pipeline:
             raise ValueError("num_inference_steps must be at least 2")
         if request.output_type not in ("array", "latent"):
             raise ValueError("output_type must be 'array' or 'latent'")
+        if request.drop_adaln_weights and not request.cache_adaln:
+            raise ValueError("drop_adaln_weights requires cache_adaln=True")
         has_references = request.references is not None
         if has_references != (self.partition == "ref2va"):
             raise ValueError(
                 f"pipeline partition {self.partition} does not match the request"
+            )
+        if request.progress_callback is not None:
+            request.progress_callback(
+                "prepare",
+                0,
+                request.num_inference_steps,
+                request.num_frames,
             )
         random = _RandomStream(request.seed)
         if self.partition == "fl2va":
@@ -680,7 +772,19 @@ class MiniMaxH3Pipeline:
             conditioning,
             layout,
             request.num_inference_steps,
+            num_frames,
+            request.progress_callback,
+            request.cache_adaln,
+            request.drop_adaln_weights,
         )
+        denoising_steps = int(self.scheduler.num_inference_steps or 0)
+        if request.progress_callback is not None:
+            request.progress_callback(
+                "decode",
+                denoising_steps,
+                denoising_steps,
+                num_frames,
+            )
         video, audio = self._decode(
             video_rows,
             audio_rows,
@@ -691,6 +795,13 @@ class MiniMaxH3Pipeline:
             num_audio_latents,
             request.output_type,
         )
+        if request.progress_callback is not None:
+            request.progress_callback(
+                "decoded",
+                denoising_steps,
+                denoising_steps,
+                num_frames,
+            )
         return MiniMaxH3PipelineOutput(
             video=video,
             audio=audio,
@@ -703,6 +814,13 @@ class MiniMaxH3Pipeline:
                 "num_frames": num_frames,
                 "seed": request.seed,
                 "num_inference_steps": request.num_inference_steps,
+                "num_denoising_steps": denoising_steps,
+                "adaln_cached": request.cache_adaln,
+                "adaln_cache_bytes": sum(
+                    cache.nbytes for cache in self._adaln_caches or ()
+                ),
+                "adaln_weights_dropped": (not self.transformer.adaln_weights_available),
+                "adaln_weights_freed_bytes": self._adaln_weights_freed_bytes,
                 "video_latent_shape": (
                     1,
                     self.video_vae.config.latent_channels,
