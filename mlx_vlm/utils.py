@@ -21,7 +21,11 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
-from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
+from .quantization.one_bit import (
+    _quantization_entry_for_path,
+    _quantization_for_path,
+    replace_one_bit_modules,
+)
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -501,8 +505,12 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
             and not _has_quantized_weights(p, weights)
         ):
             return False
-        if quantization_config is not None and p in quantization_config:
-            return quantization_config[p]
+        if quantization_config is not None:
+            has_per_layer, per_layer = _quantization_entry_for_path(
+                quantization_config, p
+            )
+            if has_per_layer:
+                return per_layer
         if not hasattr(m, "to_quantized"):
             return False
         if hasattr(m, "weight") and m.weight.size % 64 != 0:
@@ -804,9 +812,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Skip 1-bit layers already replaced above.
             if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            # Handle custom per layer quantizations.
+            has_per_layer, per_layer = _quantization_entry_for_path(
+                config["quantization"], p
+            )
+            if has_per_layer:
+                return per_layer
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64

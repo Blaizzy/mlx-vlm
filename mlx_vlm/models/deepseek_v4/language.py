@@ -16,6 +16,7 @@ from ..cache import CacheList, PoolingCache, RotatingKVCache
 from ..mla import MultiLinear
 from ..pipeline import PipelineMixin
 from ..switch_layers import SwitchGLU
+from ...quantization.one_bit import _quantization_entry_for_path
 from .config import ModelConfig
 from .hisa_kernel import hisa_select
 from .hyper_connection import HyperConnection, HyperHead, hc_expand
@@ -1405,8 +1406,10 @@ class LanguageModel(nn.Module):
         quantization_config = make_quantization_config(self)
 
         def predicate(path, _):
-            path = path.removeprefix("language_model.")
-            return quantization_config.get(path, True)
+            has_per_layer, per_layer = _quantization_entry_for_path(
+                quantization_config, path
+            )
+            return per_layer if has_per_layer else True
 
         return predicate
 
