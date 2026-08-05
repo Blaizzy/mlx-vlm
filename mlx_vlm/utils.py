@@ -810,9 +810,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
             override = config["quantization"].get(p)
             if override is None and p.startswith("language_model."):
-                override = config["quantization"].get(
-                    p[len("language_model.") :]
-                )
+                override = config["quantization"].get(p[len("language_model.") :])
             if isinstance(override, dict):
                 return override
             if not hasattr(m, "to_quantized"):
