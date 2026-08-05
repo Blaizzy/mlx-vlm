@@ -94,14 +94,7 @@ mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --p
 
 # Multi-modal generation (Image + Audio)
 mlx_vlm.generate --model mlx-community/gemma-3n-E2B-it-4bit --max-tokens 100 --prompt "Describe what you see and hear" --image /path/to/image.jpg --audio /path/to/audio.wav
-
-# Video + synchronized audio generation with MiniMax-H3
-mlx_vlm.generate --output-modality video --model MiniMaxAI/MiniMax-H3 --prompt "A paper boat crossing a rain puddle" --num-frames 124 --output output.mp4
 ```
-
-MiniMax-H3 video generation also supports first/last-frame conditioning and
-ordered image, video, and audio references. See the
-[MiniMax-H3 model guide](mlx_vlm/models/minimax_h3/README.md#generic-api-and-cli).
 
 #### Thinking Budget
 
