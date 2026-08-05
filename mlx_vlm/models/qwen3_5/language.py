@@ -1265,6 +1265,55 @@ def _qwen3_5_cached_sdpa_scalars(scale: float, k_size: int):
     )
 
 
+# Threads per threadgroup the one-pass kernel and the second pass of the
+# two-pass plan are written for. Both assume exactly 32 SIMD groups of 32 lanes
+# (BN == BD == 32): the block reduction and the threadgroup transpose index off
+# simd_gid over [0, 32), so this cannot simply be lowered without reworking them.
+_QWEN3_5_SDPA_THREADS = 1024
+
+# Metal caps threads-per-threadgroup per compiled *pipeline*, not per device --
+# a kernel holding more registers live gets a lower ceiling than the device
+# maximum. At D_SIZE == 256 the two-pass reduction keeps elem_per_thread == 8
+# floats per thread, and on applegpu_g14d (M2 Ultra) that compiles to a ceiling
+# of 896 threads, so requesting 1024 raises:
+#
+#   ValueError: Thread group size (1024) is greater than the maximum allowed
+#   threads per threadgroup (896).
+#
+# D_SIZE is what moves it: 64/96/128 launch fine on the same GPU, and the same
+# 256 launches fine on applegpu_g16s (M4 Max). Nothing in the shapes predicts
+# which parts are affected, and the error is raised lazily
+# when the command buffer is built rather than when the kernel is called, so it
+# cannot be caught around the call site. Probe each kernel signature once with a
+# forced eval, cache the verdict, and route around whichever launches this GPU
+# rejects: two-pass degrades to one-pass, one-pass degrades to the caller's
+# portable per-pad-group fallback. No-op wherever 1024 threads are legal.
+_QWEN3_5_SDPA_LAUNCHABLE = {}
+
+
+def _qwen3_5_try_launch(key, launch):
+    """Run ``launch()``, or return None if this GPU rejects that launch.
+
+    ``key`` must capture everything that determines the compiled pipeline (the
+    kernel and its template arguments), so the verdict is cached per pipeline
+    rather than per call.
+    """
+    verdict = _QWEN3_5_SDPA_LAUNCHABLE.get(key)
+    if verdict is False:
+        return None
+    try:
+        outputs = launch()
+        if verdict is None:
+            # First use of this pipeline: force it now so an illegal
+            # threadgroup surfaces here instead of at the caller's next eval.
+            mx.eval(outputs)
+            _QWEN3_5_SDPA_LAUNCHABLE[key] = True
+        return outputs
+    except ValueError:
+        _QWEN3_5_SDPA_LAUNCHABLE[key] = False
+        return None
+
+
 def _qwen3_5_ragged_decode_attention(
     queries: mx.array,
     keys: mx.array,
@@ -1321,45 +1370,66 @@ def _qwen3_5_ragged_decode_attention(
         ("GQA_FACTOR", int(q_heads // kv_heads)),
     ]
 
-    if mode == "one_pass":
-        kernel = _qwen3_5_ragged_sdpa_one_pass_kernel(queries.dtype, d_size, v_size)
-        return kernel(
+    signature = (queries.dtype, int(d_size), int(v_size), int(q_heads), int(kv_heads))
+
+    if mode == "two_pass":
+        kernel_1 = _qwen3_5_ragged_sdpa_two_pass_1_kernel(
+            queries.dtype, d_size, v_size, blocks
+        )
+        pass_1 = _qwen3_5_try_launch(
+            ("two_pass_1", *signature, int(blocks)),
+            lambda: kernel_1(
+                inputs=[queries, keys, values, pads_array, scale_array, k_size_array],
+                template=[*template, ("BLOCKS", int(blocks))],
+                grid=(32 * kv_heads, (q_heads // kv_heads) * batch, blocks),
+                threadgroup=(32, q_heads // kv_heads, 1),
+                output_shapes=[
+                    (batch, q_heads, 1, blocks, v_size),
+                    (batch, q_heads, 1, blocks),
+                    (batch, q_heads, 1, blocks),
+                ],
+                output_dtypes=[queries.dtype, mx.float32, mx.float32],
+            ),
+        )
+        if pass_1 is not None:
+            partials, sums, maxs = pass_1
+            kernel_2 = _qwen3_5_ragged_sdpa_two_pass_2_kernel(
+                queries.dtype, v_size, blocks
+            )
+            pass_2 = _qwen3_5_try_launch(
+                ("two_pass_2", queries.dtype, int(v_size), int(blocks)),
+                lambda: kernel_2(
+                    inputs=[partials, sums, maxs],
+                    template=[
+                        ("T", queries.dtype),
+                        ("D_SIZE", int(v_size)),
+                        ("BLOCKS", int(blocks)),
+                    ],
+                    grid=(_QWEN3_5_SDPA_THREADS, batch * q_heads, 1),
+                    threadgroup=(_QWEN3_5_SDPA_THREADS, 1, 1),
+                    output_shapes=[(batch, q_heads, 1, v_size)],
+                    output_dtypes=[queries.dtype],
+                ),
+            )
+            if pass_2 is not None:
+                return pass_2[0]
+        # This GPU will not launch the two-pass kernels at this size. The
+        # one-pass kernel computes the same attention in a single dispatch, so
+        # prefer it over dropping out of the fast path entirely.
+
+    kernel = _qwen3_5_ragged_sdpa_one_pass_kernel(queries.dtype, d_size, v_size)
+    one_pass = _qwen3_5_try_launch(
+        ("one_pass", *signature),
+        lambda: kernel(
             inputs=[queries, keys, values, pads_array, scale_array, k_size_array],
             template=template,
-            grid=(1024, batch * q_heads, 1),
-            threadgroup=(1024, 1, 1),
+            grid=(_QWEN3_5_SDPA_THREADS, batch * q_heads, 1),
+            threadgroup=(_QWEN3_5_SDPA_THREADS, 1, 1),
             output_shapes=[(batch, q_heads, 1, v_size)],
             output_dtypes=[queries.dtype],
-        )[0]
-
-    kernel_1 = _qwen3_5_ragged_sdpa_two_pass_1_kernel(
-        queries.dtype, d_size, v_size, blocks
+        ),
     )
-    partials, sums, maxs = kernel_1(
-        inputs=[queries, keys, values, pads_array, scale_array, k_size_array],
-        template=[*template, ("BLOCKS", int(blocks))],
-        grid=(32 * kv_heads, (q_heads // kv_heads) * batch, blocks),
-        threadgroup=(32, q_heads // kv_heads, 1),
-        output_shapes=[
-            (batch, q_heads, 1, blocks, v_size),
-            (batch, q_heads, 1, blocks),
-            (batch, q_heads, 1, blocks),
-        ],
-        output_dtypes=[queries.dtype, mx.float32, mx.float32],
-    )
-    kernel_2 = _qwen3_5_ragged_sdpa_two_pass_2_kernel(queries.dtype, v_size, blocks)
-    return kernel_2(
-        inputs=[partials, sums, maxs],
-        template=[
-            ("T", queries.dtype),
-            ("D_SIZE", int(v_size)),
-            ("BLOCKS", int(blocks)),
-        ],
-        grid=(1024, batch * q_heads, 1),
-        threadgroup=(1024, 1, 1),
-        output_shapes=[(batch, q_heads, 1, v_size)],
-        output_dtypes=[queries.dtype],
-    )[0]
+    return None if one_pass is None else one_pass[0]
 
 
 def _target_verify_left_padded_attention(
