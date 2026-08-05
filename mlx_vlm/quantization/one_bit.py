@@ -1,7 +1,7 @@
 """Python-hosted 1-bit affine inference kernels."""
 
 from functools import lru_cache
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -456,14 +456,29 @@ class OneBitEmbedding(nn.Module):
         )
 
 
+def _quantization_entry_for_path(
+    quantization: Dict[str, Any], path: str
+) -> Tuple[bool, Any]:
+    """Resolve a per-module entry with the known language-model wrapper removed."""
+    if path in quantization:
+        per_layer = quantization[path]
+    else:
+        unwrapped_path = path.removeprefix("language_model.")
+        if unwrapped_path == path or unwrapped_path not in quantization:
+            return False, None
+        per_layer = quantization[unwrapped_path]
+
+    return True, per_layer.copy() if isinstance(per_layer, dict) else per_layer
+
+
 def _quantization_for_path(quantization: dict, path: str) -> dict:
     base = {
         key: quantization[key]
         for key in ("group_size", "bits", "mode")
         if key in quantization
     }
-    per_layer = quantization.get(path)
-    if isinstance(per_layer, dict):
+    has_per_layer, per_layer = _quantization_entry_for_path(quantization, path)
+    if has_per_layer and isinstance(per_layer, dict):
         base.update(per_layer)
     return base
 

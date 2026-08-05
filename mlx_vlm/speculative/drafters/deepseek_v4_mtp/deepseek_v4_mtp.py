@@ -9,6 +9,7 @@ from ....models.base import create_attention_mask
 from ....models.cache import RotatingKVCache
 from ....models.deepseek_v4.hyper_connection import HyperHead
 from ....models.deepseek_v4.language import DeepseekV4Block
+from ....quantization.one_bit import _quantization_entry_for_path
 from .config import DeepseekV4MTPConfig
 
 
@@ -86,7 +87,10 @@ class DeepseekV4MTPDraftModel(nn.Module):
         quantization_config = make_quantization_config(self)
 
         def predicate(path, _):
-            return quantization_config.get(path, True)
+            has_per_layer, per_layer = _quantization_entry_for_path(
+                quantization_config, path
+            )
+            return per_layer if has_per_layer else True
 
         return predicate
 
