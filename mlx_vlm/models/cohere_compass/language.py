@@ -132,6 +132,7 @@ class Attention(nn.Module):
             if config.layer_types[layer_idx] == "sliding_attention"
             else None
         )
+        self.rope_style = config.rope_style
         self.rope_on_all_layers = config.rope_on_all_layers
 
         self.q_proj = nn.Linear(
@@ -256,24 +257,30 @@ class Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(batch_size, sequence_length, -1)
         return _rowwise_batch(self.o_proj, output)
 
-    @staticmethod
-    def _apply_precomputed(q, k, position_embeddings):
+    def _apply_precomputed(self, q, k, position_embeddings):
         cos, sin = position_embeddings
-        return _apply_rope(q, k, cos, sin)
+        return _apply_rope(q, k, cos, sin, self.rope_style)
 
 
-def _rotate_half(x):
+def _rotate_half_interleaved(x):
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return mx.stack([-x2, x1], axis=-1).flatten(-2)
+
+
+def _rotate_half_split(x):
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
     return mx.concatenate([-x2, x1], axis=-1)
 
 
-def _apply_rope(q, k, cos, sin):
+def _apply_rope(q, k, cos, sin, rope_style):
     cos = mx.expand_dims(cos, axis=1)
     sin = mx.expand_dims(sin, axis=1)
+    rotate_half = _rotate_half_interleaved if rope_style == "interleave" else _rotate_half_split
     return (
-        (q * cos + _rotate_half(q) * sin).astype(q.dtype),
-        (k * cos + _rotate_half(k) * sin).astype(k.dtype),
+        (q * cos + rotate_half(q) * sin).astype(q.dtype),
+        (k * cos + rotate_half(k) * sin).astype(k.dtype),
     )
 
 

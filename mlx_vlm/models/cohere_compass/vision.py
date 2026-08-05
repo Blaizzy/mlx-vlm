@@ -3,7 +3,6 @@ from itertools import accumulate
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..base import ensure_fused_sdpa
 from .config import VisionConfig
 
 
@@ -22,6 +21,15 @@ def _apply_rotary_pos_emb_vision(q, k, cos, sin):
     q = q * cos + _rotate_half(q) * sin
     k = k * cos + _rotate_half(k) * sin
     return q.astype(dtype_q), k.astype(dtype_k)
+
+
+def _vision_position_embeddings(rotary_pos_emb):
+    cos = mx.cos(rotary_pos_emb)
+    sin = mx.sin(rotary_pos_emb)
+    return (
+        mx.concatenate([cos, cos], axis=-1),
+        mx.concatenate([sin, sin], axis=-1),
+    )
 
 
 class VisionRotaryEmbedding(nn.Module):
@@ -81,7 +89,7 @@ class PatchMerger(nn.Module):
             eps=1e-6,
         )
         self.linear_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.act_fn = nn.GELU(approx="tanh")
+        self.act_fn = nn.GELU()
         self.linear_fc2 = nn.Linear(self.hidden_size, config.out_hidden_size)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -114,10 +122,7 @@ class Attention(nn.Module):
         q, k, v = q[:, 0], k[:, 0], v[:, 0]
 
         if rotary_pos_emb is not None:
-            cos = mx.cos(rotary_pos_emb)
-            sin = mx.sin(rotary_pos_emb)
-            cos = mx.repeat(cos, 2, axis=-1)
-            sin = mx.repeat(sin, 2, axis=-1)
+            cos, sin = _vision_position_embeddings(rotary_pos_emb)
             q, k = _apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         q = q.transpose(1, 0, 2)[None]
@@ -129,7 +134,9 @@ class Attention(nn.Module):
         ]
         outputs = []
         for q_i, k_i, v_i in zip(*splits):
-            outputs.append(ensure_fused_sdpa(q_i, k_i, v_i, self.scale))
+            outputs.append(
+                mx.fast.scaled_dot_product_attention(q_i, k_i, v_i, scale=self.scale)
+            )
         output = mx.concatenate(outputs, axis=2)
         output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
         return self.proj(output)
@@ -219,7 +226,7 @@ class VisionModel(nn.Module):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
-        weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
+        weight_tensor = mx.array(weight_list, dtype=mx.float32)
         pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[..., None]
         patch_pos_embeds = pos_embeds.sum(axis=0)
 

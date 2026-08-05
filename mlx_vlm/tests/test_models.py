@@ -12075,6 +12075,39 @@ class TestLfm2Embedding(unittest.TestCase):
 
 
 class TestCohereCompass(unittest.TestCase):
+    def test_text_rope_respects_interleaved_and_split_layouts(self):
+        from mlx_vlm.models.cohere_compass.language import _apply_rope
+
+        q = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]])
+        k = mx.array([[[[5.0, 6.0, 7.0, 8.0]]]])
+        cos = mx.zeros((1, 1, 4))
+        sin = mx.ones((1, 1, 4))
+
+        q_interleaved, k_interleaved = _apply_rope(q, k, cos, sin, "interleave")
+        q_split, k_split = _apply_rope(q, k, cos, sin, "split")
+        mx.eval(q_interleaved, k_interleaved, q_split, k_split)
+
+        self.assertEqual(q_interleaved.tolist(), [[[[-2.0, 1.0, -4.0, 3.0]]]])
+        self.assertEqual(k_interleaved.tolist(), [[[[-6.0, 5.0, -8.0, 7.0]]]])
+        self.assertEqual(q_split.tolist(), [[[[-3.0, -4.0, 1.0, 2.0]]]])
+        self.assertEqual(k_split.tolist(), [[[[-7.0, -8.0, 5.0, 6.0]]]])
+
+    def test_vision_rope_uses_split_frequency_layout(self):
+        from mlx_vlm.models.cohere_compass.vision import (
+            _vision_position_embeddings,
+        )
+
+        rotary = mx.array([[0.0, mx.pi / 2]])
+        cos, sin = _vision_position_embeddings(rotary)
+        mx.eval(cos, sin)
+
+        self.assertTrue(
+            mx.allclose(cos, mx.array([[1.0, 0.0, 1.0, 0.0]]), atol=1e-6).item()
+        )
+        self.assertTrue(
+            mx.allclose(sin, mx.array([[0.0, 1.0, 0.0, 1.0]]), atol=1e-6).item()
+        )
+
     def _tiny_model(self):
         from mlx_vlm.models import cohere_compass
 
