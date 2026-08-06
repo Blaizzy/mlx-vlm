@@ -41,6 +41,8 @@ from ..speculative.utils import (
     run_speculative_server_rounds,
     speculative_hidden_state,
     speculative_prefill_kwargs,
+    speculative_stats_since,
+    speculative_stats_snapshot,
 )
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
@@ -77,6 +79,18 @@ def _notify_queues(queues, *items):
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_max_num_seqs():
+    """Max sequences allowed in the running batch at once (None = unbounded)."""
+    raw = os.environ.get("MLX_VLM_MAX_NUM_SEQS", "")
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
 
 
 def get_server_max_tokens():
@@ -184,7 +198,7 @@ def _run_chunked_speculative_prefill(
     if (
         prefill_step_size is not None
         and prefill_step_size > 0
-        and remaining_embeds.shape[1] > prefill_step_size
+        and remaining_embeds.shape[1] > 1
     ):
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
@@ -830,6 +844,10 @@ class GenerationMetrics:
     last_chunk_rate: Optional[float] = None
     generated_tokens: int = 0
     first_chunk_tokens: int = 0
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
+    draft_n: Optional[int] = None
 
     def record_chunk(self, chunk) -> Optional[float]:
         now = getattr(chunk, "emitted_at", None) or time.perf_counter()
@@ -875,6 +893,18 @@ class GenerationMetrics:
         cached_tokens = getattr(result, "cached_tokens", None)
         if cached_tokens is not None:
             self.cached_tokens = max(self.cached_tokens, int(cached_tokens))
+        draft_kind = getattr(result, "draft_kind", None)
+        if draft_kind is not None:
+            self.draft_kind = draft_kind
+        draft_rounds = getattr(result, "draft_rounds", None)
+        if draft_rounds is not None:
+            self.draft_rounds = int(draft_rounds)
+        draft_n_accepted = getattr(result, "draft_n_accepted", None)
+        if draft_n_accepted is not None:
+            self.draft_n_accepted = int(draft_n_accepted)
+        draft_n = getattr(result, "draft_n", None)
+        if draft_n is not None:
+            self.draft_n = int(draft_n)
 
 
 @dataclass
@@ -892,6 +922,10 @@ class StreamingToken:
     peak_memory: float = 0.0
     prompt_tps: Optional[float] = None
     generation_tps: Optional[float] = None
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
+    draft_n: Optional[int] = None
     top_logprobs: Optional[List[Tuple[int, float]]] = None
     cached_tokens: int = 0
     token_count: int = 1
@@ -1567,10 +1601,16 @@ class ResponseGenerator:
         self,
         *,
         active: bool,
+        capacity: Optional[int] = None,
         idle_timeout: float = 0.1,
         coalesce_s: float = 0.0,
     ):
-        """Collect the first queued request, then drain immediately available peers."""
+        """Collect the first queued request, then drain immediately available peers.
+
+        When ``capacity`` is set, admit at most ``capacity`` new requests and leave
+        the rest queued (backpressure), so the running batch never exceeds
+        ``--max-num-seqs`` concurrent sequences.
+        """
         pending = []
         should_stop = False
 
@@ -1582,9 +1622,13 @@ class ResponseGenerator:
                 return
             pending.append(item)
 
+        def _has_room():
+            return capacity is None or len(pending) < capacity
+
         try:
             if active:
-                append_item(self.requests.get_nowait())
+                if _has_room():
+                    append_item(self.requests.get_nowait())
             else:
                 append_item(self.requests.get(timeout=idle_timeout))
         except QueueEmpty:
@@ -1593,7 +1637,7 @@ class ResponseGenerator:
         if pending and coalesce_s > 0:
             time.sleep(coalesce_s)
 
-        while not should_stop:
+        while not should_stop and _has_room():
             try:
                 append_item(self.requests.get_nowait())
             except QueueEmpty:
@@ -1627,6 +1671,7 @@ class ResponseGenerator:
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
+        max_num_seqs = get_max_num_seqs()
 
         while not self._stop:
             try:
@@ -1642,8 +1687,12 @@ class ResponseGenerator:
                     )
                     else 0.0
                 )
+                capacity = (
+                    None if max_num_seqs is None else max(0, max_num_seqs - len(active))
+                )
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
+                    capacity=capacity,
                     coalesce_s=coalesce_s,
                 )
                 if should_stop:
@@ -1746,6 +1795,11 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        "spec_snapshot": (
+                            speculative_stats_snapshot(self.draft_model)
+                            if self.draft_model is not None
+                            else None
+                        ),
                         **log_state,
                     }
 
@@ -2096,6 +2150,11 @@ class ResponseGenerator:
                         return True
                     return False
 
+                spec_snapshot = speculative_stats_snapshot(drafter)
+
+                def spec_summary():
+                    return speculative_stats_since(drafter, spec_snapshot)
+
                 rounds_iter = run_speculative_server_rounds(
                     self.model,
                     drafter,
@@ -2140,6 +2199,9 @@ class ResponseGenerator:
                             finish_reason=finish,
                         )
 
+                        rounds, accepted, drafted = (
+                            spec_summary() if finish else (None, None, None)
+                        )
                         rqueues[uid].put(
                             StreamingToken(
                                 text=text,
@@ -2149,6 +2211,10 @@ class ResponseGenerator:
                                 peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
                                 emitted_at=emitted_at,
+                                draft_kind=draft_kind if finish else None,
+                                draft_rounds=rounds,
+                                draft_n_accepted=accepted,
+                                draft_n=drafted,
                             )
                         )
 
@@ -2158,18 +2224,20 @@ class ResponseGenerator:
                     if len(finished_uids) == len(uids):
                         break
 
-                # Log acceptance stats
-                al = drafter.accept_lens
-                if al:
-                    mean_a = (sum(al) + len(al)) / len(al)
+                # Log acceptance stats for this batch only, not the drafter's
+                # lifetime history.
+                rounds, accepted, drafted = spec_summary()
+                if rounds:
+                    mean_a = (accepted + rounds) / rounds
                     logger.info(
                         "Speculative decode: kind=%s batch=%d tokens=%d "
-                        "accept=%.2f rounds=%d",
+                        "accept=%.2f rounds=%d drafted=%s",
                         draft_kind,
                         B,
                         sum(len(token_lists[u]) for u in uids),
                         mean_a,
-                        len(al),
+                        rounds,
+                        drafted,
                     )
 
                 # Finalize any remaining
@@ -2194,6 +2262,10 @@ class ResponseGenerator:
                                 prompt_tps=prompt_tps_map.get(uid),
                                 token_count=0,
                                 emitted_at=emitted_at,
+                                draft_kind=(draft_kind if rounds is not None else None),
+                                draft_rounds=rounds,
+                                draft_n_accepted=accepted,
+                                draft_n=drafted,
                             )
                         )
                         rqueues[uid].put(None)
@@ -2251,6 +2323,15 @@ class ResponseGenerator:
                 token_count=token_count,
             )
 
+            draft_rounds = draft_accepted = draft_total = None
+            request_draft_kind = None
+            if r.finish_reason is not None and info.get("spec_snapshot") is not None:
+                draft_rounds, draft_accepted, draft_total = speculative_stats_since(
+                    self.draft_model, info["spec_snapshot"]
+                )
+                if draft_rounds is not None:
+                    request_draft_kind = self.draft_kind
+
             rqueue.put(
                 StreamingToken(
                     text=text,
@@ -2259,6 +2340,10 @@ class ResponseGenerator:
                     finish_reason=r.finish_reason,
                     peak_memory=mx.get_peak_memory() / 1e9 if r.finish_reason else 0,
                     prompt_tps=info.get("prompt_tps"),
+                    draft_kind=request_draft_kind,
+                    draft_rounds=draft_rounds,
+                    draft_n_accepted=draft_accepted,
+                    draft_n=draft_total,
                     top_logprobs=getattr(r, "top_logprobs", None),
                     cached_tokens=info.get("cached_tokens", 0),
                     token_count=token_count,

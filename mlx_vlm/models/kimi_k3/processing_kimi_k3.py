@@ -4,6 +4,7 @@ Processor class for Kimi K3.
 Adapted from the custom HuggingFace Transformers implementation:
 https://huggingface.co/moonshotai/Kimi-K3/blob/main/kimi_k3_processor.py
 https://huggingface.co/moonshotai/Kimi-K3/blob/main/kimi_k3_vision_processing.py
+https://huggingface.co/moonshotai/Kimi-K3/blob/main/encoding_k3.py
 
 The K3 chat template renders one <|media_pad|> per image which the reference
 model expands to the image's merged-token count at embedding time; this
@@ -11,7 +12,7 @@ processor pre-expands the placeholders at the prompt level instead so the
 model-side merge is 1:1.
 """
 
-import inspect
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -20,17 +21,149 @@ from typing import List, Tuple
 import mlx.core as mx
 import numpy as np
 from PIL import Image
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.image_utils import make_list_of_images, valid_images
 from transformers.processing_utils import ProcessorMixin
 
+from .encoding_k3 import build_chat_segments, is_batched_conversation
+
 IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 MEDIA_PAD = "<|media_pad|>"
+_KIMI_K3_NUM_CONTROL_TOKENS = 256
+_KIMI_K3_TIKTOKEN_PATTERN = "|".join(
+    [
+        r"[\p{Han}]+",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*"
+        r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+"
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+"
+        r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*"
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+        r"\p{N}{1,3}",
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*",
+        r"\s*[\r\n]+",
+        r"\s+(?!\S)",
+        r"\s+",
+    ]
+)
 
 # prompt_utils selects a chat renderer only when chat_template is non-None.
 _CHAT_TEMPLATE_SENTINEL = "<kimi-k3-native-python-chat-renderer>"
+
+
+def _kimi_k3_control_tokens(tokenizer_config, base_vocab_size):
+    added_tokens = tokenizer_config.get("added_tokens_decoder", {})
+    known_tokens = {
+        int(token_id): token["content"] if isinstance(token, dict) else str(token)
+        for token_id, token in added_tokens.items()
+    }
+    return [
+        known_tokens.get(token_id, f"<|reserved_token_{token_id}|>")
+        for token_id in range(
+            base_vocab_size, base_vocab_size + _KIMI_K3_NUM_CONTROL_TOKENS
+        )
+    ]
+
+
+def _convert_kimi_k3_tiktoken(vocab_file, tokenizer_config_file):
+    if importlib.util.find_spec("tiktoken") is None:
+        raise ImportError(
+            "Kimi K3 provides a tiktoken tokenizer. Install `tiktoken` to "
+            "convert it at runtime, or use a checkpoint that includes tokenizer.json."
+        )
+
+    from tiktoken.load import load_tiktoken_bpe
+    from tokenizers import Regex, pre_tokenizers
+    from transformers.convert_slow_tokenizer import TikTokenConverter
+
+    with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+        tokenizer_config = json.load(f)
+
+    base_vocab_size = len(load_tiktoken_bpe(str(vocab_file)))
+    control_tokens = _kimi_k3_control_tokens(tokenizer_config, base_vocab_size)
+    backend = TikTokenConverter(
+        vocab_file=str(vocab_file),
+        pattern=_KIMI_K3_TIKTOKEN_PATTERN,
+        extra_special_tokens=control_tokens,
+    ).converted()
+    backend.pre_tokenizer = pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.FixedLength(400_000),
+            pre_tokenizers.Split(
+                Regex(r"\s{25000}|\S{25000}"),
+                behavior="merged_with_previous",
+            ),
+            pre_tokenizers.Split(
+                Regex(_KIMI_K3_TIKTOKEN_PATTERN),
+                behavior="isolated",
+            ),
+            pre_tokenizers.ByteLevel(
+                add_prefix_space=False,
+                trim_offsets=True,
+                use_regex=False,
+            ),
+        ]
+    )
+
+    ignored_config_keys = {
+        "added_tokens_decoder",
+        "auto_map",
+        "tokenizer_class",
+    }
+    init_kwargs = {
+        key: value
+        for key, value in tokenizer_config.items()
+        if key not in ignored_config_keys
+    }
+    return PreTrainedTokenizerFast(tokenizer_object=backend, **init_kwargs)
+
+
+def _load_kimi_k3_tokenizer(pretrained_model_name_or_path, is_local, hub_kwargs):
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    source = str(pretrained_model_name_or_path)
+    tokenizer_kwargs = dict(hub_kwargs)
+    if is_local:
+        tokenizer_kwargs.pop("revision", None)
+        tokenizer_kwargs["local_files_only"] = True
+        tokenizer_json = Path(source) / "tokenizer.json"
+    else:
+        try:
+            tokenizer_json = Path(
+                hf_hub_download(source, "tokenizer.json", **hub_kwargs)
+            )
+        except EntryNotFoundError:
+            tokenizer_json = None
+
+    if tokenizer_json is not None and tokenizer_json.exists():
+        return PreTrainedTokenizerFast.from_pretrained(
+            source,
+            trust_remote_code=False,
+            **tokenizer_kwargs,
+        )
+
+    if is_local:
+        vocab_file = Path(source) / "tiktoken.model"
+        tokenizer_config_file = Path(source) / "tokenizer_config.json"
+        missing_files = [
+            path.name
+            for path in (vocab_file, tokenizer_config_file)
+            if not path.exists()
+        ]
+        if missing_files:
+            raise FileNotFoundError(
+                f"Missing Kimi K3 tokenizer files: {', '.join(missing_files)}"
+            )
+    else:
+        vocab_file = Path(hf_hub_download(source, "tiktoken.model", **hub_kwargs))
+        tokenizer_config_file = Path(
+            hf_hub_download(source, "tokenizer_config.json", **hub_kwargs)
+        )
+
+    return _convert_kimi_k3_tiktoken(vocab_file, tokenizer_config_file)
 
 
 class KimiK3ImageProcessor(BaseImageProcessor):
@@ -176,33 +309,98 @@ class KimiK3Processor(ProcessorMixin):
     attributes = ["image_processor", "tokenizer"]
     valid_kwargs = ["chat_template"]
     image_processor_class = "KimiK3ImageProcessor"
-    tokenizer_class = "AutoTokenizer"
+    tokenizer_class = "PreTrainedTokenizerFast"
 
     def __init__(self, image_processor=None, tokenizer=None, **kwargs):
         self.image_token = MEDIA_PAD
         if image_processor is None:
             image_processor = KimiK3ImageProcessor()
         super().__init__(image_processor, tokenizer, **kwargs)
-        if (
-            self.chat_template is None
-            and getattr(self.tokenizer, "chat_template", None) is None
-        ):
+        if self.chat_template is None:
             self.chat_template = _CHAT_TEMPLATE_SENTINEL
 
-    def apply_chat_template(self, conversation, **kwargs):
+    def apply_chat_template(
+        self,
+        conversation,
+        tools=None,
+        tokenize=False,
+        add_generation_prompt=True,
+        thinking=True,
+        padding=False,
+        truncation=False,
+        max_length=None,
+        return_tensors=None,
+        return_dict=False,
+        **kwargs,
+    ):
+        """Render and optionally encode K3 XTML without tokenizer custom code."""
+
         kwargs.pop("chat_template", None)
-        try:
-            parameters = inspect.signature(
-                self.tokenizer.apply_chat_template
-            ).parameters
-        except (TypeError, ValueError):
-            parameters = None
-        if parameters is not None and not any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD
-            for parameter in parameters.values()
-        ):
-            kwargs = {key: value for key, value in kwargs.items() if key in parameters}
-        return self.tokenizer.apply_chat_template(conversation, **kwargs)
+        image_prompts = kwargs.pop("image_prompts", None)
+        is_batched = is_batched_conversation(conversation)
+        conversations = conversation if is_batched else [conversation]
+        if is_batched and image_prompts is not None:
+            raise ValueError("image_prompts is only supported for one chat.")
+
+        kwargs.setdefault("thinking_effort", "max")
+        segment_batches = [
+            build_chat_segments(
+                messages,
+                tools=tools,
+                add_generation_prompt=add_generation_prompt,
+                thinking=thinking,
+                image_prompts=image_prompts,
+                **kwargs,
+            )
+            for messages in conversations
+        ]
+
+        if not tokenize:
+            rendered = [
+                "".join(segment.text for segment in segments)
+                for segments in segment_batches
+            ]
+            return rendered if is_batched else rendered[0]
+
+        encoded_inputs = []
+        for segments in segment_batches:
+            token_ids = []
+            for segment in segments:
+                token_ids.extend(
+                    self.tokenizer.encode(
+                        segment.text,
+                        add_special_tokens=False,
+                        split_special_tokens=not segment.allow_special,
+                    )
+                )
+            if truncation and max_length is not None:
+                token_ids = token_ids[:max_length]
+            encoded_inputs.append(token_ids)
+
+        needs_batch_encoding = (
+            is_batched or padding or return_tensors is not None or return_dict
+        )
+        if not needs_batch_encoding:
+            return encoded_inputs[0]
+
+        features = [
+            {"input_ids": ids, "attention_mask": [1] * len(ids)}
+            for ids in encoded_inputs
+        ]
+        batch = self.tokenizer.pad(
+            features,
+            padding=padding,
+            max_length=max_length if padding else None,
+            return_attention_mask=True,
+            return_tensors=return_tensors,
+        )
+        if return_dict:
+            return batch
+        if is_batched:
+            return batch["input_ids"]
+        if return_tensors is None:
+            return batch["input_ids"][0]
+        return batch["input_ids"]
 
     def make_image_prompt(self, width: int, height: int, num_tokens: int) -> str:
         return (
@@ -210,7 +408,10 @@ class KimiK3Processor(ProcessorMixin):
             f"<|media_content|>{MEDIA_PAD * num_tokens}<|media_end|>"
         )
 
-    def __call__(self, images=None, text=None, **kwargs):
+    def __call__(self, images=None, text=None, videos=None, **kwargs):
+        if videos is not None:
+            raise ValueError("unsupported media type: video")
+
         if images is None and text is None:
             raise ValueError("You have to specify at least one of `images` or `text`.")
 
@@ -257,7 +458,10 @@ class KimiK3Processor(ProcessorMixin):
                     t = merged
                 expanded_texts.append(t)
 
-            all_input_ids = [self.tokenizer.encode(t) for t in expanded_texts]
+            all_input_ids = [
+                self.tokenizer.encode(t, add_special_tokens=False)
+                for t in expanded_texts
+            ]
 
             max_len = max(len(ids) for ids in all_input_ids)
             pad_token_id = self.tokenizer.pad_token_id or 0
@@ -284,6 +488,8 @@ class KimiK3Processor(ProcessorMixin):
         return BatchFeature(data=data)
 
     def save_pretrained(self, *args, **kwargs):
+        # As with Gemma4, ProcessorMixin.save_pretrained delegates to the
+        # tokenizer and persists an in-memory conversion as tokenizer.json.
         if self.chat_template != _CHAT_TEMPLATE_SENTINEL:
             return super().save_pretrained(*args, **kwargs)
         self.chat_template = None
@@ -296,12 +502,29 @@ class KimiK3Processor(ProcessorMixin):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from huggingface_hub import hf_hub_download
 
+        # The processor and chat behavior are implemented locally. Prefer a
+        # checkpoint's standard tokenizer.json and only convert legacy
+        # tiktoken.model checkpoints when the optional dependency is present.
+        kwargs.pop("trust_remote_code", None)
+        kwargs.pop("use_fast", None)
+
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
-        tokenizer = AutoTokenizer.from_pretrained(
-            str(model_path) if is_local else pretrained_model_name_or_path,
-            trust_remote_code=True,
-            local_files_only=is_local,
+        hub_keys = (
+            "cache_dir",
+            "force_download",
+            "local_files_only",
+            "revision",
+            "token",
+        )
+        hub_kwargs = {key: kwargs[key] for key in hub_keys if key in kwargs}
+        if is_local:
+            hub_kwargs["local_files_only"] = True
+
+        tokenizer = _load_kimi_k3_tokenizer(
+            pretrained_model_name_or_path,
+            is_local=is_local,
+            hub_kwargs=hub_kwargs,
         )
 
         image_processor_config = {}
@@ -311,7 +534,9 @@ class KimiK3Processor(ProcessorMixin):
             else:
                 preproc_path = Path(
                     hf_hub_download(
-                        pretrained_model_name_or_path, "preprocessor_config.json"
+                        pretrained_model_name_or_path,
+                        "preprocessor_config.json",
+                        **hub_kwargs,
                     )
                 )
             if preproc_path.exists():

@@ -76,6 +76,42 @@ pip install -U 'mlx-vlm[ui]'
 Quote the package name so that shells which expand square brackets, such as
 `zsh`, do not treat `[ui]` as a glob pattern.
 
+## Agent Skills
+
+This repo ships an agent-skills bundle under `skills/` for common MLX-VLM workflows — usage, conversion, development, and support. Skills load into a coding agent (Claude Code, Codex, Gemini) so it follows the right project conventions instead of guessing.
+
+| Skill | Description |
+|-------|-------------|
+| `cli-inference` | Run and debug command-line inference (`mlx_vlm.generate`) — text/image/audio inputs and image-generation flags. |
+| `server-inference` | Run and debug the local server across the models, chat, responses, messages, audio, image, cache, and metrics endpoints. |
+| `convert-quantize` | Convert and quantize Hugging Face models to MLX (`mlx_vlm.convert`) — bits/group size, quant modes, RTN/AWQ, mixed recipes. |
+| `add-new-model` | Port a new architecture into `mlx_vlm/models` — config, weight-name mapping, reuse a similar model, add a test class. |
+| `benchmarking` | Produce credible, reproducible perf numbers and fork-vs-main A/B tables for PRs. |
+| `contributing` | Shape a change to pass review — code/config/test placement, pre-commit hooks, and PR expectations. |
+| `hf-cache-models` | List MLX-VLM-supported (and, with `--check-arch`, loadable) models in the local Hugging Face cache. |
+| `reproducible-github-issues` | Turn CLI or server failures into concise, reproducible GitHub issues. |
+
+Validate the bundle at any time:
+
+```sh
+python3 skills/scripts/validate_skills.py
+```
+
+Install from a local checkout:
+
+```sh
+# Claude Code
+/plugin marketplace add /path/to/mlx-vlm
+/plugin install mlx-vlm-skills@mlx-vlm
+
+# Codex CLI
+codex plugin marketplace add /path/to/mlx-vlm
+codex plugin add mlx-vlm-skills@mlx-vlm
+
+# Gemini CLI
+gemini extensions install /path/to/mlx-vlm/skills
+```
+
 ## Usage
 
 ### Command Line Interface (CLI)
