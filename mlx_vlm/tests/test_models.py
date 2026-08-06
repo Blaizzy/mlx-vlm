@@ -2865,6 +2865,32 @@ class TestModels(unittest.TestCase):
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
 
+    def test_chandra_ocr2_config_uses_qwen3_5(self):
+        from mlx_vlm.models import qwen3_5
+        from mlx_vlm.utils import get_model_and_args
+
+        chandra_config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+            "vision_start_token_id": 151652,
+            "vision_end_token_id": 151653,
+            "tie_word_embeddings": True,
+            "text_config": {"model_type": "qwen3_5_text"},
+            "vision_config": {"model_type": "qwen3_5", "patch_size": 16},
+        }
+
+        model_class, _ = get_model_and_args(config=dict(chandra_config))
+        self.assertIs(model_class, qwen3_5)
+
+        config = qwen3_5.ModelConfig.from_dict(dict(chandra_config))
+        self.assertEqual(config.image_token_id, 151655)
+        self.assertEqual(config.video_token_id, 151656)
+        self.assertEqual(config.vision_start_token_id, 151652)
+        self.assertEqual(config.vision_end_token_id, 151653)
+        self.assertEqual(config.vision_config.patch_size, 16)
+
     def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
         from mlx_vlm.models import qwen3_5
 
