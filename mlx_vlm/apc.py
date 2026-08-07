@@ -3518,7 +3518,11 @@ def _fill_stream_layer_cache(
         from .turboquant import TurboQuantKVCache, turboquant_enabled
 
         if turboquant_enabled(bits, scheme):
-            c = TurboQuantKVCache(bits=float(bits))
+            c = TurboQuantKVCache(
+                bits=float(bits),
+                key_bits=kv_quant_config.get("key_bits"),
+                value_bits=kv_quant_config.get("value_bits"),
+            )
             c.update_and_fetch(merged_k, merged_v)
             return c
         c = QuantizedKVCache(
@@ -3568,7 +3572,12 @@ def _fill_batch_layer_cache(
         from .turboquant import BatchTurboQuantKVCache, turboquant_enabled
 
         if turboquant_enabled(bits, scheme):
-            c = BatchTurboQuantKVCache(left_padding, bits=float(bits))
+            c = BatchTurboQuantKVCache(
+                left_padding,
+                bits=float(bits),
+                key_bits=kv_quant_config.get("key_bits"),
+                value_bits=kv_quant_config.get("value_bits"),
+            )
             c.update_and_fetch(merged_k, merged_v)
             return c
         c = BatchQuantizedKVCache(
@@ -3832,7 +3841,12 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> 
     from .turboquant import BatchTurboQuantKVCache, turboquant_enabled
 
     if turboquant_enabled(bits, scheme):
-        return BatchTurboQuantKVCache(left_padding, bits=float(bits))
+        return BatchTurboQuantKVCache(
+            left_padding,
+            bits=float(bits),
+            key_bits=kv_quant_config.get("key_bits"),
+            value_bits=kv_quant_config.get("value_bits"),
+        )
     from .models.cache import BatchQuantizedKVCache
 
     return BatchQuantizedKVCache(

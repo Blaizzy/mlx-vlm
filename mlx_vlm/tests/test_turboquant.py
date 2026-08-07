@@ -618,3 +618,54 @@ def test_apc_namespace_separates_key_value_bit_splits():
 
     assert default == apc_disk_namespace("m", **base)
     assert len({default, k8v3, k3v8}) == 3
+
+
+def _turbo_quant_config(**overrides):
+    config = {"bits": 3.5, "group_size": 64, "scheme": "turboquant"}
+    config.update(overrides)
+    return config
+
+
+def test_apc_stream_warm_cache_honors_key_value_bits():
+    from mlx_vlm.apc import _fill_stream_layer_cache
+
+    keys = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    built = _fill_stream_layer_cache(
+        keys,
+        values,
+        prefix_len=8,
+        quantize=True,
+        kv_quant_config=_turbo_quant_config(key_bits=8, value_bits=3),
+    )
+    assert (built.key_bits, built.value_bits) == (8.0, 3.0)
+
+
+def test_apc_batch_warm_cache_honors_key_value_bits():
+    from mlx_vlm.apc import _fill_batch_layer_cache
+
+    keys = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16)
+    built = _fill_batch_layer_cache(
+        keys,
+        values,
+        [0],
+        [8],
+        quantize=True,
+        kv_quant_config=_turbo_quant_config(key_bits=8, value_bits=3),
+    )
+    assert (built.key_bits, built.value_bits) == (8.0, 3.0)
+
+
+def test_apc_empty_batch_cache_honors_key_value_bits():
+    from mlx_vlm.apc import _empty_quant_batch_cache
+
+    built = _empty_quant_batch_cache([0], _turbo_quant_config(key_bits=8, value_bits=3))
+    assert (built.key_bits, built.value_bits) == (8.0, 3.0)
+
+
+def test_apc_warm_cache_defaults_match_live_split():
+    from mlx_vlm.apc import _empty_quant_batch_cache
+
+    built = _empty_quant_batch_cache([0], _turbo_quant_config())
+    assert (built.key_bits, built.value_bits) == (3.0, 4.0)
