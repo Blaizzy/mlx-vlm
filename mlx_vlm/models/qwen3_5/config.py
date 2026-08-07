@@ -110,7 +110,7 @@ class TextConfig(BaseModelConfig):
 @dataclass
 class ModelConfig(BaseModelConfig):
     text_config: TextConfig
-    vision_config: VisionConfig
+    vision_config: Optional[VisionConfig]
     model_type: str
     ignore_index: int = -100
     image_token_id: int = 248056
@@ -121,6 +121,7 @@ class ModelConfig(BaseModelConfig):
     vision_end_token_id: int = 248046
     vocab_size: int = 248320
     eos_token_id: Optional[Union[int, List[int]]] = None
+    language_model_only: bool = False
     quantization: Optional[Dict] = None
     quantization_config: Optional[Dict] = None
 

@@ -52,7 +52,10 @@ class Model(Qwen3VLModel):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class
         nn.Module.__init__(self)
         self.config = config
-        self.vision_tower = VisionModel(config.vision_config)
+        if config.vision_config is None or config.language_model_only:
+            self.vision_tower = None
+        else:
+            self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
@@ -78,6 +81,9 @@ class Model(Qwen3VLModel):
                 position_ids=position_ids,
                 rope_deltas=rope_deltas,
             )
+
+        if self.vision_tower is None:
+            raise ValueError("this Qwen3.5 model was loaded without a vision tower")
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
         pixel_values = pixel_values.astype(dtype)

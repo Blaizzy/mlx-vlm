@@ -2940,6 +2940,58 @@ class TestModels(unittest.TestCase):
         self.assertEqual(config.vision_end_token_id, 151653)
         self.assertEqual(config.vision_config.patch_size, 16)
 
+    def test_qwen3_5_text_only_config_skips_vision_tower(self):
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import qwen3_5
+
+        tiny_text = {
+            "model_type": "qwen3_5_text",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 128,
+            "max_position_embeddings": 128,
+            "full_attention_interval": 4,
+        }
+
+        text_only_configs = (
+            {"vision_config": None},
+            {
+                "vision_config": {"model_type": "qwen3_5"},
+                "language_model_only": True,
+            },
+        )
+        for text_only_config in text_only_configs:
+            with self.subTest(config=text_only_config):
+                config = qwen3_5.ModelConfig.from_dict(
+                    {
+                        "model_type": "qwen3_5",
+                        "text_config": tiny_text,
+                        **text_only_config,
+                    }
+                )
+                model = qwen3_5.Model(config)
+
+                self.assertIsNone(model.vision_tower)
+                keys = [key for key, _ in tree_flatten(model.parameters())]
+                self.assertFalse(any("vision_tower" in key for key in keys))
+
+                with self.assertRaisesRegex(ValueError, "without a vision tower"):
+                    model.get_input_embeddings(
+                        input_ids=mx.array([[1, 2, 3]]),
+                        pixel_values=mx.zeros((1, 4)),
+                    )
+
     def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
         from mlx_vlm.models import qwen3_5
 
