@@ -787,3 +787,124 @@ def test_kv_quant_homogeneous_fingerprint_has_no_scheme_suffix():
 
     assert "-ks" not in from_legacy(3.5, "turboquant", 64).fingerprint(0)
     assert "-ks" not in from_legacy(3.5, "turboquant", 64, 8, 3).fingerprint(0)
+
+
+def _hybrid_policy():
+    from mlx_vlm.kv_quant import from_legacy
+
+    return from_legacy(8, "uniform", 64, kv_value_bits=3, kv_value_scheme="turboquant")
+
+
+def _uniform_roundtrip(tensor, bits, group_size=64):
+    weights, scales, biases = mx.quantize(tensor, group_size=group_size, bits=bits)
+    return mx.dequantize(weights, scales, biases, group_size=group_size, bits=bits)
+
+
+def _turbo_roundtrip(tensor, bits, seed):
+    codec = _build_codec(tensor, bits, mode="mse", seed=seed)
+    return codec.dequantize(codec.quantize(tensor))
+
+
+def _relative_error(a, b):
+    return mx.sqrt(
+        mx.sum((a.astype(mx.float32) - b.astype(mx.float32)) ** 2)
+        / mx.sum(b.astype(mx.float32) ** 2)
+    ).item()
+
+
+def test_hybrid_cache_quantizes_each_tensor_with_its_own_scheme():
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    cache = HybridQuantKVCache(_hybrid_policy())
+    keys = mx.random.normal((1, 4, 64, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 64, 256)).astype(mx.bfloat16)
+    deq_keys, deq_values = cache.update_and_fetch(keys, values)
+
+    assert cache.offset == 64
+    assert _relative_error(deq_keys, _uniform_roundtrip(keys, 8)) < 1e-6
+    assert (
+        _relative_error(deq_values, _turbo_roundtrip(values, 3, cache.seed + 1)) < 1e-6
+    )
+
+
+def test_hybrid_cache_appends_across_decode_steps():
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    cache = HybridQuantKVCache(_hybrid_policy())
+    cache.update_and_fetch(
+        mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16),
+    )
+    for _ in range(3):
+        deq_keys, deq_values = cache.update_and_fetch(
+            mx.random.normal((1, 4, 1, 256)).astype(mx.bfloat16),
+            mx.random.normal((1, 4, 1, 256)).astype(mx.bfloat16),
+        )
+    assert cache.offset == 11
+    assert deq_keys.shape == (1, 4, 11, 256)
+    assert deq_values.shape == (1, 4, 11, 256)
+
+
+def test_hybrid_cache_uses_the_plain_attention_path():
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    cache = HybridQuantKVCache(_hybrid_policy())
+    deq_keys, deq_values = cache.update_and_fetch(
+        mx.random.normal((1, 4, 16, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 4, 16, 256)).astype(mx.bfloat16),
+    )
+    assert not hasattr(cache, "bits")
+    queries = mx.random.normal((1, 16, 1, 256)).astype(mx.bfloat16)
+    out = scaled_dot_product_attention(
+        queries, deq_keys, deq_values, cache=cache, scale=256**-0.5, mask=None
+    )
+    assert out.shape == (1, 16, 1, 256)
+
+
+def test_hybrid_cache_trims_both_tensors():
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    cache = HybridQuantKVCache(_hybrid_policy())
+    cache.update_and_fetch(
+        mx.random.normal((1, 4, 20, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 4, 20, 256)).astype(mx.bfloat16),
+    )
+    assert cache.trim(5) == 5
+    assert cache.offset == 15
+    deq_keys, deq_values = cache.dequantize()
+    assert deq_keys.shape[-2] == 15
+    assert deq_values.shape[-2] == 15
+
+
+def test_hybrid_cache_meta_state_round_trips_policy():
+    from mlx_vlm.kv_quant import from_legacy
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    cache = HybridQuantKVCache(_hybrid_policy())
+    cache.offset = 12
+    restored = HybridQuantKVCache(from_legacy(4, "uniform", 64))
+    restored.meta_state = cache.meta_state
+    assert restored.policy == cache.policy
+    assert restored.offset == 12
+    assert restored.seed == cache.seed
+
+
+def test_hybrid_cache_supports_turboquant_key_uniform_value():
+    from mlx_vlm.kv_quant import from_legacy
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    cache = HybridQuantKVCache(
+        from_legacy(
+            8,
+            "turboquant",
+            64,
+            kv_key_bits=3,
+            kv_value_bits=8,
+            kv_value_scheme="uniform",
+        )
+    )
+    keys = mx.random.normal((1, 4, 32, 256)).astype(mx.bfloat16)
+    values = mx.random.normal((1, 4, 32, 256)).astype(mx.bfloat16)
+    deq_keys, deq_values = cache.update_and_fetch(keys, values)
+    assert _relative_error(deq_keys, _turbo_roundtrip(keys, 3, cache.seed)) < 1e-6
+    assert _relative_error(deq_values, _uniform_roundtrip(values, 8)) < 1e-6
