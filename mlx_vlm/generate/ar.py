@@ -171,6 +171,8 @@ def generate_step(
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[float] = None,
+    kv_key_bits: Optional[float] = None,
+    kv_value_bits: Optional[float] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -249,6 +251,8 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
@@ -730,6 +734,8 @@ def _make_cache(
     model,
     left_padding,
     kv_bits=None,
+    kv_key_bits=None,
+    kv_value_bits=None,
     kv_group_size=64,
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start=0,
@@ -757,7 +763,9 @@ def _make_cache(
         if use_turbo:
             if defer_turbo:
                 return cache.BatchKVCache(lp)
-            return BatchTurboQuantKVCache(lp, bits=kv_bits)
+            return BatchTurboQuantKVCache(
+                lp, bits=kv_bits, key_bits=kv_key_bits, value_bits=kv_value_bits
+            )
         return cache.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
         )
@@ -1555,6 +1563,8 @@ class PromptProcessingBatch:
         thinking_budget_criteria: Optional[List[Any]] = None,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = 0,
@@ -1654,6 +1664,8 @@ class PromptProcessingBatch:
                     lm,
                     lp,
                     kv_bits=kv_bits,
+                    kv_key_bits=kv_key_bits,
+                    kv_value_bits=kv_value_bits,
                     kv_group_size=kv_group_size,
                     kv_quant_scheme=kv_quant_scheme,
                     quantized_kv_start=quantized_kv_start,
@@ -1672,6 +1684,8 @@ class PromptProcessingBatch:
                 model,
                 left_padding,
                 kv_bits=kv_bits,
+                kv_key_bits=kv_key_bits,
+                kv_value_bits=kv_value_bits,
                 kv_group_size=kv_group_size,
                 kv_quant_scheme=kv_quant_scheme,
                 quantized_kv_start=quantized_kv_start,
@@ -2133,6 +2147,8 @@ class BatchGenerator:
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         prompt_cache=None,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -2152,6 +2168,8 @@ class BatchGenerator:
         self.max_tokens = max_tokens
         self.processor = processor
         self.kv_bits = kv_bits
+        self.kv_key_bits = kv_key_bits
+        self.kv_value_bits = kv_value_bits
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
@@ -2386,6 +2404,8 @@ class BatchGenerator:
         _quant_cfg = (
             {
                 "bits": self.kv_bits,
+                "key_bits": getattr(self, "kv_key_bits", None),
+                "value_bits": getattr(self, "kv_value_bits", None),
                 "group_size": self.kv_group_size,
                 "scheme": self.kv_quant_scheme,
             }
@@ -2446,6 +2466,8 @@ class BatchGenerator:
             thinking_budget_criteria=thinking_budget_criteria,
             prefill_step_size=self.prefill_step_size,
             kv_bits=self.kv_bits,
+            kv_key_bits=getattr(self, "kv_key_bits", None),
+            kv_value_bits=getattr(self, "kv_value_bits", None),
             kv_group_size=self.kv_group_size,
             kv_quant_scheme=self.kv_quant_scheme,
             quantized_kv_start=getattr(
@@ -2755,6 +2777,8 @@ class BatchGenerator:
                 thinking_budget_criteria=thinking_budget_criteria,
                 prefill_step_size=self.prefill_step_size,
                 kv_bits=self.kv_bits,
+                kv_key_bits=getattr(self, "kv_key_bits", None),
+                kv_value_bits=getattr(self, "kv_value_bits", None),
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
                 quantized_kv_start=getattr(

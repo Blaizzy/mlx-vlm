@@ -33,6 +33,8 @@ class GenerateKwargs(TypedDict, total=False):
     prompt_cache: list[Any] | None
     max_kv_size: int | None
     kv_bits: float | None
+    kv_key_bits: float | None
+    kv_value_bits: float | None
     kv_group_size: int
     kv_quant_scheme: str
     quantized_kv_start: int

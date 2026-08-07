@@ -222,6 +222,8 @@ def apc_disk_namespace(
     adapter_path: Any = None,
     weights_fingerprint: Any = None,
     kv_bits: Any = None,
+    kv_key_bits: Any = None,
+    kv_value_bits: Any = None,
     kv_group_size: Any = None,
     kv_quant_scheme: Any = None,
     quantized_kv_start: Any = None,
@@ -238,6 +240,8 @@ def apc_disk_namespace(
     kv_descriptor = (
         f"kv{kv_bits}-{kv_group_size}-{kv_quant_scheme}-{quantized_kv_start}"
     )
+    if kv_key_bits is not None or kv_value_bits is not None:
+        kv_descriptor += f"-k{kv_key_bits}-v{kv_value_bits}"
     fingerprint = _stable_int_hash(
         ADAPTER_SCHEMA_VERSION,
         _hash_payload(str(model_path)) or 0,

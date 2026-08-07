@@ -152,6 +152,18 @@ def main():
         help="Number of bits for KV cache quantization (e.g. 3.5 for TurboQuant).",
     )
     parser.add_argument(
+        "--kv-key-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant key bit-width (defaults to floor(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -266,6 +278,10 @@ def main():
         os.environ["MLX_VLM_THINKING_END_TOKEN"] = args.thinking_end_token
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
+    if args.kv_key_bits is not None:
+        os.environ["KV_KEY_BITS"] = str(args.kv_key_bits)
+    if args.kv_value_bits is not None:
+        os.environ["KV_VALUE_BITS"] = str(args.kv_value_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     if args.max_kv_size is not None:

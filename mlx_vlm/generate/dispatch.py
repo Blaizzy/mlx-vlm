@@ -366,6 +366,18 @@ def parse_arguments():
         help="Number of bits to quantize the KV cache to.",
     )
     parser.add_argument(
+        "--kv-key-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant key bit-width (defaults to floor(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -521,6 +533,8 @@ def maybe_quantize_kv_cache(
     kv_group_size,
     kv_bits,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+    kv_key_bits: Optional[float] = None,
+    kv_value_bits: Optional[float] = None,
 ):
     if kv_bits is None:
         return
@@ -535,10 +549,19 @@ def maybe_quantize_kv_cache(
             if isinstance(entry, cache.KVCache):
                 if entry.offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
+                    return TurboQuantKVCache(
+                        bits=kv_bits,
+                        key_bits=kv_key_bits,
+                        value_bits=kv_value_bits,
+                    )
                 if entry.offset < quantized_kv_start:
                     return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
+                return TurboQuantKVCache.from_cache(
+                    entry,
+                    bits=kv_bits,
+                    key_bits=kv_key_bits,
+                    value_bits=kv_value_bits,
+                )
             if isinstance(entry, cache.CacheList):
                 entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
                 return entry
@@ -963,6 +986,8 @@ def stream_generate(
                     _quant_cfg = (
                         {
                             "bits": _kv_bits,
+                            "key_bits": kwargs.get("kv_key_bits"),
+                            "value_bits": kwargs.get("kv_value_bits"),
                             "group_size": kwargs.get("kv_group_size", 64),
                             "scheme": kwargs.get("kv_quant_scheme"),
                         }
@@ -1541,6 +1566,8 @@ def main():
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
+            "kv_key_bits": getattr(args, "kv_key_bits", None),
+            "kv_value_bits": getattr(args, "kv_value_bits", None),
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME

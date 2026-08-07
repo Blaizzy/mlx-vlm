@@ -77,6 +77,7 @@ from .generation import (
     get_max_kv_size,
     get_prefill_step_size,
     get_quantized_kv_bits,
+    get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_server_enable_thinking,
     get_server_max_tokens,

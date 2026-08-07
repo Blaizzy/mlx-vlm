@@ -574,3 +574,47 @@ def test_batch_cache_propagates_asymmetric_bits_to_extracted_rows():
     cache.update_and_fetch(keys, values)
     extracted = cache.extract(0)
     assert (extracted.key_bits, extracted.value_bits) == (8.0, 3.0)
+
+
+def test_maybe_quantize_kv_cache_applies_key_value_overrides():
+    prompt_cache = [KVCache(), KVCache(), KVCache()]
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=0,
+        kv_group_size=64,
+        kv_bits=3.5,
+        kv_quant_scheme="turboquant",
+        kv_key_bits=8,
+        kv_value_bits=3,
+    )
+    converted = [c for c in prompt_cache if isinstance(c, TurboQuantKVCache)]
+    assert converted
+    for entry in converted:
+        assert (entry.key_bits, entry.value_bits) == (8.0, 3.0)
+
+
+def test_maybe_quantize_kv_cache_defaults_unchanged():
+    prompt_cache = [KVCache(), KVCache(), KVCache()]
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=0,
+        kv_group_size=64,
+        kv_bits=3.5,
+        kv_quant_scheme="turboquant",
+    )
+    converted = [c for c in prompt_cache if isinstance(c, TurboQuantKVCache)]
+    assert converted
+    for entry in converted:
+        assert (entry.key_bits, entry.value_bits) == (3.0, 4.0)
+
+
+def test_apc_namespace_separates_key_value_bit_splits():
+    from mlx_vlm.apc import apc_disk_namespace
+
+    base = dict(kv_bits=3.5, kv_group_size=64, kv_quant_scheme="turboquant")
+    default = apc_disk_namespace("m", **base)
+    k8v3 = apc_disk_namespace("m", **base, kv_key_bits=8, kv_value_bits=3)
+    k3v8 = apc_disk_namespace("m", **base, kv_key_bits=3, kv_value_bits=8)
+
+    assert default == apc_disk_namespace("m", **base)
+    assert len({default, k8v3, k3v8}) == 3
