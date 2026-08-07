@@ -730,3 +730,60 @@ def test_kv_quant_fingerprint_matches_legacy_descriptor():
         kv_quant_fingerprint(3.5, 64, "turboquant", 0, 8, 3)
         == "kv3.5-64-turboquant-0-k8-v3"
     )
+
+
+def test_kv_quant_policy_supports_per_tensor_schemes():
+    from mlx_vlm.kv_quant import from_legacy
+
+    policy = from_legacy(
+        8, "uniform", 64, kv_value_bits=3, kv_value_scheme="turboquant"
+    )
+    assert not policy.is_homogeneous
+    assert (policy.key.scheme, policy.key.bits) == ("uniform", 8.0)
+    assert (policy.value.scheme, policy.value.bits) == ("turboquant", 3.0)
+    assert not policy.is_turboquant
+
+
+def test_kv_quant_policy_scheme_property_rejects_heterogeneous():
+    from mlx_vlm.kv_quant import from_legacy
+
+    policy = from_legacy(
+        8, "uniform", 64, kv_value_bits=3, kv_value_scheme="turboquant"
+    )
+    with pytest.raises(ValueError):
+        policy.scheme
+
+
+def test_kv_quant_policy_rejects_unknown_scheme():
+    from mlx_vlm.kv_quant import from_legacy
+
+    with pytest.raises(ValueError):
+        from_legacy(8, "uniform", 64, kv_key_scheme="turbo3")
+
+
+def test_kv_quant_policy_rejects_fractional_uniform_bits():
+    from mlx_vlm.kv_quant import from_legacy
+
+    with pytest.raises(ValueError):
+        from_legacy(3.5, "turboquant", 64, kv_key_bits=3.5, kv_key_scheme="uniform")
+
+
+def test_kv_quant_heterogeneous_round_trips_and_fingerprints_distinctly():
+    from mlx_vlm.kv_quant import from_config, from_legacy
+
+    hetero = from_legacy(
+        8, "uniform", 64, kv_value_bits=3, kv_value_scheme="turboquant"
+    )
+    assert from_config(hetero.to_config()) == hetero
+
+    homogeneous = from_legacy(8, "uniform", 64)
+    assert homogeneous.fingerprint(0) == "kv8.0-64-uniform-0"
+    assert hetero.fingerprint(0) != homogeneous.fingerprint(0)
+    assert hetero.fingerprint(0).endswith("-ksuniform-vsturboquant")
+
+
+def test_kv_quant_homogeneous_fingerprint_has_no_scheme_suffix():
+    from mlx_vlm.kv_quant import from_legacy
+
+    assert "-ks" not in from_legacy(3.5, "turboquant", 64).fingerprint(0)
+    assert "-ks" not in from_legacy(3.5, "turboquant", 64, 8, 3).fingerprint(0)
