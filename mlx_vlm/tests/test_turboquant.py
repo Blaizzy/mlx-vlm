@@ -669,3 +669,64 @@ def test_apc_warm_cache_defaults_match_live_split():
 
     built = _empty_quant_batch_cache([0], _turbo_quant_config())
     assert (built.key_bits, built.value_bits) == (3.0, 4.0)
+
+
+def test_kv_quant_policy_default_split_is_not_an_override():
+    from mlx_vlm.kv_quant import from_legacy
+
+    policy = from_legacy(3.5, "turboquant", 64)
+    assert (policy.key.bits, policy.value.bits) == (3.0, 4.0)
+    assert not policy.has_split_override
+    assert policy.to_config() == {
+        "bits": 3.5,
+        "group_size": 64,
+        "scheme": "turboquant",
+    }
+
+
+def test_kv_quant_policy_records_explicit_override():
+    from mlx_vlm.kv_quant import from_legacy
+
+    policy = from_legacy(3.5, "turboquant", 64, 8, 3)
+    assert policy.has_split_override
+    assert policy.to_config()["key_bits"] == 8.0
+    assert policy.to_config()["value_bits"] == 3.0
+
+
+def test_kv_quant_policy_round_trips_through_config():
+    from mlx_vlm.kv_quant import from_config, from_legacy
+
+    for args in [(3.5, "turboquant", 64, None, None), (3.5, "turboquant", 64, 8, 3)]:
+        policy = from_legacy(*args)
+        assert from_config(policy.to_config()) == policy
+
+
+def test_kv_quant_policy_uniform_and_none():
+    from mlx_vlm.kv_quant import from_legacy
+
+    assert from_legacy(None) is None
+    uniform = from_legacy(8, "uniform", 64)
+    assert uniform.scheme == "uniform"
+    assert not uniform.is_turboquant
+    assert (uniform.key.bits, uniform.value.bits) == (8.0, 8.0)
+    assert uniform.is_homogeneous
+
+
+def test_kv_quant_policy_is_hashable():
+    from mlx_vlm.kv_quant import from_legacy
+
+    a = from_legacy(3.5, "turboquant", 64)
+    b = from_legacy(3.5, "turboquant", 64)
+    c = from_legacy(3.5, "turboquant", 64, 8, 3)
+    assert len({a, b, c}) == 2
+
+
+def test_kv_quant_fingerprint_matches_legacy_descriptor():
+    from mlx_vlm.kv_quant import kv_quant_fingerprint
+
+    assert kv_quant_fingerprint(3.5, 64, "turboquant", 0) == "kv3.5-64-turboquant-0"
+    assert kv_quant_fingerprint(None, None, None, None) == "kvNone-None-None-None"
+    assert (
+        kv_quant_fingerprint(3.5, 64, "turboquant", 0, 8, 3)
+        == "kv3.5-64-turboquant-0-k8-v3"
+    )

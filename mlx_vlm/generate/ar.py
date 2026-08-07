@@ -16,6 +16,7 @@ import mlx.nn as nn
 from tqdm import tqdm
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
@@ -2401,17 +2402,14 @@ class BatchGenerator:
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache
         # backend (uniform BatchQuantized vs BatchTurboQuant).
-        _quant_cfg = (
-            {
-                "bits": self.kv_bits,
-                "key_bits": getattr(self, "kv_key_bits", None),
-                "value_bits": getattr(self, "kv_value_bits", None),
-                "group_size": self.kv_group_size,
-                "scheme": self.kv_quant_scheme,
-            }
-            if self.kv_bits is not None
-            else None
+        _quant_policy = kv_quant_from_legacy(
+            self.kv_bits,
+            self.kv_quant_scheme,
+            self.kv_group_size,
+            getattr(self, "kv_key_bits", None),
+            getattr(self, "kv_value_bits", None),
         )
+        _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()

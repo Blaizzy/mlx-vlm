@@ -11,6 +11,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
@@ -827,17 +828,15 @@ def stream_generate(
                     kwargs["prompt_cache"] = warm_cache
                 else:
                     apc_blocks_in_use = matched_blocks
-                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_policy = kv_quant_from_legacy(
+                        kwargs.get("kv_bits"),
+                        kwargs.get("kv_quant_scheme"),
+                        kwargs.get("kv_group_size", 64),
+                        kwargs.get("kv_key_bits"),
+                        kwargs.get("kv_value_bits"),
+                    )
                     _quant_cfg = (
-                        {
-                            "bits": _kv_bits,
-                            "key_bits": kwargs.get("kv_key_bits"),
-                            "value_bits": kwargs.get("kv_value_bits"),
-                            "group_size": kwargs.get("kv_group_size", 64),
-                            "scheme": kwargs.get("kv_quant_scheme"),
-                        }
-                        if _kv_bits is not None
-                        else None
+                        _quant_policy.to_config() if _quant_policy is not None else None
                     )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,

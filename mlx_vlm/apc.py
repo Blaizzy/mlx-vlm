@@ -57,6 +57,8 @@ import mlx.core as mx
 import numpy as np
 
 from .apc_storage import APCNode, ComponentId, StateHandle
+from .kv_quant import from_config as kv_quant_from_config
+from .kv_quant import kv_quant_fingerprint
 
 logger = logging.getLogger("mlx_vlm.apc")
 
@@ -237,11 +239,14 @@ def apc_disk_namespace(
     """
     from .apc_adapters import ADAPTER_SCHEMA_VERSION
 
-    kv_descriptor = (
-        f"kv{kv_bits}-{kv_group_size}-{kv_quant_scheme}-{quantized_kv_start}"
+    kv_descriptor = kv_quant_fingerprint(
+        kv_bits,
+        kv_group_size,
+        kv_quant_scheme,
+        quantized_kv_start,
+        kv_key_bits,
+        kv_value_bits,
     )
-    if kv_key_bits is not None or kv_value_bits is not None:
-        kv_descriptor += f"-k{kv_key_bits}-v{kv_value_bits}"
     fingerprint = _stable_int_hash(
         ADAPTER_SCHEMA_VERSION,
         _hash_payload(str(model_path)) or 0,
@@ -3513,21 +3518,20 @@ def _fill_stream_layer_cache(
     from .models.cache import KVCache, QuantizedKVCache
 
     if quantize and kv_quant_config is not None:
-        bits = kv_quant_config["bits"]
-        scheme = kv_quant_config.get("scheme")
-        from .turboquant import TurboQuantKVCache, turboquant_enabled
+        policy = kv_quant_from_config(kv_quant_config)
+        from .turboquant import TurboQuantKVCache
 
-        if turboquant_enabled(bits, scheme):
+        if policy.is_turboquant:
             c = TurboQuantKVCache(
-                bits=float(bits),
-                key_bits=kv_quant_config.get("key_bits"),
-                value_bits=kv_quant_config.get("value_bits"),
+                bits=policy.bits,
+                key_bits=policy.key.bits,
+                value_bits=policy.value.bits,
             )
             c.update_and_fetch(merged_k, merged_v)
             return c
         c = QuantizedKVCache(
-            group_size=int(kv_quant_config.get("group_size", 64)),
-            bits=int(bits),
+            group_size=policy.group_size,
+            bits=int(policy.bits),
         )
         c.update_and_fetch(merged_k, merged_v)
         return c
@@ -3567,23 +3571,22 @@ def _fill_batch_layer_cache(
     from .models.cache import BatchKVCache, BatchQuantizedKVCache
 
     if quantize and kv_quant_config is not None:
-        bits = kv_quant_config["bits"]
-        scheme = kv_quant_config.get("scheme")
-        from .turboquant import BatchTurboQuantKVCache, turboquant_enabled
+        policy = kv_quant_from_config(kv_quant_config)
+        from .turboquant import BatchTurboQuantKVCache
 
-        if turboquant_enabled(bits, scheme):
+        if policy.is_turboquant:
             c = BatchTurboQuantKVCache(
                 left_padding,
-                bits=float(bits),
-                key_bits=kv_quant_config.get("key_bits"),
-                value_bits=kv_quant_config.get("value_bits"),
+                bits=policy.bits,
+                key_bits=policy.key.bits,
+                value_bits=policy.value.bits,
             )
             c.update_and_fetch(merged_k, merged_v)
             return c
         c = BatchQuantizedKVCache(
             left_padding,
-            group_size=int(kv_quant_config.get("group_size", 64)),
-            bits=int(bits),
+            group_size=policy.group_size,
+            bits=int(policy.bits),
         )
         c.update_and_fetch(merged_k, merged_v)
         return c
@@ -3836,23 +3839,22 @@ def _merge_exact_cache_entries(
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:
     """Empty quantized batch cache matching live ``_make_cache`` backend."""
-    bits = kv_quant_config["bits"]
-    scheme = kv_quant_config.get("scheme")
-    from .turboquant import BatchTurboQuantKVCache, turboquant_enabled
+    policy = kv_quant_from_config(kv_quant_config)
+    from .turboquant import BatchTurboQuantKVCache
 
-    if turboquant_enabled(bits, scheme):
+    if policy.is_turboquant:
         return BatchTurboQuantKVCache(
             left_padding,
-            bits=float(bits),
-            key_bits=kv_quant_config.get("key_bits"),
-            value_bits=kv_quant_config.get("value_bits"),
+            bits=policy.bits,
+            key_bits=policy.key.bits,
+            value_bits=policy.value.bits,
         )
     from .models.cache import BatchQuantizedKVCache
 
     return BatchQuantizedKVCache(
         left_padding,
-        group_size=int(kv_quant_config.get("group_size", 64)),
-        bits=int(bits),
+        group_size=policy.group_size,
+        bits=int(policy.bits),
     )
 
 
