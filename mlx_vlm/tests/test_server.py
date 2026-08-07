@@ -6285,6 +6285,34 @@ class TestSplitThinking:
         assert reasoning is None
         assert content == "Just plain text."
 
+    def test_prompt_opened_thinking_is_detected(self):
+        assert server.prompt_has_open_thinking("<|im_start|>assistant\n<think>")
+        assert not server.prompt_has_open_thinking("<|im_start|>assistant\n")
+
+    def test_unterminated_thinking_without_markers_is_reasoning(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == text
+        assert content == ""
+
+    def test_unterminated_thinking_stays_content_when_not_in_block(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=False)
+        assert reasoning is None
+        assert content == text
+
+    def test_starts_in_thinking_still_splits_on_close_marker(self):
+        text = "Reasoning first.</think>The answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Reasoning first."
+        assert content == "The answer."
+
+    def test_starts_in_thinking_respects_paired_markers(self):
+        text = "<think>Thinking.</think>Answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Thinking."
+        assert content == "Answer."
+
     def test_empty_content_after_thinking(self):
         text = "<|channel>thought\nOnly thinking.<channel|>"
         reasoning, content = server._split_thinking(text)
