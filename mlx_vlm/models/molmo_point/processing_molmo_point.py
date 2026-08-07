@@ -93,9 +93,11 @@ class MolmoPointProcessor:
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoTokenizer
 
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
+
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             padding_side="left",
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)

@@ -2173,6 +2173,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     full_text,
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
+                    prompt_has_open_thinking(
+                        formatted_prompt,
+                        gen_args.enable_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    ),
                 )
 
                 # Count raw generated tokens minus thinking tag tokens

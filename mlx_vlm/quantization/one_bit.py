@@ -463,6 +463,10 @@ def _quantization_for_path(quantization: dict, path: str) -> dict:
         if key in quantization
     }
     per_layer = quantization.get(path)
+    if per_layer is None and path.startswith("language_model."):
+        # Config keys from the underlying text checkpoint omit the mlx-vlm
+        # ``language_model.`` wrapper prefix that loaded module paths carry.
+        per_layer = quantization.get(path[len("language_model.") :])
     if isinstance(per_layer, dict):
         base.update(per_layer)
     return base

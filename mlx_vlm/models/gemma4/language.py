@@ -650,6 +650,8 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_logits_to_keep = True
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -726,6 +728,7 @@ class LanguageModel(nn.Module):
         # Allow callers to pass pre-allocated sinks directly.
         hidden_sink = kwargs.pop("hidden_sink", hidden_sink)
         shared_kv_sink = kwargs.pop("shared_kv_sink", shared_kv_sink)
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
 
         out = self.model(
             inputs,
@@ -738,6 +741,8 @@ class LanguageModel(nn.Module):
             shared_kv_sink=shared_kv_sink,
             **kwargs,
         )
+        if logits_to_keep:
+            out = out[:, -int(logits_to_keep) :, :]
         out = self.logits_from_hidden(out)
         return LanguageModelOutput(
             logits=out,

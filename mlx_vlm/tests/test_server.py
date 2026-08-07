@@ -1803,6 +1803,82 @@ def test_responses_endpoint_merges_developer_message_with_instructions(client):
     ]
 
 
+def test_responses_endpoint_places_function_output_image_after_tool_result(
+    client, monkeypatch
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    image_url = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "view_image",
+                        "arguments": "{}",
+                        "call_id": "call_view_image",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_view_image",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": image_url,
+                                "detail": "high",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.kwargs["prompt"]
+    assert prompt.index("Tool:") < prompt.index("<image>")
+    assert image_url not in prompt
+    assert mock_generate.call_args.kwargs["image"] == [image_url]
+
+
+def test_responses_endpoint_rejects_image_file_id(client):
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "demo",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_view_image",
+                    "output": [{"type": "input_image", "file_id": "file-image"}],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "input_image.file_id is not supported by this server. "
+        "Provide image_url instead."
+    )
+
+
 @pytest.mark.parametrize(
     ("include_adapter", "adapter_path", "expected_adapter"),
     [
@@ -3037,6 +3113,95 @@ def test_generation_metrics_reports_chunk_and_aggregate_rates():
     assert first_rate is None
     assert second_rate == pytest.approx(12.0)
     assert metrics.rate == pytest.approx(12.0)
+
+
+def test_generation_timings_include_speculative_stats():
+    metrics = SimpleNamespace(
+        cached_tokens=0,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+        peak_memory=0.0,
+        draft_kind="mtp",
+        draft_rounds=5,
+        draft_n_accepted=12,
+        draft_n=20,
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 17)
+
+    assert timings.draft_kind == "mtp"
+    assert timings.draft_rounds == 5
+    assert timings.draft_n_accepted == 12
+    assert timings.draft_n == 20
+    assert timings.draft_n_accepted / timings.draft_n == pytest.approx(0.6)
+
+
+def test_generation_timings_speculative_stats_default_to_none():
+    metrics = SimpleNamespace(
+        cached_tokens=0,
+        prompt_tps=20.0,
+        generation_tps=8.0,
+        token_times=[],
+        peak_memory=0.0,
+    )
+    timings = server.GenerationTimings.from_metrics(metrics, 10, 4)
+
+    assert timings.draft_kind is None
+    assert timings.draft_rounds is None
+    assert timings.draft_n_accepted is None
+    assert timings.draft_n is None
+
+
+def test_generation_metrics_record_speculative_stats():
+    metrics = server_generation.GenerationMetrics()
+
+    metrics.record_chunk(SimpleNamespace(generation_tokens=1, emitted_at=10.0))
+    metrics.record_chunk(
+        SimpleNamespace(
+            generation_tokens=6,
+            emitted_at=10.5,
+            draft_kind="dflash",
+            draft_rounds=3,
+            draft_n_accepted=4,
+            draft_n=9,
+        )
+    )
+
+    assert metrics.draft_kind == "dflash"
+    assert metrics.draft_rounds == 3
+    assert metrics.draft_n_accepted == 4
+    assert metrics.draft_n == 9
+
+
+def test_speculative_lifetime_counters_survive_reset():
+    from mlx_vlm.speculative.common import (
+        _record_speculative_round,
+        speculative_stats_since,
+        speculative_stats_snapshot,
+    )
+
+    drafter = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert speculative_stats_since(drafter, speculative_stats_snapshot(drafter)) == (
+        None,
+        None,
+        None,
+    )
+
+    snapshot = speculative_stats_snapshot(drafter)
+    _record_speculative_round(drafter, 3, 7)
+    _record_speculative_round(drafter, 2.5, 7)
+    drafter.accept_lens = []
+    drafter.draft_lens = []
+    _record_speculative_round(drafter, 1.5, 7)
+
+    rounds, accepted, drafted = speculative_stats_since(drafter, snapshot)
+    assert (rounds, accepted, drafted) == (3, 7, 21)
+
+    later_snapshot = speculative_stats_snapshot(drafter)
+    _record_speculative_round(drafter, 2, 7)
+    rounds, accepted, drafted = speculative_stats_since(drafter, later_snapshot)
+    assert (rounds, accepted, drafted) == (1, 2, 7)
 
 
 def test_chat_completions_returns_timings(client, monkeypatch):
@@ -5060,8 +5225,10 @@ class TestResponseGenerator:
             gen.draft_kind = "mtp"
             gen.tokenizer = SimpleNamespace()
 
-        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
-            del idle_timeout
+        def fake_collect_pending_requests(
+            *, active, idle_timeout=0.1, coalesce_s=0.0, capacity=None
+        ):
+            del idle_timeout, capacity
             calls.append((active, coalesce_s))
             return [], True
 
@@ -6117,6 +6284,34 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(text)
         assert reasoning is None
         assert content == "Just plain text."
+
+    def test_prompt_opened_thinking_is_detected(self):
+        assert server.prompt_has_open_thinking("<|im_start|>assistant\n<think>")
+        assert not server.prompt_has_open_thinking("<|im_start|>assistant\n")
+
+    def test_unterminated_thinking_without_markers_is_reasoning(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == text
+        assert content == ""
+
+    def test_unterminated_thinking_stays_content_when_not_in_block(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=False)
+        assert reasoning is None
+        assert content == text
+
+    def test_starts_in_thinking_still_splits_on_close_marker(self):
+        text = "Reasoning first.</think>The answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Reasoning first."
+        assert content == "The answer."
+
+    def test_starts_in_thinking_respects_paired_markers(self):
+        text = "<think>Thinking.</think>Answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Thinking."
+        assert content == "Answer."
 
     def test_empty_content_after_thinking(self):
         text = "<|channel>thought\nOnly thinking.<channel|>"
