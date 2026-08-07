@@ -250,6 +250,20 @@ def main():
         help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
     )
     parser.add_argument(
+        "--kv-key-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for keys only.",
+    )
+    parser.add_argument(
+        "--kv-value-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for values only.",
+    )
+    parser.add_argument(
         "--kv-group-size",
         type=int,
         default=DEFAULT_KV_GROUP_SIZE,
@@ -351,6 +365,8 @@ def main():
         kwargs["kv_bits"] = args.kv_bits
         kwargs["kv_key_bits"] = args.kv_key_bits
         kwargs["kv_value_bits"] = args.kv_value_bits
+        kwargs["kv_key_scheme"] = args.kv_key_scheme
+        kwargs["kv_value_scheme"] = args.kv_value_scheme
         kwargs["kv_group_size"] = args.kv_group_size
         kwargs["kv_quant_scheme"] = args.kv_quant_scheme
         kwargs["quantized_kv_start"] = args.quantized_kv_start

@@ -8,8 +8,9 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
-from ..turboquant import TurboQuantKVCache, turboquant_enabled
+from ..turboquant import HybridQuantKVCache, TurboQuantKVCache, turboquant_enabled
 
 DEFAULT_KV_GROUP_SIZE = 64
 DEFAULT_KV_QUANT_SCHEME = "uniform"
@@ -69,8 +70,49 @@ def maybe_quantize_kv_cache(
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     kv_key_bits: Optional[float] = None,
     kv_value_bits: Optional[float] = None,
+    kv_key_scheme: Optional[str] = None,
+    kv_value_scheme: Optional[str] = None,
 ):
     if kv_bits is None:
+        return
+
+    policy = kv_quant_from_legacy(
+        kv_bits,
+        kv_quant_scheme,
+        kv_group_size,
+        kv_key_bits,
+        kv_value_bits,
+        kv_key_scheme,
+        kv_value_scheme,
+    )
+    if policy is not None and not policy.is_homogeneous:
+
+        def hybridize(entry):
+            if isinstance(entry, (HybridQuantKVCache, cache.RotatingKVCache)):
+                return entry
+            if isinstance(entry, cache.KVCache):
+                if entry.offset >= quantized_kv_start or entry.offset == 0:
+                    built = HybridQuantKVCache(policy)
+                    if entry.offset:
+                        built.update_and_fetch(*entry.state)
+                    return built
+                return entry
+            if isinstance(entry, cache.CacheList):
+                entry.caches = [hybridize(sub) for sub in entry.caches]
+                return entry
+            if isinstance(entry, list):
+                for i, sub in enumerate(entry):
+                    entry[i] = hybridize(sub)
+                return entry
+            if isinstance(entry, tuple):
+                return tuple(hybridize(sub) for sub in entry)
+            return entry
+
+        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
+        for index, layer_cache in enumerate(prompt_cache):
+            if index == last_idx:
+                continue
+            prompt_cache[index] = hybridize(layer_cache)
         return
 
     if turboquant_enabled(kv_bits, kv_quant_scheme):

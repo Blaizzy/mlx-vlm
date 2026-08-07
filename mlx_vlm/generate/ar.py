@@ -174,6 +174,8 @@ def generate_step(
     kv_bits: Optional[float] = None,
     kv_key_bits: Optional[float] = None,
     kv_value_bits: Optional[float] = None,
+    kv_key_scheme: Optional[str] = None,
+    kv_value_scheme: Optional[str] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -254,6 +256,8 @@ def generate_step(
         kv_quant_scheme=kv_quant_scheme,
         kv_key_bits=kv_key_bits,
         kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
     )
 
     sampler_is_greedy = sampler is None and temperature == 0

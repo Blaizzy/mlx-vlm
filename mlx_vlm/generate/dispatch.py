@@ -380,6 +380,20 @@ def parse_arguments():
         help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
     )
     parser.add_argument(
+        "--kv-key-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for keys only.",
+    )
+    parser.add_argument(
+        "--kv-value-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for values only.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -834,6 +848,8 @@ def stream_generate(
                         kwargs.get("kv_group_size", 64),
                         kwargs.get("kv_key_bits"),
                         kwargs.get("kv_value_bits"),
+                        kwargs.get("kv_key_scheme"),
+                        kwargs.get("kv_value_scheme"),
                     )
                     _quant_cfg = (
                         _quant_policy.to_config() if _quant_policy is not None else None
@@ -1412,6 +1428,8 @@ def main():
             "kv_bits": args.kv_bits,
             "kv_key_bits": getattr(args, "kv_key_bits", None),
             "kv_value_bits": getattr(args, "kv_value_bits", None),
+            "kv_key_scheme": getattr(args, "kv_key_scheme", None),
+            "kv_value_scheme": getattr(args, "kv_value_scheme", None),
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME

@@ -73,6 +73,7 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_kv_split_schemes,
     get_log_progress_interval,
     get_max_kv_size,
     get_prefill_step_size,

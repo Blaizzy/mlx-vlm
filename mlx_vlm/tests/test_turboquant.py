@@ -908,3 +908,42 @@ def test_hybrid_cache_supports_turboquant_key_uniform_value():
     deq_keys, deq_values = cache.update_and_fetch(keys, values)
     assert _relative_error(deq_keys, _turbo_roundtrip(keys, 3, cache.seed)) < 1e-6
     assert _relative_error(deq_values, _uniform_roundtrip(values, 8)) < 1e-6
+
+
+def test_maybe_quantize_kv_cache_builds_hybrid_for_mixed_schemes():
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    prompt_cache = [KVCache(), KVCache(), KVCache()]
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=0,
+        kv_group_size=64,
+        kv_bits=8,
+        kv_quant_scheme="uniform",
+        kv_value_bits=3,
+        kv_value_scheme="turboquant",
+    )
+    built = [c for c in prompt_cache if isinstance(c, HybridQuantKVCache)]
+    assert built
+    for entry in built:
+        assert entry.policy.key.scheme == "uniform"
+        assert entry.policy.key.bits == 8.0
+        assert entry.policy.value.scheme == "turboquant"
+        assert entry.policy.value.bits == 3.0
+
+
+def test_maybe_quantize_kv_cache_keeps_turboquant_for_matching_schemes():
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    prompt_cache = [KVCache(), KVCache(), KVCache()]
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=0,
+        kv_group_size=64,
+        kv_bits=3.5,
+        kv_quant_scheme="turboquant",
+        kv_key_scheme="turboquant",
+        kv_value_scheme="turboquant",
+    )
+    assert not any(isinstance(c, HybridQuantKVCache) for c in prompt_cache)
+    assert any(isinstance(c, TurboQuantKVCache) for c in prompt_cache)
