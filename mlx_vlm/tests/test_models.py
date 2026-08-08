@@ -12201,3 +12201,176 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestMoEOffload(unittest.TestCase):
+    """mlx_vlm.moe_offload: repack a real (tiny) quantized MoE checkpoint --
+    through mlx-vlm's own save_weights/nn.quantize path, not hand-rolled
+    tensor names -- and confirm the offloaded model, loaded transparently via
+    ``load_model``, matches the resident one.
+
+    Tolerance note: gather_qmm (resident, one fused call across all
+    tokens+experts) and quantized_matmul looped per-expert (offloaded) are
+    mathematically equivalent but not bit-identical. Measured directly: a
+    plain (3,D)@(D,H) batched matmul vs. 3 separate (1,D)@(D,H) matmuls on
+    identical data already differs by ~1e-3 relative on this backend, zero
+    routing logic involved -- that's the real noise floor, not a bug. A
+    routing/scatter bug produces order-of-magnitude larger, qualitatively
+    different errors, not a uniform floor like this, so 2% relative is a
+    tight-enough bar to still catch a real regression.
+    """
+
+    def _tiny_deepseek_v3_config(self):
+        from mlx_vlm.models import deepseek_v3
+
+        return deepseek_v3.ModelConfig(
+            model_type="deepseek_v3",
+            vocab_size=256,
+            hidden_size=64,
+            intermediate_size=128,
+            moe_intermediate_size=128,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=16,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=256,
+            rms_norm_eps=1e-5,
+            rope_scaling=None,
+            attention_bias=False,
+        )
+
+    def _build_and_repack(self, tmp_dir, quantize):
+        import dataclasses
+        import json
+        import os
+        from pathlib import Path
+
+        from mlx_vlm.models import deepseek_v3
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import save_weights
+
+        config = self._tiny_deepseek_v3_config()
+        model = deepseek_v3.Model(config)
+        mx.eval(model.parameters())
+
+        group_size, bits = 32, 4
+        if quantize:
+
+            def only_switch_mlp(path, module):
+                return "switch_mlp" in path and hasattr(module, "to_quantized")
+
+            nn.quantize(
+                model,
+                group_size=group_size,
+                bits=bits,
+                class_predicate=only_switch_mlp,
+            )
+            mx.eval(model.parameters())
+
+        build = os.path.join(tmp_dir, "build")
+        offload = os.path.join(tmp_dir, "offload")
+        save_weights(build, model)
+
+        cfg_dict = dataclasses.asdict(config)
+        if quantize:
+            cfg_dict["quantization"] = {
+                "group_size": group_size,
+                "bits": bits,
+                "mode": "affine",
+            }
+        with open(os.path.join(build, "config.json"), "w") as f:
+            json.dump(cfg_dict, f)
+
+        repack(build, offload)
+        return Path(build), Path(offload)
+
+    def _assert_offload_matches_resident(self, quantize):
+        import shutil
+        import tempfile
+
+        from mlx_vlm.utils import load_model
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build, offload = self._build_and_repack(tmp_dir, quantize)
+
+            prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+
+            resident_model = load_model(build)
+            logits_resident = resident_model(prompt).logits
+            mx.eval(logits_resident)
+
+            offload_model = load_model(offload)
+            store = getattr(offload_model, "moe_offload_store", None)
+            self.assertIsNotNone(store, "load_model did not auto-patch the offload dir")
+            self.assertEqual(store.swapped, 2)  # first_k_dense_replace=1, 3 layers
+
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+
+            diff = mx.abs(logits_resident - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_resident).max())
+            self.assertLess(rel, 0.02, f"offloaded output diverged: {rel:.4f} relative")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_offload_matches_resident_quantized(self):
+        self._assert_offload_matches_resident(quantize=True)
+
+    def test_offload_matches_resident_unquantized(self):
+        self._assert_offload_matches_resident(quantize=False)
+
+    def test_patch_model_skips_wrong_expert_count(self):
+        """A SwitchGLU-family module whose expert count doesn't match the
+        store (e.g. always-on shared experts modeled as their own switch
+        layer) must stay resident, not get offloaded and collide indices."""
+        from mlx_vlm.models.switch_layers import SwitchGLU
+        from mlx_vlm.moe_offload import _n_experts
+
+        four_experts = SwitchGLU(16, 32, 4)
+        eight_experts = SwitchGLU(16, 32, 8)
+        mx.eval(four_experts.parameters(), eight_experts.parameters())
+
+        self.assertEqual(_n_experts(four_experts), 4)
+        self.assertEqual(_n_experts(eight_experts), 8)
+
+    def test_plan_partitions_stacked_and_shared_experts(self):
+        from mlx_vlm.moe_offload import plan
+
+        names = [
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.scales",
+            "language_model.model.layers.1.mlp.shared_experts.gate_proj.weight",
+            "language_model.model.layers.2.mlp.experts.3.gate_proj.weight",
+        ]
+        result = plan(names)
+
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            result["resident"],
+        )
+        self.assertIn(
+            "language_model.model.layers.1.mlp.shared_experts.gate_proj.weight",
+            result["resident"],
+        )
+        self.assertEqual(result["layers"], [1, 2])
+        stacked_entries = result["experts"][1]
+        self.assertEqual(stacked_entries[0][2], "STACK")
+        perexpert_entries = result["experts"][2]
+        self.assertEqual(perexpert_entries[0][0], "e3.gate_proj.weight")

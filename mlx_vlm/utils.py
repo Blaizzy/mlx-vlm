@@ -629,6 +629,19 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
+    # An expert-offload directory (see mlx_vlm.moe_offload) has its routed
+    # MoE experts split out into offload_dir/experts/*.safetensors, so the
+    # resident weight files are always missing those keys by design: force
+    # non-strict loading and defer the final `mx.eval(model.parameters())`
+    # until after patch_model() has swapped the affected SwitchGLU modules
+    # for OffloadedSwitchGLU. Skipping that deferral would eagerly
+    # materialize the (otherwise-discarded) randomly-initialized resident
+    # expert tensors those modules start with -- on a large MoE, the exact
+    # OOM this feature exists to avoid.
+    is_offload_dir = (model_path / "offload_index.json").exists()
+    if is_offload_dir:
+        strict = False
+        requested_lazy, lazy = lazy, True
     config = load_config(model_path, **kwargs)
 
     index_file = model_path / "model.safetensors.index.json"
@@ -838,6 +851,14 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model = quantize_activations(model)
 
     model.load_weights(list(weights.items()), strict=strict)
+
+    if is_offload_dir:
+        from .moe_offload import patch_model
+
+        model.moe_offload_store = patch_model(
+            model, str(model_path), lru_experts=kwargs.get("lru_experts")
+        )
+        lazy = requested_lazy
 
     if not lazy:
         mx.eval(model.parameters())
