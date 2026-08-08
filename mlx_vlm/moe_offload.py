@@ -6,10 +6,13 @@ the overwhelming majority of the weights. ``repack`` splits each MoE layer's
 stacked expert tensor into a per-expert on-disk store; ``ExpertStore`` mmaps
 it; ``patch_model`` swaps every ``SwitchGLU`` in a loaded model for an
 ``OffloadedSwitchGLU`` that computes only the router-selected experts, paged
-from that store. Works with any model in ``mlx_vlm/models/`` built on
+from that store. Works with any model built on
 ``mlx_vlm.models.switch_layers.SwitchGLU`` (or a subclass of it, e.g. the
-native Inkling model) -- which is every MoE model in this repo, since they
-all share that module.
+native Inkling model) -- most MoE models in this repo, but not all: a few
+(e.g. Laguna, MiniMax-M3-VL) use a *fused* switch layer with a single
+``gate_up_proj`` instead of separate ``gate_proj``/``up_proj`` modules, and
+aren't supported yet. ``patch_model`` raises rather than silently loading
+those fully resident.
 
 Loading an offload dir (a directory produced by ``repack``) is transparent:
 ``mlx_vlm.load()`` detects ``offload_index.json`` and patches automatically.
@@ -25,8 +28,9 @@ import glob
 import json
 import os
 import re
+import threading
 from collections import OrderedDict
-from typing import Optional
+from typing import Optional, Tuple
 
 # Routed-expert weights of an MoE MLP block. Two on-disk conventions are
 # supported:
@@ -205,6 +209,9 @@ class ExpertStore:
         self._lru: OrderedDict = OrderedDict()
         self._cap = lru_experts
         self.hits = self.misses = 0
+        # Guards _lru/hits/misses: batched/server-style generation can call
+        # get() from multiple threads against one shared model instance.
+        self._lock = threading.Lock()
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
@@ -215,11 +222,12 @@ class ExpertStore:
         bf16/float32) expert -- ``e{j}.{proj}.weight`` is the only key repack
         wrote for it."""
         key = (layer_id, j)
-        if key in self._lru:
-            self.hits += 1
-            self._lru.move_to_end(key)
-            return self._lru[key]
-        self.misses += 1
+        with self._lock:
+            if key in self._lru:
+                self.hits += 1
+                self._lru.move_to_end(key)
+                return self._lru[key]
+            self.misses += 1
         m = self._maps[layer_id]
         trip = lambda p: (
             m[f"e{j}.{p}.weight"],
@@ -228,9 +236,10 @@ class ExpertStore:
         )
         val = (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
         if self._cap:
-            self._lru[key] = val
-            if len(self._lru) > self._cap:
-                self._lru.popitem(last=False)
+            with self._lock:
+                self._lru[key] = val
+                if len(self._lru) > self._cap:
+                    self._lru.popitem(last=False)
         return val
 
     def stats(self) -> dict:
@@ -246,10 +255,22 @@ def patch_model(
     model, offload_dir: str, lru_experts: Optional[int] = None
 ) -> "ExpertStore":
     """Swap every ``SwitchGLU`` (or subclass, e.g. Inkling's) in ``model`` for an
-    offloaded one, paged from ``offload_dir``. Reads group_size/bits/mode from
-    ``offload_dir/config.json``'s top-level ``quantization`` (per-layer
-    quantization overrides are not yet supported -- see module docstring).
-    Returns the store so callers can inspect ``store.stats()``.
+    offloaded one, paged from ``offload_dir``. group_size/bits/mode are
+    resolved *per projection* from ``offload_dir/config.json``'s
+    ``quantization`` dict via the same per-path override mechanism
+    ``mlx_vlm.utils.load_model`` and ``mlx_vlm.convert``'s mixed-precision
+    recipes already use (a single MoE layer can legitimately have different
+    bits per projection today -- e.g. a ``mixed_4_6`` conversion gives
+    ``down_proj`` different bits than ``gate_proj``/``up_proj``). Returns the
+    store so callers can inspect ``store.stats()``.
+
+    Raises ``ValueError`` if no expert files are found in ``offload_dir``, or
+    if nothing gets swapped -- a malformed/mistyped directory should fail
+    loudly, not silently load fully resident with no offloading at all.
+    Models built on a *fused* switch layer (a single ``gate_up_proj``, not
+    separate ``gate_proj``/``up_proj`` modules -- e.g. Laguna, MiniMax-M3-VL)
+    are not yet supported and will hit this same error, since their modules
+    aren't ``SwitchGLU`` and their weights aren't split out by ``repack()``.
 
     ``mlx.nn.Module`` is a dict subclass -- child modules are dict items, so we
     traverse via ``module.items()`` and replace via ``module[name] = ...``
@@ -258,17 +279,28 @@ def patch_model(
     import mlx.nn as nn
 
     from .models.switch_layers import OffloadedSwitchGLU, SwitchGLU
+    from .quantization.one_bit import _quantization_for_path
 
     cfg = json.load(open(os.path.join(offload_dir, "config.json")))
-    q = (
-        cfg.get("quantization")
-        or cfg.get("text_config", {}).get("quantization")
-        or {
-            "group_size": 64,
-            "bits": 4,
-        }
+    quantization = (
+        cfg.get("quantization") or cfg.get("text_config", {}).get("quantization") or {}
     )
+    default_quant = {
+        "group_size": quantization.get("group_size", 64),
+        "bits": quantization.get("bits", 4),
+        "mode": quantization.get("mode", "affine"),
+    }
+
+    def resolve_quant(path: str) -> Tuple[int, int, str]:
+        merged = {**default_quant, **_quantization_for_path(quantization, path)}
+        return merged["group_size"], merged["bits"], merged["mode"]
+
     store = ExpertStore(offload_dir, lru_experts=lru_experts)
+    if not store._maps:
+        raise ValueError(
+            f"No expert files found under {offload_dir}/experts -- this "
+            "doesn't look like a valid repack() output directory."
+        )
     swapped = [0]
 
     def visit(module, path=""):
@@ -289,9 +321,9 @@ def patch_model(
                         module[name] = OffloadedSwitchGLU(
                             store,
                             lid,
-                            q["group_size"],
-                            q["bits"],
-                            q.get("mode", "affine"),
+                            resolve_quant(f"{cp}.gate_proj"),
+                            resolve_quant(f"{cp}.up_proj"),
+                            resolve_quant(f"{cp}.down_proj"),
                             activation=getattr(child, "activation", None),
                             gate_scale=getattr(child, "gate_scale", None),
                             out_scale=getattr(child, "out_scale", None),
@@ -318,6 +350,13 @@ def patch_model(
                         visit(c, f"{cp}.{k}")
 
     visit(model)
+    if swapped[0] == 0:
+        raise ValueError(
+            f"patch_model swapped 0 modules for {offload_dir} -- offload_index.json "
+            "declares experts but no matching SwitchGLU was found in the model "
+            "(fused switch layers like Laguna/MiniMax-M3-VL's gate_up_proj are not "
+            "yet supported; see module docstring)."
+        )
     store.swapped = swapped[0]
     return store
 

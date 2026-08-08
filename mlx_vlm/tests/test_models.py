@@ -12335,6 +12335,122 @@ class TestMoEOffload(unittest.TestCase):
     def test_offload_matches_resident_unquantized(self):
         self._assert_offload_matches_resident(quantize=False)
 
+    def test_offload_resolves_per_projection_quantization_override(self):
+        """A single MoE layer can legitimately have different bits per
+        projection today (mlx-vlm's mixed-precision convert recipes give
+        down_proj different bits than gate_proj/up_proj via a path-substring
+        match that also matches switch_mlp.down_proj). patch_model must
+        resolve group_size/bits/mode per projection via the same per-path
+        override mechanism load_model's own get_class_predicate uses --
+        using one uniform triple for the whole layer would dequantize
+        down_proj with the wrong bits and silently corrupt every token."""
+        import dataclasses
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models import deepseek_v3
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = self._tiny_deepseek_v3_config()
+        model = deepseek_v3.Model(config)
+        mx.eval(model.parameters())
+
+        # gate_proj/up_proj at 4 bits, down_proj at 8 bits -- deliberately far
+        # apart so using the wrong bits for down_proj is not mistakable for
+        # ordinary quantization noise.
+        def mixed_predicate(path, module):
+            if not (hasattr(module, "to_quantized") and "switch_mlp" in path):
+                return False
+            if path.endswith("down_proj"):
+                return {"group_size": 32, "bits": 8}
+            return {"group_size": 32, "bits": 4}
+
+        nn.quantize(model, group_size=32, bits=4, class_predicate=mixed_predicate)
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = Path(os.path.join(tmp_dir, "build"))
+            offload = Path(os.path.join(tmp_dir, "offload"))
+            save_weights(build, model)
+
+            cfg_dict = dataclasses.asdict(config)
+            cfg_dict["quantization"] = {
+                "group_size": 32,
+                "bits": 4,
+                "mode": "affine",
+                "language_model.model.layers.1.mlp.switch_mlp.down_proj": {
+                    "group_size": 32,
+                    "bits": 8,
+                },
+                "language_model.model.layers.2.mlp.switch_mlp.down_proj": {
+                    "group_size": 32,
+                    "bits": 8,
+                },
+            }
+            with open(build / "config.json", "w") as f:
+                json.dump(cfg_dict, f)
+
+            repack(str(build), str(offload))
+
+            prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+            logits_resident = load_model(build)(prompt).logits
+            mx.eval(logits_resident)
+
+            offload_model = load_model(offload)
+            switch_mlp = offload_model.language_model.model.layers[1].mlp.switch_mlp
+            self.assertEqual(switch_mlp.gate_quant, (32, 4, "affine"))
+            self.assertEqual(switch_mlp.up_quant, (32, 4, "affine"))
+            self.assertEqual(
+                switch_mlp.down_quant,
+                (32, 8, "affine"),
+                "down_proj's per-path override (8 bits) was not resolved -- "
+                "got the layer's default (4 bits) instead",
+            )
+
+            logits_offload = offload_model(prompt).logits
+            mx.eval(logits_offload)
+            diff = mx.abs(logits_resident - logits_offload).max().item()
+            rel = diff / float(mx.abs(logits_resident).max())
+            self.assertLess(
+                rel, 0.02, f"mixed-precision offload output diverged: {rel:.4f}"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_patch_model_raises_on_empty_offload_dir(self):
+        """A malformed/mistyped offload dir (offload_index.json present but
+        no expert files -- e.g. an interrupted repack, or a fused-switch-
+        layer model like Laguna/MiniMax-M3-VL that plan() can't split) must
+        fail loudly via patch_model, not silently load fully resident with
+        zero offloading."""
+        import json
+        import os
+        import shutil
+        import tempfile
+
+        import mlx.nn as nn_mod
+
+        from mlx_vlm.moe_offload import patch_model
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(tmp_dir, "experts"))  # present but empty
+            json.dump(
+                {"layers": [], "num_experts": 4},
+                open(os.path.join(tmp_dir, "offload_index.json"), "w"),
+            )
+            json.dump({}, open(os.path.join(tmp_dir, "config.json"), "w"))
+
+            with self.assertRaises(ValueError):
+                patch_model(nn_mod.Module(), tmp_dir)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_patch_model_skips_wrong_expert_count(self):
         """A SwitchGLU-family module whose expert count doesn't match the
         store (e.g. always-on shared experts modeled as their own switch
@@ -12416,11 +12532,13 @@ class TestMoEOffload(unittest.TestCase):
         x = mx.random.normal((3, D))
         indices = mx.array([[0], [0], [0]], dtype=mx.uint32)
 
+        quant = (64, 4, "affine")
         glu = OffloadedSwitchGLU(
             FakeStore(gw, uw, dw),
             layer_id=0,
-            group_size=64,
-            bits=4,
+            gate_quant=quant,
+            up_quant=quant,
+            down_quant=quant,
             activation=NegateGateActivation(),
         )
         out = glu(x, indices)

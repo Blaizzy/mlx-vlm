@@ -1,5 +1,5 @@
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -225,15 +225,23 @@ class OffloadedSwitchGLU(nn.Module):
     data of the same shape -- root cause not fully isolated, smells like an
     ``mx.compile(shapeless=True)`` cache/trace issue), while calling the
     identical activation object trivially can't diverge from itself.
+
+    ``gate_quant``/``up_quant``/``down_quant`` are each a
+    ``(group_size, bits, mode)`` triple, resolved *per projection* rather
+    than shared, because a single MoE layer can legitimately have different
+    quantization per projection today (mlx-vlm's own mixed-precision convert
+    recipes give ``down_proj`` different bits than ``gate_proj``/``up_proj``
+    within the same layer via a path-substring match that also matches
+    ``switch_mlp.down_proj``).
     """
 
     def __init__(
         self,
         store: Any,
         layer_id: int,
-        group_size: int,
-        bits: int,
-        mode: str = "affine",
+        gate_quant: Tuple[int, int, str],
+        up_quant: Tuple[int, int, str],
+        down_quant: Tuple[int, int, str],
         activation: Any = None,
         gate_scale: Optional[mx.array] = None,
         out_scale: Optional[mx.array] = None,
@@ -243,26 +251,31 @@ class OffloadedSwitchGLU(nn.Module):
     ):
         super().__init__()
         self.store, self.layer_id = store, layer_id
-        self.group_size, self.bits, self.mode = group_size, bits, mode
+        self.gate_quant, self.up_quant, self.down_quant = (
+            gate_quant,
+            up_quant,
+            down_quant,
+        )
         self.activation = activation
         self.gate_scale, self.out_scale = gate_scale, out_scale
         self.gate_bias, self.up_bias, self.down_bias = gate_bias, up_bias, down_bias
 
-    def _proj(self, xr, w, scales, biases):
+    def _proj(self, xr, w, scales, biases, quant):
         """One expert's projection. ``scales is None`` means this expert's
         weight was never quantized (a plain bf16/float32 checkpoint) --
         matches ``SwitchLinear.__call__``'s plain matmul in that case."""
         if scales is None:
             return xr @ w.T
+        group_size, bits, mode = quant
         return mx.quantized_matmul(
             xr,
             w,
             scales=scales,
             biases=biases,
             transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
         )
 
     def __call__(self, x, indices) -> mx.array:
@@ -279,14 +292,14 @@ class OffloadedSwitchGLU(nn.Module):
             (gw, gsc, gb), (uw, usc, ub), (dw, dsc, db) = self.store.get(
                 self.layer_id, j
             )
-            x_gate = self._proj(xr, gw, gsc, gb)
+            x_gate = self._proj(xr, gw, gsc, gb, self.gate_quant)
             if self.gate_bias is not None:
                 x_gate = x_gate + self.gate_bias[j].astype(x_gate.dtype)
             if self.gate_scale is not None:
                 # every row in this iteration routes to the same expert j, so
                 # the per-expert correction is one shared scalar, not a gather.
                 x_gate = x_gate * self.gate_scale[j].astype(x_gate.dtype)
-            x_up = self._proj(xr, uw, usc, ub)
+            x_up = self._proj(xr, uw, usc, ub, self.up_quant)
             if self.up_bias is not None:
                 x_up = x_up + self.up_bias[j].astype(x_up.dtype)
             # Matches SwitchGLU.__call__'s own `self.activation(x_up, x_gate)`
@@ -296,7 +309,7 @@ class OffloadedSwitchGLU(nn.Module):
                 if self.activation is not None
                 else (nn.silu(x_gate) * x_up)
             )
-            d = self._proj(h, dw, dsc, db)
+            d = self._proj(h, dw, dsc, db, self.down_quant)
             if self.down_bias is not None:
                 d = d + self.down_bias[j].astype(d.dtype)
             if self.out_scale is not None:

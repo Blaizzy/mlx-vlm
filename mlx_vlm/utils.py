@@ -850,6 +850,29 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
+    if is_offload_dir:
+        # strict=False is forced above because the resident weight files are
+        # always missing the routed-expert keys by design -- but that must
+        # not silently swallow a genuinely malformed offload dir (a
+        # truncated/missing resident shard, a repack() regex misclassifying
+        # some other tensor). Verify every parameter this load will leave at
+        # its random-init value is actually an expected expert-weight path,
+        # and fail loudly on anything else, restoring the validation
+        # strict=True would normally provide.
+        from .moe_offload import PEREXPERT_RE, STACKED_RE
+
+        expected = {k for k, _ in tree_flatten(model.parameters())}
+        missing = expected - set(weights)
+        unexpected_missing = [
+            k for k in missing if not (PEREXPERT_RE.match(k) or STACKED_RE.match(k))
+        ]
+        if unexpected_missing:
+            raise ValueError(
+                f"Offload dir {model_path} is missing {len(unexpected_missing)} "
+                "resident parameters that aren't routed-expert weights (malformed "
+                "repack() output?): " + ", ".join(sorted(unexpected_missing)[:10])
+            )
+
     model.load_weights(list(weights.items()), strict=strict)
 
     if is_offload_dir:
