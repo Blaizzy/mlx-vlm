@@ -947,3 +947,82 @@ def test_maybe_quantize_kv_cache_keeps_turboquant_for_matching_schemes():
     )
     assert not any(isinstance(c, HybridQuantKVCache) for c in prompt_cache)
     assert any(isinstance(c, TurboQuantKVCache) for c in prompt_cache)
+
+
+def test_batch_generator_accepts_scheme_overrides():
+    import inspect
+
+    from mlx_vlm.generate.ar import BatchGenerator, _make_cache
+
+    for target in (BatchGenerator.__init__, _make_cache):
+        params = inspect.signature(target).parameters
+        assert "kv_key_scheme" in params
+        assert "kv_value_scheme" in params
+
+
+def test_make_cache_rejects_mixed_schemes():
+    from mlx_vlm.generate.ar import _make_cache
+
+    class _FakeModel:
+        def make_cache(self):
+            return [KVCache()]
+
+    with pytest.raises(NotImplementedError, match="batch path"):
+        _make_cache(
+            _FakeModel(),
+            [0],
+            kv_bits=8,
+            kv_quant_scheme="uniform",
+            kv_value_bits=3,
+            kv_value_scheme="turboquant",
+        )
+
+
+def test_make_cache_still_builds_homogeneous_batch_caches():
+    from mlx_vlm.generate.ar import _make_cache
+
+    class _FakeModel:
+        def make_cache(self):
+            return [KVCache()]
+
+    caches = _make_cache(_FakeModel(), [0], kv_bits=3.5, kv_quant_scheme="turboquant")
+    assert isinstance(caches[0], BatchTurboQuantKVCache)
+
+
+def test_apc_batch_builders_reject_mixed_schemes():
+    from mlx_vlm.apc import _empty_quant_batch_cache
+
+    with pytest.raises(NotImplementedError, match="batch prefix caches"):
+        _empty_quant_batch_cache(
+            [0],
+            {
+                "bits": 8,
+                "group_size": 64,
+                "scheme": "uniform",
+                "value_bits": 3,
+                "value_scheme": "turboquant",
+            },
+        )
+
+
+def test_apc_stream_builder_supports_mixed_schemes():
+    from mlx_vlm.apc import _fill_stream_layer_cache
+    from mlx_vlm.turboquant import HybridQuantKVCache
+
+    built = _fill_stream_layer_cache(
+        mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 4, 8, 256)).astype(mx.bfloat16),
+        prefix_len=8,
+        quantize=True,
+        kv_quant_config={
+            "bits": 8,
+            "group_size": 64,
+            "scheme": "uniform",
+            "value_bits": 3,
+            "value_scheme": "turboquant",
+        },
+    )
+    assert isinstance(built, HybridQuantKVCache)
+    assert built.policy.key.scheme == "uniform"
+    assert built.policy.value.scheme == "turboquant"
+    assert built.offset == 8

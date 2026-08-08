@@ -3500,6 +3500,14 @@ class APCManager:
             self.disk.close()
 
 
+def _reject_mixed_batch_policy(policy) -> None:
+    if policy is not None and not policy.is_homogeneous:
+        raise NotImplementedError(
+            "mixed key/value KV quantization schemes are not supported for "
+            "batch prefix caches yet"
+        )
+
+
 def _fill_stream_layer_cache(
     merged_k: mx.array,
     merged_v: mx.array,
@@ -3519,8 +3527,13 @@ def _fill_stream_layer_cache(
 
     if quantize and kv_quant_config is not None:
         policy = kv_quant_from_config(kv_quant_config)
-        from .turboquant import TurboQuantKVCache
+        from .turboquant import HybridQuantKVCache, TurboQuantKVCache
 
+        if not policy.is_homogeneous:
+            c = HybridQuantKVCache(policy)
+            c.update_and_fetch(merged_k, merged_v)
+            c.offset = prefix_len
+            return c
         if policy.is_turboquant:
             c = TurboQuantKVCache(
                 bits=policy.bits,
@@ -3574,6 +3587,7 @@ def _fill_batch_layer_cache(
         policy = kv_quant_from_config(kv_quant_config)
         from .turboquant import BatchTurboQuantKVCache
 
+        _reject_mixed_batch_policy(policy)
         if policy.is_turboquant:
             c = BatchTurboQuantKVCache(
                 left_padding,
@@ -3842,6 +3856,7 @@ def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> 
     policy = kv_quant_from_config(kv_quant_config)
     from .turboquant import BatchTurboQuantKVCache
 
+    _reject_mixed_batch_policy(policy)
     if policy.is_turboquant:
         return BatchTurboQuantKVCache(
             left_padding,
