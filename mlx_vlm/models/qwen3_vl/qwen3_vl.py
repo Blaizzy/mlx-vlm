@@ -36,7 +36,9 @@ class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
-        self.vision_tower = VisionModel(config.vision_config)
+        self.vision_tower = (
+            None if config.skip_vision else VisionModel(config.vision_config)
+        )
         self.language_model = LanguageModel(config.text_config, config)
 
     def get_input_embeddings(
@@ -48,14 +50,11 @@ class Model(nn.Module):
         image_grid_thw = kwargs.get("image_grid_thw", None)
         video_grid_thw = kwargs.get("video_grid_thw", None)
         mask = kwargs.get("mask", None)
-        grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
+        pixel_values_videos = kwargs.get("pixel_values_videos", None)
 
         # Video inputs flow in via pixel_values_videos from the generic
         # prepare_inputs path; alias to pixel_values for the unified encoder.
-        if pixel_values is None:
-            pixel_values = kwargs.get("pixel_values_videos", None)
-
-        if pixel_values is None:
+        if pixel_values is None and pixel_values_videos is None:
             position_ids, rope_deltas = self.language_model.get_rope_index(
                 input_ids, attention_mask=mask
             )
@@ -65,36 +64,61 @@ class Model(nn.Module):
                 rope_deltas=rope_deltas,
             )
 
-        dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = pixel_values.astype(dtype)
-
         # Get the input embeddings from the language model
         inputs_embeds = self.language_model.model.embed_tokens(input_ids)
 
         cached = kwargs.get("cached_image_features", None)
         if cached is not None:
-            hidden_states = cached
+            inputs_embeds, _ = self.merge_input_ids_with_image_features(
+                cached,
+                inputs_embeds,
+                input_ids,
+                self.config.image_token_index,
+                self.config.video_token_index,
+            )
             deepstack_visual_embeds = None
         else:
-            # Get the ouptut hidden states from the vision model
-            hidden_states, deepstack_visual_embeds = self.vision_tower(
-                pixel_values, grid_thw
+            if self.vision_tower is None:
+                raise ValueError(
+                    "this Qwen3-VL model was loaded without a vision tower"
+                )
+            dtype = self.vision_tower.patch_embed.proj.weight.dtype
+            image_features = image_deepstack = None
+            video_features = video_deepstack = None
+            if pixel_values is not None:
+                image_features, image_deepstack = self.vision_tower(
+                    pixel_values.astype(dtype), image_grid_thw
+                )
+            if pixel_values_videos is not None:
+                video_features, video_deepstack = self.vision_tower(
+                    pixel_values_videos.astype(dtype), video_grid_thw
+                )
+
+            image_mask = input_ids == self.config.image_token_index
+            video_mask = input_ids == self.config.video_token_index
+            if image_features is not None:
+                inputs_embeds = masked_scatter(
+                    inputs_embeds,
+                    mx.broadcast_to(image_mask[..., None], inputs_embeds.shape),
+                    image_features,
+                )
+            if video_features is not None:
+                inputs_embeds = masked_scatter(
+                    inputs_embeds,
+                    mx.broadcast_to(video_mask[..., None], inputs_embeds.shape),
+                    video_features,
+                )
+            deepstack_visual_embeds = self._merge_deepstack_features(
+                input_ids,
+                image_deepstack,
+                video_deepstack,
             )
 
-        visual_pos_masks = None
-
-        # Insert special image tokens in the input_ids
-        inputs_embeds, image_mask = self.merge_input_ids_with_image_features(
-            hidden_states,
-            inputs_embeds,
-            input_ids,
-            self.config.image_token_index,
-            self.config.video_token_index,
+        visual_pos_masks = (input_ids == self.config.image_token_index) | (
+            input_ids == self.config.video_token_index
         )
-
-        image_mask = image_mask[..., 0]
-        visual_pos_masks = image_mask
-        mx.eval(deepstack_visual_embeds)
+        if deepstack_visual_embeds is not None:
+            mx.eval(deepstack_visual_embeds)
 
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids, image_grid_thw, video_grid_thw, mask
@@ -106,6 +130,58 @@ class Model(nn.Module):
             deepstack_visual_embeds=deepstack_visual_embeds,
             position_ids=position_ids,
             rope_deltas=rope_deltas,
+        )
+
+    def _merge_deepstack_features(
+        self,
+        input_ids: mx.array,
+        image_features: Optional[mx.array],
+        video_features: Optional[mx.array],
+    ) -> Optional[mx.array]:
+        if image_features is None:
+            return video_features
+        if video_features is None:
+            return image_features
+        if len(image_features) != len(video_features):
+            raise ValueError("image and video deepstack feature counts must match")
+
+        token_rows = input_ids.tolist()
+        merged_layers = []
+        for image_layer, video_layer in zip(image_features, video_features):
+            rows = []
+            image_index = video_index = 0
+            for token_row in token_rows:
+                for token in token_row:
+                    if token == self.config.image_token_index:
+                        rows.append(image_layer[image_index])
+                        image_index += 1
+                    elif token == self.config.video_token_index:
+                        rows.append(video_layer[video_index])
+                        video_index += 1
+            merged_layers.append(mx.stack(rows))
+        return mx.stack(merged_layers)
+
+    def hidden_state_at_layer(
+        self,
+        input_ids: mx.array,
+        layer: int,
+        pixel_values: Optional[mx.array] = None,
+        mask: Optional[mx.array] = None,
+        **kwargs,
+    ) -> mx.array:
+        """Return the pre-final-norm hidden state after ``layer`` decoder layers."""
+        features = self.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **kwargs
+        )
+        return self.language_model.model(
+            input_ids,
+            inputs_embeds=features.inputs_embeds,
+            mask=mask,
+            position_ids=features.position_ids,
+            visual_pos_masks=features.visual_pos_masks,
+            deepstack_visual_embeds=features.deepstack_visual_embeds,
+            stop_after_layer=layer,
+            apply_final_norm=False,
         )
 
     @staticmethod

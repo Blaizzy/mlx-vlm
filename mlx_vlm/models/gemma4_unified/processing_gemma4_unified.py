@@ -362,7 +362,7 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         from transformers import AutoTokenizer
 
-        kwargs.pop("trust_remote_code", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
         kwargs.pop("use_fast", None)
 
         model_path = Path(pretrained_model_name_or_path)
@@ -370,7 +370,7 @@ class Gemma4UnifiedProcessor(Gemma4Processor):
 
         tokenizer = AutoTokenizer.from_pretrained(
             str(model_path) if is_local else pretrained_model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=trust_remote_code,
             local_files_only=is_local,
         )
         load_chat_template(tokenizer, pretrained_model_name_or_path)

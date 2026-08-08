@@ -260,9 +260,12 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
+    return _split_thinking_text(
+        text, thinking_start_token, thinking_end_token, starts_in_thinking
+    )
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
