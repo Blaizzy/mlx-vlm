@@ -629,15 +629,10 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
     strict = kwargs.pop("strict", True)
-    # An expert-offload directory (see mlx_vlm.moe_offload) has its routed
-    # MoE experts split out into offload_dir/experts/*.safetensors, so the
-    # resident weight files are always missing those keys by design: force
-    # non-strict loading and defer the final `mx.eval(model.parameters())`
-    # until after patch_model() has swapped the affected SwitchGLU modules
-    # for OffloadedSwitchGLU. Skipping that deferral would eagerly
-    # materialize the (otherwise-discarded) randomly-initialized resident
-    # expert tensors those modules start with -- on a large MoE, the exact
-    # OOM this feature exists to avoid.
+    # An expert-offload dir (mlx_vlm.moe_offload) is missing routed-expert
+    # keys by design; defer eval until patch_model swaps those modules, or
+    # their random-init resident weights get eagerly materialized -- the OOM
+    # this feature exists to avoid.
     is_offload_dir = (model_path / "offload_index.json").exists()
     if is_offload_dir:
         strict = False
@@ -851,14 +846,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model = quantize_activations(model)
 
     if is_offload_dir:
-        # strict=False is forced above because the resident weight files are
-        # always missing the routed-expert keys by design -- but that must
-        # not silently swallow a genuinely malformed offload dir (a
-        # truncated/missing resident shard, a repack() regex misclassifying
-        # some other tensor). Verify every parameter this load will leave at
-        # its random-init value is actually an expected expert-weight path,
-        # and fail loudly on anything else, restoring the validation
-        # strict=True would normally provide.
+        # strict=False above must not swallow a genuinely malformed offload
+        # dir: verify every parameter left at random-init is actually an
+        # expected expert-weight path, and fail loudly on anything else.
         from .moe_offload import PEREXPERT_RE, STACKED_RE
 
         expected = {k for k, _ in tree_flatten(model.parameters())}

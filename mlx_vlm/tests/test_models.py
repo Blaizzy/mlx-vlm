@@ -12204,21 +12204,10 @@ class TestLfm2Embedding(unittest.TestCase):
 
 
 class TestMoEOffload(unittest.TestCase):
-    """mlx_vlm.moe_offload: repack a real (tiny) quantized MoE checkpoint --
-    through mlx-vlm's own save_weights/nn.quantize path, not hand-rolled
-    tensor names -- and confirm the offloaded model, loaded transparently via
-    ``load_model``, matches the resident one.
-
-    Tolerance note: gather_qmm (resident, one fused call across all
-    tokens+experts) and quantized_matmul looped per-expert (offloaded) are
-    mathematically equivalent but not bit-identical. Measured directly: a
-    plain (3,D)@(D,H) batched matmul vs. 3 separate (1,D)@(D,H) matmuls on
-    identical data already differs by ~1e-3 relative on this backend, zero
-    routing logic involved -- that's the real noise floor, not a bug. A
-    routing/scatter bug produces order-of-magnitude larger, qualitatively
-    different errors, not a uniform floor like this, so 2% relative is a
-    tight-enough bar to still catch a real regression.
-    """
+    """Repacks a real (tiny) checkpoint via mlx-vlm's own save_weights/
+    nn.quantize path and confirms the offloaded model matches resident.
+    2% relative tolerance: batched vs. looped matmul differs by ~1e-3
+    relative from GEMM reduction order alone, not a bug."""
 
     def _tiny_deepseek_v3_config(self):
         from mlx_vlm.models import deepseek_v3
@@ -12336,14 +12325,9 @@ class TestMoEOffload(unittest.TestCase):
         self._assert_offload_matches_resident(quantize=False)
 
     def test_offload_resolves_per_projection_quantization_override(self):
-        """A single MoE layer can legitimately have different bits per
-        projection today (mlx-vlm's mixed-precision convert recipes give
-        down_proj different bits than gate_proj/up_proj via a path-substring
-        match that also matches switch_mlp.down_proj). patch_model must
-        resolve group_size/bits/mode per projection via the same per-path
-        override mechanism load_model's own get_class_predicate uses --
-        using one uniform triple for the whole layer would dequantize
-        down_proj with the wrong bits and silently corrupt every token."""
+        """mlx-vlm's mixed-precision recipes can give down_proj different
+        bits than gate_proj/up_proj within one layer; patch_model must
+        resolve group_size/bits/mode per projection, not one uniform triple."""
         import dataclasses
         import json
         import os
@@ -12359,9 +12343,7 @@ class TestMoEOffload(unittest.TestCase):
         model = deepseek_v3.Model(config)
         mx.eval(model.parameters())
 
-        # gate_proj/up_proj at 4 bits, down_proj at 8 bits -- deliberately far
-        # apart so using the wrong bits for down_proj is not mistakable for
-        # ordinary quantization noise.
+        # 4 vs 8 bits: far enough apart that a wrong-bits bug isn't mistakable for noise.
         def mixed_predicate(path, module):
             if not (hasattr(module, "to_quantized") and "switch_mlp" in path):
                 return False
@@ -12423,11 +12405,8 @@ class TestMoEOffload(unittest.TestCase):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     def test_patch_model_raises_on_empty_offload_dir(self):
-        """A malformed/mistyped offload dir (offload_index.json present but
-        no expert files -- e.g. an interrupted repack, or a fused-switch-
-        layer model like Laguna/MiniMax-M3-VL that plan() can't split) must
-        fail loudly via patch_model, not silently load fully resident with
-        zero offloading."""
+        """A malformed offload dir (index present, no expert files) must
+        fail loudly via patch_model, not silently load fully resident."""
         import json
         import os
         import shutil
@@ -12491,21 +12470,161 @@ class TestMoEOffload(unittest.TestCase):
         perexpert_entries = result["experts"][2]
         self.assertEqual(perexpert_entries[0][0], "e3.gate_proj.weight")
 
-    def test_offloaded_switch_glu_uses_the_original_activation_object(self):
-        """OffloadedSwitchGLU must call the *same* activation object the
-        original SwitchGLU held, not reimplement silu(gate)*x inline.
+    def test_plan_partitions_fused_gate_up_proj(self):
+        from mlx_vlm.moe_offload import plan
 
-        On a real checkpoint (gpt-oss-20b-MXFP4-Q8), an inline
-        `nn.silu(gate) * x` reimplementation measurably diverged from
-        SwitchGLU's own `self.activation`, which for that model is a
-        `mx.compile(shapeless=True)`'d `swiglu` -- on real activations, not
-        on random data of the same shape (root cause not fully isolated).
-        A synthetic reproduction of that specific divergence isn't reliable,
-        so this test instead guards the mechanism directly: swap in an
-        activation that is deliberately *not* `silu(gate) * x`, and require
-        OffloadedSwitchGLU's output to reflect it exactly. That fails
-        immediately if the activation is ever hardcoded again.
-        """
+        names = [
+            "language_model.model.layers.3.mlp.switch_mlp.gate_up_proj.weight",
+            "language_model.model.layers.3.mlp.switch_mlp.gate_up_proj.scales",
+            "language_model.model.layers.3.mlp.switch_mlp.down_proj.weight",
+        ]
+        result = plan(names)
+
+        self.assertEqual(result["layers"], [3])
+        modes = {mode for _, _, mode in result["experts"][3]}
+        self.assertEqual(modes, {"STACK_FUSED", "STACK"})
+
+    def test_expert_store_get_is_thread_safe(self):
+        """get()'s LRU/counter bookkeeping under real concurrent pressure:
+        no lost updates, no cap violation, no exception."""
+        import shutil
+        import tempfile
+        import threading
+
+        from mlx_vlm.moe_offload import ExpertStore
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build, offload = self._build_and_repack(tmp_dir, quantize=True)
+            store = ExpertStore(str(offload), lru_experts=2)
+
+            n_threads, n_iters = 8, 200
+            errors = []
+
+            def worker(tid):
+                for i in range(n_iters):
+                    try:
+                        val = store.get(1 + (i % 2), (i + tid) % 4)
+                        assert len(val) == 3
+                    except Exception as e:
+                        errors.append(e)
+                        return
+
+            threads = [
+                threading.Thread(target=worker, args=(t,)) for t in range(n_threads)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            self.assertEqual(errors, [])
+            self.assertLessEqual(len(store._lru), store._cap)
+            self.assertEqual(store.hits + store.misses, n_threads * n_iters)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_fused_switch_layer_offloads_correctly(self):
+        """Laguna/MiniMax-M3-VL use a fused gate_up_proj instead of separate
+        gate_proj/up_proj; confirm the repack-time split reconstructs it."""
+        import json
+        import os
+        import shutil
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.laguna.language import LagunaPackedSwitchGLU
+        from mlx_vlm.moe_offload import repack
+        from mlx_vlm.utils import save_weights
+
+        class FusedMLP(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.switch_mlp = LagunaPackedSwitchGLU(32, 64, 4)
+
+        class InnerModel(nn.Module):
+            """Named ``model`` so paths read ``model.layers.N...``, matching
+            the ``\\.layers\\.`` regex repack()/patch_model() rely on."""
+
+            def __init__(self):
+                super().__init__()
+                self.router = nn.Linear(32, 4, bias=False)
+                self.layers = [FusedMLP()]
+
+        class FusedTestModel(nn.Module):
+            """One MoE layer, fused switch_mlp, top-2-of-4 routing."""
+
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                self.model_type = "fused_test_model"
+                self.model = InnerModel()
+
+            def __call__(self, x):
+                g = self.model.router(x)
+                indices = mx.argsort(-g, axis=-1)[..., :2].astype(mx.uint32)
+                weights = mx.softmax(mx.take_along_axis(g, indices, axis=-1), axis=-1)
+                y = self.model.layers[0].switch_mlp(x, indices)
+                return (y * weights[..., None]).sum(-2)
+
+        model = FusedTestModel({"model_type": "fused_test_model"})
+        mx.eval(model.parameters())
+
+        group_size, bits = 32, 4
+        nn.quantize(
+            model,
+            group_size=group_size,
+            bits=bits,
+            class_predicate=lambda p, m: "switch_mlp" in p
+            and hasattr(m, "to_quantized"),
+        )
+        mx.eval(model.parameters())
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = Path(os.path.join(tmp_dir, "build"))
+            offload = Path(os.path.join(tmp_dir, "offload"))
+            save_weights(build, model)
+            json.dump(
+                {
+                    "model_type": "fused_test_model",
+                    "quantization": {
+                        "group_size": group_size,
+                        "bits": bits,
+                        "mode": "affine",
+                    },
+                },
+                open(build / "config.json", "w"),
+            )
+            repack(str(build), str(offload))
+
+            x = mx.random.normal((3, 32))
+            mx.eval(x)
+
+            resident_out = model(x)
+            mx.eval(resident_out)
+
+            # Patch the already-loaded resident model directly, skipping
+            # load_model's full model-registry plumbing for this test-only class.
+            from mlx_vlm.moe_offload import patch_model
+
+            store = patch_model(model, str(offload))
+            self.assertEqual(store.swapped, 1)
+            offload_out = model(x)
+            mx.eval(offload_out)
+
+            diff = mx.abs(resident_out - offload_out).max().item()
+            rel = diff / float(mx.abs(resident_out).max())
+            self.assertLess(
+                rel, 0.02, f"fused switch layer offload diverged: {rel:.4f}"
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def test_offloaded_switch_glu_uses_the_original_activation_object(self):
+        """Must call the same activation object the original SwitchGLU
+        held, not reimplement silu(gate)*x inline (a real divergence was
+        found on gpt-oss-20b-MXFP4-Q8); swap in a non-silu activation."""
         from mlx_vlm.models.switch_layers import OffloadedSwitchGLU
 
         class NegateGateActivation:

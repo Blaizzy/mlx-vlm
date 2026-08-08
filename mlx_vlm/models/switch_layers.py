@@ -199,40 +199,18 @@ class OffloadedSwitchGLU(nn.Module):
     """Drop-in for ``SwitchGLU``/``InklingSwitchGLU``: computes only the
     router-selected experts, paged from an on-disk :class:`ExpertStore`
     (see ``mlx_vlm.moe_offload``) instead of holding all experts resident.
+    Matches ``SwitchGLU.__call__(x, indices) -> [..., K, D]`` exactly (no
+    weighting/sum -- the caller already does that).
 
-    Matches ``SwitchGLU.__call__(x, indices) -> [..., K, D]`` exactly: no
-    router weighting/sum here, the caller does that (every MoE block in this
-    repo already does ``(y * scores[..., None]).sum(-2)`` after calling its
-    ``switch_mlp``), so this can replace ``SwitchGLU`` in place without
-    touching the surrounding block code.
-
-    ``gate_scale``/``out_scale`` are the (tiny, per-expert-count-sized)
-    Inkling NVFP4 correction vectors; ``gate_bias``/``up_bias``/``down_bias``
-    are ``SwitchLinear``'s optional per-expert additive bias (e.g. gpt-oss's
-    experts carry one on every projection). All are kept resident and
-    applied here rather than paged, since they're negligible in size next to
-    the expert weights -- but they are not optional to skip: dropping a
-    real, nonzero per-expert bias silently corrupts every token that routes
-    through that expert.
-
-    ``activation`` is the original ``SwitchGLU``'s activation callable
-    (e.g. its ``SwiGLU()`` instance, whose ``swiglu`` is
-    ``mx.compile(shapeless=True)``'d). It is called exactly as
-    ``SwitchGLU.__call__`` calls it -- ``activation(x_up, x_gate)`` -- rather
-    than reimplementing ``silu(gate) * x`` inline: on at least one real
-    checkpoint (gpt-oss-20b-MXFP4-Q8), that inline reimplementation measurably
-    diverges from the compiled ``swiglu`` on real activations (not on random
-    data of the same shape -- root cause not fully isolated, smells like an
-    ``mx.compile(shapeless=True)`` cache/trace issue), while calling the
-    identical activation object trivially can't diverge from itself.
-
-    ``gate_quant``/``up_quant``/``down_quant`` are each a
-    ``(group_size, bits, mode)`` triple, resolved *per projection* rather
-    than shared, because a single MoE layer can legitimately have different
-    quantization per projection today (mlx-vlm's own mixed-precision convert
-    recipes give ``down_proj`` different bits than ``gate_proj``/``up_proj``
-    within the same layer via a path-substring match that also matches
-    ``switch_mlp.down_proj``).
+    ``gate_scale``/``out_scale`` are Inkling's resident NVFP4 correction
+    vectors; ``gate_bias``/``up_bias``/``down_bias`` are ``SwitchLinear``'s
+    optional per-expert additive bias (e.g. gpt-oss). ``activation`` is the
+    original ``SwitchGLU``'s activation object, called exactly as
+    ``activation(x_up, x_gate)`` rather than reimplemented inline -- an inline
+    ``silu(gate) * x`` measurably diverged from a real checkpoint's compiled
+    activation on real data. ``gate_quant``/``up_quant``/``down_quant`` are
+    each a ``(group_size, bits, mode)`` triple, resolved per projection since
+    a layer can have different bits per projection (mixed-precision converts).
     """
 
     def __init__(
@@ -296,14 +274,11 @@ class OffloadedSwitchGLU(nn.Module):
             if self.gate_bias is not None:
                 x_gate = x_gate + self.gate_bias[j].astype(x_gate.dtype)
             if self.gate_scale is not None:
-                # every row in this iteration routes to the same expert j, so
-                # the per-expert correction is one shared scalar, not a gather.
+                # one scalar per iteration (every row shares expert j), not a gather.
                 x_gate = x_gate * self.gate_scale[j].astype(x_gate.dtype)
             x_up = self._proj(xr, uw, usc, ub, self.up_quant)
             if self.up_bias is not None:
                 x_up = x_up + self.up_bias[j].astype(x_up.dtype)
-            # Matches SwitchGLU.__call__'s own `self.activation(x_up, x_gate)`
-            # exactly -- see class docstring for why this can't be inlined.
             h = (
                 self.activation(x_up, x_gate)
                 if self.activation is not None
@@ -315,12 +290,8 @@ class OffloadedSwitchGLU(nn.Module):
             if self.out_scale is not None:
                 d = d * self.out_scale[j].astype(d.dtype)
             out = out.at[mx.array(tok), mx.array(slot)].add(d)
-        # Force this layer's experts to materialize before returning. Left lazy,
-        # a long prefill would keep every routed expert touched across ALL
-        # layers pinned in one graph until the final eval -- on a large MoE
-        # that's hundreds of GB and OOMs. Evaluating per layer bounds the live
-        # expert set to (LRU cache + this layer), matching how chunked prefill
-        # (prefill_step_size) already bounds sequence length.
+        # Eval per layer, or a long prefill pins every expert across every
+        # layer in one graph until the final eval -- OOMs on a large MoE.
         mx.eval(out)
         return out.reshape(*lead, K, D)
 

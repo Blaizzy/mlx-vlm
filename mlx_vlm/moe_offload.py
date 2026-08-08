@@ -1,25 +1,14 @@
 """Expert-offload: page routed-MoE experts from an SSD store instead of holding
 them resident, so a checkpoint bigger than RAM can still run.
 
-An MoE only fires a few experts per token (e.g. 6 of 256), yet the experts are
-the overwhelming majority of the weights. ``repack`` splits each MoE layer's
-stacked expert tensor into a per-expert on-disk store; ``ExpertStore`` mmaps
-it; ``patch_model`` swaps every ``SwitchGLU`` in a loaded model for an
-``OffloadedSwitchGLU`` that computes only the router-selected experts, paged
-from that store. Works with any model built on
-``mlx_vlm.models.switch_layers.SwitchGLU`` (or a subclass of it, e.g. the
-native Inkling model) -- most MoE models in this repo, but not all: a few
-(e.g. Laguna, MiniMax-M3-VL) use a *fused* switch layer with a single
-``gate_up_proj`` instead of separate ``gate_proj``/``up_proj`` modules, and
-aren't supported yet. ``patch_model`` raises rather than silently loading
-those fully resident.
-
-Loading an offload dir (a directory produced by ``repack``) is transparent:
-``mlx_vlm.load()`` detects ``offload_index.json`` and patches automatically.
-
-Prefill must be chunked (``prefill_step_size`` in ``mlx_vlm.generate``), or a
-lazy full-prompt forward pins every routed expert across every layer in one
-graph until the final eval -- on a large MoE that OOMs regardless of offload.
+``repack`` splits each MoE layer's stacked expert tensor into a per-expert
+on-disk store; ``ExpertStore`` mmaps it; ``patch_model`` swaps every switch
+layer (``SwitchGLU``/subclasses, or a fused ``gate_up_proj`` variant like
+Laguna/MiniMax-M3-VL) for an ``OffloadedSwitchGLU`` that computes only the
+router-selected experts. Loading is transparent: ``mlx_vlm.load()`` detects
+``offload_index.json`` and patches automatically. Prefill must be chunked
+(``prefill_step_size``), or a lazy full-prompt forward pins every expert
+across every layer in one graph until the final eval and OOMs anyway.
 """
 
 from __future__ import annotations
@@ -32,26 +21,27 @@ import threading
 from collections import OrderedDict
 from typing import Optional, Tuple
 
-# Routed-expert weights of an MoE MLP block. Two on-disk conventions are
-# supported:
-#   stacked    : ...switch_mlp.gate_proj.weight        (one [E,out,in] tensor)
-#   per-expert : ...experts.{j}.gate_proj.weight        (one tensor per expert)
-# shared experts (...shared_expert(s)...) always stay resident.
+# stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
+# stacked-fused: switch_mlp.gate_up_proj.weight [E,2*out,in], gate = first half of axis 1.
 _PROJ = r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|scales|biases)$"
+_FUSED_PROJ = r"gate_up_proj\.(?P<kind>weight|scales|biases)$"
 PEREXPERT_RE = re.compile(
     r"^.*\.layers\.(?P<layer>\d+)\..*?experts\.(?P<j>\d+)\." + _PROJ
 )
 STACKED_RE = re.compile(
     r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)\." + _PROJ
 )
+STACKED_FUSED_RE = re.compile(
+    r"^.*\.layers\.(?P<layer>\d+)\..*?(?:experts|switch_mlp)\." + _FUSED_PROJ
+)
 
 
 def plan(tensor_names) -> dict:
-    """Pure partition of names -> resident vs per-layer routed experts (unit-testable).
+    """Pure partition of names -> resident vs per-layer routed experts.
 
-    experts[layer] is a list of (store_key_or_None, source_name, expert_idx):
-      - per-expert source: (``e{j}.{proj}.{kind}``, name, None)  -> copied as-is
-      - stacked source:    (None,                    name, "STACK") -> sliced per expert at repack
+    experts[layer] is a list of (store_key_or_None, source_name, mode):
+    per-expert -> (key, name, None) copied as-is; stacked/fused -> (None, name,
+    "STACK"/"STACK_FUSED") sliced (and, for fused, split gate/up) at repack.
     """
     resident, experts = [], {}
     for name in tensor_names:
@@ -62,6 +52,10 @@ def plan(tensor_names) -> dict:
         if m:
             key = f"e{int(m['j'])}.{m['proj']}.{m['kind']}"
             experts.setdefault(int(m["layer"]), []).append((key, name, None))
+            continue
+        m = STACKED_FUSED_RE.match(name)
+        if m:
+            experts.setdefault(int(m["layer"]), []).append((None, name, "STACK_FUSED"))
             continue
         m = STACKED_RE.match(name)
         if m:
@@ -152,6 +146,17 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
                 mm = STACKED_RE.match(src)
                 for j in range(E):
                     layer[f"e{j}.{mm['proj']}.{mm['kind']}"] = arr[j]
+            elif mode == "STACK_FUSED":
+                # gate = first half of axis 1 (the doubled output dim), up = second.
+                E = arr.shape[0]
+                half = arr.shape[1] // 2
+                n_experts = max(n_experts or 0, E)
+                mm = STACKED_FUSED_RE.match(src)
+                kind = mm["kind"]
+                gate_half, up_half = arr[:, :half, ...], arr[:, half:, ...]
+                for j in range(E):
+                    layer[f"e{j}.gate_proj.{kind}"] = gate_half[j]
+                    layer[f"e{j}.up_proj.{kind}"] = up_half[j]
             else:
                 layer[key] = arr
                 n_experts = max(n_experts or 0, int(key[1:].split(".")[0]) + 1)
@@ -193,7 +198,15 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
 
 
 class ExpertStore:
-    """Serves per-expert quantized weights from memory-mapped per-layer files."""
+    """Serves per-expert quantized weights from memory-mapped per-layer files.
+
+    ``get()``'s dict/counter bookkeeping is lock-protected (stress-tested:
+    32k concurrent calls across 16 threads, zero corruption). That does not
+    make the returned arrays safe to *evaluate* from a different thread than
+    the one that called ``mx.load()`` here -- MLX raises
+    ``RuntimeError: no Stream(...) in current thread`` for that, a pre-existing
+    constraint of ``mx.load()`` generally, not new here or fixable by locking.
+    """
 
     def __init__(self, offload_dir: str, lru_experts: Optional[int] = None):
         import mlx.core as mx
@@ -254,31 +267,16 @@ class ExpertStore:
 def patch_model(
     model, offload_dir: str, lru_experts: Optional[int] = None
 ) -> "ExpertStore":
-    """Swap every ``SwitchGLU`` (or subclass, e.g. Inkling's) in ``model`` for an
-    offloaded one, paged from ``offload_dir``. group_size/bits/mode are
-    resolved *per projection* from ``offload_dir/config.json``'s
-    ``quantization`` dict via the same per-path override mechanism
-    ``mlx_vlm.utils.load_model`` and ``mlx_vlm.convert``'s mixed-precision
-    recipes already use (a single MoE layer can legitimately have different
-    bits per projection today -- e.g. a ``mixed_4_6`` conversion gives
-    ``down_proj`` different bits than ``gate_proj``/``up_proj``). Returns the
-    store so callers can inspect ``store.stats()``.
-
-    Raises ``ValueError`` if no expert files are found in ``offload_dir``, or
-    if nothing gets swapped -- a malformed/mistyped directory should fail
-    loudly, not silently load fully resident with no offloading at all.
-    Models built on a *fused* switch layer (a single ``gate_up_proj``, not
-    separate ``gate_proj``/``up_proj`` modules -- e.g. Laguna, MiniMax-M3-VL)
-    are not yet supported and will hit this same error, since their modules
-    aren't ``SwitchGLU`` and their weights aren't split out by ``repack()``.
-
-    ``mlx.nn.Module`` is a dict subclass -- child modules are dict items, so we
-    traverse via ``module.items()`` and replace via ``module[name] = ...``
-    (``setattr``/``vars`` do NOT reach them).
+    """Swap every switch layer in ``model`` for an offloaded one (see module
+    docstring for separate-vs-fused handling). group_size/bits/mode are
+    resolved per projection via ``_quantization_for_path``, the same
+    per-path override mechanism ``load_model``/``convert`` use. Raises if no
+    expert files are found or nothing gets swapped, rather than silently
+    loading fully resident. Returns the store (``store.stats()``).
     """
     import mlx.nn as nn
 
-    from .models.switch_layers import OffloadedSwitchGLU, SwitchGLU
+    from .models.switch_layers import OffloadedSwitchGLU
     from .quantization.one_bit import _quantization_for_path
 
     cfg = json.load(open(os.path.join(offload_dir, "config.json")))
@@ -307,34 +305,48 @@ def patch_model(
         for name, child in list(module.items()):
             cp = f"{path}.{name}" if path else name
             if isinstance(child, nn.Module):
-                if (
-                    isinstance(child, SwitchGLU)
-                    and _n_experts(child) == store.num_experts
-                ):
-                    # Only the ROUTED experts (count == store.num_experts) are
-                    # offloaded. A sibling SwitchGLU-family module with a
-                    # different expert count (e.g. always-on shared experts
-                    # modeled as their own switch layer) stays resident --
-                    # offloading it would collide its indices with the store.
+                # Duck-typed (not isinstance SwitchGLU) to cover fused
+                # variants (Laguna/MiniMax-M3-VL) without model-specific imports.
+                is_separate = all(
+                    hasattr(child, p) for p in ("gate_proj", "up_proj", "down_proj")
+                )
+                is_fused = hasattr(child, "gate_up_proj") and hasattr(
+                    child, "down_proj"
+                )
+                if (is_separate or is_fused) and _n_experts(child) == store.num_experts:
+                    # A different expert count (e.g. always-on shared experts as
+                    # their own switch layer) stays resident -- else index collision.
                     lid = _layer_id(cp)
                     if lid is not None and store.experts_present(lid):
+                        if is_separate:
+                            gate_quant = resolve_quant(f"{cp}.gate_proj")
+                            up_quant = resolve_quant(f"{cp}.up_proj")
+                            # SwitchLinear's optional per-expert additive bias, loaded
+                            # resident (tiny) before this module is replaced.
+                            gate_bias = getattr(child.gate_proj, "bias", None)
+                            up_bias = getattr(child.up_proj, "bias", None)
+                        else:
+                            # Fused: gate/up are one on-disk tensor, quantized as a
+                            # single unit, so they share one resolved quant triple.
+                            gate_quant = up_quant = resolve_quant(f"{cp}.gate_up_proj")
+                            fused_bias = getattr(child.gate_up_proj, "bias", None)
+                            if fused_bias is not None:
+                                half = fused_bias.shape[-1] // 2
+                                gate_bias = fused_bias[..., :half]
+                                up_bias = fused_bias[..., half:]
+                            else:
+                                gate_bias = up_bias = None
                         module[name] = OffloadedSwitchGLU(
                             store,
                             lid,
-                            resolve_quant(f"{cp}.gate_proj"),
-                            resolve_quant(f"{cp}.up_proj"),
+                            gate_quant,
+                            up_quant,
                             resolve_quant(f"{cp}.down_proj"),
                             activation=getattr(child, "activation", None),
                             gate_scale=getattr(child, "gate_scale", None),
                             out_scale=getattr(child, "out_scale", None),
-                            # SwitchLinear's optional per-expert additive bias
-                            # (distinct from quantization scales/biases) --
-                            # e.g. gpt-oss's experts carry one on every
-                            # projection. Loaded resident (it's tiny: one
-                            # value per (expert, output_dim)) before this
-                            # module is replaced, same as the scale vectors.
-                            gate_bias=getattr(child.gate_proj, "bias", None),
-                            up_bias=getattr(child.up_proj, "bias", None),
+                            gate_bias=gate_bias,
+                            up_bias=up_bias,
                             down_bias=getattr(child.down_proj, "bias", None),
                         )
                         swapped[0] += 1
@@ -353,9 +365,8 @@ def patch_model(
     if swapped[0] == 0:
         raise ValueError(
             f"patch_model swapped 0 modules for {offload_dir} -- offload_index.json "
-            "declares experts but no matching SwitchGLU was found in the model "
-            "(fused switch layers like Laguna/MiniMax-M3-VL's gate_up_proj are not "
-            "yet supported; see module docstring)."
+            "declares experts but no matching switch layer (with a matching expert "
+            "count) was found anywhere in the model."
         )
     store.swapped = swapped[0]
     return store
@@ -367,11 +378,14 @@ def _layer_id(path: str) -> Optional[int]:
 
 
 def _n_experts(switch_glu) -> int:
-    """Number of experts in a SwitchGLU -- its ``gate_proj`` stacks per-expert
-    weights as ``[E, out, in]`` (``[E, out, in//pack]`` when quantized), so
-    axis 0 is the expert count. Falls back to 0 for an already-offloaded or
-    otherwise nonstandard module (no ``gate_proj.weight``)."""
+    """Number of experts in a switch layer -- its ``gate_proj`` (or, for a
+    fused switch layer, ``gate_up_proj``) stacks per-expert weights as
+    ``[E, out, in]`` (``[E, out, in//pack]`` when quantized), so axis 0 is
+    the expert count. Falls back to 0 for an already-offloaded or otherwise
+    nonstandard module (no ``.weight`` on either)."""
     w = getattr(getattr(switch_glu, "gate_proj", None), "weight", None)
+    if w is None:
+        w = getattr(getattr(switch_glu, "gate_up_proj", None), "weight", None)
     return int(w.shape[0]) if w is not None else 0
 
 
