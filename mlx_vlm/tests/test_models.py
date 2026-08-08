@@ -12374,3 +12374,61 @@ class TestMoEOffload(unittest.TestCase):
         self.assertEqual(stacked_entries[0][2], "STACK")
         perexpert_entries = result["experts"][2]
         self.assertEqual(perexpert_entries[0][0], "e3.gate_proj.weight")
+
+    def test_offloaded_switch_glu_uses_the_original_activation_object(self):
+        """OffloadedSwitchGLU must call the *same* activation object the
+        original SwitchGLU held, not reimplement silu(gate)*x inline.
+
+        On a real checkpoint (gpt-oss-20b-MXFP4-Q8), an inline
+        `nn.silu(gate) * x` reimplementation measurably diverged from
+        SwitchGLU's own `self.activation`, which for that model is a
+        `mx.compile(shapeless=True)`'d `swiglu` -- on real activations, not
+        on random data of the same shape (root cause not fully isolated).
+        A synthetic reproduction of that specific divergence isn't reliable,
+        so this test instead guards the mechanism directly: swap in an
+        activation that is deliberately *not* `silu(gate) * x`, and require
+        OffloadedSwitchGLU's output to reflect it exactly. That fails
+        immediately if the activation is ever hardcoded again.
+        """
+        from mlx_vlm.models.switch_layers import OffloadedSwitchGLU
+
+        class NegateGateActivation:
+            def __call__(self, x, gate):
+                return -gate * x
+
+        class FakeStore:
+            def __init__(self, gw, uw, dw):
+                self.gw, self.uw, self.dw = gw, uw, dw
+
+            def get(self, layer_id, j):
+                return (
+                    (self.gw, None, None),
+                    (self.uw, None, None),
+                    (self.dw, None, None),
+                )
+
+        D, H = 4, 6
+        gw = mx.random.normal((H, D))
+        uw = mx.random.normal((H, D))
+        dw = mx.random.normal((D, H))
+        mx.eval(gw, uw, dw)
+
+        x = mx.random.normal((3, D))
+        indices = mx.array([[0], [0], [0]], dtype=mx.uint32)
+
+        glu = OffloadedSwitchGLU(
+            FakeStore(gw, uw, dw),
+            layer_id=0,
+            group_size=64,
+            bits=4,
+            activation=NegateGateActivation(),
+        )
+        out = glu(x, indices)
+        mx.eval(out)
+
+        x_gate = x @ gw.T
+        x_up = x @ uw.T
+        expected = ((-x_gate * x_up) @ dw.T)[:, None, :]
+        mx.eval(expected)
+
+        self.assertTrue(mx.allclose(out, expected, atol=1e-5).item())
