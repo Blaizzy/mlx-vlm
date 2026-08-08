@@ -1026,3 +1026,28 @@ def test_apc_stream_builder_supports_mixed_schemes():
     assert built.policy.key.scheme == "uniform"
     assert built.policy.value.scheme == "turboquant"
     assert built.offset == 8
+
+
+def test_hybrid_cache_trims_fractional_turboquant_tensor():
+    from mlx_vlm.kv_quant import from_legacy
+    from mlx_vlm.turboquant import HybridQuantKVCache, _SplitCodec
+
+    cache = HybridQuantKVCache(
+        from_legacy(
+            8,
+            "uniform",
+            64,
+            kv_value_bits=3.5,
+            kv_value_scheme="turboquant",
+        )
+    )
+    cache.update_and_fetch(
+        mx.random.normal((1, 4, 20, 256)).astype(mx.bfloat16),
+        mx.random.normal((1, 4, 20, 256)).astype(mx.bfloat16),
+    )
+    assert isinstance(cache.value_quantizer.codec, _SplitCodec)
+    assert cache.trim(5) == 5
+    assert cache.offset == 15
+    deq_keys, deq_values = cache.dequantize()
+    assert deq_keys.shape[-2] == 15
+    assert deq_values.shape[-2] == 15

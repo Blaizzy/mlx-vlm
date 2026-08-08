@@ -6511,13 +6511,7 @@ class _TurboTensorQuantizer:
 
     @staticmethod
     def truncate(state, n: int):
-        if state is None:
-            return None
-        if isinstance(state, TurboQuantMSEState):
-            return TurboQuantMSEState(state.norms[..., :n], state.indices[..., :n, :])
-        raise NotImplementedError(
-            "trimming a hybrid turboquant tensor requires an MSE codec"
-        )
+        return _slice_state(state, n)
 
 
 def _make_tensor_quantizer(spec, seed: int):
