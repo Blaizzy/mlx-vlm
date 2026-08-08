@@ -2166,7 +2166,7 @@ class LanguageModel(nn.Module):
             return valid_ends_mx
 
         def _is_ssm_cache(c):
-            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
+            return not hasattr(c, "keys")
 
         ssm_caches = []
         for c in caches:

@@ -337,18 +337,7 @@ def scaled_dot_product_attention(
             mask=mask,
         )
 
-    if hasattr(cache, "bits"):
-        if sinks is not None:
-            raise ValueError("Quantized SDPA does not support attention sinks.")
-        return quantized_scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            scale=scale,
-            mask=mask,
-            group_size=cache.group_size,
-            bits=cache.bits,
-        )
+ 
 
     return mx.fast.scaled_dot_product_attention(
         queries,

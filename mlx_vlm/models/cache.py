@@ -1750,9 +1750,10 @@ class BatchQuantizedKVCache(_BaseCache):
             self.keys[i][..., prev : self._idx, :] = q_keys[i]
             self.values[i][..., prev : self._idx, :] = q_values[i]
 
+        # Return dequantized arrays for API consistency with BatchKVCache
         return (
-            tuple(k[..., : self._idx, :] for k in self.keys),
-            tuple(v[..., : self._idx, :] for v in self.values),
+            mx.dequantize(self.keys[0][..., : self._idx, :], self.keys[1][..., : self._idx, :], self.keys[2][..., : self._idx, :], group_size=self.group_size, bits=self.bits),
+            mx.dequantize(self.values[0][..., : self._idx, :], self.values[1][..., : self._idx, :], self.values[2][..., : self._idx, :], group_size=self.group_size, bits=self.bits),
         )
 
     def dequantize_for_apc(self):
