@@ -223,11 +223,17 @@ class TwoWayAttentionBlock(nn.Module):
         keys: mx.array,
         query_pe: mx.array,
         key_pe: mx.array,
+        skip_first_layer_pe: bool = False,
     ) -> Tuple[mx.array, mx.array]:
         # Self-attention on queries
-        q = queries + query_pe
-        attn_out = self.self_attn(q, q, queries)
-        queries = queries + attn_out
+        if skip_first_layer_pe:
+            # SAM's first block intentionally omits both positional encoding
+            # and the residual around self-attention.
+            queries = self.self_attn(queries, queries, queries)
+        else:
+            q = queries + query_pe
+            attn_out = self.self_attn(q, q, queries)
+            queries = queries + attn_out
         queries = self.layer_norm1(queries)
 
         # Cross-attention: tokens to image
@@ -297,12 +303,13 @@ class TwoWayTransformer(nn.Module):
         queries = point_embedding
         keys = image_embedding
 
-        for layer in self.layers:
+        for layer_index, layer in enumerate(self.layers):
             queries, keys = layer(
                 queries,
                 keys,
                 query_pe=point_embedding,
                 key_pe=image_pe,
+                skip_first_layer_pe=layer_index == 0,
             )
 
         # Final token->image attention
@@ -473,8 +480,8 @@ class PositionalEmbedding(nn.Module):
     def __call__(self, size: Tuple[int, int]) -> mx.array:
         """Generate positional encoding for a given spatial size."""
         H, W = size
-        grid_y = mx.arange(H).astype(mx.float32) / H
-        grid_x = mx.arange(W).astype(mx.float32) / W
+        grid_y = (mx.arange(H).astype(mx.float32) + 0.5) / H
+        grid_x = (mx.arange(W).astype(mx.float32) + 0.5) / W
 
         # (H, W) grids
         gy, gx = mx.meshgrid(grid_y, grid_x, indexing="ij")
@@ -578,11 +585,11 @@ class SAMMaskDecoder(nn.Module):
         # Concatenate special tokens with sparse embeddings
         tokens = mx.concatenate(
             [
+                mx.broadcast_to(self.obj_score_token.weight[None], (B, 1, d)),
                 mx.broadcast_to(self.iou_token.weight[None], (B, 1, d)),
                 mx.broadcast_to(
                     self.mask_tokens.weight[None], (B, self.num_mask_tokens, d)
                 ),
-                mx.broadcast_to(self.obj_score_token.weight[None], (B, 1, d)),
             ],
             axis=1,
         )
@@ -595,9 +602,9 @@ class SAMMaskDecoder(nn.Module):
         hs, src = self.transformer(src, image_pe, tokens)
 
         # Extract token outputs
-        iou_token_out = hs[:, 0:1]
-        mask_tokens_out = hs[:, 1 : 1 + self.num_mask_tokens]
-        obj_score_token_out = hs[:, 1 + self.num_mask_tokens : 2 + self.num_mask_tokens]
+        obj_score_token_out = hs[:, 0:1]
+        iou_token_out = hs[:, 1:2]
+        mask_tokens_out = hs[:, 2 : 2 + self.num_mask_tokens]
 
         # Upscale image features
         HW = src.shape[1]
@@ -605,23 +612,23 @@ class SAMMaskDecoder(nn.Module):
         src = src.reshape(B, H, W, d)
 
         upscaled = self.upscale_conv1(src)  # (B, 2H, 2W, D/4)
-        upscaled = self.upscale_layer_norm(upscaled)
-        upscaled = nn.gelu(upscaled)
 
-        # Add s1 high-res skip (144x144 level, D/4=64 channels)
-        if high_res_features is not None and len(high_res_features) >= 1:
-            s1_feat = self.conv_s1(high_res_features[0])  # (B, 144, 144, 64)
+        # FPN order is finest to coarsest. Add the 144px skip before
+        # normalization/GELU, matching the trained Torch decoder.
+        if high_res_features is not None and len(high_res_features) >= 2:
+            s1_feat = self.conv_s1(high_res_features[1])  # (B, 144, 144, 64)
             if s1_feat.shape[1:3] == upscaled.shape[1:3]:
                 upscaled = upscaled + s1_feat
+        upscaled = nn.gelu(self.upscale_layer_norm(upscaled))
 
         upscaled = self.upscale_conv2(upscaled)  # (B, 4H, 4W, D/8)
-        upscaled = nn.gelu(upscaled)
 
-        # Add s0 high-res skip (288x288 level, D/8=32 channels)
-        if high_res_features is not None and len(high_res_features) >= 2:
-            s0_feat = self.conv_s0(high_res_features[1])  # (B, 288, 288, 32)
+        # Add the finest 288px skip before the second GELU.
+        if high_res_features is not None and len(high_res_features) >= 1:
+            s0_feat = self.conv_s0(high_res_features[0])  # (B, 288, 288, 32)
             if s0_feat.shape[1:3] == upscaled.shape[1:3]:
                 upscaled = upscaled + s0_feat
+        upscaled = nn.gelu(upscaled)
 
         B, H_up, W_up, C_up = upscaled.shape
         upscaled_flat = upscaled.reshape(B, H_up * W_up, C_up)
@@ -640,20 +647,52 @@ class SAMMaskDecoder(nn.Module):
         masks = mx.concatenate(masks, axis=1)  # (B, num_mask_tokens, H_up, W_up)
 
         # IoU prediction
-        iou_pred = self.iou_prediction_head(iou_token_out.squeeze(1))
+        iou_pred = mx.sigmoid(self.iou_prediction_head(iou_token_out.squeeze(1)))
 
         # Object score
         obj_score = self.pred_obj_score_head(obj_score_token_out.squeeze(1))
 
         # Select masks based on multimask_output
-        if multimask_output:
-            out_masks = masks[:, 1:]  # skip first (low-res) mask
-            out_iou = iou_pred[:, 1:]
-        else:
-            out_masks = masks[:, 0:1]
-            out_iou = iou_pred[:, 0:1]
+        out_masks, out_iou = self._select_masks(
+            masks, iou_pred, multimask_output=multimask_output
+        )
 
         return out_masks, out_iou, hs, obj_score
+
+    def _select_masks(
+        self,
+        masks: mx.array,
+        iou_pred: mx.array,
+        *,
+        multimask_output: bool,
+    ) -> Tuple[mx.array, mx.array]:
+        if multimask_output:
+            return masks[:, 1:], iou_pred[:, 1:]
+
+        single_mask = masks[:, :1]
+        single_iou = iou_pred[:, :1]
+        if not self.dynamic_multimask_via_stability:
+            return single_mask, single_iou
+
+        delta = self.dynamic_multimask_stability_delta
+        intersection = mx.sum(single_mask > delta, axis=(-2, -1)).astype(mx.float32)
+        union = mx.sum(single_mask > -delta, axis=(-2, -1)).astype(mx.float32)
+        stability = mx.where(
+            union > 0,
+            intersection / mx.maximum(union, mx.ones_like(union)),
+            mx.ones_like(union),
+        )
+
+        multimask_iou = iou_pred[:, 1:]
+        best_indices = mx.argmax(multimask_iou, axis=-1)
+        batch_indices = mx.arange(masks.shape[0])
+        best_masks = masks[:, 1:][batch_indices, best_indices][:, None]
+        best_iou = multimask_iou[batch_indices, best_indices][:, None]
+        stable = stability >= self.dynamic_multimask_stability_thresh
+        return (
+            mx.where(stable[:, :, None, None], single_mask, best_masks),
+            mx.where(stable, single_iou, best_iou),
+        )
 
 
 class OutputMLP(nn.Module):
