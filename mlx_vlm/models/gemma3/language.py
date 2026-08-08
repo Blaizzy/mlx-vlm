@@ -174,9 +174,10 @@ class TransformerBlock(nn.Module):
 
 
 class Gemma3Model(nn.Module):
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, scale_inputs_embeds: bool = True):
         super().__init__()
         self.config = config
+        self.scale_inputs_embeds = scale_inputs_embeds
         self.vocab_size = config.vocab_size
         self.window_size = config.sliding_window
         self.sliding_window_pattern = config.sliding_window_pattern
@@ -196,12 +197,14 @@ class Gemma3Model(nn.Module):
         mask: mx.array = None,
         cache=None,
     ):
-        if inputs_embeds is None:
+        embedded_tokens = inputs_embeds is None
+        if embedded_tokens:
             h = self.embed_tokens(inputs)
         else:
             h = inputs_embeds
 
-        h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
+        if embedded_tokens or self.scale_inputs_embeds:
+            h *= mx.array(self.config.hidden_size**0.5, mx.bfloat16).astype(h.dtype)
 
         if cache is None:
             cache = [None] * len(self.layers)

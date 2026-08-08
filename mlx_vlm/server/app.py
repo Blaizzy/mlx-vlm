@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
+from starlette.requests import HTTPConnection
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
@@ -41,6 +42,7 @@ from .generation import (
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .realtime import register_routes as register_realtime_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
@@ -59,7 +61,7 @@ def _server_api_key() -> Optional[str]:
     return key if key else None
 
 
-def _require_management_api_key(request: Request) -> None:
+def _require_management_api_key(request: HTTPConnection) -> None:
     api_key = _server_api_key()
     if api_key is None:
         return
@@ -384,6 +386,9 @@ async def lifespan(app):
         if runtime.audio_queue is not None:
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
+        if runtime.realtime_engine is not None:
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
 
 
 app = FastAPI(
@@ -751,6 +756,15 @@ def unload_model_sync():
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
             unloaded_any = True
+    if runtime.realtime_engine is not None:
+        is_realtime_worker = getattr(
+            runtime.realtime_engine, "is_worker_thread", lambda: False
+        )
+        if not is_realtime_worker():
+            logger.info("Stopping realtime VoiceChat engine.")
+            runtime.realtime_engine.stop_and_join()
+            runtime.realtime_engine = None
+            unloaded_any = True
 
     registry = _model_cache_registry()
     for cache_group, _ in list(registry.items()):
@@ -795,6 +809,7 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
+register_realtime_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 
 

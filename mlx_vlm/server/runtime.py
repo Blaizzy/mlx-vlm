@@ -63,6 +63,7 @@ class ServerRuntime:
     model_cache: ModelCacheRegistry = field(default_factory=ModelCacheRegistry)
     response_generator: Optional[Any] = None
     audio_queue: Optional[Any] = None
+    realtime_engine: Optional[Any] = None
     apc_manager: Optional[Any] = None
     metrics: Optional[Any] = None
 
