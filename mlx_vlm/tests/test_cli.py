@@ -32,7 +32,9 @@ def _keyword_map(call: ast.Call) -> dict[str, ast.expr]:
     return {kw.arg: kw.value for kw in call.keywords}
 
 
-def _assert_verbose_uses_boolean_optional_action(path: str) -> None:
+def _assert_verbose_uses_boolean_optional_action(
+    path: str, *, expected_default: bool
+) -> None:
     verbose_call = _find_verbose_add_argument(_load_module(path))
     keywords = _keyword_map(verbose_call)
 
@@ -44,26 +46,30 @@ def _assert_verbose_uses_boolean_optional_action(path: str) -> None:
 
     default = keywords["default"]
     assert isinstance(default, ast.Constant)
-    assert default.value is True
+    assert default.value is expected_default
 
 
 def test_generate_verbose_flag_uses_boolean_optional_action():
-    _assert_verbose_uses_boolean_optional_action("mlx_vlm/generate/dispatch.py")
+    _assert_verbose_uses_boolean_optional_action(
+        "mlx_vlm/generate/dispatch.py", expected_default=False
+    )
 
 
 def test_chat_verbose_flag_uses_boolean_optional_action():
-    _assert_verbose_uses_boolean_optional_action("mlx_vlm/chat.py")
+    _assert_verbose_uses_boolean_optional_action(
+        "mlx_vlm/chat.py", expected_default=True
+    )
 
 
-def test_verbose_flag_semantics():
+def test_generate_verbose_flag_semantics():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
 
-    assert parser.parse_args([]).verbose is True
+    assert parser.parse_args([]).verbose is False
     assert parser.parse_args(["--verbose"]).verbose is True
     assert parser.parse_args(["--no-verbose"]).verbose is False
 

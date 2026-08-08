@@ -19,7 +19,13 @@ from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
-from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    load,
+    prepare_inputs,
+    should_add_special_tokens,
+)
 from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
@@ -27,6 +33,7 @@ from .image import (
     DEFAULT_IMAGE_TASK,
     run_image_generation_cli,
 )
+from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -56,7 +63,7 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text from an image using a model."
+        description="Generate text, an image, or a video with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -67,15 +74,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image"),
+        choices=("text", "image", "video"),
         default="text",
-        help="Generate text with a VLM or generate an image with a supported image model.",
+        help=(
+            "Generate text with a VLM, an image with a supported image model, "
+            "or a video with a supported video model."
+        ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image generation.",
+        help="Output path for image or video generation.",
     )
     parser.add_argument(
         "--task",
@@ -89,15 +99,19 @@ def parse_arguments():
         type=str,
         default=None,
         help=(
-            "Image size as WIDTHxHEIGHT. Generation defaults to "
-            f"{DEFAULT_IMAGE_SIZE}; editing defaults to the first reference image size."
+            "Output size as WIDTHxHEIGHT. Image generation defaults to "
+            f"{DEFAULT_IMAGE_SIZE}; image editing defaults to the first reference "
+            "image size, and video uses the model default when omitted."
         ),
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=DEFAULT_IMAGE_STEPS,
-        help="Number of image inference steps.",
+        default=None,
+        help=(
+            "Number of inference steps. Defaults to "
+            f"{DEFAULT_IMAGE_STEPS} for images and {DEFAULT_VIDEO_STEPS} for videos."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -105,7 +119,38 @@ def parse_arguments():
         default=None,
         help=(
             "PRNG seed for reproducible sampling and diffusion canvas init. "
-            "Image generation/editing defaults to a random 32-bit seed."
+            "Image and video generation default to a random 32-bit seed."
+        ),
+    )
+    parser.add_argument(
+        "--workflow",
+        choices=("t2va", "fl2va", "ref2va"),
+        default=None,
+        help=(
+            "Video-generation workflow. Inferred from --image/--last-image or "
+            "--reference when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Requested number of generated video frames.",
+    )
+    parser.add_argument(
+        "--last-image",
+        type=str,
+        default=None,
+        help="Last-frame conditioning image for FL2VA video generation.",
+    )
+    parser.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        metavar="KIND=PATH",
+        help=(
+            "Ordered Ref2VA reference; KIND is image, video, or audio. Repeat "
+            "the argument to preserve semantic reference order."
         ),
     )
     parser.add_argument(
@@ -155,6 +200,13 @@ def parse_arguments():
         type=float,
         default=2.0,
         help="Frames-per-second to sample from --video.",
+    )
+    parser.add_argument(
+        "--video-max-frames",
+        type=int,
+        default=16,
+        help="Cap on frames sent when video falls back to ordered images "
+        "(long clips are re-sampled evenly to this count).",
     )
     parser.add_argument(
         "--resize-shape",
@@ -330,8 +382,11 @@ def parse_arguments():
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Detailed output (use --no-verbose to print only the final result).",
+        default=False,
+        help=(
+            "Enable detailed output and progress bars. By default only the final "
+            "result is printed."
+        ),
     )
     parser.add_argument(
         "--eos-tokens",
@@ -694,6 +749,45 @@ def _prime_cached_prefix_rope_state(
     return True
 
 
+def _cache_fully_retained(c: Any) -> bool:
+    """Whether ``c`` still holds its whole sequence from position 0.
+
+    Only such a cache can be rolled back to an earlier prefix. Note this is not
+    ``is_trimmable()``: ``BufferedRotatingKVCache`` reports itself trimmable even
+    after it has evicted early tokens, and trimming it then would only clamp to
+    its retained window and desync ``offset`` from the flat layers.
+    """
+    children = getattr(c, "caches", None)
+    if children is not None:  # CacheList
+        return all(_cache_fully_retained(x) for x in children)
+    start_position = getattr(c, "start_position", None)
+    if start_position is not None:  # Buffered/Chunked: evicts by advancing start
+        return int(start_position) == 0
+    max_size = getattr(c, "max_size", None)
+    if max_size is not None:  # RotatingKVCache: reusable until the window wraps
+        return int(getattr(c, "offset", 0) or 0) <= int(max_size)
+    return True  # KVCache / QuantizedKVCache retain the whole sequence
+
+
+def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[int]:
+    """Trailing tokens to drop so ``kv_cache`` keeps only its first ``prefix_len``.
+
+    The old reuse path sliced key/value arrays directly --
+    ``keys[..., :prefix_len, :]`` -- which is only valid for a flat cache. On a
+    rotating (sliding-window) cache it slices a ring buffer by a logical length,
+    taking an arbitrary rotation of the window and leaving the ring index stale:
+    silent output corruption, or a broadcast crash once speculative decoding wraps
+    the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
+    (``0`` when the whole cache is reusable), or ``None`` when an entry has already
+    evicted part of the prefix and the caller must cold-prefill instead.
+    """
+    cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
+    n_drop = max(0, cached_len - prefix_len)
+    if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
+        return None
+    return n_drop
+
+
 from .ar import generate_step
 
 
@@ -744,11 +838,7 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-        else True
-    )
+    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
@@ -864,27 +954,26 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
-        if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
-                model, input_ids, mask, kwargs
-            ):
-                reused_prefix_len = prefix_len
-                # Trim to only new tokens
-                input_ids = input_ids[:, prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length)
-                kv_cache = prompt_cache_state.cache
-                # Trim cache to prefix_len in case it includes generated tokens
-                for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
-                kwargs["prompt_cache"] = kv_cache
+        kv_cache = prompt_cache_state.cache
+        # None => a cache can't be trimmed back to the shared prefix (wrapped
+        # rotating window); reusing it would corrupt state, so cold-prefill instead.
+        n_drop = _prefix_cache_trim_amount(kv_cache, prefix_len)
+        if (
+            0 < prefix_len < input_ids.shape[1]
+            and n_drop is not None
+            and _apc_suffix_is_text_only(prefix_len)
+            and _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs)
+        ):
+            # Drop cached tokens past the shared prefix via each cache's own trim().
+            for c in kv_cache:
+                if n_drop:
+                    c.trim(n_drop)
+            reused_prefix_len = prefix_len
+            # Trim to only new tokens
+            input_ids = input_ids[:, prefix_len:]
+            pixel_values = None
+            kwargs.pop("cached_image_features", None)
+            kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
@@ -1236,6 +1325,9 @@ def main():
     if getattr(args, "output_modality", "text") == "image":
         run_image_generation_cli(args)
         return
+    if getattr(args, "output_modality", "text") == "video":
+        run_video_generation_cli(args)
+        return
 
     if getattr(args, "seed", None) is not None:
         mx.random.seed(args.seed)
@@ -1309,6 +1401,62 @@ def main():
             prompt if isinstance(prompt, list) else [prompt]
         )
 
+    # Processors without native video support used to drop --video silently:
+    # the frames were loaded, the processor ignored the kwarg, and the model
+    # hallucinated an answer with no visual input at all. Fall back to sending
+    # sampled frames as ordered images (see generate/video.py).
+    gen_kwargs_extra = {}
+    video_prompt = None
+    if args.video:
+        from .video import (
+            pair_adjacent_frames,
+            processor_handles_video,
+            sample_video_frames,
+            subsample_evenly,
+            timestamped_frame_messages,
+        )
+
+        if not processor_handles_video(processor):
+            frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
+            sampled = len(frames)
+            max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
+            pair_hook = getattr(model, "prepare_video_frame_pairs", None)
+            if pair_hook is not None:
+                anchors, first_frames, second_frames = pair_adjacent_frames(
+                    frames, max_frames
+                )
+                gen_kwargs_extra.update(pair_hook(processor, second_frames))
+                still_count = len(args.image or [])
+                args.image = (args.image or []) + first_frames
+                user_text = (
+                    " ".join(args.prompt)
+                    if isinstance(args.prompt, list)
+                    else str(args.prompt)
+                )
+                msgs = timestamped_frame_messages(
+                    user_text,
+                    args.system,
+                    still_count,
+                    [a / max(frame_fps, 1e-6) for a in anchors],
+                )
+                _tok = (
+                    processor.tokenizer
+                    if hasattr(processor, "tokenizer")
+                    else processor
+                )
+                video_prompt = _tok.apply_chat_template(
+                    msgs, add_generation_prompt=True, tokenize=False
+                )
+            else:
+                frames = subsample_evenly(frames, max_frames)
+                print(
+                    f"{processor.__class__.__name__} has no native video "
+                    f"support; sending {len(frames)} of {sampled} sampled "
+                    f"frames as ordered images."
+                )
+                args.image = (args.image or []) + frames
+            args.video = None
+
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
 
@@ -1319,14 +1467,17 @@ def main():
         chat_template_kwargs["video"] = args.video
         chat_template_kwargs["fps"] = args.fps
 
-    prompt = apply_chat_template(
-        processor,
-        config,
-        prompt,
-        num_images=num_images,
-        num_audios=num_audios,
-        **chat_template_kwargs,
-    )
+    if video_prompt is not None:
+        prompt = video_prompt
+    else:
+        prompt = apply_chat_template(
+            processor,
+            config,
+            prompt,
+            num_images=num_images,
+            num_audios=num_audios,
+            **chat_template_kwargs,
+        )
 
     kwargs = {}
 
@@ -1419,6 +1570,7 @@ def main():
 
     else:
         gen_kwargs = {
+            **gen_kwargs_extra,
             "image": args.image,
             "audio": args.audio,
             "video": args.video,

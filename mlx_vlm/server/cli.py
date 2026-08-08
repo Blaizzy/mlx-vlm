@@ -69,6 +69,12 @@ def main():
         help="Pre-load a speech-to-text model at startup.",
     )
     parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default=None,
+        help="Pre-load an embedding model at startup.",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -194,6 +200,16 @@ def main():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of sequences decoded concurrently in the continuous "
+            "batch. Requests beyond this wait in the queue (backpressure), bounding "
+            "peak memory. Default: unbounded. Maps to MLX_VLM_MAX_NUM_SEQS."
+        ),
+    )
+    parser.add_argument(
         "--top-logprobs-k",
         type=int,
         default=None,
@@ -238,6 +254,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] = args.tts_model
     if args.stt_model:
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
+    if args.embedding_model:
+        os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
@@ -245,6 +263,8 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.max_num_seqs is not None:
+        os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
