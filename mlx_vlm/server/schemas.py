@@ -202,11 +202,9 @@ class ResponseInputImageParam(TypedDict, total=False):
     type: Required[
         Literal["input_image"]
     ]  # The type of the input item. Always `input_image`.
-    image_url: Required[str]
+    image_url: Optional[str]
     file_id: Optional[str]
-    """The ID of the file to be sent to the model.
-     NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
-    """
+    """A file reference. This server currently rejects file IDs."""
 
 
 class InputAudio(TypedDict, total=False):
@@ -448,6 +446,12 @@ class GenerationTimings(BaseModel):
     predicted_per_token_ms: float
     predicted_per_second: float
     peak_memory: float = 0.0
+    # Speculative decoding stats, following the llama.cpp server timings
+    # field names; None unless the request ran with a drafter.
+    draft_kind: Optional[str] = None
+    draft_rounds: Optional[int] = None
+    draft_n: Optional[int] = None
+    draft_n_accepted: Optional[int] = None
 
     @staticmethod
     def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
@@ -488,6 +492,10 @@ class GenerationTimings(BaseModel):
             ),
             predicted_per_second=float(generation_tps or 0.0),
             peak_memory=float(metrics.peak_memory or 0.0),
+            draft_kind=getattr(metrics, "draft_kind", None),
+            draft_rounds=getattr(metrics, "draft_rounds", None),
+            draft_n=getattr(metrics, "draft_n", None),
+            draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
         )
 
 

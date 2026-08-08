@@ -1,7 +1,25 @@
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
+
+
+def sanitize_quantization_config(quantization):
+    """Alias per-layer quantization entries onto the load-time fused ``qkvr_proj``.
+
+    Checkpoints quantized before the fusion existed key their per-layer
+    overrides by the constituent paths (``...self_attn.q_proj`` and friends).
+    The stacked projection inherits the ``q_proj`` entry: row-concat keeps each
+    output row's own quantization groups (see ``fuse_qkvr``), so the
+    constituents' settings apply unchanged to the fused matrix.
+    """
+    if not isinstance(quantization, dict):
+        return quantization
+    out = dict(quantization)
+    for key, value in quantization.items():
+        if key.endswith(".self_attn.q_proj"):
+            out.setdefault(key[: -len("q_proj")] + "qkvr_proj", value)
+    return out
 
 
 @dataclass
@@ -32,8 +50,9 @@ class TextConfig(BaseModelConfig):
     sconv_kernel_size: int = 4
     dense_mlp_idx: int = 0
     mlp_layer_types: Optional[List[str]] = None
+    # inkling nomenclature uses intermediate_size for MoE, then dense_intermediate_size
     intermediate_size: int = 24576
-    moe_intermediate_size: int = 3072
+    dense_intermediate_size: Optional[int] = None
     n_routed_experts: int = 256
     num_experts_per_tok: int = 6
     n_shared_experts: int = 2
@@ -73,6 +92,7 @@ class AudioConfig(BaseModelConfig):
     mel_vocab_size: int = 16
     text_hidden_size: int = 6144
     rms_norm_eps: float = 1e-6
+    max_frames_per_chunk: int = 256
 
 
 @dataclass
@@ -85,6 +105,8 @@ class ModelConfig(BaseModelConfig):
     audio_token_id: int = 200053
     vocab_size: int = 201024
     eos_token_id: Optional[List[int]] = None
+    quantization: Optional[Dict] = None
+    quantization_config: Optional[Dict] = None
 
     def __post_init__(self):
         # Coerce dict sub-configs (from config.json) into typed dataclasses, and wire the
@@ -103,3 +125,11 @@ class ModelConfig(BaseModelConfig):
             self.audio_config = AudioConfig.from_dict(self.audio_config)
         self.vision_config.text_hidden_size = self.text_config.hidden_size
         self.audio_config.text_hidden_size = self.text_config.hidden_size
+        quantization = self.quantization
+        self.quantization = sanitize_quantization_config(quantization)
+        if self.quantization_config == quantization:
+            self.quantization_config = self.quantization
+        else:
+            self.quantization_config = sanitize_quantization_config(
+                self.quantization_config
+            )

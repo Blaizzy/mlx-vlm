@@ -147,19 +147,20 @@ class FalconOCRProcessor:
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         kwargs.pop("use_fast", None)
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
 
         model_path = Path(pretrained_model_name_or_path)
         is_local = model_path.exists() and model_path.is_dir()
 
         if is_local:
             tokenizer = AutoTokenizer.from_pretrained(
-                str(model_path), trust_remote_code=True
+                str(model_path), trust_remote_code=trust_remote_code
             )
             config_file = model_path / "config.json"
             config = json.loads(config_file.read_text()) if config_file.exists() else {}
         else:
             tokenizer = AutoTokenizer.from_pretrained(
-                pretrained_model_name_or_path, trust_remote_code=True
+                pretrained_model_name_or_path, trust_remote_code=trust_remote_code
             )
             try:
                 from huggingface_hub import hf_hub_download

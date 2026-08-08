@@ -141,6 +141,22 @@ class TestApplyChatTemplateIntegration:
     Uses return_messages=True to inspect intermediate messages without mocking.
     """
 
+    def test_molmo_builds_chat_message_for_processor_template(self):
+        """Molmo must go through its processor's ``User: ... Assistant:`` chat
+        template rather than the raw-prompt shortcut: raw prompts can read as
+        complete documents, making greedy decoding emit EOS immediately."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "molmo"},
+            "Describe this image briefly.",
+            return_messages=True,
+            num_images=1,
+        )
+
+        assert result == [{"role": "user", "content": "Describe this image briefly."}]
+
     def test_nemotron_omni_formats_image_and_audio_messages(self):
         """Nemotron Omni should use typed multimodal content for HF templates."""
         from mlx_vlm.prompt_utils import apply_chat_template
@@ -228,6 +244,40 @@ class TestApplyChatTemplateIntegration:
                         "type": "text",
                         "text": "Describe the video.",
                         "content": "Describe the video.",
+                    },
+                ],
+            }
+        ]
+
+    def test_gemma4_unified_formats_video_and_audio_messages(self):
+        """Video prompts should retain audio placeholders when audio is present."""
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        result = apply_chat_template(
+            None,
+            {"model_type": "gemma4_unified"},
+            "Describe the video and audio.",
+            return_messages=True,
+            video=["clip.mp4"],
+            fps=1,
+            num_audios=1,
+        )
+
+        assert result == [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "video",
+                        "video": "clip.mp4",
+                        "max_pixels": 224 * 224,
+                        "fps": 1,
+                    },
+                    {"type": "audio"},
+                    {
+                        "type": "text",
+                        "text": "Describe the video and audio.",
+                        "content": "Describe the video and audio.",
                     },
                 ],
             }

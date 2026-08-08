@@ -10,6 +10,8 @@ from ....models.inkling.language import (
     InklingDecoderLayer,
     _restore_cache_state,
     _snapshot_cache_state,
+    fuse_qkvr,
+    shared_experts_to_dense,
 )
 from .config import InklingMTPConfig
 
@@ -176,7 +178,10 @@ class InklingMTPDraftModel(nn.Module):
     def draft_eval_state(self):
         state = [self._seed_token, self._seed_hidden]
         for cache in self._cache:
-            state.append(cache.state)
+            for subcache in cache.caches:
+                if getattr(subcache, "keys", False) is None:
+                    continue
+                state.append(subcache.state)
         return state
 
     def set_shared_kv(
@@ -377,4 +382,4 @@ class InklingMTPDraftModel(nn.Module):
                     out[base + sub] = v
             else:
                 out[key] = v
-        return out
+        return fuse_qkvr(shared_experts_to_dense(out))
