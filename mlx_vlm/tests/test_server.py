@@ -6073,6 +6073,64 @@ class TestResponseGenerator:
         for key in preload_env:
             assert key not in os.environ
 
+    def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
+        preload_env = {
+            "MLX_VLM_PRELOAD_MODEL": "language-demo",
+            "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
+            "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
+            "MLX_VLM_PRELOAD_EMBEDDING_MODEL": "embed-demo",
+        }
+        for key, value in preload_env.items():
+            monkeypatch.setenv(key, value)
+        calls = []
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            calls.append(model_kind)
+            if model_kind == "audio_stt":
+                raise server.HTTPException(
+                    status_code=500, detail="Failed to load audio model: boom"
+                )
+            return SimpleNamespace(), None, SimpleNamespace(model_type=model_kind)
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+        server.runtime.preload_failures.clear()
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        asyncio.run(run_lifespan())
+
+        assert calls == ["text_generation", "audio_tts", "audio_stt", "embedding"]
+        failure = server.runtime.preload_failures["audio_stt"]
+        assert failure["model"] == "stt-demo"
+        assert "Failed to load audio model" in failure["error"]
+        assert "audio_tts" not in server.runtime.preload_failures
+        server.runtime.preload_failures.clear()
+
+    def test_lifespan_propagates_language_model_failure(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "language-demo")
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            raise server.HTTPException(
+                status_code=500, detail="language model exploded"
+            )
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        with pytest.raises(server.HTTPException):
+            asyncio.run(run_lifespan())
+
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
             def to_dict(self):
