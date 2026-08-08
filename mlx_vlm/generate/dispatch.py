@@ -33,6 +33,7 @@ from .image import (
     DEFAULT_IMAGE_TASK,
     run_image_generation_cli,
 )
+from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -62,7 +63,7 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Generate text from an image using a model."
+        description="Generate text, an image, or a video with a supported model."
     )
     parser.add_argument(
         "--model",
@@ -73,15 +74,18 @@ def parse_arguments():
     parser.add_argument(
         "--output-modality",
         type=str,
-        choices=("text", "image"),
+        choices=("text", "image", "video"),
         default="text",
-        help="Generate text with a VLM or generate an image with a supported image model.",
+        help=(
+            "Generate text with a VLM, an image with a supported image model, "
+            "or a video with a supported video model."
+        ),
     )
     parser.add_argument(
         "--output",
         type=str,
         default=None,
-        help="Output path for image generation.",
+        help="Output path for image or video generation.",
     )
     parser.add_argument(
         "--task",
@@ -95,15 +99,19 @@ def parse_arguments():
         type=str,
         default=None,
         help=(
-            "Image size as WIDTHxHEIGHT. Generation defaults to "
-            f"{DEFAULT_IMAGE_SIZE}; editing defaults to the first reference image size."
+            "Output size as WIDTHxHEIGHT. Image generation defaults to "
+            f"{DEFAULT_IMAGE_SIZE}; image editing defaults to the first reference "
+            "image size, and video uses the model default when omitted."
         ),
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=DEFAULT_IMAGE_STEPS,
-        help="Number of image inference steps.",
+        default=None,
+        help=(
+            "Number of inference steps. Defaults to "
+            f"{DEFAULT_IMAGE_STEPS} for images and {DEFAULT_VIDEO_STEPS} for videos."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -111,7 +119,38 @@ def parse_arguments():
         default=None,
         help=(
             "PRNG seed for reproducible sampling and diffusion canvas init. "
-            "Image generation/editing defaults to a random 32-bit seed."
+            "Image and video generation default to a random 32-bit seed."
+        ),
+    )
+    parser.add_argument(
+        "--workflow",
+        choices=("t2va", "fl2va", "ref2va"),
+        default=None,
+        help=(
+            "Video-generation workflow. Inferred from --image/--last-image or "
+            "--reference when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Requested number of generated video frames.",
+    )
+    parser.add_argument(
+        "--last-image",
+        type=str,
+        default=None,
+        help="Last-frame conditioning image for FL2VA video generation.",
+    )
+    parser.add_argument(
+        "--reference",
+        action="append",
+        default=None,
+        metavar="KIND=PATH",
+        help=(
+            "Ordered Ref2VA reference; KIND is image, video, or audio. Repeat "
+            "the argument to preserve semantic reference order."
         ),
     )
     parser.add_argument(
@@ -343,8 +382,11 @@ def parse_arguments():
     parser.add_argument(
         "--verbose",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Detailed output (use --no-verbose to print only the final result).",
+        default=False,
+        help=(
+            "Enable detailed output and progress bars. By default only the final "
+            "result is printed."
+        ),
     )
     parser.add_argument(
         "--eos-tokens",
@@ -1282,6 +1324,9 @@ def main():
 
     if getattr(args, "output_modality", "text") == "image":
         run_image_generation_cli(args)
+        return
+    if getattr(args, "output_modality", "text") == "video":
+        run_video_generation_cli(args)
         return
 
     if getattr(args, "seed", None) is not None:

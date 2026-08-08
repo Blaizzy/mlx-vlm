@@ -1803,6 +1803,82 @@ def test_responses_endpoint_merges_developer_message_with_instructions(client):
     ]
 
 
+def test_responses_endpoint_places_function_output_image_after_tool_result(
+    client, monkeypatch
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    image_url = "data:image/png;base64,ZmFrZS1pbWFnZQ=="
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/responses",
+            json={
+                "model": "demo",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "view_image",
+                        "arguments": "{}",
+                        "call_id": "call_view_image",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_view_image",
+                        "output": [
+                            {
+                                "type": "input_image",
+                                "image_url": image_url,
+                                "detail": "high",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = mock_generate.call_args.kwargs["prompt"]
+    assert prompt.index("Tool:") < prompt.index("<image>")
+    assert image_url not in prompt
+    assert mock_generate.call_args.kwargs["image"] == [image_url]
+
+
+def test_responses_endpoint_rejects_image_file_id(client):
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "demo",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_view_image",
+                    "output": [{"type": "input_image", "file_id": "file-image"}],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "input_image.file_id is not supported by this server. "
+        "Provide image_url instead."
+    )
+
+
 @pytest.mark.parametrize(
     ("include_adapter", "adapter_path", "expected_adapter"),
     [
@@ -5149,8 +5225,10 @@ class TestResponseGenerator:
             gen.draft_kind = "mtp"
             gen.tokenizer = SimpleNamespace()
 
-        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
-            del idle_timeout
+        def fake_collect_pending_requests(
+            *, active, idle_timeout=0.1, coalesce_s=0.0, capacity=None
+        ):
+            del idle_timeout, capacity
             calls.append((active, coalesce_s))
             return [], True
 
@@ -5995,6 +6073,64 @@ class TestResponseGenerator:
         for key in preload_env:
             assert key not in os.environ
 
+    def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
+        preload_env = {
+            "MLX_VLM_PRELOAD_MODEL": "language-demo",
+            "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
+            "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
+            "MLX_VLM_PRELOAD_EMBEDDING_MODEL": "embed-demo",
+        }
+        for key, value in preload_env.items():
+            monkeypatch.setenv(key, value)
+        calls = []
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            calls.append(model_kind)
+            if model_kind == "audio_stt":
+                raise server.HTTPException(
+                    status_code=500, detail="Failed to load audio model: boom"
+                )
+            return SimpleNamespace(), None, SimpleNamespace(model_type=model_kind)
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+        server.runtime.preload_failures.clear()
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        asyncio.run(run_lifespan())
+
+        assert calls == ["text_generation", "audio_tts", "audio_stt", "embedding"]
+        failure = server.runtime.preload_failures["audio_stt"]
+        assert failure["model"] == "stt-demo"
+        assert "Failed to load audio model" in failure["error"]
+        assert "audio_tts" not in server.runtime.preload_failures
+        server.runtime.preload_failures.clear()
+
+    def test_lifespan_propagates_language_model_failure(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "language-demo")
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            raise server.HTTPException(
+                status_code=500, detail="language model exploded"
+            )
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        with pytest.raises(server.HTTPException):
+            asyncio.run(run_lifespan())
+
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
             def to_dict(self):
@@ -6206,6 +6342,34 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(text)
         assert reasoning is None
         assert content == "Just plain text."
+
+    def test_prompt_opened_thinking_is_detected(self):
+        assert server.prompt_has_open_thinking("<|im_start|>assistant\n<think>")
+        assert not server.prompt_has_open_thinking("<|im_start|>assistant\n")
+
+    def test_unterminated_thinking_without_markers_is_reasoning(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == text
+        assert content == ""
+
+    def test_unterminated_thinking_stays_content_when_not_in_block(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=False)
+        assert reasoning is None
+        assert content == text
+
+    def test_starts_in_thinking_still_splits_on_close_marker(self):
+        text = "Reasoning first.</think>The answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Reasoning first."
+        assert content == "The answer."
+
+    def test_starts_in_thinking_respects_paired_markers(self):
+        text = "<think>Thinking.</think>Answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Thinking."
+        assert content == "Answer."
 
     def test_empty_content_after_thinking(self):
         text = "<|channel>thought\nOnly thinking.<channel|>"

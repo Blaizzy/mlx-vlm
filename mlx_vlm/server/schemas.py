@@ -202,11 +202,9 @@ class ResponseInputImageParam(TypedDict, total=False):
     type: Required[
         Literal["input_image"]
     ]  # The type of the input item. Always `input_image`.
-    image_url: Required[str]
+    image_url: Optional[str]
     file_id: Optional[str]
-    """The ID of the file to be sent to the model.
-     NOTE : wouldn't this help the model if we passed the file_id as well to the vlm models
-    """
+    """A file reference. This server currently rejects file IDs."""
 
 
 class InputAudio(TypedDict, total=False):

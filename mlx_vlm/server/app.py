@@ -153,6 +153,7 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -260,9 +261,12 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
-    return _split_thinking_text(text, thinking_start_token, thinking_end_token)
+    return _split_thinking_text(
+        text, thinking_start_token, thinking_end_token, starts_in_thinking
+    )
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -370,15 +374,31 @@ async def lifespan(app):
             "embedding model",
         ),
     )
+    runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
         if not preload_model_path:
             continue
         logger.info("Pre-loading %s: %s", label, preload_model_path)
-        get_cached_model(
-            preload_model_path,
-            preload_adapter_path,
-            model_kind=model_kind,
-        )
+        try:
+            get_cached_model(
+                preload_model_path,
+                preload_adapter_path,
+                model_kind=model_kind,
+            )
+        except Exception as e:
+            reason = getattr(e, "detail", None) or str(e)
+            runtime.preload_failures[model_kind] = {
+                "model": preload_model_path,
+                "label": label,
+                "error": str(reason),
+            }
+            logger.error(
+                "Failed to pre-load %s %r: %s. Continuing without it.",
+                label,
+                preload_model_path,
+                reason,
+            )
+            continue
         logger.info("%s ready.", label.capitalize())
     try:
         yield

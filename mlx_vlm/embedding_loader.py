@@ -90,6 +90,24 @@ def load_embedding_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.M
             model_class.LanguageModel, weights, model_config.text_config
         )
 
+    quantization = config.get("quantization", None)
+    if quantization is not None:
+
+        def _quant_predicate(path, module):
+            if not hasattr(module, "to_quantized"):
+                return False
+            if hasattr(module, "weight") and module.weight.size % 64 != 0:
+                return False
+            return f"{path}.scales" in weights
+
+        nn.quantize(
+            model,
+            group_size=quantization["group_size"],
+            bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
+            class_predicate=_quant_predicate,
+        )
+
     model.load_weights(list(weights.items()), strict=strict)
     if not lazy:
         mx.eval(model.parameters())
