@@ -135,6 +135,86 @@ class TestNumericalEquivalence:
         assert mx.allclose(out, reference, atol=2e-2).item()
 
 
+class TestShapesBeyondTheDefaultLayout:
+    """The fused path has to survive head geometries other than the default.
+
+    Models differ in head_dim and in how many query heads share a KV head, so
+    exercise a couple of combinations rather than only 4 heads at 64 dims.
+    """
+
+    @pytest.mark.parametrize("head_dim", [64, 128, 256])
+    @pytest.mark.parametrize("q_per_kv", [1, 4, 6])
+    def test_decode_matches_fallback(self, head_dim, q_per_kv):
+        kv_heads, seq_len = 4, 96
+        scale = head_dim**-0.5
+        cache = BatchTurboQuantKVCache([0], bits=BITS)
+        keys, values = cache.update_and_fetch(
+            mx.random.normal((1, kv_heads, seq_len, head_dim)),
+            mx.random.normal((1, kv_heads, seq_len, head_dim)),
+        )
+        queries = mx.random.normal((1, kv_heads * q_per_kv, 1, head_dim))
+
+        fused = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=scale, mask=None
+        )
+        dq_k, dq_v = cache.dequantize(keys, values)
+        reference = mx.fast.scaled_dot_product_attention(
+            queries,
+            dq_k.astype(queries.dtype),
+            dq_v.astype(queries.dtype),
+            scale=scale,
+            mask=None,
+        )
+        mx.eval(fused, reference)
+        assert fused.shape == reference.shape
+        assert mx.allclose(fused, reference, atol=2e-2).item()
+
+
+class TestAttentionSinks:
+    """Sinks must be applied, not dropped and not rejected.
+
+    The fused kernels carry no sink term, so a request with sinks has to fall
+    through to the dequantizing path, which can pass them to MLX.
+    """
+
+    def _with_sinks(self, cache, keys, values, queries, sinks):
+        return scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=SCALE, mask=None, sinks=sinks
+        )
+
+    def test_sinks_are_applied(self):
+        cache, keys, values = _filled([0], 64)
+        queries = mx.random.normal((1, H, 1, D))
+        sinks = mx.random.normal((H,))
+
+        out = self._with_sinks(cache, keys, values, queries, sinks)
+        dq_k, dq_v = cache.dequantize(keys, values)
+        reference = mx.fast.scaled_dot_product_attention(
+            queries,
+            dq_k.astype(queries.dtype),
+            dq_v.astype(queries.dtype),
+            scale=SCALE,
+            mask=None,
+            sinks=sinks,
+        )
+        mx.eval(out, reference)
+        assert mx.allclose(out, reference, atol=2e-2).item()
+
+    def test_sinks_change_the_result(self):
+        # Guards against silently discarding them: the batch cache used to
+        # drop sinks on the floor and return the no-sink answer.
+        cache, keys, values = _filled([0], 64)
+        queries = mx.random.normal((1, H, 1, D))
+        sinks = mx.full((H,), 5.0)
+
+        with_sinks = self._with_sinks(cache, keys, values, queries, sinks)
+        without = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=SCALE, mask=None
+        )
+        mx.eval(with_sinks, without)
+        assert not mx.allclose(with_sinks, without, atol=1e-3).item()
+
+
 class TestDecodeMemoryIsFlat:
     """Regression guard for the bug this change fixes.
 

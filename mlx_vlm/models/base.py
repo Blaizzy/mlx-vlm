@@ -314,11 +314,10 @@ def scaled_dot_product_attention(
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
     if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
-        if sinks is not None:
-            raise ValueError("TurboQuant KV cache does not support attention sinks.")
-        # The batch cache only shares the fused kernels when it holds a single
-        # unpadded row; wider batches keep the dequantizing fallback below.
-        if _turboquant_attention_applies(cache):
+        # The fused kernels have no sink term, and the batch cache only shares
+        # them when it holds a single unpadded row. Anything else dequantizes,
+        # which is also the only path that can apply sinks.
+        if sinks is None and _turboquant_attention_applies(cache):
             if queries.shape[-2] == 1:
                 return cache.decode_attention(
                     queries,
@@ -343,6 +342,7 @@ def scaled_dot_product_attention(
             dequantized_values.astype(queries.dtype),
             scale=scale,
             mask=mask,
+            sinks=sinks,
         )
 
     if hasattr(cache, "bits"):
