@@ -36,7 +36,9 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_kv_split_schemes,
     get_quantized_kv_bits,
+    get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
@@ -700,6 +702,8 @@ def get_cached_model(
 
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
+    kv_key_bits, kv_value_bits = get_quantized_kv_split_bits()
+    kv_key_scheme, kv_value_scheme = get_kv_split_schemes()
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
@@ -709,6 +713,8 @@ def get_cached_model(
             model_path,
             adapter_path=adapter_path,
             kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
@@ -720,6 +726,10 @@ def get_cached_model(
         adapter_path=adapter_path,
         vision_cache=vision_cache,
         kv_bits=kv_bits,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,

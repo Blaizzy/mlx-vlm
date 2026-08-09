@@ -340,6 +340,18 @@ def get_quantized_kv_bits(model: str):
     return kv_bits
 
 
+def get_quantized_kv_split_bits():
+    def _read(name):
+        raw = os.environ.get(name)
+        return float(raw) if raw else None
+
+    return _read("KV_KEY_BITS"), _read("KV_VALUE_BITS")
+
+
+def get_kv_split_schemes():
+    return os.environ.get("KV_KEY_SCHEME"), os.environ.get("KV_VALUE_SCHEME")
+
+
 def get_kv_group_size():
     return int(os.environ.get("KV_GROUP_SIZE", DEFAULT_KV_GROUP_SIZE))
 
@@ -1061,6 +1073,10 @@ class ResponseGenerator:
         adapter_path: Optional[str] = None,
         vision_cache=None,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
         kv_group_size=DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
@@ -1076,6 +1092,10 @@ class ResponseGenerator:
         self.vision_cache = vision_cache
         self.draft_model = None
         self.kv_bits = kv_bits
+        self.kv_key_bits = kv_key_bits
+        self.kv_value_bits = kv_value_bits
+        self.kv_key_scheme = kv_key_scheme
+        self.kv_value_scheme = kv_value_scheme
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
@@ -1736,6 +1756,10 @@ class ResponseGenerator:
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
                             kv_bits=self.kv_bits,
+                            kv_key_bits=getattr(self, "kv_key_bits", None),
+                            kv_value_bits=getattr(self, "kv_value_bits", None),
+                            kv_key_scheme=getattr(self, "kv_key_scheme", None),
+                            kv_value_scheme=getattr(self, "kv_value_scheme", None),
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
