@@ -747,9 +747,7 @@ def _decode_turboquant_state(
         return value
 
     items = [
-        _decode_turboquant_state(
-            item, path, tensor_entries, data_start, eval_targets
-        )
+        _decode_turboquant_state(item, path, tensor_entries, data_start, eval_targets)
         for item in descriptor.get("items", [])
     ]
     if kind == "tuple":
@@ -1495,6 +1493,12 @@ class DiskBlockStore:
                 offset = int(metadata.get(f"{prefix}_offset", "0"))
                 bits = float(metadata[f"{prefix}_bits"])
                 seed = int(metadata.get(f"{prefix}_seed", "0"))
+                # Snapshots written before per-tensor widths existed carry only
+                # the combined budget; None lets the cache re-derive the split.
+                key_bits = metadata.get(f"{prefix}_key_bits")
+                value_bits = metadata.get(f"{prefix}_value_bits")
+                key_bits = float(key_bits) if key_bits is not None else None
+                value_bits = float(value_bits) if value_bits is not None else None
                 key_descriptor = json.loads(metadata[f"{prefix}_keys"])
                 value_descriptor = json.loads(metadata[f"{prefix}_values"])
                 keys = _decode_turboquant_state(
@@ -1513,7 +1517,9 @@ class DiskBlockStore:
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 return None
-            cache = TurboQuantKVCache(bits=bits, seed=seed)
+            cache = TurboQuantKVCache(
+                bits=bits, seed=seed, key_bits=key_bits, value_bits=value_bits
+            )
             cache.keys = keys
             cache.values = values
             cache.offset = offset
@@ -2704,13 +2710,17 @@ class DiskBlockStore:
         metadata: dict[str, str],
     ) -> bool:
         from .models import cache as lm_cache
-
         from .turboquant import TurboQuantKVCache
 
         if isinstance(c, TurboQuantKVCache):
             metadata[f"{prefix}_kind"] = "turboquant_kv"
             metadata[f"{prefix}_offset"] = str(int(c.offset))
             metadata[f"{prefix}_bits"] = str(float(c.bits))
+            # Keys and values can carry different widths. Recording only the
+            # combined budget would rebuild the codecs at the default split
+            # and decode the snapshot against the wrong one.
+            metadata[f"{prefix}_key_bits"] = str(float(c.key_bits))
+            metadata[f"{prefix}_value_bits"] = str(float(c.value_bits))
             metadata[f"{prefix}_seed"] = str(int(c.seed))
             metadata[f"{prefix}_keys"] = json.dumps(
                 _encode_turboquant_state(c.keys, f"{prefix}_k", arrays)
@@ -4047,12 +4057,22 @@ def _merge_exact_cache_entries(
     if entries and all(isinstance(entry, TurboQuantKVCache) for entry in entries):
         first = entries[0]
         if any(
-            entry.bits != first.bits or entry.seed != first.seed for entry in entries
+            entry.bits != first.bits
+            or entry.seed != first.seed
+            or entry.key_bits != first.key_bits
+            or entry.value_bits != first.value_bits
+            for entry in entries
         ):
             return None
         merged: Optional[BatchTurboQuantKVCache] = None
         for entry in entries:
-            row = BatchTurboQuantKVCache([0], bits=entry.bits, seed=entry.seed)
+            row = BatchTurboQuantKVCache(
+                [0],
+                bits=entry.bits,
+                seed=entry.seed,
+                key_bits=entry.key_bits,
+                value_bits=entry.value_bits,
+            )
             row.keys = entry.keys
             row.values = entry.values
             row._idx = int(entry.offset)
@@ -4676,9 +4696,7 @@ def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
     block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
     disk_only = _env_truthy("APC_DISK_ONLY")
     num_blocks = (
-        0
-        if disk_only
-        else int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+        0 if disk_only else int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
     )
 
     disk: Optional[DiskBlockStore] = None
@@ -4714,8 +4732,7 @@ def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
         return None
 
     logger.info(
-        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s, "
-        "disk_only=%s)",
+        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s, " "disk_only=%s)",
         block_size,
         num_blocks,
         "sha256" if _hash_use_sha256() else "fast",

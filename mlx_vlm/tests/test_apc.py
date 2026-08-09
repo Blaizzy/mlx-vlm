@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -692,9 +693,7 @@ def test_exact_disk_only_turboquant_roundtrip_stays_packed(tmp_path):
     assert not manager._exact_cache
     assert disk.num_exact_indexed == 1
 
-    restored, matched = manager.lookup_exact_cache(
-        token_ids + [999], extra_hash=5
-    )
+    restored, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=5)
     assert matched == len(token_ids)
     assert restored is not None
     assert isinstance(restored[0], TurboQuantKVCache)
@@ -1302,4 +1301,89 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert matched_wrong == 0
     assert warm_wrong is None
 
+    manager.close()
+
+
+def _disk_only_manager(tmp_path, namespace):
+    disk = DiskBlockStore(tmp_path, namespace=namespace)
+    return APCManager(num_blocks=0, block_size=16, disk=disk, disk_only=True), disk
+
+
+def test_disk_only_exact_cache_preserves_key_value_bits(tmp_path):
+    """A K/V split has to survive the snapshot.
+
+    Disk-only stores the packed quantized state, so recording only the
+    combined budget would rebuild the codecs at the default split and decode
+    against the wrong widths.
+    """
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    token_ids = list(range(32))
+    cache = TurboQuantKVCache(bits=4, key_bits=3, value_bits=8)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 64)),
+        mx.random.normal((1, 2, len(token_ids), 64)),
+    )
+    assert (cache.key_bits, cache.value_bits) != (cache.bits, cache.bits)
+
+    manager, disk = _disk_only_manager(tmp_path, "bits")
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=7)
+    disk._q.join()
+    manager.close()
+
+    manager, _ = _disk_only_manager(tmp_path, "bits")
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=7)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    restored = warm[0]
+    assert isinstance(restored, TurboQuantKVCache)
+    assert restored.bits == cache.bits
+    assert restored.key_bits == cache.key_bits
+    assert restored.value_bits == cache.value_bits
+    manager.close()
+
+
+def test_disk_only_exact_cache_reads_snapshots_without_split_bits(tmp_path):
+    """Snapshots predating per-tensor widths still load.
+
+    They carry only the combined budget, so the cache re-derives the split.
+    """
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    token_ids = list(range(32))
+    cache = TurboQuantKVCache(bits=4)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 64)),
+        mx.random.normal((1, 2, len(token_ids), 64)),
+    )
+
+    manager, disk = _disk_only_manager(tmp_path, "legacy")
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=5)
+    disk._q.join()
+    manager.close()
+
+    # Strip the fields a pre-upgrade writer would not have produced.
+    shard = next(p for p in tmp_path.rglob("*.safetensors") if p.is_file())
+    raw = shard.read_bytes()
+    header_len = int.from_bytes(raw[:8], "little")
+    header = json.loads(raw[8 : 8 + header_len])
+    meta = header.get("__metadata__", {})
+    stripped = {
+        k: v for k, v in meta.items() if not k.endswith(("_key_bits", "_value_bits"))
+    }
+    assert len(stripped) < len(meta)
+    header["__metadata__"] = stripped
+    new_header = json.dumps(header).encode()
+    shard.write_bytes(
+        len(new_header).to_bytes(8, "little") + new_header + raw[8 + header_len :]
+    )
+
+    manager, _ = _disk_only_manager(tmp_path, "legacy")
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=5)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    assert isinstance(warm[0], TurboQuantKVCache)
+    assert warm[0].bits == cache.bits
     manager.close()
