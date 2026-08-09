@@ -4970,6 +4970,36 @@ class _QuantizedStateProxy:
     def __iter__(self):
         return iter(self._state)
 
+    def __getitem__(self, key):
+        # Speculative target verification narrows the cache one draft token at
+        # a time (`keys[:, :, : prefix_len + i + 1, :]`). Serve that by
+        # slicing the quantized state, so verification never has to
+        # materialize the cache in float.
+        if not isinstance(key, tuple):
+            raise TypeError(
+                "TurboQuant state supports only (batch, head, time, dim) indexing"
+            )
+        time_index = key[2] if len(key) > 2 else slice(None)
+        if not isinstance(time_index, slice) or time_index.step is not None:
+            raise TypeError(
+                "TurboQuant state supports only contiguous slices along time"
+            )
+        for axis, index in enumerate(key):
+            if axis == 2:
+                continue
+            if index != slice(None):
+                raise TypeError(
+                    "TurboQuant state can only be narrowed along the time axis"
+                )
+
+        n_tokens = self.shape[2]
+        start, stop, _ = time_index.indices(n_tokens)
+        if start != 0:
+            raise TypeError("TurboQuant state slices must start at 0")
+        return _QuantizedStateProxy(
+            _slice_state(self._state, stop), stop, self.shape[1]
+        )
+
 
 class _TurboQuantAttentionMixin:
     """Quantized-state attention shared by the single-sequence and batch caches.
@@ -6063,8 +6093,16 @@ class _TurboQuantAttentionMixin:
 class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     cache_step = 256
 
-    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
-        self.bits = _validate_bits(bits)
+    def __init__(
+        self,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+    ):
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            bits, key_bits, value_bits
+        )
         self.seed = seed
         self.offset = 0
         self.keys = None
@@ -6078,9 +6116,16 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
 
     @classmethod
     def from_cache(
-        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+        cls,
+        cache,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed)
+        turbo_cache = cls(
+            bits=bits, seed=seed, key_bits=key_bits, value_bits=value_bits
+        )
         keys, values = cache.state
         if keys is not None:
             turbo_cache.update_and_fetch(keys, values)
@@ -6088,23 +6133,12 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is None:
-            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
-            # for values instead of SplitCodec. Both stay as fast integer codecs
-            # with single-tile kernel support. Values benefit more from extra bits.
-            key_bits = (
-                math.floor(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
+            self.key_codec = _build_codec(
+                keys, self.key_bits, mode="mse", seed=self.seed
             )
-            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
         if self.value_codec is None:
-            val_bits = (
-                math.ceil(self.bits)
-                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
-                else self.bits
-            )
             self.value_codec = _build_codec(
-                values, val_bits, mode="mse", seed=self.seed + 1
+                values, self.value_bits, mode="mse", seed=self.seed + 1
             )
 
     def _try_fused_kv_quantize(self, keys, values):
