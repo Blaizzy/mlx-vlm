@@ -13,6 +13,9 @@ from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_STEPS,
     ImageGenerationResult,
+    _image_model_class_for_type,
+    _image_model_type_from_manifest,
+    _load_json_file,
     _local_image_model_types,
     _model_type_from_id,
     _normalize_model_type,
@@ -157,6 +160,33 @@ def load_image_edit_model(
         if resolved_path is not None
         else ()
     )
+    # If the repo's authoritative type (manifest first, then model id) maps
+    # to a known image model that has no edit-capable class, stop here:
+    # Bonsai repos carry FLUX.2-named components, so the candidate scan
+    # below would otherwise select the flux2 edit class and fail variant
+    # inference on Bonsai weights. Raise the clear unsupported-edit message
+    # instead of the confusing flux2 variant error. (A type with an edit
+    # class, e.g. flux2 or mage_flow, skips the guard and keeps today's
+    # behavior.)
+    authoritative_type = _model_type_from_id(model)
+    if resolved_path is not None:
+        manifest = _load_json_file(Path(resolved_path) / "manifest.json")
+        if manifest is not None:
+            authoritative_type = (
+                _image_model_type_from_manifest(manifest) or authoritative_type
+            )
+    if _image_edit_model_class_for_type(authoritative_type) is None and (
+        _image_model_class_for_type(authoritative_type) is not None
+    ):
+        raise ValueError(
+            "Model "
+            + model
+            + " is a text-to-image generation model and does not support "
+            "image editing with reference images. Image editing requires a "
+            "model that implements edit support (FLUX.2 or Mage-Flow-Edit). "
+            "Send the request to /v1/images/generations without a reference "
+            "image, or use an edit-capable model."
+        )
     model_class = None
     for model_type in (*local_model_types, _model_type_from_id(model)):
         model_class = _image_edit_model_class_for_type(model_type)
@@ -170,7 +200,15 @@ def load_image_edit_model(
         if resolved_path is not None:
             kwargs.setdefault("model_path", resolved_path)
         return model_class.from_model_id(model, **kwargs)
-    raise ValueError(f"Image edit model {model} is not supported")
+    raise ValueError(
+        "Model "
+        + model
+        + " is a text-to-image generation model and does not support "
+        "image editing with reference images. Image editing requires a "
+        "model that implements edit support (FLUX.2 or Mage-Flow-Edit). "
+        "Send the request to /v1/images/generations without a reference "
+        "image, or use an edit-capable model."
+    )
 
 
 def _request_from_prompt(
