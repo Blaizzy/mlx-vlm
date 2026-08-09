@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import struct
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +17,7 @@ from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
     _load_safetensors,
+    _resolve_weight_files,
     apply_generation_config_defaults,
     get_model_and_args,
     load,
@@ -927,3 +929,60 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestResolveWeightFiles:
+    def _shard(self, path, name):
+        (path / name).write_bytes(b"stub")
+
+    def _index(self, path, shard_names):
+        index = {
+            "weight_map": {f"layer.{i}": name for i, name in enumerate(shard_names)}
+        }
+        (path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    def test_complete_index_is_used(self, tmp_path):
+        self._shard(tmp_path, "model-00001-of-00002.safetensors")
+        self._shard(tmp_path, "model-00002-of-00002.safetensors")
+        self._shard(tmp_path, "consolidated.safetensors")
+        self._index(
+            tmp_path,
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+        )
+        files = _resolve_weight_files(tmp_path)
+        assert [Path(f).name for f in files] == [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        ]
+
+    def test_stale_index_falls_back_to_glob_and_warns(self, tmp_path, caplog):
+        # The index names shards from a previous upload; only some (or none)
+        # exist on disk. Trusting it would load a partial weight set.
+        self._shard(tmp_path, "model-00001-of-00002.safetensors")
+        self._shard(tmp_path, "actual.safetensors")
+        self._index(
+            tmp_path,
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
+        )
+        with caplog.at_level(logging.WARNING):
+            files = _resolve_weight_files(tmp_path)
+        assert sorted(Path(f).name for f in files) == [
+            "actual.safetensors",
+            "model-00001-of-00002.safetensors",
+        ]
+        assert any("stale" in record.message for record in caplog.records)
+
+    def test_no_index_globs(self, tmp_path):
+        self._shard(tmp_path, "model.safetensors")
+        self._shard(tmp_path, "consolidated.safetensors")
+        files = _resolve_weight_files(tmp_path)
+        assert [Path(f).name for f in files] == ["model.safetensors"]
+
+    def test_corrupt_index_globs(self, tmp_path):
+        self._shard(tmp_path, "model.safetensors")
+        (tmp_path / "model.safetensors.index.json").write_text("{not json")
+        files = _resolve_weight_files(tmp_path)
+        assert [Path(f).name for f in files] == ["model.safetensors"]
+
+    def test_empty_dir_returns_empty(self, tmp_path):
+        assert _resolve_weight_files(tmp_path) == []

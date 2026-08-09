@@ -606,6 +606,43 @@ def get_model_path(
     return model_path
 
 
+def _resolve_weight_files(model_path: Path) -> List[str]:
+    """Resolve the model's safetensors shards, preferring the index file.
+
+    Falls back to globbing ``*.safetensors`` when the index is absent,
+    unreadable, or stale — i.e. it references shards that are missing on
+    disk. Trusting a stale index would silently load a partial weight set
+    that only fails much later, in ``load_weights``, with a confusing
+    missing-parameter error instead of pointing at the real cause.
+    """
+    index_file = model_path / "model.safetensors.index.json"
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+        except (ValueError, OSError):
+            weight_map = {}
+        shards = sorted(set(weight_map.values()))
+        missing = [shard for shard in shards if not (model_path / shard).exists()]
+        if shards and not missing:
+            return [str(model_path / shard) for shard in shards]
+        if missing:
+            logging.warning(
+                "%s references %d shard(s) not present in %s (e.g. %s); "
+                "treating the index as stale and discovering shards by "
+                "globbing *.safetensors instead.",
+                index_file.name,
+                len(missing),
+                model_path,
+                missing[0],
+            )
+    return [
+        wf
+        for wf in glob.glob(str(model_path / "*.safetensors"))
+        if not wf.endswith("consolidated.safetensors")
+    ]
+
+
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     """
     Load and initialize the model from a given path.
@@ -631,25 +668,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    index_file = model_path / "model.safetensors.index.json"
-    weight_files = []
-    if index_file.exists():
-        try:
-            with open(index_file) as f:
-                weight_map = json.load(f).get("weight_map", {})
-            weight_files = [
-                str(model_path / shard)
-                for shard in sorted(set(weight_map.values()))
-                if (model_path / shard).exists()
-            ]
-        except (ValueError, OSError):
-            weight_files = []
-    if not weight_files:
-        weight_files = [
-            wf
-            for wf in glob.glob(str(model_path / "*.safetensors"))
-            if not wf.endswith("consolidated.safetensors")
-        ]
+    weight_files = _resolve_weight_files(model_path)
 
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
