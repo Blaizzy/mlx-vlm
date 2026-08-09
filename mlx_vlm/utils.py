@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import struct
+import warnings
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -1669,6 +1670,7 @@ def process_inputs(
     padding=True,
     padding_side="left",
     return_tensors="mlx",
+    processor_kwargs=None,
     **kwargs,
 ):
     # Get the process method from the processor
@@ -1692,6 +1694,13 @@ def process_inputs(
     for param in parameters.keys():
         if param in kwargs.keys():
             args[param] = kwargs.get(param, None)
+
+    # Forward explicit processor kwargs (e.g. max_pixels/min_pixels) verbatim.
+    # Processors typically consume these through their **kwargs, which the
+    # signature filter above cannot see, so they would otherwise be dropped
+    # silently.
+    if processor_kwargs:
+        args.update(processor_kwargs)
 
     # Add audio if provided and supported
     if audio is not None and len(audio) > 0:
@@ -1744,8 +1753,16 @@ def prepare_inputs(
     padding_side="left",
     pad_to_uniform_size=False,
     return_tensors="mlx",
+    processor_kwargs=None,
     **kwargs,
 ):
+    """Prepare model inputs from prompts and multimodal data.
+
+    Args:
+        processor_kwargs (dict, optional): Extra kwargs forwarded verbatim to
+            the processor call, e.g. ``{"max_pixels": 1_000_000}`` for
+            processors that support per-call sizing overrides.
+    """
 
     has_images = images is not None and (
         not hasattr(images, "__len__") or len(images) > 0
@@ -1880,6 +1897,14 @@ def prepare_inputs(
     if hasattr(processor, "image_processor") and isinstance(
         processor.image_processor, BaseImageProcessor
     ):
+        if processor_kwargs:
+            # This path calls image_processor.preprocess(images=...) directly
+            # with no kwarg plumbing; fail soft but never silently.
+            warnings.warn(
+                f"processor_kwargs={sorted(processor_kwargs)} are not supported "
+                f"by {type(processor.image_processor).__name__} inputs and were "
+                "ignored."
+            )
         if not isinstance(prompts, list):
             prompts = [prompts]
 
@@ -1924,6 +1949,7 @@ def prepare_inputs(
             audio=audio,
             prompts=prompts,
             add_special_tokens=add_special_tokens,
+            processor_kwargs=processor_kwargs,
             **extra,
             **kwargs,
         )

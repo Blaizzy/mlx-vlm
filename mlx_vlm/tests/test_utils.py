@@ -24,6 +24,7 @@ from mlx_vlm.utils import (
     load_model,
     load_processor,
     prepare_inputs,
+    process_inputs,
     process_inputs_with_fallback,
     sanitize_weights,
     update_module_configs,
@@ -927,3 +928,88 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestProcessorKwargsForwarding:
+    class RecordingProcessor:
+        """Processor double that consumes extra kwargs via **kwargs, like the
+        Qwen-family processors consume max_pixels/min_pixels."""
+
+        def __init__(self):
+            self.seen_kwargs = None
+            self.tokenizer = SimpleNamespace(pad_token="[PAD]", eos_token="[EOS]")
+
+        def __call__(
+            self, text=None, images=None, padding=None, return_tensors="mlx", **kwargs
+        ):
+            self.seen_kwargs = kwargs
+            return {
+                "input_ids": mx.array([[1, 2, 3]]),
+                "attention_mask": mx.array([[1, 1, 1]]),
+            }
+
+    def test_process_inputs_forwards_processor_kwargs(self):
+        processor = self.RecordingProcessor()
+        process_inputs(processor, prompts="hi", processor_kwargs={"max_pixels": 1234})
+        assert processor.seen_kwargs.get("max_pixels") == 1234
+
+    def test_unmatched_loose_kwargs_are_still_filtered(self):
+        # Kwargs matching no named parameter are dropped by the signature
+        # filter (generation kwargs like max_tokens share this code path);
+        # the explicit processor_kwargs channel is the supported way through.
+        processor = self.RecordingProcessor()
+        process_inputs(processor, prompts="hi", max_pixels=1234)
+        assert "max_pixels" not in processor.seen_kwargs
+
+    def test_prepare_inputs_forwards_processor_kwargs(self):
+        from PIL import Image
+
+        processor = self.RecordingProcessor()
+        image = Image.new("RGB", (64, 64))
+        prepare_inputs(
+            processor,
+            prompts="hi",
+            images=[image],
+            processor_kwargs={"max_pixels": 1234},
+        )
+        assert processor.seen_kwargs.get("max_pixels") == 1234
+
+    def test_qwen3_vl_per_call_max_pixels_shrinks_grid(self):
+        from PIL import Image
+
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        processor = Qwen3VLImageProcessor()
+        img = Image.new("RGB", (1000, 1400), color=(3, 5, 7))
+        default_grid = processor([img])["image_grid_thw"][0]
+        capped_grid = processor([img], max_pixels=256 * 256)["image_grid_thw"][0]
+        assert capped_grid.prod() < default_grid.prod()
+
+    def test_legacy_image_processor_warns_on_processor_kwargs(self):
+        import numpy as np
+        from PIL import Image
+
+        from mlx_vlm.models.base import BaseImageProcessor
+
+        class LegacyImageProcessor(BaseImageProcessor):
+            def preprocess(self, images):
+                return [np.zeros((3, 8, 8), dtype=np.float32) for _ in images]
+
+        class LegacyProcessor:
+            def __init__(self):
+                self.image_processor = LegacyImageProcessor()
+                self.pad_token = "[PAD]"
+                self.pad_token_id = 0
+                self.eos_token = "[EOS]"
+
+            def __call__(self, text):
+                return SimpleNamespace(input_ids=[1, 2])
+
+        with pytest.warns(UserWarning, match="processor_kwargs"):
+            prepare_inputs(
+                LegacyProcessor(),
+                prompts="a <image> b",
+                images=[Image.new("RGB", (8, 8))],
+                image_token_index=99,
+                processor_kwargs={"max_pixels": 1234},
+            )
