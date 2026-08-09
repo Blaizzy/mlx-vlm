@@ -6582,7 +6582,12 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         """
         if self.batch_size != 1 or int(idx) != 0:
             return self.extract(idx)
-        cache = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        cache = TurboQuantKVCache(
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+        )
         if self.keys is None or self._idx == 0:
             return cache
         cache.key_codec = self.key_codec

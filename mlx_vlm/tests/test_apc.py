@@ -1387,3 +1387,47 @@ def test_disk_only_exact_cache_reads_snapshots_without_split_bits(tmp_path):
     assert isinstance(warm[0], TurboQuantKVCache)
     assert warm[0].bits == cache.bits
     manager.close()
+
+
+def test_disk_only_exact_cache_preserves_bits_through_batch_extract(tmp_path):
+    """The production path starts from a batch cache, not a single-row one.
+
+    Storing goes BatchTurboQuantKVCache -> extract_view() -> serializer, and a
+    view that rebuilt the row at the default split would hand the serializer
+    the wrong widths to record.
+    """
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+    token_ids = list(range(32))
+    batch = BatchTurboQuantKVCache([0], bits=4, key_bits=3, value_bits=8)
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 64)),
+        mx.random.normal((1, 2, len(token_ids), 64)),
+    )
+
+    borrowed = batch.extract_view(0)
+    assert borrowed.key_bits == batch.key_bits
+    assert borrowed.value_bits == batch.value_bits
+
+    # Mirror the server: rows are borrowed, then handed to the store.
+    row = apc_module.snapshot_prompt_cache_row([batch], 0, detach=False)
+    assert row is not None
+
+    manager, disk = _disk_only_manager(tmp_path, "batch")
+    assert manager.store_exact_cache(token_ids, row, extra_hash=3)
+    disk._q.join()
+    manager.close()
+
+    manager, _ = _disk_only_manager(tmp_path, "batch")
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=3)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    restored = warm[0]
+    assert isinstance(restored, TurboQuantKVCache)
+    assert (restored.bits, restored.key_bits, restored.value_bits) == (
+        batch.bits,
+        batch.key_bits,
+        batch.value_bits,
+    )
+    manager.close()

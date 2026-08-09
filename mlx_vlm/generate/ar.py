@@ -1830,9 +1830,7 @@ class PromptProcessingBatch:
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
     def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
-        disk_only = bool(
-            self._apc_manager is not None and self._apc_manager.disk_only
-        )
+        disk_only = bool(self._apc_manager is not None and self._apc_manager.disk_only)
         return _apc.snapshot_prompt_cache_row(
             self.prompt_cache,
             batch_idx,
@@ -2726,9 +2724,14 @@ class BatchGenerator:
                     top_logprobs_k=self.top_logprobs_k,
                     greedy_sampling=self.greedy_sampling,
                 )
-                mx.synchronize(self._stream)
-                gc.collect()
-                mx.clear_cache()
+                if getattr(self._apc_manager, "disk_only", False):
+                    # Restoring a long prefix from disk allocates before the
+                    # old batch's cache would otherwise be collected, so force
+                    # the release here. The stop-the-world collection is not
+                    # worth imposing on runs that never restore.
+                    mx.synchronize(self._stream)
+                    gc.collect()
+                    mx.clear_cache()
             if (
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0

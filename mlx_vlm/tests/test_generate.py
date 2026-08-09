@@ -625,13 +625,18 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
         assert prompt_responses[0].cached_tokens == 0
 
+    @pytest.mark.parametrize("disk_only", [True, False])
     def test_finished_generation_releases_cache_before_next_prompt(
-        self, mock_model, mock_processor, monkeypatch
+        self, mock_model, mock_processor, monkeypatch, disk_only
     ):
+        # Forcing the release costs a stop-the-world collection, so it is
+        # limited to disk-only APC, where restoring a long prefix allocates
+        # before the finished batch would otherwise be reclaimed.
         gen = BatchGenerator(
             model=mock_model.language_model,
             processor=mock_processor,
         )
+        gen._apc_manager = SimpleNamespace(disk_only=disk_only)
 
         class FinishingBatch:
             def __init__(self):
@@ -670,9 +675,14 @@ class TestBatchGenerator:
         assert prompt_responses == []
         assert generation_responses == ["done"]
         assert gen._generation_batch is empty
-        synchronize.assert_called_once_with(gen._stream)
-        collect.assert_called_once()
-        clear_cache.assert_called_once()
+        if disk_only:
+            synchronize.assert_called_once_with(gen._stream)
+            collect.assert_called_once()
+            clear_cache.assert_called_once()
+        else:
+            synchronize.assert_not_called()
+            collect.assert_not_called()
+            clear_cache.assert_not_called()
 
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
