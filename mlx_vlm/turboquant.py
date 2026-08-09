@@ -4971,7 +4971,17 @@ class _QuantizedStateProxy:
         return iter(self._state)
 
 
-class TurboQuantKVCache(_BaseCache):
+class _TurboQuantAttentionMixin:
+    """Quantized-state attention shared by the single-sequence and batch caches.
+
+    The fused Metal kernels below read only the codecs and the explicitly
+    passed ``keys_state``/``values_state``; they never touch the owning
+    cache's storage layout. Both states carry a leading batch dimension, so
+    the same kernels serve ``TurboQuantKVCache`` and, for a single row,
+    ``BatchTurboQuantKVCache``.
+    """
+
+    # Chunking thresholds for the attention kernels below.
     decode_key_chunk_size = 1 << 30
     prefill_key_chunk_size = 2048
     prefill_query_block_size = 16
@@ -5125,23 +5135,14 @@ class TurboQuantKVCache(_BaseCache):
     def _unwrap(state):
         return state._state if isinstance(state, _QuantizedStateProxy) else state
 
-    def dequantize(self, keys_state=None, values_state=None):
-        if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
-        keys_state = self._unwrap(keys_state)
-        values_state = self._unwrap(values_state)
-        keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
-        values = self.value_codec.dequantize(values_state).astype(mx.float32)
-        return keys, values
+    def _attention_states(self):
+        """(keys_state, values_state) for callers that omit them.
 
-    def dequantize_for_apc(self):
-        """Return raw float (keys, values) for APC storage.
-
-        Returns (None, None) if the cache is empty.
+        ``state`` carries extra batch bookkeeping on the batch cache, so the
+        first two entries are taken rather than unpacked.
         """
-        if self.keys is None or self.offset == 0:
-            return None, None
-        return self.dequantize()
+        state = self.state
+        return state[0], state[1]
 
     def _apply_attention_mask(
         self,
@@ -5183,7 +5184,7 @@ class TurboQuantKVCache(_BaseCache):
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
+            keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
@@ -5280,7 +5281,7 @@ class TurboQuantKVCache(_BaseCache):
         """Fast prefill: fold L queries into R dimension, reuse decode kernels.
         Avoids the expensive O(T×D²) dequantize rotation matmul."""
         if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
+            keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
@@ -5849,7 +5850,7 @@ class TurboQuantKVCache(_BaseCache):
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
+            keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
@@ -6058,6 +6059,168 @@ class TurboQuantKVCache(_BaseCache):
         output = output.reshape(B, n_q_heads, L, value_dim)
         return output.astype(queries.dtype)
 
+
+class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
+    cache_step = 256
+
+    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
+        self.bits = _validate_bits(bits)
+        self.seed = seed
+        self.offset = 0
+        self.keys = None
+        self.values = None
+        self.key_codec = None
+        self.value_codec = None
+        self._cached_state = None
+        self._cached_state_offset = -1
+        self._shadow_keys = None
+        self._shadow_values = None
+
+    @classmethod
+    def from_cache(
+        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+    ) -> "TurboQuantKVCache":
+        turbo_cache = cls(bits=bits, seed=seed)
+        keys, values = cache.state
+        if keys is not None:
+            turbo_cache.update_and_fetch(keys, values)
+        return turbo_cache
+
+    def _ensure_codecs(self, keys: mx.array, values: mx.array):
+        if self.key_codec is None:
+            # For fractional bits (e.g. 3.5), use lower bits for keys and higher
+            # for values instead of SplitCodec. Both stay as fast integer codecs
+            # with single-tile kernel support. Values benefit more from extra bits.
+            key_bits = (
+                math.floor(self.bits)
+                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
+                else self.bits
+            )
+            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
+        if self.value_codec is None:
+            val_bits = (
+                math.ceil(self.bits)
+                if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
+                else self.bits
+            )
+            self.value_codec = _build_codec(
+                values, val_bits, mode="mse", seed=self.seed + 1
+            )
+
+    def _try_fused_kv_quantize(self, keys, values):
+        """Fused key+value quantize in 1 dispatch. Returns (key_state, val_state) or (None, None)."""
+        if (
+            keys.shape[-2] != 1
+            or not isinstance(self.key_codec, _TurboQuantMSECodec)
+            or not isinstance(self.value_codec, _TurboQuantMSECodec)
+        ):
+            return None, None
+
+        # RHT codecs use Hadamard rotation; this fused kernel applies dense rotation.
+        if self.key_codec.use_rht or self.value_codec.use_rht:
+            return None, None
+
+        key_bits = int(self.key_codec.bits)
+        val_bits = int(self.value_codec.bits)
+        kernel = _fused_kv_quantize_kernel(key_bits, val_bits)
+        if kernel is None:
+            return None, None
+
+        D = keys.shape[-1]
+        k_flat = keys.reshape(-1, D)
+        v_flat = values.reshape(-1, D)
+        BH = k_flat.shape[0]
+        k_pw = (D * key_bits + 31) // 32
+        v_pw = (D * val_bits + 31) // 32
+
+        k_norms, k_packed, v_norms, v_packed = kernel(
+            inputs=[
+                k_flat,
+                v_flat,
+                self.key_codec.rotation,
+                self.value_codec.rotation,
+                self.key_codec._midpoints,
+                self.value_codec._midpoints,
+            ],
+            template=[
+                ("Dim", D),
+                ("KPackedWidth", k_pw),
+                ("VPackedWidth", v_pw),
+            ],
+            grid=(D * BH, 2, 1),
+            threadgroup=(D, 1, 1),
+            output_shapes=[
+                (BH,),
+                (BH, k_pw),
+                (BH,),
+                (BH, v_pw),
+            ],
+            output_dtypes=[mx.float16, mx.uint32, mx.float16, mx.uint32],
+        )
+
+        orig = keys.shape[:-1]
+        return (
+            TurboQuantMSEState(k_norms.reshape(orig), k_packed.reshape(*orig, k_pw)),
+            TurboQuantMSEState(v_norms.reshape(orig), v_packed.reshape(*orig, v_pw)),
+        )
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        self._ensure_codecs(keys, values)
+
+        # Try fused key+value quantize (1 dispatch instead of 2)
+        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
+        if new_keys is None:
+            new_keys = self.key_codec.quantize(keys)
+            new_values = self.value_codec.quantize(values)
+
+        new_end = self.offset + keys.shape[2]
+        if self.keys is None:
+            self.keys = _allocate_state_like(new_keys, new_end)
+            self.values = _allocate_state_like(new_values, new_end)
+        else:
+            self.keys = _reserve_state_capacity(
+                self.keys, self.offset, new_end, self.cache_step
+            )
+            self.values = _reserve_state_capacity(
+                self.values, self.offset, new_end, self.cache_step
+            )
+
+        _write_state(self.keys, new_keys, self.offset)
+        _write_state(self.values, new_values, self.offset)
+
+        B, n_heads = keys.shape[0], keys.shape[1]
+        D = keys.shape[-1]
+        n_new = keys.shape[2]
+
+        self.offset = new_end
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if n_new > 1 or (self.offset % 50 == 0):
+            mx.eval(self.keys, self.values)
+        ks, vs = self.state
+        return (
+            _QuantizedStateProxy(ks, self.offset, n_heads),
+            _QuantizedStateProxy(vs, self.offset, n_heads),
+        )
+
+    def dequantize(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self._attention_states()
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+        keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
+        values = self.value_codec.dequantize(values_state).astype(mx.float32)
+        return keys, values
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self.offset == 0:
+            return None, None
+        return self.dequantize()
+
     def size(self):
         return self.offset
 
@@ -6135,7 +6298,7 @@ class TurboQuantKVCache(_BaseCache):
 # ── Batch-aware TurboQuant cache for continuous batching ────────────────
 
 
-class BatchTurboQuantKVCache(_BaseCache):
+class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     """Batch-aware TurboQuant KV cache for continuous batching.
 
     Wraps TurboQuant's quantization codecs with per-sequence offsets and
