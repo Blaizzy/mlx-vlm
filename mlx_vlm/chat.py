@@ -23,6 +23,14 @@ from mlx_vlm.generate import (
     PromptCacheState,
     stream_generate,
 )
+from mlx_vlm.generate.remote import (
+    RemoteServerError,
+    _image_url,
+    resolve_base_url,
+    sampling_params,
+    server_available,
+    stream_chat,
+)
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_image
 from mlx_vlm.vision_cache import VisionFeatureCache
@@ -35,9 +43,12 @@ class MLXVisionChat:
         temperature: float = 0.7,
         max_tokens: int = 1000,
         verbose: bool = False,
+        remote_args=None,
         **kwargs,
     ):
         self.console = Console()
+        self.model_path = model_path
+        self.remote_args = remote_args
         self.verbose = verbose
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -56,10 +67,16 @@ class MLXVisionChat:
             self.chat_template_kwargs["thinking_mode"] = thinking_mode
         self.stream_kwargs = kwargs
 
-        with self.console.status("[bold green]Loading model..."):
-            self.model, self.processor = load(model_path)
-
-        rprint("[bold green]Model loaded successfully![/bold green]")
+        if remote_args is None:
+            with self.console.status("[bold green]Loading model..."):
+                self.model, self.processor = load(model_path)
+            rprint("[bold green]Model loaded successfully![/bold green]")
+        else:
+            self.model = None
+            self.processor = None
+            rprint(
+                f"[bold green]Using server at {resolve_base_url(remote_args)}.[/bold green]"
+            )
         self.print_help()
 
     def print_help(self) -> None:
@@ -96,10 +113,31 @@ class MLXVisionChat:
     def add_to_history(self, role: str, text: str) -> None:
         """Add a message to the conversation history."""
         content = [{"type": "text", "text": text}]
+        if role == "user" and self.remote_args and self.current_image_path:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _image_url(self.current_image_path)},
+                }
+            )
         self.history.append({"role": role, "content": content})
 
     def generate_response(self) -> str:
         """Generate a response from the model based on the conversation history."""
+        if self.remote_args is not None:
+            text = ""
+            for chunk in stream_chat(
+                resolve_base_url(self.remote_args),
+                self.model_path,
+                self.history,
+                sampling_params(self.remote_args),
+                self.remote_args,
+            ):
+                text += chunk
+                if self.verbose:
+                    rprint(chunk, end="", flush=True)
+            return text
+
         num_images = 1 if self.current_image_path else 0
         image = [self.current_image_path] if self.current_image_path else None
 
@@ -193,6 +231,28 @@ def main():
         "--model",
         default="mlx-community/idefics2-8b-chatty-4bit",
         help="Path to the model or model identifier",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="Base URL of a running mlx-vlm server to reuse (default: "
+        "$MLX_VLM_BASE_URL or http://127.0.0.1:8080).",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for the server (default: $MLX_VLM_API_KEY).",
+    )
+    server_mode = parser.add_mutually_exclusive_group()
+    server_mode.add_argument(
+        "--server",
+        action="store_true",
+        help="Require a running server instead of loading the model locally.",
+    )
+    server_mode.add_argument(
+        "--local",
+        action="store_true",
+        help="Force local execution even if a server is running.",
     )
     parser.add_argument(
         "--verbose",
@@ -332,6 +392,31 @@ def main():
 
     args = parser.parse_args()
 
+    remote_eligible = (
+        args.eos_tokens is None
+        and not args.skip_special_tokens
+        and args.thinking_mode is None
+        and args.max_kv_size is None
+        and args.kv_bits is None
+        and args.prefill_step_size in (None, DEFAULT_PREFILL_STEP_SIZE)
+    )
+    use_server = False
+    if not args.local and remote_eligible:
+        try:
+            use_server = server_available(resolve_base_url(args), args)
+        except RemoteServerError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    if args.server and not remote_eligible:
+        print("Error: --server cannot be used with these chat options", file=sys.stderr)
+        sys.exit(1)
+    if args.server and not use_server:
+        print(
+            f"Error: No mlx-vlm server is available at {resolve_base_url(args)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Build stream_generate kwargs matching generate.py's main()
     kwargs = {}
 
@@ -382,6 +467,7 @@ def main():
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
+            remote_args=args if use_server else None,
             **kwargs,
         )
         chat.chat_loop()

@@ -74,6 +74,32 @@ def parse_arguments():
         help="The path to the local model directory or Hugging Face repo.",
     )
     parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Base URL of a running mlx-vlm server to reuse (default: "
+        "$MLX_VLM_BASE_URL or http://127.0.0.1:8080). Used only for plain "
+        "text/vision generation; other flags always run locally.",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for the server (default: $MLX_VLM_API_KEY).",
+    )
+    server_mode = parser.add_mutually_exclusive_group()
+    server_mode.add_argument(
+        "--server",
+        action="store_true",
+        help="Require the server: send the request over HTTP instead of loading "
+        "the model locally (errors if the server is unreachable).",
+    )
+    server_mode.add_argument(
+        "--local",
+        action="store_true",
+        help="Force local execution even if a server is running.",
+    )
+    parser.add_argument(
         "--output-modality",
         type=str,
         choices=("text", "image", "video"),
@@ -1243,6 +1269,11 @@ def main():
         args.audio = [args.audio]
     if isinstance(args.video, str):
         args.video = [args.video]
+
+    from .remote import run_on_server
+
+    if run_on_server(args):
+        return
 
     model, processor = load(
         args.model,
