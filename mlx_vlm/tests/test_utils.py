@@ -24,6 +24,7 @@ from mlx_vlm.utils import (
     load_model,
     load_processor,
     prepare_inputs,
+    process_image,
     process_inputs_with_fallback,
     sanitize_weights,
     update_module_configs,
@@ -927,3 +928,35 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestProcessImage:
+    def _image(self, width=640, height=480):
+        from PIL import Image
+
+        return Image.new("RGB", (width, height), color=(120, 40, 200))
+
+    def test_resize_shape_applied_without_custom_processor(self):
+        img = process_image(self._image(), (320, 320), None)
+        assert max(img.size) <= 320
+
+    def test_resize_shape_ignored_with_custom_processor_warns(self):
+        from mlx_vlm.models.base import BaseImageProcessor
+
+        class DummyProcessor(BaseImageProcessor):
+            def preprocess(self, images):
+                return images
+
+        original = self._image()
+        with pytest.warns(UserWarning, match="resize_shape.*DummyProcessor"):
+            img = process_image(original, (320, 320), DummyProcessor())
+
+        assert img.size == original.size
+
+    def test_no_resize_shape_no_warning(self):
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            img = process_image(self._image(), None, None)
+        assert img.size == (640, 480)
