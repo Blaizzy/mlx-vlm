@@ -9,22 +9,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-OFFICIAL_REVISION = "c5d3b70183b6bb9d7553590e111b05685049751c"
 BASE_TOKENIZER_REPO = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
-BASE_TOKENIZER_REVISION = "6533e8de2c68e4536bf7c411d7a3ce5734111476"
 TOKENIZER_FILES = [
     "config.json",
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",
 ]
-RUNTIME_CONFIG_VERSION = 2
 
 
 def _resolve(
@@ -49,13 +47,7 @@ def _text_config(base: dict) -> dict:
     pattern = base.get("hybrid_override_pattern")
     if pattern is None:
         raise ValueError("base tokenizer model config lacks hybrid_override_pattern")
-    time_step_limit = base.get("time_step_limit")
-    if time_step_limit is None:
-        # ``time_step_min/max`` control parameter initialization in Nemotron-H;
-        # they are not the runtime dt clamp. The reference runtime is unbounded
-        # unless ``time_step_limit`` is explicitly configured.
-        time_step_limit = [0.0, float("inf")]
-    return {
+    config = {
         "model_type": "nemotron_h",
         "vocab_size": base["vocab_size"],
         "hidden_size": base["hidden_size"],
@@ -79,8 +71,25 @@ def _text_config(base: dict) -> dict:
         "use_conv_bias": base.get("use_conv_bias", True),
         "hybrid_override_pattern": pattern,
         "head_dim": base.get("head_dim"),
-        "time_step_limit": time_step_limit,
     }
+    time_step_limit = base.get("time_step_limit")
+    if time_step_limit is not None:
+        if (
+            not isinstance(time_step_limit, (list, tuple))
+            or len(time_step_limit) != 2
+            or not all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                for value in time_step_limit
+            )
+        ):
+            raise ValueError("time_step_limit must contain two finite numbers")
+        config["time_step_limit"] = list(time_step_limit)
+    # ``time_step_min/max`` control parameter initialization, not the runtime
+    # clamp. Omission selects Nemotron-H's unbounded in-memory default without
+    # serializing the non-standard JSON token ``Infinity``.
+    return config
 
 
 def build_runtime_config(source: dict, base: dict) -> dict:
@@ -120,7 +129,6 @@ def build_runtime_config(source: dict, base: dict) -> dict:
     codec = speech["codec_config"]
 
     config = {
-        "mlx_runtime_config_version": RUNTIME_CONFIG_VERSION,
         "model_type": "nemotron_voicechat",
         "architectures": ["NemotronVoiceChatForConditionalGeneration"],
         "text_config": _text_config(base),
@@ -190,8 +198,6 @@ def build_runtime_config(source: dict, base: dict) -> dict:
         "output_sample_rate": source["data"]["target_sample_rate"],
         "frame_duration": source["data"]["frame_length"],
         "function_channel_weight": stt["duplex_function_channel_weight"],
-        "source_revision": OFFICIAL_REVISION,
-        "base_tokenizer_revision": BASE_TOKENIZER_REVISION,
         "speaker": "Aria",
         "rnnt_vocabulary": joint_source.get("vocabulary", []),
     }
@@ -230,7 +236,7 @@ def prepare_artifact(
 
     output_path.mkdir(parents=True, exist_ok=True)
     (output_path / "config.json").write_text(
-        json.dumps(runtime_config, indent=2, ensure_ascii=False) + "\n"
+        json.dumps(runtime_config, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     )
 
     index = source_path / "model.safetensors.index.json"
@@ -259,7 +265,13 @@ def prepare_artifact(
         tokenizer_config = json.loads(tokenizer_config_path.read_text())
         tokenizer_config["fix_mistral_regex"] = True
         tokenizer_config_path.write_text(
-            json.dumps(tokenizer_config, indent=2, ensure_ascii=False) + "\n"
+            json.dumps(
+                tokenizer_config,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
         )
 
     readme = Path(__file__).with_name("README.md")
@@ -282,7 +294,7 @@ def main() -> None:
     parser.add_argument("--tokenizer", default=BASE_TOKENIZER_REPO)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--revision")
-    parser.add_argument("--tokenizer-revision", default=BASE_TOKENIZER_REVISION)
+    parser.add_argument("--tokenizer-revision")
     parser.add_argument("--copy-weights", action="store_true")
     args = parser.parse_args()
 

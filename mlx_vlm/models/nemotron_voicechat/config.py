@@ -148,8 +148,6 @@ class ModelConfig:
     default_system_prompt: str = ""
     rnnt_vocabulary: list[str] = field(default_factory=list)
     speaker: str = "Aria"
-    source_revision: str | None = None
-    base_tokenizer_revision: str | None = None
     quantization: dict[str, Any] | None = None
     quantization_config: dict[str, Any] | None = None
 

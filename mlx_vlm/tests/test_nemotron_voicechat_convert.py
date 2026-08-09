@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mlx_vlm.models.nemotron_voicechat import convert
 from mlx_vlm.models.nemotron_voicechat.convert import build_runtime_config
 
@@ -147,8 +149,10 @@ def _base_config():
 def test_build_runtime_config_normalizes_source_schema():
     config = build_runtime_config(_source_config(), _base_config())
     assert config["model_type"] == "nemotron_voicechat"
-    assert config["mlx_runtime_config_version"] == convert.RUNTIME_CONFIG_VERSION
-    assert config["text_config"]["time_step_limit"] == [0.0, float("inf")]
+    assert "mlx_runtime_config_version" not in config
+    assert "source_revision" not in config
+    assert "base_tokenizer_revision" not in config
+    assert "time_step_limit" not in config["text_config"]
     assert config["eos_token_id"] == 2
     assert config["pad_token_id"] == 12
     assert config["audio_config"]["encoder"]["att_context_size"] == [[70, 0]]
@@ -156,6 +160,23 @@ def test_build_runtime_config_normalizes_source_schema():
     assert config["codec_config"]["channel_multipliers"] == [1, 2, 4]
     assert config["codec_config"]["downsample_rates"] == [7, 7, 9]
     assert config["rnnt_vocabulary"] == ["<unk>", "▁hello"]
+
+
+def test_build_runtime_config_preserves_finite_time_step_limit():
+    base = _base_config()
+    base["time_step_limit"] = [0.001, 0.1]
+
+    config = build_runtime_config(_source_config(), base)
+
+    assert config["text_config"]["time_step_limit"] == [0.001, 0.1]
+
+
+def test_build_runtime_config_rejects_non_finite_time_step_limit():
+    base = _base_config()
+    base["time_step_limit"] = [0.0, float("inf")]
+
+    with pytest.raises(ValueError, match="two finite numbers"):
+        build_runtime_config(_source_config(), base)
 
 
 def test_build_runtime_config_flattens_per_module_quantization():
@@ -223,6 +244,19 @@ def test_prepare_artifact_writes_generic_load_layout(tmp_path):
     assert (output / shard_name).read_bytes() == b"weights"
     assert not (output / shard_name).is_symlink()
     assert (output / "README.md").exists()
+
+
+def test_prepare_artifact_rejects_non_finite_runtime_json(tmp_path, monkeypatch):
+    source, tokenizer, _ = _write_artifact_inputs(tmp_path)
+    output = tmp_path / "invalid-output"
+    monkeypatch.setattr(
+        convert,
+        "build_runtime_config",
+        lambda *_args: {"value": float("inf")},
+    )
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        convert.prepare_artifact(source, tokenizer, output, copy_weights=True)
 
 
 def test_prepare_artifact_can_link_weight_shards(tmp_path):
