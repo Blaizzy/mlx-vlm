@@ -625,6 +625,55 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
         assert prompt_responses[0].cached_tokens == 0
 
+    def test_finished_generation_releases_cache_before_next_prompt(
+        self, mock_model, mock_processor, monkeypatch
+    ):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+        )
+
+        class FinishingBatch:
+            def __init__(self):
+                self.active = True
+                self.prompt_cache = [object()]
+
+            def __len__(self):
+                return int(self.active)
+
+            def next(self):
+                self.active = False
+                return ["done"]
+
+        class EmptyBatch:
+            prompt_cache = []
+
+            def __len__(self):
+                return 0
+
+        empty = EmptyBatch()
+        gen._generation_batch = FinishingBatch()
+        monkeypatch.setattr(
+            ar_module.GenerationBatch,
+            "empty",
+            lambda *args, **kwargs: empty,
+        )
+        clear_cache = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "clear_cache", clear_cache)
+        synchronize = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "synchronize", synchronize)
+        collect = MagicMock()
+        monkeypatch.setattr(ar_module.gc, "collect", collect)
+
+        prompt_responses, generation_responses = gen._next()
+
+        assert prompt_responses == []
+        assert generation_responses == ["done"]
+        assert gen._generation_batch is empty
+        synchronize.assert_called_once_with(gen._stream)
+        collect.assert_called_once()
+        clear_cache.assert_called_once()
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),

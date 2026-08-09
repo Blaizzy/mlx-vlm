@@ -831,6 +831,21 @@ APC_DISK_SHARD_MAX_BLOCKS=256 \
 mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
 ```
 
+For memory-constrained hosts, keep reusable prefixes only on SSD:
+
+```sh
+APC_ENABLED=1 \
+APC_DISK_ONLY=1 \
+APC_DISK_PATH=~/.cache/mlx-vlm/caching \
+APC_DISK_MAX_GB=16 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --kv-bits 4 --port 8080
+```
+
+This disables both the block pool and exact-cache LRU in memory. The cache
+restored for an active request still resides in memory while that request is
+running. Exact TurboQuant snapshots remain packed on disk and are restored
+without a float dequantize/requantize round trip.
+
 Repeated requests with the same long prefix will hit APC automatically:
 
 ```sh
@@ -864,7 +879,9 @@ Common APC environment variables:
 | `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
 | `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
 | `APC_DISK_PATH` | unset | Directory for persistent disk shards |
+| `APC_DISK_ONLY` | `0` | Set to `1` to disable persistent in-memory APC tiers; requires `APC_DISK_PATH` |
 | `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_DISK_MIN_FREE_RAM_GB` | `2` (`0` with `APC_DISK_ONLY=1`) | Skip SSD restore below this free-RAM threshold |
 | `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
 | `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
 | `APC_LAYER_MAJOR_MEMORY_MIN_TOKENS` | `50000` | Store long warm-memory prefixes as compact layer-major snapshots instead of per-block tensors |

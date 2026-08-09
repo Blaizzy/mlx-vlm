@@ -661,6 +661,128 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_disk_only_turboquant_roundtrip_stays_packed(tmp_path):
+    from mlx_vlm.turboquant import (
+        BatchTurboQuantKVCache,
+        TurboQuantKVCache,
+        TurboQuantMSEState,
+    )
+
+    token_ids = list(range(40))
+    cache = TurboQuantKVCache(bits=4, seed=7)
+    cache.keys = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40),
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4),
+    )
+    cache.values = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40) + 1,
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4) + 2,
+    )
+    cache.offset = len(token_ids)
+    mx.eval(cache.state)
+
+    disk = DiskBlockStore(tmp_path, namespace="tq-disk-only")
+    manager = APCManager(
+        num_blocks=0,
+        block_size=16,
+        disk=disk,
+        disk_only=True,
+    )
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=5)
+    assert not manager._exact_cache
+    assert disk.num_exact_indexed == 1
+
+    restored, matched = manager.lookup_exact_cache(
+        token_ids + [999], extra_hash=5
+    )
+    assert matched == len(token_ids)
+    assert restored is not None
+    assert isinstance(restored[0], TurboQuantKVCache)
+    assert restored[0].bits == 4
+    assert restored[0].seed == 7
+    assert restored[0].offset == len(token_ids)
+    assert restored[0].keys.indices.dtype == mx.uint32
+    _assert_allclose(restored[0].keys.norms, cache.keys.norms)
+    assert bool(mx.array_equal(restored[0].keys.indices, cache.keys.indices).item())
+
+    warm, prefix_len = make_warm_batch_exact_cache_multi(
+        [restored],
+        [matched],
+        kv_quant_config={"bits": 4, "scheme": "turboquant"},
+    )
+    assert prefix_len == len(token_ids)
+    assert warm is not None
+    assert isinstance(warm[0], BatchTurboQuantKVCache)
+    assert warm[0]._idx == len(token_ids)
+    assert warm[0].keys.indices.dtype == mx.uint32
+    manager.close()
+
+
+def test_from_env_disk_only_has_no_memory_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("APC_ENABLED", "1")
+    monkeypatch.setenv("APC_DISK_ONLY", "1")
+    monkeypatch.setenv("APC_DISK_PATH", str(tmp_path))
+    monkeypatch.setenv("APC_NUM_BLOCKS", "999")
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "999")
+
+    manager = from_env("disk-only")
+    assert manager is not None
+    assert manager.disk_only is True
+    assert manager.num_blocks == 0
+    assert manager.pool == []
+    assert manager._exact_cache_max == 0
+    assert manager._disk_min_free_ram_bytes == 0
+    manager.close()
+
+
+def test_from_env_disk_only_requires_disk_path(monkeypatch):
+    monkeypatch.setenv("APC_ENABLED", "1")
+    monkeypatch.setenv("APC_DISK_ONLY", "1")
+    monkeypatch.delenv("APC_DISK_PATH", raising=False)
+
+    assert from_env("disk-only-no-path") is None
+
+
+def test_turboquant_extract_view_borrows_single_row_state():
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantMSEState
+
+    cache = BatchTurboQuantKVCache([0], bits=4, seed=7)
+    cache.keys = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40),
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4),
+    )
+    cache.values = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40) + 1,
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4) + 2,
+    )
+    cache._idx = 40
+    cache.offset = mx.array([40])
+    mx.eval(cache.state)
+
+    view = cache.extract_view(0)
+    assert view.offset == 40
+    assert view.keys.norms.shape == (1, 1, 40)
+    assert view.keys.indices.shape == (1, 1, 40, 4)
+    _assert_allclose(view.keys.norms, cache.keys.norms)
+    assert bool(mx.array_equal(view.keys.indices, cache.keys.indices).item())
+
+
+def test_batch_kv_extract_view_preserves_single_row_prefix():
+    from mlx_vlm.models.cache import BatchKVCache
+
+    cache = BatchKVCache([2])
+    cache.keys = mx.arange(48, dtype=mx.float16).reshape(1, 2, 6, 4)
+    cache.values = cache.keys + 1
+    cache._idx = 6
+    cache.offset = mx.array([4])
+
+    view = cache.extract_view(0)
+    assert view.offset == 4
+    assert view.keys.shape == (1, 2, 4, 4)
+    _assert_allclose(view.keys, cache.keys[:, :, 2:6])
+    _assert_allclose(view.values, cache.values[:, :, 2:6])
+
+
 def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
     from mlx_vlm.models.cache import KVCache, RotatingKVCache
 

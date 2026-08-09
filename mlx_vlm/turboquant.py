@@ -6573,6 +6573,29 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         cache.offset = _state_length(cache.keys)
         return cache
 
+    def extract_view(self, idx):
+        """Borrow one row for a synchronous exact-cache disk write.
+
+        The common single-row case avoids ``mx.contiguous`` and therefore
+        does not allocate a second packed KV prefix. The returned cache must
+        not outlive the caller's synchronous serialization step.
+        """
+        if self.batch_size != 1 or int(idx) != 0:
+            return self.extract(idx)
+        cache = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        if self.keys is None or self._idx == 0:
+            return cache
+        cache.key_codec = self.key_codec
+        cache.value_codec = self.value_codec
+        padding = max(0, int(self.left_padding[0].item()))
+        end = self._idx
+        if padding >= end:
+            return cache
+        cache.keys = _slice_state_range(self.keys, padding, end)
+        cache.values = _slice_state_range(self.values, padding, end)
+        cache.offset = end - padding
+        return cache
+
     # ------------------------------------------------------------------
     # State / introspection
     # ------------------------------------------------------------------
