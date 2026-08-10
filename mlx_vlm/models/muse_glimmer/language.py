@@ -32,8 +32,7 @@ class CenteredRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        normalized = mx.fast.rms_norm(x, None, self.eps)
-        return normalized * (1.0 + self.weight)
+        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
 
 
 class NormedEmbedding(nn.Embedding):

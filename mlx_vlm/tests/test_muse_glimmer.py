@@ -6,9 +6,15 @@ from PIL import Image
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, NormedEmbedding
+from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
     smart_resize,
+)
+from mlx_vlm.models.muse_glimmer.vision import (
+    _window_index,
+    apply_rotary,
+    rotate_half,
 )
 
 
@@ -83,6 +89,44 @@ def test_centered_rms_norm_uses_one_plus_checkpoint_weight():
     np.testing.assert_allclose(
         np.asarray(output), expected_base * np.array([[1.0, 2.0]]), rtol=1e-6
     )
+
+
+def test_compiled_vision_rotary_matches_fp32_reference():
+    q = mx.arange(48, dtype=mx.bfloat16).reshape(1, 2, 2, 12) / 48
+    k = q + 0.25
+    cos = mx.cos(mx.arange(24, dtype=mx.float32).reshape(2, 12) / 24)
+    sin = mx.sin(mx.arange(24, dtype=mx.float32).reshape(2, 12) / 24)
+
+    actual_q, actual_k = apply_rotary(q, k, cos, sin)
+    expanded_cos = cos[None, :, None, :]
+    expanded_sin = sin[None, :, None, :]
+    q32, k32 = q.astype(mx.float32), k.astype(mx.float32)
+    expected_q = (q32 * expanded_cos + rotate_half(q32) * expanded_sin).astype(q.dtype)
+    expected_k = (k32 * expanded_cos + rotate_half(k32) * expanded_sin).astype(k.dtype)
+    mx.eval(actual_q, actual_k, expected_q, expected_k)
+
+    assert bool(mx.array_equal(actual_q, expected_q).item())
+    assert bool(mx.array_equal(actual_k, expected_k).item())
+
+
+def test_window_index_skips_identity_reordering():
+    identity_index, identity_cu = _window_index([[1, 4, 4]], window_size=4)
+    assert identity_index is None
+    assert identity_cu == [0, 16]
+
+    window_index, window_cu = _window_index([[1, 4, 8]], window_size=4)
+    mx.eval(window_index)
+    assert window_cu == [0, 16, 32]
+    assert sorted(window_index.tolist()) == list(range(32))
+
+
+def test_masked_scatter_stays_in_mlx():
+    inputs = mx.arange(12).reshape(1, 3, 4)
+    mask = mx.broadcast_to(mx.array([[[False], [True], [False]]]), inputs.shape)
+    source = mx.array([[20, 21, 22, 23]])
+    output = masked_scatter(inputs, mask, source)
+    mx.eval(output)
+    assert output.tolist() == [[[0, 1, 2, 3], [20, 21, 22, 23], [8, 9, 10, 11]]]
 
 
 def test_image_processor_patch_layout_and_grid():

@@ -2,20 +2,18 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from ..base import InputEmbeddingsFeatures
 from .config import ModelConfig
 from .language import LanguageModel, RMSNormNoScale
-from .vision import VisionModel
+from .vision import VisionModel, gelu
 
 
 def masked_scatter(input_tensor: mx.array, mask: mx.array, source: mx.array):
     shape = input_tensor.shape
     flat_input = input_tensor.flatten()
     flat_mask = mask.flatten()
-    positions = mx.array(np.where(flat_mask)[0], dtype=mx.uint32)
-    flat_input[positions] = source.flatten()
+    flat_input[flat_mask] = source.flatten()
     return flat_input.reshape(shape)
 
 
@@ -30,7 +28,7 @@ class VisionAdapter(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        return nn.gelu(self.fc2(nn.gelu(self.fc1(x))))
+        return gelu(self.fc2(gelu(self.fc1(x))))
 
 
 class Model(nn.Module):

@@ -1,4 +1,5 @@
-from typing import List
+from functools import partial
+from typing import List, Optional, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,33 +14,54 @@ def rotate_half(x: mx.array) -> mx.array:
     return mx.concatenate((-x[..., half:], x[..., :half]), axis=-1)
 
 
-def apply_rotary(q: mx.array, k: mx.array, cos: mx.array, sin: mx.array):
-    cos = cos[None, :, None, :].astype(mx.float32)
-    sin = sin[None, :, None, :].astype(mx.float32)
+@partial(mx.compile, shapeless=True)
+def _apply_rotary(
+    q: mx.array,
+    k: mx.array,
+    rotated_q: mx.array,
+    rotated_k: mx.array,
+    cos: mx.array,
+    sin: mx.array,
+):
+    cos = mx.expand_dims(cos, (0, 2)).astype(mx.float32)
+    sin = mx.expand_dims(sin, (0, 2)).astype(mx.float32)
     q_dtype, k_dtype = q.dtype, k.dtype
     q = q.astype(mx.float32)
     k = k.astype(mx.float32)
-    q = (q * cos + rotate_half(q) * sin).astype(q_dtype)
-    k = (k * cos + rotate_half(k) * sin).astype(k_dtype)
+    rotated_q = rotated_q.astype(mx.float32)
+    rotated_k = rotated_k.astype(mx.float32)
+    q = (q * cos + rotated_q * sin).astype(q_dtype)
+    k = (k * cos + rotated_k * sin).astype(k_dtype)
     return q, k
 
 
-def _cu_seqlens(grid_thw: mx.array) -> mx.array:
+def apply_rotary(q: mx.array, k: mx.array, cos: mx.array, sin: mx.array):
+    return _apply_rotary(q, k, rotate_half(q), rotate_half(k), cos, sin)
+
+
+@partial(mx.compile, shapeless=True)
+def gelu(x: mx.array) -> mx.array:
+    return nn.gelu(x)
+
+
+def _cu_seqlens(grid: Sequence[Sequence[int]]) -> List[int]:
     lengths: List[int] = []
-    for temporal, height, width in grid_thw.tolist():
+    for temporal, height, width in grid:
         lengths.extend([int(height) * int(width)] * int(temporal))
-    return mx.array([0] + np.cumsum(lengths).tolist(), dtype=mx.int32)
+    return [0] + np.cumsum(lengths).tolist()
 
 
-def _window_index(grid_thw: mx.array, window_size: int):
+def _window_index(
+    grid: Sequence[Sequence[int]], window_size: int
+) -> tuple[Optional[mx.array], List[int]]:
     indices = []
     cumulative = [0]
     offset = 0
-    for temporal, height, width in grid_thw.tolist():
+    for temporal, height, width in grid:
         temporal, height, width = int(temporal), int(height), int(width)
         index = np.arange(temporal * height * width).reshape(temporal, height, width)
-        pad_h = window_size - height % window_size
-        pad_w = window_size - width % window_size
+        pad_h = (-height) % window_size
+        pad_w = (-width) % window_size
         n_h = (height + pad_h) // window_size
         n_w = (width + pad_w) // window_size
         padded = np.pad(
@@ -59,15 +81,15 @@ def _window_index(grid_thw: mx.array, window_size: int):
 
     cumulative = np.asarray(cumulative, dtype=np.int32)
     keep = np.concatenate(([True], cumulative[1:] != cumulative[:-1]))
-    return (
-        mx.array(np.concatenate(indices), dtype=mx.int32),
-        mx.array(cumulative[keep], dtype=mx.int32),
-    )
+    indices = np.concatenate(indices).astype(np.int32, copy=False)
+    identity = np.array_equal(indices, np.arange(indices.size, dtype=np.int32))
+    window_index = None if identity else mx.array(indices, dtype=mx.int32)
+    return window_index, cumulative[keep].tolist()
 
 
-def _position_ids(grid_thw: mx.array) -> mx.array:
+def _position_ids(grid: Sequence[Sequence[int]]) -> mx.array:
     result = []
-    for temporal, height, width in grid_thw.tolist():
+    for temporal, height, width in grid:
         temporal, height, width = int(temporal), int(height), int(width)
         rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
         # Reference order after flip(-1) + 1 is (width, height), one-indexed.
@@ -86,17 +108,18 @@ class PatchEmbedder(nn.Module):
         )
         self.num_grid_per_side = config.pos_emb_height
 
-    def _position_embeddings(self, grid_thw: mx.array) -> mx.array:
+    def _position_embeddings(self, grid: Sequence[Sequence[int]]) -> mx.array:
         side = self.num_grid_per_side
         all_indices = [[] for _ in range(4)]
         all_weights = [[] for _ in range(4)]
 
-        for temporal, height, width in grid_thw.tolist():
+        for temporal, height, width in grid:
             temporal, height, width = int(temporal), int(height), int(width)
             h_grid = (np.arange(height, dtype=np.float32) + 0.5) * (side / height) - 0.5
             w_grid = (np.arange(width, dtype=np.float32) + 0.5) * (side / width) - 0.5
-            h0, w0 = np.floor(h_grid).astype(np.int32), np.floor(w_grid).astype(
-                np.int32
+            h0, w0 = (
+                np.floor(h_grid).astype(np.int32),
+                np.floor(w_grid).astype(np.int32),
             )
             h1, w1 = h0 + 1, w0 + 1
             dh, dw = h_grid - h0, w_grid - w0
@@ -140,9 +163,11 @@ class PatchEmbedder(nn.Module):
         table = self.position_embedding_table(indices)
         return mx.sum(table * weights[..., None], axis=0)
 
-    def __call__(self, pixel_values: mx.array, grid_thw: mx.array) -> mx.array:
+    def __call__(
+        self, pixel_values: mx.array, grid: Sequence[Sequence[int]]
+    ) -> mx.array:
         embeddings = self.patch_embedding(pixel_values)
-        positions = self._position_embeddings(grid_thw).astype(embeddings.dtype)
+        positions = self._position_embeddings(grid).astype(embeddings.dtype)
         return embeddings + positions
 
 
@@ -160,7 +185,7 @@ class VisionAttention(nn.Module):
     def __call__(
         self,
         hidden_states: mx.array,
-        cu_seqlens: mx.array,
+        split_points: List[int],
         cos: mx.array,
         sin: mx.array,
     ) -> mx.array:
@@ -171,15 +196,17 @@ class VisionAttention(nn.Module):
         q, k = apply_rotary(q, k, cos, sin)
         q, k, v = (tensor.transpose(0, 2, 1, 3) for tensor in (q, k, v))
 
-        split_points = cu_seqlens[1:-1].tolist()
-        chunks = [mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)]
-        output = mx.concatenate(
-            [
-                ensure_fused_sdpa(q_chunk, k_chunk, v_chunk, self.scale)
-                for q_chunk, k_chunk, v_chunk in zip(*chunks)
-            ],
-            axis=2,
-        )
+        if split_points:
+            chunks = [mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)]
+            output = mx.concatenate(
+                [
+                    ensure_fused_sdpa(q_chunk, k_chunk, v_chunk, self.scale)
+                    for q_chunk, k_chunk, v_chunk in zip(*chunks)
+                ],
+                axis=2,
+            )
+        else:
+            output = ensure_fused_sdpa(q, k, v, self.scale)
         output = output.transpose(0, 2, 1, 3).reshape(length, -1)
         return self.proj(output)
 
@@ -191,7 +218,7 @@ class VisionMLP(nn.Module):
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.fc2(nn.gelu(self.fc1(x)))
+        return self.fc2(gelu(self.fc1(x)))
 
 
 class VisionBlock(nn.Module):
@@ -202,8 +229,8 @@ class VisionBlock(nn.Module):
         self.attn = VisionAttention(config)
         self.mlp = VisionMLP(config)
 
-    def __call__(self, x, cu_seqlens, cos, sin):
-        x = x + self.attn(self.norm1(x), cu_seqlens, cos, sin)
+    def __call__(self, x, split_points, cos, sin):
+        x = x + self.attn(self.norm1(x), split_points, cos, sin)
         return x + self.mlp(self.norm2(x))
 
 
@@ -236,12 +263,12 @@ class VisionModel(nn.Module):
         freqs = mx.concatenate((freq_w, freq_h, freq_w, freq_h), axis=-1)
         return mx.cos(freqs), mx.sin(freqs)
 
-    def _pixel_shuffle(self, hidden_states: mx.array, grid_thw: mx.array):
+    def _pixel_shuffle(self, hidden_states: mx.array, grid: Sequence[Sequence[int]]):
         merge = self.config.merge_size
         dim = hidden_states.shape[-1]
         outputs = []
         offset = 0
-        for temporal, height, width in grid_thw.tolist():
+        for temporal, height, width in grid:
             temporal, height, width = int(temporal), int(height), int(width)
             count = temporal * height * width
             chunk = hidden_states[offset : offset + count]
@@ -259,23 +286,28 @@ class VisionModel(nn.Module):
         return mx.concatenate(outputs, axis=0)
 
     def __call__(self, pixel_values: mx.array, grid_thw: mx.array) -> mx.array:
-        full_cu = _cu_seqlens(grid_thw)
+        grid = grid_thw.tolist()
+        full_split_points = _cu_seqlens(grid)[1:-1]
         window_side = self.config.pos_emb_height
-        window_index, window_cu = _window_index(grid_thw, window_side)
+        window_index, window_cu = _window_index(grid, window_side)
+        window_split_points = window_cu[1:-1]
 
-        hidden_states = self.patch_embedder(pixel_values, grid_thw)
-        hidden_states = self.ln_pre(hidden_states)[window_index]
-        positions = _position_ids(grid_thw)[window_index]
+        hidden_states = self.ln_pre(self.patch_embedder(pixel_values, grid))
+        positions = _position_ids(grid)
+        if window_index is not None:
+            hidden_states = hidden_states[window_index]
+            positions = positions[window_index]
         cos, sin = self._rotary(positions)
 
         for idx, block in enumerate(self.layers):
-            cu = (
-                full_cu
+            split_points = (
+                full_split_points
                 if self.config.layer_types[idx] == "full_attention"
-                else window_cu
+                else window_split_points
             )
-            hidden_states = block(hidden_states, cu, cos, sin)
+            hidden_states = block(hidden_states, split_points, cos, sin)
 
-        hidden_states = hidden_states[mx.argsort(window_index)]
+        if window_index is not None:
+            hidden_states = hidden_states[mx.argsort(window_index)]
         hidden_states = self.ln_post(hidden_states)
-        return self._pixel_shuffle(hidden_states, grid_thw)
+        return self._pixel_shuffle(hidden_states, grid)
