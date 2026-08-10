@@ -11,11 +11,7 @@ from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
     smart_resize,
 )
-from mlx_vlm.models.muse_glimmer.vision import (
-    _window_index,
-    apply_rotary,
-    rotate_half,
-)
+from mlx_vlm.models.muse_glimmer.vision import _window_index, apply_rotary, rotate_half
 
 
 def tiny_config():
@@ -93,12 +89,10 @@ def test_centered_rms_norm_uses_one_plus_checkpoint_weight():
 
 def test_centered_rms_norm_preserves_transformers_fp32_operation_order():
     norm = CenteredRMSNorm(4, eps=1e-6)
-    norm.weight = (
-        mx.arange(4, dtype=mx.float32) * 0.031 - 0.2
-    ).astype(mx.bfloat16)
+    norm.weight = (mx.arange(4, dtype=mx.float32) * 0.031 - 0.2).astype(mx.bfloat16)
     inputs = (
-        mx.arange(4, dtype=mx.float32) * 0.37 - 1.13
-    ).reshape(1, 4).astype(mx.bfloat16)
+        (mx.arange(4, dtype=mx.float32) * 0.37 - 1.13).reshape(1, 4).astype(mx.bfloat16)
+    )
 
     inputs32 = inputs.astype(mx.float32)
     variance = mx.mean(mx.square(inputs32), axis=-1, keepdims=True)

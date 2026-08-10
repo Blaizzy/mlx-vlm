@@ -15,9 +15,7 @@ from .config import TextConfig
 
 
 @mx.compile
-def _centered_rms_norm(
-    x: mx.array, weight: mx.array, eps: float
-) -> mx.array:
+def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     dtype = x.dtype
     x = x.astype(mx.float32)
     variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
