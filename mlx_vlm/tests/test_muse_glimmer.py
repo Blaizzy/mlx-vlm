@@ -128,9 +128,7 @@ def test_quantization_preserves_normalized_embedding():
     embedding = model.language_model.model.embed_tokens
 
     assert isinstance(embedding, NormedEmbedding)
-    assert not model.quant_predicate(
-        "language_model.model.embed_tokens", embedding
-    )
+    assert not model.quant_predicate("language_model.model.embed_tokens", embedding)
     assert model.quant_predicate(
         "language_model.model.layers.0.self_attn.q_proj",
         model.language_model.model.layers[0].self_attn.q_proj,
