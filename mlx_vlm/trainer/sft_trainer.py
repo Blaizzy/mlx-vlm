@@ -213,6 +213,13 @@ def vision_language_loss_fn(
             )
             loss_mask = loss_mask * completion_mask[:, 1:]
 
+    # MLX cross-entropy does not bounds-check targets, and models with a
+    # pruned output head (split input/output vocabulary, e.g. apertus1p5)
+    # have media token ids beyond the logit range.
+    in_vocab = labels < logits.shape[-1]
+    loss_mask = loss_mask * in_vocab
+    labels = mx.where(in_vocab, labels, 0)
+
     ce = nn.losses.cross_entropy(logits, labels)
     return (ce * loss_mask).sum() / mx.maximum(loss_mask.sum(), 1)
 

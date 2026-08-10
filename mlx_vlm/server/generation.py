@@ -46,7 +46,12 @@ from ..speculative.utils import (
 )
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import (
+    ThinkingBudgetCriteria,
+    load,
+    prepare_inputs,
+    should_add_special_tokens,
+)
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -1261,11 +1266,8 @@ class ResponseGenerator:
 
     def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
-        add_special_tokens = (
-            getattr(self.processor, "chat_template", None) is None
-            if self.model.config.model_type
-            in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-            else True
+        add_special_tokens = should_add_special_tokens(
+            self.model.config.model_type, self.processor
         )
         image_token_index = getattr(self.model.config, "image_token_index", None)
         return prepare_inputs(

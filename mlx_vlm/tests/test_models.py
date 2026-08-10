@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 class TestModels(unittest.TestCase):
@@ -12201,3 +12202,1038 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+def _apertus1p5_tiny_config():
+    from mlx_vlm.models import apertus1p5
+
+    return apertus1p5.ModelConfig.from_dict(_apertus1p5_tiny_config_dict())
+
+
+def _apertus1p5_tiny_config_dict():
+    return {
+        "model_type": "apertus1p5",
+        "image_token_id": 9,
+        "audio_token_id": 10,
+        "image_token_offset": 96,
+        "audio_token_offset": 160,
+        "text_config": {
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "vocab_size": 192,
+            "output_vocab_size": 64,
+            "max_position_embeddings": 128,
+            "rope_parameters": {
+                "rope_theta": 4000000,
+                "rope_type": "llama3",
+                "factor": 2.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 64,
+            },
+        },
+        "vision_tokenizer_config": {
+            "codebook_size": 64,
+            "embed_dim": 32,
+            "latent_channels": 8,
+            "base_channels": 32,
+            "channel_multiplier": [1, 2],
+            "num_res_blocks": 1,
+            "attn_resolutions": [8],
+            "resolution": 16,
+        },
+        "audio_tokenizer_config": {
+            "codebook_size": 32,
+            "codebook_dim": 8,
+            "hidden_size": 8,
+            "num_filters": 2,
+            "upsampling_ratios": [2, 2],
+            "num_lstm_layers": 1,
+            "kernel_size": 3,
+            "last_kernel_size": 3,
+        },
+    }
+
+
+class _Apertus1p5FakeTokenizer(PreTrainedTokenizerBase):
+    image_token = "<|image|>"
+    audio_token = "<|audio|>"
+    model_input_names = ["input_ids", "attention_mask"]
+
+    def __init__(self):
+        super().__init__(chat_template=None)
+
+    def __call__(self, text, **kwargs):
+        self.last_text = text
+        self.last_kwargs = kwargs
+        return {
+            "input_ids": np.ones((len(text), 1), dtype=np.int64),
+            "attention_mask": np.ones((len(text), 1), dtype=np.int64),
+        }
+
+    def save_pretrained(self, save_directory, **kwargs):
+        from pathlib import Path
+
+        path = Path(save_directory, "tokenizer_config.json")
+        path.write_text("{}")
+        return (str(path),)
+
+
+class TestApertus1p5(unittest.TestCase):
+    def setUp(self):
+        from mlx_vlm.models import apertus1p5
+
+        self.apertus1p5 = apertus1p5
+
+    def test_split_vocabulary_and_image_placeholders(self):
+        config = _apertus1p5_tiny_config()
+        model = self.apertus1p5.Model(config)
+        pixels = mx.random.uniform(shape=(1, 3, 16, 16), low=-1, high=1)
+
+        codes = model.vision_tokenizer.encode(pixels)
+        mx.eval(codes)
+        self.assertEqual(codes.shape, (1, 8, 8))
+        self.assertGreaterEqual(int(mx.min(codes).item()), 0)
+        self.assertLess(int(mx.max(codes).item()), 64)
+
+        input_ids = mx.array([[1] + [config.image_token_id] * 64 + [2]])
+        outputs = model(
+            input_ids,
+            pixel_values=pixels,
+            image_sizes=mx.array([[16, 16]]),
+        )
+        mx.eval(outputs.logits)
+        self.assertEqual(outputs.logits.shape, (1, 66, 64))
+
+    def test_extended_ids_work_without_media(self):
+        model = self.apertus1p5.Model(_apertus1p5_tiny_config())
+        outputs = model(mx.array([[0, 63, 191]]))
+        mx.eval(outputs.logits)
+        self.assertEqual(outputs.logits.shape, (1, 3, 64))
+
+    def test_precomputed_inputs_embeds_follow_generator_path(self):
+        model = self.apertus1p5.Model(_apertus1p5_tiny_config())
+        input_ids = mx.array([[1, 2, 3]])
+        inputs_embeds = model.get_input_embeddings(input_ids).inputs_embeds
+
+        expected = model(input_ids).logits
+        actual = model(
+            input_ids,
+            inputs_embeds=inputs_embeds,
+            n_to_process=input_ids.shape[1],
+        ).logits
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
+
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            model(
+                input_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=mx.zeros((1, 3, 16, 16)),
+            )
+        with self.assertRaisesRegex(ValueError, "matching batch and sequence"):
+            model(input_ids[:, :2], inputs_embeds=inputs_embeds)
+
+    def test_config_derives_rope_and_validates_ranges(self):
+        config = _apertus1p5_tiny_config()
+        self.assertEqual(config.text_config.rope_theta, 4000000)
+        self.assertEqual(config.text_config.rope_scaling["rope_type"], "llama3")
+        self.assertEqual(config.vision_tokenizer_config.spatial_scale_factor, 2)
+
+        raw = _apertus1p5_tiny_config().to_dict()
+        raw["audio_token_offset"] = 159
+        with self.assertRaisesRegex(ValueError, "visual token range"):
+            self.apertus1p5.ModelConfig.from_dict(raw)
+
+        raw = _apertus1p5_tiny_config().to_dict()
+        raw["text_config"] = raw["text_config"].to_dict()
+        raw["text_config"]["qk_norm"] = False
+        with self.assertRaisesRegex(ValueError, "qk_norm"):
+            self.apertus1p5.ModelConfig.from_dict(raw)
+
+        raw = _apertus1p5_tiny_config().to_dict()
+        raw["text_config"] = raw["text_config"].to_dict()
+        raw["text_config"]["post_norm"] = True
+        with self.assertRaisesRegex(ValueError, "post_norm"):
+            self.apertus1p5.ModelConfig.from_dict(raw)
+
+        raw = _apertus1p5_tiny_config().to_dict()
+        raw["tie_word_embeddings"] = True
+        with self.assertRaisesRegex(ValueError, "pruned output vocabulary"):
+            self.apertus1p5.ModelConfig.from_dict(raw)
+
+        raw["text_config"] = raw["text_config"].to_dict()
+        raw["text_config"]["output_vocab_size"] = None
+        tied_config = self.apertus1p5.ModelConfig.from_dict(raw)
+        self.assertTrue(tied_config.tie_word_embeddings)
+        self.assertTrue(tied_config.text_config.tie_word_embeddings)
+        tied_model = self.apertus1p5.Model(tied_config)
+        self.assertFalse(hasattr(tied_model.language_model, "lm_head"))
+        logits = tied_model(mx.array([[1, 2]])).logits
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 2, 192))
+
+        sanitized = tied_model.sanitize(
+            {
+                "model.language_model.embed_tokens.weight": mx.zeros((192, 32)),
+                "lm_head.weight": mx.zeros((192, 32)),
+            }
+        )
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+
+    def test_config_parses_published_checkpoint_config(self):
+        from mlx_vlm.models import apertus1p5
+
+        # Vendored verbatim from swiss-ai/Apertus-v1.5-8B config.json so the
+        # parser is validated against the real checkpoint layout instead of
+        # hand-written fixtures (e.g. eos_token_id lives inside text_config).
+        published = {
+            "architectures": ["Apertus1p5ForConditionalGeneration"],
+            "audio_token_id": 131085,
+            "audio_token_offset": 262344,
+            "audio_tokenizer_config": {
+                "adanorm_num_embeddings": 4,
+                "architectures": ["WavTokenizerModel"],
+                "audio_channels": 1,
+                "codebook_dim": 512,
+                "codebook_size": 4096,
+                "compress": 2,
+                "decoder_attention_num_groups": 32,
+                "decoder_hidden_size": 768,
+                "decoder_intermediate_size": 2304,
+                "decoder_num_layers": 12,
+                "dilation_growth_rate": 2,
+                "dtype": "float32",
+                "hidden_size": 512,
+                "kernel_size": 7,
+                "last_kernel_size": 7,
+                "model_type": "wavtokenizer",
+                "norm_eps": 1e-06,
+                "norm_type": "weight_norm",
+                "num_filters": 32,
+                "num_lstm_layers": 2,
+                "num_residual_layers": 1,
+                "pad_mode": "reflect",
+                "residual_kernel_size": 3,
+                "sampling_rate": 24000,
+                "upsampling_ratios": [6, 5, 5, 4],
+                "use_causal_conv": False,
+                "use_conv_shortcut": True,
+            },
+            "image_token_id": 131079,
+            "image_token_offset": 131272,
+            "model_type": "apertus1p5",
+            "text_config": {
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "bos_token_id": 1,
+                "dtype": "bfloat16",
+                "eos_token_id": [2, 68, 72],
+                "hidden_act": "xielu",
+                "hidden_dropout": 0.0,
+                "hidden_size": 4096,
+                "initializer_range": 0.02,
+                "intermediate_size": 21504,
+                "max_position_embeddings": 262144,
+                "mlp_bias": False,
+                "model_type": "apertus1p5_text",
+                "num_attention_heads": 32,
+                "num_hidden_layers": 32,
+                "num_key_value_heads": 8,
+                "output_vocab_size": 131072,
+                "pad_token_id": 3,
+                "post_norm": False,
+                "qk_norm": True,
+                "rms_norm_eps": 1e-05,
+                "rope_parameters": {
+                    "factor": 32.0,
+                    "high_freq_factor": 4.0,
+                    "low_freq_factor": 1.0,
+                    "original_max_position_embeddings": 8192,
+                    "rope_theta": 4000000,
+                    "rope_type": "llama3",
+                },
+                "tie_word_embeddings": False,
+                "use_cache": True,
+                "vocab_size": 266752,
+            },
+            "tie_word_embeddings": False,
+            "transformers_version": "5.14.0.dev0",
+            "vision_tokenizer_config": {
+                "architectures": ["Apertus1p5VisionTokenizerModel"],
+                "attn_resolutions": [16],
+                "base_channels": 256,
+                "channel_multiplier": [1, 1, 2, 2, 4],
+                "codebook_size": 131072,
+                "dropout": 0.0,
+                "dtype": "float32",
+                "embed_dim": 256,
+                "in_channels": 3,
+                "latent_channels": 256,
+                "model_type": "apertus1p5_vision_tokenizer",
+                "num_res_blocks": 4,
+                "resolution": 256,
+            },
+        }
+
+        config = apertus1p5.ModelConfig.from_dict(published)
+
+        self.assertEqual(config.eos_token_id, [2, 68, 72])
+        self.assertFalse(config.tie_word_embeddings)
+        self.assertFalse(config.text_config.tie_word_embeddings)
+        self.assertEqual(config.image_token_id, 131079)
+        self.assertEqual(config.image_token_offset, 131272)
+        self.assertEqual(config.audio_token_offset, 262344)
+        self.assertEqual(config.text_config.vocab_size, 266752)
+        self.assertEqual(config.text_config.output_vocab_size, 131072)
+        self.assertEqual(config.vision_tokenizer_config.codebook_size, 131072)
+        self.assertEqual(config.vision_tokenizer_config.spatial_scale_factor, 16)
+
+    def test_call_accepts_trainer_positional_convention(self):
+        config = _apertus1p5_tiny_config()
+        model = self.apertus1p5.Model(config)
+
+        # sft/orpo trainers call model(input_ids, pixel_values, attention_mask,
+        # **batch), so mask must occupy the third positional slot even when the
+        # batch also carries image_sizes as a keyword.
+        input_ids = mx.array([[1, 2, 3]])
+        outputs = model(input_ids, None, mx.ones_like(input_ids))
+        self.assertEqual(outputs.logits.shape, (1, 3, 64))
+
+        pixels = mx.random.uniform(shape=(1, 3, 16, 16), low=-1, high=1)
+        image_ids = mx.array([[1] + [config.image_token_id] * 64 + [2]])
+        outputs = model(
+            image_ids,
+            pixels,
+            mx.ones_like(image_ids),
+            image_sizes=mx.array([[16, 16]]),
+        )
+        self.assertEqual(outputs.logits.shape, (1, 66, 64))
+
+    def test_image_array_channel_inference(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+        )
+
+        # PIL size is (width, height).
+        chw = Apertus1p5ImageProcessor._to_pil(np.zeros((3, 5, 8), dtype=np.uint8))
+        self.assertEqual(chw.size, (8, 5))
+        grayscale_chw = Apertus1p5ImageProcessor._to_pil(
+            np.zeros((1, 5, 8), dtype=np.uint8)
+        )
+        self.assertEqual(grayscale_chw.size, (8, 5))
+        # A short HWC image must not be mistaken for channel-first.
+        short_hwc = Apertus1p5ImageProcessor._to_pil(
+            np.zeros((4, 8, 3), dtype=np.uint8)
+        )
+        self.assertEqual(short_hwc.size, (8, 4))
+
+    def test_top_level_tie_flag_survives_module_config_rebuild(self):
+        from mlx_vlm.utils import update_module_configs
+
+        raw = _apertus1p5_tiny_config_dict()
+        raw["tie_word_embeddings"] = True
+        raw["text_config"]["output_vocab_size"] = raw["text_config"]["vocab_size"]
+
+        config = self.apertus1p5.ModelConfig.from_dict(raw)
+        self.assertTrue(config.text_config.tie_word_embeddings)
+
+        # load_model reparses text_config from the raw nested dict after
+        # from_dict, which discards the hoisted flag (the nested dict does
+        # not carry it).
+        config = update_module_configs(
+            config,
+            self.apertus1p5,
+            raw,
+            ["text", "vision", "perceiver", "projector", "audio"],
+        )
+        self.assertFalse(config.text_config.tie_word_embeddings)
+
+        model = self.apertus1p5.Model(config)
+        self.assertTrue(config.text_config.tie_word_embeddings)
+        self.assertFalse(hasattr(model.language_model, "lm_head"))
+
+        logits = model(mx.array([[1, 2, 3]])).logits
+        self.assertEqual(logits.shape[-1], raw["text_config"]["vocab_size"])
+
+        # Tying is structurally impossible with the pruned output head: the
+        # config guard catches it at parse time...
+        pruned = _apertus1p5_tiny_config_dict()
+        pruned["tie_word_embeddings"] = True
+        with self.assertRaisesRegex(ValueError, "cannot be tied"):
+            self.apertus1p5.ModelConfig.from_dict(pruned)
+
+        # ...and the language model re-checks after the load-path re-hoist,
+        # which runs after __post_init__ validation already happened.
+        config = _apertus1p5_tiny_config()
+        config.tie_word_embeddings = True
+        with self.assertRaisesRegex(ValueError, "output_vocab_size"):
+            self.apertus1p5.Model(config)
+
+    def test_sanitize_and_conversion_predicates(self):
+        model = self.apertus1p5.Model(_apertus1p5_tiny_config())
+        conv = mx.zeros((4, 3, 3, 2))
+        weights = {
+            "model.language_model.embed_tokens.weight": mx.zeros((192, 32)),
+            "model.vision_tokenizer.encoder.conv_in.weight": conv,
+            "model.audio_tokenizer.backbone.embed.weight": mx.zeros((1,)),
+            "model.audio_tokenizer.head.linear.weight": mx.zeros((1,)),
+            "model.audio_tokenizer.quantizer.codebook.inited": mx.zeros((1,)),
+            "model.audio_tokenizer.quantizer.codebook.cluster_size": mx.zeros((32,)),
+            "model.audio_tokenizer.quantizer.codebook.embed_avg": mx.zeros((32, 8)),
+            "model.audio_tokenizer.quantizer.codebook.embed": mx.zeros((32, 8)),
+            "lm_head.weight": mx.zeros((64, 32)),
+        }
+        sanitized = model.sanitize(weights)
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            sanitized["vision_tokenizer.encoder.conv_in.weight"].shape,
+            (4, 3, 2, 3),
+        )
+        # Decoder weights and codebook EMA buffers are dropped; the codebook
+        # itself is kept.
+        self.assertEqual(
+            [key for key in sanitized if "audio_tokenizer" in key],
+            ["audio_tokenizer.quantizer.codebook.embed"],
+        )
+        vision_path = "vision_tokenizer.quantize.embedding"
+        self.assertFalse(model.cast_predicate(vision_path))
+        self.assertFalse(model.quant_predicate(vision_path, model.vision_tokenizer))
+        audio_path = "audio_tokenizer.quantizer.codebook.embed"
+        self.assertFalse(model.cast_predicate(audio_path))
+        self.assertFalse(model.quant_predicate(audio_path, model.audio_tokenizer))
+        self.assertTrue(
+            model.cast_predicate("language_model.model.embed_tokens.weight")
+        )
+        self.assertTrue(
+            model.quant_predicate(
+                "language_model.model.embed_tokens", model.language_model
+            )
+        )
+
+        sanitized_again = model.sanitize(sanitized)
+        self.assertEqual(sanitized.keys(), sanitized_again.keys())
+        for key in sanitized:
+            self.assertEqual(sanitized[key].shape, sanitized_again[key].shape)
+            self.assertTrue(mx.array_equal(sanitized[key], sanitized_again[key]).item())
+
+    def test_audio_sanitize_fuses_weight_norm_and_lstm(self):
+        model = self.apertus1p5.Model(_apertus1p5_tiny_config())
+        direction = mx.array(
+            [[[3.0, 0.0, 4.0]], [[0.0, 5.0, 12.0]]]
+        )  # (out=2, in=1, k=3)
+        magnitude = mx.array([[[10.0]], [[26.0]]])  # (out=2, 1, 1)
+        weights = {
+            "model.audio_tokenizer.encoder.layers.0.conv.parametrizations"
+            ".weight.original0": magnitude,
+            "model.audio_tokenizer.encoder.layers.0.conv.parametrizations"
+            ".weight.original1": direction,
+            "model.audio_tokenizer.encoder.layers.0.conv.bias": mx.zeros((2,)),
+            "model.audio_tokenizer.encoder.layers.3.lstm.weight_ih_l0": mx.ones(
+                (32, 8)
+            ),
+            "model.audio_tokenizer.encoder.layers.3.lstm.weight_hh_l0": mx.ones(
+                (32, 8)
+            ),
+            "model.audio_tokenizer.encoder.layers.3.lstm.bias_ih_l0": mx.ones((32,)),
+            "model.audio_tokenizer.encoder.layers.3.lstm.bias_hh_l0": 2
+            * mx.ones((32,)),
+        }
+        sanitized = model.sanitize(weights)
+
+        fused = sanitized["audio_tokenizer.encoder.layers.0.conv.weight"]
+        # torch (out, in, k) -> MLX (out, k, in); rows scaled to g * v / |v|.
+        self.assertEqual(fused.shape, (2, 3, 1))
+        expected = mx.array([[[6.0], [0.0], [8.0]], [[0.0], [10.0], [24.0]]])
+        self.assertTrue(mx.allclose(fused, expected).item())
+        self.assertIn("audio_tokenizer.encoder.layers.0.conv.bias", sanitized)
+        self.assertEqual(
+            sanitized["audio_tokenizer.encoder.layers.3.lstm.0.Wx"].shape, (32, 8)
+        )
+        self.assertEqual(
+            sanitized["audio_tokenizer.encoder.layers.3.lstm.0.Wh"].shape, (32, 8)
+        )
+        bias = sanitized["audio_tokenizer.encoder.layers.3.lstm.0.bias"]
+        self.assertTrue(mx.allclose(bias, 3 * mx.ones((32,))).item())
+
+        with self.assertRaisesRegex(ValueError, "Incomplete weight normalization"):
+            model.sanitize(
+                {
+                    "model.audio_tokenizer.encoder.layers.0.conv"
+                    ".parametrizations.weight.original0": magnitude
+                }
+            )
+
+    def test_audio_feature_extractor_pads_and_counts_codes(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5FeatureExtractor,
+        )
+
+        extractor = Apertus1p5FeatureExtractor(hop_length=4)
+        self.assertEqual(extractor.get_num_audio_codes(1), 1)
+        self.assertEqual(extractor.get_num_audio_codes(4), 1)
+        self.assertEqual(extractor.get_num_audio_codes(5), 2)
+
+        clips = [np.ones(6, dtype=np.float32), np.ones(3, dtype=np.float32)]
+        outputs = extractor(clips)
+        self.assertEqual(outputs["input_values"].shape, (2, 1, 6))
+        self.assertTrue((outputs["padding_mask"][0] == 1).all())
+        self.assertEqual(outputs["padding_mask"][1].tolist(), [1, 1, 1, 0, 0, 0])
+        self.assertEqual(float(outputs["input_values"][1, 0, 3:].sum()), 0.0)
+
+        with self.assertRaisesRegex(ValueError, "sampled at"):
+            extractor(clips, sampling_rate=16000)
+        with self.assertRaisesRegex(ValueError, "mono audio"):
+            extractor([np.ones((2, 6), dtype=np.float32)])
+        with self.assertRaisesRegex(ValueError, "is empty"):
+            extractor([np.ones(0, dtype=np.float32)])
+
+    def test_processor_expands_audio_placeholders(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5FeatureExtractor,
+            Apertus1p5ImageProcessor,
+            Apertus1p5Processor,
+        )
+
+        tokenizer = _Apertus1p5FakeTokenizer()
+        processor = Apertus1p5Processor(
+            image_processor=Apertus1p5ImageProcessor(),
+            tokenizer=tokenizer,
+            feature_extractor=Apertus1p5FeatureExtractor(hop_length=4),
+        )
+        clip_a = np.ones(8, dtype=np.float32)
+        clip_b = np.ones(5, dtype=np.float32)
+        outputs = processor(
+            text="Hear <|audio|> then <|audio|> end",
+            audio=[clip_a, clip_b],
+        )
+        expected = (
+            "Hear <|audio_start|><|audio|><|audio|><|audio_end|> then "
+            "<|audio_start|><|audio|><|audio|><|audio_end|> end"
+        )
+        self.assertEqual(tokenizer.last_text, [expected])
+        self.assertEqual(outputs["input_features"].shape, (2, 1, 8))
+        self.assertEqual(
+            np.asarray(outputs["feature_attention_mask"]).tolist(),
+            [[1] * 8, [1] * 5 + [0] * 3],
+        )
+        # Clips are peak-normalized to -3 dBFS before feature extraction.
+        peak = float(np.abs(np.asarray(outputs["input_features"])).max())
+        self.assertAlmostEqual(peak, 10.0 ** (-3.0 / 20.0), places=5)
+
+        # Nested audio must provide one clip list per text sample.
+        processor(text="One <|audio|> two <|audio|>", audio=[[clip_a, clip_b]])
+        with self.assertRaisesRegex(ValueError, "Per-sample audio"):
+            processor(text="One <|audio|>", audio=[[clip_a, clip_b]])
+
+    def test_audio_tokenizer_encode_and_model_merge(self):
+        config = _apertus1p5_tiny_config()
+        model = self.apertus1p5.Model(config)
+        hop = config.audio_tokenizer_config.hop_length
+        self.assertEqual(hop, 4)
+
+        rng = np.random.default_rng(0)
+        for num_samples, expected_codes in ((1, 1), (4, 1), (5, 2), (11, 3)):
+            clip = mx.array(rng.standard_normal((1, 1, num_samples)).astype(np.float32))
+            codes = model.audio_tokenizer.encode(clip)
+            self.assertEqual(codes.shape, (1, expected_codes))
+
+        features = mx.array(rng.standard_normal((2, 1, 8)).astype(np.float32))
+        mask = mx.array([[1] * 8, [1] * 4 + [0] * 4])
+        vocab_ids = model.get_audio_tokens(features, mask)
+        self.assertEqual(vocab_ids.shape, (3,))  # 2 codes + 1 code
+        self.assertTrue(
+            (np.asarray(vocab_ids) >= config.audio_token_offset).all()
+            and (
+                np.asarray(vocab_ids)
+                < config.audio_token_offset
+                + config.audio_tokenizer_config.codebook_size
+            ).all()
+        )
+
+        audio_id = config.audio_token_id
+        input_ids = mx.array([[1, audio_id, audio_id, audio_id, 2]])
+        embeds = model.get_input_embeddings(
+            input_ids, input_features=features, feature_attention_mask=mask
+        ).inputs_embeds
+        expected = model.language_model.model.embed_tokens(vocab_ids)
+        self.assertTrue(mx.allclose(embeds[0, 1:4], expected).item())
+
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            model.get_input_embeddings(
+                mx.array([[1, audio_id, 2]]),
+                input_features=features,
+                feature_attention_mask=mask,
+            )
+        with self.assertRaisesRegex(ValueError, "zero"):
+            model.get_audio_tokens(features, mx.zeros((2, 8)))
+        with self.assertRaisesRegex(ValueError, "right-padded"):
+            model.get_audio_tokens(features, mx.array([[1] * 8, [0] * 4 + [1] * 4]))
+        with self.assertRaisesRegex(ValueError, "right-padded"):
+            model.get_audio_tokens(
+                features, mx.array([[1] * 8, [1, 1, 0, 1, 0, 0, 0, 0]])
+            )
+
+        model.audio_tokenizer.set_dtype(mx.bfloat16)
+        with self.assertRaisesRegex(ValueError, "float32"):
+            model.audio_tokenizer.encode(mx.ones((1, 1, 4)))
+
+    def test_converted_checkpoint_strictly_reloads(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = _apertus1p5_tiny_config()
+        model = self.apertus1p5.Model(config)
+        input_ids = mx.array([[1, 2, 3]])
+        expected = model(input_ids).logits
+        mx.eval(expected)
+
+        config_dict = config.to_dict()
+        config_dict["text_config"] = config.text_config.to_dict()
+        config_dict["vision_tokenizer_config"] = (
+            config.vision_tokenizer_config.to_dict()
+        )
+        config_dict["audio_tokenizer_config"] = config.audio_tokenizer_config.to_dict()
+        with TemporaryDirectory() as directory:
+            model_path = Path(directory)
+            save_weights(model_path, model)
+            Path(model_path, "config.json").write_text(json.dumps(config_dict))
+            reloaded = load_model(model_path, lazy=False, strict=True)
+            actual = reloaded(input_ids).logits
+            mx.eval(actual)
+
+        self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_quantization_keeps_discrete_tokenizer_in_float32(self):
+        from mlx_vlm.quant_utils import quantize_model
+
+        config = _apertus1p5_tiny_config()
+        model = self.apertus1p5.Model(config)
+        model, _ = quantize_model(
+            model,
+            config.to_dict(),
+            group_size=32,
+            bits=4,
+        )
+        self.assertIsInstance(model.vision_tokenizer.quantize.embedding, nn.Embedding)
+        self.assertEqual(
+            model.vision_tokenizer.quantize.embedding.weight.dtype, mx.float32
+        )
+        self.assertIsInstance(model.language_model.lm_head, nn.QuantizedLinear)
+
+    def test_chunked_quantizer_matches_full_reference(self):
+        from mlx_vlm.models.apertus1p5.vision import VectorQuantizer
+
+        config = _apertus1p5_tiny_config().vision_tokenizer_config
+        quantizer = VectorQuantizer(config, max_positions_per_chunk=5)
+        hidden_states = mx.random.normal((2, 3, 7, config.embed_dim))
+        expected = mx.argmax(
+            mx.einsum("bhwd,nd->bnhw", hidden_states, quantizer.embedding.weight),
+            axis=1,
+        )
+        actual = quantizer(hidden_states)
+        mx.eval(expected, actual)
+        self.assertTrue(mx.array_equal(expected, actual).item())
+
+    def test_image_processor_resize_normalize_and_pad(self):
+        from PIL import Image
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+            smart_resize,
+        )
+
+        self.assertEqual(smart_resize(100, 200, 16, 65536, 1960000), (176, 368))
+        processor = Apertus1p5ImageProcessor(
+            min_pixels=16 * 16,
+            max_pixels=32 * 32,
+            spatial_factor=16,
+        )
+        black = Image.fromarray(np.zeros((16, 32, 3), dtype=np.uint8))
+        white = Image.fromarray(np.full((32, 16, 3), 255, dtype=np.uint8))
+        outputs = processor([black, white])
+        self.assertEqual(outputs["pixel_values"].shape, (2, 3, 32, 32))
+        self.assertEqual(outputs["image_sizes"].tolist(), [[16, 32], [32, 16]])
+        self.assertEqual(outputs["image_grids"].tolist(), [[1, 2], [2, 1]])
+        self.assertEqual(float(outputs["pixel_values"][0, 0, 0, 0].item()), -1.0)
+        self.assertEqual(float(outputs["pixel_values"][1, 0, 0, 0].item()), 1.0)
+
+        grayscale = np.arange(16 * 16, dtype=np.uint8).reshape(16, 16)
+        chw_grayscale = processor(grayscale[None, :, :])["pixel_values"]
+        hwc_grayscale = processor(grayscale[:, :, None])["pixel_values"]
+        mx.eval(chw_grayscale, hwc_grayscale)
+        self.assertTrue(mx.array_equal(chw_grayscale, hwc_grayscale).item())
+        self.assertEqual(chw_grayscale.shape, (1, 3, 16, 16))
+        with self.assertRaisesRegex(TypeError, "unscaled uint8"):
+            processor(np.zeros((16, 16, 3), dtype=np.float32))
+
+    def test_uint8_bicubic_matches_torchvision_reference(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            _resize_uint8_bicubic,
+        )
+
+        image = np.arange(18, dtype=np.uint8).reshape(3, 2, 3) * 13
+        expected = np.asarray(
+            [
+                [
+                    [0, 1, 10, 19, 24],
+                    [8, 12, 21, 30, 35],
+                    [30, 35, 44, 53, 58],
+                    [41, 46, 55, 64, 69],
+                ],
+                [
+                    [74, 79, 88, 97, 102],
+                    [85, 90, 99, 108, 113],
+                    [108, 113, 122, 131, 136],
+                    [119, 124, 133, 142, 147],
+                ],
+                [
+                    [152, 157, 166, 175, 180],
+                    [163, 168, 177, 186, 191],
+                    [186, 191, 200, 209, 214],
+                    [197, 202, 211, 220, 225],
+                ],
+            ],
+            dtype=np.uint8,
+        )
+        np.testing.assert_array_equal(
+            _resize_uint8_bicubic(image, height=4, width=5), expected
+        )
+
+    def test_processor_normalizes_batched_and_empty_image_inputs(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+            Apertus1p5Processor,
+        )
+
+        image_processor = Apertus1p5ImageProcessor(
+            min_pixels=16 * 16,
+            max_pixels=32 * 48,
+            spatial_factor=16,
+        )
+        batch = np.arange(2 * 32 * 48 * 3, dtype=np.uint8).reshape(2, 32, 48, 3)
+        batched = image_processor.preprocess(batch)
+        listed = image_processor.preprocess([batch[0], batch[1]])
+        self.assertTrue(np.array_equal(batched["pixel_values"], listed["pixel_values"]))
+        with self.assertRaises(ValueError):
+            image_processor.preprocess([])
+
+        processor = Apertus1p5Processor(
+            image_processor=image_processor,
+            tokenizer=_Apertus1p5FakeTokenizer(),
+        )
+        outputs = processor(text="no images here", images=[])
+        self.assertNotIn("pixel_values", outputs)
+
+    def test_processor_expands_nontrivial_grids_and_validates_inputs(self):
+        from PIL import Image
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+            Apertus1p5Processor,
+        )
+
+        tokenizer = _Apertus1p5FakeTokenizer()
+        processor = Apertus1p5Processor(
+            image_processor=Apertus1p5ImageProcessor(
+                min_pixels=16 * 16,
+                max_pixels=32 * 48,
+                spatial_factor=16,
+            ),
+            tokenizer=tokenizer,
+        )
+        small = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8))
+        large = Image.fromarray(np.zeros((32, 48, 3), dtype=np.uint8))
+        outputs = processor(
+            text="A <|image|> B <|image|>",
+            images=[[small, large]],
+        )
+
+        self.assertNotIn("image_grids", outputs)
+        self.assertEqual(outputs["pixel_values"].shape, (2, 3, 32, 48))
+        expected = (
+            "A <|img_start|>1*1<|img_token_start|><|image|><|img_end|> B "
+            "<|img_start|>2*3<|img_token_start|>"
+            "<|image|><|image|><|image|><|img_end_of_row|>"
+            "<|image|><|image|><|image|><|img_end|>"
+        )
+        self.assertEqual(tokenizer.last_text, [expected])
+
+        processor(
+            text="A <|image|> B <|image|>",
+            images=[small, large],
+        )
+        self.assertEqual(tokenizer.last_text, [expected])
+
+        with self.assertRaisesRegex(ValueError, "number of image placeholders"):
+            processor(text="A <|image|>", images=[small, large])
+        with self.assertRaisesRegex(ValueError, "Per-sample"):
+            processor(
+                text="A <|image|>",
+                images=[[small, large]],
+            )
+        with self.assertRaisesRegex(ValueError, "batch size 1"):
+            processor(text=["A", "B"])
+        with self.assertRaisesRegex(ValueError, "audio placeholders"):
+            processor(text="Listen: <|audio|>")
+        with self.assertRaisesRegex(ValueError, "audio placeholders"):
+            processor(text="no audio", audio=[np.zeros(8, dtype=np.float32)])
+
+    def test_processor_collapses_non_user_roles_for_template(self):
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+            Apertus1p5Processor,
+        )
+        from mlx_vlm.prompt_utils import get_message_json
+
+        def message(prompt, role, num_images=0):
+            return get_message_json(
+                "apertus1p5",
+                prompt,
+                role=role,
+                skip_image_token=role != "user",
+                skip_audio_token=True,
+                num_images=num_images,
+                num_audios=0,
+            )
+
+        messages = [
+            message("Be terse.", "system"),
+            message("Describe this.", "user", num_images=2),
+            message("It is a cat.", "assistant"),
+        ]
+        # The shared formatter emits content-part lists for every role...
+        self.assertIsInstance(messages[0]["content"], list)
+        self.assertEqual(
+            [part["type"] for part in messages[1]["content"]],
+            ["image", "image", "text"],
+        )
+
+        # ...but the published chat template accepts part lists only for user
+        # messages (non-string system/assistant content raises TemplateError),
+        # so the processor collapses other roles before delegating.
+        processor = Apertus1p5Processor(
+            image_processor=Apertus1p5ImageProcessor(),
+            tokenizer=_Apertus1p5FakeTokenizer(),
+        )
+        rendered = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            chat_template=(
+                "{% for m in messages %}"
+                "{% if m.content is string %}[{{ m.role }}:{{ m.content }}]"
+                "{% else %}[{{ m.role }}:"
+                "{% for p in m.content %}({{ p.type }}){% endfor %}]"
+                "{% endif %}"
+                "{% endfor %}"
+            ),
+        )
+        self.assertEqual(
+            rendered,
+            "[system:Be terse.][user:(image)(image)(text)][assistant:It is a cat.]",
+        )
+
+    def test_processor_forwards_tokenizer_and_image_overrides(self):
+        from PIL import Image
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+            Apertus1p5Processor,
+        )
+        from mlx_vlm.utils import process_inputs, should_add_special_tokens
+
+        tokenizer = _Apertus1p5FakeTokenizer()
+        processor = Apertus1p5Processor(
+            image_processor=Apertus1p5ImageProcessor(
+                min_pixels=16 * 16,
+                max_pixels=32 * 48,
+                spatial_factor=16,
+            ),
+            tokenizer=tokenizer,
+            chat_template="{{ messages }}",
+        )
+
+        # The chat template emits <s> itself, so generate() must not ask the
+        # tokenizer for another one.
+        self.assertFalse(should_add_special_tokens("apertus1p5", processor))
+        self.assertTrue(
+            should_add_special_tokens(
+                "apertus1p5",
+                Apertus1p5Processor(
+                    image_processor=processor.image_processor,
+                    tokenizer=tokenizer,
+                ),
+            )
+        )
+
+        image = Image.fromarray(np.zeros((32, 48, 3), dtype=np.uint8))
+        inputs = process_inputs(
+            processor,
+            prompts=["<|image|> hi"],
+            images=[image],
+            audio=None,
+            add_special_tokens=False,
+            max_pixels=16 * 16,
+        )
+        self.assertIs(tokenizer.last_kwargs["add_special_tokens"], False)
+        self.assertEqual(inputs["pixel_values"].shape, (1, 3, 16, 16))
+        # The processor renames the feature extractor's outputs, so its
+        # advertised model input names must be the renamed keys.
+        self.assertIn("input_features", processor.model_input_names)
+        self.assertIn("feature_attention_mask", processor.model_input_names)
+
+    def test_processor_forwards_hub_download_options(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest.mock import call, patch
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import Apertus1p5Processor
+
+        with TemporaryDirectory() as directory:
+            processor_config = Path(directory, "processor_config.json")
+            processor_config.write_text(
+                json.dumps({"image_processor": {"min_pixels": 1024}})
+            )
+            model_config = Path(directory, "config.json")
+            model_config.write_text(
+                json.dumps(
+                    {"vision_tokenizer_config": {"channel_multiplier": [1, 1, 2, 2, 4]}}
+                )
+            )
+            cache_dir = Path(directory, "cache")
+            hub_options = {
+                "revision": "test-revision",
+                "token": "test-token",
+                "cache_dir": cache_dir,
+                "local_files_only": True,
+            }
+            with (
+                patch(
+                    "mlx_vlm.models.apertus1p5.processing_apertus1p5."
+                    "AutoTokenizer.from_pretrained",
+                    return_value=_Apertus1p5FakeTokenizer(),
+                ) as load_tokenizer,
+                patch(
+                    "huggingface_hub.hf_hub_download",
+                    side_effect=[str(processor_config), str(model_config)],
+                ) as download,
+            ):
+                processor = Apertus1p5Processor.from_pretrained(
+                    "test-owner/test-apertus", trust_remote_code=True, **hub_options
+                )
+
+        load_tokenizer.assert_called_once_with(
+            "test-owner/test-apertus",
+            trust_remote_code=False,
+            **hub_options,
+        )
+        self.assertEqual(
+            download.call_args_list,
+            [
+                call(
+                    "test-owner/test-apertus",
+                    "processor_config.json",
+                    **hub_options,
+                ),
+                call("test-owner/test-apertus", "config.json", **hub_options),
+            ],
+        )
+        self.assertEqual(processor.image_processor.min_pixels, 1024)
+
+    def test_processor_save_and_reload_preserves_image_configuration(self):
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from unittest.mock import patch
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+            Apertus1p5Processor,
+        )
+        from mlx_vlm.utils import load_image_processor
+
+        processor = Apertus1p5Processor(
+            image_processor=Apertus1p5ImageProcessor(
+                min_pixels=32 * 32,
+                max_pixels=64 * 64,
+                spatial_factor=16,
+            ),
+            tokenizer=_Apertus1p5FakeTokenizer(),
+        )
+        with TemporaryDirectory() as directory:
+            processor.save_pretrained(directory)
+            Path(directory, "config.json").write_text(
+                json.dumps({"model_type": "apertus1p5"})
+            )
+            config_path = Path(directory, "processor_config.json")
+            self.assertTrue(config_path.exists())
+            saved_config = json.loads(config_path.read_text())
+            self.assertEqual(saved_config["image_processor"]["min_pixels"], 1024)
+            self.assertEqual(saved_config["image_processor"]["max_pixels"], 4096)
+
+            with patch(
+                "mlx_vlm.models.apertus1p5.processing_apertus1p5."
+                "AutoTokenizer.from_pretrained",
+                return_value=_Apertus1p5FakeTokenizer(),
+            ):
+                reloaded = Apertus1p5Processor.from_pretrained(
+                    directory, local_files_only=True
+                )
+
+            self.assertIsNone(load_image_processor(Path(directory)))
+
+        self.assertEqual(reloaded.image_processor.min_pixels, 1024)
+        self.assertEqual(reloaded.image_processor.max_pixels, 4096)
+        self.assertEqual(reloaded.image_processor.spatial_factor, 16)
+
+    def test_model_rejects_unsupported_batch_and_invalid_image_sizes(self):
+        model = self.apertus1p5.Model(_apertus1p5_tiny_config())
+        with self.assertRaisesRegex(ValueError, "batch size 1"):
+            model(mx.array([[1], [2]]))
+        with self.assertRaisesRegex(ValueError, "batch size 1"):
+            model(inputs_embeds=mx.zeros((2, 1, 32)))
+        with self.assertRaisesRegex(ValueError, "rank-3"):
+            model.get_input_embeddings(
+                mx.array([[1]]), input_features=mx.zeros((1, 10))
+            )
+
+        invalid_pixels = mx.zeros((1, 3, 15, 16))
+        with self.assertRaisesRegex(ValueError, "positive multiples"):
+            model.vision_tokenizer.encode(invalid_pixels)
+
+        pixels = mx.zeros((1, 3, 16, 16))
+        with self.assertRaisesRegex(ValueError, "within the padded tensor"):
+            model.get_image_tokens(pixels, mx.array([[16, 32]]))
+
+    def test_model_config_validates_on_direct_construction(self):
+        with self.assertRaisesRegex(ValueError, "audio_token_offset"):
+            self.apertus1p5.ModelConfig(audio_token_offset=1)
+
+    def test_do_pad_false_rejects_mixed_image_sizes(self):
+        from PIL import Image
+
+        from mlx_vlm.models.apertus1p5.processing_apertus1p5 import (
+            Apertus1p5ImageProcessor,
+        )
+
+        processor = Apertus1p5ImageProcessor(
+            min_pixels=16 * 16,
+            max_pixels=32 * 32,
+            spatial_factor=16,
+        )
+        small = Image.fromarray(np.zeros((16, 16, 3), dtype=np.uint8))
+        wide = Image.fromarray(np.zeros((16, 32, 3), dtype=np.uint8))
+        with self.assertRaisesRegex(ValueError, "do_pad=False"):
+            processor([small, wide], do_pad=False)
+
+        uniform = processor([small, small], do_pad=False)["pixel_values"]
+        self.assertEqual(uniform.shape, (2, 3, 16, 16))

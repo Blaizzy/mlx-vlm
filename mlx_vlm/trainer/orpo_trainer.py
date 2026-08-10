@@ -83,6 +83,13 @@ def get_logps(model, batch, train_on_completions=False, assistant_id=77091):
     else:
         mask = base_mask
 
+    # MLX cross-entropy does not bounds-check targets, and models with a
+    # pruned output head (split input/output vocabulary, e.g. apertus1p5)
+    # have media token ids beyond the logit range.
+    in_vocab = targets < logits.shape[-1]
+    mask = mask * in_vocab
+    targets = mx.where(in_vocab, targets, 0)
+
     log_probs = -nn.losses.cross_entropy(logits, targets, reduction="none")
     mask_f = mask.astype(log_probs.dtype)
     token_counts = mx.maximum(mask_f.sum(-1), 1)

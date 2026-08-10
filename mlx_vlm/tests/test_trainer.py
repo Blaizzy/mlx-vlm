@@ -510,6 +510,38 @@ class TestTrainer(unittest.TestCase):
 
         self.assertAlmostEqual(actual.item(), expected.item(), places=6)
 
+    def test_out_of_vocab_labels_are_excluded_from_loss(self):
+        class DummyOutput:
+            def __init__(self, logits):
+                self.logits = logits
+
+        vocab_size = 131072
+        row = (mx.arange(vocab_size) % 7).astype(mx.float32) * 0.1
+
+        class PrunedHeadModel:
+            model_type = "apertus1p5"
+
+            def __call__(self, input_ids, pixel_values, mask, **kwargs):
+                return DummyOutput(mx.broadcast_to(row, (*input_ids.shape, vocab_size)))
+
+        # Released apertus1p5 ids: the media placeholder (131079) and the
+        # image/audio codes (131272+, 262344+) all exceed the pruned
+        # 131072-logit output head, so only the final label may contribute.
+        batch = {
+            "input_ids": mx.array([[5, 131079, 131272, 262344, 3]]),
+            "attention_mask": mx.array([[1, 1, 1, 1, 1]]),
+            "pixel_values": None,
+        }
+        expected = (mx.logsumexp(row) - row[3]).item()
+
+        loss = vision_language_loss_fn(PrunedHeadModel(), batch)
+        self.assertAlmostEqual(loss.item(), expected, places=4)
+
+        from mlx_vlm.trainer.orpo_trainer import get_logps
+
+        logps, _ = get_logps(PrunedHeadModel(), batch)
+        self.assertAlmostEqual(logps[0].item(), -expected, places=4)
+
 
 class TestLoRaScaling(unittest.TestCase):
     """Verify LoRaLayer uses alpha/rank scaling (standard LoRA convention)."""
