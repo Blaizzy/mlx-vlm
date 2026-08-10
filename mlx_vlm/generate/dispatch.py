@@ -652,6 +652,34 @@ def _cache_fully_retained(c: Any) -> bool:
     return True  # KVCache / QuantizedKVCache retain the whole sequence
 
 
+def _cache_supports_trim(c: Any) -> bool:
+    """Whether ``c`` can be rolled back at all, i.e. whether ``trim()`` is usable.
+
+    Complements :func:`_cache_fully_retained`, which asks whether the prefix is
+    still *present*. A recurrent entry has no per-token history to roll back to:
+    ``ArraysCache`` -- used by the linear-attention (GatedDeltaNet) layers of
+    hybrid models such as Qwen3.5/Qwen3.6 MoE -- holds a fixed-size state, reports
+    ``is_trimmable() == False`` and defines no ``trim`` at all. It also exposes
+    none of the attributes ``_cache_fully_retained`` keys off, so it falls through
+    that check as reusable and the caller then dies on ``c.trim(n_drop)`` with
+    ``AttributeError: 'ArraysCache' object has no attribute 'trim'``.
+
+    This mirrors ``mlx_lm.models.cache.can_trim_prompt_cache``.
+    """
+    children = getattr(c, "caches", None)
+    if children is not None:  # CacheList
+        return all(_cache_supports_trim(x) for x in children)
+    if not hasattr(c, "trim"):
+        return False
+    is_trimmable = getattr(c, "is_trimmable", None)
+    if callable(is_trimmable):
+        try:
+            return bool(is_trimmable())
+        except Exception:
+            return False
+    return True
+
+
 def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[int]:
     """Trailing tokens to drop so ``kv_cache`` keeps only its first ``prefix_len``.
 
@@ -661,11 +689,14 @@ def _prefix_cache_trim_amount(kv_cache: List[Any], prefix_len: int) -> Optional[
     taking an arbitrary rotation of the window and leaving the ring index stale:
     silent output corruption, or a broadcast crash once speculative decoding wraps
     the cache in ``BufferedRotatingKVCache``. Returns the number of tokens to drop
-    (``0`` when the whole cache is reusable), or ``None`` when an entry has already
-    evicted part of the prefix and the caller must cold-prefill instead.
+    (``0`` when the whole cache is reusable), or ``None`` when an entry cannot be
+    rolled back -- because it does not support ``trim()`` at all, or because it has
+    already evicted part of the prefix -- and the caller must cold-prefill instead.
     """
     cached_len = max((int(getattr(c, "offset", 0) or 0) for c in kv_cache), default=0)
     n_drop = max(0, cached_len - prefix_len)
+    if n_drop and not all(_cache_supports_trim(c) for c in kv_cache):
+        return None
     if n_drop and not all(_cache_fully_retained(c) for c in kv_cache):
         return None
     return n_drop

@@ -28,6 +28,7 @@ from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BufferedRotatingKVCache,
     KVCache,
@@ -2537,6 +2538,35 @@ class TestPrefixCacheReuseTrim:
         assert c.offset == 40
         c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
         assert c.offset == 41
+
+    def test_recurrent_cache_is_not_reusable(self):
+        # ArraysCache backs the linear-attention (GatedDeltaNet) layers of hybrid
+        # models such as Qwen3.5/Qwen3.6 MoE. It keeps a fixed-size recurrent state
+        # with no per-token history, so it defines no trim() at all -- reuse must be
+        # declined rather than reaching c.trim() and raising AttributeError.
+        c = ArraysCache(1)
+        c.offset = 100
+        assert not hasattr(c, "trim")
+        assert dispatch_module._prefix_cache_trim_amount([c], 60) is None
+
+    def test_mixed_flat_and_recurrent_is_not_reusable(self):
+        # A hybrid model interleaves both: 3 linear-attention layers per full
+        # attention layer for Qwen3.5/3.6. One non-trimmable entry must decline
+        # reuse for the whole cache, otherwise the flat layers get rolled back
+        # while the recurrent ones do not and the two desync.
+        flat = self._fill(KVCache(), 100)
+        recurrent = ArraysCache(1)
+        recurrent.offset = 100
+        assert dispatch_module._prefix_cache_trim_amount([flat, recurrent], 60) is None
+
+    def test_recurrent_cache_with_exact_prefix_still_reusable(self):
+        # n_drop == 0 needs no rollback: the cache already *is* the shared prefix,
+        # so a recurrent state can be carried over as-is. Keeps the common
+        # append-only follow-up turn on the warm path.
+        flat = self._fill(KVCache(), 100)
+        recurrent = ArraysCache(1)
+        recurrent.offset = 100
+        assert dispatch_module._prefix_cache_trim_amount([flat, recurrent], 100) == 0
 
 
 class TestGemma4LogitsToKeep:
