@@ -248,6 +248,16 @@ class LanguageModel(nn.Module):
     def n_kv_heads(self):
         return self.args.num_key_value_heads
 
+    @property
+    def quant_predicate(self):
+        def predicate(_, module):
+            # NormedEmbedding has a custom forward pass which applies an RMS
+            # normalization. Replacing it with QuantizedEmbedding would drop
+            # that normalization and corrupt the language model's activations.
+            return not isinstance(module, NormedEmbedding)
+
+        return predicate
+
     def make_cache(self):
         return [
             (

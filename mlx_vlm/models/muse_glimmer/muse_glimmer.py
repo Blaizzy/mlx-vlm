@@ -115,6 +115,10 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.layers
 
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
+
     def make_cache(self):
         return self.language_model.make_cache()
 

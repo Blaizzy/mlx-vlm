@@ -1,10 +1,11 @@
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, NormedEmbedding
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
     smart_resize,
@@ -118,6 +119,39 @@ def test_tiny_text_and_multimodal_forward():
     mx.eval(embeddings)
     assert embeddings.shape == (1, 3, 16)
     assert bool(mx.isfinite(embeddings).all().item())
+
+
+def test_quantization_preserves_normalized_embedding():
+    config = tiny_config()
+    config.text_config.hidden_size = 32
+    model = Model(config)
+    embedding = model.language_model.model.embed_tokens
+
+    assert isinstance(embedding, NormedEmbedding)
+    assert not model.quant_predicate(
+        "language_model.model.embed_tokens", embedding
+    )
+    assert model.quant_predicate(
+        "language_model.model.layers.0.self_attn.q_proj",
+        model.language_model.model.layers[0].self_attn.q_proj,
+    )
+
+    nn.quantize(
+        model.language_model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda path, module: (
+            hasattr(module, "to_quantized")
+            and model.quant_predicate(path, module)
+            and module.weight.shape[-1] % 32 == 0
+        ),
+    )
+
+    assert isinstance(model.language_model.model.embed_tokens, NormedEmbedding)
+    assert isinstance(
+        model.language_model.model.layers[0].self_attn.q_proj,
+        nn.QuantizedLinear,
+    )
 
 
 def test_cache_matches_layer_attention_type():
