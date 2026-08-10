@@ -354,3 +354,32 @@ def test_run_on_server_http_error_surfaced(monkeypatch):
         raise AssertionError("expected SystemExit")
     except SystemExit as exc:
         assert "HTTP 500" in str(exc)
+
+
+# --- Server-aware chat (--base-url) --------------------------------------------
+
+
+def test_chat_defines_base_url_and_api_key():
+    module = _load_module("mlx_vlm/chat.py")
+    _find_add_argument(module, "--base-url")
+    _find_add_argument(module, "--api-key")
+
+
+def test_chat_defines_remote_class():
+    module = _load_module("mlx_vlm/chat.py")
+    assert any(
+        isinstance(n, ast.ClassDef) and n.name == "RemoteVisionChat"
+        for n in ast.walk(module)
+    )
+
+
+def test_chat_main_routes_to_server_when_base_url_set():
+    module = _load_module("mlx_vlm/chat.py")
+    main = _find_function_def(module, "main")
+    names = [
+        n.func.id
+        for n in ast.walk(main)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    ]
+    assert "resolve_base_url" in names
+    assert "RemoteVisionChat" in names

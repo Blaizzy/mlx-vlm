@@ -2,6 +2,7 @@ import argparse
 import codecs
 import os
 import sys
+import urllib.error
 from typing import Dict, List
 
 from rich import print as rprint
@@ -23,6 +24,7 @@ from mlx_vlm.generate import (
     PromptCacheState,
     stream_generate,
 )
+from mlx_vlm.generate.remote import resolve_base_url, sampling_params, stream_chat
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_image
 from mlx_vlm.vision_cache import VisionFeatureCache
@@ -187,12 +189,117 @@ class MLXVisionChat:
                 continue
 
 
+class RemoteVisionChat:
+    """Chat REPL backed by a running mlx-vlm server (see --base-url)."""
+
+    def __init__(self, args, base_url: str):
+        self.args = args
+        self.base_url = base_url
+        self.console = Console()
+        self.messages: List[Dict] = []
+        self.image_path = None
+        rprint(f"[bold green]Using mlx-vlm server at {base_url}[/bold green]")
+        self._print_help()
+
+    def _print_help(self) -> None:
+        rprint(
+            Panel(
+                "\n".join(
+                    [
+                        "• /image <path> - attach an image to the next message",
+                        "• /clear - clear the conversation",
+                        "• /help - show this help",
+                        "• /exit - quit",
+                    ]
+                ),
+                title="Help",
+                border_style="blue",
+            )
+        )
+
+    def _command(self, text: str) -> bool:
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd == "/exit":
+            rprint("[bold yellow]Goodbye![/bold yellow]")
+            return False
+        if cmd == "/help":
+            self._print_help()
+        elif cmd == "/clear":
+            self.messages.clear()
+            self.image_path = None
+            rprint("[bold blue]Conversation cleared.[/bold blue]")
+        elif cmd == "/image":
+            path = os.path.expanduser(arg)
+            if arg and os.path.exists(path):
+                self.image_path = path
+                rprint(f"[bold blue]Attached:[/bold blue] {arg}")
+            else:
+                rprint(f"[bold red]Error:[/bold red] image not found: {arg}")
+        else:
+            rprint(f"[bold red]Unknown command:[/bold red] {cmd}")
+        return True
+
+    def _send(self, text: str) -> None:
+        content = [{"type": "text", "text": text}]
+        if self.image_path:
+            content.append({"type": "image_url", "image_url": {"url": self.image_path}})
+            self.image_path = None
+        self.messages.append({"role": "user", "content": content})
+
+        params = sampling_params(self.args)
+        rprint("[bold green]Assistant:[/bold green]", end=" ")
+        reply = ""
+        try:
+            for chunk in stream_chat(
+                self.base_url, self.args.model, self.messages, params, self.args
+            ):
+                reply += chunk
+                print(chunk, end="", flush=True)
+            print()
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            rprint(f"\n[bold red]Server error:[/bold red] {exc}")
+            self.messages.pop()  # drop the unanswered turn
+            return
+        self.messages.append({"role": "assistant", "content": reply})
+
+    def chat_loop(self) -> None:
+        while True:
+            try:
+                user_input = Prompt.ask("\n[bold cyan]You[/bold cyan]").strip()
+                if not user_input:
+                    continue
+                if user_input.startswith("/"):
+                    if not self._command(user_input):
+                        break
+                    continue
+                self._send(user_input)
+            except KeyboardInterrupt:
+                rprint("\n[bold yellow]Interrupted. Type /exit to quit.[/bold yellow]")
+                continue
+
+
 def main():
     parser = argparse.ArgumentParser(description="MLX Vision Chat CLI")
     parser.add_argument(
         "--model",
         default="mlx-community/idefics2-8b-chatty-4bit",
         help="Path to the model or model identifier",
+    )
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Reuse a running mlx-vlm server instead of loading the model "
+        "locally. Also read from $MLX_VLM_BASE_URL. With no base URL, the chat "
+        "runs locally.",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for the server (also read from $MLX_VLM_API_KEY).",
     )
     parser.add_argument(
         "--verbose",
@@ -331,6 +438,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Reuse a running server when --base-url is set; otherwise load locally.
+    base_url = resolve_base_url(args)
+    if base_url:
+        try:
+            RemoteVisionChat(args, base_url).chat_loop()
+        except Exception as e:
+            rprint(f"[bold red]Fatal error:[/bold red] {str(e)}")
+            sys.exit(1)
+        return
 
     # Build stream_generate kwargs matching generate.py's main()
     kwargs = {}
