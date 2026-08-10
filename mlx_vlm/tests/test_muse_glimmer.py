@@ -121,24 +121,6 @@ def test_tiny_text_and_multimodal_forward():
     assert bool(mx.isfinite(embeddings).all().item())
 
 
-def test_language_model_can_compute_only_the_final_logits():
-    mx.random.seed(0)
-    language_model = Model(tiny_config()).language_model
-    input_ids = mx.array([[1, 2, 3]])
-
-    full_logits = language_model(input_ids).logits
-    final_logits = language_model(input_ids, logits_to_keep=1).logits
-    mx.eval(full_logits, final_logits)
-
-    assert final_logits.shape == (1, 1, 64)
-    np.testing.assert_allclose(
-        np.asarray(final_logits),
-        np.asarray(full_logits[:, -1:, :]),
-        rtol=1e-5,
-        atol=1e-7,
-    )
-
-
 def test_quantization_preserves_normalized_embedding():
     config = tiny_config()
     config.text_config.hidden_size = 32

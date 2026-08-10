@@ -211,8 +211,6 @@ class TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_logits_to_keep = True
-
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -232,10 +230,7 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        logits_to_keep = kwargs.pop("logits_to_keep", None)
         hidden_states = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        if logits_to_keep:
-            hidden_states = hidden_states[:, -int(logits_to_keep) :, :]
         logits = self.lm_head(hidden_states) * self.output_multiplier
         softcap = self.final_logit_softcapping
         logits = mx.tanh(logits / softcap) * softcap
