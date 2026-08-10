@@ -74,6 +74,20 @@ def parse_arguments():
         help="The path to the local model directory or Hugging Face repo.",
     )
     parser.add_argument(
+        "--base-url",
+        type=str,
+        default=None,
+        help="Reuse a running mlx-vlm server instead of loading the model "
+        "locally. Also read from $MLX_VLM_BASE_URL. With no base URL, "
+        "generation runs locally.",
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help="API key for the server (also read from $MLX_VLM_API_KEY).",
+    )
+    parser.add_argument(
         "--output-modality",
         type=str,
         choices=("text", "image", "video"),
@@ -1243,6 +1257,12 @@ def main():
         args.audio = [args.audio]
     if isinstance(args.video, str):
         args.video = [args.video]
+
+    # Reuse a running server when --base-url is set; otherwise load locally.
+    from .remote import run_on_server
+
+    if run_on_server(args):
+        return
 
     model, processor = load(
         args.model,
