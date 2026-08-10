@@ -353,6 +353,13 @@ def run_speculative_rounds(
         )
 
     hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
+    eos = getattr(model.config, "eos_token_id", None)
+    if isinstance(eos, int):
+        eos_set = {eos}
+    elif eos is None:
+        eos_set = None
+    else:
+        eos_set = set(int(x) for x in eos)
     if B == 1:
         mx.eval(first_token)
         bonus = first_token.item()
@@ -367,6 +374,7 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            eos_token_ids=eos_set,
         )
     else:
         mx.eval(first_token)
@@ -382,4 +390,5 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            eos_token_ids=eos_set,
         )
