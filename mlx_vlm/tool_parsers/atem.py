@@ -10,8 +10,7 @@ tool_call_start = "to=self<|message|>"
 tool_call_end = "</atem:function_calls>"
 
 _INVOKE_PATTERN = re.compile(
-    r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">(?P<body>.*?)'
-    r"</atem:invoke>",
+    r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">(?P<body>.*?)' r"</atem:invoke>",
     re.DOTALL,
 )
 _PARAMETER_PATTERN = re.compile(

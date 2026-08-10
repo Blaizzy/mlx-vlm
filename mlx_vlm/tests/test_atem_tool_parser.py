@@ -28,8 +28,7 @@ def test_muse_config_exposes_native_reasoning_boundaries():
 
 
 def test_parses_json_and_unquoted_atem_parameter_values():
-    result = atem.parse_tool_call(
-        """
+    result = atem.parse_tool_call("""
 <atem:invoke name="weather.get_weather">
 <atem:parameter name="city">New York</atem:parameter>
 <atem:parameter name="days">3</atem:parameter>
@@ -38,8 +37,7 @@ def test_parses_json_and_unquoted_atem_parameter_values():
 <atem:parameter name="labels">["rain", "wind"]</atem:parameter>
 <atem:parameter name="note">  keep surrounding spaces  </atem:parameter>
 </atem:invoke>
-"""
-    )
+""")
 
     assert result == {
         "name": "weather.get_weather",
@@ -55,8 +53,7 @@ def test_parses_json_and_unquoted_atem_parameter_values():
 
 
 def test_parses_multiline_parameters_and_multiple_invocations():
-    result = atem.parse_tool_call(
-        """
+    result = atem.parse_tool_call("""
 <atem:invoke name="files.write">
 <atem:parameter name="content">first line
 second line</atem:parameter>
@@ -64,8 +61,7 @@ second line</atem:parameter>
 <atem:invoke name="files.read">
 <atem:parameter name="path">notes.txt</atem:parameter>
 </atem:invoke>
-"""
-    )
+""")
 
     assert result == [
         {
