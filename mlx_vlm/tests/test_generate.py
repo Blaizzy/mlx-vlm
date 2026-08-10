@@ -636,7 +636,11 @@ class TestBatchGenerator:
             model=mock_model.language_model,
             processor=mock_processor,
         )
-        gen._apc_manager = SimpleNamespace(disk_only=disk_only)
+        # BatchGenerator stores this as `apc_manager`; setting the private
+        # name instead would create an attribute the code never reads and the
+        # test would pass against a broken lookup.
+        assert hasattr(gen, "apc_manager")
+        gen.apc_manager = SimpleNamespace(disk_only=disk_only)
 
         class FinishingBatch:
             def __init__(self):

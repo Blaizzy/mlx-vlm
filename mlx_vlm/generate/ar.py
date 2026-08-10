@@ -2724,7 +2724,7 @@ class BatchGenerator:
                     top_logprobs_k=self.top_logprobs_k,
                     greedy_sampling=self.greedy_sampling,
                 )
-                if getattr(self._apc_manager, "disk_only", False):
+                if getattr(self.apc_manager, "disk_only", False):
                     # Restoring a long prefix from disk allocates before the
                     # old batch's cache would otherwise be collected, so force
                     # the release here. The stop-the-world collection is not
