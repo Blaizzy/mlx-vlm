@@ -308,7 +308,7 @@ def test_chat_completions_rejects_invalid_tool_choice(
 ):
     with patch.object(server, "get_cached_model") as mock_get_cached_model:
         response = client.post(
-            "/v1/chat/completions",
+            "/chat/completions",
             json={
                 "model": "demo",
                 "messages": [{"role": "user", "content": "Hello"}],
@@ -320,6 +320,167 @@ def test_chat_completions_rejects_invalid_tool_choice(
     assert response.status_code == 400
     assert detail in response.json()["detail"]
     mock_get_cached_model.assert_not_called()
+
+
+def test_chat_completions_video_url_falls_back_to_frames_when_processor_rejects_video(
+    client, monkeypatch
+):
+    """Processors without native video support (e.g. Mage-VL's mage_vl) raise
+    NotImplementedError when asked to ingest the videos kwarg.  The server
+    should mirror the CLI's fallback (generate/dispatch.py): sample evenly
+    spaced frames and re-route them as ordered images so the request still
+    succeeds end-to-end.
+    """
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    # Model/processor stubs.  MageVLProcessor has no video_processor attribute,
+    # so processor_handles_video() returns False and the fallback activates.
+    model = SimpleNamespace()
+    processor = SimpleNamespace(tokenizer=SimpleNamespace(chat_template=None))
+    config = SimpleNamespace(model_type="mage_vl")
+    result = GenerationResult(
+        text="A panel of commentators discussing a soccer match.",
+        prompt_tokens=20,
+        generation_tokens=10,
+    )
+
+    # Two sampled frames returned by the fallback's ffmpeg wrapper.
+    fake_frames = [
+        Image.new("RGB", (448, 252), (10, 20, 30)),
+        Image.new("RGB", (448, 252), (40, 50, 60)),
+    ]
+
+    # server.openai imports `from ..generate import generate, stream_generate`
+    # which shadows the `mlx_vlm.generate` submodule inside the server module
+    # namespace; reach for the submodule via the real package import path
+    # that the server's fallback uses too.
+    from mlx_vlm.generate import video as video_module
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="<bos>frames+question"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+        patch.object(
+            video_module,
+            "processor_handles_video",
+            return_value=False,
+        ),
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            return_value=(fake_frames, 24.0),
+        ),
+        patch.object(
+            video_module,
+            "subsample_evenly",
+            side_effect=lambda frames, max_frames: frames[:max_frames],
+        ),
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video_url",
+                                "video_url": {
+                                    "url": "/tmp/fake_clip.mp4",
+                                },
+                            },
+                            {"type": "text", "text": "What is happening?"},
+                        ],
+                    }
+                ],
+                "max_tokens": 50,
+            },
+        )
+
+    # End-to-end: request succeeded because of the fallback, not the original
+    # 500 Internal Server Error the un-patched code would return.
+    assert response.status_code == 200
+    assert (
+        response.json()["choices"][0]["message"]["content"]
+        == "A panel of commentators discussing a soccer match."
+    )
+
+    # apply_chat_template was called with the sampled frames appended to
+    # images and videos cleared to [] so prepare_inputs never sees the kwarg
+    # the processor rejects.
+    template_kwargs = mock_template.call_args.kwargs
+    assert template_kwargs["num_images"] == len(fake_frames)
+    # Original chat-completions contract: video kwarg must be None or empty
+    # so the processor's image-only path runs.
+    assert not template_kwargs.get("video") or template_kwargs.get("video") == []
+
+
+def test_chat_completions_video_url_keeps_video_kwarg_when_processor_supports_video(
+    client, monkeypatch
+):
+    """When the loaded processor does support videos natively, the server
+    must NOT trigger the frame fallback — the model's native codec/decoder
+    is the right path.  Asserts the no-op behaviour.
+    """
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    model = SimpleNamespace()
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(chat_template=None),
+        # Native video support requires both a ``videos`` parameter on
+        # __call__ AND a video_processor component (per processor_handles_video).
+        video_processor=SimpleNamespace(),
+    )
+    config = SimpleNamespace(model_type="qwen3_vl")
+    result = GenerationResult(
+        text="video ok",
+        prompt_tokens=10,
+        generation_tokens=2,
+    )
+
+    from mlx_vlm.generate import video as video_module
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="<bos>video"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+        patch.object(
+            video_module,
+            "processor_handles_video",
+            return_value=True,
+        ),
+        patch.object(video_module, "sample_video_frames") as mock_sample,
+    ):
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "video_url",
+                                "video_url": {"url": "/tmp/clip.mp4"},
+                            },
+                            {"type": "text", "text": "describe"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    mock_sample.assert_not_called()
 
 
 def test_speculative_server_dispatches_mtp_batch_loop():

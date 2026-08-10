@@ -1688,6 +1688,54 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         model, processor, config = get_cached_model(request.model, adapter_path)
 
+        # When the model/processor cannot ingest video natively, fall back to
+        # the same frame-sampling path the CLI uses (generate/dispatch.py):
+        # sample evenly-spaced frames, append them to ``images`` so the chat
+        # template expands the right number of image tokens, and clear
+        # ``videos`` so prepare_inputs never sees a kwarg the processor
+        # rejects. Mirrors the Mage-VL case (mage_vl processor raises
+        # NotImplementedError for the ``videos`` parameter).
+        if videos:
+            try:
+                from ..generate.video import (
+                    processor_handles_video,
+                    sample_video_frames,
+                    subsample_evenly,
+                )
+
+                if not processor_handles_video(processor):
+                    logger.info(
+                        "Processor %s has no native video support; "
+                        "sampling frames for %d submitted video(s)",
+                        processor.__class__.__name__,
+                        len(videos),
+                    )
+                    frame_urls: List[str] = []
+                    max_frames = 16
+                    frame_fps = 2.0
+                    for vref in videos:
+                        try:
+                            frames, sampled_fps = sample_video_frames(
+                                [vref], fps=frame_fps
+                            )
+                            if sampled_fps:
+                                frame_fps = sampled_fps
+                            frame_urls.extend(subsample_evenly(frames, max_frames))
+                        except Exception as exc:
+                            logger.warning(
+                                "Frame extraction failed for video %r: %s",
+                                vref if isinstance(vref, str) else "<bytes>",
+                                exc,
+                            )
+                    if frame_urls:
+                        images = list(images) + frame_urls
+                        videos = []
+            except ImportError:
+                # generate/video.py not importable — leave the request alone
+                # and let prepare_inputs raise the original NotImplementedError
+                # so the caller sees a clear error.
+                pass
+
         # Detect tool parser from chat template
         tool_parser_type = _infer_tool_parser_from_processor(processor)
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
