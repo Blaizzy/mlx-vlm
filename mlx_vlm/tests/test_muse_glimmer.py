@@ -91,6 +91,26 @@ def test_centered_rms_norm_uses_one_plus_checkpoint_weight():
     )
 
 
+def test_centered_rms_norm_preserves_transformers_fp32_operation_order():
+    norm = CenteredRMSNorm(4, eps=1e-6)
+    norm.weight = (
+        mx.arange(4, dtype=mx.float32) * 0.031 - 0.2
+    ).astype(mx.bfloat16)
+    inputs = (
+        mx.arange(4, dtype=mx.float32) * 0.37 - 1.13
+    ).reshape(1, 4).astype(mx.bfloat16)
+
+    inputs32 = inputs.astype(mx.float32)
+    variance = mx.mean(mx.square(inputs32), axis=-1, keepdims=True)
+    expected = inputs32 * mx.rsqrt(variance + norm.eps)
+    expected = expected * (1.0 + norm.weight.astype(mx.float32))
+    expected = expected.astype(inputs.dtype)
+    output = norm(inputs)
+    mx.eval(output, expected)
+
+    assert bool(mx.array_equal(output, expected).item())
+
+
 def test_compiled_vision_rotary_matches_fp32_reference():
     q = mx.arange(48, dtype=mx.bfloat16).reshape(1, 2, 2, 12) / 48
     k = q + 0.25

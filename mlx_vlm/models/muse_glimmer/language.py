@@ -14,6 +14,18 @@ from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
+@mx.compile
+def _centered_rms_norm(
+    x: mx.array, weight: mx.array, eps: float
+) -> mx.array:
+    dtype = x.dtype
+    x = x.astype(mx.float32)
+    variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
+    x = x * mx.rsqrt(variance + eps)
+    x = x * (1.0 + weight.astype(mx.float32))
+    return x.astype(dtype)
+
+
 class RMSNormNoScale(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
@@ -32,7 +44,9 @@ class CenteredRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+        # Transformers applies the centered scale in FP32 before casting back
+        # to the activation dtype. Casting earlier changes BF16 decode choices.
+        return _centered_rms_norm(x, self.weight, self.eps)
 
 
 class NormedEmbedding(nn.Embedding):
