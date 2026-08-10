@@ -47,15 +47,6 @@ class CenteredRMSNorm(nn.Module):
         return _centered_rms_norm(x, self.weight, self.eps)
 
 
-class NormedEmbedding(nn.Embedding):
-    def __init__(self, vocab_size: int, hidden_size: int, eps: float):
-        super().__init__(vocab_size, hidden_size)
-        self.embed_norm = RMSNormNoScale(eps)
-
-    def __call__(self, inputs: mx.array) -> mx.array:
-        return self.embed_norm(super().__call__(inputs))
-
-
 class MLP(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -179,9 +170,8 @@ class TextModel(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
-        self.embed_tokens = NormedEmbedding(
-            args.vocab_size, args.hidden_size, args.rms_norm_eps
-        )
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.embed_norm = RMSNormNoScale(args.rms_norm_eps)
         self.layers = [DecoderLayer(args, idx) for idx in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.layer_types = args.layer_types
@@ -200,9 +190,9 @@ class TextModel(nn.Module):
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
     ) -> mx.array:
-        hidden_states = (
-            self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
-        )
+        hidden_states = inputs_embeds
+        if hidden_states is None:
+            hidden_states = self.embed_norm(self.embed_tokens(inputs))
         if cache is None:
             cache = [None] * len(self.layers)
 
@@ -258,16 +248,6 @@ class LanguageModel(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
-
-    @property
-    def quant_predicate(self):
-        def predicate(_, module):
-            # NormedEmbedding has a custom forward pass which applies an RMS
-            # normalization. Replacing it with QuantizedEmbedding would drop
-            # that normalization and corrupt the language model's activations.
-            return not isinstance(module, NormedEmbedding)
-
-        return predicate
 
     def make_cache(self):
         return [

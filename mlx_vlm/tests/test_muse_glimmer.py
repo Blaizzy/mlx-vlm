@@ -5,7 +5,7 @@ from PIL import Image
 
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, NormedEmbedding
+from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, RMSNormNoScale
 from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
@@ -179,35 +179,37 @@ def test_tiny_text_and_multimodal_forward():
     assert bool(mx.isfinite(embeddings).all().item())
 
 
-def test_quantization_preserves_normalized_embedding():
+def test_quantization_keeps_embedding_normalization_outside_embedding():
     config = tiny_config()
     config.text_config.hidden_size = 32
     model = Model(config)
-    embedding = model.language_model.model.embed_tokens
-
-    assert isinstance(embedding, NormedEmbedding)
-    assert not model.quant_predicate("language_model.model.embed_tokens", embedding)
-    assert model.quant_predicate(
-        "language_model.model.layers.0.self_attn.q_proj",
-        model.language_model.model.layers[0].self_attn.q_proj,
-    )
 
     nn.quantize(
         model.language_model,
         group_size=32,
         bits=4,
         class_predicate=lambda path, module: (
-            hasattr(module, "to_quantized")
-            and model.quant_predicate(path, module)
-            and module.weight.shape[-1] % 32 == 0
+            hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0
         ),
     )
 
-    assert isinstance(model.language_model.model.embed_tokens, NormedEmbedding)
+    text_model = model.language_model.model
+    assert isinstance(text_model.embed_tokens, nn.QuantizedEmbedding)
+    assert isinstance(text_model.embed_norm, RMSNormNoScale)
     assert isinstance(
-        model.language_model.model.layers[0].self_attn.q_proj,
+        text_model.layers[0].self_attn.q_proj,
         nn.QuantizedLinear,
     )
+
+    input_ids = mx.array([[1, 2, 3]])
+    normalized = text_model.embed_norm(text_model.embed_tokens(input_ids))
+    multimodal_path = model.get_input_embeddings(input_ids).inputs_embeds
+    direct_path = text_model(input_ids)
+    embedded_path = text_model(None, inputs_embeds=normalized)
+    mx.eval(normalized, multimodal_path, direct_path, embedded_path)
+
+    np.testing.assert_allclose(multimodal_path, normalized, rtol=1e-5, atol=1e-7)
+    np.testing.assert_allclose(direct_path, embedded_path, rtol=1e-5, atol=1e-7)
 
 
 def test_cache_matches_layer_attention_type():
