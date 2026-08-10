@@ -36,6 +36,18 @@ class CenteredRMSNorm(nn.Module):
         return normalized * (1.0 + self.weight)
 
 
+class QuantizedNormedEmbedding(nn.QuantizedEmbedding):
+    """Quantized NormedEmbedding that keeps the weightless embedding norm.
+
+    ``nn.Embedding.to_quantized`` returns a plain ``QuantizedEmbedding``, which
+    would silently drop ``embed_norm`` and feed unnormalized embeddings into the
+    residual stream.
+    """
+
+    def __call__(self, inputs: mx.array) -> mx.array:
+        return self.embed_norm(super().__call__(inputs))
+
+
 class NormedEmbedding(nn.Embedding):
     def __init__(self, vocab_size: int, hidden_size: int, eps: float):
         super().__init__(vocab_size, hidden_size)
@@ -43,6 +55,19 @@ class NormedEmbedding(nn.Embedding):
 
     def __call__(self, inputs: mx.array) -> mx.array:
         return self.embed_norm(super().__call__(inputs))
+
+    def to_quantized(
+        self,
+        group_size: int = 64,
+        bits: int = 4,
+        mode: str = "affine",
+        **kwargs,
+    ) -> "QuantizedNormedEmbedding":
+        quantized = QuantizedNormedEmbedding.from_embedding(
+            self, group_size, bits, mode=mode
+        )
+        quantized.embed_norm = self.embed_norm
+        return quantized
 
 
 class MLP(nn.Module):

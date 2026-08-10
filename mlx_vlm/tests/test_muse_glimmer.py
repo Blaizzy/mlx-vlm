@@ -1,10 +1,11 @@
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 from PIL import Image
 
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, NormedEmbedding
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
     smart_resize,
@@ -139,3 +140,43 @@ def test_checkpoint_prefixes_are_sanitized_to_native_modules():
     assert "language_model.model.layers.0.self_attn.q_proj.weight" in weights
     assert "vision_tower.ln_pre.weight" in weights
     assert "language_model.lm_head.weight" in weights
+
+
+def test_quantization_preserves_embedding_norm():
+    """Quantizing must not drop the weightless norm on the token embedding.
+
+    ``nn.Embedding.to_quantized`` returns a plain ``QuantizedEmbedding``, so
+    without an override the subclass loses ``embed_norm`` and feeds
+    unnormalized embeddings into the residual stream. This regresses silently:
+    the model still runs, but logits collapse onto generic tokens.
+    """
+
+    class Container(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = NormedEmbedding(64, 64, 1e-5)
+
+        def __call__(self, ids):
+            return self.embed_tokens(ids)
+
+    container = Container()
+    # A deliberately large scale: only the norm can bring this back to unit RMS.
+    container.embed_tokens.weight = mx.random.normal((64, 64)) * 5.0
+
+    ids = mx.array([[1, 2, 3]])
+    reference = container(ids)
+    mx.eval(reference)
+
+    nn.quantize(container, group_size=32, bits=8)
+
+    quantized_embed = container.embed_tokens
+    assert hasattr(quantized_embed, "embed_norm"), (
+        "quantization dropped embed_norm: "
+        f"{type(quantized_embed).__name__} has no weightless embedding norm"
+    )
+
+    quantized = container(ids)
+    mx.eval(quantized)
+
+    assert abs(float(mx.sqrt(mx.mean(reference**2))) - 1.0) < 1e-2
+    assert abs(float(mx.sqrt(mx.mean(quantized**2))) - 1.0) < 1e-2
