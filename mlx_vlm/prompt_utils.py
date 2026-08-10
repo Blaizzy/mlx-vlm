@@ -582,6 +582,39 @@ def get_message_json(
     )
 
 
+def _normalize_tool_call_content(
+    messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Coerce ``content: None`` to ``""`` on assistant tool-call turns.
+
+    A tool-call turn carrying no accompanying text is an ordinary shape in an
+    agentic loop, and both the OpenAI and Anthropic compatibility layers
+    forward it as ``{"content": None, "tool_calls": [...]}``. Chat templates
+    commonly branch on ``message.content is string`` and otherwise iterate the
+    value, so ``None`` raises ``'NoneType' object is not iterable`` during
+    rendering. An empty string takes the string branch and renders identically
+    to a turn whose text really is empty.
+
+    The input list is left untouched; a shallow copy is made only when a
+    message actually needs patching.
+    """
+    normalized = None
+
+    for index, message in enumerate(messages):
+        if (
+            isinstance(message, dict)
+            and message.get("content") is None
+            and message.get("tool_calls")
+        ):
+            if normalized is None:
+                normalized = list(messages)
+            patched = dict(message)
+            patched["content"] = ""
+            normalized[index] = patched
+
+    return messages if normalized is None else normalized
+
+
 def get_chat_template(
     processor,
     messages: List[Dict[str, Any]],
@@ -590,6 +623,8 @@ def get_chat_template(
     **kwargs,
 ) -> Any:
     """Apply chat template using processor's tokenizer."""
+
+    messages = _normalize_tool_call_content(messages)
 
     def _get_image_token() -> str:
         if processor is None:

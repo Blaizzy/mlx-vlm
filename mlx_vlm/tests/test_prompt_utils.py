@@ -762,3 +762,126 @@ class TestModelSpecificPromptContracts:
             "text",
         ]
         assert result[0]["content"][-1]["text"] == "OCR:"
+
+
+class TestToolCallOnlyAssistantTurn:
+    """A tool-call turn carrying no text must still render (#1785, #1034)."""
+
+    # Faithful reduction of the Qwen3-VL assistant branch: it checks whether
+    # content is a string and otherwise assumes the value is iterable.
+    ASSISTANT_BRANCH_TEMPLATE = (
+        "{%- for message in messages %}"
+        '{%- if message.role == "assistant" %}'
+        "{{- '<|im_start|>assistant\n' }}"
+        "{%- if message.content is string %}{{- message.content }}"
+        "{%- else %}"
+        "{%- for content_item in message.content %}"
+        "{%- if 'text' in content_item %}{{- content_item.text }}{%- endif %}"
+        "{%- endfor %}"
+        "{%- endif %}"
+        "{%- if message.tool_calls %}"
+        "{%- for tc in message.tool_calls %}"
+        "{{- '<tool_call>' + tc.function.name + '</tool_call>' }}"
+        "{%- endfor %}"
+        "{%- endif %}"
+        "{{- '<|im_end|>\n' }}"
+        "{%- else %}"
+        "{{- '<|im_start|>' + message.role + '\n'"
+        " + (message.content or '') + '<|im_end|>\n' }}"
+        "{%- endif %}"
+        "{%- endfor %}"
+        "{%- if add_generation_prompt %}"
+        "{{- '<|im_start|>assistant\n' }}{%- endif %}"
+    )
+
+    @staticmethod
+    def _processor(template):
+        from jinja2 import Environment
+
+        class _Processor:
+            chat_template = template
+
+            def apply_chat_template(
+                self,
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                **kwargs,
+            ):
+                compiled = Environment().from_string(template)
+                return compiled.render(
+                    messages=messages,
+                    add_generation_prompt=add_generation_prompt,
+                    **kwargs,
+                )
+
+        return _Processor()
+
+    @staticmethod
+    def _messages(content):
+        return [
+            {"role": "user", "content": "Open the docs page."},
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "navigate",
+                            "arguments": {"url": "/docs"},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+
+    def test_null_content_tool_call_turn_renders(self):
+        """content=None must not blow up the template with a TypeError."""
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        rendered = get_chat_template(
+            self._processor(self.ASSISTANT_BRANCH_TEMPLATE),
+            self._messages(None),
+            add_generation_prompt=True,
+        )
+
+        assert "<tool_call>navigate</tool_call>" in rendered
+        assert rendered.endswith("<|im_start|>assistant\n")
+
+    def test_null_content_renders_like_empty_string(self):
+        """content=None and content="" must produce identical prompts."""
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        processor = self._processor(self.ASSISTANT_BRANCH_TEMPLATE)
+        from_null = get_chat_template(
+            processor, self._messages(None), add_generation_prompt=True
+        )
+        from_empty = get_chat_template(
+            processor, self._messages(""), add_generation_prompt=True
+        )
+
+        assert from_null == from_empty
+
+    def test_caller_messages_are_not_mutated(self):
+        """Normalization must not write back into the caller's list."""
+        from mlx_vlm.prompt_utils import get_chat_template
+
+        messages = self._messages(None)
+        get_chat_template(
+            self._processor(self.ASSISTANT_BRANCH_TEMPLATE),
+            messages,
+            add_generation_prompt=True,
+        )
+
+        assert messages[1]["content"] is None
+
+    def test_null_content_without_tool_calls_is_left_alone(self):
+        """Only tool-call turns are normalized; other None content is untouched."""
+        from mlx_vlm.prompt_utils import _normalize_tool_call_content
+
+        messages = [{"role": "assistant", "content": None}]
+
+        assert _normalize_tool_call_content(messages) is messages
