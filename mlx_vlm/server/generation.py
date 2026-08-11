@@ -1197,6 +1197,7 @@ class ResponseGenerator:
         if self.apc_manager is not None:
             language_model = getattr(model, "language_model", model)
             self.apc_mode = _apc.model_apc_mode(language_model)
+
     def generate(
         self,
         prompt: str,
@@ -1810,9 +1811,8 @@ class ResponseGenerator:
                     has_embeds = bool(gen_kwargs.get("inputs_embeds") is not None)
                     # Preserve tenant isolation for manually queued requests
                     # that predate server-side semantic hash computation.
-                    if (
-                        request.apc_semantic_hash is None
-                        and getattr(args, "tenant_id", None)
+                    if request.apc_semantic_hash is None and getattr(
+                        args, "tenant_id", None
                     ):
                         gen_kwargs["_apc_tenant"] = args.tenant_id
 
