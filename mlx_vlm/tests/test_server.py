@@ -956,6 +956,7 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
     assert "local/single-file-model" in ids
     assert "local/sharded-model" in ids
     assert "missing/weights" not in ids
+    assert all(isinstance(m["capabilities"], list) for m in response.json()["data"])
 
 
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
@@ -976,6 +977,7 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
             "id": "/models/local-qwen",
             "object": "model",
             "created": response.json()["data"][0]["created"],
+            "capabilities": [],
         }
     ]
 

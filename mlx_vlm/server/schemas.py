@@ -1005,6 +1005,7 @@ class ModelInfo(BaseModel):
     id: str
     object: str
     created: int
+    capabilities: Optional[List[str]] = None
 
 
 class ModelsResponse(BaseModel):

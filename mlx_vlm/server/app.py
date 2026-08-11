@@ -17,7 +17,7 @@ from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 
 from .. import apc as _apc
-from ..generate.edit_image import load_image_edit_model
+from ..generate.edit_image import load_image_edit_model, model_capabilities
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
@@ -881,6 +881,12 @@ def models_endpoint():
             )
 
     response = {"object": "list", "data": models}
+
+    for model in models:
+        try:
+            model["capabilities"] = model_capabilities(model["id"])
+        except Exception:
+            model["capabilities"] = []
 
     return response
 
