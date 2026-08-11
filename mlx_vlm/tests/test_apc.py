@@ -81,6 +81,19 @@ def test_hash_chain_and_image_hash_are_deterministic():
     )
 
 
+def test_image_hash_preserves_tensor_shape_and_dtype():
+    flat_values = mx.arange(12, dtype=mx.float32)
+    first_shape = flat_values.reshape(1, 3, 2, 2)
+    second_shape = flat_values.reshape(1, 3, 1, 4)
+
+    assert hash_image_payload(pixel_values=first_shape) != hash_image_payload(
+        pixel_values=second_shape
+    )
+    assert hash_image_payload(pixel_values=first_shape) != hash_image_payload(
+        pixel_values=first_shape.astype(mx.float16)
+    )
+
+
 def test_tenant_scoped_hash_is_stable_namespaced_and_process_stable():
     image_hash = hash_image_payload(image_ref="cat.jpg")
 
