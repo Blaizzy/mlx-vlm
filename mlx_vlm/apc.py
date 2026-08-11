@@ -127,8 +127,8 @@ def tenant_scoped_hash(tenant: Optional[str], payload_hash: int = 0) -> int:
 def _tensor_content_hash(t: Any) -> int:
     """Lossless content hash of a tensor: shape + dtype + exact bytes.
 
-    Unlike ``hash_image_payload`` this keeps shape and dtype and does not
-    downcast to fp16, so distinct masks/embeddings never collide.
+    Keeps shape and dtype and does not downcast, so distinct semantic inputs
+    never collide solely because their flattened values happen to match.
     """
     dtype = str(getattr(t, "dtype", ""))
     shape = tuple(getattr(t, "shape", ()))
@@ -379,9 +379,7 @@ def hash_image_payload(
     """
     if pixel_values is not None:
         try:
-            arr = np.asarray(pixel_values).astype(np.float16, copy=False)
-            digest = hashlib.sha256(arr.tobytes()).digest()
-            return int.from_bytes(digest[:8], "little", signed=True)
+            return _tensor_content_hash(pixel_values)
         except Exception:
             pass
 
