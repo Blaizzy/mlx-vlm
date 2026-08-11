@@ -12075,6 +12075,58 @@ class TestLfm2Embedding(unittest.TestCase):
 
 
 class TestCohereCompass(unittest.TestCase):
+    def test_released_text_config_defaults_and_per_layer_rope(self):
+        from mlx_vlm.models import cohere_compass
+
+        text_config = cohere_compass.TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_parameters={
+                "sliding_attention": {
+                    "mrope_interleaved": True,
+                    "mrope_section": [2, 1, 1],
+                    "rope_type": "default",
+                    "rope_theta": 50_000,
+                },
+                "full_attention": None,
+                "rope_type": "default",
+                "rope_theta": 10_000,
+            },
+        )
+        model = cohere_compass.LanguageModel(text_config)
+
+        self.assertEqual(text_config.norm_type, "layer_norm")
+        self.assertEqual(text_config.transformer_block_type, "parallel")
+        self.assertFalse(hasattr(model.model.layers[0], "post_attention_layernorm"))
+        self.assertTrue(model.model.layers[0].self_attn.rotary_emb.enabled)
+        self.assertFalse(model.model.layers[1].self_attn.rotary_emb.enabled)
+        self.assertAlmostEqual(
+            model.model.layers[0].self_attn.rotary_emb.inv_freq[1].item(),
+            50_000 ** (-0.25),
+            places=6,
+        )
+        rotary = model.model.layers[0].self_attn.rotary_emb
+        positions = mx.array(
+            [
+                [[1, 2]],
+                [[3, 4]],
+                [[5, 6]],
+            ]
+        )
+        cos, _ = rotary(mx.zeros((1, 2, 32)), positions)
+        selected = mx.take(positions, rotary.position_selector, axis=0).transpose(
+            1, 2, 0
+        )
+        frequencies = selected.astype(mx.float32) * rotary.inv_freq
+        expected = mx.cos(mx.concatenate([frequencies, frequencies], axis=-1))
+        self.assertTrue(mx.allclose(cos, expected).item())
+
     def test_text_rope_respects_interleaved_and_split_layouts(self):
         from mlx_vlm.models.cohere_compass.language import _apply_rope
 
@@ -12176,6 +12228,95 @@ class TestCohereCompass(unittest.TestCase):
         mx.eval(next_output.logits)
         self.assertEqual(next_output.logits.shape, (1, 1, 64))
 
+    def test_chunked_prefill_aligns_deepstack_visual_rows(self):
+        from types import SimpleNamespace
+
+        model = self._tiny_model()
+        language_model = model.language_model
+
+        class Recorder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual_pos_masks = None
+                self.deepstack_visual_embeds = None
+                self.embed_tokens = SimpleNamespace(
+                    as_linear=lambda hidden: mx.zeros(
+                        (*hidden.shape[:-1], 64), dtype=hidden.dtype
+                    )
+                )
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                self.deepstack_visual_embeds = deepstack_visual_embeds
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 32))
+
+        recorder = Recorder()
+        language_model.model = recorder
+        full_mask = mx.array(
+            [
+                [False, True, True, False, True, True, False, True, False],
+                [True, False, True, False, True, False, False, False, False],
+            ]
+        )
+        visual_rows = int(full_mask.sum().item())
+        embeds = mx.arange(visual_rows * 32).reshape(visual_rows, 32)
+
+        language_model(
+            mx.zeros((2, 3), dtype=mx.int32),
+            inputs_embeds=mx.zeros((2, 3, 32)),
+            cache=[SimpleNamespace(offset=4)],
+            position_ids=mx.zeros((3, 2, 3), dtype=mx.int32),
+            visual_pos_masks=full_mask,
+            deepstack_visual_embeds=[embeds],
+        )
+
+        self.assertEqual(
+            recorder.visual_pos_masks.tolist(),
+            [[True, True, False], [True, False, False]],
+        )
+        expected = mx.concatenate([embeds[2:4], embeds[7:8]], axis=0)
+        self.assertEqual(
+            recorder.deepstack_visual_embeds[0].tolist(), expected.tolist()
+        )
+
+    def test_visual_deepstack_allows_chunked_prefill(self):
+        model = self._tiny_model()
+        self.assertTrue(model.chunked_prefill_policy(prefill_kwargs={}))
+        self.assertTrue(
+            model.chunked_prefill_policy(
+                prefill_kwargs={"deepstack_visual_embeds": [mx.zeros((4, 32))]}
+            )
+        )
+
+    def test_deepstack_injection_preserves_batch_row_order(self):
+        model = self._tiny_model()
+        hidden = mx.zeros((2, 5, 32))
+        visual_mask = mx.array(
+            [
+                [False, True, False, True, False],
+                [True, False, True, False, True],
+            ]
+        )
+        visual_embeds = mx.concatenate(
+            [mx.full((1, 32), float(index)) for index in range(1, 6)], axis=0
+        )
+        output = model.language_model.model._deepstack_process(
+            hidden, visual_mask, visual_embeds
+        )
+
+        self.assertEqual(output[0, 1, 0].item(), 1)
+        self.assertEqual(output[0, 3, 0].item(), 2)
+        self.assertEqual(output[1, 0, 0].item(), 3)
+        self.assertEqual(output[1, 2, 0].item(), 4)
+        self.assertEqual(output[1, 4, 0].item(), 5)
+
     def test_batched_padding_matches_single_rows(self):
         from mlx_vlm.generate.ar import _make_cache
 
@@ -12184,7 +12325,11 @@ class TestCohereCompass(unittest.TestCase):
             tree_map(lambda value: value.astype(mx.bfloat16), model.parameters())
         )
         language_model = model.language_model
-        rows = [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10, 11, 12, 13]]
+        rows = [
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10, 11, 12, 13],
+            [14, 15, 16, 17, 18, 19, 20, 21],
+        ]
         max_length = max(map(len, rows))
         padding = [max_length - len(row) for row in rows]
         input_ids = mx.array([[0] * pad + row for row, pad in zip(rows, padding)])
@@ -12216,7 +12361,7 @@ class TestCohereCompass(unittest.TestCase):
             single_logits.append(output.logits[:, -1])
             single_deltas.append(row_delta)
 
-        batch_cache = _make_cache(language_model, [0, 0])
+        batch_cache = _make_cache(language_model, [0] * len(rows))
         output = language_model(
             input_ids,
             cache=batch_cache,
@@ -12225,6 +12370,7 @@ class TestCohereCompass(unittest.TestCase):
             attention_mask=attention_mask,
         )
         mx.eval(output.logits, [entry.state for entry in batch_cache])
+        self.assertEqual(output.logits.shape[1], 1)
         for row, expected in enumerate(single_logits):
             self.assertTrue(
                 mx.allclose(

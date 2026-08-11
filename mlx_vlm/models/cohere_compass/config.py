@@ -41,10 +41,10 @@ class TextConfig(BaseModelConfig):
     hidden_act: str = "silu"
     max_position_embeddings: int = 8192
     initializer_range: float = 0.02
-    rms_norm_eps: Optional[float] = 1e-6
+    rms_norm_eps: Optional[float] = None
     layer_norm_eps: float = 1e-5
-    norm_type: str = "rms_norm"
-    transformer_block_type: str = "vanilla"
+    norm_type: str = "layer_norm"
+    transformer_block_type: str = "parallel"
     use_cache: bool = True
     tie_word_embeddings: bool = False
     pad_token_id: Optional[int] = None

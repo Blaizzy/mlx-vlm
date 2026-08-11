@@ -54,18 +54,35 @@ def _interleaved_position_selector(mrope_section, freq_dim):
 class CompassRotaryEmbedding(nn.Module):
     """Compass RoPE, including its repeated-frequency MRoPE layout."""
 
-    def __init__(self, config: TextConfig):
+    def __init__(self, config: TextConfig, layer_type: Optional[str] = None):
         super().__init__()
         self.dim = config.head_dim
         self.rope_style = config.rope_style
+        rope_parameters = config.rope_parameters
+        uses_per_layer_rope = (
+            isinstance(rope_parameters, dict)
+            and any(layer in rope_parameters for layer in config.layer_types)
+        )
+        if uses_per_layer_rope:
+            rope_parameters = rope_parameters.get(layer_type)
+            self.enabled = rope_parameters is not None
+        else:
+            self.enabled = config.rope_on_all_layers or layer_type in (
+                None,
+                "sliding_attention",
+            )
+        rope_parameters = rope_parameters or {}
+        rope_theta = rope_parameters.get(
+            "rope_theta",
+            config.swa_rope_theta
+            if layer_type == "sliding_attention"
+            else config.rope_theta,
+        )
         self._inv_freq = 1.0 / (
-            config.rope_theta
+            rope_theta
             ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
-        rope_parameters = config.rope_parameters
-        section = None
-        if isinstance(rope_parameters, dict):
-            section = rope_parameters.get("mrope_section")
+        section = rope_parameters.get("mrope_section")
         if (
             isinstance(section, (list, tuple))
             and len(section) == 3
@@ -97,7 +114,7 @@ class CompassRotaryEmbedding(nn.Module):
         else:
             freqs = position_ids.astype(mx.float32)[..., None] * self.inv_freq
 
-        if self.position_selector is not None or self.rope_style == "interleave":
+        if self.rope_style == "interleave":
             emb = mx.repeat(freqs, 2, axis=-1)
         else:
             emb = mx.concatenate([freqs, freqs], axis=-1)
@@ -127,13 +144,11 @@ class Attention(nn.Module):
         self.num_key_value_groups = self.n_heads // self.n_kv_heads
         self.head_dim = config.head_dim
         self.scale = self.head_dim**-0.5
+        self.layer_type = config.layer_types[layer_idx]
         self.sliding_window = (
-            config.sliding_window
-            if config.layer_types[layer_idx] == "sliding_attention"
-            else None
+            config.sliding_window if self.layer_type == "sliding_attention" else None
         )
         self.rope_style = config.rope_style
-        self.rope_on_all_layers = config.rope_on_all_layers
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.n_heads * self.head_dim, bias=config.attention_bias
@@ -153,7 +168,7 @@ class Attention(nn.Module):
             config.hidden_size,
             bias=config.attention_bias,
         )
-        self.rotary_emb = CompassRotaryEmbedding(config)
+        self.rotary_emb = CompassRotaryEmbedding(config, self.layer_type)
 
     def __call__(
         self,
@@ -177,7 +192,7 @@ class Attention(nn.Module):
         keys = keys.transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
-        if self.rope_on_all_layers or self.sliding_window is not None:
+        if self.rotary_emb.enabled:
             if position_embeddings is None:
                 if position_ids is None:
                     position_ids = mx.arange(sequence_length, dtype=mx.int32)[None, :]
@@ -330,7 +345,19 @@ class TextModel(nn.Module):
             if config.rms_norm_eps is not None
             else CompassLayerNorm(config.hidden_size, config.layer_norm_eps)
         )
-        self.rotary_emb = CompassRotaryEmbedding(config)
+        layer_types = list(dict.fromkeys(config.layer_types))
+        self.rotary_embeddings = {
+            layer_type: CompassRotaryEmbedding(config, layer_type)
+            for layer_type in layer_types
+        }
+        self.rotary_emb = next(
+            (
+                rotary
+                for rotary in self.rotary_embeddings.values()
+                if rotary.enabled
+            ),
+            next(iter(self.rotary_embeddings.values())),
+        )
 
     def __call__(
         self,
@@ -371,7 +398,12 @@ class TextModel(nn.Module):
                 position_ids = mx.broadcast_to(
                     position_ids[None, ...], (3, h.shape[0], h.shape[1])
                 )
-        position_embeddings = self.rotary_emb(h, position_ids)
+        position_embeddings = {
+            layer_type: (
+                rotary(h, position_ids) if rotary.enabled else None
+            )
+            for layer_type, rotary in self.rotary_embeddings.items()
+        }
 
         for layer_idx, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             layer_mask = (
@@ -384,7 +416,7 @@ class TextModel(nn.Module):
                 layer_mask,
                 layer_cache,
                 position_ids,
-                position_embeddings,
+                position_embeddings[layer.attention_type],
             )
             if deepstack_visual_embeds is not None and layer_idx < len(
                 deepstack_visual_embeds
@@ -398,23 +430,18 @@ class TextModel(nn.Module):
     def _deepstack_process(hidden_states, visual_pos_masks, visual_embeds):
         if visual_pos_masks is None:
             return hidden_states
-        batches = []
-        offset = 0
-        for batch_index in range(hidden_states.shape[0]):
-            indices = mx.array(
-                np.where(visual_pos_masks[batch_index])[0],
-                dtype=mx.uint32,
-            )
-            count = indices.shape[0]
-            result = hidden_states[batch_index]
-            if count:
-                result = result.at[indices].add(visual_embeds[offset : offset + count])
-                offset += count
-            batches.append(result)
-        return mx.stack(batches, axis=0)
+        flat_mask = visual_pos_masks.reshape(-1)
+        indices = mx.array(np.where(flat_mask)[0], dtype=mx.uint32)
+        if not indices.shape[0]:
+            return hidden_states
+        flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        flat_hidden = flat_hidden.at[indices].add(visual_embeds[: indices.shape[0]])
+        return flat_hidden.reshape(hidden_states.shape)
 
 
 class LanguageModel(nn.Module):
+    supports_logits_to_keep = True
+
     def __init__(self, config: TextConfig):
         super().__init__()
         self.config = config
@@ -562,6 +589,8 @@ class LanguageModel(nn.Module):
         deepstack_visual_embeds = kwargs.pop("deepstack_visual_embeds", None)
         rope_deltas = kwargs.pop("rope_deltas", None)
         attention_mask = kwargs.pop("attention_mask", None)
+        logits_to_keep = kwargs.pop("logits_to_keep", None)
+        n_to_process = kwargs.pop("n_to_process", None)
 
         if pixel_values is not None:
             self._rope_deltas = None
@@ -604,6 +633,40 @@ class LanguageModel(nn.Module):
             else:
                 cache_offset = int(cache_offset)
 
+        if (
+            visual_pos_masks is not None
+            and visual_pos_masks.shape[-1] != inputs.shape[-1]
+        ):
+            # ``generate_step`` forwards full-prompt multimodal metadata to
+            # every chunk.  Align both the mask and its packed visual rows to
+            # the current cache window before deep-stack injection.
+            start = cache_offset
+            stop = start + inputs.shape[1]
+            full_visual_pos_masks = visual_pos_masks
+            visual_pos_masks = full_visual_pos_masks[:, start:stop]
+            if deepstack_visual_embeds is not None:
+                embed_windows = [[] for _ in deepstack_visual_embeds]
+                row_offset = 0
+                for row, row_mask in enumerate(full_visual_pos_masks):
+                    row_visuals = int(row_mask.sum().item())
+                    before = int(row_mask[:start].sum().item())
+                    count = int(visual_pos_masks[row].sum().item())
+                    for layer, embeds in enumerate(deepstack_visual_embeds):
+                        embed_windows[layer].append(
+                            embeds[
+                                row_offset + before : row_offset + before + count
+                            ]
+                        )
+                    row_offset += row_visuals
+                deepstack_visual_embeds = [
+                    (
+                        mx.concatenate(windows, axis=0)
+                        if windows
+                        else mx.zeros((0, self.config.hidden_size))
+                    )
+                    for windows in embed_windows
+                ]
+
         if position_ids is not None and position_ids.shape[-1] > inputs.shape[-1]:
             position_ids = position_ids[
                 ..., cache_offset : cache_offset + inputs.shape[-1]
@@ -633,6 +696,16 @@ class LanguageModel(nn.Module):
             visual_pos_masks=visual_pos_masks,
             deepstack_visual_embeds=deepstack_visual_embeds,
         )
+        batch_cache = bool(cache) and hasattr(cache[0], "left_padding")
+        batch_last_token_is_real = attention_mask is None or bool(
+            mx.all(attention_mask[:, -1]).item()
+        )
+        if (
+            logits_to_keep
+            or n_to_process is not None
+            or (batch_cache and batch_last_token_is_real)
+        ):
+            hidden_states = hidden_states[:, -int(logits_to_keep or 1) :, :]
         logits = _rowwise_batch(
             (
                 self.model.embed_tokens.as_linear

@@ -89,6 +89,19 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ):
+        del input_ids, inputs_embeds, prompt_cache, draft_kind, prefill_kwargs
+        return draft_model is None
+
     def __call__(
         self,
         input_ids: mx.array,
