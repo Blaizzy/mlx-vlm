@@ -5,6 +5,7 @@ from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
+    EagerRoPE,
     MRoPERotaryEmbedding,
     ProportionalRoPE,
     apply_mrope_frequency_layout,
@@ -12,6 +13,7 @@ from mlx_vlm.models.rope_utils import (
     apply_rotary_pos_emb_even_odd,
     compute_mrope_frequencies,
     compute_selected_mrope_cos_sin,
+    initialize_rope,
     mrope_position_selector,
     mrope_section_selectors,
 )
@@ -39,6 +41,32 @@ def _disable_metal_fast_path(fn):
 def _position_ids(batch=2, seq_len=4):
     base = mx.arange(batch * seq_len, dtype=mx.int32).reshape(batch, seq_len)
     return mx.stack([base, base + 3, base + 7])
+
+
+def test_eager_rope_uses_fp32_frequencies_and_activation_dtype_trig():
+    inputs = (mx.arange(24, dtype=mx.float32) / 7).reshape(1, 2, 3, 4)
+    inputs = inputs.astype(mx.bfloat16)
+    rope = initialize_rope(
+        dims=4,
+        base=10000.0,
+        traditional=False,
+        scaling_config={"rope_type": "default"},
+        implementation="eager",
+    )
+    assert isinstance(rope, EagerRoPE)
+
+    positions = mx.arange(2, 5, dtype=mx.float32)
+    frequencies = 1.0 / (10000.0 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
+    angles = positions[:, None] * frequencies[None]
+    angles = mx.concatenate([angles, angles], axis=-1)
+    cos = mx.cos(angles).astype(inputs.dtype)[None, None]
+    sin = mx.sin(angles).astype(inputs.dtype)[None, None]
+    rotated = mx.concatenate([-inputs[..., 2:], inputs[..., :2]], axis=-1)
+    expected = inputs * cos + rotated * sin
+    output = rope(inputs, offset=2)
+    mx.eval(output, expected)
+
+    assert bool(mx.array_equal(output, expected).item())
 
 
 def test_mrope_rotary_embedding_evals_private_helper_arrays_on_init(monkeypatch):

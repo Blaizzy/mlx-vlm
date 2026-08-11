@@ -8,7 +8,6 @@ from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionCo
 from mlx_vlm.models.muse_glimmer.language import (
     CenteredRMSNorm,
     RMSNormNoScale,
-    TextRotaryEmbedding,
     _scale_queries,
 )
 from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
@@ -119,25 +118,6 @@ def test_query_scale_uses_transformers_fp32_operation_order():
 
     assert bool(mx.array_equal(output, expected).item())
     assert not bool(mx.array_equal(output, bf16_scalar_result).item())
-
-
-def test_text_rotary_embedding_uses_fp32_frequencies():
-    inputs = (mx.arange(24, dtype=mx.float32) / 7).reshape(1, 2, 3, 4)
-    inputs = inputs.astype(mx.bfloat16)
-    rope = TextRotaryEmbedding(dim=4, base=10000.0)
-
-    positions = mx.arange(2, 5, dtype=mx.float32)
-    frequencies = 1.0 / (10000.0 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
-    angles = positions[:, None] * frequencies[None]
-    angles = mx.concatenate([angles, angles], axis=-1)
-    cos = mx.cos(angles).astype(inputs.dtype)[None, None]
-    sin = mx.sin(angles).astype(inputs.dtype)[None, None]
-    rotated = mx.concatenate([-inputs[..., 2:], inputs[..., :2]], axis=-1)
-    expected = inputs * cos + rotated * sin
-    output = rope(inputs, offset=2)
-    mx.eval(output, expected)
-
-    assert bool(mx.array_equal(output, expected).item())
 
 
 def test_compiled_vision_rotary_matches_fp32_reference():

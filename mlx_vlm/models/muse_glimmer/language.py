@@ -10,6 +10,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
+from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -44,27 +45,6 @@ class CenteredRMSNorm(nn.Module):
         # Transformers applies the centered scale in FP32 before casting back
         # to the activation dtype. Casting earlier changes BF16 decode choices.
         return _centered_rms_norm(x, self.weight, self.eps)
-
-
-class TextRotaryEmbedding:
-    """Muse Glimmer RoPE with the Transformers FP32 frequency formulation."""
-
-    def __init__(self, dim: int, base: float):
-        self.dim = dim
-        self.base = base
-
-    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
-        positions = mx.arange(offset, offset + x.shape[-2], dtype=mx.float32)
-        frequencies = 1.0 / (
-            self.base ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
-        )
-        angles = positions[:, None] * frequencies[None]
-        angles = mx.concatenate([angles, angles], axis=-1)
-        cos = mx.cos(angles).astype(x.dtype)[None, None]
-        sin = mx.sin(angles).astype(x.dtype)[None, None]
-        midpoint = x.shape[-1] // 2
-        rotated = mx.concatenate([-x[..., midpoint:], x[..., :midpoint]], axis=-1)
-        return x * cos + rotated * sin
 
 
 def _scale_queries(queries: mx.array, scale: float) -> mx.array:
@@ -115,7 +95,14 @@ class Attention(nn.Module):
             if self.use_rope
             else float(args.rope_parameters.get("rope_theta", 500000.0))
         )
-        self.rope = TextRotaryEmbedding(self.head_dim, theta)
+        self.rope = initialize_rope(
+            self.head_dim,
+            base=theta,
+            traditional=False,
+            scaling_config={"rope_type": "default", "rope_theta": theta},
+            max_position_embeddings=args.max_position_embeddings,
+            implementation="eager",
+        )
 
     def __call__(
         self,

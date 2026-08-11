@@ -12,6 +12,51 @@ _HALF_COS = "half"
 _FULL_COS = "full"
 
 
+class EagerRoPE(nn.Module):
+    """RoPE with explicit FP32 frequencies and activation-dtype cos/sin."""
+
+    def __init__(
+        self,
+        dims: int,
+        traditional: bool = False,
+        base: float = 10000.0,
+        scale: float = 1.0,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+        self.base = base
+        self.scale = scale
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        positions = mx.arange(offset, offset + x.shape[-2], dtype=mx.float32)
+        positions = positions * self.scale
+        frequencies = 1.0 / (
+            self.base ** (mx.arange(0, self.dims, 2, dtype=mx.float32) / self.dims)
+        )
+        angles = positions[:, None] * frequencies[None]
+
+        x_rope = x[..., : self.dims]
+        if self.traditional:
+            angles = mx.repeat(angles, 2, axis=-1)
+            rotated = mx.stack([-x_rope[..., 1::2], x_rope[..., ::2]], axis=-1).reshape(
+                x_rope.shape
+            )
+        else:
+            angles = mx.concatenate([angles, angles], axis=-1)
+            midpoint = self.dims // 2
+            rotated = mx.concatenate(
+                [-x_rope[..., midpoint:], x_rope[..., :midpoint]], axis=-1
+            )
+
+        cos = mx.cos(angles).astype(x.dtype)[None, None]
+        sin = mx.sin(angles).astype(x.dtype)[None, None]
+        out = x_rope * cos + rotated * sin
+        if self.dims < x.shape[-1]:
+            out = mx.concatenate([out, x[..., self.dims :]], axis=-1)
+        return out
+
+
 class SuScaledRoPE(nn.Module):
     def __init__(
         self,
@@ -272,6 +317,7 @@ def initialize_rope(
     traditional,
     scaling_config: Optional[dict] = None,
     max_position_embeddings: Optional[int] = None,
+    implementation: str = "fast",
 ):
     if scaling_config is not None:
         rope_type = scaling_config.get("type") or scaling_config.get(
@@ -280,9 +326,24 @@ def initialize_rope(
     else:
         rope_type = "default"
 
+    if implementation not in ("fast", "eager"):
+        raise ValueError(f"Unsupported RoPE implementation {implementation}")
+
     if rope_type in ["default", "linear"]:
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
+        if implementation == "eager":
+            return EagerRoPE(
+                dims,
+                traditional=traditional,
+                base=base,
+                scale=scale,
+            )
         return nn.RoPE(dims, traditional=traditional, base=base, scale=scale)
+
+    if implementation != "fast":
+        raise ValueError(
+            f"RoPE implementation {implementation} does not support type {rope_type}"
+        )
 
     if rope_type == "llama3":
         return Llama3RoPE(
