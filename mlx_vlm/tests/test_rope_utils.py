@@ -5,8 +5,11 @@ from mlx.utils import tree_flatten
 
 import mlx_vlm.models.rope_utils as rope_utils
 from mlx_vlm.models.rope_utils import (
+    Llama3RoPE,
     MRoPERotaryEmbedding,
     ProportionalRoPE,
+    SuScaledRoPE,
+    YarnRoPE,
     apply_mrope_frequency_layout,
     apply_multimodal_rotary_pos_emb,
     apply_rotary_pos_emb_even_odd,
@@ -86,6 +89,77 @@ def test_proportional_rope_evals_private_helper_arrays_on_init(monkeypatch):
     assert tree_flatten(host.trainable_parameters()) == []
     eager_arrays = host.rope.eager_eval_arrays()
     assert eager_arrays[0] is host.rope.freqs
+    assert len(eval_args) == 1
+    assert eval_args[0][0] is eager_arrays[0]
+
+
+def test_su_scaled_rope_evals_private_helper_arrays_on_init(monkeypatch):
+    eval_args = []
+    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rope = SuScaledRoPE(dims=8, long_factor=[1.0] * 4)
+
+    host = Host()
+
+    assert isinstance(host.rope, nn.Module)
+    assert tree_flatten(host.parameters()) == []
+    assert tree_flatten(host.trainable_parameters()) == []
+    eager_arrays = host.rope.eager_eval_arrays()
+    assert eager_arrays[0] is host.rope._freqs
+    assert len(eval_args) == 1
+    assert eval_args[0][0] is eager_arrays[0]
+
+
+def test_llama3_rope_evals_private_helper_arrays_on_init(monkeypatch):
+    eval_args = []
+    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rope = Llama3RoPE(
+                dims=8,
+                max_position_embeddings=64,
+                traditional=False,
+                base=10000.0,
+                scaling_config={
+                    "factor": 2.0,
+                    "low_freq_factor": 1.0,
+                    "high_freq_factor": 4.0,
+                    "original_max_position_embeddings": 32,
+                },
+            )
+
+    host = Host()
+
+    assert isinstance(host.rope, nn.Module)
+    assert tree_flatten(host.parameters()) == []
+    assert tree_flatten(host.trainable_parameters()) == []
+    eager_arrays = host.rope.eager_eval_arrays()
+    assert eager_arrays[0] is host.rope._freqs
+    assert len(eval_args) == 1
+    assert eval_args[0][0] is eager_arrays[0]
+
+
+def test_yarn_rope_evals_private_helper_arrays_on_init(monkeypatch):
+    eval_args = []
+    monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
+
+    class Host(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.rope = YarnRoPE(dims=8, traditional=False, base=10000.0)
+
+    host = Host()
+
+    assert isinstance(host.rope, nn.Module)
+    assert tree_flatten(host.parameters()) == []
+    assert tree_flatten(host.trainable_parameters()) == []
+    eager_arrays = host.rope.eager_eval_arrays()
+    assert eager_arrays[0] is host.rope._freqs
     assert len(eval_args) == 1
     assert eval_args[0][0] is eager_arrays[0]
 
