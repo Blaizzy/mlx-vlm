@@ -1962,34 +1962,6 @@ def test_dflash_next_block_size_starts_at_requested_ceiling():
     assert _dflash_next_block_size(draft_model, 16, 20) == 16
 
 
-def test_dflash_next_block_size_honors_exact_verify_limits():
-    draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
-
-    assert (
-        _dflash_next_block_size(
-            draft_model,
-            16,
-            20,
-            initial_block_total=3,
-            minimum_block_total=3,
-        )
-        == 3
-    )
-
-    draft_model.accept_lens = [0, 1]
-    draft_model.draft_lens = [2, 2]
-    assert (
-        _dflash_next_block_size(
-            draft_model,
-            16,
-            20,
-            initial_block_total=3,
-            minimum_block_total=3,
-        )
-        == 3
-    )
-
-
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
     draft_model = SimpleNamespace(accept_lens=[1, 2], draft_lens=[15, 7])
 

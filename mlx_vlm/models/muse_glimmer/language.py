@@ -11,7 +11,6 @@ from ..base import (
 )
 from ..cache import KVCache, RotatingKVCache
 from ..rope_utils import initialize_rope
-from ..target_verify import exact_quantized_linear
 from .config import TextConfig
 
 
@@ -48,29 +47,6 @@ class CenteredRMSNorm(nn.Module):
         return _centered_rms_norm(x, self.weight, self.eps)
 
 
-def _target_verify_linear(linear, x: mx.array, target_verify: bool) -> mx.array:
-    """Use decode-shaped quantized matmuls while verifying draft blocks."""
-
-    if not (
-        target_verify
-        and x.ndim == 3
-        and x.shape[1] > 1
-        and isinstance(linear, nn.QuantizedLinear)
-    ):
-        return linear(x)
-    output = exact_quantized_linear(linear, x)
-    if output is not None:
-        return output
-    return mx.concatenate(
-        [linear(x[:, index : index + 1]) for index in range(x.shape[1])],
-        axis=1,
-    )
-
-
-def _target_verify_linears(linears, x: mx.array, target_verify: bool):
-    return tuple(_target_verify_linear(linear, x, target_verify) for linear in linears)
-
-
 class MLP(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -78,15 +54,8 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
         self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
 
-    def __call__(self, x: mx.array, target_verify: bool = False) -> mx.array:
-        gate, up = _target_verify_linears(
-            (self.gate_proj, self.up_proj), x, target_verify
-        )
-        return _target_verify_linear(
-            self.down_proj,
-            swiglu(gate, up),
-            target_verify,
-        )
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Attention(nn.Module):
@@ -134,15 +103,11 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        target_verify: bool = False,
     ) -> mx.array:
         batch, length, _ = x.shape
-        queries, keys, values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj), x, target_verify
-        )
-        queries = queries.reshape(batch, length, self.n_heads, self.head_dim)
-        keys = keys.reshape(batch, length, self.n_kv_heads, self.head_dim)
-        values = values.reshape(batch, length, self.n_kv_heads, self.head_dim)
+        queries = self.q_proj(x).reshape(batch, length, self.n_heads, self.head_dim)
+        keys = self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
+        values = self.v_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
 
         queries = (self.qk_norm(queries) * self.qk_scale_factor).transpose(0, 2, 1, 3)
         keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
@@ -153,62 +118,20 @@ class Attention(nn.Module):
             queries = self.rope(queries, offset=offset)
             keys = self.rope(keys, offset=offset)
 
-        if target_verify and length > 1:
-            rotate_during_verify = (
-                isinstance(cache, RotatingKVCache)
-                and cache.offset + length > cache.max_size
-            )
-            if rotate_during_verify:
-                token_outputs = []
-                for index in range(length):
-                    attention_keys, attention_values = cache.update_and_fetch(
-                        keys[:, :, index : index + 1],
-                        values[:, :, index : index + 1],
-                    )
-                    token_outputs.append(
-                        scaled_dot_product_attention(
-                            queries[:, :, index : index + 1],
-                            attention_keys,
-                            attention_values,
-                            cache=cache,
-                            scale=self.scale,
-                            mask=None,
-                        )
-                    )
-                output = mx.concatenate(token_outputs, axis=2)
-            else:
-                if cache is not None:
-                    keys, values = cache.update_and_fetch(keys, values)
-                prefix_length = keys.shape[-2] - length
-                output = mx.concatenate(
-                    [
-                        scaled_dot_product_attention(
-                            queries[:, :, index : index + 1],
-                            keys[:, :, : prefix_length + index + 1],
-                            values[:, :, : prefix_length + index + 1],
-                            cache=cache,
-                            scale=self.scale,
-                            mask=None,
-                        )
-                        for index in range(length)
-                    ],
-                    axis=2,
-                )
-        else:
-            if cache is not None:
-                keys, values = cache.update_and_fetch(keys, values)
-            output = scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                cache=cache,
-                scale=self.scale,
-                mask=mask,
-            )
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        output = scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            cache=cache,
+            scale=self.scale,
+            mask=mask,
+        )
         output = output.transpose(0, 2, 1, 3).reshape(batch, length, -1)
-        gate = _target_verify_linear(self.gate_proj, x, target_verify)
-        output = output * mx.sigmoid(gate)
-        return _target_verify_linear(self.o_proj, output, target_verify)
+        output = output * mx.sigmoid(self.gate_proj(x))
+        return self.o_proj(output)
 
 
 class DecoderLayer(nn.Module):
@@ -233,22 +156,13 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        target_verify: bool = False,
     ) -> mx.array:
         residual = x
-        x = self.self_attn(
-            self.input_layernorm(x),
-            mask=mask,
-            cache=cache,
-            target_verify=target_verify,
-        )
+        x = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
         x = residual + self.post_attention_layernorm(x)
 
         residual = x
-        x = self.mlp(
-            self.pre_feedforward_layernorm(x),
-            target_verify=target_verify,
-        )
+        x = self.mlp(self.pre_feedforward_layernorm(x))
         return residual + self.post_feedforward_layernorm(x)
 
 
@@ -277,7 +191,6 @@ class TextModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         capture_layer_ids: Optional[list[int]] = None,
         hidden_sink: Optional[list[mx.array]] = None,
-        target_verify: bool = False,
     ) -> mx.array:
         hidden_states = inputs_embeds
         if hidden_states is None:
@@ -297,20 +210,13 @@ class TextModel(nn.Module):
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for layer_idx, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             mask = sliding_mask if layer.is_sliding else full_mask
-            hidden_states = layer(
-                hidden_states,
-                mask=mask,
-                cache=layer_cache,
-                target_verify=target_verify,
-            )
+            hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
             if hidden_sink is not None and layer_idx in capture_set:
                 hidden_sink.append(hidden_states)
         return self.norm(hidden_states)
 
 
 class LanguageModel(nn.Module):
-    supports_speculative_target_verify = True
-
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -349,15 +255,6 @@ class LanguageModel(nn.Module):
         if inputs is None:
             inputs = kwargs.get("input_ids")
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        target_verify = bool(kwargs.pop("target_verify", False))
-        batch_size = (
-            inputs_embeds.shape[0] if inputs_embeds is not None else inputs.shape[0]
-        )
-        target_verify = (
-            target_verify
-            and batch_size == 1
-            and isinstance(self.lm_head, nn.QuantizedLinear)
-        )
         hidden_sink: Optional[list[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )
@@ -367,16 +264,8 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
-            target_verify=target_verify,
         )
-        logits = (
-            _target_verify_linear(
-                self.lm_head,
-                hidden_states,
-                target_verify,
-            )
-            * self.output_multiplier
-        )
+        logits = self.lm_head(hidden_states) * self.output_multiplier
         softcap = self.final_logit_softcapping
         logits = mx.tanh(logits / softcap) * softcap
         return LanguageModelOutput(logits=logits, hidden_states=hidden_sink)
