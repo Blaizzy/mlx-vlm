@@ -22,6 +22,7 @@ from mlx_vlm.speculative.drafters.muse_glimmer_assistant import (
 )
 from mlx_vlm.speculative.drafters.muse_glimmer_assistant.dflash import (
     _bidirectional_sliding_mask,
+    _prepare_assistant_mlp_input,
 )
 from mlx_vlm.utils import get_model_and_args
 
@@ -210,6 +211,28 @@ def test_bidirectional_sliding_mask_matches_transformers_definition():
     ]
 
 
+def test_compiled_assistant_transition_preserves_outputs():
+    residual = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8).astype(mx.bfloat16)
+    attention = (residual * 0.25 - 0.75).astype(mx.bfloat16)
+    weight = (mx.arange(8, dtype=mx.float32) * 0.03 + 0.5).astype(mx.bfloat16)
+    eps = 1e-5
+
+    expected_hidden = residual + attention
+    expected_mlp_input = mx.fast.rms_norm(expected_hidden, weight, eps)
+    actual_hidden, actual_mlp_input = _prepare_assistant_mlp_input(
+        residual, attention, weight, eps
+    )
+    mx.eval(
+        expected_hidden,
+        expected_mlp_input,
+        actual_hidden,
+        actual_mlp_input,
+    )
+
+    assert bool(mx.array_equal(actual_hidden, expected_hidden).item())
+    assert bool(mx.array_equal(actual_mlp_input, expected_mlp_input).item())
+
+
 def test_tiny_drafter_forward_and_cache_shapes():
     mx.random.seed(0)
     target = _tiny_target()
@@ -233,6 +256,40 @@ def test_tiny_drafter_forward_and_cache_shapes():
     assert hidden.shape == (1, 3, 32)
     assert tokens.shape == (1, 3)
     assert all(cache.offset == 3 for cache in caches)
+
+
+def test_prepared_target_hidden_preserves_draft_tokens():
+    mx.random.seed(4)
+    target = _tiny_target()
+    drafter = MuseGlimmerAssistantModel(_tiny_assistant_config())
+    drafter.reset(target)
+    target_output = target.language_model(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        cache=target.make_cache(),
+        capture_layer_ids=[0, 1],
+    )
+    hidden = mx.concatenate(target_output.hidden_states, axis=-1)
+    prepared = drafter.prepare_target_hidden(hidden)
+    sampler = lambda logits: mx.argmax(logits, axis=-1)
+
+    regular_tokens = drafter.draft_block(
+        4,
+        hidden,
+        drafter.make_cache(),
+        block_size=4,
+        sampler=sampler,
+    )
+    prepared_tokens = drafter.draft_block(
+        4,
+        prepared,
+        drafter.make_cache(),
+        block_size=4,
+        sampler=sampler,
+        target_hidden_prepared=True,
+    )
+    mx.eval(regular_tokens, prepared_tokens)
+
+    assert bool(mx.array_equal(regular_tokens, prepared_tokens).item())
 
 
 def test_greedy_speculative_generation_matches_baseline():

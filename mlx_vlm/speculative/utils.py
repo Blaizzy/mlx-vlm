@@ -197,6 +197,25 @@ def run_speculative_server_rounds(
         return
 
     if draft_kind == "dflash":
+        if batch_size == 1:
+            for tok, state in _dflash_rounds(
+                model,
+                draft_model,
+                prompt_cache,
+                hidden,
+                first_bonus=int(first_bonus.reshape(-1).item()),
+                max_tokens=max_tokens,
+                sampler=sampler,
+                draft_block_size=draft_block_size,
+                token_dtype=token_dtype,
+                greedy_sampling=greedy_sampling,
+                use_model_initial_block_size=False,
+            ):
+                yield [tok], state
+                if stop_check is not None and stop_check(0, tok):
+                    return
+            return
+
         yield from _dflash_rounds_batch(
             model,
             draft_model,
@@ -208,6 +227,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            greedy_sampling=greedy_sampling,
         )
         return
 
@@ -350,6 +370,7 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
         )
     else:
         mx.eval(first_token)
@@ -365,4 +386,5 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
+            greedy_sampling=sampler_is_greedy,
         )

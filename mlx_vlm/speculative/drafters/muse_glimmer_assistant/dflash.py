@@ -37,6 +37,17 @@ def _bidirectional_sliding_mask(
     return mx.abs(query_positions - key_positions) <= sliding_window
 
 
+@mx.compile
+def _prepare_assistant_mlp_input(
+    residual: mx.array,
+    attention_output: mx.array,
+    weight: mx.array,
+    eps: float,
+) -> tuple[mx.array, mx.array]:
+    hidden_states = residual + attention_output
+    return hidden_states, mx.fast.rms_norm(hidden_states, weight, eps)
+
+
 class MuseGlimmerAssistantAttention(nn.Module):
     def __init__(self, config: MuseGlimmerAssistantConfig):
         super().__init__()
@@ -166,8 +177,13 @@ class MuseGlimmerAssistantDecoderLayer(nn.Module):
             rope,
             cache,
         )
-        hidden_states = residual + hidden_states
-        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        hidden_states, mlp_input = _prepare_assistant_mlp_input(
+            residual,
+            hidden_states,
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+        )
+        return hidden_states + self.mlp(mlp_input)
 
 
 class MuseGlimmerAssistantContextProjection(nn.Module):
@@ -182,6 +198,8 @@ class MuseGlimmerAssistantContextProjection(nn.Module):
 
 
 class MuseGlimmerAssistantDraftModel(nn.Module):
+    dflash_initial_block_size = 4
+
     def __init__(self, config: MuseGlimmerAssistantConfig):
         super().__init__()
         config.validate()
@@ -253,9 +271,16 @@ class MuseGlimmerAssistantDraftModel(nn.Module):
             raise RuntimeError("bind(target_model) must run before DFlash generation.")
         return self.embed_tokens(inputs)
 
-    def _hidden(self, inputs, target_hidden, cache):
+    def prepare_target_hidden(self, target_hidden: mx.array) -> mx.array:
+        return self.encoder(target_hidden)
+
+    def _hidden(self, inputs, target_hidden, cache, *, target_hidden_prepared=False):
         hidden_states = self._embed_input_tokens(inputs)
-        context_hidden_states = self.encoder(target_hidden)
+        context_hidden_states = (
+            target_hidden
+            if target_hidden_prepared
+            else self.prepare_target_hidden(target_hidden)
+        )
         for layer, layer_cache in zip(self.layers, cache):
             hidden_states = layer(
                 hidden_states,
@@ -283,6 +308,7 @@ class MuseGlimmerAssistantDraftModel(nn.Module):
         block_size: int,
         sampler: Callable[[mx.array], mx.array],
         token_dtype: mx.Dtype = mx.int32,
+        target_hidden_prepared: bool = False,
     ) -> mx.array:
         mask_id = self.config.mask_token_id
         if isinstance(last_bonus, int):
@@ -296,7 +322,16 @@ class MuseGlimmerAssistantDraftModel(nn.Module):
             block = mx.concatenate(
                 [last_bonus[:, None].astype(token_dtype), masks], axis=1
             )
-        return sampler(self._logits(self._hidden(block, hidden, cache)[:, 1:]))
+        return sampler(
+            self._logits(
+                self._hidden(
+                    block,
+                    hidden,
+                    cache,
+                    target_hidden_prepared=target_hidden_prepared,
+                )[:, 1:]
+            )
+        )
 
     def sanitize(self, weights: Mapping[str, mx.array]) -> dict[str, mx.array]:
         normalized = {

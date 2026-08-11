@@ -5,7 +5,13 @@ from PIL import Image
 
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, RMSNormNoScale
+from mlx_vlm.models.muse_glimmer.language import (
+    CenteredRMSNorm,
+    RMSNormNoScale,
+    _centered_rms_norm_impl,
+    _finish_mlp,
+    _prepare_mlp_input,
+)
 from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
@@ -105,6 +111,41 @@ def test_centered_rms_norm_preserves_transformers_fp32_operation_order():
     assert bool(mx.array_equal(output, expected).item())
 
 
+def test_compiled_decoder_transitions_preserve_operation_order():
+    residual = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8).astype(mx.bfloat16)
+    attention = (residual * 0.125 - 0.5).astype(mx.bfloat16)
+    mlp_output = (residual * -0.25 + 0.75).astype(mx.bfloat16)
+    weight = (mx.arange(8, dtype=mx.float32) * 0.02 - 0.1).astype(mx.bfloat16)
+    eps = 1e-6
+
+    expected_residual = residual + _centered_rms_norm_impl(attention, weight, eps)
+    expected_mlp_input = _centered_rms_norm_impl(expected_residual, weight, eps)
+    actual_residual, actual_mlp_input = _prepare_mlp_input(
+        residual,
+        attention,
+        weight,
+        weight,
+        eps,
+        eps,
+    )
+    expected_output = expected_residual + _centered_rms_norm_impl(
+        mlp_output, weight, eps
+    )
+    actual_output = _finish_mlp(expected_residual, mlp_output, weight, eps)
+    mx.eval(
+        expected_residual,
+        expected_mlp_input,
+        actual_residual,
+        actual_mlp_input,
+        expected_output,
+        actual_output,
+    )
+
+    assert bool(mx.array_equal(actual_residual, expected_residual).item())
+    assert bool(mx.array_equal(actual_mlp_input, expected_mlp_input).item())
+    assert bool(mx.array_equal(actual_output, expected_output).item())
+
+
 def test_compiled_vision_rotary_matches_fp32_reference():
     q = mx.arange(48, dtype=mx.bfloat16).reshape(1, 2, 2, 12) / 48
     k = q + 0.25
@@ -177,6 +218,20 @@ def test_tiny_text_and_multimodal_forward():
     mx.eval(embeddings)
     assert embeddings.shape == (1, 3, 16)
     assert bool(mx.isfinite(embeddings).all().item())
+
+
+def test_raw_speculative_logits_preserve_greedy_choice():
+    mx.random.seed(3)
+    model = Model(tiny_config()).language_model
+    inputs = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    regular = model(inputs).logits
+    raw = model(inputs, skip_logit_transform=True).logits
+    mx.eval(regular, raw)
+
+    assert bool(
+        mx.array_equal(mx.argmax(regular, axis=-1), mx.argmax(raw, axis=-1)).item()
+    )
 
 
 def test_quantization_keeps_embedding_normalization_outside_embedding():

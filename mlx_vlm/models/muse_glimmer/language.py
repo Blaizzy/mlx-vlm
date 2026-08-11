@@ -14,14 +14,54 @@ from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
-@mx.compile
-def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
+def _centered_rms_norm_impl(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     dtype = x.dtype
     x = x.astype(mx.float32)
     variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
     x = x * mx.rsqrt(variance + eps)
     x = x * (1.0 + weight.astype(mx.float32))
     return x.astype(dtype)
+
+
+@mx.compile
+def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
+    return _centered_rms_norm_impl(x, weight, eps)
+
+
+@mx.compile
+def _prepare_mlp_input(
+    residual: mx.array,
+    attention_output: mx.array,
+    post_attention_weight: mx.array,
+    pre_feedforward_weight: mx.array,
+    post_attention_eps: float,
+    pre_feedforward_eps: float,
+) -> tuple[mx.array, mx.array]:
+    hidden_states = residual + _centered_rms_norm_impl(
+        attention_output,
+        post_attention_weight,
+        post_attention_eps,
+    )
+    mlp_input = _centered_rms_norm_impl(
+        hidden_states,
+        pre_feedforward_weight,
+        pre_feedforward_eps,
+    )
+    return hidden_states, mlp_input
+
+
+@mx.compile
+def _finish_mlp(
+    residual: mx.array,
+    mlp_output: mx.array,
+    post_feedforward_weight: mx.array,
+    post_feedforward_eps: float,
+) -> mx.array:
+    return residual + _centered_rms_norm_impl(
+        mlp_output,
+        post_feedforward_weight,
+        post_feedforward_eps,
+    )
 
 
 class RMSNormNoScale(nn.Module):
@@ -159,11 +199,20 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         residual = x
         x = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
-        x = residual + self.post_attention_layernorm(x)
-
-        residual = x
-        x = self.mlp(self.pre_feedforward_layernorm(x))
-        return residual + self.post_feedforward_layernorm(x)
+        residual, mlp_input = _prepare_mlp_input(
+            residual,
+            x,
+            self.post_attention_layernorm.weight,
+            self.pre_feedforward_layernorm.weight,
+            self.post_attention_layernorm.eps,
+            self.pre_feedforward_layernorm.eps,
+        )
+        return _finish_mlp(
+            residual,
+            self.mlp(mlp_input),
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+        )
 
 
 class TextModel(nn.Module):
@@ -217,6 +266,8 @@ class TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    supports_speculative_raw_logits = True
+
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -255,6 +306,7 @@ class LanguageModel(nn.Module):
         if inputs is None:
             inputs = kwargs.get("input_ids")
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        skip_logit_transform = bool(kwargs.pop("skip_logit_transform", False))
         hidden_sink: Optional[list[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )
@@ -265,9 +317,11 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
-        logits = self.lm_head(hidden_states) * self.output_multiplier
-        softcap = self.final_logit_softcapping
-        logits = mx.tanh(logits / softcap) * softcap
+        logits = self.lm_head(hidden_states)
+        if not skip_logit_transform:
+            logits = logits * self.output_multiplier
+            softcap = self.final_logit_softcapping
+            logits = mx.tanh(logits / softcap) * softcap
         return LanguageModelOutput(logits=logits, hidden_states=hidden_sink)
 
     def rollback_speculative_cache(

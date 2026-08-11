@@ -16,6 +16,7 @@ def _dflash_next_block_size(
     draft_model: nn.Module,
     requested_block_total: int,
     remaining_budget: int,
+    initial_block_size: Optional[int] = None,
 ) -> int:
     """Choose the next DFlash verify block size from recent acceptance.
 
@@ -38,6 +39,8 @@ def _dflash_next_block_size(
         if int(d) > 0
     ]
     if not recent:
+        if initial_block_size is not None:
+            return min(block_total, max(2, int(initial_block_size)))
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
@@ -83,6 +86,8 @@ def _dflash_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
+    greedy_sampling: bool = False,
+    use_model_initial_block_size: bool = True,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
 
@@ -100,6 +105,11 @@ def _dflash_rounds(
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_cache = draft_model.reset(model)
+    prepare_target_hidden = getattr(draft_model, "prepare_target_hidden", None)
+    hidden_is_prepared = callable(prepare_target_hidden)
+    if hidden_is_prepared:
+        hidden = prepare_target_hidden(hidden)
+        mx.async_eval(hidden)
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
@@ -109,12 +119,24 @@ def _dflash_rounds(
             draft_model,
             block_total,
             max_tokens - emitted + 1,
+            (
+                getattr(draft_model, "dflash_initial_block_size", None)
+                if use_model_initial_block_size
+                else None
+            ),
         )
         if bs <= 1:
             break
 
+        draft_kwargs = {"target_hidden_prepared": True} if hidden_is_prepared else {}
         draft_tokens = draft_model.draft_block(
-            b, hidden, draft_cache, bs, sampler, token_dtype
+            b,
+            hidden,
+            draft_cache,
+            bs,
+            sampler,
+            token_dtype,
+            **draft_kwargs,
         )
         mx.async_eval(draft_tokens)
 
@@ -123,11 +145,12 @@ def _dflash_rounds(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
+            verify_kwargs = {"capture_layer_ids": target_layer_ids}
+            if greedy_sampling and getattr(
+                lm, "supports_speculative_raw_logits", False
+            ):
+                verify_kwargs["skip_logit_transform"] = True
+            verify_out = lm(verify_input, cache=prompt_cache, **verify_kwargs)
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
         mx.async_eval(target_tokens, hidden)
@@ -137,13 +160,6 @@ def _dflash_rounds(
             draft_tokens, target_tokens, max_tokens - emitted
         )
         _record_speculative_round(draft_model, accepted, bs - 1)
-
-        # Emit
-        for tok in new_tokens:
-            yield tok, None
-            emitted += 1
-            if emitted >= max_tokens:
-                return
 
         if accepted < bs - 1:
             hidden = hidden[:, : accepted + 1, :]
@@ -155,8 +171,19 @@ def _dflash_rounds(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
 
+        if hidden_is_prepared and emitted + len(new_tokens) < max_tokens:
+            hidden = prepare_target_hidden(hidden)
+            mx.async_eval(hidden)
+
+        # Emit after scheduling the next context projection so its execution
+        # can overlap server-side detokenization and response handling.
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
         verify_out = None
-        mx.clear_cache()
 
 
 def _dflash_rounds_batch(
@@ -171,6 +198,7 @@ def _dflash_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    greedy_sampling: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -242,11 +270,12 @@ def _dflash_rounds_batch(
         # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_out = lm(
-                verify_input,
-                cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
-            )
+            verify_kwargs = {"capture_layer_ids": target_layer_ids}
+            if greedy_sampling and getattr(
+                lm, "supports_speculative_raw_logits", False
+            ):
+                verify_kwargs["skip_logit_transform"] = True
+            verify_out = lm(verify_input, cache=prompt_cache, **verify_kwargs)
             hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
         mx.async_eval(target_tokens, hidden_full)
@@ -313,5 +342,4 @@ def _dflash_rounds_batch(
             active_idx = [active_idx[j] for j in keep_slots]
 
         verify_out = None
-        mx.clear_cache()
         total_emitted = sum(emitted)
