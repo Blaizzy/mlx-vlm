@@ -12991,3 +12991,36 @@ class TestCohereCompass(unittest.TestCase):
         processor(text=["short", "longer"], padding=True)
 
         self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")
+
+
+class TestMinistral3Embedding(unittest.TestCase):
+    def test_ministral3_embedding_forward(self):
+        from mlx_vlm.models import ministral3_embedding
+
+        config = ministral3_embedding.ModelConfig(
+            model_type="ministral3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=99,
+            head_dim=8,
+            max_position_embeddings=64,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        model = ministral3_embedding.Model(config)
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
