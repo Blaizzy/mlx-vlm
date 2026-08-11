@@ -1,30 +1,35 @@
 import argparse
 import codecs
-import contextlib
 import json
 import logging
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
-from ..turboquant import TurboQuantKVCache, turboquant_enabled
 from ..utils import (
     StoppingCriteria,
     ThinkingBudgetCriteria,
     load,
     prepare_inputs,
     should_add_special_tokens,
+)
+from .common import (
+    DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_QUANTIZED_KV_START,
+    GenerationResult,
+    generation_stream,
+    wired_limit,
 )
 from .image import (
     DEFAULT_IMAGE_GUIDANCE,
@@ -49,13 +54,10 @@ DEFAULT_SEED = 0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_KV_GROUP_SIZE = 64
-DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
-DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
@@ -408,6 +410,32 @@ def parse_arguments():
         help="Number of bits to quantize the KV cache to.",
     )
     parser.add_argument(
+        "--kv-key-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant key bit-width (defaults to floor(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-key-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for keys only.",
+    )
+    parser.add_argument(
+        "--kv-value-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for values only.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -553,151 +581,6 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
-
-
-def maybe_quantize_kv_cache(
-    prompt_cache,
-    quantized_kv_start,
-    kv_group_size,
-    kv_bits,
-    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
-):
-    if kv_bits is None:
-        return
-
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
-
-        def quantize_entry(entry):
-            if isinstance(entry, TurboQuantKVCache):
-                return entry
-            if isinstance(entry, cache.RotatingKVCache):
-                return entry
-            if isinstance(entry, cache.KVCache):
-                if entry.offset == 0:
-                    # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
-                if entry.offset < quantized_kv_start:
-                    return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
-            if isinstance(entry, cache.CacheList):
-                entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
-                return entry
-            if isinstance(entry, list):
-                for i, sub_entry in enumerate(entry):
-                    entry[i] = quantize_entry(sub_entry)
-                return entry
-            if isinstance(entry, tuple):
-                return tuple(quantize_entry(sub_entry) for sub_entry in entry)
-            return entry
-
-        # Last-layer policy shared with _make_cache / APC warm restore.
-        n = len(prompt_cache)
-        for index, layer_cache in enumerate(prompt_cache):
-            if not cache.should_quantize_kv_layer(index, n):
-                continue
-            prompt_cache[index] = quantize_entry(layer_cache)
-        return
-
-    n = len(prompt_cache)
-    for index, layer_cache in enumerate(prompt_cache):
-        if not cache.should_quantize_kv_layer(index, n):
-            continue
-        if (
-            hasattr(layer_cache, "to_quantized")
-            and layer_cache.offset >= quantized_kv_start
-        ):
-            prompt_cache[index] = layer_cache.to_quantized(
-                group_size=kv_group_size,
-                bits=int(kv_bits),
-            )
-
-
-@contextlib.contextmanager
-def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
-    """
-    A context manager to temporarily change the wired limit.
-
-    Note, the wired limit should not be changed during an async eval.  If an
-    async eval could be running pass in the streams to synchronize with prior
-    to exiting the context manager.
-    """
-    if not mx.metal.is_available():
-        yield
-        return
-
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
-    )
-    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
-        )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
-
-
-@dataclass
-class GenerationResult:
-    text: str = ""
-    token: Optional[int] = None
-    logprobs: Optional[List[float]] = None
-    prompt_tokens: int = 0
-    generation_tokens: int = 0
-    total_tokens: int = 0
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    peak_memory: float = 0.0
-    cached_tokens: int = 0
-    # Populated only on the terminal chunk yielded by ``stream_generate``:
-    # ``"stop"`` for eos/stop-sequence, ``"length"`` for max_tokens.
-    finish_reason: Optional[str] = None
-
-
-class PromptCacheState:
-    """Holds KV cache and token history across conversation turns.
-
-    Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
-    reuse the KV cache from previous turns.  Only the new tokens (after
-    the common prefix) are processed, avoiding redundant prefill.
-    """
-
-    def __init__(self):
-        self.cache: Optional[List[Any]] = None
-        self.token_ids: Optional[List[int]] = None
-
-    def find_prefix_length(self, new_ids: list) -> int:
-        """Return the number of leading tokens that match the cached ids."""
-        if self.token_ids is None:
-            return 0
-        max_len = min(len(self.token_ids), len(new_ids))
-        for i in range(max_len):
-            if self.token_ids[i] != new_ids[i]:
-                return i
-        return max_len
-
-    def update(self, token_ids: list, kv_cache: list):
-        """Store the full token sequence and corresponding KV cache."""
-        self.token_ids = list(token_ids)
-        self.cache = kv_cache
-
-
-from .common import GenerationResult, generation_stream, wired_limit
 from .diffusion import (
     DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
@@ -1001,15 +884,17 @@ def stream_generate(
                     kwargs["prompt_cache"] = warm_cache
                 else:
                     apc_blocks_in_use = matched_blocks
-                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_policy = kv_quant_from_legacy(
+                        kwargs.get("kv_bits"),
+                        kwargs.get("kv_quant_scheme"),
+                        kwargs.get("kv_group_size", 64),
+                        kwargs.get("kv_key_bits"),
+                        kwargs.get("kv_value_bits"),
+                        kwargs.get("kv_key_scheme"),
+                        kwargs.get("kv_value_scheme"),
+                    )
                     _quant_cfg = (
-                        {
-                            "bits": _kv_bits,
-                            "group_size": kwargs.get("kv_group_size", 64),
-                            "scheme": kwargs.get("kv_quant_scheme"),
-                        }
-                        if _kv_bits is not None
-                        else None
+                        _quant_policy.to_config() if _quant_policy is not None else None
                     )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
@@ -1586,6 +1471,10 @@ def main():
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
+            "kv_key_bits": getattr(args, "kv_key_bits", None),
+            "kv_value_bits": getattr(args, "kv_value_bits", None),
+            "kv_key_scheme": getattr(args, "kv_key_scheme", None),
+            "kv_value_scheme": getattr(args, "kv_value_scheme", None),
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
