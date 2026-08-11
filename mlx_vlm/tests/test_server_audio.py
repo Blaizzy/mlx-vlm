@@ -205,140 +205,22 @@ def test_audio_transcriptions_accepts_repeated_hotwords(client, monkeypatch):
     assert fake_model.calls[0]["hotwords"] == ["MLX", "Apple Silicon"]
 
 
-def test_stt_prompt_routes_to_explicit_backend_parameter():
-    def qwen_generate(path, *, system_prompt=None, **kwargs):
-        pass
-
-    def whisper_generate(path, *, initial_prompt=None, **kwargs):
-        pass
-
-    def moss_generate(path, *, prompt=None, **kwargs):
-        pass
-
-    def vibevoice_generate(path, *, context=None, **kwargs):
-        pass
-
-    for generate, expected_parameter in (
-        (qwen_generate, "system_prompt"),
-        (whisper_generate, "initial_prompt"),
-        (moss_generate, "prompt"),
-        (vibevoice_generate, "context"),
-    ):
-        kwargs = server_audio._build_stt_generate_kwargs(
-            SimpleNamespace(generate=generate),
-            server_audio.AudioTranscriptionRequest(
-                model="fake-stt", prompt="Prefer the spelling Nativ"
-            ),
-            translate=False,
-        )
-
-        assert kwargs[expected_parameter] == "Prefer the spelling Nativ"
-        vocabulary_parameters = {
-            "prompt",
-            "context",
-            "system_prompt",
-            "initial_prompt",
-        }
-        assert not (vocabulary_parameters - {expected_parameter}) & kwargs.keys()
-
-
-def test_stt_hotwords_route_to_explicit_backend_capability():
-    def funasr_generate(path, *, hotwords=None, context=None, **kwargs):
-        pass
-
-    def qwen_generate(path, *, system_prompt=None, **kwargs):
-        pass
-
-    def whisper_generate(path, *, initial_prompt=None, **kwargs):
-        pass
-
-    def moss_generate(path, *, prompt=None, **kwargs):
-        pass
-
-    def vibevoice_generate(path, *, context=None, **kwargs):
-        pass
-
-    request = server_audio.AudioTranscriptionRequest(
-        model="fake-stt", hotwords=["MLX", "Apple Silicon"]
-    )
-
-    funasr_kwargs = server_audio._build_stt_generate_kwargs(
-        SimpleNamespace(generate=funasr_generate), request, translate=False
-    )
-    assert funasr_kwargs["hotwords"] == ["MLX", "Apple Silicon"]
-    for generate, expected_parameter in (
-        (qwen_generate, "system_prompt"),
-        (whisper_generate, "initial_prompt"),
-        (moss_generate, "prompt"),
-        (vibevoice_generate, "context"),
-    ):
-        kwargs = server_audio._build_stt_generate_kwargs(
-            SimpleNamespace(generate=generate), request, translate=False
-        )
-
-        assert kwargs[expected_parameter] == "Preferred vocabulary: MLX, Apple Silicon"
-        assert "hotwords" not in kwargs
-
-
-@pytest.mark.parametrize(
-    "vocabulary",
-    (
-        {"prompt": "Prefer the spelling Nativ"},
-        {"context": "Nativ product names"},
-        {"hotwords": ["Nativ"]},
-    ),
-)
-def test_stt_vocabulary_rejects_kwargs_only_backend(vocabulary):
-    def generate(path, **kwargs):
-        pass
-
-    with pytest.raises(HTTPException) as exc_info:
-        server_audio._build_stt_generate_kwargs(
-            SimpleNamespace(generate=generate),
-            server_audio.AudioTranscriptionRequest(model="fake-stt", **vocabulary),
-            translate=False,
-        )
-
-    assert exc_info.value.status_code == 400
-    assert "does not explicitly support transcription vocabulary" in str(
-        exc_info.value.detail
-    )
-
-
-def test_stt_vocabulary_rejects_ambiguous_inputs():
+def test_stt_forwards_context_and_hotwords_when_backend_accepts_both():
     def generate(path, *, hotwords=None, context=None, **kwargs):
-        pass
-
-    with pytest.raises(HTTPException) as exc_info:
-        server_audio._build_stt_generate_kwargs(
-            SimpleNamespace(generate=generate),
-            server_audio.AudioTranscriptionRequest(
-                model="fake-stt",
-                context="Product names",
-                hotwords=["Nativ"],
-            ),
-            translate=False,
-        )
-
-    assert exc_info.value.status_code == 400
-    assert "only one of prompt, context, or hotwords" in str(exc_info.value.detail)
-
-
-def test_stt_prompt_does_not_override_explicit_text():
-    def generate(path, *, text=None):
         pass
 
     kwargs = server_audio._build_stt_generate_kwargs(
         SimpleNamespace(generate=generate),
         server_audio.AudioTranscriptionRequest(
-            model="fake-aligner",
-            prompt="Portable hint",
-            text="Exact alignment transcript",
+            model="fake-stt",
+            context="Product names",
+            hotwords=["Nativ"],
         ),
         translate=False,
     )
 
-    assert kwargs["text"] == "Exact alignment transcript"
+    assert kwargs["context"] == "Product names"
+    assert kwargs["hotwords"] == ["Nativ"]
 
 
 def test_audio_transcriptions_text_response_format(client, monkeypatch):

@@ -563,12 +563,16 @@ def _build_stt_generate_kwargs(
     translate: bool,
 ) -> Dict[str, Any]:
     kwargs = request.model_dump(
-        exclude={"model", "response_format", "prompt", "context", "hotwords"},
-        exclude_none=True,
+        exclude={"model", "response_format", "prompt"}, exclude_none=True
     )
+    prompt = request.prompt
     accepted = _callable_parameters(model.generate)
-    for name, value in _build_stt_vocabulary_kwargs(accepted, request).items():
-        kwargs.setdefault(name, value)
+
+    if prompt:
+        if _accepts_parameter(accepted, "context"):
+            kwargs.setdefault("context", prompt)
+        elif _accepts_parameter(accepted, "text"):
+            kwargs.setdefault("text", prompt)
 
     if translate:
         if _accepts_parameter(accepted, "task"):
@@ -585,64 +589,6 @@ def _build_stt_generate_kwargs(
         model.generate,
         kwargs,
         extra_allowed={"word_timestamps", "timestamp_granularities"},
-    )
-
-
-def _build_stt_vocabulary_kwargs(
-    accepted,
-    request: AudioTranscriptionRequest,
-) -> Dict[str, Any]:
-    hotwords = [word.strip() for word in request.hotwords or [] if word.strip()]
-    supplied = sum(bool(value) for value in (request.prompt, request.context, hotwords))
-    if supplied > 1:
-        raise HTTPException(
-            status_code=400,
-            detail="Pass only one of prompt, context, or hotwords.",
-        )
-
-    if hotwords:
-        if _explicitly_accepts_parameter(accepted, "hotwords"):
-            return {"hotwords": hotwords}
-        return _route_stt_prompt(
-            accepted,
-            f"Preferred vocabulary: {', '.join(hotwords)}",
-        )
-
-    if request.context:
-        if _explicitly_accepts_parameter(accepted, "context"):
-            return {"context": request.context}
-        raise _unsupported_stt_vocabulary()
-
-    if request.prompt:
-        return _route_stt_prompt(accepted, request.prompt)
-
-    return {}
-
-
-def _route_stt_prompt(accepted, prompt: str) -> Dict[str, str]:
-    for parameter in (
-        "system_prompt",
-        "initial_prompt",
-        "prompt",
-        "context",
-        "text",
-    ):
-        if _explicitly_accepts_parameter(accepted, parameter):
-            return {parameter: prompt}
-    raise _unsupported_stt_vocabulary()
-
-
-def _explicitly_accepts_parameter(accepted, name: str) -> bool:
-    return accepted is not None and name in accepted.get("params", set())
-
-
-def _unsupported_stt_vocabulary() -> HTTPException:
-    return HTTPException(
-        status_code=400,
-        detail=(
-            "Selected model does not explicitly support transcription vocabulary "
-            "through prompt, context, or hotwords."
-        ),
     )
 
 
