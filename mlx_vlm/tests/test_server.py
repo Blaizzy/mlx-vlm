@@ -6396,6 +6396,29 @@ class TestSplitThinking:
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
 
+    def test_last_chunk_releases_text_held_for_an_unfinished_marker(self):
+        state = server.ThinkingStreamState()
+
+        assert state.feed("hello <").content == "hello "
+        assert state.feed("", last=True).content == "<"
+
+    def test_last_chunk_releases_reasoning_held_for_an_unfinished_marker(self):
+        state = server.ThinkingStreamState()
+
+        state.feed("<think>")
+        assert state.feed("cut off </thi", last=True).reasoning == "cut off </thi"
+
+    def test_last_chunk_does_not_disturb_a_complete_stream(self):
+        state = server.ThinkingStreamState()
+        reasoning, content = "", ""
+
+        for chunk in ("<think>", "why", "</think>", "answer"):
+            delta = state.feed(chunk, last=chunk == "answer")
+            reasoning += delta.reasoning or ""
+            content += delta.content or ""
+
+        assert (reasoning, content) == ("why", "answer")
+
     def test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking(self):
         assert server.prompt_has_open_thinking("prompt", enable_thinking=True) is False
         assert (
