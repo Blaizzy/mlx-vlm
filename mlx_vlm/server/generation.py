@@ -1709,7 +1709,7 @@ class ResponseGenerator:
                                 "Generation cancelled: request=%s generated_tokens=%d",
                                 info.get("request_id", uid),
                                 int(info.get("generated_tokens", 0) or 0),
-                            )
+   )
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
@@ -2030,6 +2030,34 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or make_sampler(temp=0)
 
+                # --- APC exact-mode lookup for speculative prefill ---
+                cached_prefix_lens = []
+                if self.apc_manager is not None:
+                    for j, ids_list in enumerate(all_input_ids):
+                        if not ids_list:
+                            cached_prefix_lens.append(0)
+                            continue
+                        pk = prompt_kwargs_list[j] if j < len(prompt_kwargs_list) else {}
+                        extra_hash = pk.get("_apc_image_hash", 0) or 0
+                        cached_cache, prefix_len = self.apc_manager.lookup_exact_cache(
+                            ids_list, extra_hash=extra_hash
+                        )
+                        cached_prefix_lens.append(prefix_len)
+                        logger.info(
+                             "APC lookup: request=%s ids_len=%d extra_hash=%d prefix_len=%d cached=%s",
+                             stream_infos[uids[j]].get("request_id", uids[j]),
+                             len(ids_list),
+                             extra_hash,
+                             prefix_len,
+                             cached_cache is not None,
+                        )
+                        if cached_cache is not None and prefix_len > 0:
+                            logger.info(
+                                "APC exact hit: request=%s prefix_len=%d",
+                                stream_infos[uids[j]].get("request_id", uids[j]),
+                                prefix_len,
+                            )
+
                 B = len(uids)
                 max_len = max(len(ids) for ids in all_input_ids)
                 left_padding = [max_len - len(ids) for ids in all_input_ids]
@@ -2042,12 +2070,19 @@ class ResponseGenerator:
                     prompt_kwargs_list, all_input_ids
                 )
 
+                # Override make_cache to close over kv params (matching _run path)
+                _kv_make_cache = lambda lm, lp: _make_cache(
+                    lm, lp, kv_bits=self.kv_bits, kv_group_size=self.kv_group_size,
+                    kv_quant_scheme=self.kv_quant_scheme,
+                    quantized_kv_start=self.quantized_kv_start,
+                )
+
                 prompt_cache = make_speculative_prompt_cache(
                     lm,
                     draft_kind=draft_kind,
                     batch_size=B,
                     left_padding=left_padding,
-                    make_cache=_make_cache,
+                    make_cache=_kv_make_cache,
                 )
 
                 prefill_step_size = get_prefill_step_size()
@@ -2074,6 +2109,20 @@ class ResponseGenerator:
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
                 )
+                # --- APC exact-mode store for speculative prefill ---
+                if self.apc_manager is not None:
+                    for j, ids_list in enumerate(all_input_ids):
+                        if not ids_list:
+                            continue
+                        pk = prompt_kwargs_list[j] if j < len(prompt_kwargs_list) else {}
+                        extra_hash = pk.get("_apc_image_hash", 0) or 0
+                        row_snapshot = _apc.snapshot_prompt_cache_row(
+                            prompt_cache, batch_idx=j
+                        )
+                        if row_snapshot is not None and ids_list:
+                            self.apc_manager.store_exact_cache(
+                                ids_list, row_snapshot, extra_hash=extra_hash
+   )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B
@@ -2211,11 +2260,11 @@ class ResponseGenerator:
                                 peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                                 prompt_tps=prompt_tps_map.get(uid),
                                 emitted_at=emitted_at,
-                                draft_kind=draft_kind if finish else None,
-                                draft_rounds=rounds,
-                                draft_n_accepted=accepted,
-                                draft_n=drafted,
-                            )
+                                 draft_kind=draft_kind if finish else None,
+                                 draft_rounds=rounds,
+                                 draft_n_accepted=accepted,
+                                 draft_n=drafted,
+                             )
                         )
 
                         if finish is not None:
@@ -2262,11 +2311,11 @@ class ResponseGenerator:
                                 prompt_tps=prompt_tps_map.get(uid),
                                 token_count=0,
                                 emitted_at=emitted_at,
-                                draft_kind=(draft_kind if rounds is not None else None),
-                                draft_rounds=rounds,
-                                draft_n_accepted=accepted,
-                                draft_n=drafted,
-                            )
+                                 draft_kind=(draft_kind if rounds is not None else None),
+                                 draft_rounds=rounds,
+                                 draft_n_accepted=accepted,
+                                 draft_n=drafted,
+                             )
                         )
                         rqueues[uid].put(None)
 

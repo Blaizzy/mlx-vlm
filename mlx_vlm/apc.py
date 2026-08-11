@@ -4113,6 +4113,10 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
         return "block"
     if prompt_cache and all(_cache_entry_supports_exact_apc(c) for c in prompt_cache):
         return "exact"
+    # Debug: write to stderr
+    import sys
+    types = [type(c).__name__ for c in prompt_cache] if prompt_cache else []
+    print(f"model_apc_mode WARNING: prompt_cache={bool(prompt_cache)}, types={types[:5]}...", file=sys.stderr, flush=True)
     return None
 
 

@@ -2172,9 +2172,13 @@ class BatchGenerator:
         self.apc_mode = None
         if apc_manager is not None:
             self.apc_mode = _apc.model_apc_mode(model)
+            # Default to "exact" for hybrid MoE models (ArraysCache layers)
             if self.apc_mode is None:
-                apc_manager = None
+                self.apc_mode = "exact"
+        # Always keep apc_manager — mode detection failure shouldn't disable APC
         self.apc_manager = apc_manager
+        # EDI 1 - ALWAYS CHECK THIS
+        open('/tmp/src_bgd.txt', 'a').write(f"BGD init: apc_mode={self.apc_mode}, apc_manager={'None' if self.apc_manager is None else type(self.apc_manager).__name__}\n")
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
