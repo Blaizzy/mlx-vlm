@@ -471,6 +471,8 @@ mlx_vlm.server --api-key <secret-token>
 - `--thinking-end-token`: Default token that closes a thinking block (`--thinking-eos-token` is also accepted)
 - `--kv-bits`: Number of bits for KV cache quantization (e.g. `8` for uniform, `3.5` for TurboQuant)
 - `--kv-quant-scheme`: KV cache quantization backend (`uniform` or `turboquant`)
+- `--kv-key-bits` / `--kv-value-bits`: Override the bit-width for keys or values individually (see [Per-tensor KV quantization](#per-tensor-kv-quantization))
+- `--kv-key-scheme` / `--kv-value-scheme`: Override the quantization backend for keys or values individually
 - `--kv-group-size`: Group size for uniform KV cache quantization (default: `64`)
 - `--max-kv-size`: Maximum KV cache size in tokens
 - `--vision-cache-size`: Max number of cached vision features (default: `20`)
@@ -873,6 +875,33 @@ mlx_vlm.server --model google/gemma-4-26b-a4b-it --kv-bits 3.5 --kv-quant-scheme
 ```
 
 Full-attention layers use quantized batch caches while sliding-window layers keep their fixed-size rotating caches. The last full-attention layer stays unquantized (sensitive in deep models).
+
+##### Per-tensor KV quantization
+
+Keys and values do not have to share a bit-width or a backend. A fractional `--kv-bits` already splits the budget — `3.5` gives 3-bit keys and 4-bit values — and `--kv-key-bits` / `--kv-value-bits` override either side:
+
+```sh
+# 8-bit keys, 3-bit values, both TurboQuant
+mlx_vlm.generate --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --kv-bits 3.5 --kv-quant-scheme turboquant \
+  --kv-key-bits 8 --kv-value-bits 3
+```
+
+`--kv-key-scheme` / `--kv-value-scheme` go further and select a different backend per tensor, which builds a hybrid cache:
+
+```sh
+# uniform 8-bit keys beside TurboQuant 3-bit values
+mlx_vlm.generate --model mlx-community/Qwen3.5-9B-MLX-4bit \
+  --kv-bits 8 --kv-quant-scheme uniform \
+  --kv-value-bits 3 --kv-value-scheme turboquant
+```
+
+Two limitations apply to mixed *schemes* specifically:
+
+- The hybrid cache dequantizes on every step instead of using a fused kernel, so it is slower than either homogeneous path.
+- Mixed schemes are not supported during continuous batching or for batch prefix caches, and raise `NotImplementedError` there. Mixed bit-widths under a single scheme work everywhere.
+
+Note that values are given the extra bit by default for a reason: value error passes straight through the attention output, whereas key error is partly reabsorbed by the softmax. Measured on Qwen3.5, spending an equal budget key-heavy was consistently worse than value-heavy, so prefer measuring before overriding.
 
 Tested with gemma-4-26b-a4b-it at 20K context:
 
