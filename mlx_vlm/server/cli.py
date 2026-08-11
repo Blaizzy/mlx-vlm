@@ -265,7 +265,7 @@ def main():
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.max_num_seqs is not None:
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
-    if args.prefill_step_size:
+    if args.prefill_step_size is not None:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)

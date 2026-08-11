@@ -550,7 +550,7 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
     if (
         x.ndim != 3
         or x.shape[1] != 1
-        or len(linears) != 4
+        or len(linears) < 3
         or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
     ):
         return None
@@ -597,6 +597,139 @@ def _decode_quantized_linears_fused(linears, x: mx.array):
         mode=first.mode,
     )
     return tuple(mx.split(output, split_indices, axis=-1))
+
+
+def _decode_quantized_qkv_fused(
+    linears,
+    x: mx.array,
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    rotary_emb,
+    cache,
+    position_ids,
+    position_embeddings,
+    num_attention_heads: int,
+    num_key_value_heads: int,
+    head_dim: int,
+):
+    """Fused QKV projection + RMSNorm + RoPE for decode (single token).
+
+    Combines q_proj, k_proj, v_proj quantized matmuls into a single operation,
+    applies RMSNorm inline to q and k, and applies RoPE inline. Returns
+    (queries, keys, values, gate, position_ids) ready for attention.
+
+    Only activates when x.shape[1] == 1 (decode phase) and all linears are
+    compatible QuantizedLinear layers.
+    """
+    if (
+        x.ndim != 3
+        or x.shape[1] != 1
+        or len(linears) != 3
+        or not all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
+    ):
+        return None
+
+    q_linear, k_linear, v_linear = linears
+
+    # Check compatibility
+    first = q_linear
+    if not all(
+        linear.bits == first.bits
+        and linear.group_size == first.group_size
+        and linear.mode == first.mode
+        and linear.biases is not None
+        and linear.scales.dtype == x.dtype
+        and linear.biases.dtype == x.dtype
+        and "bias" not in linear
+        for linear in linears
+    ):
+        return None
+
+    # Compute output dimensions
+    q_out_dim = q_linear.weight.shape[0]
+    k_out_dim = k_linear.weight.shape[0]
+    v_out_dim = v_linear.weight.shape[0]
+
+    # Check cache
+    cache_key = tuple(
+        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
+    )
+    cached = getattr(q_linear, "_qwen3_5_fused_qkv", None)
+    if cached is None or cached[0] != cache_key:
+        weights = mx.concatenate([q_linear.weight, k_linear.weight, v_linear.weight], axis=0)
+        scales = mx.concatenate([q_linear.scales, k_linear.scales, v_linear.scales], axis=0)
+        biases = mx.concatenate([q_linear.biases, k_linear.biases, v_linear.biases], axis=0)
+        split_indices = [q_out_dim, q_out_dim + k_out_dim]
+        mx.eval(weights, scales, biases)
+        cached = (cache_key, weights, scales, biases, split_indices)
+        q_linear._qwen3_5_fused_qkv = cached
+
+    _, weights, scales, biases, split_indices = cached
+
+    # Single quantized matmul for all 3 projections
+    output = mx.quantized_matmul(
+        x,
+        weights,
+        scales=scales,
+        biases=biases,
+        transpose=True,
+        group_size=first.group_size,
+        bits=first.bits,
+        mode=first.mode,
+    )
+
+    # Split into q_proj_output, keys, values
+    parts = mx.split(output, split_indices, axis=-1)
+    q_proj_output = parts[0]
+    keys = parts[1]
+    values = parts[2]
+
+    B, L, D = x.shape[0], x.shape[1], x.shape[2]
+
+    # Split q_proj_output into queries and gate (gated attention)
+    queries, gate = mx.split(
+        q_proj_output.reshape(B, L, num_attention_heads, -1), 2, axis=-1
+    )
+    gate = gate.reshape(B, L, -1)
+
+    # Apply RMSNorm inline
+    queries = q_norm(queries).transpose(0, 2, 1, 3)
+    keys = k_norm(keys.reshape(B, L, num_key_value_heads, -1)).transpose(0, 2, 1, 3)
+    values = values.reshape(B, L, num_key_value_heads, -1).transpose(0, 2, 1, 3)
+
+    # Compute position_ids if not provided (needed for RoPE)
+    kv_seq_len = keys.shape[-2]
+    if position_ids is None and position_embeddings is None:
+        cache_offset = cache.offset
+        if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
+            offsets = mx.maximum(cache_offset[:B], 0)
+            kv_seq_len = kv_seq_len + offsets + 1
+            position_ids = offsets[:, None] + mx.arange(L)[None, :]
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+        else:
+            if isinstance(cache_offset, mx.array):
+                cache_offset = int(cache_offset.item())
+            kv_seq_len += cache_offset + 1
+            position_ids = mx.arange(cache_offset, cache_offset + L)
+            position_ids = mx.expand_dims(position_ids, axis=0)
+            position_ids = mx.tile(position_ids, (3, 1, 1))
+    else:
+        kv_seq_len += cache.offset + 1 if cache is not None else 0
+
+    # Apply RoPE inline
+    if position_embeddings is None:
+        queries, keys = rotary_emb.apply_rotary(
+            queries,
+            keys,
+            position_ids,
+            unsqueeze_dim=1,
+        )
+    else:
+        cos, sin = position_embeddings
+        queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
+
+    return queries, keys, values, gate, kv_seq_len, position_ids
 
 
 def _pad_token_mask_to_head(token_mask: mx.array, n_size: int) -> mx.array:
@@ -1563,52 +1696,72 @@ class Qwen3_5Attention(nn.Module):
         target_verify: bool = False,
     ) -> mx.array:
         B, L, D = x.shape
-        q_proj_output, keys, values = _target_verify_linears(
-            (self.q_proj, self.k_proj, self.v_proj), x, target_verify
-        )
-        queries, gate = mx.split(
-            q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
-        )
-        gate = gate.reshape(B, L, -1)
 
-        queries = self.q_norm(queries).transpose(0, 2, 1, 3)
-        keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
-            0, 2, 1, 3
-        )
-
-        kv_seq_len = keys.shape[-2]
-
-        if position_ids is None:
-            cache_offset = cache.offset
-            if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
-                offsets = mx.maximum(cache_offset[:B], 0)
-                kv_seq_len = kv_seq_len + offsets + 1
-                position_ids = offsets[:, None] + mx.arange(L)[None, :]
-                position_ids = mx.expand_dims(position_ids, axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-            else:
-                if isinstance(cache_offset, mx.array):
-                    cache_offset = int(cache_offset.item())
-                kv_seq_len += cache_offset + 1
-                position_ids = mx.arange(cache_offset, cache_offset + L)
-                position_ids = mx.expand_dims(position_ids, axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
-        else:
-            kv_seq_len += cache.offset + 1 if cache is not None else 0
-
-        if position_embeddings is None:
-            queries, keys = self.rotary_emb.apply_rotary(
-                queries,
-                keys,
+        # Try fused QKV + RMSNorm + RoPE during decode phase (single token)
+        if L == 1 and not target_verify:
+            fused_result = _decode_quantized_qkv_fused(
+                (self.q_proj, self.k_proj, self.v_proj),
+                x,
+                self.q_norm,
+                self.k_norm,
+                self.rotary_emb,
+                cache,
                 position_ids,
-                unsqueeze_dim=1,
+                position_embeddings,
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.head_dim,
             )
+            if fused_result is not None:
+                queries, keys, values, gate, kv_seq_len, position_ids = fused_result
         else:
-            cos, sin = position_embeddings
-            queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
+            # Original path for prefix / target_verify / non-quantized
+            q_proj_output, keys, values = _target_verify_linears(
+                (self.q_proj, self.k_proj, self.v_proj), x, target_verify
+            )
+            queries, gate = mx.split(
+                q_proj_output.reshape(B, L, self.num_attention_heads, -1), 2, axis=-1
+            )
+            gate = gate.reshape(B, L, -1)
+
+            queries = self.q_norm(queries).transpose(0, 2, 1, 3)
+            keys = self.k_norm(keys.reshape(B, L, self.num_key_value_heads, -1)).transpose(
+                0, 2, 1, 3
+            )
+            values = values.reshape(B, L, self.num_key_value_heads, -1).transpose(
+                0, 2, 1, 3
+            )
+
+            kv_seq_len = keys.shape[-2]
+
+            if position_ids is None:
+                cache_offset = cache.offset
+                if isinstance(cache_offset, mx.array) and cache_offset.ndim > 0:
+                    offsets = mx.maximum(cache_offset[:B], 0)
+                    kv_seq_len = kv_seq_len + offsets + 1
+                    position_ids = offsets[:, None] + mx.arange(L)[None, :]
+                    position_ids = mx.expand_dims(position_ids, axis=0)
+                    position_ids = mx.tile(position_ids, (3, 1, 1))
+                else:
+                    if isinstance(cache_offset, mx.array):
+                        cache_offset = int(cache_offset.item())
+                    kv_seq_len += cache_offset + 1
+                    position_ids = mx.arange(cache_offset, cache_offset + L)
+                    position_ids = mx.expand_dims(position_ids, axis=0)
+                    position_ids = mx.tile(position_ids, (3, 1, 1))
+            else:
+                kv_seq_len += cache.offset + 1 if cache is not None else 0
+
+            if position_embeddings is None:
+                queries, keys = self.rotary_emb.apply_rotary(
+                    queries,
+                    keys,
+                    position_ids,
+                    unsqueeze_dim=1,
+                )
+            else:
+                cos, sin = position_embeddings
+                queries, keys = apply_multimodal_rotary_pos_emb(queries, keys, cos, sin)
 
         if mask is not None and isinstance(mask, mx.array):
             if (
@@ -1814,6 +1967,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
+        # Single-token decode optimization: always use Metal kernel for
+        # inference (not just when use_kernel=True) to avoid Python overhead
+        use_gdn_kernel = not self.training
         initial_state = state
         if gdn_sink is not None:
             out, state, intermediate_states = _gated_delta_update_verify_decode(
@@ -1826,7 +1982,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.dt_bias,
                 state,
                 mask,
-                use_kernel=not self.training,
+                use_kernel=use_gdn_kernel,
             )
         else:
             out, state = gated_delta_update(
@@ -1839,7 +1995,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.dt_bias,
                 state,
                 mask,
-                use_kernel=not self.training,
+                use_kernel=use_gdn_kernel,
             )
             intermediate_states = None
 
@@ -2166,7 +2322,7 @@ class LanguageModel(nn.Module):
             return valid_ends_mx
 
         def _is_ssm_cache(c):
-            return not c.is_trimmable() and not hasattr(c, "zero_row_tail")
+            return not hasattr(c, "keys")
 
         ssm_caches = []
         for c in caches:
