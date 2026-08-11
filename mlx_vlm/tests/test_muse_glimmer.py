@@ -1,17 +1,23 @@
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+import pytest
 from PIL import Image
 
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, RMSNormNoScale
+from mlx_vlm.models.muse_glimmer.language import (
+    CenteredRMSNorm,
+    LanguageModel,
+    RMSNormNoScale,
+)
 from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
     smart_resize,
 )
 from mlx_vlm.models.muse_glimmer.vision import _window_index, apply_rotary, rotate_half
+from mlx_vlm.models.target_verify import exact_quantized_linear
 
 
 def tiny_config():
@@ -210,6 +216,80 @@ def test_quantization_keeps_embedding_normalization_outside_embedding():
 
     np.testing.assert_allclose(multimodal_path, normalized, rtol=1e-5, atol=1e-7)
     np.testing.assert_allclose(direct_path, embedded_path, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_exact_affine_qmv_matches_single_token_decode(bits):
+    mx.random.seed(4)
+    linear = nn.QuantizedLinear(512, 16, group_size=32, bits=bits, bias=False)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    inputs = mx.random.normal((2, 3, 512)).astype(mx.bfloat16)
+
+    expected = mx.concatenate(
+        [linear(inputs[:, index : index + 1]) for index in range(inputs.shape[1])],
+        axis=1,
+    )
+    actual = exact_quantized_linear(linear, inputs)
+    assert actual is not None
+    mx.eval(expected, actual)
+
+    assert bool(mx.array_equal(actual, expected).item())
+
+
+def test_quantized_target_verify_matches_single_token_decode():
+    config = tiny_config().text_config
+    config.hidden_size = 32
+    config.intermediate_size = 64
+    config.head_dim = 8
+    model = LanguageModel(config)
+    model.set_dtype(mx.bfloat16)
+    nn.quantize(
+        model,
+        group_size=32,
+        bits=4,
+        class_predicate=lambda _, module: (
+            isinstance(module, nn.Linear) and module.weight.shape[-1] % 32 == 0
+        ),
+    )
+
+    block_cache = model.make_cache()
+    token_cache = model.make_cache()
+    # Fill the sliding cache so verification also covers its rotating layout.
+    prefix = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=mx.int32)
+    mx.eval(model(prefix, cache=block_cache).logits)
+    mx.eval(model(prefix, cache=token_cache).logits)
+
+    verify_ids = mx.array([[9, 10, 11]], dtype=mx.int32)
+    block = model(
+        verify_ids,
+        cache=block_cache,
+        capture_layer_ids=[0, 1],
+        target_verify=True,
+    )
+    token_outputs = [
+        model(
+            verify_ids[:, index : index + 1],
+            cache=token_cache,
+            capture_layer_ids=[0, 1],
+        )
+        for index in range(verify_ids.shape[1])
+    ]
+    token_logits = mx.concatenate([output.logits for output in token_outputs], axis=1)
+    token_hidden = [
+        mx.concatenate(
+            [output.hidden_states[layer] for output in token_outputs], axis=1
+        )
+        for layer in range(2)
+    ]
+    mx.eval(block.logits, token_logits, block.hidden_states, token_hidden)
+
+    assert bool(mx.array_equal(block.logits, token_logits).item())
+    assert all(
+        bool(mx.array_equal(actual, expected).item())
+        for actual, expected in zip(block.hidden_states, token_hidden)
+    )
 
 
 def test_cache_matches_layer_attention_type():

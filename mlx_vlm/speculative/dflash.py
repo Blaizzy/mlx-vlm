@@ -16,6 +16,9 @@ def _dflash_next_block_size(
     draft_model: nn.Module,
     requested_block_total: int,
     remaining_budget: int,
+    *,
+    initial_block_total: Optional[int] = None,
+    minimum_block_total: int = 4,
 ) -> int:
     """Choose the next DFlash verify block size from recent acceptance.
 
@@ -38,10 +41,12 @@ def _dflash_next_block_size(
         if int(d) > 0
     ]
     if not recent:
+        if initial_block_total is not None:
+            return min(block_total, max(2, int(initial_block_total)))
         return block_total
 
     current = min(block_total, max(2, recent[-1][1] + 1))
-    min_total = min(block_total, 4)
+    min_total = min(block_total, max(2, int(minimum_block_total)))
     drafted = sum(d for _, d in recent)
     accepted = sum(a for a, _ in recent)
     accept_rate = accepted / drafted
@@ -100,6 +105,13 @@ def _dflash_rounds(
     target_layer_ids = list(draft_model.config.target_layer_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     draft_cache = draft_model.reset(model)
+    exact_quantized_verify = (
+        draft_block_size is None
+        and getattr(lm, "supports_speculative_target_verify", False)
+        and isinstance(getattr(lm, "lm_head", None), nn.QuantizedLinear)
+        and getattr(lm.lm_head, "bits", None) in (4, 5)
+        and getattr(lm.lm_head, "mode", None) == "affine"
+    )
 
     b = first_bonus
     emitted = 1  # the first bonus has already been yielded by the caller
@@ -109,6 +121,8 @@ def _dflash_rounds(
             draft_model,
             block_total,
             max_tokens - emitted + 1,
+            initial_block_total=3 if exact_quantized_verify else None,
+            minimum_block_total=3 if exact_quantized_verify else 4,
         )
         if bs <= 1:
             break
@@ -123,10 +137,13 @@ def _dflash_rounds(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
+            verify_kwargs = {"capture_layer_ids": target_layer_ids}
+            if getattr(lm, "supports_speculative_target_verify", False):
+                verify_kwargs["target_verify"] = True
             verify_out = lm(
                 verify_input,
                 cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
+                **verify_kwargs,
             )
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
@@ -242,10 +259,13 @@ def _dflash_rounds_batch(
         # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+            verify_kwargs = {"capture_layer_ids": target_layer_ids}
+            if getattr(lm, "supports_speculative_target_verify", False):
+                verify_kwargs["target_verify"] = True
             verify_out = lm(
                 verify_input,
                 cache=prompt_cache,
-                capture_layer_ids=target_layer_ids,
+                **verify_kwargs,
             )
             hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
