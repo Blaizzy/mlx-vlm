@@ -23,6 +23,7 @@ import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
+from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
@@ -638,6 +639,7 @@ def _unstarted_response_generator():
     gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
     gen.top_logprobs_k = 0
     gen.apc_manager = None
+    gen.apc_mode = None
     gen.tokenizer = None
     gen.requests = Queue()
     gen._stop = False
@@ -682,6 +684,30 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.processor is processor
     assert gen.draft_model is None
     assert gen.draft_kind is None
+
+
+def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[])
+    language_model = SimpleNamespace()
+    model = SimpleNamespace(language_model=language_model)
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    gen = _unstarted_response_generator()
+    gen.apc_manager = object()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+    apc_mode = MagicMock(return_value="exact")
+    monkeypatch.setattr(apc_module, "model_apc_mode", apc_mode)
+
+    gen._initialize_model()
+
+    assert gen.apc_mode == "exact"
+    apc_mode.assert_called_once_with(language_model)
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
@@ -745,7 +771,7 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
         "mlx_vlm.speculative.drafters.load_drafter",
         lambda *_args, **_kwargs: (drafter, "mtp"),
     )
-    gen._gpu_embed = lambda raw_inputs, images=None: (
+    gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
         mx.array([[raw_inputs["token"]]], dtype=mx.int32),
         {},
     )
@@ -1552,8 +1578,8 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     specs_iter = iter(request_specs)
 
-    def fake_gpu_embed(raw_inputs, images=None):
-        del raw_inputs, images
+    def fake_gpu_embed(raw_inputs, images=None, apc_semantic_hash=None):
+        del raw_inputs, images, apc_semantic_hash
         spec = next(specs_iter)
         return spec["input_ids"], spec["gen_kwargs"]
 
@@ -1673,8 +1699,7 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
                 "gen_kwargs": {
                     "inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32),
                     "image_grid_thw": mx.array([[1, 2, 3]], dtype=mx.int32),
-                    "_apc_image_hash": 123,
-                    "_apc_tenant": "tenant-a",
+                    "_apc_semantic_hash": 123,
                 },
             },
             {
@@ -1691,8 +1716,7 @@ def test_speculative_server_prefill_threads_qwen_dflash_prompt_kwargs(monkeypatc
     assert call["image_grid_thw"].tolist() == [[1, 2, 3], [4, 5, 6]]
     assert call["inputs_embeds"].shape == (2, 3, 4)
     assert call["inputs_embeds"].tolist()[1][0] == [0.0, 0.0, 0.0, 0.0]
-    assert "_apc_image_hash" not in call
-    assert "_apc_tenant" not in call
+    assert "_apc_semantic_hash" not in call
 
 
 def test_responses_endpoint_forwards_new_sampling_args(client):
@@ -4312,10 +4336,15 @@ class TestResponseGenerator:
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
         gen.draft_model = None
-        gen._cpu_preprocess = lambda prompt, images, audio: {
-            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        gen.apc_manager = object()
+        gen.apc_mode = "block"
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32),
+            "pixel_values": mx.zeros((1, 3, 2, 2), dtype=mx.float32),
         }
         gen.requests = Queue()
+        image_hash = MagicMock(wraps=apc_module.hash_image_payload)
+        monkeypatch.setattr(apc_module, "hash_image_payload", image_hash)
 
         monkeypatch.setenv("MAX_KV_SIZE", "8")
 
@@ -4323,6 +4352,7 @@ class TestResponseGenerator:
             gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
 
         assert gen.requests.empty()
+        image_hash.assert_not_called()
 
     def test_generate_serializes_budget_criteria_with_tokenizer_preprocessing(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -4385,6 +4415,101 @@ class TestResponseGenerator:
         assert max_active == 1
         assert len(queued) == 4
         assert all(request.thinking_budget_criteria is not None for request in queued)
+
+    def test_generate_precomputes_semantic_hash_from_processed_image_content(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen.apc_manager = object()
+        gen.apc_mode = "block"
+        gen.model = SimpleNamespace(language_model=SimpleNamespace())
+        gen.processor = SimpleNamespace()
+        gen._cancel = lambda uid: None
+
+        pixel_values = iter(
+            [
+                mx.zeros((1, 3, 2, 2), dtype=mx.float32),
+                mx.ones((1, 3, 2, 2), dtype=mx.float32),
+            ]
+        )
+        queued = []
+
+        def preprocess(prompt, images=None, audio=None, videos=None):
+            del prompt, images, audio, videos
+            return {
+                "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+                "pixel_values": next(pixel_values),
+            }
+
+        class Requests:
+            def put(self, request):
+                queued.append(request)
+                request.rqueue.put(
+                    server.GenerationContext(uid=len(queued), prompt_tokens=2)
+                )
+
+        gen._preprocess_request = preprocess
+        gen.requests = Requests()
+
+        for _ in range(2):
+            _, token_iter = gen.generate(
+                "prompt",
+                images=["mutable-image.png"],
+                args=server.GenerationArguments(max_tokens=1),
+            )
+            token_iter.close()
+
+        assert queued[0].images == queued[1].images
+        assert queued[0].apc_semantic_hash != queued[1].apc_semantic_hash
+        assert queued[0].apc_semantic_hash == apc_module.semantic_extra_hash(
+            image_hash=hash_image_payload(
+                pixel_values=mx.zeros((1, 3, 2, 2), dtype=mx.float32)
+            ),
+            model=gen.model.language_model,
+            processor=gen.processor,
+        )
+        assert queued[1].apc_semantic_hash == apc_module.semantic_extra_hash(
+            image_hash=hash_image_payload(
+                pixel_values=mx.ones((1, 3, 2, 2), dtype=mx.float32)
+            ),
+            model=gen.model.language_model,
+            processor=gen.processor,
+        )
+
+    def test_generate_skips_semantic_hash_for_unsupported_apc_model(self, monkeypatch):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen.apc_manager = object()
+        gen.apc_mode = None
+        gen._cancel = lambda uid: None
+        gen._preprocess_request = lambda prompt, images, audio, videos: {
+            "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+            "pixel_values": mx.zeros((1, 3, 2, 2), dtype=mx.float32),
+        }
+        queued = []
+
+        class Requests:
+            def put(self, request):
+                queued.append(request)
+                request.rqueue.put(server.GenerationContext(uid=1, prompt_tokens=2))
+
+        gen.requests = Requests()
+        image_hash = MagicMock(wraps=apc_module.hash_image_payload)
+        semantic_hash = MagicMock(wraps=apc_module.semantic_extra_hash)
+        monkeypatch.setattr(apc_module, "hash_image_payload", image_hash)
+        monkeypatch.setattr(apc_module, "semantic_extra_hash", semantic_hash)
+
+        _, token_iter = gen.generate(
+            "prompt",
+            images=["image.png"],
+            args=server.GenerationArguments(max_tokens=1),
+        )
+        token_iter.close()
+
+        assert queued[0].apc_semantic_hash is None
+        image_hash.assert_not_called()
+        semantic_hash.assert_not_called()
 
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
@@ -5007,7 +5132,7 @@ class TestResponseGenerator:
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -5163,7 +5288,7 @@ class TestResponseGenerator:
 
         gen._initialize_model = fake_initialize_model
         gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
-        gen._gpu_embed = lambda raw_inputs, images=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -5346,7 +5471,7 @@ class TestResponseGenerator:
             gen.tokenizer = SimpleNamespace()
 
         gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None: (
+        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
             mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
             {},
         )
@@ -6073,6 +6198,64 @@ class TestResponseGenerator:
         for key in preload_env:
             assert key not in os.environ
 
+    def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
+        preload_env = {
+            "MLX_VLM_PRELOAD_MODEL": "language-demo",
+            "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
+            "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
+            "MLX_VLM_PRELOAD_EMBEDDING_MODEL": "embed-demo",
+        }
+        for key, value in preload_env.items():
+            monkeypatch.setenv(key, value)
+        calls = []
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            calls.append(model_kind)
+            if model_kind == "audio_stt":
+                raise server.HTTPException(
+                    status_code=500, detail="Failed to load audio model: boom"
+                )
+            return SimpleNamespace(), None, SimpleNamespace(model_type=model_kind)
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+        server.runtime.preload_failures.clear()
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        asyncio.run(run_lifespan())
+
+        assert calls == ["text_generation", "audio_tts", "audio_stt", "embedding"]
+        failure = server.runtime.preload_failures["audio_stt"]
+        assert failure["model"] == "stt-demo"
+        assert "Failed to load audio model" in failure["error"]
+        assert "audio_tts" not in server.runtime.preload_failures
+        server.runtime.preload_failures.clear()
+
+    def test_lifespan_propagates_language_model_failure(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "language-demo")
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            raise server.HTTPException(
+                status_code=500, detail="language model exploded"
+            )
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        with pytest.raises(server.HTTPException):
+            asyncio.run(run_lifespan())
+
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
             def to_dict(self):
@@ -6086,6 +6269,9 @@ class TestResponseGenerator:
 
         response_generator = SimpleNamespace(model=Model(), vision_cache=None)
         pixel_values = mx.array([[[[1.0, 2.0]]]])
+        semantic_hash = apc_module.semantic_extra_hash(
+            image_hash=hash_image_payload(pixel_values=pixel_values)
+        )
 
         _, gen_kwargs = server.ResponseGenerator._gpu_embed(
             response_generator,
@@ -6095,11 +6281,10 @@ class TestResponseGenerator:
                 "attention_mask": mx.array([[1, 1]]),
             },
             images=None,
+            apc_semantic_hash=semantic_hash,
         )
 
-        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(
-            pixel_values=pixel_values
-        )
+        assert gen_kwargs["_apc_semantic_hash"] == semantic_hash
 
     def test_gpu_embed_drops_none_embedding_fields(self):
         class Embed:
@@ -6129,8 +6314,9 @@ class TestResponseGenerator:
 
         assert "position_ids" not in gen_kwargs
         assert "rope_deltas" not in gen_kwargs
+        assert "_apc_semantic_hash" not in gen_kwargs
 
-    def test_gpu_embed_prefers_image_ref_for_apc_hash(self):
+    def test_gpu_embed_uses_precomputed_semantic_hash(self):
         class Embed:
             def to_dict(self):
                 return {"inputs_embeds": mx.zeros((1, 2, 4))}
@@ -6144,6 +6330,9 @@ class TestResponseGenerator:
         response_generator = SimpleNamespace(model=Model(), vision_cache=None)
         pixel_values = mx.array([[[[1.0, 2.0]]]])
         images = ["image-a.png"]
+        semantic_hash = apc_module.semantic_extra_hash(
+            image_hash=hash_image_payload(pixel_values=pixel_values)
+        )
 
         _, gen_kwargs = server.ResponseGenerator._gpu_embed(
             response_generator,
@@ -6153,12 +6342,10 @@ class TestResponseGenerator:
                 "attention_mask": mx.array([[1, 1]]),
             },
             images=images,
+            apc_semantic_hash=semantic_hash,
         )
 
-        assert gen_kwargs["_apc_image_hash"] == hash_image_payload(image_ref=images)
-        assert gen_kwargs["_apc_image_hash"] != hash_image_payload(
-            pixel_values=pixel_values
-        )
+        assert gen_kwargs["_apc_semantic_hash"] == semantic_hash
 
     def test_extract_chat_response_format_json_schema(self):
         req = SimpleNamespace(
@@ -6284,6 +6471,34 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(text)
         assert reasoning is None
         assert content == "Just plain text."
+
+    def test_prompt_opened_thinking_is_detected(self):
+        assert server.prompt_has_open_thinking("<|im_start|>assistant\n<think>")
+        assert not server.prompt_has_open_thinking("<|im_start|>assistant\n")
+
+    def test_unterminated_thinking_without_markers_is_reasoning(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == text
+        assert content == ""
+
+    def test_unterminated_thinking_stays_content_when_not_in_block(self):
+        text = "The user is asking me to say OK. This is a simple request"
+        reasoning, content = server._split_thinking(text, starts_in_thinking=False)
+        assert reasoning is None
+        assert content == text
+
+    def test_starts_in_thinking_still_splits_on_close_marker(self):
+        text = "Reasoning first.</think>The answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Reasoning first."
+        assert content == "The answer."
+
+    def test_starts_in_thinking_respects_paired_markers(self):
+        text = "<think>Thinking.</think>Answer."
+        reasoning, content = server._split_thinking(text, starts_in_thinking=True)
+        assert reasoning == "Thinking."
+        assert content == "Answer."
 
     def test_empty_content_after_thinking(self):
         text = "<|channel>thought\nOnly thinking.<channel|>"

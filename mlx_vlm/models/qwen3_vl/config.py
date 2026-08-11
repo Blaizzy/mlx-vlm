@@ -71,6 +71,7 @@ class TextConfig(BaseModelConfig):
     tie_word_embeddings: bool = False
     attention_bias: bool = False
     hidden_act: str = "silu"
+    use_final_norm: bool = True
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -85,8 +86,8 @@ class TextConfig(BaseModelConfig):
             if not all(key in self.rope_scaling for key in required_keys):
                 raise ValueError(f"rope_scaling must contain keys {required_keys}")
 
-            if not self.rope_scaling["type"] in ["mrope", "default"]:
-                raise ValueError(f"rope_scaling type must be 'mrope' or 'default'")
+            if self.rope_scaling["type"] not in ["mrope", "default"]:
+                raise ValueError("rope_scaling type must be 'mrope' or 'default'")
 
 
 @dataclass
@@ -106,6 +107,7 @@ class ModelConfig(BaseModelConfig):
     vision_feature_layer: int = -2
     vocab_size: int = 32000
     eos_token_id: Optional[List[int]] = None
+    skip_vision: bool = False
 
     def __post_init__(self):
         if self.image_token_index is None:
