@@ -134,6 +134,7 @@ def _build_structured_logits_processors(
 def _build_gen_args(
     request,
     processor=None,
+    config=None,
     tenant_id: Optional[str] = None,
     structured_logits_processor_builder=_build_structured_logits_processors,
 ) -> GenerationArguments:
@@ -166,6 +167,12 @@ def _build_gen_args(
     )
     default_top_p = _model_config_field_or_default(processor, "top_p", DEFAULT_TOP_P)
     default_top_k = _model_config_field_or_default(processor, "top_k", 0)
+    thinking_start_token = get_server_thinking_start_token()
+    if thinking_start_token is None:
+        thinking_start_token = getattr(config, "thinking_start_token", None)
+    thinking_end_token = get_server_thinking_end_token()
+    if thinking_end_token is None:
+        thinking_end_token = getattr(config, "thinking_end_token", None)
     if _model_config_field_or_default(processor, "do_sample", None) is False:
         default_temperature = 0.0
     args = GenerationArguments(
@@ -230,10 +237,10 @@ def _build_gen_args(
             request, "thinking_budget", get_server_thinking_budget()
         ),
         thinking_start_token=_request_field_or_default(
-            request, "thinking_start_token", get_server_thinking_start_token()
+            request, "thinking_start_token", thinking_start_token
         ),
         thinking_end_token=_request_field_or_default(
-            request, "thinking_end_token", get_server_thinking_end_token()
+            request, "thinking_end_token", thinking_end_token
         ),
         tenant_id=tenant_id,
     )

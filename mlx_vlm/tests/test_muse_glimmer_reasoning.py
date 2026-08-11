@@ -1,0 +1,103 @@
+from types import SimpleNamespace
+
+from mlx_vlm.server.generation import GenerationArguments
+from mlx_vlm.server.request_normalization import _build_gen_args
+from mlx_vlm.server.responses_state import (
+    ThinkingStreamState,
+    _split_thinking,
+    _strip_content_markers,
+)
+
+
+def test_splits_muse_glimmer_reasoning_and_channel_header():
+    reasoning, content = _split_thinking(
+        "to=self<|message|>Say exactly: hello world ... No extra."
+        "<|eom|><|start|>assistant to=user<|message|>hello world",
+        "to=self<|message|>",
+        "<|eom|>",
+    )
+
+    assert (reasoning, content) == (
+        "Say exactly: hello world ... No extra.",
+        "hello world",
+    )
+
+
+def test_streaming_thinking_strips_split_harmony_channel_header():
+    state = ThinkingStreamState(
+        thinking_start_token="to=self<|message|>", thinking_end_token="<|eom|>"
+    )
+    reasoning = []
+    content = []
+
+    for chunk in [
+        "to=self<|message|>REASONING<|eom|><|start|>",
+        "assistant to=user",
+        "<|message|>hello world",
+    ]:
+        delta = state.feed(chunk)
+        if delta.reasoning:
+            reasoning.append(delta.reasoning)
+        if delta.content:
+            content.append(delta.content)
+
+    assert "".join(reasoning) == "REASONING"
+    assert "".join(content) == "hello world"
+
+
+def test_strips_harmony_channel_headers_without_changing_ordinary_text():
+    assert (
+        _strip_content_markers("<|start|>assistant to=user<|message|>hello world")
+        == "hello world"
+    )
+    assert (
+        _strip_content_markers(
+            "<|start|>assistant to=user<|message|>hello"
+            "<|eom|><|start|>assistant to=user<|message|> world<|eot|>"
+        )
+        == "hello world"
+    )
+    assert _strip_content_markers("ordinary text") == "ordinary text"
+
+
+def test_build_gen_args_prefers_request_and_environment_to_config(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_THINKING_START_TOKEN", raising=False)
+    monkeypatch.delenv("MLX_VLM_THINKING_END_TOKEN", raising=False)
+    config = SimpleNamespace(
+        thinking_start_token="config-start",
+        thinking_end_token="config-end",
+    )
+
+    config_args = _build_gen_args(SimpleNamespace(), config=config)
+    assert config_args.thinking_start_token == "config-start"
+    assert config_args.thinking_end_token == "config-end"
+
+    no_marker_config_args = _build_gen_args(SimpleNamespace(), config=SimpleNamespace())
+    assert no_marker_config_args.thinking_start_token is None
+    assert no_marker_config_args.thinking_end_token is None
+
+    monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "env-start")
+    monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "env-end")
+    env_args = _build_gen_args(SimpleNamespace(), config=config)
+    assert env_args.thinking_start_token == "env-start"
+    assert env_args.thinking_end_token == "env-end"
+
+    request = SimpleNamespace(
+        thinking_start_token="request-start",
+        thinking_end_token="request-end",
+    )
+    request_args = _build_gen_args(request, config=config)
+    assert request_args.thinking_start_token == "request-start"
+    assert request_args.thinking_end_token == "request-end"
+
+
+def test_template_kwargs_aliases_reasoning_effort_to_reasoning_strength():
+    args = GenerationArguments(reasoning_effort="medium")
+    kwargs = args.to_template_kwargs()
+
+    assert kwargs["reasoning_effort"] == "medium"
+    assert kwargs["reasoning_strength"] == "medium"
+
+    kwargs_without_effort = GenerationArguments().to_template_kwargs()
+    assert "reasoning_effort" not in kwargs_without_effort
+    assert "reasoning_strength" not in kwargs_without_effort

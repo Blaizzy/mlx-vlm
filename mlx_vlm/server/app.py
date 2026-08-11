@@ -163,12 +163,13 @@ def _server_runtime_snapshot() -> dict:
 
 
 def _build_gen_args(
-    request, processor=None, tenant_id: Optional[str] = None
+    request, processor=None, config=None, tenant_id: Optional[str] = None
 ) -> GenerationArguments:
     """Build GenerationArguments from a compatible API request."""
     return _request_normalization._build_gen_args(
         request,
         processor=processor,
+        config=config,
         tenant_id=tenant_id,
         structured_logits_processor_builder=_build_structured_logits_processors,
     )

@@ -14,12 +14,16 @@ logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
+_HARMONY_START_MARKER = "<|start|>"
+_HARMONY_MESSAGE_MARKER = "<|message|>"
+_HARMONY_CHANNEL_HEADER = re.compile(r"<\|start\|>[^<]*?<\|message\|>")
+_CONTENT_END_MARKERS = ("<|eom|>", "<|eot|>")
 
 
 def _strip_content_markers(text: str) -> str:
-    for marker in _CONTENT_MARKERS:
+    for marker in _CONTENT_MARKERS + _CONTENT_END_MARKERS:
         text = text.replace(marker, "")
-    return text
+    return _HARMONY_CHANNEL_HEADER.sub("", text)
 
 
 @dataclass
@@ -90,7 +94,7 @@ class ThinkingStreamState:
                 continue
 
             if self.thinking_done:
-                emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
+                emit, self.buffer = self._split_content_partial(self.buffer)
                 emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)
@@ -155,6 +159,24 @@ class ThinkingStreamState:
         if hold:
             return text[:-hold], text[-hold:]
         return text, ""
+
+    @staticmethod
+    def _split_content_partial(text: str) -> Tuple[str, str]:
+        emit, partial = ThinkingStreamState._split_partial(
+            text, _CONTENT_MARKERS + _CONTENT_END_MARKERS + (_HARMONY_START_MARKER,)
+        )
+        start = text.rfind(_HARMONY_START_MARKER)
+        if start >= 0:
+            header_tail = text[start + len(_HARMONY_START_MARKER) :]
+            message_start = header_tail.find("<")
+            is_partial_header = _HARMONY_MESSAGE_MARKER not in header_tail and (
+                message_start < 0
+                or _HARMONY_MESSAGE_MARKER.startswith(header_tail[message_start:])
+            )
+            partial_start = len(text) - len(partial) if partial else len(text)
+            if is_partial_header and start < partial_start:
+                return text[:start], text[start:]
+        return emit, partial
 
     def _strip_open_marker(self, text: str) -> str:
         for marker in self.open_markers:
