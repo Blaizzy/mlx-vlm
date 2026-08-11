@@ -189,7 +189,8 @@ class TextModel(nn.Module):
         inputs: Optional[mx.array],
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
-    ) -> mx.array:
+        capture_layer_ids: Optional[list] = None,
+    ):
         hidden_states = inputs_embeds
         if hidden_states is None:
             hidden_states = self.embed_norm(self.embed_tokens(inputs))
@@ -205,10 +206,17 @@ class TextModel(nn.Module):
                 window_size=self.sliding_window,
             )
 
-        for layer, layer_cache in zip(self.layers, cache):
+        # DFlash drafters consume the target's aux hidden states at
+        # ``capture_layer_ids`` (post-layer, pre-final-norm). ``captured`` stays
+        # None on the normal decode path, so capture costs nothing there.
+        captured = [] if capture_layer_ids is not None else None
+        capture_set = set(capture_layer_ids) if capture_layer_ids is not None else set()
+        for i, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             mask = sliding_mask if layer.is_sliding else full_mask
             hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
-        return self.norm(hidden_states)
+            if captured is not None and i in capture_set:
+                captured.append(hidden_states)
+        return self.norm(hidden_states), captured
 
 
 class LanguageModel(nn.Module):
@@ -231,11 +239,62 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        hidden_states = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.get("capture_layer_ids", None)
+        hidden_states, captured = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+        )
         logits = self.lm_head(hidden_states) * self.output_multiplier
         softcap = self.final_logit_softcapping
         logits = mx.tanh(logits / softcap) * softcap
-        return LanguageModelOutput(logits=logits)
+        output = LanguageModelOutput(logits=logits)
+        if capture_layer_ids is not None:
+            output.hidden_states = captured if captured is not None else []
+        return output
+
+    def rollback_speculative_cache(self, prompt_cache, gdn_states, accepted, bs):
+        """Rewind the target KV caches after a DFlash verify round, trimming the
+        freshly-verified block back to the committed prefix.
+
+        Both Muse cache types (RotatingKVCache / KVCache) fetch by their logical
+        offset, so a scalar offset trim is exact — no per-round KV snapshots or
+        replay forwards. ``gdn_states`` is accepted (and ignored) for API parity
+        with the other DFlash targets; Muse has no SSM / gated-delta state.
+
+        Muse runs the single-stream (B=1) DFlash loop, where ``accepted`` is a
+        scalar. A ragged per-row accept array (batched DFlash) cannot be rolled
+        back losslessly on a concat/rotating cache — zeroing a rejected
+        position's K/V does NOT drop it (a zero key still scores q·0 = 0 and
+        keeps softmax weight e^0/Z) — so we raise rather than silently corrupt.
+        Returns the committed accept count.
+        """
+        del gdn_states
+        if isinstance(accepted, mx.array):
+            accepted_list = [int(x) for x in accepted.reshape(-1).tolist()]
+        elif isinstance(accepted, (list, tuple)):
+            accepted_list = [int(x) for x in accepted]
+        else:
+            accepted_list = [int(accepted)]
+
+        if len(set(accepted_list)) > 1:
+            raise NotImplementedError(
+                "Muse-Glimmer DFlash supports single-stream (B=1) decoding only; "
+                f"got a ragged batch accept array {accepted_list}. Per-row "
+                "rollback of Muse's rotating/full KV caches is not lossless."
+            )
+
+        max_a = max(accepted_list)
+        trim_n = bs - (max_a + 1)
+        for c in prompt_cache:
+            if c is None:
+                continue
+            if trim_n > 0:
+                trim = getattr(c, "trim", None)
+                if trim is not None:
+                    trim(trim_n)
+        return max_a
 
     @property
     def layers(self):
