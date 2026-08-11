@@ -10,7 +10,6 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import KVCache, RotatingKVCache
-from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
@@ -24,13 +23,34 @@ def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     return x.astype(dtype)
 
 
+@mx.compile
+def _rms_norm(x: mx.array, weight: Optional[mx.array], eps: float) -> mx.array:
+    dtype = x.dtype
+    x = x.astype(mx.float32)
+    mean_squared = mx.mean(mx.square(x), axis=-1, keepdims=True) + eps
+    x = x * mx.power(mean_squared, -0.5)
+    if weight is not None:
+        x = x * weight.astype(mx.float32)
+    return x.astype(dtype)
+
+
 class RMSNormNoScale(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, None, self.eps)
+        return _rms_norm(x, None, self.eps)
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float):
+        super().__init__()
+        self.weight = mx.ones((dim,))
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return _rms_norm(x, self.weight, self.eps)
 
 
 class CenteredRMSNorm(nn.Module):
@@ -45,6 +65,32 @@ class CenteredRMSNorm(nn.Module):
         # Transformers applies the centered scale in FP32 before casting back
         # to the activation dtype. Casting earlier changes BF16 decode choices.
         return _centered_rms_norm(x, self.weight, self.eps)
+
+
+class TextRotaryEmbedding:
+    """Muse Glimmer RoPE with the Transformers FP32 frequency formulation."""
+
+    def __init__(self, dim: int, base: float):
+        self.dim = dim
+        self.base = base
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        positions = mx.arange(offset, offset + x.shape[-2], dtype=mx.float32)
+        frequencies = 1.0 / (
+            self.base ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
+        )
+        angles = positions[:, None] * frequencies[None]
+        angles = mx.concatenate([angles, angles], axis=-1)
+        cos = mx.cos(angles).astype(x.dtype)[None, None]
+        sin = mx.sin(angles).astype(x.dtype)[None, None]
+        midpoint = x.shape[-1] // 2
+        rotated = mx.concatenate([-x[..., midpoint:], x[..., :midpoint]], axis=-1)
+        return x * cos + rotated * sin
+
+
+def _scale_queries(queries: mx.array, scale: float) -> mx.array:
+    dtype = queries.dtype
+    return (queries.astype(mx.float32) * scale).astype(dtype)
 
 
 class MLP(nn.Module):
@@ -90,13 +136,7 @@ class Attention(nn.Module):
             if self.use_rope
             else float(args.rope_parameters.get("rope_theta", 500000.0))
         )
-        self.rope = initialize_rope(
-            self.head_dim,
-            base=theta,
-            traditional=False,
-            scaling_config={"rope_type": "default", "rope_theta": theta},
-            max_position_embeddings=args.max_position_embeddings,
-        )
+        self.rope = TextRotaryEmbedding(self.head_dim, theta)
 
     def __call__(
         self,
@@ -109,7 +149,9 @@ class Attention(nn.Module):
         keys = self.k_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
         values = self.v_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
 
-        queries = (self.qk_norm(queries) * self.qk_scale_factor).transpose(0, 2, 1, 3)
+        queries = self.qk_norm(queries)
+        queries = _scale_queries(queries, self.qk_scale_factor)
+        queries = queries.transpose(0, 2, 1, 3)
         keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
 
@@ -173,7 +215,7 @@ class TextModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.embed_norm = RMSNormNoScale(args.rms_norm_eps)
         self.layers = [DecoderLayer(args, idx) for idx in range(args.num_hidden_layers)]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.layer_types = args.layer_types
         self.sliding_window = args.sliding_window
 

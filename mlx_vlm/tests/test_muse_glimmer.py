@@ -5,7 +5,12 @@ from PIL import Image
 
 from mlx_vlm.models.cache import KVCache, RotatingKVCache
 from mlx_vlm.models.muse_glimmer import Model, ModelConfig, TextConfig, VisionConfig
-from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm, RMSNormNoScale
+from mlx_vlm.models.muse_glimmer.language import (
+    CenteredRMSNorm,
+    RMSNormNoScale,
+    TextRotaryEmbedding,
+    _scale_queries,
+)
 from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
 from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
     MuseGlimmerImageProcessor,
@@ -100,6 +105,49 @@ def test_centered_rms_norm_preserves_transformers_fp32_operation_order():
     expected = expected * (1.0 + norm.weight.astype(mx.float32))
     expected = expected.astype(inputs.dtype)
     output = norm(inputs)
+    mx.eval(output, expected)
+
+    assert bool(mx.array_equal(output, expected).item())
+
+
+def test_unscaled_rms_norm_preserves_transformers_fp32_operation_order():
+    norm = RMSNormNoScale(eps=1e-6)
+    inputs = mx.array([[0.1, 1.0, 3.0, 9.0]], dtype=mx.bfloat16)
+
+    inputs32 = inputs.astype(mx.float32)
+    mean_squared = mx.mean(mx.square(inputs32), axis=-1, keepdims=True) + norm.eps
+    expected = (inputs32 * mx.power(mean_squared, -0.5)).astype(inputs.dtype)
+    output = norm(inputs)
+    mx.eval(output, expected)
+
+    assert bool(mx.array_equal(output, expected).item())
+
+
+def test_query_scale_uses_transformers_fp32_operation_order():
+    inputs = mx.array([0.1, 1.0, 9.0], dtype=mx.bfloat16)
+    output = _scale_queries(inputs, 3.87)
+    expected = (inputs.astype(mx.float32) * 3.87).astype(inputs.dtype)
+    bf16_scalar_result = inputs * 3.87
+    mx.eval(output, expected, bf16_scalar_result)
+
+    assert bool(mx.array_equal(output, expected).item())
+    assert not bool(mx.array_equal(output, bf16_scalar_result).item())
+
+
+def test_text_rotary_embedding_uses_fp32_frequencies():
+    inputs = (mx.arange(24, dtype=mx.float32) / 7).reshape(1, 2, 3, 4)
+    inputs = inputs.astype(mx.bfloat16)
+    rope = TextRotaryEmbedding(dim=4, base=10000.0)
+
+    positions = mx.arange(2, 5, dtype=mx.float32)
+    frequencies = 1.0 / (10000.0 ** (mx.arange(0, 4, 2, dtype=mx.float32) / 4))
+    angles = positions[:, None] * frequencies[None]
+    angles = mx.concatenate([angles, angles], axis=-1)
+    cos = mx.cos(angles).astype(inputs.dtype)[None, None]
+    sin = mx.sin(angles).astype(inputs.dtype)[None, None]
+    rotated = mx.concatenate([-inputs[..., 2:], inputs[..., :2]], axis=-1)
+    expected = inputs * cos + rotated * sin
+    output = rope(inputs, offset=2)
     mx.eval(output, expected)
 
     assert bool(mx.array_equal(output, expected).item())
