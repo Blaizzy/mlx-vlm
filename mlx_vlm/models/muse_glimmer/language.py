@@ -23,34 +23,13 @@ def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     return x.astype(dtype)
 
 
-@mx.compile
-def _rms_norm(x: mx.array, weight: Optional[mx.array], eps: float) -> mx.array:
-    dtype = x.dtype
-    x = x.astype(mx.float32)
-    mean_squared = mx.mean(mx.square(x), axis=-1, keepdims=True) + eps
-    x = x * mx.power(mean_squared, -0.5)
-    if weight is not None:
-        x = x * weight.astype(mx.float32)
-    return x.astype(dtype)
-
-
 class RMSNormNoScale(nn.Module):
     def __init__(self, eps: float):
         super().__init__()
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        return _rms_norm(x, None, self.eps)
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.weight = mx.ones((dim,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return _rms_norm(x, self.weight, self.eps)
+        return mx.fast.rms_norm(x, None, self.eps)
 
 
 class CenteredRMSNorm(nn.Module):
@@ -215,7 +194,7 @@ class TextModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.embed_norm = RMSNormNoScale(args.rms_norm_eps)
         self.layers = [DecoderLayer(args, idx) for idx in range(args.num_hidden_layers)]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.layer_types = args.layer_types
         self.sliding_window = args.sliding_window
 

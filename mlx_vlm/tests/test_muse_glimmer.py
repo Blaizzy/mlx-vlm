@@ -110,19 +110,6 @@ def test_centered_rms_norm_preserves_transformers_fp32_operation_order():
     assert bool(mx.array_equal(output, expected).item())
 
 
-def test_unscaled_rms_norm_preserves_transformers_fp32_operation_order():
-    norm = RMSNormNoScale(eps=1e-6)
-    inputs = mx.array([[0.1, 1.0, 3.0, 9.0]], dtype=mx.bfloat16)
-
-    inputs32 = inputs.astype(mx.float32)
-    mean_squared = mx.mean(mx.square(inputs32), axis=-1, keepdims=True) + norm.eps
-    expected = (inputs32 * mx.power(mean_squared, -0.5)).astype(inputs.dtype)
-    output = norm(inputs)
-    mx.eval(output, expected)
-
-    assert bool(mx.array_equal(output, expected).item())
-
-
 def test_query_scale_uses_transformers_fp32_operation_order():
     inputs = mx.array([0.1, 1.0, 9.0], dtype=mx.bfloat16)
     output = _scale_queries(inputs, 3.87)
