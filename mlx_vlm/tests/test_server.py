@@ -136,6 +136,14 @@ def test_chat_request_schema_requires_model():
     assert "model" in server.ChatRequest.model_json_schema()["required"]
 
 
+def test_chat_request_schema_leaves_seed_unset_by_default():
+    request = server.ChatRequest(
+        model="model", messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert request.seed is None
+
+
 def test_chat_request_schema_declares_tool_choice_fields():
     properties = server.ChatRequest.model_json_schema()["properties"]
 
@@ -422,6 +430,50 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
     mx.eval(batched, single_0, single_1)
 
     assert batched.tolist() == [single_0.item(), single_1.item()]
+
+
+def _uniform_logprobs(rows, vocab):
+    return mx.zeros((rows, vocab)) - float(np.log(vocab))
+
+
+def test_positioned_target_sampler_draws_a_fresh_seed_when_none_is_given():
+    positions = list(range(32))
+    row_ids = [0] * len(positions)
+    logprobs = _uniform_logprobs(len(positions), 8)
+
+    first = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, seed=None
+    )
+    second = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, seed=None
+    )
+
+    assert first.seed != second.seed
+
+    tokens_first = first.sample_target(logprobs, row_ids=row_ids, positions=positions)
+    tokens_second = second.sample_target(logprobs, row_ids=row_ids, positions=positions)
+    mx.eval(tokens_first, tokens_second)
+
+    assert tokens_first.tolist() != tokens_second.tolist()
+
+
+def test_positioned_target_sampler_repeats_draws_for_an_explicit_seed():
+    positions = list(range(32))
+    row_ids = [0] * len(positions)
+    logprobs = _uniform_logprobs(len(positions), 8)
+
+    first = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, seed=1234
+    )
+    second = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, seed=1234
+    )
+
+    tokens_first = first.sample_target(logprobs, row_ids=row_ids, positions=positions)
+    tokens_second = second.sample_target(logprobs, row_ids=row_ids, positions=positions)
+    mx.eval(tokens_first, tokens_second)
+
+    assert tokens_first.tolist() == tokens_second.tolist()
 
 
 def test_speculative_server_dispatches_eagle3_batch_loop():
