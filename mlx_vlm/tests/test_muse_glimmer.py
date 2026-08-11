@@ -220,20 +220,6 @@ def test_tiny_text_and_multimodal_forward():
     assert bool(mx.isfinite(embeddings).all().item())
 
 
-def test_raw_speculative_logits_preserve_greedy_choice():
-    mx.random.seed(3)
-    model = Model(tiny_config()).language_model
-    inputs = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
-
-    regular = model(inputs).logits
-    raw = model(inputs, skip_logit_transform=True).logits
-    mx.eval(regular, raw)
-
-    assert bool(
-        mx.array_equal(mx.argmax(regular, axis=-1), mx.argmax(raw, axis=-1)).item()
-    )
-
-
 def test_quantization_keeps_embedding_normalization_outside_embedding():
     config = tiny_config()
     config.text_config.hidden_size = 32

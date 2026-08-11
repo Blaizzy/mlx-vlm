@@ -86,7 +86,6 @@ def _dflash_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
-    greedy_sampling: bool = False,
     use_model_initial_block_size: bool = True,
 ) -> Generator[Tuple[int, None], None, None]:
     """DFlash speculative-decoding **round loop**.
@@ -145,12 +144,11 @@ def _dflash_rounds(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
             )
-            verify_kwargs = {"capture_layer_ids": target_layer_ids}
-            if greedy_sampling and getattr(
-                lm, "supports_speculative_raw_logits", False
-            ):
-                verify_kwargs["skip_logit_transform"] = True
-            verify_out = lm(verify_input, cache=prompt_cache, **verify_kwargs)
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
             hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
         mx.async_eval(target_tokens, hidden)
@@ -198,7 +196,6 @@ def _dflash_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
-    greedy_sampling: bool = False,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -270,12 +267,11 @@ def _dflash_rounds_batch(
         # Verify
         with mx.stream(generation_stream):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
-            verify_kwargs = {"capture_layer_ids": target_layer_ids}
-            if greedy_sampling and getattr(
-                lm, "supports_speculative_raw_logits", False
-            ):
-                verify_kwargs["skip_logit_transform"] = True
-            verify_out = lm(verify_input, cache=prompt_cache, **verify_kwargs)
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                capture_layer_ids=target_layer_ids,
+            )
             hidden_full = mx.concatenate(verify_out.hidden_states, axis=-1)
             target_tokens = sampler(verify_out.logits)
         mx.async_eval(target_tokens, hidden_full)

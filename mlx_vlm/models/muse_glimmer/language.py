@@ -266,8 +266,6 @@ class TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
-    supports_speculative_raw_logits = True
-
     def __init__(self, args: TextConfig):
         super().__init__()
         self.args = args
@@ -306,7 +304,6 @@ class LanguageModel(nn.Module):
         if inputs is None:
             inputs = kwargs.get("input_ids")
         capture_layer_ids = kwargs.pop("capture_layer_ids", None)
-        skip_logit_transform = bool(kwargs.pop("skip_logit_transform", False))
         hidden_sink: Optional[list[mx.array]] = (
             [] if capture_layer_ids is not None else None
         )
@@ -317,11 +314,9 @@ class LanguageModel(nn.Module):
             capture_layer_ids=capture_layer_ids,
             hidden_sink=hidden_sink,
         )
-        logits = self.lm_head(hidden_states)
-        if not skip_logit_transform:
-            logits = logits * self.output_multiplier
-            softcap = self.final_logit_softcapping
-            logits = mx.tanh(logits / softcap) * softcap
+        logits = self.lm_head(hidden_states) * self.output_multiplier
+        softcap = self.final_logit_softcapping
+        logits = mx.tanh(logits / softcap) * softcap
         return LanguageModelOutput(logits=logits, hidden_states=hidden_sink)
 
     def rollback_speculative_cache(

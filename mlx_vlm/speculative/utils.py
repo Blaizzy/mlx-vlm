@@ -208,7 +208,6 @@ def run_speculative_server_rounds(
                 sampler=sampler,
                 draft_block_size=draft_block_size,
                 token_dtype=token_dtype,
-                greedy_sampling=greedy_sampling,
                 use_model_initial_block_size=False,
             ):
                 yield [tok], state
@@ -227,7 +226,6 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
-            greedy_sampling=greedy_sampling,
         )
         return
 
@@ -370,7 +368,6 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
-            greedy_sampling=sampler_is_greedy,
         )
     else:
         mx.eval(first_token)
@@ -386,5 +383,4 @@ def run_speculative_rounds(
             sampler=sampler,
             draft_block_size=draft_block_size,
             token_dtype=input_ids.dtype,
-            greedy_sampling=sampler_is_greedy,
         )

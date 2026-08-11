@@ -1623,7 +1623,6 @@ def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
     assert result == [([3], None), ([4], None)]
     assert calls
     assert calls[0][1]["first_bonus"] == 2
-    assert calls[0][1]["greedy_sampling"] is True
     assert calls[0][1]["use_model_initial_block_size"] is False
 
 
