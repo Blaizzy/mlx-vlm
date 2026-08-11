@@ -101,3 +101,72 @@ def test_template_kwargs_aliases_reasoning_effort_to_reasoning_strength():
     kwargs_without_effort = GenerationArguments().to_template_kwargs()
     assert "reasoning_effort" not in kwargs_without_effort
     assert "reasoning_strength" not in kwargs_without_effort
+
+
+# Captured from a live Muse Glimmer server: when the model answers without
+# reasoning first, add_generation_prompt has already emitted "<|start|>assistant",
+# so the header the model produces has no "<|start|>" prefix.
+BARE_HEADER_OUTPUT = "to=user<|message|>391"
+FULL_HEADER_OUTPUT = (
+    "to=self<|message|>Reasoning here.<|eom|><|start|>assistant to=user<|message|>391"
+)
+
+
+def _drive_stream(chunks):
+    state = ThinkingStreamState(
+        thinking_start_token="to=self<|message|>", thinking_end_token="<|eom|>"
+    )
+    reasoning = []
+    content = []
+    for chunk in chunks:
+        delta = state.feed(chunk)
+        if delta.reasoning:
+            reasoning.append(delta.reasoning)
+        if delta.content:
+            content.append(delta.content)
+    return "".join(reasoning), "".join(content)
+
+
+def test_strips_bare_harmony_channel_header():
+    assert _strip_content_markers("to=user<|message|>391") == "391"
+
+
+def test_streaming_strips_bare_header_at_every_split_point():
+    for index in range(len(BARE_HEADER_OUTPUT) + 1):
+        _, content = _drive_stream(
+            [BARE_HEADER_OUTPUT[:index], BARE_HEADER_OUTPUT[index:]]
+        )
+        assert content == "391", f"split at {index}"
+
+
+def test_streaming_strips_bare_header_one_character_at_a_time():
+    _, content = _drive_stream(list(BARE_HEADER_OUTPUT))
+    assert content == "391"
+
+
+def test_streaming_splits_full_header_at_every_split_point():
+    for index in range(len(FULL_HEADER_OUTPUT) + 1):
+        reasoning, content = _drive_stream(
+            [FULL_HEADER_OUTPUT[:index], FULL_HEADER_OUTPUT[index:]]
+        )
+        assert content == "391", f"split at {index}"
+        assert reasoning == "Reasoning here.", f"split at {index}"
+
+
+def test_keeps_harmony_like_text_once_content_has_started():
+    text = "391 and the literal to=user<|message|> marker"
+    assert _strip_content_markers(text) == text
+    _, content = _drive_stream([text])
+    assert content == text
+
+
+def test_streaming_keeps_harmony_like_chunk_after_content_started():
+    state = ThinkingStreamState(
+        thinking_start_token="to=self<|message|>", thinking_end_token="<|eom|>"
+    )
+
+    first = state.feed("The answer is 391. ")
+    second = state.feed("to=user<|message|> is the literal marker")
+
+    assert first.content == "The answer is 391. "
+    assert second.content == "to=user<|message|> is the literal marker"
