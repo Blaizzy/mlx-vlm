@@ -289,6 +289,7 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
@@ -313,6 +314,10 @@ def _split_thinking(
         if start_marker in text:
             reasoning = _clean_reasoning(text, start_marker)
             return reasoning or None, ""
+
+    if starts_in_thinking:
+        reasoning = _strip_content_markers(text).strip()
+        return reasoning or None, ""
 
     return None, _strip_content_markers(text).strip()
 
@@ -415,6 +420,68 @@ def _response_call_to_chat_tool_call(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _response_image_source(part: Dict[str, Any]) -> Optional[Any]:
+    part_type = part.get("type")
+    if part_type == "image_url":
+        image_url = part.get("image_url")
+        return image_url.get("url") if isinstance(image_url, dict) else image_url
+    if part_type != "input_image":
+        return None
+
+    if part.get("file_id") is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "input_image.file_id is not supported by this server. "
+                "Provide image_url instead."
+            ),
+        )
+    image_url = part.get("image_url")
+    return image_url or None
+
+
+def _response_tool_output_to_text_and_images(
+    output: Any,
+) -> Tuple[str, List[Any]]:
+    if isinstance(output, str):
+        return output, []
+    if not isinstance(output, list):
+        return json.dumps(output, ensure_ascii=False), []
+
+    text_parts = []
+    remaining_parts = []
+    output_images = []
+    for part in output:
+        part = _as_plain_dict(part)
+        if not isinstance(part, dict):
+            remaining_parts.append(part)
+            continue
+        part_type = part.get("type")
+        if part_type in ("input_text", "output_text", "text"):
+            text_parts.append(str(part.get("text", "")))
+        elif part_type in ("input_image", "image_url"):
+            image = _response_image_source(part)
+            if image:
+                output_images.append(image)
+            else:
+                remaining_parts.append(part)
+        else:
+            remaining_parts.append(part)
+
+    if remaining_parts:
+        text_parts.append(json.dumps(remaining_parts, ensure_ascii=False))
+    if output_images:
+        text_parts.append("[Image output attached in the next message]")
+    return "\n".join(part for part in text_parts if part), output_images
+
+
+def _response_image_message(image_count: int) -> Dict[str, Any]:
+    return {
+        "role": "user",
+        "content": [{"type": "image"} for _ in range(image_count)],
+    }
+
+
 def _append_response_item_to_prompt(
     item: Dict[str, Any],
     chat_messages: List[Dict[str, Any]],
@@ -425,26 +492,36 @@ def _append_response_item_to_prompt(
         role = item.get("role") or "user"
         content = item.get("content")
         if isinstance(content, list):
-            text_parts = []
+            content_parts = []
+            item_images = []
             for part in content:
                 part = _as_plain_dict(part)
                 if not isinstance(part, dict):
                     continue
                 part_type = part.get("type")
                 if part_type in ("input_text", "output_text", "text"):
-                    text_parts.append(str(part.get("text", "")))
-                elif part_type == "input_image":
-                    image = part.get("image_url") or part.get("file_id")
+                    text = str(part.get("text", ""))
+                    if text:
+                        content_parts.append({"type": "text", "text": text})
+                elif part_type in ("input_image", "image_url"):
+                    image = _response_image_source(part)
                     if image:
-                        images.append(image)
-                elif part_type == "image_url":
-                    image_url = part.get("image_url")
-                    images.append(
-                        image_url.get("url")
-                        if isinstance(image_url, dict)
-                        else image_url
-                    )
-            content = "\n".join(p for p in text_parts if p)
+                        item_images.append(image)
+                        content_parts.append({"type": "image"})
+            images.extend(item_images)
+            if item_images and role not in ("user",):
+                text = "\n".join(
+                    part["text"] for part in content_parts if part.get("type") == "text"
+                )
+                chat_messages.append({"role": role, "content": text})
+                chat_messages.append(_response_image_message(len(item_images)))
+                return
+            if item_images:
+                content = content_parts
+            else:
+                content = "\n".join(
+                    part["text"] for part in content_parts if part.get("type") == "text"
+                )
         chat_messages.append({"role": role, "content": content or ""})
         return
 
@@ -465,8 +542,7 @@ def _append_response_item_to_prompt(
         "tool_result",
     ):
         output = item.get("output", item.get("content", ""))
-        if not isinstance(output, str):
-            output = json.dumps(output, ensure_ascii=False)
+        output, output_images = _response_tool_output_to_text_and_images(output)
         chat_messages.append(
             {
                 "role": "tool",
@@ -474,6 +550,9 @@ def _append_response_item_to_prompt(
                 "content": output,
             }
         )
+        if output_images:
+            images.extend(output_images)
+            chat_messages.append(_response_image_message(len(output_images)))
 
 
 def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str, Any]]:

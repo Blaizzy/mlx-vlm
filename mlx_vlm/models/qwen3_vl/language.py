@@ -182,7 +182,11 @@ class Qwen3VLModel(nn.Module):
             Qwen3VLDecoderLayer(args=args, layer_idx=layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = (
+            nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            if getattr(args, "use_final_norm", True)
+            else None
+        )
 
     def __call__(
         self,
@@ -194,6 +198,8 @@ class Qwen3VLModel(nn.Module):
         # args for deepstack
         visual_pos_masks: Optional[mx.array] = None,
         deepstack_visual_embeds: Optional[mx.array] = None,
+        stop_after_layer: Optional[int] = None,
+        apply_final_norm: bool = True,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -215,7 +221,16 @@ class Qwen3VLModel(nn.Module):
         ):
             position_embeddings = self.layers[0].self_attn.rotary_emb(h, position_ids)
 
+        if stop_after_layer is not None and not 0 <= stop_after_layer <= len(
+            self.layers
+        ):
+            raise ValueError(
+                f"stop_after_layer must be between 0 and {len(self.layers)}"
+            )
+
         for layer_idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            if stop_after_layer is not None and layer_idx >= stop_after_layer:
+                break
             h = layer(h, mask, c, position_ids, position_embeddings)
             # Add deepstack visual embeds
             # add visual features to the hidden states of first several layers
@@ -228,7 +243,9 @@ class Qwen3VLModel(nn.Module):
                     deepstack_visual_embeds[layer_idx],
                 )
 
-        return self.norm(h)
+        if apply_final_norm and self.norm is not None:
+            return self.norm(h)
+        return h
 
     def _deepstack_process(
         self,
@@ -500,6 +517,13 @@ class LanguageModel(nn.Module):
             cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
             if isinstance(c0.offset, mx.array) and c0.offset.ndim > 0:
                 cache_offset_array = c0.offset
+
+        if position_ids is not None and cache_offset_array is None:
+            seq_length = inputs.shape[-1]
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
 
         if (
             visual_pos_masks is not None

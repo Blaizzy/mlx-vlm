@@ -69,6 +69,12 @@ def main():
         help="Pre-load a speech-to-text model at startup.",
     )
     parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default=None,
+        help="Pre-load an embedding model at startup.",
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -146,6 +152,32 @@ def main():
         help="Number of bits for KV cache quantization (e.g. 3.5 for TurboQuant).",
     )
     parser.add_argument(
+        "--kv-key-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant key bit-width (defaults to floor(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-key-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for keys only.",
+    )
+    parser.add_argument(
+        "--kv-value-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for values only.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -194,6 +226,16 @@ def main():
         help="Override the drafter's configured block size.",
     )
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of sequences decoded concurrently in the continuous "
+            "batch. Requests beyond this wait in the queue (backpressure), bounding "
+            "peak memory. Default: unbounded. Maps to MLX_VLM_MAX_NUM_SEQS."
+        ),
+    )
+    parser.add_argument(
         "--top-logprobs-k",
         type=int,
         default=None,
@@ -238,6 +280,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] = args.tts_model
     if args.stt_model:
         os.environ["MLX_VLM_PRELOAD_STT_MODEL"] = args.stt_model
+    if args.embedding_model:
+        os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
@@ -245,6 +289,8 @@ def main():
         os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
     if args.draft_block_size is not None:
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.max_num_seqs is not None:
+        os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
@@ -258,6 +304,14 @@ def main():
         os.environ["MLX_VLM_THINKING_END_TOKEN"] = args.thinking_end_token
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
+    if args.kv_key_bits is not None:
+        os.environ["KV_KEY_BITS"] = str(args.kv_key_bits)
+    if args.kv_value_bits is not None:
+        os.environ["KV_VALUE_BITS"] = str(args.kv_value_bits)
+    if args.kv_key_scheme is not None:
+        os.environ["KV_KEY_SCHEME"] = args.kv_key_scheme
+    if args.kv_value_scheme is not None:
+        os.environ["KV_VALUE_SCHEME"] = args.kv_value_scheme
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     if args.max_kv_size is not None:

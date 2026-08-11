@@ -48,6 +48,21 @@ def _collate_arrays(values):
         raise
 
 
+def _collate_grid_thw(values):
+    """Pack per-example image/video grids as (total_media, 3)."""
+    rows = []
+    for value in values:
+        value = value if isinstance(value, mx.array) else mx.array(value)
+        if value.ndim == 1:
+            value = value[None, :]
+        if value.ndim != 2 or value.shape[1] != 3:
+            raise ValueError(
+                f"Expected grid_thw values with shape (num_media, 3), got {value.shape}"
+            )
+        rows.append(value)
+    return mx.concatenate(rows, axis=0)
+
+
 @dataclass
 class TrainingArgs:
     batch_size: int = field(default=4, metadata={"help": "Minibatch size."})
@@ -285,6 +300,10 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 )
             ]
             for k in extra_keys:
+                if k in ("image_grid_thw", "video_grid_thw"):
+                    batch[k] = _collate_grid_thw([item[k] for item in items])
+                    continue
+
                 vals = [_squeeze_leading_batch_dim(item[k]) for item in items]
                 if isinstance(vals[0], mx.array):
                     try:

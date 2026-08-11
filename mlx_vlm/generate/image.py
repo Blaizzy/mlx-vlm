@@ -273,15 +273,22 @@ def _local_image_model_types(model: str) -> tuple[str, ...]:
         return ()
 
     candidates: list[str] = []
+    manifest = _load_json_file(root / "manifest.json")
+    if manifest is not None:
+        # Bonsai repos ship FLUX.2 configs (Flux2KleinPipeline /
+        # Flux2Transformer2DModel), so class-name scanning below would
+        # classify them as flux2 before the manifest check. The manifest
+        # layout (transformer-packed-mflux + text_encoder-mlx-4bit +
+        # tokenizer) is the authoritative Bonsai discriminator, so it must
+        # be checked first.
+        _add_model_type(candidates, _image_model_type_from_manifest(manifest))
+
     for filename in ("model_index.json", "config.json"):
         metadata = _load_json_file(root / filename)
         if metadata is not None:
             for model_type in _image_model_types_from_metadata(metadata):
                 _add_model_type(candidates, model_type)
 
-    manifest = _load_json_file(root / "manifest.json")
-    if manifest is not None:
-        _add_model_type(candidates, _image_model_type_from_manifest(manifest))
     _add_model_type(candidates, _image_model_type_from_component_indexes(root))
 
     for config_path in sorted(root.glob("*/config.json")):
@@ -370,7 +377,7 @@ def _image_generation_model_class_from_path(
         if resolved_path is not None
         else ()
     )
-    for model_type in (*local_model_types, _model_type_from_id(model)):
+    for model_type in (_model_type_from_id(model), *local_model_types):
         model_class = _image_model_class_for_type(model_type)
         if model_class is not None and model_class.is_image_generation_model:
             return model_class
@@ -440,7 +447,7 @@ def load_image_generation_model(
         else ()
     )
     model_class = None
-    for model_type in (*local_model_types, _model_type_from_id(model)):
+    for model_type in (_model_type_from_id(model), *local_model_types):
         model_class = _image_model_class_for_type(model_type)
         if model_class is not None and model_class.is_image_generation_model:
             break
@@ -509,8 +516,7 @@ def generate_image(
         if isinstance(request, ImageGenerationRequest):
             if image_paths is None:
                 raise ValueError(
-                    "image_paths are required when editing from "
-                    "ImageGenerationRequest"
+                    "image_paths are required when editing from ImageGenerationRequest"
                 )
             request = ImageEditRequest(
                 prompt=request.prompt,
@@ -607,6 +613,9 @@ def run_image_generation_cli(args: Any) -> None:
     task = _normalize_image_task(getattr(args, "task", DEFAULT_IMAGE_TASK))
     _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
+    steps = getattr(args, "steps", None)
+    if steps is None:
+        steps = DEFAULT_IMAGE_STEPS
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
         raise ValueError(f"--prompt must not be empty for image {task}")
@@ -632,7 +641,7 @@ def run_image_generation_cli(args: Any) -> None:
             prompt=prompt,
             image_paths=tuple(args.image),
             seed=seed,
-            steps=args.steps,
+            steps=steps,
             width=width,
             height=height,
             guidance=args.guidance,
@@ -659,7 +668,7 @@ def run_image_generation_cli(args: Any) -> None:
         request = ImageGenerationRequest(
             prompt=prompt,
             seed=seed,
-            steps=args.steps,
+            steps=steps,
             width=width,
             height=height,
             guidance=args.guidance,

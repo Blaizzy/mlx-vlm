@@ -16,6 +16,7 @@ import mlx.nn as nn
 from tqdm import tqdm
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
@@ -27,7 +28,7 @@ from ..speculative.utils import (
     speculative_prefill_kwargs,
 )
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
-from ..utils import group_images_by_shape, prepare_inputs
+from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
 from .common import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
@@ -171,6 +172,10 @@ def generate_step(
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
     kv_bits: Optional[float] = None,
+    kv_key_bits: Optional[float] = None,
+    kv_value_bits: Optional[float] = None,
+    kv_key_scheme: Optional[str] = None,
+    kv_value_scheme: Optional[str] = None,
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -249,6 +254,10 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
@@ -328,6 +337,8 @@ def generate_step(
         step_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
             step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
+        if getattr(model.language_model, "supports_logits_to_keep", False):
+            step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
         with mx.stream(generation_stream):
             if "decoder_input_ids" in step_kwargs:
@@ -433,12 +444,15 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_len
                     ):
                         n_to_process = checkpoint_len - processed_tokens
+                    chunk_kwargs = kwargs
+                    if getattr(model.language_model, "supports_logits_to_keep", False):
+                        chunk_kwargs = {**kwargs, "logits_to_keep": 1}
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
                         n_to_process=n_to_process,
-                        **kwargs,
+                        **chunk_kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
@@ -729,6 +743,10 @@ def _make_cache(
     model,
     left_padding,
     kv_bits=None,
+    kv_key_bits=None,
+    kv_value_bits=None,
+    kv_key_scheme=None,
+    kv_value_scheme=None,
     kv_group_size=64,
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start=0,
@@ -746,6 +764,22 @@ def _make_cache(
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
     """
+    _batch_policy = kv_quant_from_legacy(
+        kv_bits,
+        kv_quant_scheme,
+        kv_group_size,
+        kv_key_bits,
+        kv_value_bits,
+        kv_key_scheme,
+        kv_value_scheme,
+    )
+    if _batch_policy is not None and not _batch_policy.is_homogeneous:
+        raise NotImplementedError(
+            "mixed key/value KV quantization schemes are not supported on the "
+            "batch path yet; run with a single --kv-quant-scheme or disable "
+            "continuous batching"
+        )
+
     use_turbo = kv_bits is not None and turboquant_enabled(kv_bits, kv_quant_scheme)
 
     defer_turbo = (
@@ -756,7 +790,9 @@ def _make_cache(
         if use_turbo:
             if defer_turbo:
                 return cache.BatchKVCache(lp)
-            return BatchTurboQuantKVCache(lp, bits=kv_bits)
+            return BatchTurboQuantKVCache(
+                lp, bits=kv_bits, key_bits=kv_key_bits, value_bits=kv_value_bits
+            )
         return cache.BatchQuantizedKVCache(
             lp, group_size=kv_group_size, bits=int(kv_bits)
         )
@@ -1554,6 +1590,10 @@ class PromptProcessingBatch:
         thinking_budget_criteria: Optional[List[Any]] = None,
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = 0,
@@ -1653,6 +1693,10 @@ class PromptProcessingBatch:
                     lm,
                     lp,
                     kv_bits=kv_bits,
+                    kv_key_bits=kv_key_bits,
+                    kv_value_bits=kv_value_bits,
+                    kv_key_scheme=kv_key_scheme,
+                    kv_value_scheme=kv_value_scheme,
                     kv_group_size=kv_group_size,
                     kv_quant_scheme=kv_quant_scheme,
                     quantized_kv_start=quantized_kv_start,
@@ -1671,6 +1715,10 @@ class PromptProcessingBatch:
                 model,
                 left_padding,
                 kv_bits=kv_bits,
+                kv_key_bits=kv_key_bits,
+                kv_value_bits=kv_value_bits,
+                kv_key_scheme=kv_key_scheme,
+                kv_value_scheme=kv_value_scheme,
                 kv_group_size=kv_group_size,
                 kv_quant_scheme=kv_quant_scheme,
                 quantized_kv_start=quantized_kv_start,
@@ -2132,6 +2180,10 @@ class BatchGenerator:
         prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
         prompt_cache=None,
         kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
         kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
         quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
@@ -2151,6 +2203,10 @@ class BatchGenerator:
         self.max_tokens = max_tokens
         self.processor = processor
         self.kv_bits = kv_bits
+        self.kv_key_bits = kv_key_bits
+        self.kv_value_bits = kv_value_bits
+        self.kv_key_scheme = kv_key_scheme
+        self.kv_value_scheme = kv_value_scheme
         self.kv_group_size = kv_group_size
         self.kv_quant_scheme = kv_quant_scheme
         self.quantized_kv_start = quantized_kv_start
@@ -2240,7 +2296,10 @@ class BatchGenerator:
         )
 
     def _apc_media_token_ids(self) -> set[int]:
-        return _apc.multimodal_token_ids_from_config(self.model.config)
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return set()
+        return _apc.multimodal_token_ids_from_config(config)
 
     def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
@@ -2382,15 +2441,16 @@ class BatchGenerator:
         apc_mode = getattr(self, "apc_mode", "block")
         # bits + group_size + scheme so warm restore matches live _make_cache
         # backend (uniform BatchQuantized vs BatchTurboQuant).
-        _quant_cfg = (
-            {
-                "bits": self.kv_bits,
-                "group_size": self.kv_group_size,
-                "scheme": self.kv_quant_scheme,
-            }
-            if self.kv_bits is not None
-            else None
+        _quant_policy = kv_quant_from_legacy(
+            self.kv_bits,
+            self.kv_quant_scheme,
+            self.kv_group_size,
+            getattr(self, "kv_key_bits", None),
+            getattr(self, "kv_value_bits", None),
+            getattr(self, "kv_key_scheme", None),
+            getattr(self, "kv_value_scheme", None),
         )
+        _quant_cfg = _quant_policy.to_config() if _quant_policy is not None else None
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
@@ -2445,6 +2505,10 @@ class BatchGenerator:
             thinking_budget_criteria=thinking_budget_criteria,
             prefill_step_size=self.prefill_step_size,
             kv_bits=self.kv_bits,
+            kv_key_bits=getattr(self, "kv_key_bits", None),
+            kv_value_bits=getattr(self, "kv_value_bits", None),
+            kv_key_scheme=getattr(self, "kv_key_scheme", None),
+            kv_value_scheme=getattr(self, "kv_value_scheme", None),
             kv_group_size=self.kv_group_size,
             kv_quant_scheme=self.kv_quant_scheme,
             quantized_kv_start=getattr(
@@ -2754,6 +2818,10 @@ class BatchGenerator:
                 thinking_budget_criteria=thinking_budget_criteria,
                 prefill_step_size=self.prefill_step_size,
                 kv_bits=self.kv_bits,
+                kv_key_bits=getattr(self, "kv_key_bits", None),
+                kv_value_bits=getattr(self, "kv_value_bits", None),
+                kv_key_scheme=getattr(self, "kv_key_scheme", None),
+                kv_value_scheme=getattr(self, "kv_value_scheme", None),
                 kv_group_size=self.kv_group_size,
                 kv_quant_scheme=self.kv_quant_scheme,
                 quantized_kv_start=getattr(
@@ -3050,11 +3118,7 @@ def _generate_batch(
         for i, p in enumerate(prompts)
     ]
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-        else True
-    )
+    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)

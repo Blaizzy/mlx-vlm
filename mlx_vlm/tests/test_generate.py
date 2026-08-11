@@ -27,7 +27,12 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
-from mlx_vlm.models.cache import BatchKVCache, KVCache
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -165,6 +170,20 @@ def mock_model():
 @pytest.fixture
 def mock_processor():
     return MockProcessor()
+
+
+def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
+    model = SimpleNamespace(
+        language_model=MockLanguageModel(),
+        make_cache=lambda: [KVCache()],
+    )
+    generator = ar_module.BatchGenerator(
+        model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+    )
+
+    assert generator._apc_media_token_ids() == set()
 
 
 # ============================================================================
@@ -2229,7 +2248,13 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
         draft_block_size=None,
     )
     model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
-    processor = SimpleNamespace()
+    # A processor with native video support (a declared ``videos`` kwarg plus a
+    # video_processor component) forwards --video untouched; anything less
+    # diverts into the frames fallback.
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
 
     with (
         patch.object(dispatch_module, "parse_arguments", return_value=args),
@@ -2250,6 +2275,88 @@ def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
     assert mock_generate.call_args.kwargs["fps"] == pytest.approx(1.0)
     assert capsys.readouterr().out.strip() == "done"
+
+
+def test_generate_cli_video_frames_fallback_without_video_processor(capsys):
+    video_module = __import__("mlx_vlm.generate.video", fromlist=[""])
+
+    args = Namespace(
+        model="demo",
+        output_modality="text",
+        output=None,
+        size="512x512",
+        steps=4,
+        seed=None,
+        guidance=1.0,
+        adapter_path=None,
+        image=None,
+        audio=None,
+        video=["clip.mp4"],
+        fps=1.0,
+        resize_shape=None,
+        prompt=["Describe this video."],
+        system=None,
+        max_tokens=8,
+        temperature=0.0,
+        repetition_penalty=None,
+        repetition_context_size=20,
+        presence_penalty=None,
+        presence_context_size=20,
+        frequency_penalty=None,
+        frequency_context_size=20,
+        chat=False,
+        verbose=False,
+        eos_tokens=None,
+        max_kv_size=None,
+        kv_bits=None,
+        kv_group_size=64,
+        kv_quant_scheme="uniform",
+        quantized_kv_start=512,
+        skip_special_tokens=False,
+        force_download=False,
+        revision=None,
+        trust_remote_code=False,
+        quantize_activations=False,
+        processor_kwargs={},
+        gen_kwargs={},
+        prefill_step_size=None,
+        enable_thinking=False,
+        thinking_mode=None,
+        thinking_budget=None,
+        thinking_start_token="<think>",
+        thinking_end_token="</think>",
+        draft_model=None,
+        draft_kind=None,
+        draft_block_size=None,
+        video_max_frames=4,
+    )
+    model = SimpleNamespace(config=SimpleNamespace(model_type="gemma4"))
+    processor = SimpleNamespace()
+    frames = [object() for _ in range(6)]
+
+    with (
+        patch.object(dispatch_module, "parse_arguments", return_value=args),
+        patch.object(dispatch_module, "load", return_value=(model, processor)),
+        patch.object(video_module, "sample_video_frames", return_value=(frames, 2.0)),
+        patch.object(
+            dispatch_module, "apply_chat_template", return_value="prompt"
+        ) as mock_apply_chat_template,
+        patch.object(
+            dispatch_module,
+            "generate",
+            return_value=SimpleNamespace(text="done"),
+        ) as mock_generate,
+    ):
+        dispatch_module.main()
+
+    # 6 sampled frames capped to 4, sent as ordered images; --video is spent.
+    assert mock_apply_chat_template.call_args.kwargs["num_images"] == 4
+    assert "video" not in mock_apply_chat_template.call_args.kwargs
+    assert len(mock_generate.call_args.kwargs["image"]) == 4
+    assert mock_generate.call_args.kwargs["video"] is None
+    out = capsys.readouterr().out
+    assert "no native video support" in out
+    assert "4 of 6 sampled frames" in out
 
 
 def test_generate_image_cli_routes_before_vlm_load():
@@ -2323,6 +2430,7 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.output_modality == "text"
     assert args.task == "generate"
     assert args.size is None
+    assert args.verbose is False
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
@@ -2353,6 +2461,129 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+class TestPrefixCacheReuseTrim:
+    """Prompt-cache prefix reuse must trim each cache through its own trim()
+    contract. A raw ``keys[..., :prefix_len, :]`` slice corrupts rotating
+    (sliding-window) ring buffers -- silent wrong output, or a shape crash once
+    speculative decoding wraps them (mlx-vlm issue #1715)."""
+
+    @staticmethod
+    def _fill(cache, n, marker=False, heads=1, dim=4):
+        for i in range(n):
+            v = (
+                mx.full((1, heads, 1, dim), float(i))
+                if marker
+                else mx.zeros((1, heads, 1, dim))
+            )
+            cache.update_and_fetch(v, v)
+        return cache
+
+    def test_flat_cache_trims_to_prefix(self):
+        c = self._fill(KVCache(), 20, marker=True)
+        n_drop = dispatch_module._prefix_cache_trim_amount([c], 8)
+        assert n_drop == 12
+        c.trim(n_drop)
+        keys, _ = c.state
+        assert c.offset == 8 and keys.shape[2] == 8
+        assert bool(mx.array_equal(keys[0, 0, :, 0], mx.arange(8, dtype=keys.dtype)))
+
+    def test_full_prefix_needs_no_trim(self):
+        c = self._fill(KVCache(), 12)
+        assert dispatch_module._prefix_cache_trim_amount([c], 12) == 0
+
+    def test_empty_cache_is_reusable(self):
+        assert dispatch_module._prefix_cache_trim_amount([], 0) == 0
+
+    def test_unwrapped_rotating_trims_and_stays_usable(self):
+        c = self._fill(RotatingKVCache(max_size=512), 100)
+        assert c.offset == 100  # window has not wrapped
+        n_drop = dispatch_module._prefix_cache_trim_amount([c], 40)
+        assert n_drop == 60
+        c.trim(n_drop)
+        assert c.offset == 40 and c._idx == 40
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        assert c.offset == 41
+
+    def test_wrapped_rotating_is_not_reusable(self):
+        c = self._fill(RotatingKVCache(max_size=8), 20)  # ring has wrapped
+        assert c.offset > c.max_size
+        assert dispatch_module._prefix_cache_trim_amount([c], 3) is None
+
+    def test_mixed_flat_and_wrapped_rotating_is_not_reusable(self):
+        flat = self._fill(KVCache(), 20)
+        wrapped = self._fill(RotatingKVCache(max_size=8), 20)
+        assert dispatch_module._prefix_cache_trim_amount([flat, wrapped], 3) is None
+
+    def test_wrapped_buffered_rotating_declined_and_survives_next_step(self):
+        # BufferedRotatingKVCache is what speculative decoding installs; the old
+        # raw slice desynced its ring index and crashed on the next update. When
+        # reuse is declined the cache stays intact, so generation continues.
+        c = BufferedRotatingKVCache.from_cache(
+            self._fill(RotatingKVCache(max_size=8), 20), buffer_size=16
+        )
+        assert dispatch_module._prefix_cache_trim_amount([c], 2) is None
+        c.update_and_fetch(mx.zeros((1, 1, 2, 4)), mx.zeros((1, 1, 2, 4)))
+
+    def test_unwrapped_buffered_rotating_trims(self):
+        # A buffered cache that has not evicted anything (start_position == 0) is
+        # still rollback-able even though is_trimmable() is unconditionally True.
+        c = BufferedRotatingKVCache(max_size=512, buffer_size=16)
+        self._fill(c, 100)
+        assert c.start_position == 0
+        assert dispatch_module._prefix_cache_trim_amount([c], 40) == 60
+        c.trim(60)
+        assert c.offset == 40
+        c.update_and_fetch(mx.zeros((1, 1, 1, 4)), mx.zeros((1, 1, 1, 4)))
+        assert c.offset == 41
+
+
+class TestGemma4LogitsToKeep:
+    class _FakeTextModel:
+        def __init__(self, hidden):
+            self.hidden = hidden
+
+        def __call__(
+            self, inputs=None, inputs_embeds=None, input_embeddings=None, **kwargs
+        ):
+            seq = next(
+                t for t in (inputs, inputs_embeds, input_embeddings) if t is not None
+            )
+            return mx.zeros((1, seq.shape[1], self.hidden))
+
+    def _gemma4_lm(self, hidden):
+        from mlx_vlm.models.gemma4.language import LanguageModel
+
+        lm = LanguageModel.__new__(LanguageModel)
+        lm.model = self._FakeTextModel(hidden)
+        lm.logits_from_hidden = lambda h: h
+        return LanguageModel, lm
+
+    def _gemma4_text_lm(self, hidden):
+        from mlx_vlm.models.gemma4_text.language import LanguageModel
+
+        lm = LanguageModel.__new__(LanguageModel)
+        lm.model = self._FakeTextModel(hidden)
+        lm.tie_word_embeddings = False
+        lm.lm_head = lambda h: h
+        lm.final_logit_softcapping = None
+        return LanguageModel, lm
+
+    def test_gemma4_slices_before_lm_head(self):
+        cls, lm = self._gemma4_lm(hidden=8)
+        ids = mx.zeros((1, 6), dtype=mx.int32)
+        assert cls.supports_logits_to_keep is True
+        assert lm(ids).logits.shape == (1, 6, 8)
+        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
+        assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
+
+    def test_gemma4_text_slices_before_lm_head(self):
+        cls, lm = self._gemma4_text_lm(hidden=8)
+        ids = mx.zeros((1, 6), dtype=mx.int32)
+        assert cls.supports_logits_to_keep is True
+        assert lm(ids).logits.shape == (1, 6, 8)
+        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
 
 
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
