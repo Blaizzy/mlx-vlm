@@ -12,6 +12,67 @@ _HALF_COS = "half"
 _FULL_COS = "full"
 
 
+def _eager_rope_angles(x, offset, frequencies, scale, traditional):
+    positions = mx.arange(x.shape[-2], dtype=mx.float32) + offset
+    positions = positions * scale
+    angles = positions[:, None] * frequencies[None]
+    if traditional:
+        return mx.repeat(angles, 2, axis=-1)
+    return mx.concatenate([angles, angles], axis=-1)
+
+
+def _eager_rope_rotate(x, dims, traditional):
+    x = x[..., :dims]
+    if traditional:
+        return mx.stack([-x[..., 1::2], x[..., ::2]], axis=-1).reshape(x.shape)
+    midpoint = dims // 2
+    return mx.concatenate([-x[..., midpoint:], x[..., :midpoint]], axis=-1)
+
+
+def _eager_rope_apply(x, cos, sin, dims, traditional):
+    x_rope = x[..., :dims]
+    rotated = _eager_rope_rotate(x, dims, traditional)
+    out = x_rope * cos + rotated * sin
+    if dims < x.shape[-1]:
+        out = mx.concatenate([out, x[..., dims:]], axis=-1)
+    return out
+
+
+@mx.compile
+def _compiled_eager_rope(x, offset, frequencies, scale, traditional):
+    dims = frequencies.shape[0] * 2
+    angles = _eager_rope_angles(x, offset, frequencies, scale, traditional)
+    cos = mx.cos(angles).astype(x.dtype)[None, None]
+    sin = mx.sin(angles).astype(x.dtype)[None, None]
+    return _eager_rope_apply(x, cos, sin, dims, traditional)
+
+
+@mx.compile
+def _compiled_eager_rope_qk(q, k, offset, frequencies, scale, traditional):
+    dims = frequencies.shape[0] * 2
+    angles = _eager_rope_angles(q, offset, frequencies, scale, traditional)
+    cos = mx.cos(angles).astype(q.dtype)[None, None]
+    sin = mx.sin(angles).astype(q.dtype)[None, None]
+    return (
+        _eager_rope_apply(q, cos, sin, dims, traditional),
+        _eager_rope_apply(k, cos, sin, dims, traditional),
+    )
+
+
+@mx.compile
+def _compiled_eager_rope_qk_half_split(q, k, offset, frequencies, scale):
+    positions = mx.arange(q.shape[-2], dtype=mx.float32) + offset
+    positions = positions * scale
+    angles = positions[:, None] * frequencies[None]
+    angles = mx.concatenate([angles, angles], axis=-1)
+    cos = mx.cos(angles).astype(q.dtype)[None, None]
+    sin = mx.sin(angles).astype(q.dtype)[None, None]
+    midpoint = q.shape[-1] // 2
+    q_rotated = mx.concatenate([-q[..., midpoint:], q[..., :midpoint]], axis=-1)
+    k_rotated = mx.concatenate([-k[..., midpoint:], k[..., :midpoint]], axis=-1)
+    return q * cos + q_rotated * sin, k * cos + k_rotated * sin
+
+
 class EagerRoPE(nn.Module):
     """RoPE with explicit FP32 frequencies and activation-dtype cos/sin."""
 
@@ -27,34 +88,46 @@ class EagerRoPE(nn.Module):
         self.traditional = traditional
         self.base = base
         self.scale = scale
+        self._frequencies = 1.0 / (
+            base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+        )
+        self._scale = mx.array(scale, dtype=mx.float32)
 
     def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
-        positions = mx.arange(offset, offset + x.shape[-2], dtype=mx.float32)
-        positions = positions * self.scale
-        frequencies = 1.0 / (
-            self.base ** (mx.arange(0, self.dims, 2, dtype=mx.float32) / self.dims)
+        return _compiled_eager_rope(
+            x,
+            mx.array(offset, dtype=mx.float32),
+            self._frequencies,
+            self._scale,
+            self.traditional,
         )
-        angles = positions[:, None] * frequencies[None]
 
-        x_rope = x[..., : self.dims]
-        if self.traditional:
-            angles = mx.repeat(angles, 2, axis=-1)
-            rotated = mx.stack([-x_rope[..., 1::2], x_rope[..., ::2]], axis=-1).reshape(
-                x_rope.shape
+    def apply_qk(
+        self, q: mx.array, k: mx.array, offset: int = 0
+    ) -> tuple[mx.array, mx.array]:
+        if q.dtype != k.dtype or q.shape[-2] != k.shape[-2]:
+            return self(q, offset=offset), self(k, offset=offset)
+        offset = mx.array(offset, dtype=mx.float32)
+        if (
+            not self.traditional
+            and self.dims == q.shape[-1]
+            and self.dims == k.shape[-1]
+        ):
+            return _compiled_eager_rope_qk_half_split(
+                q,
+                k,
+                offset,
+                self._frequencies,
+                self._scale,
             )
-        else:
-            angles = mx.concatenate([angles, angles], axis=-1)
-            midpoint = self.dims // 2
-            rotated = mx.concatenate(
-                [-x_rope[..., midpoint:], x_rope[..., :midpoint]], axis=-1
-            )
-
-        cos = mx.cos(angles).astype(x.dtype)[None, None]
-        sin = mx.sin(angles).astype(x.dtype)[None, None]
-        out = x_rope * cos + rotated * sin
-        if self.dims < x.shape[-1]:
-            out = mx.concatenate([out, x[..., self.dims :]], axis=-1)
-        return out
+        return _compiled_eager_rope_qk(
+            q,
+            k,
+            offset,
+            self._frequencies,
+            self._scale,
+            self.traditional,
+        )
 
 
 class SuScaledRoPE(nn.Module):

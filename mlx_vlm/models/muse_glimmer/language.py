@@ -123,8 +123,11 @@ class Attention(nn.Module):
 
         if self.use_rope:
             offset = cache.offset if cache is not None else 0
-            queries = self.rope(queries, offset=offset)
-            keys = self.rope(keys, offset=offset)
+            if hasattr(self.rope, "apply_qk"):
+                queries, keys = self.rope.apply_qk(queries, keys, offset=offset)
+            else:
+                queries = self.rope(queries, offset=offset)
+                keys = self.rope(keys, offset=offset)
 
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
