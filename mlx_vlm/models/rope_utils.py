@@ -47,32 +47,6 @@ def _compiled_eager_rope(x, offset, frequencies, scale, traditional):
     return _eager_rope_apply(x, cos, sin, dims, traditional)
 
 
-@mx.compile
-def _compiled_eager_rope_qk(q, k, offset, frequencies, scale, traditional):
-    dims = frequencies.shape[0] * 2
-    angles = _eager_rope_angles(q, offset, frequencies, scale, traditional)
-    cos = mx.cos(angles).astype(q.dtype)[None, None]
-    sin = mx.sin(angles).astype(q.dtype)[None, None]
-    return (
-        _eager_rope_apply(q, cos, sin, dims, traditional),
-        _eager_rope_apply(k, cos, sin, dims, traditional),
-    )
-
-
-@mx.compile
-def _compiled_eager_rope_qk_half_split(q, k, offset, frequencies, scale):
-    positions = mx.arange(q.shape[-2], dtype=mx.float32) + offset
-    positions = positions * scale
-    angles = positions[:, None] * frequencies[None]
-    angles = mx.concatenate([angles, angles], axis=-1)
-    cos = mx.cos(angles).astype(q.dtype)[None, None]
-    sin = mx.sin(angles).astype(q.dtype)[None, None]
-    midpoint = q.shape[-1] // 2
-    q_rotated = mx.concatenate([-q[..., midpoint:], q[..., :midpoint]], axis=-1)
-    k_rotated = mx.concatenate([-k[..., midpoint:], k[..., :midpoint]], axis=-1)
-    return q * cos + q_rotated * sin, k * cos + k_rotated * sin
-
-
 class EagerRoPE(nn.Module):
     """RoPE with explicit FP32 frequencies and activation-dtype cos/sin."""
 
@@ -97,33 +71,6 @@ class EagerRoPE(nn.Module):
         return _compiled_eager_rope(
             x,
             mx.array(offset, dtype=mx.float32),
-            self._frequencies,
-            self._scale,
-            self.traditional,
-        )
-
-    def apply_qk(
-        self, q: mx.array, k: mx.array, offset: int = 0
-    ) -> tuple[mx.array, mx.array]:
-        if q.dtype != k.dtype or q.shape[-2] != k.shape[-2]:
-            return self(q, offset=offset), self(k, offset=offset)
-        offset = mx.array(offset, dtype=mx.float32)
-        if (
-            not self.traditional
-            and self.dims == q.shape[-1]
-            and self.dims == k.shape[-1]
-        ):
-            return _compiled_eager_rope_qk_half_split(
-                q,
-                k,
-                offset,
-                self._frequencies,
-                self._scale,
-            )
-        return _compiled_eager_rope_qk(
-            q,
-            k,
-            offset,
             self._frequencies,
             self._scale,
             self.traditional,

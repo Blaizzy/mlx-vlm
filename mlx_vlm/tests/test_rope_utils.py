@@ -69,21 +69,6 @@ def test_eager_rope_uses_fp32_frequencies_and_activation_dtype_trig():
     assert bool(mx.array_equal(output, expected).item())
 
 
-@pytest.mark.parametrize("traditional", [False, True])
-def test_eager_rope_fused_qk_matches_individual_application(traditional):
-    q = (mx.arange(2 * 3 * 4 * 10).reshape(2, 3, 4, 10) / 17).astype(mx.bfloat16)
-    k = (mx.arange(2 * 2 * 4 * 10).reshape(2, 2, 4, 10) / 13).astype(mx.bfloat16)
-    rope = EagerRoPE(dims=8, traditional=traditional, base=10000.0)
-
-    expected_q = rope(q, offset=7)
-    expected_k = rope(k, offset=7)
-    actual_q, actual_k = rope.apply_qk(q, k, offset=7)
-    mx.eval(expected_q, expected_k, actual_q, actual_k)
-
-    assert bool(mx.array_equal(actual_q, expected_q).item())
-    assert bool(mx.array_equal(actual_k, expected_k).item())
-
-
 def test_mrope_rotary_embedding_evals_private_helper_arrays_on_init(monkeypatch):
     eval_args = []
     monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))
