@@ -59,9 +59,8 @@ class CompassRotaryEmbedding(nn.Module):
         self.dim = config.head_dim
         self.rope_style = config.rope_style
         rope_parameters = config.rope_parameters
-        uses_per_layer_rope = (
-            isinstance(rope_parameters, dict)
-            and any(layer in rope_parameters for layer in config.layer_types)
+        uses_per_layer_rope = isinstance(rope_parameters, dict) and any(
+            layer in rope_parameters for layer in config.layer_types
         )
         if uses_per_layer_rope:
             rope_parameters = rope_parameters.get(layer_type)
@@ -74,13 +73,14 @@ class CompassRotaryEmbedding(nn.Module):
         rope_parameters = rope_parameters or {}
         rope_theta = rope_parameters.get(
             "rope_theta",
-            config.swa_rope_theta
-            if layer_type == "sliding_attention"
-            else config.rope_theta,
+            (
+                config.swa_rope_theta
+                if layer_type == "sliding_attention"
+                else config.rope_theta
+            ),
         )
         self._inv_freq = 1.0 / (
-            rope_theta
-            ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
+            rope_theta ** (mx.arange(0, self.dim, 2, dtype=mx.float32) / self.dim)
         )
         section = rope_parameters.get("mrope_section")
         if (
@@ -107,9 +107,9 @@ class CompassRotaryEmbedding(nn.Module):
 
     def __call__(self, x: mx.array, position_ids: mx.array):
         if position_ids.ndim == 3 and self.position_selector is not None:
-            positions = mx.take(
-                position_ids, self.position_selector, axis=0
-            ).transpose(1, 2, 0)
+            positions = mx.take(position_ids, self.position_selector, axis=0).transpose(
+                1, 2, 0
+            )
             freqs = positions.astype(mx.float32) * self.inv_freq
         else:
             freqs = position_ids.astype(mx.float32)[..., None] * self.inv_freq
@@ -292,7 +292,9 @@ def _rotate_half_split(x):
 def _apply_rope(q, k, cos, sin, rope_style):
     cos = mx.expand_dims(cos, axis=1)
     sin = mx.expand_dims(sin, axis=1)
-    rotate_half = _rotate_half_interleaved if rope_style == "interleave" else _rotate_half_split
+    rotate_half = (
+        _rotate_half_interleaved if rope_style == "interleave" else _rotate_half_split
+    )
     return (
         (q * cos + rotate_half(q) * sin).astype(q.dtype),
         (k * cos + rotate_half(k) * sin).astype(k.dtype),
@@ -351,11 +353,7 @@ class TextModel(nn.Module):
             for layer_type in layer_types
         }
         self.rotary_emb = next(
-            (
-                rotary
-                for rotary in self.rotary_embeddings.values()
-                if rotary.enabled
-            ),
+            (rotary for rotary in self.rotary_embeddings.values() if rotary.enabled),
             next(iter(self.rotary_embeddings.values())),
         )
 
@@ -399,9 +397,7 @@ class TextModel(nn.Module):
                     position_ids[None, ...], (3, h.shape[0], h.shape[1])
                 )
         position_embeddings = {
-            layer_type: (
-                rotary(h, position_ids) if rotary.enabled else None
-            )
+            layer_type: (rotary(h, position_ids) if rotary.enabled else None)
             for layer_type, rotary in self.rotary_embeddings.items()
         }
 
@@ -653,9 +649,7 @@ class LanguageModel(nn.Module):
                     count = int(visual_pos_masks[row].sum().item())
                     for layer, embeds in enumerate(deepstack_visual_embeds):
                         embed_windows[layer].append(
-                            embeds[
-                                row_offset + before : row_offset + before + count
-                            ]
+                            embeds[row_offset + before : row_offset + before + count]
                         )
                     row_offset += row_visuals
                 deepstack_visual_embeds = [

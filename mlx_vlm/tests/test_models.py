@@ -12145,9 +12145,7 @@ class TestCohereCompass(unittest.TestCase):
         self.assertEqual(k_split.tolist(), [[[[-7.0, -8.0, 5.0, 6.0]]]])
 
     def test_vision_rope_uses_split_frequency_layout(self):
-        from mlx_vlm.models.cohere_compass.vision import (
-            _vision_position_embeddings,
-        )
+        from mlx_vlm.models.cohere_compass.vision import _vision_position_embeddings
 
         rotary = mx.array([[0.0, mx.pi / 2]])
         cos, sin = _vision_position_embeddings(rotary)
@@ -12320,6 +12318,7 @@ class TestCohereCompass(unittest.TestCase):
     def test_batched_padding_matches_single_rows(self):
         from mlx_vlm.generate.ar import _make_cache
 
+        mx.random.seed(0)
         model = self._tiny_model()
         model.update(
             tree_map(lambda value: value.astype(mx.bfloat16), model.parameters())
