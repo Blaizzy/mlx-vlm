@@ -94,8 +94,7 @@ def _dflash_rounds(
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "Speculative decoding with a DFlash drafter currently only "
-            "supports mlx_vlm.models.qwen3_5."
+            "This target does not currently support DFlash speculative decoding."
         )
 
     target_layer_ids = list(draft_model.config.target_layer_ids)

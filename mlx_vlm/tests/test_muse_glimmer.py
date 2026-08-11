@@ -219,6 +219,37 @@ def test_cache_matches_layer_attention_type():
     assert isinstance(caches[1], KVCache)
 
 
+def test_dflash_capture_and_rollback_hooks():
+    model = Model(tiny_config()).language_model
+    caches = model.make_cache()
+    outputs = model(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        cache=caches,
+        capture_layer_ids=[0, 1],
+    )
+    mx.eval(outputs.logits, outputs.hidden_states)
+
+    assert len(outputs.hidden_states) == 2
+    assert all(hidden.shape == (1, 3, 16) for hidden in outputs.hidden_states)
+    assert [cache.offset for cache in caches] == [3, 3]
+
+    verify = model(
+        mx.array([[4, 5, 6, 7]], dtype=mx.int32),
+        cache=caches,
+        capture_layer_ids=[0, 1],
+    )
+    mx.eval(verify.logits)
+    accepted = model.rollback_speculative_cache(
+        caches,
+        verify.gdn_states,
+        accepted=1,
+        block_size=4,
+    )
+
+    assert accepted == 1
+    assert [cache.offset for cache in caches] == [5, 5]
+
+
 def test_checkpoint_prefixes_are_sanitized_to_native_modules():
     model = Model(tiny_config())
     weights = model.sanitize(

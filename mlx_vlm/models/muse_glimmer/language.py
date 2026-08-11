@@ -189,6 +189,8 @@ class TextModel(nn.Module):
         inputs: Optional[mx.array],
         cache=None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[list[int]] = None,
+        hidden_sink: Optional[list[mx.array]] = None,
     ) -> mx.array:
         hidden_states = inputs_embeds
         if hidden_states is None:
@@ -205,9 +207,12 @@ class TextModel(nn.Module):
                 window_size=self.sliding_window,
             )
 
-        for layer, layer_cache in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for layer_idx, (layer, layer_cache) in enumerate(zip(self.layers, cache)):
             mask = sliding_mask if layer.is_sliding else full_mask
             hidden_states = layer(hidden_states, mask=mask, cache=layer_cache)
+            if hidden_sink is not None and layer_idx in capture_set:
+                hidden_sink.append(hidden_states)
         return self.norm(hidden_states)
 
 
@@ -222,6 +227,24 @@ class LanguageModel(nn.Module):
         self.final_logit_softcapping = args.final_logit_softcapping
         self.output_multiplier = args.output_multiplier
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        if draft_model is None:
+            return True
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_kind in ("dflash", "eagle3"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return False
+
     def __call__(
         self,
         inputs: Optional[mx.array] = None,
@@ -231,11 +254,67 @@ class LanguageModel(nn.Module):
     ) -> LanguageModelOutput:
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        hidden_states = self.model(inputs, cache=cache, inputs_embeds=inputs_embeds)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        hidden_sink: Optional[list[mx.array]] = (
+            [] if capture_layer_ids is not None else None
+        )
+        hidden_states = self.model(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+        )
         logits = self.lm_head(hidden_states) * self.output_multiplier
         softcap = self.final_logit_softcapping
         logits = mx.tanh(logits / softcap) * softcap
-        return LanguageModelOutput(logits=logits)
+        return LanguageModelOutput(logits=logits, hidden_states=hidden_sink)
+
+    def rollback_speculative_cache(
+        self,
+        caches: list[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        """Rewind target KV caches to the accepted speculative prefix."""
+
+        del gdn_states
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+        if isinstance(accepted, (list, tuple)):
+            accepted = mx.array(accepted, dtype=mx.int32)
+
+        max_accepted = int(accepted.max().item())
+        retained = max_accepted + 1
+        trim = block_size - retained
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        for cache in caches:
+            if cache is None:
+                continue
+            if trim > 0 and hasattr(cache, "trim"):
+                cache.trim(trim)
+            if (
+                is_batch
+                and hasattr(cache, "_idx")
+                and cache.keys is not None
+                and max_accepted > 0
+            ):
+                cache_length = cache._idx
+                verify_start = cache_length - retained
+                for row, valid_end in enumerate(valid_ends.tolist()):
+                    start = verify_start + int(valid_end)
+                    if start >= cache_length:
+                        continue
+                    zero_row_tail = getattr(cache, "zero_row_tail", None)
+                    if callable(zero_row_tail):
+                        zero_row_tail(row, start, cache_length)
+                    else:
+                        cache.keys[row, :, start:cache_length, :] = 0
+                        cache.values[row, :, start:cache_length, :] = 0
+        return max_accepted
 
     @property
     def layers(self):
