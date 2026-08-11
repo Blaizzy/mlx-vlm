@@ -14,11 +14,21 @@ logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
+_HARMONY_START_MARKER = "<|start|>"
+_HARMONY_MESSAGE_MARKER = "<|message|>"
+_HARMONY_CHANNEL_HEADER = re.compile(r"<\|start\|>[^<]*?<\|message\|>")
+# When the model answers without reasoning first, add_generation_prompt has
+# already emitted "<|start|>assistant", so the header it writes has no prefix.
+_HARMONY_BARE_HEADER = re.compile(r"^to=[^<]*?<\|message\|>")
+_CONTENT_END_MARKERS = ("<|eom|>", "<|eot|>")
 
 
-def _strip_content_markers(text: str) -> str:
-    for marker in _CONTENT_MARKERS:
+def _strip_content_markers(text: str, strip_bare_header: bool = True) -> str:
+    for marker in _CONTENT_MARKERS + _CONTENT_END_MARKERS:
         text = text.replace(marker, "")
+    text = _HARMONY_CHANNEL_HEADER.sub("", text)
+    if strip_bare_header:
+        text = _HARMONY_BARE_HEADER.sub("", text, count=1)
     return text
 
 
@@ -59,6 +69,7 @@ class ThinkingStreamState:
         self.close_markers = tuple(marker for _, marker in self.open_close_markers)
         self.in_thinking = bool(enable_thinking)
         self.thinking_done = False
+        self.content_started = False
         self.buffer = ""
 
     def feed(self, text: str) -> ThinkingStreamDelta:
@@ -89,9 +100,20 @@ class ThinkingStreamState:
                 thinking_closed = True
                 continue
 
+            if not self.content_started and not self._starts_like_open_marker(
+                self.buffer
+            ):
+                header = _HARMONY_BARE_HEADER.match(self.buffer)
+                if header:
+                    self.buffer = self.buffer[header.end() :]
+                    if not self.buffer:
+                        break
+                elif self._is_partial_bare_header(self.buffer):
+                    break
+
             if self.thinking_done:
-                emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
-                emit = _strip_content_markers(emit)
+                emit, self.buffer = self._split_content_partial(self.buffer)
+                emit = _strip_content_markers(emit, strip_bare_header=False)
                 if emit:
                     content.append(emit)
                 break
@@ -99,22 +121,28 @@ class ThinkingStreamState:
             idx, marker = self._find_first(self.buffer, self.open_markers)
             if idx < 0:
                 emit, self.buffer = self._split_partial(self.buffer, self.open_markers)
-                emit = _strip_content_markers(emit)
+                emit = _strip_content_markers(emit, strip_bare_header=False)
                 if emit:
                     content.append(emit)
                 break
 
             if idx:
-                emit = _strip_content_markers(self.buffer[:idx])
+                emit = _strip_content_markers(
+                    self.buffer[:idx], strip_bare_header=False
+                )
                 if emit:
                     content.append(emit)
 
             self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
             self.in_thinking = True
 
+        emitted_content = "".join(content)
+        if emitted_content:
+            self.content_started = True
+
         return ThinkingStreamDelta(
             reasoning="".join(reasoning) or None,
-            content="".join(content) or None,
+            content=emitted_content or None,
             thinking_closed=thinking_closed,
         )
 
@@ -155,6 +183,45 @@ class ThinkingStreamState:
         if hold:
             return text[:-hold], text[-hold:]
         return text, ""
+
+    @staticmethod
+    def _split_content_partial(text: str) -> Tuple[str, str]:
+        emit, partial = ThinkingStreamState._split_partial(
+            text, _CONTENT_MARKERS + _CONTENT_END_MARKERS + (_HARMONY_START_MARKER,)
+        )
+        start = text.rfind(_HARMONY_START_MARKER)
+        if start >= 0:
+            header_tail = text[start + len(_HARMONY_START_MARKER) :]
+            message_start = header_tail.find("<")
+            is_partial_header = _HARMONY_MESSAGE_MARKER not in header_tail and (
+                message_start < 0
+                or _HARMONY_MESSAGE_MARKER.startswith(header_tail[message_start:])
+            )
+            partial_start = len(text) - len(partial) if partial else len(text)
+            if is_partial_header and start < partial_start:
+                return text[:start], text[start:]
+        return emit, partial
+
+    def _starts_like_open_marker(self, text: str) -> bool:
+        """Whether text is, or could still become, a thinking open marker."""
+        return any(
+            text.startswith(marker) or marker.startswith(text)
+            for marker in self.open_markers
+        )
+
+    @staticmethod
+    def _is_partial_bare_header(text: str) -> bool:
+        """Whether text could still grow into a bare to=...<|message|> header."""
+        prefix = "to="
+        if len(text) < len(prefix):
+            return prefix.startswith(text)
+        if not text.startswith(prefix):
+            return False
+        recipient = text[len(prefix) :]
+        marker_start = recipient.find("<")
+        if marker_start < 0:
+            return True
+        return _HARMONY_MESSAGE_MARKER.startswith(recipient[marker_start:])
 
     def _strip_open_marker(self, text: str) -> str:
         for marker in self.open_markers:

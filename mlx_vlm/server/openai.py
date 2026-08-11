@@ -820,7 +820,10 @@ async def responses_input_tokens_endpoint(request: Request):
         del model
         chat_tools, _ = _response_tool_registry(openai_request.tools)
         gen_args = _build_gen_args(
-            openai_request, processor, tenant_id=_read_tenant_id(request)
+            openai_request,
+            processor,
+            config=config,
+            tenant_id=_read_tenant_id(request),
         )
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -986,7 +989,10 @@ async def responses_endpoint(request: Request):
 
         try:
             gen_args = _build_gen_args(
-                openai_request, processor, tenant_id=_read_tenant_id(request)
+                openai_request,
+                processor,
+                config=config,
+                tenant_id=_read_tenant_id(request),
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -1696,7 +1702,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         try:
             gen_args = _build_gen_args(
-                request, processor, tenant_id=_read_tenant_id(http_request)
+                request,
+                processor,
+                config=config,
+                tenant_id=_read_tenant_id(http_request),
             )
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))

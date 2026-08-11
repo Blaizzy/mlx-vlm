@@ -810,6 +810,8 @@ class GenerationArguments:
             kw["reasoning"] = self.reasoning
         if self.reasoning_effort is not None:
             kw["reasoning_effort"] = self.reasoning_effort
+            # Muse Glimmer's chat template reads the reasoning_strength alias.
+            kw["reasoning_strength"] = self.reasoning_effort
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:

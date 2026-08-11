@@ -481,7 +481,10 @@ async def anthropic_messages_endpoint(http_request: Request):
 
         try:
             gen_args = _build_gen_args(
-                request, processor, tenant_id=_read_tenant_id(http_request)
+                request,
+                processor,
+                config=config,
+                tenant_id=_read_tenant_id(http_request),
             )
         except Exception as e:
             return _anthropic_error_response(400, str(e))
@@ -1055,7 +1058,10 @@ async def anthropic_count_tokens_endpoint(http_request: Request):
             _anthropic_messages_to_internal(request)
         )
         gen_args = _build_gen_args(
-            request, processor, tenant_id=_read_tenant_id(http_request)
+            request,
+            processor,
+            config=config,
+            tenant_id=_read_tenant_id(http_request),
         )
         template_kwargs = gen_args.to_template_kwargs()
         if tool_choice is not None:
