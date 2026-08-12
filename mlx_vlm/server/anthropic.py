@@ -671,7 +671,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                         for event in start_message_event():
                             yield event
 
-                        thinking_delta = thinking_state.feed(delta)
+                        thinking_delta = thinking_state.feed(
+                            delta, last=bool(getattr(token, "finish_reason", None))
+                        )
                         delta_reasoning = thinking_delta.reasoning
                         delta_content = thinking_delta.content
 
