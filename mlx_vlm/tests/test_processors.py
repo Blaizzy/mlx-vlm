@@ -3254,6 +3254,49 @@ class TestLocateAnythingProcessor(unittest.TestCase):
             self.assertEqual(reloaded.tokenizer.chat_template, chat_template)
 
 
+class TestMuseGlimmerProcessor(unittest.TestCase):
+    def test_from_pretrained_attaches_model_config(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
+            MuseGlimmerProcessor,
+        )
+
+        tokenizer = _mock_tokenizer(chat_template="{{ messages }}")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "muse_glimmer",
+                        "text_config": {
+                            "vocab_size": 1234,
+                            "eos_token_id": 99,
+                        },
+                    }
+                )
+            )
+            with (
+                patch(
+                    "transformers.AutoTokenizer.from_pretrained",
+                    return_value=tokenizer,
+                ),
+                patch.object(
+                    MuseGlimmerProcessor,
+                    "check_argument_for_proper_class",
+                    return_value=None,
+                ),
+            ):
+                processor = MuseGlimmerProcessor.from_pretrained(tmpdir)
+
+        self.assertEqual(processor.config.model_type, "muse_glimmer")
+        self.assertEqual(processor.config.vocab_size, 1234)
+        self.assertEqual(processor.config.eos_token_id, 99)
+        self.assertEqual(processor.config.thinking_start_token, "to=self<|message|>")
+        self.assertEqual(processor.config.thinking_end_token, "<|eom|>")
+
+
 class TestProcessorRegistration(unittest.TestCase):
     _AFFECTED_MODULES = (
         "mlx_vlm.models.glm4v.glm4v",

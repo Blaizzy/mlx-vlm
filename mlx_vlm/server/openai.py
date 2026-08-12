@@ -32,7 +32,6 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
-    ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
@@ -42,6 +41,7 @@ from .responses_state import (
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _store_response,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     response_store,
@@ -1095,7 +1095,8 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
-                    thinking_state = ThinkingStreamState(
+                    thinking_state = make_response_stream_state(
+                        processor,
                         prompt_has_open_thinking(
                             formatted_prompt,
                             gen_args.enable_thinking,
@@ -1232,6 +1233,7 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                             reasoning_item_id,
+                            processor=processor,
                         )
                     )
                     tool_output_items = [
@@ -1490,6 +1492,7 @@ async def responses_endpoint(request: Request):
                         tool_registry,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        processor=processor,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -1783,7 +1786,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState(
+                        thinking_state = make_response_stream_state(
+                            processor,
                             prompt_has_open_thinking(
                                 formatted_prompt,
                                 gen_args.enable_thinking,
@@ -1935,7 +1939,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState(
+                        thinking_state = make_response_stream_state(
+                            processor,
                             prompt_has_open_thinking(
                                 formatted_prompt,
                                 gen_args.enable_thinking,
@@ -2187,6 +2192,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     ),
+                    processor=processor,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens
