@@ -598,6 +598,7 @@ class APCStats:
     disk_writes: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
+    exact_store_dedups: int = 0
     rejects: int = 0
     rejects_by_reason: Dict[str, int] = field(default_factory=dict)
     last_reject: Optional[Dict[str, Any]] = None
@@ -626,6 +627,7 @@ class APCStats:
             "disk_writes": self.disk_writes,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
+            "exact_store_dedups": self.exact_store_dedups,
             "rejects": self.rejects,
             "rejects_by_reason": dict(self.rejects_by_reason),
             "last_reject": (
@@ -3124,28 +3126,78 @@ class APCManager:
         prompt_cache: Sequence[Any],
         *,
         extra_hash: int = 0,
+        clone: bool = True,
+        disk: bool = True,
     ) -> bool:
-        """Store a full prompt-cache snapshot for exact-prefix reuse."""
+        """Store a full prompt-cache snapshot for exact-prefix reuse.
+
+        With ``clone=False`` the caller transfers ownership of the snapshot to
+        the APC manager: ``prompt_cache`` is stored as-is (no defensive deep
+        copy), so the caller must not mutate it afterwards.
+
+        ``disk=False`` keeps the entry in the memory tier only. Use it for
+        entries whose reuse is confined to the current process -- persisting
+        those costs a large write per request and evicts entries that a later
+        run could actually hit. Both disk-write sites below honour it,
+        including the dedup path: a warm exact hit re-stores its full prefix
+        every time, so leaving that one ungated would keep writing the very
+        entry the flag exists to keep off disk.
+        """
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
-        if copied is None:
-            types = [type(c).__name__ for c in prompt_cache]
-            logger.warning(
-                "APC exact-cache store rejected: unclonable prompt cache types %s "
-                "(token_len=%d). Exact-mode APC will not reuse this prefix.",
-                types,
-                len(token_tuple),
-            )
-            with self.lock:
-                self.stats.record_reject(
-                    "unclonable",
-                    types=types,
-                    token_len=len(token_tuple),
-                )
-            return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+        existing_cache: Optional[List[Any]] = None
+        with self.lock:
+            existing = self._exact_cache.get(key)
+            if (
+                existing is not None
+                and existing.token_ids == token_tuple
+                and existing.extra_hash == int(extra_hash)
+            ):
+                # Re-store of an identical entry (every warm exact hit
+                # re-stores its full prefix): refresh recency and skip the
+                # multi-GB clone that would otherwise sit between prefill and
+                # first token.
+                self._exact_cache.move_to_end(key)
+                existing.last_used = time.time()
+                self.stats.exact_store_dedups += 1
+                existing_cache = existing.prompt_cache
+        if existing_cache is not None:
+            if self.disk is not None and disk:
+                try:
+                    # Sharing the stored snapshot with the disk writer is safe:
+                    # _enqueue_exact_snapshot dedups an existing shard before
+                    # serializing, and LRU entries are never mutated in place.
+                    self.disk.save_exact_cache(
+                        key, token_tuple, extra_hash, existing_cache
+                    )
+                    with self.lock:
+                        self.stats.disk_writes += 1
+                except Exception as e:
+                    logger.warning("APC exact disk save scheduling failed: %s", e)
+            with self.lock:
+                self.stats.exact_stores += 1
+            return True
+        if clone:
+            copied = _clone_prompt_cache_for_apc(prompt_cache)
+            if copied is None:
+                types = [type(c).__name__ for c in prompt_cache]
+                logger.warning(
+                    "APC exact-cache store rejected: unclonable prompt cache types %s "
+                    "(token_len=%d). Exact-mode APC will not reuse this prefix.",
+                    types,
+                    len(token_tuple),
+                )
+                with self.lock:
+                    self.stats.record_reject(
+                        "unclonable",
+                        types=types,
+                        token_len=len(token_tuple),
+                    )
+                return False
+        else:
+            copied = list(prompt_cache)
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
@@ -3167,7 +3219,7 @@ class APCManager:
                 token_len=len(token_tuple),
                 layers=len(copied),
             )
-        if self.disk is not None:
+        if self.disk is not None and disk:
             try:
                 self.disk.save_exact_cache(key, token_tuple, extra_hash, copied)
                 with self.lock:

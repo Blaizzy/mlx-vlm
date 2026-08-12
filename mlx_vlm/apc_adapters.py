@@ -353,7 +353,33 @@ class RotatingKVCacheCloneAdapter:
         out.offset = int(getattr(c, "offset", 0) or 0)
         out._idx = int(getattr(c, "_idx", 0) or 0)
         if c.keys is not None and c.values is not None:
-            out.keys, out.values = copy(c.keys), copy(c.values)
+            # A one-shot (S > 1) prefill concatenates from None, so the live
+            # buffer physically retains ALL tokens (keys.shape[2] == offset ==
+            # _idx even when offset >> max_size). Snapshotting that verbatim
+            # stores O(prompt) tokens per sliding layer instead of O(window):
+            # for Muse-Glimmer (39 sliding layers, window 2048, ~1 KB per
+            # token per layer) a 36k-token prompt wastes ~1.4 GB per entry.
+            # When the buffer is in this pure linear retained-all state — and
+            # keep == 0, so there are no sink tokens the tail slice would
+            # drop — keep only the last `max_size` positions. This is lossless
+            # for every downstream consumer: BatchRotatingKVCache.merge takes
+            # _temporal_order(keys)[..., -min(offset, max_size):, :], which is
+            # exactly this window (with _idx == keys.shape[2] the temporal
+            # order is a no-op), and a direct in-place decode continuation
+            # behaves identically to a cold cache after its first post-prefill
+            # trim.
+            if (
+                int(getattr(c, "keep", 0) or 0) == 0
+                and int(c._idx) == int(c.keys.shape[2])
+                and int(c.offset) == int(c._idx)
+                and int(c.offset) > int(c.max_size)
+            ):
+                out.keys = copy(c.keys[..., -int(c.max_size) :, :])
+                out.values = copy(c.values[..., -int(c.max_size) :, :])
+                out._idx = int(c.max_size)
+                # out.offset stays at the full logical length on purpose.
+            else:
+                out.keys, out.values = copy(c.keys), copy(c.values)
             eval_targets.extend([out.keys, out.values])
         return out
 

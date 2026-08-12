@@ -36,6 +36,7 @@ from ..generate.diffusion import (
     stream_diffusion_generate_from_kwargs,
 )
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..speculative import apc_dflash as _apc_dflash
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -184,8 +185,19 @@ def _run_chunked_speculative_prefill(
     *,
     prefill_step_size: Optional[int],
     generation_stream,
+    checkpoint_at: Optional[int] = None,
+    on_checkpoint=None,
 ) -> Tuple[object, mx.array]:
-    """Prefill target cache in chunks, capturing speculative state only at end."""
+    """Prefill target cache in chunks, capturing speculative state only at end.
+
+    ``checkpoint_at``/``on_checkpoint`` let a caller observe the cache exactly
+    once, at the moment the prefill has consumed that many positions. A chunk
+    edge is shortened so it lands on the position rather than straddling it.
+    Used to capture the static system+tools prefix while the sliding-window
+    layers still hold the window ending there (see apc_dflash's
+    store_prefix_checkpoint); after the full prefill those tokens have rotated
+    out and no trim can recover them.
+    """
     remaining_input_ids = input_ids
     remaining_embeds = inputs_embeds
     remaining_kwargs = dict(prompt_kwargs or {})
@@ -200,8 +212,17 @@ def _run_chunked_speculative_prefill(
         and prefill_step_size > 0
         and remaining_embeds.shape[1] > prefill_step_size
     ):
+        processed = 0
         while remaining_embeds.shape[1] > 1:
             n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
+            # Land a chunk edge exactly on the checkpoint instead of stepping
+            # over it; without this the cache is only ever observable at
+            # multiples of the step size.
+            if (
+                checkpoint_at is not None
+                and processed < checkpoint_at < processed + n_to_process
+            ):
+                n_to_process = checkpoint_at - processed
             chunk_kwargs = _slice_prefill_kwargs(
                 remaining_kwargs, sequence_keys, n_to_process
             )
@@ -214,12 +235,63 @@ def _run_chunked_speculative_prefill(
                     **chunk_kwargs,
                 )
             mx.eval([c.state for c in prompt_cache])
+            processed += n_to_process
+            if (
+                checkpoint_at is not None
+                and on_checkpoint is not None
+                and processed == checkpoint_at
+            ):
+                try:
+                    on_checkpoint(prompt_cache)
+                except Exception:
+                    # A failed capture costs future reuse, never this request.
+                    logger.warning(
+                        "APC prefix checkpoint capture failed", exc_info=True
+                    )
+                on_checkpoint = None
             remaining_input_ids = remaining_input_ids[:, n_to_process:]
             remaining_embeds = remaining_embeds[:, n_to_process:]
             remaining_kwargs = _drop_prefill_kwargs(
                 remaining_kwargs, sequence_keys, n_to_process
             )
             mx.clear_cache()
+
+    elif (
+        checkpoint_at is not None
+        and on_checkpoint is not None
+        and 1 <= checkpoint_at < remaining_embeds.shape[1]
+    ):
+        # Unchunked prefill (the DFlash path: _chunked_prefill_enabled returns
+        # `draft_model is None`, so attaching a drafter disables chunking and
+        # the whole prompt goes through in one lm() call). There is no mid-point
+        # to observe, so split once at the checkpoint. The tail call below still
+        # carries speculative_kwargs, but relative to the previous one-shot
+        # DFlash prefill the speculative hidden states now cover only the TAIL,
+        # so the drafter's cross-attention context is shortened on cold
+        # captures too -- the same first-block acceptance-dip caveat as a warm
+        # hit, though milder here because the tail is usually much longer than
+        # the warm path's single position.
+        n_head = int(checkpoint_at)
+        head_kwargs = _slice_prefill_kwargs(remaining_kwargs, sequence_keys, n_head)
+        with mx.stream(generation_stream):
+            lm(
+                remaining_input_ids[:, :n_head],
+                cache=prompt_cache,
+                inputs_embeds=remaining_embeds[:, :n_head],
+                n_to_process=n_head,
+                **head_kwargs,
+            )
+        mx.eval([c.state for c in prompt_cache])
+        try:
+            on_checkpoint(prompt_cache)
+        except Exception:
+            logger.warning("APC prefix checkpoint capture failed", exc_info=True)
+        remaining_input_ids = remaining_input_ids[:, n_head:]
+        remaining_embeds = remaining_embeds[:, n_head:]
+        remaining_kwargs = _drop_prefill_kwargs(
+            remaining_kwargs, sequence_keys, n_head
+        )
+        mx.clear_cache()
 
     final_kwargs = {**remaining_kwargs, **speculative_kwargs}
     final_kwargs["inputs_embeds"] = remaining_embeds
@@ -1642,6 +1714,16 @@ class ResponseGenerator:
         }
         if apc_semantic_hash is not None:
             gen_kwargs["_apc_semantic_hash"] = apc_semantic_hash
+        # Image-presence signal for APC (apc_dflash._text_only): the vision
+        # encoder above REPLACES pixel_values with inputs_embeds, so without
+        # this key an image-bearing request is indistinguishable from text
+        # downstream and its KV could be stored/reused under a text-only key.
+        if images is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(image_ref=images)
+        elif pixel_values is not None:
+            gen_kwargs["_apc_image_hash"] = _apc.hash_image_payload(
+                pixel_values=pixel_values
+            )
         return input_ids, gen_kwargs
 
     def _collect_pending_requests(
@@ -2112,9 +2194,80 @@ class ResponseGenerator:
                     make_cache=_make_cache,
                 )
 
+                # --- APC cross-request prefix reuse (DFlash, per-row, exact) ---
+                # No-op unless APC is enabled (apc_manager is None by default),
+                # so the default serving path is unchanged. Each row looks up its
+                # own exact prefix; hits are merged into a batched warm cache and
+                # only the (right-padded) per-row suffixes are prefilled.
+                # prepare()/finalize() roll the right-pad KV out so every row's
+                # offset is correct for decode. Fail-safe: any fault → cold.
+                apc_active = False
+                apc_prefix_lens = [0] * B
+                apc_extra_hashes = [None] * B
+                apc_right_pad = [0] * B
+                if draft_kind == "dflash" and self.apc_manager is not None:
+                    try:
+                        plan = _apc_dflash.lookup_batch(
+                            self.apc_manager,
+                            lm,
+                            self.model,
+                            self.processor,
+                            all_input_ids,
+                            prompt_kwargs_list,
+                        )
+                        if plan is not None:
+                            # Build the APC path into TEMP locals; only commit to
+                            # input_mx/inputs_embeds_mx/prompt_cache after every
+                            # step (incl. prepare) succeeds, so an exception leaves
+                            # the cold path fully intact (Codex #4).
+                            _prefix_lens = plan["prefix_lens"]
+                            _extra_hashes = plan["extra_hashes"]
+                            _right_pad = plan["right_pad"]
+                            _lengths = plan["lengths"]
+                            _suffixes = plan["suffixes"]
+                            _input_mx = mx.array(
+                                [s + [0] * _right_pad[i] for i, s in enumerate(_suffixes)],
+                                dtype=mx.int32,
+                            )
+                            _embeds = None
+                            if inputs_embeds_mx is not None:
+                                D = inputs_embeds_mx.shape[-1]
+                                emb_rows = []
+                                for i in range(B):
+                                    fe = prompt_kwargs_list[i].get("inputs_embeds")
+                                    e = fe[:, _prefix_lens[i]:, :]
+                                    if _right_pad[i] > 0:
+                                        e = mx.concatenate(
+                                            [e, mx.zeros((1, _right_pad[i], D), dtype=e.dtype)],
+                                            axis=1,
+                                        )
+                                    emb_rows.append(e)
+                                _embeds = mx.concatenate(emb_rows, axis=0)
+                            _warm = plan["warm_cache"]
+                            for c in _warm:
+                                prep = getattr(c, "prepare", None)
+                                if prep is not None:
+                                    prep(right_padding=_right_pad, lengths=_lengths)
+                            # Commit (all steps above succeeded).
+                            apc_prefix_lens = _prefix_lens
+                            apc_extra_hashes = _extra_hashes
+                            apc_right_pad = _right_pad
+                            input_mx = _input_mx
+                            if _embeds is not None:
+                                inputs_embeds_mx = _embeds
+                            prompt_cache = _warm
+                            apc_active = True
+                    except Exception:
+                        logger.warning(
+                            "APC batched lookup failed; cold prefill", exc_info=True
+                        )
+                        apc_active = False
+
                 prefill_step_size = get_prefill_step_size()
                 policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
-                if not _chunked_prefill_enabled(
+                # No chunking on the APC path: prepare()/finalize() wrap the
+                # whole suffix prefill, and suffixes are short anyway.
+                if apc_active or not _chunked_prefill_enabled(
                     self.model,
                     input_ids=input_mx,
                     inputs_embeds=inputs_embeds_mx,
@@ -2123,7 +2276,78 @@ class ResponseGenerator:
                     draft_kind=draft_kind,
                     prefill_kwargs=policy_kwargs,
                 ):
+                    _would_chunk_at = prefill_step_size  # step size before disabling
                     prefill_step_size = None
+                    # The "suffixes are short anyway" invariant holds only when
+                    # every row hit. At B>=2 a cold-miss row (prefix 0, suffix =
+                    # whole prompt) coalesced with a warm hit prefills unchunked
+                    # at the batch's max width — a memory-spike risk the cold path
+                    # would have chunked away. Never triggers at B==1 (a miss
+                    # there takes the cold, chunked path). Diagnostic only so the
+                    # rare case is visible rather than a silent OOM (Fable F2).
+                    if (
+                        apc_active
+                        and _would_chunk_at
+                        and getattr(input_mx, "ndim", 0) >= 2
+                        and input_mx.shape[1] > _would_chunk_at
+                    ):
+                        logger.warning(
+                            "APC prefill unchunked across %d suffix positions "
+                            "(> %d step size), B=%d: a long cold-miss row is "
+                            "coalesced with a warm hit — memory-spike risk "
+                            "(Fable F2).",
+                            int(input_mx.shape[1]), int(_would_chunk_at), B,
+                        )
+
+                # --- static system+tools prefix checkpoint (B==1, cold only) ---
+                # Capture the cache at the first user-turn boundary while the
+                # sliding layers still hold the window ending there. Restricted
+                # to B==1 because rows in a coalesced batch have different
+                # boundaries and right-padding, and to cold prefills because a
+                # warm row's cache does not start at position 0. B==1 cold is
+                # the case that matters: a fresh session on a long system
+                # prompt, which is exactly what pays the full prefill today.
+                _ckpt_at = None
+                _on_ckpt = None
+                if (
+                    draft_kind == "dflash"
+                    and self.apc_manager is not None
+                    and not apc_active
+                    and B == 1
+                ):
+                    try:
+                        _ids0 = all_input_ids[0]
+                        _pk0 = (
+                            prompt_kwargs_list[0]
+                            if prompt_kwargs_list and len(prompt_kwargs_list) > 0
+                            else None
+                        )
+                        _b = _apc_dflash.static_prefix_boundary(self.processor, _ids0)
+                        if _b and 1 <= _b < len(_ids0):
+                            _ckpt_at = _b
+
+                            def _on_ckpt(cache, _ids0=_ids0, _pk0=_pk0, _b=_b):
+                                stored = _apc_dflash.store_prefix_checkpoint(
+                                    self.apc_manager,
+                                    self.model,
+                                    self.processor,
+                                    _ids0,
+                                    cache,
+                                    _b,
+                                    extra_hash=apc_extra_hashes[0],
+                                    prompt_kwargs=_pk0,
+                                )
+                                logger.debug(
+                                    "APC static-prefix checkpoint at %d: %s",
+                                    _b,
+                                    "stored" if stored else "skipped",
+                                )
+                    except Exception:
+                        logger.warning(
+                            "APC prefix checkpoint setup failed", exc_info=True
+                        )
+                        _ckpt_at = None
+                        _on_ckpt = None
 
                 prompt_started = time.perf_counter()
                 out, input_mx = _run_chunked_speculative_prefill(
@@ -2135,30 +2359,89 @@ class ResponseGenerator:
                     prefill_kwargs,
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
+                    checkpoint_at=_ckpt_at,
+                    on_checkpoint=_on_ckpt,
                 )
-                hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B
-                first_bonus = _sample_last_token(
-                    out.logits,
-                    sampler,
-                    row_ids=sample_row_ids,
-                    positions=[0] * B,
-                )
+                if apc_active:
+                    # Roll each row's right-pad KV out so offsets are correct
+                    # for decode, then sample first-bonus + capture drafter aux
+                    # at each row's real last position (max_suf - 1 - right_pad).
+                    for c in prompt_cache:
+                        fin = getattr(c, "finalize", None)
+                        if fin is not None:
+                            fin()
+                    seq = out.logits.shape[1]
+                    li = mx.array(
+                        [seq - 1 - rp for rp in apc_right_pad], dtype=mx.int32
+                    )
+                    logit_idx = mx.broadcast_to(
+                        li[:, None, None], (B, 1, out.logits.shape[-1])
+                    )
+                    # Sample the per-row last-real position through the request's
+                    # sampler (temperature/top-p), NOT unconditional argmax, so an
+                    # APC hit doesn't silently make a sampled request greedy for
+                    # its first token (Codex #3). Shape [B,1,vocab] -> _sample_last_token.
+                    last_logits_3d = mx.take_along_axis(out.logits, logit_idx, axis=1)
+                    first_bonus = _sample_last_token(
+                        last_logits_3d,
+                        sampler,
+                        row_ids=sample_row_ids,
+                        positions=[0] * B,
+                    ).astype(mx.int32)
+                    hs = speculative_hidden_state(draft_kind, out)
+                    h_idx = mx.broadcast_to(li[:, None, None], (B, 1, hs.shape[-1]))
+                    hidden = mx.take_along_axis(hs, h_idx, axis=1)
+                else:
+                    hidden = speculative_hidden_state(draft_kind, out)
+                    first_bonus = _sample_last_token(
+                        out.logits,
+                        sampler,
+                        row_ids=sample_row_ids,
+                        positions=[0] * B,
+                    )
                 mx.eval(first_bonus, hidden, out.logits)
                 prompt_elapsed = time.perf_counter() - prompt_started
-                for uid in uids:
+
+                # Store each row's full post-prefill prefix for future reuse.
+                # Done after eval so the caches are materialized. Fail-safe.
+                if draft_kind == "dflash" and self.apc_manager is not None:
+                    try:
+                        _apc_dflash.store_batch(
+                            self.apc_manager,
+                            self.model,
+                            self.processor,
+                            all_input_ids,
+                            prompt_cache,
+                            apc_extra_hashes,
+                            prompt_kwargs_list=prompt_kwargs_list,
+                        )
+                    except Exception:
+                        logger.warning("APC dflash store failed", exc_info=True)
+
+                for ri, uid in enumerate(uids):
                     prompt_tokens = prompt_tokens_map[uid]
+                    cached = apc_prefix_lens[ri] if ri < len(apc_prefix_lens) else 0
+                    # Report the TRUE prefill rate: only the tokens actually
+                    # prefilled this request (prompt_tokens - cached) were
+                    # computed in prompt_elapsed; the cached tokens were restored
+                    # from APC, not processed. Dividing the full prompt_tokens by
+                    # the suffix-only elapsed inflated the rate ~20x on a high
+                    # hit (Fable F7).
+                    prefilled = max(0, prompt_tokens - cached)
                     prompt_tps_map[uid] = (
-                        prompt_tokens / prompt_elapsed
-                        if prompt_tokens > 0 and prompt_elapsed > 0
+                        prefilled / prompt_elapsed
+                        if prefilled > 0 and prompt_elapsed > 0
                         else None
                     )
                     logger.info(
                         "Prefill completed: request=%s prompt_tokens=%d "
-                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        "cached_tokens=%d prefilled=%d elapsed=%.3fs rate=%.1f tok/s",
                         stream_infos[uid].get("request_id", uid),
                         prompt_tokens,
+                        cached,
+                        prefilled,
                         prompt_elapsed,
                         float(prompt_tps_map[uid] or 0.0),
                     )
@@ -2189,6 +2472,7 @@ class ResponseGenerator:
                             finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
                             prompt_tps=prompt_tps_map.get(uid),
+                            cached_tokens=apc_prefix_lens[j] if j < len(apc_prefix_lens) else 0,
                             emitted_at=emitted_at,
                         )
                     )
