@@ -10023,17 +10023,54 @@ class TestMuseGlimmer(unittest.TestCase):
 
         self.assertTrue(bool(mx.array_equal(output, expected).item()))
 
-    def test_query_scale_uses_transformers_fp32_operation_order(self):
-        from mlx_vlm.models.muse_glimmer.language import _scale_queries
+    def test_attention_query_scale_uses_transformers_fp32_operation_order(self):
+        from unittest.mock import patch
 
-        inputs = mx.array([0.1, 1.0, 9.0], dtype=mx.bfloat16)
-        output = _scale_queries(inputs, 3.87)
-        expected = (inputs.astype(mx.float32) * 3.87).astype(inputs.dtype)
-        bf16_scalar_result = inputs * 3.87
-        mx.eval(output, expected, bf16_scalar_result)
+        from mlx_vlm.models.muse_glimmer.language import Attention
 
-        self.assertTrue(bool(mx.array_equal(output, expected).item()))
-        self.assertFalse(bool(mx.array_equal(output, bf16_scalar_result).item()))
+        config = self._tiny_config().text_config
+        config.layer_types = ["full_attention"] * config.num_hidden_layers
+        config.layer_rope_theta = [0] * config.num_hidden_layers
+        config.qk_scale_factor = 3.87
+        attention = Attention(config, layer_idx=0)
+        attention.update(
+            tree_map(
+                lambda parameter: parameter.astype(mx.bfloat16), attention.parameters()
+            )
+        )
+        inputs = (
+            (mx.arange(config.hidden_size, dtype=mx.float32) * 0.37 - 1.13)
+            .reshape(1, 1, config.hidden_size)
+            .astype(mx.bfloat16)
+        )
+
+        projected = attention.q_proj(inputs).reshape(
+            1, 1, attention.n_heads, attention.head_dim
+        )
+        normalized = attention.qk_norm(projected)
+        expected = (
+            (normalized.astype(mx.float32) * config.qk_scale_factor)
+            .astype(normalized.dtype)
+            .transpose(0, 2, 1, 3)
+        )
+        bf16_scalar_result = (normalized * config.qk_scale_factor).transpose(0, 2, 1, 3)
+        captured = {}
+
+        def capture_queries(queries, keys, values, **kwargs):
+            captured["queries"] = queries
+            return mx.zeros_like(queries)
+
+        with patch(
+            "mlx_vlm.models.muse_glimmer.language.scaled_dot_product_attention",
+            side_effect=capture_queries,
+        ):
+            output = attention(inputs)
+
+        mx.eval(output, captured["queries"], expected, bf16_scalar_result)
+        self.assertTrue(bool(mx.array_equal(captured["queries"], expected).item()))
+        self.assertFalse(
+            bool(mx.array_equal(captured["queries"], bf16_scalar_result).item())
+        )
 
     def test_compiled_vision_rotary_matches_fp32_reference(self):
         from mlx_vlm.models.muse_glimmer.vision import apply_rotary, rotate_half

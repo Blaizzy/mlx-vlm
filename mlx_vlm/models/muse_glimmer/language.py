@@ -47,11 +47,6 @@ class CenteredRMSNorm(nn.Module):
         return _centered_rms_norm(x, self.weight, self.eps)
 
 
-def _scale_queries(queries: mx.array, scale: float) -> mx.array:
-    dtype = queries.dtype
-    return (queries.astype(mx.float32) * scale).astype(dtype)
-
-
 class MLP(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -116,7 +111,9 @@ class Attention(nn.Module):
         values = self.v_proj(x).reshape(batch, length, self.n_kv_heads, self.head_dim)
 
         queries = self.qk_norm(queries)
-        queries = _scale_queries(queries, self.qk_scale_factor)
+        queries = (queries.astype(mx.float32) * self.qk_scale_factor).astype(
+            queries.dtype
+        )
         queries = queries.transpose(0, 2, 1, 3)
         keys = self.qk_norm(keys).transpose(0, 2, 1, 3)
         values = values.transpose(0, 2, 1, 3)
