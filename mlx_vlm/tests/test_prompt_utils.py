@@ -3,6 +3,20 @@
 from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
 
 
+def _assistant_tool_call(content):
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": {}},
+            }
+        ],
+    }
+
+
 class TestExtractTextFromContent:
     """Tests for the extract_text_from_content function."""
 
@@ -341,6 +355,44 @@ class TestApplyChatTemplateIntegration:
 
         arguments = result[1]["tool_calls"][0]["function"]["arguments"]
         assert arguments == {"method": "monte_carlo", "samples": 1000}
+
+    def test_assistant_tool_call_content_is_preserved(self):
+        """Existing text and structured content should remain unchanged."""
+        for content in [
+            "I will check.",
+            [{"type": "text", "text": "I will check."}],
+        ]:
+            result = apply_chat_template(
+                None,
+                {"model_type": "qwen3_vl"},
+                _assistant_tool_call(content),
+                return_messages=True,
+            )
+
+            assert result[0]["content"] == content
+
+    def test_assistant_tool_call_none_content_reaches_template_as_string(self):
+        """Templates that iterate non-string content should receive a string."""
+
+        class IterableContentTemplate:
+            chat_template = "tool template"
+
+            def apply_chat_template(self, messages, **_):
+                for message in messages:
+                    content = message["content"]
+                    if not isinstance(content, str):
+                        list(content)
+                return messages
+
+        message = _assistant_tool_call(None)
+        result = apply_chat_template(
+            IterableContentTemplate(),
+            {"model_type": "qwen3_vl"},
+            message,
+        )
+
+        assert message["content"] is None
+        assert result[0]["content"] == ""
 
     def test_single_tool_call_dict_is_preserved(self):
         """A single assistant message with tool_calls should keep tool metadata."""

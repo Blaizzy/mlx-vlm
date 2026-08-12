@@ -27,6 +27,7 @@ from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -3743,6 +3744,13 @@ def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeyp
         },
         {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
     ]
+    normalized = apply_chat_template(
+        None,
+        config,
+        mock_template.call_args.args[2],
+        return_messages=True,
+    )
+    assert normalized[0]["content"] == ""
 
 
 def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
