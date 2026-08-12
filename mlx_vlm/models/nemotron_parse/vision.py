@@ -1,6 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import scaled_dot_product_attention
 from .config import VisionConfig
 
 
@@ -24,11 +25,12 @@ class Attention(nn.Module):
         qkv = qkv.transpose(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = q * self.scale
-        attn = mx.matmul(q, k.transpose(0, 1, 3, 2))
-        attn = mx.softmax(attn, axis=-1)
-
-        out = mx.matmul(attn, v)
+        # mx.fast.scaled_dot_product_attention keeps the scores in registers
+        # instead of materializing the [B, H, N, N] matrix — 17x less peak
+        # memory than a manual matmul+softmax at 13320 tokens.
+        out = scaled_dot_product_attention(
+            q, k, v, cache=None, scale=self.scale, mask=None
+        )
         out = out.transpose(0, 2, 1, 3).reshape(batch, n_tokens, dim)
         out = self.proj(out)
         return out

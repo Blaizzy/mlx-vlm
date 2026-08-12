@@ -92,9 +92,6 @@ class ModelConfig(BaseModelConfig):
         # Promote image-level fields to vision config if present.
         if "image_size" in params:
             vision_config.image_size = tuple(params["image_size"])
-        if "max_sequence_length" in params:
-            params = dict(params)
-            params.setdefault("max_position_embeddings", params["max_sequence_length"])
 
         model_params = {
             k: v for k, v in params.items() if k in inspect.signature(cls).parameters

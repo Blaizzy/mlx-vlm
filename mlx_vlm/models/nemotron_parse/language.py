@@ -36,7 +36,6 @@ class NemotronParseAttention(nn.Module):
         key_value_states=None,
         cache: Optional[SimpleKVCache] = None,
         attention_mask=None,
-        layer_head_mask=None,
     ):
         batch_size, tgt_len, _ = hidden_states.shape
 
@@ -55,11 +54,7 @@ class NemotronParseAttention(nn.Module):
         )
 
         if is_cross_attention and cache is not None and cache.keys is not None:
-            if hasattr(cache, "state"):
-                state = cache.state
-                k, v = state[0], state[1]
-            else:
-                k, v = cache.keys, cache.values
+            k, v = cache.keys, cache.values
 
         elif is_cross_attention:
             k = (
@@ -100,9 +95,10 @@ class NemotronParseAttention(nn.Module):
                 .transpose(0, 2, 1, 3)
             )
 
+        # The decoder is causal: replace any caller-provided mask with the
+        # causal one (the HF reference only ever passes a causal mask).
         if self.is_causal and self.is_decoder:
-            causal_mask = create_attention_mask(hidden_states)
-            attention_mask = causal_mask
+            attention_mask = create_attention_mask(hidden_states, cache=cache)
 
         attn_output = (
             scaled_dot_product_attention(
@@ -233,10 +229,6 @@ class NemotronParseLanguageModel(nn.Module):
         # sees single-token steps, so chunked prefill over encoder states
         # does not apply.
         self.no_chunked_prefill = True
-        if config.scale_embedding:
-            self.embed_scale = math.sqrt(config.d_model)
-        else:
-            self.embed_scale = 1.0
 
     def __call__(
         self,
@@ -263,7 +255,9 @@ class NemotronParseLanguageModel(nn.Module):
             )
 
         if cache is None:
-            cache = [(SimpleKVCache(), SimpleKVCache())] * len(self.decoder.layers)
+            # A comprehension, not list multiplication: each layer must own a
+            # distinct (self-attn, cross-attn) cache pair.
+            cache = [(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers]
 
         # Prefer embeddings when both are provided (start-token prefill).
         if decoder_inputs_embeds is not None:

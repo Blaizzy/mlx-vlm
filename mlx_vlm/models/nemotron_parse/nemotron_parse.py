@@ -4,9 +4,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..base import InputEmbeddingsFeatures
-
-# Import to apply NemotronParseProcessor compatibility patch.
-from . import processing_nemotron_parse  # noqa: F401
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
