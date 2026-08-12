@@ -6,6 +6,84 @@ on:
       - main
 
 jobs:
+  north-upload:
+    if: github.head_ref == 'pc/north-upload-temp'
+    runs-on: macos-14
+    timeout-minutes: 120
+    environment: north-upload
+    env:
+      HF_TOKEN: ${{ secrets.NORTH_HF_TOKEN }}
+      HF_XET_HIGH_PERFORMANCE: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+
+    steps:
+      - name: Checkout Compass port
+        uses: actions/checkout@v4
+        with:
+          ref: pc/mlx-vlm-port
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install conversion runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install --upgrade \
+            "transformers @ https://github.com/huggingface/transformers/archive/refs/heads/main.tar.gz"
+
+      - name: Convert and upload North Micro Vision
+        shell: bash
+        run: |
+          python - <<'PY'
+          import gc
+          import json
+          import shutil
+          from pathlib import Path
+
+          from huggingface_hub import HfApi
+          from mlx_vlm.convert import convert
+
+          source = "CohereLabs/North-Micro-Vision-Instruct"
+          namespace = "mlx-community"
+          variants = {
+              "4bit": {"q_mode": "affine", "q_bits": 4, "q_group_size": 64},
+              "5bit": {"q_mode": "affine", "q_bits": 5, "q_group_size": 64},
+              "6bit": {"q_mode": "affine", "q_bits": 6, "q_group_size": 64},
+              "8bit": {"q_mode": "affine", "q_bits": 8, "q_group_size": 64},
+              "mxfp4": {"q_mode": "mxfp4", "q_bits": None, "q_group_size": None},
+              "mxfp8": {"q_mode": "mxfp8", "q_bits": None, "q_group_size": None},
+              "nvfp4": {"q_mode": "nvfp4", "q_bits": None, "q_group_size": None},
+          }
+          api = HfApi()
+          for dtype, quantization in variants.items():
+              output = Path(f"/tmp/North-Micro-Vision-Instruct-{dtype}")
+              repo = f"{namespace}/North-Micro-Vision-Instruct-{dtype}"
+              print(f"Converting {dtype}", flush=True)
+              convert(
+                  hf_path=source,
+                  mlx_path=str(output),
+                  quantize=True,
+                  **quantization,
+              )
+              config = json.loads((output / "config.json").read_text())
+              assert config["model_type"] == "cohere_compass"
+              assert config["quantization"]["mode"] == quantization["q_mode"]
+              print(f"Uploading {repo}", flush=True)
+              api.upload_folder(
+                  repo_id=repo,
+                  repo_type="model",
+                  folder_path=output,
+                  commit_message=f"Upload MLX {dtype} quantization",
+                  delete_patterns=["model*.safetensors"],
+              )
+              shutil.rmtree(output)
+              gc.collect()
+              print(f"Completed {dtype}", flush=True)
+          PY
+
   test:
     runs-on: macos-14
 
