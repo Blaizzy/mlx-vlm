@@ -1,3 +1,4 @@
+import os
 from typing import Any, Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -10,6 +11,15 @@ from .common import (
     _speculative_walk_batch,
     generation_stream,
 )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Call-time env flag with a default. Deliberately NOT hoisted to import
+    time so benches can toggle per-arm in-process (2026-08-11)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _dflash_next_block_size(
@@ -73,6 +83,103 @@ def _dflash_committed_hidden_segments(
         hidden_full[i : i + 1, : len(new_tokens), :]
         for i, new_tokens in enumerate(new_tokens_list)
     ]
+
+
+# --- Round-1 drafter-context assembly (2026-08-11) --------------------------
+#
+# RoPE-offset design (Fixes 1+2). The DFlash drafter is trained with ABSOLUTE
+# positions: HF's DFlashTokenCandidateGenerator sets noise_position_ids =
+# arange + last_ctx_pos + 1, and context keys carry their true sequence
+# positions. The z-lab MLX reference (model_mlx.py:85-91) keeps that invariant
+# when it drops context: it slices the round-1 context to the last
+# sliding_window-1 positions and bumps its drafter cache offset by the number
+# skipped, so kept keys still get absolute RoPE positions.
+#
+# We implement the same semantics, but the shift is carried as an additive
+# ``pos_shift`` attribute on each drafter layer cache (read by the DFlash
+# drafter attentions: rope offset = cache.offset + pos_shift) instead of
+# mutating cache.offset directly. Rationale: RotatingKVCache's ``offset``
+# doubles as storage bookkeeping — pre-seeding it while the buffer is not
+# exactly full corrupts _update_in_place (growth size ``max_size - offset``
+# can go negative, and the write index rewinds to ``offset``, past the buffer
+# end, leaving attended zero-KV garbage). The additive shift keeps every cache
+# code path byte-identical to the validated cold flow, and shifts compose: an
+# APC warm hit contributes cached_tokens, a round-1 truncation adds the
+# skipped count.
+
+
+def _drafter_pos_shift(cache_list, extra: int) -> None:
+    """Add ``extra`` to each drafter layer-cache's absolute-position shift."""
+    for c in cache_list:
+        c.pos_shift = int(getattr(c, "pos_shift", 0)) + int(extra)
+
+
+def _round1_window_limit(draft_model: nn.Module) -> Optional[int]:
+    """Max round-1 context positions = sliding_window - 1 (the drafter cache's
+    max_size), or None when the drafter has no window (nothing to enforce) or
+    MUSE_ROUND1_TRUNC=0 (call-time A/B kill switch restoring the old
+    full-length round-1 context)."""
+    if not _env_flag("MUSE_ROUND1_TRUNC", True):
+        return None
+    window = getattr(getattr(draft_model, "config", None), "sliding_window", None)
+    if not window or int(window) <= 1:
+        return None
+    return int(window) - 1
+
+
+def _apply_round1_window(
+    hidden: mx.array, cache_list, keep: int
+) -> mx.array:
+    """Enforce the drafter's training-time sliding window on the round-1
+    context: keep the LAST ``keep`` positions and bump ``pos_shift`` by the
+    number skipped so the kept keys' RoPE positions stay absolute. Off-window
+    context is off-training-distribution AND transiently stores a 5-layer x
+    prompt_len KV spike in the rotating cache's first _update_concat.
+    Continuation rounds carry accepted+1 positions (far below the window) and
+    are naturally unaffected."""
+    skipped = int(hidden.shape[1]) - int(keep)
+    if skipped <= 0:
+        return hidden
+    _drafter_pos_shift(cache_list, skipped)
+    return hidden[:, -int(keep):, :]
+
+
+def assemble_warm_drafter_context(
+    hidden_states: mx.array,
+    right_pad: List[int],
+    prefix_lens: List[int],
+):
+    """APC warm-hit drafter context (Fix 1, 2026-08-11).
+
+    After a warm hit only the suffix (prompt_len - cached) was prefilled, and
+    the forward captured aux hidden states for ALL suffix positions — but the
+    old code handed the drafter a single position, versus ~2047 in the z-lab/HF
+    reference flow (the top acceptance lever found by the reference audit).
+
+    Default (MUSE_WARMCTX unset/on): returns ``(rows, context_offsets)`` where
+    ``rows[i]`` is row i's FULL un-padded suffix hidden ``[1, S_i, D]`` (ragged
+    per-row is fine — drafting is row-wise in the batched loop) and
+    ``context_offsets[i] = prefix_lens[i]`` seeds the drafter cache's absolute
+    position shift, so suffix context keys get RoPE positions
+    cached..cached+S_i-1 exactly as the cold path gives 0..P-1.
+
+    MUSE_WARMCTX=0 (call-time read, per-request A/B): the exact old behavior —
+    one hidden position per row (each row's last real position) and no offsets,
+    byte-identical to the pre-fix take_along_axis slice.
+    """
+    B = int(hidden_states.shape[0])
+    seq = int(hidden_states.shape[1])
+    if _env_flag("MUSE_WARMCTX", True):
+        rows = [
+            hidden_states[i : i + 1, : seq - int(right_pad[i]), :]
+            for i in range(B)
+        ]
+        return rows, [int(p) for p in prefix_lens]
+    li = mx.array([seq - 1 - int(rp) for rp in right_pad], dtype=mx.int32)
+    idx = mx.broadcast_to(
+        li[:, None, None], (B, 1, int(hidden_states.shape[-1]))
+    )
+    return mx.take_along_axis(hidden_states, idx, axis=1), None
 
 
 def _dflash_rounds(
@@ -196,6 +303,7 @@ def _dflash_rounds_batch(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    context_offsets: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batch DFlash speculative-decoding round loop (B > 1).
 
@@ -205,6 +313,14 @@ def _dflash_rounds_batch(
 
     ``stop_check(seq_idx, token_id) -> bool`` is an optional callback
     that returns True to stop a sequence (e.g. EOS detection).
+
+    ``hidden`` may be a single ``[B, S, D]`` array (cold path) or a per-row
+    ragged list of ``[1, S_i, D]`` arrays (APC warm hits with per-row suffix
+    lengths — drafting is row-wise, so raggedness is free here).
+
+    ``context_offsets[i]``: absolute position of row i's first context
+    position (cached_tokens on a warm hit); seeds that row's drafter-cache
+    RoPE position shift. None/0 == historical behavior.
 
     Yields ``(tokens_list, None)`` where ``tokens_list[i]`` is the
     token for sequence ``i`` (or ``None`` if that sequence has nothing
@@ -228,7 +344,24 @@ def _dflash_rounds_batch(
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))  # maps active-slot → original-index
-    hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
+    if isinstance(hidden, (list, tuple)):
+        hidden_by_orig = [hidden[i] for i in range(B)]
+    else:
+        hidden_by_orig = [hidden[i : i + 1] for i in range(B)]
+    if context_offsets:
+        for i in range(B):
+            off = int(context_offsets[i]) if i < len(context_offsets) else 0
+            if off > 0:
+                _drafter_pos_shift(draft_caches[i], off)
+    # Round-1 window truncation (see _apply_round1_window). Runs AFTER the
+    # warm-context offsets above so a warm suffix longer than the window
+    # composes: pos_shift = cached_tokens + skipped.
+    _keep = _round1_window_limit(draft_model)
+    if _keep is not None:
+        for i in range(B):
+            hidden_by_orig[i] = _apply_round1_window(
+                hidden_by_orig[i], draft_caches[i], _keep
+            )
 
     total_emitted = sum(emitted)
 

@@ -89,9 +89,14 @@ def _normalize_dflash_qkv(projected, q_norm, k_norm):
 
 def _apply_dflash_attention(attention, x, projected, rope, cache):
     queries, context_keys, proposal_keys, context_values, proposal_values = projected
-    queries = rope(queries, offset=cache.offset + context_keys.shape[2])
-    context_keys = rope(context_keys, offset=cache.offset)
-    proposal_keys = rope(proposal_keys, offset=cache.offset + context_keys.shape[2])
+    # Additive absolute-position shift (APC warm hits / round-1 window
+    # truncation), set by speculative/dflash.py's _drafter_pos_shift; see the
+    # rationale comment in speculative/drafters/qwen3_dflash/dflash.py.
+    # Default 0 == old behavior.
+    offset = cache.offset + int(getattr(cache, "pos_shift", 0))
+    queries = rope(queries, offset=offset + context_keys.shape[2])
+    context_keys = rope(context_keys, offset=offset)
+    proposal_keys = rope(proposal_keys, offset=offset + context_keys.shape[2])
     cached_keys, cached_values = cache.update_and_fetch(context_keys, context_values)
     keys = mx.concatenate([cached_keys, proposal_keys], axis=2)
     values = mx.concatenate([cached_values, proposal_values], axis=2)

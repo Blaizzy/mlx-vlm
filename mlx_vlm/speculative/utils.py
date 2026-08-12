@@ -137,6 +137,7 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    context_offsets: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
 
@@ -197,7 +198,11 @@ def run_speculative_server_rounds(
         return
 
     if draft_kind == "dflash":
-        if batch_size == 1:
+        # An APC warm hit hands over ragged per-row hidden plus
+        # context_offsets, which only the batch loop consumes (pos_shift
+        # seeding + per-row suffix context), so a warm B==1 keeps the
+        # batched flow; the singleton fast path stays for cold requests.
+        if batch_size == 1 and not context_offsets:
             for tok, state in _dflash_rounds(
                 model,
                 draft_model,
@@ -225,6 +230,7 @@ def run_speculative_server_rounds(
             draft_block_size=draft_block_size,
             token_dtype=token_dtype,
             stop_check=stop_check,
+            context_offsets=context_offsets,
         )
         return
 

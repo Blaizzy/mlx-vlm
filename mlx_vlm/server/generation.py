@@ -37,6 +37,7 @@ from ..generate.diffusion import (
 )
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative import apc_dflash as _apc_dflash
+from ..speculative.dflash import assemble_warm_drafter_context
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -2364,6 +2365,7 @@ class ResponseGenerator:
                 )
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 sample_row_ids = [0] * B
+                warm_context_offsets = None
                 if apc_active:
                     # Roll each row's right-pad KV out so offsets are correct
                     # for decode, then sample first-bonus + capture drafter aux
@@ -2390,9 +2392,16 @@ class ResponseGenerator:
                         row_ids=sample_row_ids,
                         positions=[0] * B,
                     ).astype(mx.int32)
+                    # Drafter round-1 context (Fix 1, 2026-08-11): the suffix
+                    # prefill captured aux hidden for ALL suffix positions, so
+                    # hand the drafter the full per-row suffix (ragged list) +
+                    # per-row absolute offsets (= cached_tokens) instead of the
+                    # old single last position. MUSE_WARMCTX=0 (call-time)
+                    # restores the old 1-position slice byte-identically.
                     hs = speculative_hidden_state(draft_kind, out)
-                    h_idx = mx.broadcast_to(li[:, None, None], (B, 1, hs.shape[-1]))
-                    hidden = mx.take_along_axis(hs, h_idx, axis=1)
+                    hidden, warm_context_offsets = assemble_warm_drafter_context(
+                        hs, apc_right_pad, apc_prefix_lens
+                    )
                 else:
                     hidden = speculative_hidden_state(draft_kind, out)
                     first_bonus = _sample_last_token(
@@ -2520,6 +2529,7 @@ class ResponseGenerator:
                     eos_token_ids=eos_set,
                     prompt_tokens=input_mx,
                     row_ids=sample_row_ids,
+                    context_offsets=warm_context_offsets,
                 )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):

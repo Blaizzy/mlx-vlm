@@ -73,9 +73,20 @@ class DFlashAttention(nn.Module):
         prop_values = prop_values.reshape(B, L, self.n_kv_heads, -1).transpose(
             0, 2, 1, 3
         )
-        queries = rope(queries, offset=cache.offset + S)
-        ctx_keys = rope(ctx_keys, offset=cache.offset)
-        prop_keys = rope(prop_keys, offset=cache.offset + S)
+        # Absolute-position RoPE: ``pos_shift`` counts positions that exist in
+        # the absolute sequence but were never stored in this cache (APC warm
+        # hit: the suffix starts at cached_tokens; round-1 window truncation:
+        # the kept context starts at the number skipped). It is an additive
+        # attribute set by speculative/dflash.py's _drafter_pos_shift rather
+        # than a pre-seeded cache.offset because RotatingKVCache's offset
+        # doubles as storage bookkeeping — seeding it while the buffer is not
+        # exactly full corrupts _update_in_place (the in-place trim above is
+        # safe only because it fills the buffer to max_size on the same call).
+        # Default 0 == old behavior.
+        offset = cache.offset + int(getattr(cache, "pos_shift", 0))
+        queries = rope(queries, offset=offset + S)
+        ctx_keys = rope(ctx_keys, offset=offset)
+        prop_keys = rope(prop_keys, offset=offset + S)
         keys, values = cache.update_and_fetch(ctx_keys, ctx_values)
         keys = mx.concatenate([keys, prop_keys], axis=2)
         values = mx.concatenate([values, prop_values], axis=2)
