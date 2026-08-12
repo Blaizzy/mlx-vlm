@@ -7103,6 +7103,80 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.array_equal(actual_q, expected_q).item())
         self.assertTrue(mx.array_equal(actual_k, expected_k).item())
 
+    def test_muse_glimmer_compiled_decoder_transitions(self):
+        from mlx_vlm.models.muse_glimmer.language import (
+            _centered_rms_norm,
+            _finish_mlp,
+            _prepare_mlp_input,
+        )
+
+        residual = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8).astype(mx.bfloat16)
+        attention = (residual * 0.125 - 0.5).astype(mx.bfloat16)
+        mlp_output = (residual * -0.25 + 0.75).astype(mx.bfloat16)
+        weight = (mx.arange(8, dtype=mx.float32) * 0.02 - 0.1).astype(mx.bfloat16)
+        eps = 1e-6
+
+        expected_residual = residual + _centered_rms_norm(attention, weight, eps)
+        expected_mlp_input = _centered_rms_norm(expected_residual, weight, eps)
+        actual_residual, actual_mlp_input = _prepare_mlp_input(
+            residual,
+            attention,
+            weight,
+            weight,
+            eps,
+            eps,
+        )
+        expected_output = expected_residual + _centered_rms_norm(
+            mlp_output, weight, eps
+        )
+        actual_output = _finish_mlp(expected_residual, mlp_output, weight, eps)
+        mx.eval(
+            expected_residual,
+            expected_mlp_input,
+            actual_residual,
+            actual_mlp_input,
+            expected_output,
+            actual_output,
+        )
+
+        self.assertTrue(mx.array_equal(actual_residual, expected_residual).item())
+        self.assertTrue(mx.array_equal(actual_mlp_input, expected_mlp_input).item())
+        self.assertTrue(mx.array_equal(actual_output, expected_output).item())
+
+    def test_muse_glimmer_dflash_capture_and_rollback(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._muse_glimmer_config()).language_model
+        caches = model.make_cache()
+        outputs = model(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            cache=caches,
+            capture_layer_ids=[0, 1],
+        )
+        mx.eval(outputs.logits, outputs.hidden_states)
+
+        self.assertEqual(len(outputs.hidden_states), 2)
+        self.assertTrue(
+            all(hidden.shape == (1, 3, 32) for hidden in outputs.hidden_states)
+        )
+        self.assertEqual([cache.offset for cache in caches], [3, 3])
+
+        verify = model(
+            mx.array([[4, 5, 6, 7]], dtype=mx.int32),
+            cache=caches,
+            capture_layer_ids=[0, 1],
+        )
+        mx.eval(verify.logits)
+        accepted = model.rollback_speculative_cache(
+            caches,
+            verify.gdn_states,
+            accepted=1,
+            block_size=4,
+        )
+
+        self.assertEqual(accepted, 1)
+        self.assertEqual([cache.offset for cache in caches], [5, 5])
+
     def test_muse_glimmer_quantized_embeddings(self):
         from mlx_vlm.models import muse_glimmer
         from mlx_vlm.models.muse_glimmer.language import RMSNormNoScale

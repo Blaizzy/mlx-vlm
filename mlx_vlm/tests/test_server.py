@@ -520,7 +520,10 @@ def test_speculative_server_hidden_state_concatenates_for_dflash():
     assert result.shape == (1, 1, 8)
 
 
-def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatch):
+@pytest.mark.parametrize("draft_kind", ["mtp", "dflash", "eagle3"])
+def test_speculative_prompt_cache_uses_unbatched_cache_for_singleton(
+    monkeypatch, draft_kind
+):
     lm = object()
     unbatched_cache = object()
     batched_cache = object()
@@ -531,7 +534,7 @@ def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatc
 
     result = speculative_utils.make_speculative_prompt_cache(
         lm,
-        draft_kind="mtp",
+        draft_kind=draft_kind,
         batch_size=1,
         left_padding=[0],
         make_cache=lambda *args, **kwargs: batched_cache,
@@ -540,7 +543,7 @@ def test_speculative_prompt_cache_uses_unbatched_cache_for_single_mtp(monkeypatc
     assert result is unbatched_cache
 
 
-def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeypatch):
+def test_speculative_prompt_cache_uses_batched_cache_for_batch(monkeypatch):
     lm = object()
     batched_cache = object()
 
@@ -562,12 +565,69 @@ def test_speculative_prompt_cache_uses_batched_cache_for_batch_or_dflash(monkeyp
         speculative_utils.make_speculative_prompt_cache(
             lm,
             draft_kind="dflash",
-            batch_size=1,
-            left_padding=[0],
+            batch_size=2,
+            left_padding=[0, 1],
             make_cache=lambda *args, **kwargs: batched_cache,
         )
         is batched_cache
     )
+
+
+def test_speculative_prefill_keeps_short_prompt_in_one_forward():
+    calls = []
+    output = SimpleNamespace(logits=mx.zeros((1, 3, 5)))
+
+    def lm(inputs, cache=None, **kwargs):
+        calls.append((inputs, cache, kwargs))
+        return output
+
+    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+    inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
+    result, remaining_ids = server_generation._run_chunked_speculative_prefill(
+        lm,
+        input_ids,
+        inputs_embeds,
+        [],
+        {},
+        {"capture_layer_ids": [1, 2]},
+        prefill_step_size=4,
+        generation_stream=mx.default_stream(mx.default_device()),
+    )
+
+    assert result is output
+    assert remaining_ids.tolist() == [[1, 2, 3]]
+    assert len(calls) == 1
+    assert calls[0][0].tolist() == [[1, 2, 3]]
+    assert calls[0][2]["inputs_embeds"].shape == (1, 3, 4)
+    assert calls[0][2]["capture_layer_ids"] == [1, 2]
+    assert "n_to_process" not in calls[0][2]
+
+
+def test_speculative_prefill_chunks_only_above_step_size():
+    calls = []
+
+    def lm(inputs, cache=None, **kwargs):
+        calls.append((inputs, cache, kwargs))
+        return SimpleNamespace(logits=mx.zeros((1, inputs.shape[1], 5)))
+
+    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+    inputs_embeds = mx.ones((1, 3, 4), dtype=mx.float32)
+    _, remaining_ids = server_generation._run_chunked_speculative_prefill(
+        lm,
+        input_ids,
+        inputs_embeds,
+        [],
+        {},
+        {"capture_layer_ids": [1, 2]},
+        prefill_step_size=2,
+        generation_stream=mx.default_stream(mx.default_device()),
+    )
+
+    assert remaining_ids.tolist() == [[3]]
+    assert [call[0].tolist() for call in calls] == [[[1, 2]], [[3]]]
+    assert calls[0][2]["n_to_process"] == 2
+    assert "capture_layer_ids" not in calls[0][2]
+    assert calls[1][2]["capture_layer_ids"] == [1, 2]
 
 
 def test_speculative_server_reads_draft_block_size_env(monkeypatch):
