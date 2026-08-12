@@ -7003,6 +7003,129 @@ class TestModels(unittest.TestCase):
         self.assertEqual(projected.shape, (4, 64))
         self.assertTrue(mx.isfinite(projected).all().item())
 
+    @staticmethod
+    def _muse_glimmer_config():
+        from mlx_vlm.models import muse_glimmer
+
+        return muse_glimmer.ModelConfig(
+            text_config=muse_glimmer.TextConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                max_position_embeddings=128,
+                sliding_window=8,
+                layer_types=["sliding_attention", "full_attention"],
+                layer_rope_theta=[10000.0, 0],
+            ),
+            vision_config=muse_glimmer.VisionConfig(
+                hidden_size=8,
+                intermediate_size=16,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                patch_size=2,
+                patch_temporal=2,
+                merge_size=2,
+                pos_emb_height=4,
+                pos_emb_width=4,
+                max_position_embeddings=16,
+                layer_types=["window_attention", "full_attention"],
+            ),
+            image_token_id=7,
+            video_token_id=6,
+            out_hidden_size=32,
+            projector_hidden_size=16,
+        )
+
+    def test_muse_glimmer(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+        config = self._muse_glimmer_config()
+        model = muse_glimmer.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.zeros((4, 2 * 3 * 2 * 2))
+        grid = mx.array([[1, 2, 2]])
+        output = model(
+            mx.array([[1, config.image_token_id, 2]]),
+            pixel_values=pixel_values,
+            image_grid_thw=grid,
+        )
+        self.assertEqual(output.logits.shape, (1, 3, config.text_config.vocab_size))
+        self.assertTrue(mx.isfinite(output.logits).all().item())
+
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+
+    def test_muse_glimmer_numerical_parity(self):
+        from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+        from mlx_vlm.models.muse_glimmer.vision import apply_rotary, rotate_half
+
+        norm = CenteredRMSNorm(4, eps=1e-6)
+        norm.weight = (mx.arange(4, dtype=mx.float32) * 0.031 - 0.2).astype(mx.bfloat16)
+        inputs = (
+            (mx.arange(4, dtype=mx.float32) * 0.37 - 1.13)
+            .reshape(1, 4)
+            .astype(mx.bfloat16)
+        )
+        inputs32 = inputs.astype(mx.float32)
+        expected = inputs32 * mx.rsqrt(
+            mx.mean(mx.square(inputs32), axis=-1, keepdims=True) + norm.eps
+        )
+        expected = (expected * (1.0 + norm.weight.astype(mx.float32))).astype(
+            inputs.dtype
+        )
+        self.assertTrue(mx.array_equal(norm(inputs), expected).item())
+
+        q = mx.arange(16, dtype=mx.bfloat16).reshape(1, 2, 2, 4) / 16
+        k = q + 0.25
+        cos = mx.cos(mx.arange(8, dtype=mx.float32).reshape(2, 4) / 8)
+        sin = mx.sin(mx.arange(8, dtype=mx.float32).reshape(2, 4) / 8)
+        actual_q, actual_k = apply_rotary(q, k, cos, sin)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        expected_q = (
+            q.astype(mx.float32) * cos + rotate_half(q).astype(mx.float32) * sin
+        ).astype(q.dtype)
+        expected_k = (
+            k.astype(mx.float32) * cos + rotate_half(k).astype(mx.float32) * sin
+        ).astype(k.dtype)
+        self.assertTrue(mx.array_equal(actual_q, expected_q).item())
+        self.assertTrue(mx.array_equal(actual_k, expected_k).item())
+
+    def test_muse_glimmer_quantized_embeddings(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.muse_glimmer.language import RMSNormNoScale
+
+        model = muse_glimmer.Model(self._muse_glimmer_config())
+        nn.quantize(
+            model.language_model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda _, module: (
+                hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0
+            ),
+        )
+
+        text_model = model.language_model.model
+        self.assertIsInstance(text_model.embed_tokens, nn.QuantizedEmbedding)
+        self.assertIsInstance(text_model.embed_norm, RMSNormNoScale)
+
+        input_ids = mx.array([[1, 2, 3]])
+        normalized = text_model.embed_norm(text_model.embed_tokens(input_ids))
+        embedded = model.get_input_embeddings(input_ids).inputs_embeds
+        np.testing.assert_allclose(embedded, normalized, rtol=1e-5, atol=1e-7)
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""

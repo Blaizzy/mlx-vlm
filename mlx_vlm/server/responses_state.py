@@ -171,6 +171,75 @@ class ThinkingStreamState:
         return text
 
 
+class ResponseTemplateStreamState:
+    """Adapt a Transformers response-template parser to server stream deltas."""
+
+    def __init__(self, parser):
+        self.parser = parser
+
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
+        reasoning = []
+        content = []
+        thinking_closed = False
+        events = self.parser.feed(text or "")
+        if last:
+            _, final_events = self.parser.finalize()
+            events.extend(final_events)
+
+        for event in events:
+            event_type = event.get("type")
+            field = event.get("field")
+            if event_type == "region_close" and field in (
+                "reasoning",
+                "reasoning_content",
+            ):
+                thinking_closed = True
+            if event_type != "region_chunk":
+                continue
+            chunk = event.get("text")
+            if not chunk:
+                continue
+            if field in ("reasoning", "reasoning_content"):
+                reasoning.append(chunk)
+            elif field == "content":
+                content.append(chunk)
+        return ThinkingStreamDelta(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+            thinking_closed=thinking_closed,
+        )
+
+
+def _response_template_tokenizer(processor):
+    if processor is None:
+        return None
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if getattr(tokenizer, "response_template", None) is None:
+        return None
+    return tokenizer
+
+
+def make_response_stream_state(
+    processor,
+    enable_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+):
+    tokenizer = _response_template_tokenizer(processor)
+    if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
+        try:
+            return ResponseTemplateStreamState(tokenizer.get_response_parser(prefix=""))
+        except (AttributeError, TypeError, ValueError):
+            logger.debug(
+                "Falling back from tokenizer response-template parser", exc_info=True
+            )
+    return ThinkingStreamState(
+        enable_thinking,
+        thinking_start_token,
+        thinking_end_token,
+    )
+
+
 def prompt_has_open_thinking(
     prompt: Any,
     enable_thinking: bool = False,
@@ -297,9 +366,32 @@ def _split_thinking(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
+    processor=None,
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
+
+    tokenizer = _response_template_tokenizer(processor)
+    if tokenizer is not None and hasattr(tokenizer, "parse_response"):
+        try:
+            parsed = tokenizer.parse_response(text, prefix="")
+            if isinstance(parsed, dict) and (
+                "content" in parsed
+                or "reasoning" in parsed
+                or "reasoning_content" in parsed
+            ):
+                reasoning = parsed.get("reasoning_content") or parsed.get("reasoning")
+                content = parsed.get("content")
+                if reasoning is None or isinstance(reasoning, str):
+                    if content is None or isinstance(content, str):
+                        return (
+                            reasoning.strip() if reasoning else None,
+                            content.strip() if content else "",
+                        )
+        except (AttributeError, TypeError, ValueError):
+            logger.debug(
+                "Falling back from tokenizer response-template parser", exc_info=True
+            )
 
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
@@ -338,9 +430,13 @@ def _response_output_items_from_text(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
+    processor=None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
-        full_text, thinking_start_token, thinking_end_token
+        full_text,
+        thinking_start_token,
+        thinking_end_token,
+        processor=processor,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
