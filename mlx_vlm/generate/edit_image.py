@@ -121,32 +121,6 @@ def is_image_edit_model(model: str | None) -> bool:
     return False
 
 
-def model_capabilities(model: str | None) -> list[str]:
-    """Capability tokens for a model: 'image_generation', optionally
-    'image_editing'. Registry + manifest only — never loads the model.
-    Reports [] for anything unrecognized.
-    """
-    if model is None:
-        return []
-    caps: list[str] = []
-    model_path = Path(model).expanduser()
-    local_types = (
-        _local_image_model_types(str(model_path)) if model_path.exists() else ()
-    )
-    for model_type in (*local_types, _model_type_from_id(model)):
-        model_class = _image_model_class_for_type(model_type)
-        if (
-            model_class is not None
-            and getattr(model_class, "is_image_generation_model", False)
-            and model_class.supports_model(model)
-        ):
-            caps = ["image_generation"]
-            break
-    if is_image_edit_model(model):
-        caps.append("image_editing")
-    return caps
-
-
 def load_image_edit_model(
     model: str | None,
     **kwargs: Any,

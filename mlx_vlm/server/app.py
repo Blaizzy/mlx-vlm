@@ -17,7 +17,8 @@ from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 
 from .. import apc as _apc
-from ..generate.edit_image import load_image_edit_model, model_capabilities
+from ..generate.capabilities import model_capabilities
+from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
@@ -861,9 +862,15 @@ def models_endpoint():
     except CacheNotFound:
         downloaded_models = []
 
-    # Create a list of available models
-    models = [
-        {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
+    # Create a list of available models, carrying each repo's local snapshot
+    # path (when present) so capability detection can read config.json off
+    # disk - no model loads.
+    entries: list[tuple[str, int, str | None]] = [
+        (
+            repo.repo_id,
+            int(repo.last_modified),
+            getattr(repo, "repo_path", None),
+        )
         for repo in downloaded_models
     ]
     loaded_models = {
@@ -875,18 +882,23 @@ def models_endpoint():
     if loaded_model:
         loaded_models.add(loaded_model)
     for loaded in sorted(loaded_models):
-        if all(model["id"] != loaded for model in models):
-            models.append(
-                {"id": loaded, "object": "model", "created": int(time.time())}
-            )
+        if all(entry[0] != loaded for entry in entries):
+            entries.append((loaded, int(time.time()), None))
 
-    response = {"object": "list", "data": models}
-
-    for model in models:
+    response = {"object": "list", "data": []}
+    for model_id, created, snapshot in entries:
         try:
-            model["capabilities"] = model_capabilities(model["id"])
+            capabilities = model_capabilities(model_id, snapshot_path=snapshot)
         except Exception:
-            model["capabilities"] = []
+            capabilities = []
+        response["data"].append(
+            {
+                "id": model_id,
+                "object": "model",
+                "created": created,
+                "capabilities": capabilities,
+            }
+        )
 
     return response
 

@@ -959,6 +959,50 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
     assert all(isinstance(m["capabilities"], list) for m in response.json()["data"])
 
 
+def test_models_endpoint_reports_config_derived_capabilities(
+    client, monkeypatch, tmp_path
+):
+    snapshot = tmp_path / "snap"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+
+    def repo(repo_id, file_names):
+        return SimpleNamespace(
+            repo_id=repo_id,
+            repo_type="model",
+            last_modified=123.0,
+            repo_path=str(snapshot),
+            refs={
+                "main": SimpleNamespace(
+                    files=[
+                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
+                        for file_name in file_names
+                    ]
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        lambda: SimpleNamespace(
+            repos=[
+                repo(
+                    "local/qwen2",
+                    ["config.json", "model.safetensors", "tokenizer_config.json"],
+                )
+            ]
+        ),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) == 1
+    assert data[0]["capabilities"] == ["text_generation"]
+
+
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     client, monkeypatch
 ):
