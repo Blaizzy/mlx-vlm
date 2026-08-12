@@ -54,9 +54,49 @@ def _write_config(snapshot_path, config: dict) -> str:
     return str(snapshot_path)
 
 
+def _write_tokenizer_config(snapshot_path, chat_template) -> str:
+    snapshot_path.mkdir(parents=True, exist_ok=True)
+    (snapshot_path / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": chat_template})
+    )
+    return str(snapshot_path)
+
+
 def test_model_capabilities_text_only_from_config(tmp_path) -> None:
     snapshot = _write_config(tmp_path / "qwen2", {"model_type": "qwen2"})
     assert model_capabilities("org/qwen2", snapshot_path=snapshot) == [
+        "text_generation"
+    ]
+
+
+def test_model_capabilities_tools_from_template(tmp_path) -> None:
+    snapshot = _write_config(tmp_path / "qwen2", {"model_type": "qwen2"})
+    _write_tokenizer_config(
+        snapshot, "{% if tool_call %}<tool_call>\n<function={{ tool_call.name }}"
+    )
+    assert model_capabilities("org/qwen2", snapshot_path=snapshot) == [
+        "text_generation",
+        "tools",
+    ]
+
+
+def test_model_capabilities_tools_from_template_list(tmp_path) -> None:
+    # Newer repos store chat_template as a list of {name, template} entries.
+    snapshot = _write_config(tmp_path / "gemma", {"model_type": "gemma3"})
+    _write_tokenizer_config(
+        snapshot,
+        [{"name": "default", "template": "<|tool_call|>{{ tool }}"}],
+    )
+    assert model_capabilities("org/gemma", snapshot_path=snapshot) == [
+        "text_generation",
+        "tools",
+    ]
+
+
+def test_model_capabilities_no_tools_without_markers(tmp_path) -> None:
+    snapshot = _write_config(tmp_path / "llama", {"model_type": "llama3.2"})
+    _write_tokenizer_config(snapshot, "{{ message.content }}")
+    assert model_capabilities("org/llama", snapshot_path=snapshot) == [
         "text_generation"
     ]
 
@@ -88,8 +128,10 @@ def test_model_capabilities_embeddings_from_config(tmp_path) -> None:
 
 def test_model_capabilities_image_flags_suppress_text(tmp_path) -> None:
     # A diffusion model config must not gain text_generation even though
-    # get_model_and_args would resolve its type module.
+    # get_model_and_args would resolve its type module; a tool-ish template
+    # must not add tools either.
     snapshot = _write_config(tmp_path / "flux2", {"model_type": "flux2"})
+    _write_tokenizer_config(snapshot, "<tool_call>\n<function=")
     caps = model_capabilities(
         "black-forest-labs/FLUX.2-klein-4B", snapshot_path=snapshot
     )

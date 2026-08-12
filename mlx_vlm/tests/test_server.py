@@ -1003,6 +1003,52 @@ def test_models_endpoint_reports_config_derived_capabilities(
     assert data[0]["capabilities"] == ["text_generation"]
 
 
+def test_models_endpoint_reports_tool_capabilities(client, monkeypatch, tmp_path):
+    snapshot = tmp_path / "snap"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+    (snapshot / "tokenizer_config.json").write_text(
+        json.dumps(
+            {"chat_template": "<tool_call>\n<function={{ tool_call.name }}"}
+        )
+    )
+
+    def repo(repo_id):
+        return SimpleNamespace(
+            repo_id=repo_id,
+            repo_type="model",
+            last_modified=123.0,
+            repo_path=str(snapshot),
+            refs={
+                "main": SimpleNamespace(
+                    files=[
+                        SimpleNamespace(
+                            file_path=SimpleNamespace(name=file_name)
+                        )
+                        for file_name in [
+                            "config.json",
+                            "tokenizer_config.json",
+                            "model.safetensors",
+                        ]
+                    ]
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        lambda: SimpleNamespace(repos=[repo("local/qwen2-tools")]),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) == 1
+    assert data[0]["capabilities"] == ["text_generation", "tools"]
+
+
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     client, monkeypatch
 ):

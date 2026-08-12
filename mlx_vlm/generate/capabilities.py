@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from ..embedding_loader import EMBEDDING_MODEL_REMAPPING
+from ..tool_parsers import _infer_tool_parser
 from ..utils import _has_config, get_model_and_args, load_config
 from .edit_image import is_image_edit_model
 from .image import (
@@ -18,6 +20,7 @@ TEXT_GENERATION = "text_generation"
 VISION = "vision"
 AUDIO = "audio"
 EMBEDDINGS = "embeddings"
+TOOLS = "tools"
 
 
 def model_capabilities(
@@ -27,10 +30,11 @@ def model_capabilities(
 ) -> list[str]:
     """Full capability tokens for a model, without loading it.
 
-    Registry + local config (config.json) only. Image tokens derive from the
-    model registries; text/vision/audio/embedding tokens derive from the
-    repo's config.json when a snapshot is available locally (HF cache or a
-    loaded local path). Unknown models report [] and never block callers.
+    Registry + local config (config.json, tokenizer_config.json) only.
+    Image tokens derive from the model registries; text/vision/audio/
+    embedding/tool tokens derive from the repo's config when a snapshot is
+    available locally (HF cache or a loaded local path). Unknown models
+    report [] and never block callers.
     """
     if model is None:
         return []
@@ -68,6 +72,13 @@ def model_capabilities(
                 caps.append(TEXT_GENERATION)
                 if _has_config(config, "vision_config"):
                     caps.append(VISION)
+                # Tool-calling matches mlx-vlm's load-time rule: the same
+                # chat-template marker scan the server runs after loading.
+                if any(
+                    _infer_tool_parser(template) is not None
+                    for template in _chat_templates(snapshot_path or model)
+                ):
+                    caps.append(TOOLS)
         if _has_config(config, "audio_config"):
             # TTS vs STT is not distinguishable without loading (mlx-vlm
             # delegates audio to mlx_audio); the token means "audio-capable".
@@ -87,3 +98,25 @@ def _read_config(path: str | Path) -> dict[str, Any] | None:
         return dict(load_config(candidate))
     except Exception:
         return None
+
+
+def _chat_templates(path: str | Path) -> list[str]:
+    """Return chat_template strings from tokenizer_config.json (no load)."""
+    candidate = Path(path).expanduser()
+    tokenizer_config = candidate / "tokenizer_config.json"
+    if not tokenizer_config.is_file():
+        return []
+    try:
+        data = json.loads(tokenizer_config.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    template = data.get("chat_template")
+    if isinstance(template, str):
+        return [template]
+    if isinstance(template, list):
+        return [
+            entry.get("template")
+            for entry in template
+            if isinstance(entry, dict) and isinstance(entry.get("template"), str)
+        ]
+    return []
