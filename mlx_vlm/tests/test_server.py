@@ -16,6 +16,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+from huggingface_hub.errors import CacheNotFound
 from PIL import Image
 
 import mlx_vlm.server as server
@@ -27,6 +28,7 @@ from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.model_registry import MODEL_ALIASES_ENV, MODEL_PATHS_ENV
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 
@@ -937,7 +939,9 @@ def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
     assert calls == {"clear_cache": 1, "collect": 1}
 
 
-def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
+def test_models_endpoint_lists_single_file_safetensors_models(
+    client, monkeypatch, tmp_path
+):
     def repo(repo_id, file_names):
         return SimpleNamespace(
             repo_id=repo_id,
@@ -945,10 +949,11 @@ def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatc
             last_modified=123.0,
             refs={
                 "main": SimpleNamespace(
+                    snapshot_path=tmp_path / repo_id.replace("/", "--"),
                     files=[
                         SimpleNamespace(file_path=SimpleNamespace(name=file_name))
                         for file_name in file_names
-                    ]
+                    ],
                 )
             },
         )
@@ -990,23 +995,22 @@ def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     monkeypatch.setattr(
         server,
         "scan_cache_dir",
-        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
     )
     monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
 
     response = client.get("/v1/models")
 
     assert response.status_code == 200
-    assert response.json()["data"] == [
-        {
-            "id": "/models/local-qwen",
-            "object": "model",
-            "created": response.json()["data"][0]["created"],
-        }
-    ]
+    model_info = response.json()["data"][0]
+    assert model_info["id"].startswith("local/local-qwen-")
+    assert "/models/local-qwen" not in response.text
+    assert model_info["object"] == "model"
 
 
-def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
+def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(
+    client, monkeypatch, tmp_path
+):
     def repo(repo_id, file_names):
         return SimpleNamespace(
             repo_id=repo_id,
@@ -1014,10 +1018,11 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
             last_modified=123.0,
             refs={
                 "main": SimpleNamespace(
+                    snapshot_path=tmp_path / repo_id.replace("/", "--"),
                     files=[
                         SimpleNamespace(file_path=SimpleNamespace(name=file_name))
                         for file_name in file_names
-                    ]
+                    ],
                 )
             },
         )
@@ -1046,6 +1051,217 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     assert [model["id"] for model in response.json()["data"]].count(
         "local/sharded-model"
     ) == 1
+
+
+def test_models_endpoint_discovers_configured_local_roots(
+    client, monkeypatch, tmp_path
+):
+    models_root = tmp_path / "models"
+    model_path = models_root / "org" / "demo"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text("{}")
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv(MODEL_PATHS_ENV, str(models_root))
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert [model["id"] for model in response.json()["data"]] == ["local/org/demo"]
+    assert str(tmp_path) not in response.text
+
+
+def test_models_endpoint_returns_alias_instead_of_local_path(
+    client, monkeypatch, tmp_path
+):
+    model_path = tmp_path / "private" / "demo"
+    model_path.mkdir(parents=True)
+    (model_path / "config.json").write_text("{}")
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv(MODEL_ALIASES_ENV, json.dumps({"demo": str(model_path)}))
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    assert [model["id"] for model in response.json()["data"]] == ["demo"]
+    assert str(model_path) not in response.text
+
+
+def test_models_endpoint_reports_private_collision_error(client, monkeypatch, tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    for root in (first_root, second_root):
+        model_path = root / "org" / "demo"
+        model_path.mkdir(parents=True)
+        (model_path / "config.json").write_text("{}")
+        (model_path / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv(
+        MODEL_PATHS_ENV,
+        os.pathsep.join((str(first_root), str(second_root))),
+    )
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 409
+    assert "configure an explicit alias" in response.text
+    assert str(tmp_path) not in response.text
+
+
+def test_models_endpoint_reports_private_invalid_alias_error(
+    client, monkeypatch, tmp_path
+):
+    missing = tmp_path / "private" / "missing"
+    monkeypatch.setenv(MODEL_ALIASES_ENV, json.dumps({"demo": str(missing)}))
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 400
+    assert "missing directory" in response.text
+    assert str(tmp_path) not in response.text
+
+
+def test_models_endpoint_hides_invalid_alias_identifier(client, monkeypatch, tmp_path):
+    private_id = str(tmp_path / "private-id")
+    monkeypatch.setenv(MODEL_ALIASES_ENV, json.dumps({private_id: "/missing"}))
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 400
+    assert str(tmp_path) not in response.text
+
+
+def test_get_cached_model_resolves_alias_and_deduplicates_path(monkeypatch, tmp_path):
+    model_path = tmp_path / "private" / "image-model"
+    model_path.mkdir(parents=True)
+    (model_path / "model_index.json").write_text("{}")
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv(
+        MODEL_ALIASES_ENV,
+        json.dumps({"image-demo": str(model_path)}),
+    )
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=CacheNotFound("missing cache", "/missing")),
+    )
+    calls = []
+
+    def load_image_model(path):
+        calls.append(path)
+        return SimpleNamespace(family="test")
+
+    monkeypatch.setattr(
+        server._app_module, "load_image_generation_model", load_image_model
+    )
+    server.runtime.model_cache.clear("image_generation")
+
+    server.get_cached_model("image-demo", model_kind="image_generation")
+    server.get_cached_model(str(model_path), model_kind="image_generation")
+
+    cache = server.runtime.model_cache.for_kind("image_generation")
+    assert calls == [str(model_path.resolve())]
+    assert cache["model_id"] == "image-demo"
+    assert cache["model_path"] == str(model_path.resolve())
+    server.runtime.model_cache.clear("image_generation")
+
+
+def test_get_cached_model_hides_alias_path_in_loader_errors(monkeypatch, tmp_path):
+    model_path = tmp_path / "private" / "image-model"
+    model_path.mkdir(parents=True)
+    (model_path / "model_index.json").write_text("{}")
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    monkeypatch.setenv(
+        MODEL_ALIASES_ENV,
+        json.dumps({"image-demo": str(model_path)}),
+    )
+
+    def fail_to_load(path):
+        raise ValueError(f"invalid configuration at {path}")
+
+    monkeypatch.setattr(server._app_module, "load_image_generation_model", fail_to_load)
+    server.runtime.model_cache.clear("image_generation")
+
+    with pytest.raises(server.HTTPException) as error:
+        server.get_cached_model("image-demo", model_kind="image_generation")
+
+    assert "image-demo" in error.value.detail
+    assert str(tmp_path) not in error.value.detail
+    server.runtime.model_cache.clear("image_generation")
+
+
+def test_generated_local_model_id_resolves_while_model_is_loaded(monkeypatch, tmp_path):
+    model_path = tmp_path / "private" / "image-model"
+    model_path.mkdir(parents=True)
+    (model_path / "model_index.json").write_text("{}")
+    (model_path / "model.safetensors").write_bytes(b"weights")
+    calls = []
+
+    def load_image_model(path):
+        calls.append(path)
+        return SimpleNamespace(family="test")
+
+    monkeypatch.setattr(
+        server._app_module, "load_image_generation_model", load_image_model
+    )
+    server.runtime.model_cache.clear("image_generation")
+
+    server.get_cached_model(str(model_path), model_kind="image_generation")
+    cache = server.runtime.model_cache.for_kind("image_generation")
+    model_id = cache["model_id"]
+    server.get_cached_model(model_id, model_kind="image_generation")
+
+    assert model_id.startswith("local/image-model-")
+    assert calls == [str(model_path.resolve())]
+    server.runtime.model_cache.clear("image_generation")
+
+
+def test_health_uses_private_identifier_for_legacy_local_cache(
+    client, monkeypatch, tmp_path
+):
+    model_path = str(tmp_path / "private" / "demo")
+    monkeypatch.setitem(server.runtime.model_cache, "model_path", model_path)
+    monkeypatch.setitem(server.runtime.model_cache, "model_id", None)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["loaded_model"].startswith("local/demo-")
+    assert str(tmp_path) not in response.text
+
+
+def test_health_uses_private_identifier_for_legacy_relative_local_cache(
+    client, monkeypatch, tmp_path
+):
+    model_path = tmp_path / "models" / "demo"
+    model_path.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setitem(server.runtime.model_cache, "model_path", "models/demo")
+    monkeypatch.setitem(server.runtime.model_cache, "model_id", None)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["loaded_model"].startswith("local/demo-")
+    assert "models/demo" not in response.text
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
@@ -4237,6 +4453,23 @@ def test_metrics_store_logs_request_lifecycle(caplog):
     assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
 
 
+def test_metrics_store_does_not_expose_absolute_model_paths(tmp_path):
+    model_path = str(tmp_path / "private" / "demo")
+    metrics = server.ServerMetricsStore()
+    metrics.begin_request(endpoint="/chat/completions", model=model_path, stream=False)
+    metrics.record_failure(
+        endpoint="/chat/completions",
+        model=model_path,
+        stream=False,
+        error=f"failed to load {model_path}",
+    )
+
+    snapshot = metrics.snapshot()
+
+    assert snapshot["summary"]["last_error"]["model"].startswith("local/demo-")
+    assert str(tmp_path) not in json.dumps(snapshot)
+
+
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "apc_manager", None)
@@ -6077,7 +6310,7 @@ class TestResponseGenerator:
         assert args.thinking_start_token == "<think>"
         assert args.thinking_end_token == "</think>"
 
-    def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+    def test_server_cli_sets_thinking_defaults(self, monkeypatch, tmp_path):
         for env_var in (
             "MLX_VLM_ENABLE_THINKING",
             "MLX_VLM_PRELOAD_MODEL",
@@ -6091,6 +6324,8 @@ class TestResponseGenerator:
             "MLX_VLM_THINKING_START_TOKEN",
             "MLX_VLM_THINKING_END_TOKEN",
             "MLX_VLM_SERVER_API_KEY",
+            MODEL_PATHS_ENV,
+            MODEL_ALIASES_ENV,
             "PREFILL_STEP_SIZE",
             "KV_GROUP_SIZE",
             "KV_QUANT_SCHEME",
@@ -6108,6 +6343,10 @@ class TestResponseGenerator:
                 "8080",
                 "--model",
                 "demo",
+                "--model-path",
+                str(tmp_path / "models"),
+                "--model-alias",
+                f"local-demo={tmp_path / 'local=model'}",
                 "--image-model",
                 "image-demo",
                 "--tts-model",
@@ -6144,6 +6383,10 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
+            assert os.environ[MODEL_PATHS_ENV] == str((tmp_path / "models").resolve())
+            assert json.loads(os.environ[MODEL_ALIASES_ENV]) == {
+                "local-demo": str((tmp_path / "local=model").resolve())
+            }
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
@@ -6159,6 +6402,8 @@ class TestResponseGenerator:
                 "MLX_VLM_THINKING_START_TOKEN",
                 "MLX_VLM_THINKING_END_TOKEN",
                 "MLX_VLM_SERVER_API_KEY",
+                MODEL_PATHS_ENV,
+                MODEL_ALIASES_ENV,
             ):
                 os.environ.pop(env_var, None)
 
@@ -6198,7 +6443,13 @@ class TestResponseGenerator:
         for key in preload_env:
             assert key not in os.environ
 
-    def test_lifespan_continues_when_optional_preload_fails(self, monkeypatch):
+    def test_lifespan_continues_when_optional_preload_fails(
+        self, monkeypatch, tmp_path
+    ):
+        stt_model = tmp_path / "private" / "stt-demo"
+        stt_model.mkdir(parents=True)
+        (stt_model / "config.json").write_text("{}")
+        (stt_model / "model.safetensors").write_bytes(b"weights")
         preload_env = {
             "MLX_VLM_PRELOAD_MODEL": "language-demo",
             "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
@@ -6207,13 +6458,18 @@ class TestResponseGenerator:
         }
         for key, value in preload_env.items():
             monkeypatch.setenv(key, value)
+        monkeypatch.setenv(
+            MODEL_ALIASES_ENV,
+            json.dumps({"stt-demo": str(stt_model)}),
+        )
         calls = []
 
         def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
             calls.append(model_kind)
             if model_kind == "audio_stt":
                 raise server.HTTPException(
-                    status_code=500, detail="Failed to load audio model: boom"
+                    status_code=500,
+                    detail=f"Failed to load audio model at {stt_model}: boom",
                 )
             return SimpleNamespace(), None, SimpleNamespace(model_type=model_kind)
 
@@ -6233,6 +6489,7 @@ class TestResponseGenerator:
         failure = server.runtime.preload_failures["audio_stt"]
         assert failure["model"] == "stt-demo"
         assert "Failed to load audio model" in failure["error"]
+        assert str(tmp_path) not in failure["error"]
         assert "audio_tts" not in server.runtime.preload_failures
         server.runtime.preload_failures.clear()
 
