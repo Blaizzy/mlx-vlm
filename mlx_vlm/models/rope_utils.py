@@ -12,6 +12,80 @@ _HALF_COS = "half"
 _FULL_COS = "full"
 
 
+def _eager_rope_angles(x, offset, frequencies, scale, traditional):
+    positions = mx.arange(x.shape[-2], dtype=mx.float32) + offset
+    positions = positions * scale
+    angles = positions[:, None] * frequencies[None]
+    if traditional:
+        return mx.repeat(angles, 2, axis=-1)
+    return mx.concatenate([angles, angles], axis=-1)
+
+
+def _eager_rope_rotate(x, dims, traditional):
+    x = x[..., :dims]
+    if traditional:
+        return mx.stack([-x[..., 1::2], x[..., ::2]], axis=-1).reshape(x.shape)
+    midpoint = dims // 2
+    return mx.concatenate([-x[..., midpoint:], x[..., :midpoint]], axis=-1)
+
+
+def _eager_rope_apply(x, cos, sin, dims, traditional):
+    x_rope = x[..., :dims]
+    rotated = _eager_rope_rotate(x, dims, traditional)
+    out = x_rope * cos + rotated * sin
+    if dims < x.shape[-1]:
+        out = mx.concatenate([out, x[..., dims:]], axis=-1)
+    return out
+
+
+@mx.compile
+def _compiled_eager_rope(x, offset, frequencies, scale, traditional):
+    dims = frequencies.shape[0] * 2
+    angles = _eager_rope_angles(x, offset, frequencies, scale, traditional)
+    cos = mx.cos(angles).astype(x.dtype)[None, None]
+    sin = mx.sin(angles).astype(x.dtype)[None, None]
+    return _eager_rope_apply(x, cos, sin, dims, traditional)
+
+
+class EagerRoPE(nn.Module):
+    """RoPE with explicit FP32 frequencies and activation-dtype cos/sin."""
+
+    def __init__(
+        self,
+        dims: int,
+        traditional: bool = False,
+        base: float = 10000.0,
+        scale: float = 1.0,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+        self.base = base
+        self.scale = scale
+        self._frequencies = 1.0 / (
+            base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
+        )
+        self._scale = mx.array(scale, dtype=mx.float32)
+        self.eval_cached_arrays()
+
+    def eager_eval_arrays(self):
+        return [self._frequencies, self._scale]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        return _compiled_eager_rope(
+            x,
+            mx.array(offset, dtype=mx.float32),
+            self._frequencies,
+            self._scale,
+            self.traditional,
+        )
+
+
 class SuScaledRoPE(nn.Module):
     def __init__(
         self,
@@ -299,6 +373,7 @@ def initialize_rope(
     traditional,
     scaling_config: Optional[dict] = None,
     max_position_embeddings: Optional[int] = None,
+    implementation: str = "fast",
 ):
     if scaling_config is not None:
         rope_type = scaling_config.get("type") or scaling_config.get(
@@ -307,9 +382,24 @@ def initialize_rope(
     else:
         rope_type = "default"
 
+    if implementation not in ("fast", "eager"):
+        raise ValueError(f"Unsupported RoPE implementation {implementation}")
+
     if rope_type in ["default", "linear"]:
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
+        if implementation == "eager":
+            return EagerRoPE(
+                dims,
+                traditional=traditional,
+                base=base,
+                scale=scale,
+            )
         return nn.RoPE(dims, traditional=traditional, base=base, scale=scale)
+
+    if implementation != "fast":
+        raise ValueError(
+            f"RoPE implementation {implementation} does not support type {rope_type}"
+        )
 
     if rope_type == "llama3":
         return Llama3RoPE(

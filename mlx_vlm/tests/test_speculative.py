@@ -1589,6 +1589,43 @@ def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
     assert calls[0][2]["row_ids"] == [0]
 
 
+def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
+    calls = []
+
+    def fake_single(*args, **kwargs):
+        calls.append((args, kwargs))
+        yield 3, None
+        yield 4, None
+        yield 5, None
+
+    def fake_batch(*args, **kwargs):
+        raise AssertionError("server DFlash singleton should use single round path")
+
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds", fake_single)
+    monkeypatch.setattr(speculative_utils, "_dflash_rounds_batch", fake_batch)
+
+    result = list(
+        speculative_utils.run_speculative_server_rounds(
+            SimpleNamespace(language_model=SimpleNamespace()),
+            SimpleNamespace(),
+            prompt_cache=[],
+            hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
+            draft_kind="dflash",
+            first_bonus=mx.array([2], dtype=mx.int32),
+            max_tokens=4,
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+            stop_check=lambda _seq_idx, token_id: token_id == 4,
+        )
+    )
+
+    assert result == [([3], None), ([4], None)]
+    assert calls
+    assert calls[0][1]["first_bonus"] == 2
+    assert "use_model_initial_block_size" not in calls[0][1]
+
+
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
     ragged_drafter = SimpleNamespace(requires_uniform_batch_acceptance=False)
     uniform_drafter = SimpleNamespace(requires_uniform_batch_acceptance=True)
@@ -1960,6 +1997,12 @@ def test_dflash_next_block_size_starts_at_requested_ceiling():
     draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
 
     assert _dflash_next_block_size(draft_model, 16, 20) == 16
+
+
+def test_dflash_next_block_size_uses_model_initial_size():
+    draft_model = SimpleNamespace(accept_lens=[], draft_lens=[])
+
+    assert _dflash_next_block_size(draft_model, 16, 20, 4) == 4
 
 
 def test_dflash_next_block_size_backs_off_on_low_acceptance():
