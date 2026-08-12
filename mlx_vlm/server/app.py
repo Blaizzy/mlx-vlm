@@ -36,7 +36,9 @@ from .generation import (
     get_configured_context_limit,
     get_kv_group_size,
     get_kv_quant_scheme,
+    get_kv_split_schemes,
     get_quantized_kv_bits,
+    get_quantized_kv_split_bits,
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
@@ -151,6 +153,7 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -371,15 +374,31 @@ async def lifespan(app):
             "embedding model",
         ),
     )
+    runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
         if not preload_model_path:
             continue
         logger.info("Pre-loading %s: %s", label, preload_model_path)
-        get_cached_model(
-            preload_model_path,
-            preload_adapter_path,
-            model_kind=model_kind,
-        )
+        try:
+            get_cached_model(
+                preload_model_path,
+                preload_adapter_path,
+                model_kind=model_kind,
+            )
+        except Exception as e:
+            reason = getattr(e, "detail", None) or str(e)
+            runtime.preload_failures[model_kind] = {
+                "model": preload_model_path,
+                "label": label,
+                "error": str(reason),
+            }
+            logger.error(
+                "Failed to pre-load %s %r: %s. Continuing without it.",
+                label,
+                preload_model_path,
+                reason,
+            )
+            continue
         logger.info("%s ready.", label.capitalize())
     try:
         yield
@@ -683,6 +702,8 @@ def get_cached_model(
 
     # KV cache quantization (uniform or TurboQuant)
     kv_bits = get_quantized_kv_bits(model_path)
+    kv_key_bits, kv_value_bits = get_quantized_kv_split_bits()
+    kv_key_scheme, kv_value_scheme = get_kv_split_schemes()
     kv_group_size = get_kv_group_size()
     quantized_kv_start = get_quantized_kv_start()
     kv_quant_scheme = get_kv_quant_scheme()
@@ -692,6 +713,8 @@ def get_cached_model(
             model_path,
             adapter_path=adapter_path,
             kv_bits=kv_bits,
+            kv_key_bits=kv_key_bits,
+            kv_value_bits=kv_value_bits,
             kv_group_size=kv_group_size,
             kv_quant_scheme=kv_quant_scheme,
             quantized_kv_start=quantized_kv_start,
@@ -703,6 +726,10 @@ def get_cached_model(
         adapter_path=adapter_path,
         vision_cache=vision_cache,
         kv_bits=kv_bits,
+        kv_key_bits=kv_key_bits,
+        kv_value_bits=kv_value_bits,
+        kv_key_scheme=kv_key_scheme,
+        kv_value_scheme=kv_value_scheme,
         kv_group_size=kv_group_size,
         kv_quant_scheme=kv_quant_scheme,
         quantized_kv_start=quantized_kv_start,
