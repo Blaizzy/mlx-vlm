@@ -155,6 +155,7 @@ class Model(nn.Module):
 
             image_features = pooler_output.astype(pixel_values.dtype)
             image_features = self.connector(image_features)
+            image_features = image_features.reshape(-1, image_features.shape[-1])
 
         final_inputs_embeds = self._prepare_inputs_for_multimodal(
             image_features, inputs_embeds, input_ids

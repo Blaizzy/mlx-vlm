@@ -279,6 +279,23 @@ def iterate_batches(dataset, batch_size, max_seq_length, train=False):
                 pixel_values_batch = _collate_arrays(
                     [_squeeze_leading_batch_dim(item["pixel_values"]) for item in items]
                 )
+                # Fix: trim pixel_values when truncation removes image tokens.
+                # Count remaining image tokens in truncated input_ids and trim
+                # pixel_values to match (each sub-image = tokens_per_image features).
+                if pixel_values_batch is not None and hasattr(dataset, 'config'):
+                    config = dataset.config if hasattr(dataset, 'config') else {}
+                    image_token_id = config.get("image_token_id", 49153)
+                    for i in range(len(items)):
+                        n_image_tokens = int((input_ids_batch[i] == image_token_id).sum())
+                        pv = pixel_values_batch[i] if isinstance(pixel_values_batch, list) else None
+                        if pv is not None and hasattr(pv, 'shape'):
+                            n_sub_images = pv.shape[0] if len(pv.shape) >= 3 else 1
+                            tokens_per_image = 81  # Idefics3 perceiver resampler output
+                            expected_tokens = n_sub_images * tokens_per_image
+                            if n_image_tokens < expected_tokens and n_image_tokens > 0:
+                                keep_images = n_image_tokens // tokens_per_image
+                                if keep_images > 0 and keep_images < n_sub_images:
+                                    pixel_values_batch[i] = pv[:keep_images]
 
             batch = {
                 "input_ids": mx.array(input_ids_batch),

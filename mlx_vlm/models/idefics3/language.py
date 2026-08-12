@@ -50,7 +50,7 @@ class Attention(nn.Module):
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        if cache is not None:
+        if cache is not None and hasattr(cache, 'update_and_fetch'):
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
