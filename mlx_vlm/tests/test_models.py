@@ -9918,6 +9918,282 @@ class TestMiniCPMO(unittest.TestCase):
         self.assertEqual(vision_hidden_states[0].shape, (1, 4, 64))
 
 
+class TestMuseGlimmer(unittest.TestCase):
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import muse_glimmer
+
+        text_config = muse_glimmer.TextConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            max_position_embeddings=128,
+            sliding_window=8,
+            layer_types=["sliding_attention", "full_attention"],
+            layer_rope_theta=[10000.0, 0],
+        )
+        vision_config = muse_glimmer.VisionConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=2,
+            patch_size=2,
+            patch_temporal=2,
+            merge_size=2,
+            pos_emb_height=4,
+            pos_emb_width=4,
+            max_position_embeddings=16,
+            layer_types=["window_attention", "full_attention"],
+        )
+        return muse_glimmer.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=7,
+            video_token_id=6,
+            out_hidden_size=32,
+            projector_hidden_size=16,
+        )
+
+    def test_config_matches_local_global_patterns(self):
+        from mlx_vlm.models import muse_glimmer
+
+        text_config = muse_glimmer.TextConfig(num_hidden_layers=8)
+        self.assertEqual(
+            text_config.layer_types,
+            [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+        self.assertEqual(text_config.layer_rope_theta[3], 0)
+        self.assertEqual(text_config.layer_rope_theta[7], 0)
+
+        vision_config = muse_glimmer.VisionConfig(num_hidden_layers=6)
+        self.assertEqual(
+            vision_config.layer_types,
+            [
+                "window_attention",
+                "window_attention",
+                "window_attention",
+                "full_attention",
+                "window_attention",
+                "full_attention",
+            ],
+        )
+
+    def test_centered_rms_norm_uses_one_plus_checkpoint_weight(self):
+        from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+
+        norm = CenteredRMSNorm(2, eps=0.0)
+        norm.weight = mx.array([0.0, 1.0])
+        output = norm(mx.array([[3.0, 4.0]]))
+        expected_base = np.array([[3.0, 4.0]]) / np.sqrt((9.0 + 16.0) / 2.0)
+        np.testing.assert_allclose(
+            np.asarray(output), expected_base * np.array([[1.0, 2.0]]), rtol=1e-6
+        )
+
+    def test_centered_rms_norm_preserves_transformers_fp32_operation_order(self):
+        from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+
+        norm = CenteredRMSNorm(4, eps=1e-6)
+        norm.weight = (mx.arange(4, dtype=mx.float32) * 0.031 - 0.2).astype(mx.bfloat16)
+        inputs = (
+            (mx.arange(4, dtype=mx.float32) * 0.37 - 1.13)
+            .reshape(1, 4)
+            .astype(mx.bfloat16)
+        )
+
+        inputs32 = inputs.astype(mx.float32)
+        variance = mx.mean(mx.square(inputs32), axis=-1, keepdims=True)
+        expected = inputs32 * mx.rsqrt(variance + norm.eps)
+        expected = expected * (1.0 + norm.weight.astype(mx.float32))
+        expected = expected.astype(inputs.dtype)
+        output = norm(inputs)
+        mx.eval(output, expected)
+
+        self.assertTrue(bool(mx.array_equal(output, expected).item()))
+
+    def test_query_scale_uses_transformers_fp32_operation_order(self):
+        from mlx_vlm.models.muse_glimmer.language import _scale_queries
+
+        inputs = mx.array([0.1, 1.0, 9.0], dtype=mx.bfloat16)
+        output = _scale_queries(inputs, 3.87)
+        expected = (inputs.astype(mx.float32) * 3.87).astype(inputs.dtype)
+        bf16_scalar_result = inputs * 3.87
+        mx.eval(output, expected, bf16_scalar_result)
+
+        self.assertTrue(bool(mx.array_equal(output, expected).item()))
+        self.assertFalse(bool(mx.array_equal(output, bf16_scalar_result).item()))
+
+    def test_compiled_vision_rotary_matches_fp32_reference(self):
+        from mlx_vlm.models.muse_glimmer.vision import apply_rotary, rotate_half
+
+        q = mx.arange(48, dtype=mx.bfloat16).reshape(1, 2, 2, 12) / 48
+        k = q + 0.25
+        cos = mx.cos(mx.arange(24, dtype=mx.float32).reshape(2, 12) / 24)
+        sin = mx.sin(mx.arange(24, dtype=mx.float32).reshape(2, 12) / 24)
+
+        actual_q, actual_k = apply_rotary(q, k, cos, sin)
+        expanded_cos = cos[None, :, None, :]
+        expanded_sin = sin[None, :, None, :]
+        q32, k32 = q.astype(mx.float32), k.astype(mx.float32)
+        expected_q = (q32 * expanded_cos + rotate_half(q32) * expanded_sin).astype(
+            q.dtype
+        )
+        expected_k = (k32 * expanded_cos + rotate_half(k32) * expanded_sin).astype(
+            k.dtype
+        )
+        mx.eval(actual_q, actual_k, expected_q, expected_k)
+
+        self.assertTrue(bool(mx.array_equal(actual_q, expected_q).item()))
+        self.assertTrue(bool(mx.array_equal(actual_k, expected_k).item()))
+
+    def test_window_index_skips_identity_reordering(self):
+        from mlx_vlm.models.muse_glimmer.vision import _window_index
+
+        identity_index, identity_cu = _window_index([[1, 4, 4]], window_size=4)
+        self.assertIsNone(identity_index)
+        self.assertEqual(identity_cu, [0, 16])
+
+        window_index, window_cu = _window_index([[1, 4, 8]], window_size=4)
+        mx.eval(window_index)
+        self.assertEqual(window_cu, [0, 16, 32])
+        self.assertEqual(sorted(window_index.tolist()), list(range(32)))
+
+    def test_masked_scatter_stays_in_mlx(self):
+        from mlx_vlm.models.muse_glimmer.muse_glimmer import masked_scatter
+
+        inputs = mx.arange(12).reshape(1, 3, 4)
+        mask = mx.broadcast_to(mx.array([[[False], [True], [False]]]), inputs.shape)
+        source = mx.array([[20, 21, 22, 23]])
+        output = masked_scatter(inputs, mask, source)
+        mx.eval(output)
+        self.assertEqual(
+            output.tolist(),
+            [[[0, 1, 2, 3], [20, 21, 22, 23], [8, 9, 10, 11]]],
+        )
+
+    def test_image_processor_patch_layout_and_grid(self):
+        from PIL import Image
+
+        from mlx_vlm.models.muse_glimmer.processing_muse_glimmer import (
+            MuseGlimmerImageProcessor,
+            smart_resize,
+        )
+
+        self.assertEqual(
+            smart_resize(28, 56, patch_size=28, max_tokens=4096),
+            (28, 56),
+        )
+        processor = MuseGlimmerImageProcessor(
+            patch_size=14,
+            temporal_patch_size=2,
+            merge_size=2,
+            max_image_tokens=4096,
+        )
+        output = processor(Image.new("RGB", (28, 28), (255, 0, 0)))
+        self.assertEqual(output["pixel_values"].shape, (4, 1176))
+        self.assertEqual(output["image_grid_thw"].tolist(), [[1, 2, 2]])
+        # Temporal copies are adjacent within each flattened patch.
+        first = output["pixel_values"][0].reshape(2, 3, 14, 14)
+        np.testing.assert_array_equal(first[0], first[1])
+
+    def test_tiny_text_and_multimodal_forward(self):
+        from mlx_vlm.models import muse_glimmer
+
+        mx.random.seed(0)
+        model = muse_glimmer.Model(self._tiny_config())
+
+        text_output = model(mx.array([[1, 2, 3]]))
+        mx.eval(text_output.logits)
+        self.assertEqual(text_output.logits.shape, (1, 3, 64))
+        self.assertTrue(bool(mx.isfinite(text_output.logits).all().item()))
+
+        # A 2x2 raw patch grid is pixel-shuffled into one visual token.
+        pixels = mx.zeros((4, 2 * 3 * 2 * 2), dtype=mx.float32)
+        grid = mx.array([[1, 2, 2]])
+        embeddings = model.get_input_embeddings(
+            mx.array([[1, 7, 2]]), pixels, image_grid_thw=grid
+        ).inputs_embeds
+        mx.eval(embeddings)
+        self.assertEqual(embeddings.shape, (1, 3, 16))
+        self.assertTrue(bool(mx.isfinite(embeddings).all().item()))
+
+    def test_quantization_keeps_embedding_normalization_outside_embedding(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.muse_glimmer.language import RMSNormNoScale
+
+        config = self._tiny_config()
+        config.text_config.hidden_size = 32
+        model = muse_glimmer.Model(config)
+
+        nn.quantize(
+            model.language_model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, module: (
+                hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0
+            ),
+        )
+
+        text_model = model.language_model.model
+        self.assertIsInstance(text_model.embed_tokens, nn.QuantizedEmbedding)
+        self.assertIsInstance(text_model.embed_norm, RMSNormNoScale)
+        self.assertIsInstance(
+            text_model.layers[0].self_attn.q_proj,
+            nn.QuantizedLinear,
+        )
+
+        input_ids = mx.array([[1, 2, 3]])
+        normalized = text_model.embed_norm(text_model.embed_tokens(input_ids))
+        multimodal_path = model.get_input_embeddings(input_ids).inputs_embeds
+        direct_path = text_model(input_ids)
+        embedded_path = text_model(None, inputs_embeds=normalized)
+        mx.eval(normalized, multimodal_path, direct_path, embedded_path)
+
+        np.testing.assert_allclose(multimodal_path, normalized, rtol=1e-5, atol=1e-7)
+        np.testing.assert_allclose(direct_path, embedded_path, rtol=1e-5, atol=1e-7)
+
+    def test_cache_matches_layer_attention_type(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+        caches = muse_glimmer.Model(self._tiny_config()).make_cache()
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertEqual(caches[0].max_size, 8)
+        self.assertIsInstance(caches[1], KVCache)
+
+    def test_checkpoint_prefixes_are_sanitized_to_native_modules(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._tiny_config())
+        weights = model.sanitize(
+            {
+                "model.language_model.layers.0.self_attn.q_proj.weight": mx.zeros(
+                    (16, 16)
+                ),
+                "model.vision_tower.ln_pre.weight": mx.ones((8,)),
+                "lm_head.weight": mx.zeros((64, 16)),
+            }
+        )
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            weights,
+        )
+        self.assertIn("vision_tower.ln_pre.weight", weights)
+        self.assertIn("language_model.lm_head.weight", weights)
+
+
 class TestPhi4MM(unittest.TestCase):
     @staticmethod
     def _tiny_config():
