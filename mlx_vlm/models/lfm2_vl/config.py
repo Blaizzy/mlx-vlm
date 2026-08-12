@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from ..base import BaseModelConfig
 
@@ -22,7 +22,7 @@ class TextConfig(BaseModelConfig):
     use_pos_enc: bool = True
     block_auto_adjust_ff_dim: bool = True
     block_dim: int = 1024
-    block_ff_dim: int = 6656
+    block_ff_dim: Optional[int] = None
     block_ffn_dim_multiplier: float = 1.0
     block_mlp_init_scale: float = 1.0
     block_multiple_of: int = 256
@@ -40,6 +40,11 @@ class TextConfig(BaseModelConfig):
     full_attn_idxs: List[int] = None
 
     def __post_init__(self):
+
+        # LFM2.5-VL checkpoints expose the MLP width as ``intermediate_size``
+        # and omit the legacy ``block_ff_dim`` field.
+        if self.block_ff_dim is None:
+            self.block_ff_dim = self.intermediate_size
 
         if self.full_attn_idxs is None:
             self.full_attn_idxs = [

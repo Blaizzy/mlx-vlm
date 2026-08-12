@@ -797,6 +797,18 @@ class TestModels(unittest.TestCase):
         self.assertNotIn("layer_norm", projector.parameters())
         self.assertEqual(projector(x).shape, (1, 4, config.text_config.hidden_size))
 
+    def test_lfm2_vl_uses_intermediate_size_when_block_ff_dim_is_omitted(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.TextConfig.from_dict(
+            {
+                "intermediate_size": 10752,
+                "layer_types": ["full_attention"],
+            }
+        )
+
+        self.assertEqual(config.block_ff_dim, 10752)
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
