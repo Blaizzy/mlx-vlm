@@ -114,9 +114,6 @@ def make_speculative_prompt_cache(
     left_padding,
     make_cache: Callable,
 ):
-    # Match the regular generation path for singleton requests. Batch-aware
-    # caches add padding/offset bookkeeping and can change the BF16 execution
-    # order even when the effective batch size is one.
     if batch_size == 1:
         return cache.make_prompt_cache(lm)
     return make_cache(lm, left_padding)
