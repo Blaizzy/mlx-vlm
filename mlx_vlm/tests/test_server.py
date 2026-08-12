@@ -6640,7 +6640,6 @@ class TestSplitThinking:
         reasoning, content = server._split_thinking(
             text,
             processor=SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
-            prefix="<|start|>assistant",
         )
         assert reasoning == "Muse reasoning."
         assert content == "Muse answer."
@@ -6807,7 +6806,6 @@ class TestThinkingStreamState:
     def test_response_template_markers_split_across_chunks(self):
         state = server.make_response_stream_state(
             SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
-            "<|start|>assistant",
             thinking_start_token="unused-start",
             thinking_end_token="unused-end",
         )

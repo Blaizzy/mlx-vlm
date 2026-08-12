@@ -437,14 +437,12 @@ def _anthropic_content_from_generation(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
     processor=None,
-    prefix=None,
 ) -> List[Dict[str, Any]]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
         processor=processor,
-        prefix=prefix,
     )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
@@ -548,7 +546,6 @@ async def anthropic_messages_endpoint(http_request: Request):
                 text_output = ""
                 thinking_state = make_response_stream_state(
                     processor,
-                    formatted_prompt,
                     prompt_has_open_thinking(
                         formatted_prompt,
                         gen_args.enable_thinking,
@@ -970,7 +967,6 @@ async def anthropic_messages_endpoint(http_request: Request):
                 thinking_start_token=gen_args.thinking_start_token,
                 thinking_end_token=gen_args.thinking_end_token,
                 processor=processor,
-                prefix=formatted_prompt,
             )
             stop_reason = _anthropic_stop_reason(
                 finish_reason,

@@ -216,7 +216,6 @@ def _response_template_tokenizer(processor):
 
 def make_response_stream_state(
     processor,
-    prefix: Any,
     enable_thinking: bool = False,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
@@ -225,7 +224,7 @@ def make_response_stream_state(
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
             return ResponseTemplateStreamState(
-                tokenizer.get_response_parser(prefix="" if prefix is None else prefix)
+                tokenizer.get_response_parser(prefix="")
             )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
@@ -365,7 +364,6 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
-    prefix: Any = None,
 ) -> Tuple[Optional[str], str]:
     if not text:
         return None, text
@@ -373,9 +371,7 @@ def _split_thinking(
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
-            parsed = tokenizer.parse_response(
-                text, prefix="" if prefix is None else prefix
-            )
+            parsed = tokenizer.parse_response(text, prefix="")
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
@@ -432,14 +428,12 @@ def _response_output_items_from_text(
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
     processor=None,
-    prefix: Any = None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
         processor=processor,
-        prefix=prefix,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
