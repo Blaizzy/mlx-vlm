@@ -81,7 +81,8 @@ class ModelConfig(BaseModelConfig):
     do_image_splitting: bool = True
     downsample_factor: int = 2
     encoder_patch_size: int = 16
-    image_token_index: int = 396
+    image_token_id: int = 396
+    image_token_index: Optional[int] = None
     max_image_tokens: int = 256
     max_num_patches: int = 1024
     max_pixels_tolerance: float = 2.0
@@ -97,3 +98,7 @@ class ModelConfig(BaseModelConfig):
     projector_hidden_size: int = 2560
     eos_token_id: int = 7
     projector_use_layernorm: bool = True
+
+    def __post_init__(self):
+        if self.image_token_index is None:
+            self.image_token_index = self.image_token_id

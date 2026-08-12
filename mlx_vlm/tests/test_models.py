@@ -809,6 +809,24 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(config.block_ff_dim, 10752)
 
+    def test_lfm2_vl_uses_image_token_id_when_index_is_omitted(self):
+        from mlx_vlm.models import lfm2_vl
+
+        current = lfm2_vl.ModelConfig(
+            text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+            vision_config=lfm2_vl.VisionConfig(),
+            image_token_id=124907,
+        )
+        legacy = lfm2_vl.ModelConfig(
+            text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+            vision_config=lfm2_vl.VisionConfig(),
+            image_token_id=124907,
+            image_token_index=396,
+        )
+
+        self.assertEqual(current.image_token_index, 124907)
+        self.assertEqual(legacy.image_token_index, 396)
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
