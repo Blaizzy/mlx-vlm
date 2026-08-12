@@ -458,6 +458,7 @@ mlx_vlm.server --api-key <secret-token>
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
+- `--reranker-model`: Preload a Qwen3 or Qwen3-VL reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -1052,6 +1053,7 @@ Structured outputs are not currently supported with speculative decoding.
 - `/chat/completions` and `/v1/chat/completions` - OpenAI-compatible chat-style interaction endpoint with support for images, audio, and text
 - `/responses` and `/v1/responses` - OpenAI-compatible responses endpoint
 - `/embeddings` and `/v1/embeddings` - OpenAI-compatible embeddings endpoint backed by native MLX embedding models
+- `/v1/rerank` - Rank text or multimodal documents by relevance to a query
 - `/audio/speech` and `/v1/audio/speech` - OpenAI-compatible text-to-speech endpoint backed by `mlx-audio` TTS models
 - `/audio/transcriptions` and `/v1/audio/transcriptions` - OpenAI-compatible speech-to-text endpoint backed by `mlx-audio` STT models
 - `/audio/translations` and `/v1/audio/translations` - OpenAI-compatible audio translation endpoint for STT models that expose a translation task
@@ -1079,6 +1081,22 @@ curl -X POST "http://localhost:8080/v1/embeddings" \
 ```
 
 Preload a default with `--embedding-model <repo-or-path>`. Supported architectures: BERT, XLM-RoBERTa, ModernBERT, Qwen3-Embedding, EmbeddingGemma (gemma3), LFM2, SigLIP (text), Qwen3-VL-Embedding, and Llama-Nemotron-VL, plus LLM2Vec bidirectional Llama. ColBERT-style multi-vector models (ColIdefics3, ColQwen2.5) are also available for late-interaction use.
+
+##### Reranking
+
+```sh
+curl -X POST "http://localhost:8080/v1/rerank" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-Reranker-0.6B-4bit",
+    "query": "What is the capital of France?",
+    "documents": ["Berlin is in Germany.", "Paris is the capital of France."],
+    "top_n": 1,
+    "return_documents": true
+  }'
+```
+
+Preload a default with `--reranker-model <repo-or-path>`. Qwen3 rerankers accept text, while Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`.
 
 ##### Text Input
 
