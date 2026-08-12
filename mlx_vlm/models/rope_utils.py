@@ -53,6 +53,7 @@ class SuScaledRoPE(nn.Module):
 
         freqs = base ** (mx.arange(0, dims, 2, dtype=mx.float32) / dims)
         self._freqs = mx.array(long_factor, dtype=mx.float32) * freqs
+        self.eval_cached_arrays()
 
         def default_scale(factor):
             return math.sqrt(
@@ -61,6 +62,14 @@ class SuScaledRoPE(nn.Module):
 
         factor = max_position_embeddings / original_max_position_embeddings
         self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
+
+    def eager_eval_arrays(self):
+        return [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
         x = x[...]
@@ -111,12 +120,21 @@ class Llama3RoPE(nn.Module):
         )
         smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
         self._freqs = mx.where(is_medium_freq, smooth_freqs, freqs)
+        self.eval_cached_arrays()
 
     def extra_repr(self):
         return (
             f"{self.dims}, traditional={self.traditional}, "
             f"max_position_embeddings={self.max_position_embeddings}"
         )
+
+    def eager_eval_arrays(self):
+        return [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset: int = 0):
         return mx.fast.rope(
@@ -185,6 +203,15 @@ class YarnRoPE(nn.Module):
         )
         self.dims = dims
         self.traditional = traditional
+        self.eval_cached_arrays()
+
+    def eager_eval_arrays(self):
+        return [self._freqs]
+
+    def eval_cached_arrays(self):
+        arrays = self.eager_eval_arrays()
+        if arrays:
+            mx.eval(*arrays)
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
