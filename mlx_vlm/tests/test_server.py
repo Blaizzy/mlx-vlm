@@ -893,6 +893,49 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
     assert rqueue.get(timeout=1) is None
 
 
+def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
+    class FakeBatchGenerator:
+        def __init__(self, *_args, **_kwargs):
+            self.has_work = False
+
+        def close(self):
+            pass
+
+    gen = _unstarted_response_generator()
+
+    def initialize_model():
+        gen.model = SimpleNamespace(language_model=object())
+        gen.processor = SimpleNamespace()
+        gen.config = SimpleNamespace()
+        gen.tokenizer = SimpleNamespace()
+
+    error = RuntimeError("vision embedding failed")
+    gen._initialize_model = initialize_model
+    gen._gpu_embed = MagicMock(side_effect=error)
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+
+    rqueue = Queue()
+    gen.requests.put(
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
+        )
+    )
+
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+    try:
+        assert rqueue.get(timeout=1) is error
+        assert rqueue.get(timeout=1) is None
+        assert worker.is_alive()
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
+
+
 def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
     gen = _unstarted_response_generator()
     gen.model = SimpleNamespace(language_model=SimpleNamespace())
