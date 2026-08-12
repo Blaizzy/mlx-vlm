@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -423,3 +425,40 @@ def test_selected_mrope_cos_sin_applies_section_selectors():
     expected = mx.cos(emb), mx.sin(emb)
 
     _assert_pair_close(fast, expected)
+
+
+def _build_on_worker(factory):
+    """Build on one thread, use on another, as the server does."""
+    with ThreadPoolExecutor(max_workers=1) as loader:
+        rope = loader.submit(factory).result()
+
+    def use():
+        return mx.eval(rope(mx.ones((1, 2, 4, 8))))
+
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        worker.submit(use).result()
+
+
+def test_su_scaled_rope_runs_on_a_thread_it_was_not_built_on():
+    _build_on_worker(lambda: SuScaledRoPE(dims=8, long_factor=[1.0] * 4))
+
+
+def test_llama3_rope_runs_on_a_thread_it_was_not_built_on():
+    _build_on_worker(
+        lambda: Llama3RoPE(
+            dims=8,
+            max_position_embeddings=64,
+            traditional=False,
+            base=10000.0,
+            scaling_config={
+                "factor": 2.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 32,
+            },
+        )
+    )
+
+
+def test_yarn_rope_runs_on_a_thread_it_was_not_built_on():
+    _build_on_worker(lambda: YarnRoPE(dims=8, traditional=False, base=10000.0))
