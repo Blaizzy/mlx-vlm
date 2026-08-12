@@ -7105,7 +7105,7 @@ class TestModels(unittest.TestCase):
 
     def test_muse_glimmer_compiled_decoder_transitions(self):
         from mlx_vlm.models.muse_glimmer.language import (
-            _centered_rms_norm_impl,
+            _centered_rms_norm,
             _finish_mlp,
             _prepare_mlp_input,
         )
@@ -7116,8 +7116,8 @@ class TestModels(unittest.TestCase):
         weight = (mx.arange(8, dtype=mx.float32) * 0.02 - 0.1).astype(mx.bfloat16)
         eps = 1e-6
 
-        expected_residual = residual + _centered_rms_norm_impl(attention, weight, eps)
-        expected_mlp_input = _centered_rms_norm_impl(expected_residual, weight, eps)
+        expected_residual = residual + _centered_rms_norm(attention, weight, eps)
+        expected_mlp_input = _centered_rms_norm(expected_residual, weight, eps)
         actual_residual, actual_mlp_input = _prepare_mlp_input(
             residual,
             attention,
@@ -7126,7 +7126,7 @@ class TestModels(unittest.TestCase):
             eps,
             eps,
         )
-        expected_output = expected_residual + _centered_rms_norm_impl(
+        expected_output = expected_residual + _centered_rms_norm(
             mlp_output, weight, eps
         )
         actual_output = _finish_mlp(expected_residual, mlp_output, weight, eps)

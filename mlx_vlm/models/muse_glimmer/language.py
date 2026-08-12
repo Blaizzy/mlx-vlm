@@ -14,18 +14,14 @@ from ..rope_utils import initialize_rope
 from .config import TextConfig
 
 
-def _centered_rms_norm_impl(x: mx.array, weight: mx.array, eps: float) -> mx.array:
+@mx.compile
+def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
     dtype = x.dtype
     x = x.astype(mx.float32)
     variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
     x = x * mx.rsqrt(variance + eps)
     x = x * (1.0 + weight.astype(mx.float32))
     return x.astype(dtype)
-
-
-@mx.compile
-def _centered_rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
-    return _centered_rms_norm_impl(x, weight, eps)
 
 
 @mx.compile
@@ -37,12 +33,12 @@ def _prepare_mlp_input(
     post_attention_eps: float,
     pre_feedforward_eps: float,
 ) -> tuple[mx.array, mx.array]:
-    hidden_states = residual + _centered_rms_norm_impl(
+    hidden_states = residual + _centered_rms_norm(
         attention_output,
         post_attention_weight,
         post_attention_eps,
     )
-    mlp_input = _centered_rms_norm_impl(
+    mlp_input = _centered_rms_norm(
         hidden_states,
         pre_feedforward_weight,
         pre_feedforward_eps,
@@ -57,7 +53,7 @@ def _finish_mlp(
     post_feedforward_weight: mx.array,
     post_feedforward_eps: float,
 ) -> mx.array:
-    return residual + _centered_rms_norm_impl(
+    return residual + _centered_rms_norm(
         mlp_output,
         post_feedforward_weight,
         post_feedforward_eps,
