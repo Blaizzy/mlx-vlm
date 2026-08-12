@@ -431,19 +431,11 @@ def _apply_stop_sequences(
 
 
 def _anthropic_content_from_generation(
-    full_text: str,
+    reasoning: Optional[str],
+    content: str,
     parsed_tool_calls: Optional[List[Any]] = None,
     include_thinking: bool = False,
-    thinking_start_token: Optional[str] = None,
-    thinking_end_token: Optional[str] = None,
-    processor=None,
 ) -> List[Dict[str, Any]]:
-    reasoning, content = _split_thinking(
-        full_text,
-        thinking_start_token,
-        thinking_end_token,
-        processor=processor,
-    )
     blocks: List[Dict[str, Any]] = []
     if include_thinking and reasoning:
         blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
@@ -949,24 +941,32 @@ async def anthropic_messages_endpoint(http_request: Request):
                 metrics.record_result(result)
                 finish_reason = getattr(result, "finish_reason", None) or "stop"
 
+            reasoning, content = _split_thinking(
+                full_text,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+                processor=processor,
+            )
             parsed_tool_calls = None
-            response_text = full_text
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
                 if tc["calls"]:
                     parsed_tool_calls = tc["calls"]
-                    response_text = tc["remaining_text"] or ""
+                    _, content = _split_thinking(
+                        tc["remaining_text"] or "",
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                        processor=processor,
+                    )
 
-            response_text, stop_sequence = _apply_stop_sequences(
-                response_text, request.stop_sequences
+            content, stop_sequence = _apply_stop_sequences(
+                content, request.stop_sequences
             )
             content_blocks = _anthropic_content_from_generation(
-                response_text,
+                reasoning,
+                content,
                 parsed_tool_calls=parsed_tool_calls,
                 include_thinking=bool(gen_args.enable_thinking),
-                thinking_start_token=gen_args.thinking_start_token,
-                thinking_end_token=gen_args.thinking_end_token,
-                processor=processor,
             )
             stop_reason = _anthropic_stop_reason(
                 finish_reason,

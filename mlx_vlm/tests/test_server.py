@@ -4043,24 +4043,33 @@ def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkey
     assert mock_generate.call_args.kwargs["image"] == ["data:image/png;base64,aW1n"]
 
 
-def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch):
+def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
+    config = SimpleNamespace(
+        model_type="muse_glimmer",
+        thinking_start_token="to=self<|message|>",
+        thinking_end_token="<|eom|>",
+    )
+    processor = SimpleNamespace(
+        config=config,
+        tokenizer=_MuseResponseTemplateTokenizer(),
+    )
     result = GenerationResult(
-        text='<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call>',
+        text=(
+            "to=self<|message|>I need the weather tool.<|eom|>"
+            "<|start|>assistant to=get_weather<|message|>"
+            '<atem:function_calls><atem:invoke name="get_weather">'
+            '<atem:parameter name="city">Warsaw</atem:parameter>'
+            "</atem:invoke></atem:function_calls>"
+        ),
         prompt_tokens=7,
         generation_tokens=6,
         prompt_tps=0.0,
         generation_tps=0.0,
         peak_memory=0.0,
     )
-    tool_module = SimpleNamespace(
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        parse_tool_call=lambda call, tools: json.loads(call),
-    )
+    from mlx_vlm.tool_parsers import atem as tool_module
 
     with (
         patch.object(
@@ -4082,11 +4091,12 @@ def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch
                         "description": "Get weather",
                         "input_schema": {
                             "type": "object",
-                            "properties": {"location": {"type": "string"}},
-                            "required": ["location"],
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
                         },
                     }
                 ],
+                "thinking": {"type": "enabled", "budget_tokens": 4},
                 "max_tokens": 8,
             },
         )
@@ -4094,9 +4104,16 @@ def test_anthropic_messages_endpoint_returns_tool_use_blocks(client, monkeypatch
     assert response.status_code == 200
     payload = response.json()
     assert payload["stop_reason"] == "tool_use"
-    assert payload["content"][0]["type"] == "tool_use"
-    assert payload["content"][0]["name"] == "get_weather"
-    assert payload["content"][0]["input"] == {"location": "SF"}
+    assert payload["content"][0] == {
+        "type": "thinking",
+        "thinking": "I need the weather tool.",
+        "signature": "",
+    }
+    assert payload["content"][1]["type"] == "tool_use"
+    assert payload["content"][1]["name"] == "get_weather"
+    assert payload["content"][1]["input"] == {"city": "Warsaw"}
+    assert "to=self" not in response.text
+    assert "<atem:" not in response.text
 
 
 def test_anthropic_messages_streaming_uses_anthropic_events(client, monkeypatch):
