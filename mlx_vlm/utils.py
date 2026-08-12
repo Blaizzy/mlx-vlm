@@ -20,6 +20,7 @@ from PIL import Image, ImageOps
 from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
+from .model_registry import get_model_registry
 from .models.base import BaseImageProcessor
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
@@ -584,26 +585,31 @@ def get_model_path(
     Returns:
         Path: The path to the model.
     """
-    model_path = Path(path_or_hf_repo)
-    if not model_path.exists():
-        model_path = Path(
-            snapshot_download(
-                repo_id=path_or_hf_repo,
-                revision=revision,
-                allow_patterns=allow_patterns
-                or [
-                    "*.json",
-                    "*.safetensors",
-                    "*.py",
-                    "*.model",
-                    "*.tiktoken",
-                    "*.txt",
-                    "*.jinja",
-                ],
-                force_download=force_download,
-            )
+    model_path = Path(path_or_hf_repo).expanduser()
+    if model_path.exists():
+        return model_path.resolve()
+
+    resolution = get_model_registry(include_hf_cache=False).resolve(path_or_hf_repo)
+    if resolution.path is not None:
+        return resolution.path
+
+    return Path(
+        snapshot_download(
+            repo_id=resolution.load_target,
+            revision=revision,
+            allow_patterns=allow_patterns
+            or [
+                "*.json",
+                "*.safetensors",
+                "*.py",
+                "*.model",
+                "*.tiktoken",
+                "*.txt",
+                "*.jinja",
+            ],
+            force_download=force_download,
         )
-    return model_path
+    )
 
 
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
