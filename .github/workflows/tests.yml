@@ -41,36 +41,51 @@ jobs:
           import gc
           import json
           import shutil
+          import subprocess
+          import sys
           from pathlib import Path
 
           from huggingface_hub import HfApi
-          from mlx_vlm.convert import convert
 
           source = "CohereLabs/North-Micro-Vision-Instruct"
           namespace = "mlx-community"
           variants = {
-              "4bit": {"q_mode": "affine", "q_bits": 4, "q_group_size": 64},
-              "5bit": {"q_mode": "affine", "q_bits": 5, "q_group_size": 64},
-              "6bit": {"q_mode": "affine", "q_bits": 6, "q_group_size": 64},
-              "8bit": {"q_mode": "affine", "q_bits": 8, "q_group_size": 64},
-              "mxfp4": {"q_mode": "mxfp4", "q_bits": None, "q_group_size": None},
-              "mxfp8": {"q_mode": "mxfp8", "q_bits": None, "q_group_size": None},
-              "nvfp4": {"q_mode": "nvfp4", "q_bits": None, "q_group_size": None},
+              "4bit": ["--q-mode", "affine", "--q-bits", "4", "--q-group-size", "64"],
+              "5bit": ["--q-mode", "affine", "--q-bits", "5", "--q-group-size", "64"],
+              "6bit": ["--q-mode", "affine", "--q-bits", "6", "--q-group-size", "64"],
+              "8bit": ["--q-mode", "affine", "--q-bits", "8", "--q-group-size", "64"],
+              "mxfp4": ["--q-mode", "mxfp4"],
+              "mxfp8": ["--q-mode", "mxfp8"],
+              "nvfp4": ["--q-mode", "nvfp4"],
           }
           api = HfApi()
-          for dtype, quantization in variants.items():
+          for dtype, quantization_args in variants.items():
               output = Path(f"/tmp/North-Micro-Vision-Instruct-{dtype}")
               repo = f"{namespace}/North-Micro-Vision-Instruct-{dtype}"
+              if any(
+                  item.rfilename == "model.safetensors"
+                  for item in api.model_info(repo).siblings
+              ):
+                  print(f"Skipping completed {dtype}", flush=True)
+                  continue
               print(f"Converting {dtype}", flush=True)
-              convert(
-                  hf_path=source,
-                  mlx_path=str(output),
-                  quantize=True,
-                  **quantization,
+              subprocess.run(
+                  [
+                      sys.executable,
+                      "-m",
+                      "mlx_vlm.convert",
+                      "--hf-path",
+                      source,
+                      "--mlx-path",
+                      str(output),
+                      "--quantize",
+                      *quantization_args,
+                  ],
+                  check=True,
               )
               config = json.loads((output / "config.json").read_text())
               assert config["model_type"] == "cohere_compass"
-              assert config["quantization"]["mode"] == quantization["q_mode"]
+              assert config["quantization"]["mode"] == quantization_args[1]
               print(f"Uploading {repo}", flush=True)
               api.upload_folder(
                   repo_id=repo,
