@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import contextlib
 import logging
 import sys
 import typing
@@ -1995,6 +1996,100 @@ def test_stream_generate_forwards_verbose_to_generate_step():
     assert captured["verbose"] is True
 
 
+def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    prepared_mask = mx.ones((1, 4), dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(
+            dispatch_module,
+            "prepare_inputs",
+            return_value={
+                "input_ids": mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                "attention_mask": prepared_mask,
+            },
+        ),
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="hello",
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is None
+    assert captured["media"]["masks"] is None
+
+
+def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
+    captured = {}
+    tokenizer = SimpleNamespace(stopping_criteria=SimpleNamespace())
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="test"),
+        language_model=SimpleNamespace(),
+    )
+    custom_embeds = mx.ones((1, 4, 3))
+    custom_mask = mx.array([[1, 1, 0, 0]], dtype=mx.int32)
+
+    def capture_hash(**kwargs):
+        captured.update(kwargs)
+        return 0
+
+    with (
+        patch.object(dispatch_module._apc, "model_apc_mode", return_value="block"),
+        patch.object(
+            dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
+        ),
+        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(
+            dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
+        ),
+        patch.object(dispatch_module, "make_streaming_detokenizer"),
+        patch.object(dispatch_module, "generate_step", return_value=iter(())),
+    ):
+        list(
+            dispatch_module.stream_generate(
+                model=model,
+                processor=processor,
+                prompt="",
+                input_ids=mx.array([[1, 2, 3, 4]], dtype=mx.int32),
+                inputs_embeds=custom_embeds,
+                mask=custom_mask,
+                apc_manager=MagicMock(),
+                max_tokens=0,
+            )
+        )
+
+    assert captured["media"]["embeddings"] is custom_embeds
+    assert captured["media"]["masks"] is custom_mask
+
+
 def test_public_generation_annotations_match_runtime_results():
     hints = typing.get_type_hints(dispatch_module.stream_generate)
 
@@ -2335,6 +2430,7 @@ def test_parse_arguments_defaults_thinking_tokens(monkeypatch):
     assert args.output_modality == "text"
     assert args.task == "generate"
     assert args.size is None
+    assert args.verbose is False
 
 
 def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
@@ -2501,6 +2597,119 @@ def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     assert got == apc_module.tenant_scoped_hash("tenant-a", 123)
 
 
+def test_batch_apc_extra_hash_returns_precomputed_semantic_hash():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    semantic_hash = 7088136067003016882
+
+    short_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            "_apc_semantic_hash": semantic_hash,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    extended_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            "_apc_semantic_hash": semantic_hash,
+            "inputs_embeds": mx.ones((1, 12, 4)),
+            "attention_mask": mx.ones((1, 12), dtype=mx.int32),
+        },
+    )
+
+    assert short_hash == semantic_hash
+    assert extended_hash == semantic_hash
+
+
+def test_batch_apc_extra_hash_still_tracks_non_text_media():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+        "inputs_embeds": mx.ones((1, 8, 4)),
+        "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.zeros((1, 4, 8))},
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {**base, "input_features": mx.ones((1, 4, 8))},
+    )
+
+    assert first_hash != second_hash
+
+
+def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
+    batch_generator = SimpleNamespace(apc_manager=object())
+    base = {
+        "_apc_image_hash": 123,
+        "_apc_tenant": "tenant-a",
+    }
+
+    first_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.zeros((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+    second_hash = BatchGenerator._apc_extra_hash(
+        batch_generator,
+        {
+            **base,
+            "inputs_embeds": mx.ones((1, 8, 4)),
+            "attention_mask": mx.ones((1, 8), dtype=mx.int32),
+        },
+    )
+
+    assert first_hash != second_hash
+
+
+def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
+    manager = apc_module.APCManager(num_blocks=4, block_size=4)
+    manager.exact_cache_guard_tokens = 1
+    semantic_hash = 7088136067003016882
+    short_tokens = list(range(8))
+    extended_tokens = [*short_tokens, 8, 9]
+    layer_keys = [mx.ones((1, 1, len(short_tokens), 2))]
+    layer_values = [mx.ones((1, 1, len(short_tokens), 2)) * 2]
+
+    stored = manager.store_kv_blocks(
+        short_tokens,
+        layer_keys,
+        layer_values,
+        extra_hash=semantic_hash,
+    )
+    manager.release(stored)
+
+    batch_generator = object.__new__(BatchGenerator)
+    batch_generator.apc_manager = manager
+    batch_generator.apc_mode = "block"
+    batch_generator.model = SimpleNamespace(config=SimpleNamespace())
+    batch_generator._wire_stack = None
+
+    pick = batch_generator._apc_pick_for(
+        (
+            1,
+            extended_tokens,
+            1,
+            {"_apc_semantic_hash": semantic_hash},
+            [],
+            None,
+        )
+    )
+
+    assert pick is not None
+    assert pick["prefix_len"] == len(short_tokens)
+    assert pick["extra_hash"] == semantic_hash
+    manager.release(pick["matched_blocks"])
+
+
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     class EmptyGenerationBatch:
         def __len__(self):
@@ -2639,6 +2848,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "keep_tensor": mx.ones((1, 1)),
                 "_apc_tenant": "tenant-a",
                 "_apc_image_hash": 123,
+                "_apc_semantic_hash": 7,
             },
             [],
             None,
@@ -2681,6 +2891,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert batch is not None
     assert "_apc_tenant" not in captured["prompt_kwargs"]
     assert "_apc_image_hash" not in captured["prompt_kwargs"]
+    assert "_apc_semantic_hash" not in captured["prompt_kwargs"]
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 

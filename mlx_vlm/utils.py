@@ -780,9 +780,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may or may not have vision quantized
+        # Handle legacy models which may or may not have vision quantized.
+        # text-only quants of unified VLM families set vision_config to null,
+        # so coerce None to {} to avoid AttributeError on the .get below.
         # TODO: Re-upload the models with the new quantization config and remove this
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        skip_vision = (config.get("vision_config") or {}).get("skip_vision", False)
         quantized_model = (
             model.language_model._model
             if getattr(model, "_is_text_model", False)
@@ -804,9 +806,15 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Skip 1-bit layers already replaced above.
             if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
+            # Handle custom per layer quantizations. Config keys from the
+            # underlying text checkpoint omit the mlx-vlm ``language_model.``
+            # wrapper prefix that loaded module paths carry, so also match with
+            # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
+            override = config["quantization"].get(p)
+            if override is None and p.startswith("language_model."):
+                override = config["quantization"].get(p[len("language_model.") :])
+            if isinstance(override, dict):
+                return override
             if not hasattr(m, "to_quantized"):
                 return False
             # Skip layers not divisible by 64

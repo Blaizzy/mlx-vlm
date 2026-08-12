@@ -797,6 +797,36 @@ class TestModels(unittest.TestCase):
         self.assertNotIn("layer_norm", projector.parameters())
         self.assertEqual(projector(x).shape, (1, 4, config.text_config.hidden_size))
 
+    def test_lfm2_vl_uses_intermediate_size_when_block_ff_dim_is_omitted(self):
+        from mlx_vlm.models import lfm2_vl
+
+        config = lfm2_vl.TextConfig.from_dict(
+            {
+                "intermediate_size": 10752,
+                "layer_types": ["full_attention"],
+            }
+        )
+
+        self.assertEqual(config.block_ff_dim, 10752)
+
+    def test_lfm2_vl_uses_image_token_id_when_index_is_omitted(self):
+        from mlx_vlm.models import lfm2_vl
+
+        current = lfm2_vl.ModelConfig(
+            text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+            vision_config=lfm2_vl.VisionConfig(),
+            image_token_id=124907,
+        )
+        legacy = lfm2_vl.ModelConfig(
+            text_config=lfm2_vl.TextConfig(layer_types=["full_attention"]),
+            vision_config=lfm2_vl.VisionConfig(),
+            image_token_id=124907,
+            image_token_index=396,
+        )
+
+        self.assertEqual(current.image_token_index, 124907)
+        self.assertEqual(legacy.image_token_index, 396)
+
     def test_deepseek_v4_language_model(self):
         from mlx_vlm.models import deepseek_v4
         from mlx_vlm.models.deepseek_v4.hyper_connection import (
@@ -2913,6 +2943,32 @@ class TestModels(unittest.TestCase):
                 self.assertIn("vision_tower.blocks.0.attn.qkv", config.quantization)
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
+
+    def test_chandra_ocr2_config_uses_qwen3_5(self):
+        from mlx_vlm.models import qwen3_5
+        from mlx_vlm.utils import get_model_and_args
+
+        chandra_config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+            "vision_start_token_id": 151652,
+            "vision_end_token_id": 151653,
+            "tie_word_embeddings": True,
+            "text_config": {"model_type": "qwen3_5_text"},
+            "vision_config": {"model_type": "qwen3_5", "patch_size": 16},
+        }
+
+        model_class, _ = get_model_and_args(config=dict(chandra_config))
+        self.assertIs(model_class, qwen3_5)
+
+        config = qwen3_5.ModelConfig.from_dict(dict(chandra_config))
+        self.assertEqual(config.image_token_id, 151655)
+        self.assertEqual(config.video_token_id, 151656)
+        self.assertEqual(config.vision_start_token_id, 151652)
+        self.assertEqual(config.vision_end_token_id, 151653)
+        self.assertEqual(config.vision_config.patch_size, 16)
 
     def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
         from mlx_vlm.models import qwen3_5
@@ -6947,6 +7003,203 @@ class TestModels(unittest.TestCase):
         self.assertEqual(projected.shape, (4, 64))
         self.assertTrue(mx.isfinite(projected).all().item())
 
+    @staticmethod
+    def _muse_glimmer_config():
+        from mlx_vlm.models import muse_glimmer
+
+        return muse_glimmer.ModelConfig(
+            text_config=muse_glimmer.TextConfig(
+                vocab_size=64,
+                hidden_size=32,
+                intermediate_size=64,
+                num_hidden_layers=2,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=8,
+                max_position_embeddings=128,
+                sliding_window=8,
+                layer_types=["sliding_attention", "full_attention"],
+                layer_rope_theta=[10000.0, 0],
+            ),
+            vision_config=muse_glimmer.VisionConfig(
+                hidden_size=8,
+                intermediate_size=16,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                patch_size=2,
+                patch_temporal=2,
+                merge_size=2,
+                pos_emb_height=4,
+                pos_emb_width=4,
+                max_position_embeddings=16,
+                layer_types=["window_attention", "full_attention"],
+            ),
+            image_token_id=7,
+            video_token_id=6,
+            out_hidden_size=32,
+            projector_hidden_size=16,
+        )
+
+    def test_muse_glimmer(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+
+        config = self._muse_glimmer_config()
+        model = muse_glimmer.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        pixel_values = mx.zeros((4, 2 * 3 * 2 * 2))
+        grid = mx.array([[1, 2, 2]])
+        output = model(
+            mx.array([[1, config.image_token_id, 2]]),
+            pixel_values=pixel_values,
+            image_grid_thw=grid,
+        )
+        self.assertEqual(output.logits.shape, (1, 3, config.text_config.vocab_size))
+        self.assertTrue(mx.isfinite(output.logits).all().item())
+
+        cache = model.make_cache()
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+
+    def test_muse_glimmer_numerical_parity(self):
+        from mlx_vlm.models.muse_glimmer.language import CenteredRMSNorm
+        from mlx_vlm.models.muse_glimmer.vision import apply_rotary, rotate_half
+
+        norm = CenteredRMSNorm(4, eps=1e-6)
+        norm.weight = (mx.arange(4, dtype=mx.float32) * 0.031 - 0.2).astype(mx.bfloat16)
+        inputs = (
+            (mx.arange(4, dtype=mx.float32) * 0.37 - 1.13)
+            .reshape(1, 4)
+            .astype(mx.bfloat16)
+        )
+        inputs32 = inputs.astype(mx.float32)
+        expected = inputs32 * mx.rsqrt(
+            mx.mean(mx.square(inputs32), axis=-1, keepdims=True) + norm.eps
+        )
+        expected = (expected * (1.0 + norm.weight.astype(mx.float32))).astype(
+            inputs.dtype
+        )
+        self.assertTrue(mx.array_equal(norm(inputs), expected).item())
+
+        q = mx.arange(16, dtype=mx.bfloat16).reshape(1, 2, 2, 4) / 16
+        k = q + 0.25
+        cos = mx.cos(mx.arange(8, dtype=mx.float32).reshape(2, 4) / 8)
+        sin = mx.sin(mx.arange(8, dtype=mx.float32).reshape(2, 4) / 8)
+        actual_q, actual_k = apply_rotary(q, k, cos, sin)
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        expected_q = (
+            q.astype(mx.float32) * cos + rotate_half(q).astype(mx.float32) * sin
+        ).astype(q.dtype)
+        expected_k = (
+            k.astype(mx.float32) * cos + rotate_half(k).astype(mx.float32) * sin
+        ).astype(k.dtype)
+        self.assertTrue(mx.array_equal(actual_q, expected_q).item())
+        self.assertTrue(mx.array_equal(actual_k, expected_k).item())
+
+    def test_muse_glimmer_compiled_decoder_transitions(self):
+        from mlx_vlm.models.muse_glimmer.language import (
+            _centered_rms_norm,
+            _finish_mlp,
+            _prepare_mlp_input,
+        )
+
+        residual = mx.arange(16, dtype=mx.float32).reshape(1, 2, 8).astype(mx.bfloat16)
+        attention = (residual * 0.125 - 0.5).astype(mx.bfloat16)
+        mlp_output = (residual * -0.25 + 0.75).astype(mx.bfloat16)
+        weight = (mx.arange(8, dtype=mx.float32) * 0.02 - 0.1).astype(mx.bfloat16)
+        eps = 1e-6
+
+        expected_residual = residual + _centered_rms_norm(attention, weight, eps)
+        expected_mlp_input = _centered_rms_norm(expected_residual, weight, eps)
+        actual_residual, actual_mlp_input = _prepare_mlp_input(
+            residual,
+            attention,
+            weight,
+            weight,
+            eps,
+            eps,
+        )
+        expected_output = expected_residual + _centered_rms_norm(
+            mlp_output, weight, eps
+        )
+        actual_output = _finish_mlp(expected_residual, mlp_output, weight, eps)
+        mx.eval(
+            expected_residual,
+            expected_mlp_input,
+            actual_residual,
+            actual_mlp_input,
+            expected_output,
+            actual_output,
+        )
+
+        self.assertTrue(mx.array_equal(actual_residual, expected_residual).item())
+        self.assertTrue(mx.array_equal(actual_mlp_input, expected_mlp_input).item())
+        self.assertTrue(mx.array_equal(actual_output, expected_output).item())
+
+    def test_muse_glimmer_dflash_capture_and_rollback(self):
+        from mlx_vlm.models import muse_glimmer
+
+        model = muse_glimmer.Model(self._muse_glimmer_config()).language_model
+        caches = model.make_cache()
+        outputs = model(
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+            cache=caches,
+            capture_layer_ids=[0, 1],
+        )
+        mx.eval(outputs.logits, outputs.hidden_states)
+
+        self.assertEqual(len(outputs.hidden_states), 2)
+        self.assertTrue(
+            all(hidden.shape == (1, 3, 32) for hidden in outputs.hidden_states)
+        )
+        self.assertEqual([cache.offset for cache in caches], [3, 3])
+
+        verify = model(
+            mx.array([[4, 5, 6, 7]], dtype=mx.int32),
+            cache=caches,
+            capture_layer_ids=[0, 1],
+        )
+        mx.eval(verify.logits)
+        accepted = model.rollback_speculative_cache(
+            caches,
+            verify.gdn_states,
+            accepted=1,
+            block_size=4,
+        )
+
+        self.assertEqual(accepted, 1)
+        self.assertEqual([cache.offset for cache in caches], [5, 5])
+
+    def test_muse_glimmer_quantized_embeddings(self):
+        from mlx_vlm.models import muse_glimmer
+        from mlx_vlm.models.muse_glimmer.language import RMSNormNoScale
+
+        model = muse_glimmer.Model(self._muse_glimmer_config())
+        nn.quantize(
+            model.language_model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda _, module: (
+                hasattr(module, "to_quantized") and module.weight.shape[-1] % 32 == 0
+            ),
+        )
+
+        text_model = model.language_model.model
+        self.assertIsInstance(text_model.embed_tokens, nn.QuantizedEmbedding)
+        self.assertIsInstance(text_model.embed_norm, RMSNormNoScale)
+
+        input_ids = mx.array([[1, 2, 3]])
+        normalized = text_model.embed_norm(text_model.embed_tokens(input_ids))
+        embedded = model.get_input_embeddings(input_ids).inputs_embeds
+        np.testing.assert_allclose(embedded, normalized, rtol=1e-5, atol=1e-7)
+
 
 class TestGetInputEmbeddings(unittest.TestCase):
     """Test that all models with get_input_embeddings return InputEmbeddingsFeatures."""
@@ -10827,6 +11080,109 @@ class TestQwen35NormSanitization(unittest.TestCase):
 
         out = self._sanitize(qwen3_5_moe, self._MLX_KEY)
         self.assertTrue(mx.allclose(out[self._MLX_KEY], mx.zeros(4)).item())
+
+
+class TestQwen35StructuredOutputMaskWidth(unittest.TestCase):
+    """Structured output must not be capped at the tokenizer vocab width (#1797).
+
+    llguidance packs its token bitmask over the tokenizer vocabulary, but the
+    masked argmax kernel indexes mask words by lm_head row without bounds
+    checking. Checkpoints whose ``vocab_size`` is padded above the tokenizer
+    vocab (Qwen3.5: 248077 tokens, 248320 rows) therefore built a mask 7 words
+    short, and constrained decoding died with "packed token mask must be int32
+    with one complete row per token".
+    """
+
+    # Word-aligned so the mask covers exactly [0, VOCAB) and every lm_head row
+    # at or above VOCAB falls in the padding words. llguidance zeroes the
+    # unused bits of its final partial word, so this matches real masks.
+    VOCAB = 960  # tokenizer vocab -> 30 packed words
+    N = 1024  # padded lm_head rows -> 32 packed words required
+    K = 512
+
+    def _head(self):
+        import mlx.nn as nn
+
+        mx.random.seed(0)
+        linear = nn.Linear(self.K, self.N, bias=False)
+        # Let the padding rows win an unconstrained argmax, so sampling a real
+        # token proves the padding words were actually treated as disallowed.
+        weight = mx.zeros((self.N, self.K))
+        weight[self.VOCAB :, :] = 4.0
+        linear.weight = weight.astype(mx.bfloat16)
+        return nn.QuantizedLinear.from_linear(linear, group_size=64, bits=4)
+
+    def _mask(self, rows, words):
+        return mx.full((rows, words), -1, dtype=mx.int32)
+
+    def _narrow(self, rows=1):
+        return self._mask(rows, (self.VOCAB + 31) // 32)
+
+    def test_pad_widens_mask_and_disallows_padding_rows(self):
+        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+
+        narrow = self._narrow()
+        padded = _pad_token_mask_to_head(narrow, self.N)
+
+        self.assertEqual(padded.shape, (1, (self.N + 31) // 32))
+        self.assertEqual(padded.dtype, mx.int32)
+        self.assertTrue(mx.all(padded[:, : narrow.shape[1]] == -1).item())
+        self.assertTrue(mx.all(padded[:, narrow.shape[1] :] == 0).item())
+
+    def test_pad_is_noop_when_already_wide_enough(self):
+        from mlx_vlm.models.qwen3_5.language import _pad_token_mask_to_head
+
+        wide = self._mask(1, (self.N + 31) // 32)
+        self.assertIs(_pad_token_mask_to_head(wide, self.N), wide)
+
+    def test_narrow_mask_still_rejected(self):
+        from mlx_vlm.models.qwen3_5.language import _target_verify_quantized_argmax
+
+        head = self._head()
+        x = mx.zeros((1, 1, self.K), dtype=mx.bfloat16)
+        with self.assertRaises(ValueError):
+            _target_verify_quantized_argmax(head, x, token_mask=self._narrow())
+
+    def test_padded_mask_samples_within_the_real_vocabulary(self):
+        from mlx_vlm.models.qwen3_5.language import (
+            _pad_token_mask_to_head,
+            _target_verify_quantized_argmax,
+        )
+
+        head = self._head()
+        mx.random.seed(1)
+        x = (mx.random.normal((1, 1, self.K)) * 0.1).astype(mx.bfloat16)
+
+        logits = head(x).astype(mx.float32)
+        self.assertGreaterEqual(
+            int(mx.argmax(logits, axis=-1).reshape(-1)[0]), self.VOCAB
+        )
+
+        padded = _pad_token_mask_to_head(self._narrow(), self.N)
+        sampled = _target_verify_quantized_argmax(head, x, token_mask=padded)
+        self.assertIsNotNone(sampled)
+        token = int(sampled.reshape(-1)[0])
+
+        self.assertLess(token, self.VOCAB)
+        expected = mx.argmax(logits[..., : self.VOCAB], axis=-1)
+        self.assertEqual(token, int(expected.reshape(-1)[0]))
+
+    def test_padded_mask_handles_multi_row_batch(self):
+        from mlx_vlm.models.qwen3_5.language import (
+            _pad_token_mask_to_head,
+            _target_verify_quantized_argmax,
+        )
+
+        head = self._head()
+        mx.random.seed(2)
+        x = (mx.random.normal((2, 1, self.K)) * 0.1).astype(mx.bfloat16)
+        padded = _pad_token_mask_to_head(self._narrow(rows=2), self.N)
+
+        sampled = _target_verify_quantized_argmax(head, x, token_mask=padded)
+        self.assertIsNotNone(sampled)
+        self.assertEqual(sampled.shape, (2, 1))
+        for token in sampled.reshape(-1).tolist():
+            self.assertLess(int(token), self.VOCAB)
 
 
 class TestQwenMRoPEDecodeContinuation(unittest.TestCase):
