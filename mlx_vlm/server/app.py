@@ -20,6 +20,7 @@ from .. import apc as _apc
 from ..generate.capabilities import model_capabilities
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..generate.video import processor_handles_video
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -885,10 +886,36 @@ def models_endpoint():
         if all(entry[0] != loaded for entry in entries):
             entries.append((loaded, int(time.time()), None))
 
+    # Loader-known truths for entries that are currently loaded. Looked up by
+    # model_path, which is the repo id when a repo is loaded, or the local
+    # path for loaded-only entries - both are already entry ids.
+    cache_by_path: dict[str, dict] = {}
+    for cache in _model_cache_registry().values():
+        path = cache.get("model_path")
+        if path is not None:
+            cache_by_path.setdefault(path, cache)
+
+    def _cache_video(cache) -> bool:
+        if cache is None:
+            return False
+        processor = cache.get("processor")
+        if processor is None:
+            return False
+        try:
+            return processor_handles_video(processor)
+        except Exception:
+            return False
+
     response = {"object": "list", "data": []}
     for model_id, created, snapshot in entries:
+        cache = cache_by_path.get(model_id)
         try:
-            capabilities = model_capabilities(model_id, snapshot_path=snapshot)
+            capabilities = model_capabilities(
+                model_id,
+                snapshot_path=snapshot,
+                kind_hint=cache.get("model_kind") if cache else None,
+                supports_video_input=_cache_video(cache),
+            )
         except Exception:
             capabilities = []
         response["data"].append(

@@ -1075,6 +1075,25 @@ def test_models_endpoint_reports_tool_capabilities(client, monkeypatch, tmp_path
     assert data[0]["capabilities"] == ["text_generation", "tools"]
 
 
+def test_models_endpoint_reports_loaded_audio_kind(client, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
+    )
+    model_cache = server.runtime.model_cache
+    monkeypatch.setitem(model_cache, "model_path", "/models/local-tts")
+    monkeypatch.setitem(model_cache, "model_kind", "audio_tts")
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) == 1
+    assert data[0]["id"] == "/models/local-tts"
+    assert data[0]["capabilities"] == ["audio", "text_to_speech"]
+
+
 def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
     client, monkeypatch
 ):

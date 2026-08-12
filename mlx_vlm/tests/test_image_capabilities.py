@@ -136,3 +136,67 @@ def test_model_capabilities_image_flags_suppress_text(tmp_path) -> None:
         "black-forest-labs/FLUX.2-klein-4B", snapshot_path=snapshot
     )
     assert caps == ["image_generation", "image_editing"]
+
+
+def test_model_capabilities_reasoning_from_template(tmp_path) -> None:
+    snapshot = _write_config(tmp_path / "qwen2", {"model_type": "qwen2"})
+    _write_tokenizer_config(
+        snapshot,
+        "{% if thought %} thinking{{ thought }} response{% endif %}",
+    )
+    assert model_capabilities("org/qwen2", snapshot_path=snapshot) == [
+        "reasoning",
+        "text_generation",
+    ]
+
+
+def test_model_capabilities_no_reasoning_without_markers(tmp_path) -> None:
+    snapshot = _write_config(tmp_path / "qwen2", {"model_type": "qwen2"})
+    _write_tokenizer_config(snapshot, "{{ message.content }}")
+    assert model_capabilities("org/qwen2", snapshot_path=snapshot) == [
+        "text_generation"
+    ]
+
+
+def test_model_capabilities_drafter_from_namespace(tmp_path) -> None:
+    # eagle3 resolves into mlx_vlm.speculative.drafters on get_model_and_args.
+    snapshot = _write_config(tmp_path / "eagle3", {"model_type": "eagle3"})
+    caps = model_capabilities("org/eagle3", snapshot_path=snapshot)
+    assert "drafter" in caps
+
+
+def test_model_capabilities_video_from_class_hook(tmp_path) -> None:
+    # inkling's Model class declares prepare_video_frame_pairs.
+    snapshot = _write_config(tmp_path / "inkling", {"model_type": "inkling"})
+    caps = model_capabilities("org/inkling", snapshot_path=snapshot)
+    assert "video" in caps
+
+
+def test_model_capabilities_video_from_loaded_flag(tmp_path) -> None:
+    snapshot = _write_config(tmp_path / "qwen2", {"model_type": "qwen2"})
+    caps = model_capabilities(
+        "org/qwen2",
+        snapshot_path=snapshot,
+        supports_video_input=True,
+    )
+    assert caps == ["text_generation", "video"]
+
+
+def test_model_capabilities_kind_hint_audio_tts() -> None:
+    assert model_capabilities("any/model", kind_hint="audio_tts") == [
+        "audio",
+        "text_to_speech",
+    ]
+
+
+def test_model_capabilities_kind_hint_audio_stt() -> None:
+    assert model_capabilities("any/model", kind_hint="audio_stt") == [
+        "audio",
+        "speech_to_text",
+    ]
+
+
+def test_model_capabilities_kind_hint_embedding() -> None:
+    assert model_capabilities("any/model", kind_hint="embedding") == [
+        "embeddings"
+    ]
