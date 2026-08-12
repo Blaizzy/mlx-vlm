@@ -1623,7 +1623,7 @@ def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):
     assert result == [([3], None), ([4], None)]
     assert calls
     assert calls[0][1]["first_bonus"] == 2
-    assert calls[0][1]["use_model_initial_block_size"] is False
+    assert "use_model_initial_block_size" not in calls[0][1]
 
 
 def test_mtp_uses_uniform_deferred_walk_for_batched_sampling():
