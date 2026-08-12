@@ -43,6 +43,26 @@ _MUSE_RESPONSE_TEMPLATE = {
             "content": "text",
             "open_pattern": r"to=self<\|message\|>",
         },
+        "tool_calls": {
+            "close": "</atem:invoke>",
+            "content": "xml-inline",
+            "content_args": {
+                "tag_pattern": (
+                    r'<atem:parameter\b[^>]*?\bname="(?P<key>[^"]+)"'
+                    r"[^>]*?>(?P<value>.*?)</atem:parameter>"
+                ),
+                "value_parser": {
+                    "args": {"allow_non_json": True},
+                    "name": "json",
+                },
+            },
+            "open_pattern": r'<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">',
+            "repeats": True,
+            "transform": {
+                "function": {"arguments": "{content}", "name": "{name}"},
+                "type": "function",
+            },
+        },
     },
     "start_anchor": "<|start|>assistant",
 }
@@ -3433,10 +3453,10 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
     )
 
 
-def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
+def test_chat_completions_streaming_response_template_tool_calls(client, monkeypatch):
     model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
+    processor = SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer())
+    config = SimpleNamespace(model_type="muse_glimmer")
 
     class FakeResponseGenerator:
         tokenizer = SimpleNamespace(decode=lambda tokens: "")
@@ -3449,8 +3469,11 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
                 [
                     server.StreamingToken(
                         text=(
-                            '<tool_call>{"name":"get_weather",'
-                            '"arguments":{"location":"SF"}}</tool_call>'
+                            "to=self<|message|>I need the weather tool.<|eom|>"
+                            "<|start|>assistant to=get_weather<|message|>"
+                            '<atem:function_calls><atem:invoke name="get_weather">'
+                            '<atem:parameter name="city">Warsaw</atem:parameter>'
+                            "</atem:invoke></atem:function_calls>"
                         ),
                         token=1,
                         logprobs=0.0,
@@ -3461,11 +3484,8 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
                 ]
             )
 
-    tool_module = SimpleNamespace(
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        parse_tool_call=lambda call, tools: json.loads(call),
-    )
+    from mlx_vlm.tool_parsers import atem as tool_module
+
     monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
 
     with (
@@ -3499,8 +3519,23 @@ def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypa
         if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "tool_calls"
     )
     usage_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
+    reasoning = "".join(
+        chunk["choices"][0]["delta"].get("reasoning_content") or ""
+        for chunk in chunks
+        if chunk["choices"]
+    )
+    content = "".join(
+        chunk["choices"][0]["delta"].get("content") or ""
+        for chunk in chunks
+        if chunk["choices"]
+    )
+    tool_call = tool_chunk["choices"][0]["delta"]["tool_calls"][0]
 
     assert tool_chunk.get("usage") is None
+    assert tool_call["function"]["name"] == "get_weather"
+    assert json.loads(tool_call["function"]["arguments"]) == {"city": "Warsaw"}
+    assert reasoning == "I need the weather tool."
+    assert content == ""
     assert usage_chunk["choices"] == []
     assert usage_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
 
@@ -6812,19 +6847,23 @@ class TestThinkingStreamState:
         reasoning = []
         content = []
 
-        for chunk in (
+        chunks = (
             "to=self<|mes",
             "sage|>Muse reasoning.<|eom|><|start|>assistant ",
             "to=user<|message|>Muse answer.",
-        ):
-            delta = state.feed(chunk)
+        )
+        thinking_closed = False
+        for index, chunk in enumerate(chunks):
+            delta = state.feed(chunk, last=index == len(chunks) - 1)
             if delta.reasoning:
                 reasoning.append(delta.reasoning)
             if delta.content:
                 content.append(delta.content)
+            thinking_closed = thinking_closed or delta.thinking_closed
 
         assert "".join(reasoning) == "Muse reasoning."
         assert "".join(content) == "Muse answer."
+        assert thinking_closed is True
 
     def test_cohere_text_markers_are_suppressed_across_chunks(self):
         state = server.ThinkingStreamState(enable_thinking=True)

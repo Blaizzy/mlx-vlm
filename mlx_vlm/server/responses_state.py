@@ -177,11 +177,16 @@ class ResponseTemplateStreamState:
     def __init__(self, parser):
         self.parser = parser
 
-    def feed(self, text: str) -> ThinkingStreamDelta:
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         reasoning = []
         content = []
         thinking_closed = False
-        for event in self.parser.feed(text or ""):
+        events = self.parser.feed(text or "")
+        if last:
+            _, final_events = self.parser.finalize()
+            events.extend(final_events)
+
+        for event in events:
             event_type = event.get("type")
             field = event.get("field")
             if event_type == "region_close" and field in (
@@ -223,9 +228,7 @@ def make_response_stream_state(
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
-            return ResponseTemplateStreamState(
-                tokenizer.get_response_parser(prefix="")
-            )
+            return ResponseTemplateStreamState(tokenizer.get_response_parser(prefix=""))
         except (AttributeError, TypeError, ValueError):
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
