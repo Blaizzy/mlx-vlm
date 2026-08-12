@@ -61,7 +61,7 @@ class ThinkingStreamState:
         self.thinking_done = False
         self.buffer = ""
 
-    def feed(self, text: str) -> ThinkingStreamDelta:
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         self.buffer += text or ""
         reasoning = []
         content = []
@@ -111,6 +111,13 @@ class ThinkingStreamState:
 
             self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
             self.in_thinking = True
+
+        if last and self.buffer:
+            held, self.buffer = self.buffer, ""
+            if self.in_thinking:
+                reasoning.append(self._strip_open_marker(held))
+            else:
+                content.append(_strip_content_markers(held))
 
         return ThinkingStreamDelta(
             reasoning="".join(reasoning) or None,

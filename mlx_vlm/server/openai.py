@@ -1138,7 +1138,9 @@ async def responses_endpoint(request: Request):
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(token.finish_reason)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1189,7 +1191,10 @@ async def responses_endpoint(request: Request):
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(chunk_finish)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1208,7 +1213,6 @@ async def responses_endpoint(request: Request):
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1818,7 +1822,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             chunk_rate = metrics.record_chunk(token)
 
                             # Detect thinking boundaries
-                            thinking_delta = thinking_state.feed(token.text)
+                            thinking_delta = thinking_state.feed(
+                                token.text, last=bool(token.finish_reason)
+                            )
                             delta_reasoning = thinking_delta.reasoning
                             delta_content = thinking_delta.content
 
@@ -1961,7 +1967,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            thinking_delta = thinking_state.feed(chunk.text)
+                            thinking_delta = thinking_state.feed(
+                                chunk.text, last=bool(chunk_finish)
+                            )
                             if thinking_delta.content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(

@@ -6658,6 +6658,77 @@ class TestSplitThinking:
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
 
+    def test_last_chunk_releases_text_held_for_an_unfinished_marker(self):
+        state = server.ThinkingStreamState()
+
+        assert state.feed("hello <").content == "hello "
+        assert state.feed("", last=True).content == "<"
+
+    def test_last_chunk_releases_reasoning_held_for_an_unfinished_marker(self):
+        state = server.ThinkingStreamState()
+
+        state.feed("<think>")
+        assert state.feed("cut off </thi", last=True).reasoning == "cut off </thi"
+
+    def test_last_chunk_does_not_disturb_a_complete_stream(self):
+        state = server.ThinkingStreamState()
+        reasoning, content = "", ""
+
+        for chunk in ("<think>", "why", "</think>", "answer"):
+            delta = state.feed(chunk, last=chunk == "answer")
+            reasoning += delta.reasoning or ""
+            content += delta.content or ""
+
+        assert (reasoning, content) == ("why", "answer")
+
+    def test_last_chunk_on_an_empty_buffer_emits_nothing(self):
+        state = server.ThinkingStreamState()
+
+        delta = state.feed("", last=True)
+
+        assert (delta.reasoning, delta.content) == (None, None)
+
+    def test_buffer_is_only_released_once(self):
+        state = server.ThinkingStreamState()
+
+        state.feed("hello <")
+        assert state.feed("", last=True).content == "<"
+        assert state.feed("", last=True).content is None
+
+    def test_last_chunk_releases_to_reasoning_when_thinking_opened_in_the_prompt(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+
+        delta = state.feed("why </thi", last=True)
+
+        assert (delta.reasoning, delta.content) == ("why </thi", None)
+
+    def test_last_chunk_releases_a_partial_custom_end_token(self):
+        state = server.ThinkingStreamState(
+            thinking_start_token="<BEGIN>", thinking_end_token="<END>"
+        )
+
+        state.feed("<BEGIN>")
+        assert state.feed("work <EN", last=True).reasoning == "work <EN"
+
+    def test_last_chunk_releases_content_held_after_thinking_closed(self):
+        state = server.ThinkingStreamState()
+
+        state.feed("<think>x</think>")
+        assert state.feed("done <|START_TE", last=True).content == "done <|START_TE"
+
+    def test_last_chunk_still_reports_thinking_closed(self):
+        state = server.ThinkingStreamState()
+
+        state.feed("<think>why")
+        delta = state.feed("</think>tail <", last=True)
+
+        assert (delta.content, delta.thinking_closed) == ("tail <", True)
+
+    def test_last_chunk_strips_complete_content_markers(self):
+        state = server.ThinkingStreamState()
+
+        assert state.feed("hi <|END_TEXT|>", last=True).content == "hi "
+
     def test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking(self):
         assert server.prompt_has_open_thinking("prompt", enable_thinking=True) is False
         assert (
