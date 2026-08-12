@@ -12428,3 +12428,440 @@ class TestLfm2Embedding(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+
+class TestCohereCompass(unittest.TestCase):
+    def test_released_text_config_defaults_and_per_layer_rope(self):
+        from mlx_vlm.models import cohere_compass
+
+        text_config = cohere_compass.TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_parameters={
+                "sliding_attention": {
+                    "mrope_interleaved": True,
+                    "mrope_section": [2, 1, 1],
+                    "rope_type": "default",
+                    "rope_theta": 50_000,
+                },
+                "full_attention": None,
+                "rope_type": "default",
+                "rope_theta": 10_000,
+            },
+        )
+        model = cohere_compass.LanguageModel(text_config)
+
+        self.assertEqual(text_config.norm_type, "layer_norm")
+        self.assertEqual(text_config.transformer_block_type, "parallel")
+        self.assertFalse(hasattr(model.model.layers[0], "post_attention_layernorm"))
+        self.assertTrue(model.model.layers[0].self_attn.rotary_emb.enabled)
+        self.assertFalse(model.model.layers[1].self_attn.rotary_emb.enabled)
+        self.assertAlmostEqual(
+            model.model.layers[0].self_attn.rotary_emb.inv_freq[1].item(),
+            50_000 ** (-0.25),
+            places=6,
+        )
+        rotary = model.model.layers[0].self_attn.rotary_emb
+        positions = mx.array(
+            [
+                [[1, 2]],
+                [[3, 4]],
+                [[5, 6]],
+            ]
+        )
+        cos, _ = rotary(mx.zeros((1, 2, 32)), positions)
+        selected = mx.take(positions, rotary.position_selector, axis=0).transpose(
+            1, 2, 0
+        )
+        frequencies = selected.astype(mx.float32) * rotary.inv_freq
+        expected = mx.cos(mx.concatenate([frequencies, frequencies], axis=-1))
+        self.assertTrue(mx.allclose(cos, expected).item())
+
+    def test_text_rope_respects_interleaved_and_split_layouts(self):
+        from mlx_vlm.models.cohere_compass.language import _apply_rope
+
+        q = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]])
+        k = mx.array([[[[5.0, 6.0, 7.0, 8.0]]]])
+        cos = mx.zeros((1, 1, 4))
+        sin = mx.ones((1, 1, 4))
+
+        q_interleaved, k_interleaved = _apply_rope(q, k, cos, sin, "interleave")
+        q_split, k_split = _apply_rope(q, k, cos, sin, "split")
+        mx.eval(q_interleaved, k_interleaved, q_split, k_split)
+
+        self.assertEqual(q_interleaved.tolist(), [[[[-2.0, 1.0, -4.0, 3.0]]]])
+        self.assertEqual(k_interleaved.tolist(), [[[[-6.0, 5.0, -8.0, 7.0]]]])
+        self.assertEqual(q_split.tolist(), [[[[-3.0, -4.0, 1.0, 2.0]]]])
+        self.assertEqual(k_split.tolist(), [[[[-7.0, -8.0, 5.0, 6.0]]]])
+
+    def test_vision_rope_uses_split_frequency_layout(self):
+        from mlx_vlm.models.cohere_compass.vision import _vision_position_embeddings
+
+        rotary = mx.array([[0.0, mx.pi / 2]])
+        cos, sin = _vision_position_embeddings(rotary)
+        mx.eval(cos, sin)
+
+        self.assertTrue(
+            mx.allclose(cos, mx.array([[1.0, 0.0, 1.0, 0.0]]), atol=1e-6).item()
+        )
+        self.assertTrue(
+            mx.allclose(sin, mx.array([[0.0, 1.0, 0.0, 1.0]]), atol=1e-6).item()
+        )
+
+    def _tiny_model(self):
+        from mlx_vlm.models import cohere_compass
+
+        text_config = cohere_compass.TextConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            norm_type="layer_norm",
+            transformer_block_type="parallel",
+            tie_word_embeddings=True,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={"mrope_section": [2, 1, 1]},
+            rope_style="interleave",
+            rope_on_all_layers=False,
+        )
+        vision_config = cohere_compass.VisionConfig(
+            depth=2,
+            hidden_size=16,
+            intermediate_size=32,
+            num_heads=2,
+            patch_size=2,
+            temporal_patch_size=2,
+            spatial_merge_size=2,
+            out_hidden_size=32,
+            num_position_embeddings=16,
+            deepstack_visual_indexes=[0],
+        )
+        config = cohere_compass.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            image_token_id=63,
+            vision_start_token_id=62,
+            vision_end_token_id=61,
+        )
+        return cohere_compass.Model(config)
+
+    def test_forward_and_cache(self):
+        model = self._tiny_model()
+        input_ids = mx.array([[1, 62, 63, 63, 63, 63, 61, 2]])
+        pixel_values = mx.random.normal((16, 24))
+        image_grid_thw = mx.array([[1, 4, 4]])
+
+        cache = model.language_model.make_cache()
+        output = model(
+            input_ids,
+            pixel_values,
+            cache=cache,
+            image_grid_thw=image_grid_thw,
+        )
+        mx.eval(output.logits)
+        self.assertEqual(output.logits.shape, (1, 8, 64))
+
+        next_output = model(mx.array([[2]]), cache=cache)
+        mx.eval(next_output.logits)
+        self.assertEqual(next_output.logits.shape, (1, 1, 64))
+
+    def test_chunked_prefill_aligns_deepstack_visual_rows(self):
+        from types import SimpleNamespace
+
+        model = self._tiny_model()
+        language_model = model.language_model
+
+        class Recorder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.visual_pos_masks = None
+                self.deepstack_visual_embeds = None
+                self.embed_tokens = SimpleNamespace(
+                    as_linear=lambda hidden: mx.zeros(
+                        (*hidden.shape[:-1], 64), dtype=hidden.dtype
+                    )
+                )
+
+            def __call__(
+                self,
+                inputs,
+                *,
+                visual_pos_masks=None,
+                deepstack_visual_embeds=None,
+                **kwargs,
+            ):
+                self.visual_pos_masks = visual_pos_masks
+                self.deepstack_visual_embeds = deepstack_visual_embeds
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 32))
+
+        recorder = Recorder()
+        language_model.model = recorder
+        full_mask = mx.array(
+            [
+                [False, True, True, False, True, True, False, True, False],
+                [True, False, True, False, True, False, False, False, False],
+            ]
+        )
+        visual_rows = int(full_mask.sum().item())
+        embeds = mx.arange(visual_rows * 32).reshape(visual_rows, 32)
+
+        language_model(
+            mx.zeros((2, 3), dtype=mx.int32),
+            inputs_embeds=mx.zeros((2, 3, 32)),
+            cache=[SimpleNamespace(offset=4)],
+            position_ids=mx.zeros((3, 2, 3), dtype=mx.int32),
+            visual_pos_masks=full_mask,
+            deepstack_visual_embeds=[embeds],
+        )
+
+        self.assertEqual(
+            recorder.visual_pos_masks.tolist(),
+            [[True, True, False], [True, False, False]],
+        )
+        expected = mx.concatenate([embeds[2:4], embeds[7:8]], axis=0)
+        self.assertEqual(
+            recorder.deepstack_visual_embeds[0].tolist(), expected.tolist()
+        )
+
+    def test_visual_deepstack_allows_chunked_prefill(self):
+        model = self._tiny_model()
+        self.assertTrue(model.chunked_prefill_policy(prefill_kwargs={}))
+        self.assertTrue(
+            model.chunked_prefill_policy(
+                prefill_kwargs={"deepstack_visual_embeds": [mx.zeros((4, 32))]}
+            )
+        )
+
+    def test_deepstack_injection_preserves_batch_row_order(self):
+        model = self._tiny_model()
+        hidden = mx.zeros((2, 5, 32))
+        visual_mask = mx.array(
+            [
+                [False, True, False, True, False],
+                [True, False, True, False, True],
+            ]
+        )
+        visual_embeds = mx.concatenate(
+            [mx.full((1, 32), float(index)) for index in range(1, 6)], axis=0
+        )
+        output = model.language_model.model._deepstack_process(
+            hidden, visual_mask, visual_embeds
+        )
+
+        self.assertEqual(output[0, 1, 0].item(), 1)
+        self.assertEqual(output[0, 3, 0].item(), 2)
+        self.assertEqual(output[1, 0, 0].item(), 3)
+        self.assertEqual(output[1, 2, 0].item(), 4)
+        self.assertEqual(output[1, 4, 0].item(), 5)
+
+    def test_batched_padding_matches_single_rows(self):
+        from mlx_vlm.generate.ar import _make_cache
+
+        mx.random.seed(0)
+        model = self._tiny_model()
+        model.update(
+            tree_map(lambda value: value.astype(mx.bfloat16), model.parameters())
+        )
+        language_model = model.language_model
+        rows = [
+            [1, 2, 3, 4, 5],
+            [6, 7, 8, 9, 10, 11, 12, 13],
+            [14, 15, 16, 17, 18, 19, 20, 21],
+        ]
+        max_length = max(map(len, rows))
+        padding = [max_length - len(row) for row in rows]
+        input_ids = mx.array([[0] * pad + row for row, pad in zip(rows, padding)])
+        attention_mask = mx.array(
+            [[0] * pad + [1] * len(row) for row, pad in zip(rows, padding)]
+        )
+        position_ids, rope_deltas = language_model.get_rope_index(
+            input_ids, attention_mask=attention_mask
+        )
+
+        single_caches = []
+        single_logits = []
+        single_deltas = []
+        for row in rows:
+            row_ids = mx.array([row])
+            row_mask = mx.ones_like(row_ids)
+            row_positions, row_delta = language_model.get_rope_index(
+                row_ids, attention_mask=row_mask
+            )
+            row_cache = language_model.make_cache()
+            output = language_model(
+                row_ids,
+                cache=row_cache,
+                position_ids=row_positions,
+                rope_deltas=row_delta,
+            )
+            mx.eval(output.logits, [entry.state for entry in row_cache])
+            single_caches.append(row_cache)
+            single_logits.append(output.logits[:, -1])
+            single_deltas.append(row_delta)
+
+        batch_cache = _make_cache(language_model, [0] * len(rows))
+        output = language_model(
+            input_ids,
+            cache=batch_cache,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+            attention_mask=attention_mask,
+        )
+        mx.eval(output.logits, [entry.state for entry in batch_cache])
+        self.assertEqual(output.logits.shape[1], 1)
+        for row, expected in enumerate(single_logits):
+            self.assertTrue(
+                mx.allclose(
+                    output.logits[row : row + 1, -1], expected, atol=0, rtol=0
+                ).item()
+            )
+
+        first_tokens = mx.concatenate(
+            [mx.argmax(logits, axis=-1) for logits in single_logits]
+        )
+        expected_next = []
+        for row, row_cache in enumerate(single_caches):
+            next_output = language_model(
+                first_tokens[row : row + 1, None],
+                cache=row_cache,
+                rope_deltas=single_deltas[row],
+            )
+            mx.eval(next_output.logits, [entry.state for entry in row_cache])
+            expected_next.append(next_output.logits[:, -1])
+
+        batch_next = language_model(
+            first_tokens[:, None],
+            cache=batch_cache,
+            rope_deltas=rope_deltas,
+        )
+        mx.eval(batch_next.logits, [entry.state for entry in batch_cache])
+        for row, expected in enumerate(expected_next):
+            self.assertEqual(
+                mx.argmax(batch_next.logits[row, -1]).item(),
+                mx.argmax(expected).item(),
+            )
+
+        keep = mx.array([0], dtype=mx.int32)
+        for entry in batch_cache:
+            entry.filter(keep)
+        filtered_delta = rope_deltas[keep]
+        next_token = mx.argmax(expected_next[0], axis=-1)
+        expected_filtered = language_model(
+            next_token[:, None],
+            cache=single_caches[0],
+            rope_deltas=single_deltas[0],
+        )
+        actual_filtered = language_model(
+            next_token[:, None],
+            cache=batch_cache,
+            rope_deltas=filtered_delta,
+        )
+        mx.eval(expected_filtered.logits, actual_filtered.logits)
+        self.assertEqual(
+            mx.argmax(actual_filtered.logits[0, -1]).item(),
+            mx.argmax(expected_filtered.logits[0, -1]).item(),
+        )
+
+    def test_vision_batch_matches_individual_images(self):
+        model = self._tiny_model()
+        pixels = mx.random.normal((32, 24))
+        image_features, deepstack_features = model.vision_tower(
+            pixels,
+            mx.array([[1, 4, 4], [1, 4, 4]]),
+        )
+        first_features, first_deepstack = model.vision_tower(
+            pixels[:16], mx.array([[1, 4, 4]])
+        )
+        second_features, second_deepstack = model.vision_tower(
+            pixels[16:], mx.array([[1, 4, 4]])
+        )
+        mx.eval(
+            image_features,
+            first_features,
+            second_features,
+            *(deepstack_features or []),
+            *(first_deepstack or []),
+            *(second_deepstack or []),
+        )
+        self.assertTrue(
+            mx.allclose(
+                image_features,
+                mx.concatenate([first_features, second_features], axis=0),
+                atol=1e-5,
+            ).item()
+        )
+        for batched, first, second in zip(
+            deepstack_features, first_deepstack, second_deepstack
+        ):
+            self.assertTrue(
+                mx.allclose(
+                    batched,
+                    mx.concatenate([first, second], axis=0),
+                    atol=1e-5,
+                ).item()
+            )
+
+    def test_processor_patch_layout(self):
+        from PIL import Image
+
+        from mlx_vlm.models.cohere_compass.processing_cohere_compass import (
+            CohereCompassImageProcessor,
+        )
+
+        processor = CohereCompassImageProcessor(
+            patch_size=2,
+            temporal_patch_size=2,
+            merge_size=2,
+            min_pixels=16 * 16,
+            max_pixels=32 * 32,
+        )
+        output = processor(Image.new("RGB", (12, 10)))
+        self.assertEqual(output["pixel_values"].shape[-1], 24)
+        self.assertEqual(output["image_grid_thw"].tolist(), [[1, 8, 10]])
+
+    def test_processor_uses_left_padding_for_batched_prompts(self):
+        from mlx_vlm.models.cohere_compass.processing_cohere_compass import (
+            CohereCompassProcessor,
+        )
+
+        class Tokenizer:
+            image_token = "<|IMAGE_PAD|>"
+            image_token_id = 63
+            vision_start_token = "<|VISION_START|>"
+            vision_end_token = "<|VISION_END|>"
+
+            def __call__(self, text, **kwargs):
+                self.last_kwargs = kwargs
+                return {"input_ids": [[1] * len(value) for value in text]}
+
+            def convert_tokens_to_ids(self, token):
+                return self.image_token_id
+
+        processor = CohereCompassProcessor.__new__(CohereCompassProcessor)
+        processor.tokenizer = Tokenizer()
+        processor.image_processor = None
+        processor.image_token = processor.tokenizer.image_token
+        processor.image_token_id = processor.tokenizer.image_token_id
+        processor.vision_start_token = processor.tokenizer.vision_start_token
+        processor.vision_end_token = processor.tokenizer.vision_end_token
+
+        processor(text=["short", "longer"], padding=True)
+
+        self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")
