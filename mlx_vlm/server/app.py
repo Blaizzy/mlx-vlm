@@ -5,6 +5,7 @@ import os
 import secrets
 import sys
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
@@ -843,6 +844,36 @@ def models_endpoint():
 
     required_files = {"config.json", "tokenizer_config.json"}
 
+    def _snapshot_path(repo):
+        """Resolve the checked-out snapshot dir for a cached repo.
+
+        huggingface_hub's repo_path points at the repo ROOT (refs/blobs/
+        snapshots); config.json lives inside snapshots/<revision>. Handles:
+        snapshots/<commit>, snapshots/main, or the first snapshot dir.
+        """
+        root = getattr(repo, "repo_path", None)
+        if not root:
+            return None
+        root = Path(root)
+        if (root / "config.json").is_file():
+            # Already a snapshot directory.
+            return str(root)
+        ref = repo.refs.get("main") if hasattr(repo, "refs") else None
+        commit = getattr(ref, "commit_hash", None) if ref is not None else None
+        candidates: list[Path] = []
+        if commit:
+            candidates.append(root / "snapshots" / commit)
+        candidates.append(root / "snapshots" / "main")
+        snapshots = root / "snapshots"
+        if snapshots.is_dir():
+            candidates.extend(
+                sorted(entry for entry in snapshots.iterdir() if entry.is_dir())
+            )
+        for candidate in candidates:
+            if candidate.is_dir():
+                return str(candidate)
+        return None
+
     def probably_mlx_lm(repo):
         if repo.repo_type != "model":
             return False
@@ -864,13 +895,13 @@ def models_endpoint():
         downloaded_models = []
 
     # Create a list of available models, carrying each repo's local snapshot
-    # path (when present) so capability detection can read config.json off
+    # path (when present) so capability detection can read config files off
     # disk - no model loads.
     entries: list[tuple[str, int, str | None]] = [
         (
             repo.repo_id,
             int(repo.last_modified),
-            getattr(repo, "repo_path", None),
+            _snapshot_path(repo),
         )
         for repo in downloaded_models
     ]

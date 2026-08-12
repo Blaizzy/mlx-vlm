@@ -1075,6 +1075,53 @@ def test_models_endpoint_reports_tool_capabilities(client, monkeypatch, tmp_path
     assert data[0]["capabilities"] == ["text_generation", "tools"]
 
 
+def test_models_endpoint_resolves_snapshot_under_repo_root(
+    client, monkeypatch, tmp_path
+):
+    # huggingface_hub's repo_path points at the repo ROOT; config.json lives
+    # under snapshots/<revision>. Capabilities must read the snapshot.
+    root = tmp_path / "models--local--qwen2"
+    snapshot = root / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
+
+    def repo(repo_id):
+        return SimpleNamespace(
+            repo_id=repo_id,
+            repo_type="model",
+            last_modified=123.0,
+            repo_path=str(root),
+            refs={
+                "main": SimpleNamespace(
+                    commit_hash="abc123",
+                    files=[
+                        SimpleNamespace(
+                            file_path=SimpleNamespace(name=file_name)
+                        )
+                        for file_name in [
+                            "config.json",
+                            "tokenizer_config.json",
+                            "model.safetensors",
+                        ]
+                    ],
+                )
+            },
+        )
+
+    monkeypatch.setattr(
+        server,
+        "scan_cache_dir",
+        lambda: SimpleNamespace(repos=[repo("local/qwen2")]),
+    )
+
+    response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert len(data) == 1
+    assert data[0]["capabilities"] == ["text_generation"]
+
+
 def test_models_endpoint_reports_loaded_audio_kind(client, monkeypatch):
     monkeypatch.setattr(
         server,

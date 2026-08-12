@@ -142,6 +142,42 @@ def get_variant(name: str | Flux2Variant = "flux2-klein-4b") -> Flux2Variant:
         ) from exc
 
 
+def _variant_from_name(name: str) -> Flux2Variant | None:
+    """Fuzzy variant resolution from a repo/name string (no filesystem).
+
+    Mirrors the name-marker scan variant_from_local_path uses, so ids like
+    ``Runpod/FLUX.2-klein-4B-mflux-4bit`` (quantized re-releases of the
+    canonical checkpoints) resolve to the right variant. Returns None when
+    no size marker matches.
+    """
+    lowered = name.strip().lower()
+    if "kv" in lowered:
+        return VARIANTS["flux2-klein-9b-kv"]
+    if "base" in lowered and "9b" in lowered:
+        return VARIANTS["flux2-klein-base-9b"]
+    if "base" in lowered and "4b" in lowered:
+        return VARIANTS["flux2-klein-base-4b"]
+    if "9b" in lowered:
+        return VARIANTS["flux2-klein-9b"]
+    if "4b" in lowered:
+        return VARIANTS["flux2-klein-4b"]
+    return None
+
+
+def resolve_variant_by_name(name: str) -> Flux2Variant:
+    """Exact alias first, then fuzzy size-marker resolution for unknown ids."""
+    try:
+        return get_variant(name)
+    except ValueError:
+        pass
+    variant = _variant_from_name(name)
+    if variant is not None:
+        return variant
+    raise ValueError(
+        f"Unknown Flux2 variant {name!r}. Supported: {', '.join(sorted(_ALIASES))}"
+    )
+
+
 def variant_from_local_path(model_path: str | Path) -> Flux2Variant:
     root = Path(model_path).expanduser()
     name = root.name.lower()
@@ -149,16 +185,9 @@ def variant_from_local_path(model_path: str | Path) -> Flux2Variant:
         "models--"
     ):
         name = root.parent.parent.name.removeprefix("models--").replace("--", "/")
-    if "kv" in name or (root / "flux-2-klein-9b-kv.safetensors").exists():
-        return VARIANTS["flux2-klein-9b-kv"]
-    if "base" in name and "9b" in name:
-        return VARIANTS["flux2-klein-base-9b"]
-    if "base" in name and "4b" in name:
-        return VARIANTS["flux2-klein-base-4b"]
-    if "9b" in name:
-        return VARIANTS["flux2-klein-9b"]
-    if "4b" in name:
-        return VARIANTS["flux2-klein-4b"]
+    variant = _variant_from_name(name)
+    if variant is not None:
+        return variant
 
     transformer_config = root / "transformer" / "config.json"
     if transformer_config.exists():

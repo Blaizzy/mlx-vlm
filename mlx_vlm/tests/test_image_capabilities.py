@@ -11,6 +11,9 @@ from mlx_vlm.generate.image import is_image_generation_model
 FLUX2_IDS = (
     "black-forest-labs/FLUX.2-klein-4B",
     "black-forest-labs/FLUX.2-klein-9b-kv",
+    # Quantized re-releases use the same FLUX.2-klein weights; the registry
+    # must resolve them via size-marker scan, not exact alias lookup.
+    "Runpod/FLUX.2-klein-4B-mflux-4bit",
 )
 
 
@@ -124,6 +127,23 @@ def test_model_capabilities_audio_from_config(tmp_path) -> None:
 def test_model_capabilities_embeddings_from_config(tmp_path) -> None:
     snapshot = _write_config(tmp_path / "roberta", {"model_type": "xlm-roberta"})
     assert model_capabilities("org/roberta", snapshot_path=snapshot) == ["embeddings"]
+
+
+def test_model_capabilities_embedding_only_arch(tmp_path) -> None:
+    # bert-class encoders (bge-micro etc.) embed but never claim chat text.
+    snapshot = _write_config(tmp_path / "bge", {"model_type": "bert"})
+    assert model_capabilities("org/bge-micro", snapshot_path=snapshot) == [
+        "embeddings"
+    ]
+
+
+def test_model_capabilities_lm_with_embed_remap(tmp_path) -> None:
+    # qwen3 is a chat LM the server can also serve embeddings from.
+    snapshot = _write_config(tmp_path / "qwen3", {"model_type": "qwen3"})
+    assert model_capabilities("org/qwen3", snapshot_path=snapshot) == [
+        "embeddings",
+        "text_generation",
+    ]
 
 
 def test_model_capabilities_image_flags_suppress_text(tmp_path) -> None:

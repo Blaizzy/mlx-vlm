@@ -13,7 +13,12 @@ from mlx_vlm.generate.image import (
     ImageGenerationResult,
 )
 
-from .config import Flux2Variant, get_variant, variant_from_local_path
+from .config import (
+    Flux2Variant,
+    get_variant,
+    resolve_variant_by_name,
+    variant_from_local_path,
+)
 from .download import validate_model_layout
 from .pipeline import Flux2Image, Flux2ImageEdit
 
@@ -29,7 +34,7 @@ def resolve_variant(model: str | Flux2Variant | None) -> Flux2Variant:
     if model_path.exists():
         return variant_from_local_path(model_path)
 
-    return get_variant(model_s)
+    return resolve_variant_by_name(model_s)
 
 
 def _can_load(model: str, *, require_edit: bool = False) -> bool:

@@ -94,7 +94,9 @@ def model_capabilities(
     # --- LM-family capabilities from the repo's config files ---
     config = _read_config(snapshot_path or model)
     if config is not None:
-        if not image_any:
+        cfg_type = str(config.get("model_type", "")).lower()
+        is_embedding_only = _is_embedding_only(cfg_type)
+        if not image_any and not is_embedding_only:
             try:
                 arch, model_type = get_model_and_args(config)
             except Exception:
@@ -120,8 +122,7 @@ def model_capabilities(
             # TTS vs STT is not distinguishable without loading (mlx-vlm
             # delegates audio to mlx_audio); the token means "audio-capable".
             caps.append(AUDIO)
-        cfg_type = str(config.get("model_type", "")).lower()
-        if cfg_type in EMBEDDING_MODEL_REMAPPING:
+        if _can_embed(cfg_type):
             caps.append(EMBEDDINGS)
 
     return sorted(caps)
@@ -157,6 +158,22 @@ def _chat_templates(path: str | Path) -> list[str]:
             if isinstance(entry, dict) and isinstance(entry.get("template"), str)
         ]
     return []
+
+
+def _is_embedding_only(cfg_type: str) -> bool:
+    """Embedding architectures with no chat generation path (pure encoders
+    and explicit *_embedding checkpoints)."""
+    return cfg_type in {"bert", "modernbert", "xlm-roberta", "xlm_roberta"} or (
+        cfg_type.endswith("_embedding")
+    )
+
+
+def _can_embed(cfg_type: str) -> bool:
+    """True when the server can serve embeddings from this model: either a
+    documented embedding-architecture type, or a type the embedding loader
+    remaps to one (qwen3, gemma3_text, lfm2, xlm-roberta...)."""
+    remapped = EMBEDDING_MODEL_REMAPPING.get(cfg_type, cfg_type)
+    return remapped != cfg_type or _is_embedding_only(cfg_type)
 
 
 def _is_video_generator(arch: Any) -> bool:
