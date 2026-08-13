@@ -64,6 +64,59 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestOlmoModel(unittest.TestCase):
+    def _config(self, weight_tying=True):
+        from mlx_vlm.models import olmo
+
+        return olmo.ModelConfig(
+            model_type="olmo",
+            d_model=32,
+            n_layers=2,
+            n_heads=4,
+            vocab_size=64,
+            embedding_size=64,
+            mlp_hidden_size=None,
+            mlp_ratio=4,
+            weight_tying=weight_tying,
+        )
+
+    def test_native_loader_and_cached_forward(self):
+        from mlx_vlm.models import olmo
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = olmo.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        first_logits = model(inputs[:, :2], cache=cache).logits
+        second_logits = model(inputs[:, 2:], cache=cache).logits
+        cached_logits = mx.concatenate([first_logits, second_logits], axis=1)
+        mx.eval(full_logits, cached_logits)
+
+        self.assertEqual(full_logits.shape, (1, 4, config.embedding_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(config.mlp_hidden_size, config.mlp_ratio * config.d_model)
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, olmo)
+        self.assertEqual(model_type, "olmo")
+
+    def test_untied_output_and_checkpoint_prefix(self):
+        from mlx_vlm.models import olmo
+
+        config = self._config(weight_tying=False)
+        model = olmo.Model(config)
+        output = model(mx.array([[1]])).logits
+        sanitized = model.sanitize({"model.transformer.wte.weight": mx.zeros((64, 32))})
+
+        self.assertEqual(output.shape, (1, 1, config.embedding_size))
+        self.assertEqual(
+            set(sanitized), {"language_model.model.transformer.wte.weight"}
+        )
+
+
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
