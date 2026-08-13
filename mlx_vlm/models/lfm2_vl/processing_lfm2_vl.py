@@ -453,9 +453,13 @@ class Lfm2VlNumpyImageProcessor(ImageProcessingMixin):
         return self.preprocess(images, return_tensors=return_tensors, **kwargs)
 
 
-# Try to import the slow image processor to force its use. Some Transformers
-# versions import torch from the SigLIP2 processor module, so fall back to a
-# local PIL/NumPy implementation when torch/torchvision are absent.
+# Try to import the slow image processor. Some Transformers versions import
+# torch from the SigLIP2 processor module. Historically the real Siglip2
+# processor was used when importable, but it has no LFM2-VL tiling and its
+# (B, C, H, W) output never matched the packed-patch contract the MLX model
+# consumes — so behavior silently differed between torch and torch-free
+# environments. The NumPy processor below is now used unconditionally; this
+# import only feeds the _SLOW_PROCESSOR_AVAILABLE fallback below.
 try:
     from transformers.models.siglip2.image_processing_siglip2 import (
         Siglip2ImageProcessor,
@@ -488,10 +492,14 @@ def _patched_init(self, image_processor, tokenizer, chat_template=None, **kwargs
     # Check if we got the fast image processor and need to replace it with the slow one
     # The fast processor requires PyTorch tensors which we don't have
     processor_class_name = type(image_processor).__name__
-    if "Fast" in processor_class_name and _SLOW_PROCESSOR_AVAILABLE:
-        # Replace with slow processor using the same config
+    # Always swap in the NumPy image processor: it is the only implementation
+    # with the official LFM2-VL tiling + thumbnail and the packed-patch output
+    # the MLX model consumes. The real Siglip2ImageProcessor (instantiated
+    # when torch is installed) has neither.
+    if processor_class_name != "Lfm2VlNumpyImageProcessor":
+        # Replace with the NumPy processor using the same config
         if hasattr(image_processor, "to_dict"):
-            # Use the config dict to create the slow processor
+            # Use the config dict to create the replacement
             config = image_processor.to_dict()
         else:
             # Fallback to copying attributes
@@ -501,10 +509,10 @@ def _patched_init(self, image_processor, tokenizer, chat_template=None, **kwargs
                 if not k.startswith("_") and k not in ["name_or_path"]
             }
         # Apply the official tiling defaults (see _OFFICIAL_SPLITTING_DEFAULTS):
-        # MLX repos ship tiling disabled, which the slow processor can now do.
+        # MLX repos ship tiling disabled, which the NumPy processor can now do.
         for key in _OFFICIAL_SPLITTING_DEFAULTS:
             config.pop(key, None)
-        image_processor = Siglip2ImageProcessor(**config)
+        image_processor = Lfm2VlNumpyImageProcessor(**config)
 
     # Call original __init__
     _original_init(
@@ -608,7 +616,9 @@ def _patched_from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         image_processor_config.pop(key, None)
         image_processor_config[key] = kwargs.pop(key, default)
 
-    image_processor = Siglip2ImageProcessor(**image_processor_config)
+    # The NumPy image processor is used unconditionally (torch or not): it is
+    # the only implementation with official tiling + the packed-patch output.
+    image_processor = Lfm2VlNumpyImageProcessor(**image_processor_config)
     return cls(image_processor=image_processor, tokenizer=tokenizer)
 
 
@@ -654,15 +664,17 @@ _original_call = Lfm2VlProcessor.__call__
 
 def _ensure_slow_processor(processor_instance):
     """
-    Ensure we're using the slow image processor, not the fast one.
-    The fast processor only supports PyTorch tensors which we can't use without PyTorch.
+    Ensure we're using the NumPy image processor.
+
+    The fast (torchvision) processor needs PyTorch tensors and the real slow
+    Siglip2ImageProcessor has no LFM2-VL tiling — neither matches the packed
+    patch input the MLX model expects, so both are swapped for the NumPy one.
     """
     image_processor = processor_instance.image_processor
     processor_class_name = type(image_processor).__name__
 
-    if "Fast" in processor_class_name and _SLOW_PROCESSOR_AVAILABLE:
-        # Need to replace with slow processor
-        # Get the config from the fast processor
+    if processor_class_name != "Lfm2VlNumpyImageProcessor":
+        # Get the config from the existing processor
         config = (
             image_processor.to_dict() if hasattr(image_processor, "to_dict") else {}
         )
@@ -671,13 +683,13 @@ def _ensure_slow_processor(processor_instance):
         config.pop("auto_map", None)
         config.pop("_processor_class", None)
         # Apply the official tiling defaults (see _OFFICIAL_SPLITTING_DEFAULTS):
-        # MLX repos ship tiling disabled, which the slow processor can now do.
+        # MLX repos ship tiling disabled, which the NumPy processor can now do.
         for key in _OFFICIAL_SPLITTING_DEFAULTS:
             config.pop(key, None)
 
-        # Create slow processor with the same config
-        slow_processor = Siglip2ImageProcessor(**config)
-        processor_instance.image_processor = slow_processor
+        # Create the NumPy processor with the same config
+        numpy_processor = Lfm2VlNumpyImageProcessor(**config)
+        processor_instance.image_processor = numpy_processor
 
         # Re-add missing attributes
         if not hasattr(processor_instance.image_processor, "tile_size"):
