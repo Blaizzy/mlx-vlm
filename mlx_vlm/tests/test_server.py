@@ -4635,6 +4635,22 @@ class TestResponseGenerator:
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
 
+    def test_speculative_cancellation_is_request_local(self):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen._cancel_lock = Lock()
+        gen._cancelled = {11, 22}
+        rqueue = Queue()
+        finished = set()
+
+        cancelled = gen._finish_cancelled_speculative_requests(
+            [11], {11: rqueue}, finished
+        )
+
+        assert cancelled == 1
+        assert finished == {11}
+        assert rqueue.get_nowait() is None
+        assert gen._cancelled == {22}
+
     def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
