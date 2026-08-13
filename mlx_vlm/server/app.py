@@ -5,6 +5,7 @@ import os
 import secrets
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from threading import Lock
 from types import SimpleNamespace
@@ -50,6 +51,7 @@ from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
+SERVER_INSTANCE_ID = uuid.uuid4().hex
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -132,7 +134,20 @@ def _server_runtime_snapshot() -> dict:
             audio_queue_depth = runtime.audio_queue.qsize()
         except Exception:
             audio_queue_depth = 0
+    response_generator = runtime.response_generator
+    speculative = {
+        "enabled": bool(
+            response_generator is not None
+            and getattr(response_generator, "draft_model", None) is not None
+        ),
+        "kind": (
+            getattr(response_generator, "draft_kind", None)
+            if response_generator is not None
+            else None
+        ),
+    }
     return {
+        "server_instance_id": SERVER_INSTANCE_ID,
         "loaded_model": default_cache.get("model_path", None),
         "loaded_adapter": default_cache.get("adapter_path", None),
         "loaded_models": {
@@ -153,6 +168,7 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "speculative_decode": speculative,
         "preload_failures": dict(runtime.preload_failures),
         "apc": (
             {"enabled": False}
@@ -912,6 +928,7 @@ async def health_check(request: Request):
     runtime = _server_runtime_snapshot()
     return {
         "status": "healthy",
+        "server_instance_id": runtime["server_instance_id"],
         "loaded_model": runtime["loaded_model"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_models": runtime["loaded_models"],
@@ -921,6 +938,7 @@ async def health_check(request: Request):
         "loaded_tool_parser": runtime["loaded_tool_parser"],
         "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "apc_enabled": runtime["apc"]["enabled"],
+        "speculative_decode": runtime["speculative_decode"],
     }
 
 
