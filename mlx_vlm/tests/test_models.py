@@ -327,6 +327,97 @@ class TestJambaModel(unittest.TestCase):
         self.assertEqual(model_type, "jamba")
 
 
+class TestBailingMoeLinearModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_expert_sanitize_and_predicates(self):
+        from mlx_vlm.models import bailing_moe_linear
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = bailing_moe_linear.ModelConfig(
+            model_type="bailing_moe_linear",
+            hidden_size=32,
+            intermediate_size=64,
+            max_position_embeddings=128,
+            moe_intermediate_size=48,
+            num_experts=4,
+            num_shared_experts=1,
+            norm_topk_prob=True,
+            num_attention_heads=4,
+            num_experts_per_tok=2,
+            num_hidden_layers=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            vocab_size=64,
+            first_k_dense_replace=1,
+            layer_group_size=2,
+            group_norm_size=4,
+            use_qk_norm=True,
+            norm_head=True,
+            moe_router_enable_expert_bias=True,
+            score_function="sigmoid",
+            n_group=2,
+            topk_group=1,
+            head_dim=8,
+        )
+        mx.random.seed(0)
+        model = bailing_moe_linear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                **{
+                    f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                        (48, 32), expert
+                    )
+                    for expert in range(config.num_experts)
+                },
+                "model.layers.1.mlp.gate.weight": mx.ones((4, 32)),
+                "lm_head.weight": mx.ones((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertIn(
+            "language_model.model.layers.1.mlp.gate.gate_proj.weight", sanitized
+        )
+        self.assertTrue(
+            mx.allclose(
+                mx.linalg.norm(sanitized["language_model.lm_head.weight"], axis=0),
+                mx.ones((32,)),
+                atol=1e-5,
+            ).item()
+        )
+        self.assertFalse(model.cast_predicate("model.layers.1.mlp.gate.expert_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.1.mlp.gate.gate_proj", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, bailing_moe_linear)
+        self.assertEqual(model_type, "bailing_moe_linear")
+
+
 class TestMiniMaxModel(unittest.TestCase):
     def test_native_loader_cache_expert_sanitize_and_predicates(self):
         from mlx_vlm.models import minimax
