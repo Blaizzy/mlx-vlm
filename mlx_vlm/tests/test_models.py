@@ -64,6 +64,64 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestIQuestLoopCoderModel(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import iquestloopcoder
+
+        return iquestloopcoder.ModelConfig(
+            model_type="iquestloopcoder",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            head_dim=8,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            tie_word_embeddings=False,
+            loop_num=2,
+            loop_window_size=4,
+        )
+
+    def test_native_loader_dual_cache_and_checkpoint_prefix(self):
+        from mlx_vlm.models import iquestloopcoder
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = iquestloopcoder.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache[:2]))
+        self.assertTrue(all(isinstance(item, RotatingKVCache) for item in cache[2:]))
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, iquestloopcoder)
+        self.assertEqual(model_type, "iquestloopcoder")
+
+    def test_rejects_unsupported_loop_count(self):
+        from mlx_vlm.models import iquestloopcoder
+
+        config = self._config()
+        config.loop_num = 3
+        with self.assertRaisesRegex(ValueError, "Only loop_num=2"):
+            iquestloopcoder.Model(config)
+
+
 class TestYoutuLLMModel(unittest.TestCase):
     def _config(self, q_lora_rank=16, tie_word_embeddings=True):
         from mlx_vlm.models import youtu_llm
