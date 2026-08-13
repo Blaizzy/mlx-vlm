@@ -64,6 +64,72 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestBitNetModel(unittest.TestCase):
+    def _config(self, tied=True):
+        from mlx_vlm.models import bitnet
+
+        return bitnet.ModelConfig(
+            model_type="bitnet",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            tie_word_embeddings=tied,
+        )
+
+    def test_packed_ternary_kernel_and_loader(self):
+        from mlx_vlm.models import bitnet
+        from mlx_vlm.models.bitnet.bitlinear import BitLinear
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = bitnet.Model(config)
+        layer = BitLinear(4, 4, bias=False)
+        layer.weight = mx.array([[0b11100100] * 4], dtype=mx.uint8)
+        layer.weight_scale = mx.array([0.5], dtype=mx.float32)
+        output = layer(mx.ones((1, 4), dtype=mx.float32))
+        mx.eval(output)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(output.tolist(), [[-2.0, 0.0, 2.0, 4.0]])
+        self.assertIsInstance(
+            model.language_model.model.layers[0].self_attn.q_proj, BitLinear
+        )
+        self.assertIs(model_module, bitnet)
+        self.assertEqual(model_type, "bitnet")
+
+    def test_cached_forward_and_sanitize(self):
+        from mlx_vlm.models import bitnet
+
+        config = self._config()
+        model = bitnet.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((64, 32)),
+                "model.layers.0.self_attn.rotary_emb.inv_freq": mx.zeros((4,)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+
+
 class TestMambaModel(unittest.TestCase):
     def _config(self, model_type="mamba", tied=True):
         from mlx_vlm.models import mamba

@@ -764,7 +764,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
-            elif quant_method in ("awq", "gptq", "bitnet"):
+            elif quant_method in ("awq", "gptq"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
                     quant_method,
