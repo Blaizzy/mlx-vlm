@@ -135,9 +135,16 @@ class Model(nn.Module):
                 )
             )
 
-        # The checkpoint has no lm_head.weight; reconstruct it from the tied embedding.
-        # MLX nn.Linear stores weights as (out_features, in_features), which matches
-        # the HF embedding layout (vocab_size, d_model), so no transpose is needed.
+        # Nemotron-Parse v1.x checkpoints carry a real, untied output head;
+        # map it to the language model's lm_head (MLX nn.Linear stores
+        # (out_features, in_features), matching the HF (vocab_size, d_model)
+        # layout, so no transpose is needed).
+        if "lm_head.weight" in sanitized_weights:
+            sanitized_weights["language_model.lm_head.weight"] = sanitized_weights.pop(
+                "lm_head.weight"
+            )
+
+        # Otherwise reconstruct it from the tied embedding.
         if (
             "language_model.lm_head.weight" not in sanitized_weights
             and "language_model.model.shared.weight" in sanitized_weights

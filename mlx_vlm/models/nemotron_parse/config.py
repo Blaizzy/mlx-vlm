@@ -79,6 +79,21 @@ class ModelConfig(BaseModelConfig):
         encoder_params = params.get("encoder", {})
         decoder_params = params.get("decoder", {})
 
+        # HF checkpoints nest the component configs under encoder/decoder, but
+        # the loader pipeline (update_module_configs) re-derives the text
+        # config from the text_config key — which it seeds to {} when absent —
+        # after from_dict returns. Populate that key in the caller's dict so
+        # vocab_size and friends survive (v1.x vs 2.0 differ in vocab). The
+        # decoder sub-config carries a null decoder_start_token_id; the
+        # top-level value is the real one.
+        if not params.get("text_config") and decoder_params:
+            text_config_params = dict(decoder_params)
+            if params.get("decoder_start_token_id") is not None:
+                text_config_params["decoder_start_token_id"] = params[
+                    "decoder_start_token_id"
+                ]
+            params["text_config"] = text_config_params
+
         vision_config = VisionConfig.from_dict(encoder_params)
         text_config = TextConfig.from_dict(decoder_params)
 

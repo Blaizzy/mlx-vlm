@@ -259,8 +259,29 @@ class NemotronParseLanguageModel(nn.Module):
             # distinct (self-attn, cross-attn) cache pair.
             cache = [(SimpleKVCache(), SimpleKVCache()) for _ in self.decoder.layers]
 
-        # Prefer embeddings when both are provided (start-token prefill).
-        if decoder_inputs_embeds is not None:
+        # Prefer the tokenized prompt as the decoder seed when the caller
+        # provided one (the HF reference routes the prompt into
+        # decoder_input_ids); otherwise fall back to the start-token
+        # embedding. Single-token decoder steps from the generation loop
+        # pass decoder_input_ids directly and never hit this branch.
+        if (
+            decoder_inputs_embeds is not None
+            and input_ids is not None
+            and input_ids.shape[-1] > 1
+        ):
+            decoder_input_ids = input_ids
+            # The tokenizer wraps the prompt with BOS/EOS by default, but the
+            # HF reference seeds the decoder with the raw prompt; a leading
+            # BOS or trailing EOS in the seed flips the next-token prediction
+            # (the model emits an immediate stop). Strip the automatic
+            # wrapper, keeping any specials that are part of the prompt.
+            if decoder_input_ids.shape[-1] > 2:
+                if decoder_input_ids[0, -1].item() == self.config.eos_token_id:
+                    decoder_input_ids = decoder_input_ids[:, :-1]
+                if decoder_input_ids[0, 0].item() == self.config.bos_token_id:
+                    decoder_input_ids = decoder_input_ids[:, 1:]
+            decoder_inputs_embeds = None
+        elif decoder_inputs_embeds is not None:
             decoder_input_ids = None
 
         decoder_outputs = self.decoder(
