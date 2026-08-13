@@ -741,6 +741,8 @@ def _unstarted_response_generator():
     gen.vision_cache = None
     gen.draft_model = None
     gen.draft_kind = None
+    gen.draft_model_path = None
+    gen.draft_kind_override = None
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -7253,4 +7255,80 @@ class TestRuntimeConfig:
     def test_settings_patch_requires_json_object(self, client, monkeypatch):
         monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         r = client.patch("/v1/settings", json=[1, 2, 3])
+        assert r.status_code == 400
+
+
+class TestRuntimeConfigAdditions:
+    def test_schema_includes_spec_and_maxkv_knobs(self):
+        cfg = RuntimeConfig.from_env()
+        spec = {k["name"]: k for k in cfg.schema()}
+        for name in ("max_kv_size", "spec_draft_model", "spec_draft_kind"):
+            assert name in spec
+            assert spec[name]["reload_kinds"] == ["text_generation"]
+
+    def test_max_kv_size_is_live_context_limit(self, monkeypatch):
+        import mlx_vlm.server.generation as server_generation
+
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 4096)
+        assert server_generation.get_configured_context_limit() == 4096
+
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        assert server_generation.get_configured_context_limit() is None
+
+    def test_spec_draft_knob_reaches_generator(self, monkeypatch):
+        class FakeResponseGenerator:
+            last_kwargs = {}
+
+            def __init__(self, *args, **kwargs):
+                FakeResponseGenerator.last_kwargs = kwargs
+                self.model = SimpleNamespace()
+                self.processor = SimpleNamespace()
+                self.config = SimpleNamespace(model_type="qwen2_vl")
+
+            def wait_until_ready(self):
+                return self.model, self.processor, self.config
+
+            def stop_and_join(self):
+                pass
+
+        monkeypatch.setattr(
+            server._app_module, "ResponseGenerator", FakeResponseGenerator
+        )
+        monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+        monkeypatch.setattr(server.runtime, "model_cache", {})
+        monkeypatch.setattr(server.runtime, "response_generator", None)
+        monkeypatch.setattr(server.runtime, "apc_manager", None)
+        monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
+        monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+
+        server.get_cached_model("demo-model")
+        assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
+        assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
+
+    def test_settings_patch_replace_semantics(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+        assert cfg.apc_enabled is False
+
+        client.patch(
+            "/v1/settings",
+            json={"kv_quant_scheme": "group", "apc_enabled": True},
+        )
+        assert cfg.kv_quant_scheme == "group"
+        assert cfg.apc_enabled is True
+
+        r = client.patch(
+            "/v1/settings",
+            json={"op": "replace", "values": {"kv_quant_scheme": "uniform"}},
+        )
+        body = r.json()
+        assert body["op"] == "replace"
+        assert cfg.kv_quant_scheme == "uniform"
+        assert cfg.apc_enabled is False
+
+        r = client.patch("/v1/settings", json={"op": "bogus", "values": {}})
+        assert r.status_code == 400
+
+        r = client.patch("/v1/settings", json={"op": "replace", "values": "x"})
         assert r.status_code == 400

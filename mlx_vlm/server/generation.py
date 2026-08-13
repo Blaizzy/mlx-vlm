@@ -371,6 +371,8 @@ def get_max_kv_size(model: str):
 
 
 def get_configured_context_limit():
+    if runtime.config.max_kv_size is not None:
+        return runtime.config.max_kv_size or None
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     return max_kv_tokens or None
 
@@ -1083,6 +1085,8 @@ class ResponseGenerator:
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
         apc_manager: Optional["_apc.APCManager"] = None,
+        draft_model_path: Optional[str] = None,
+        draft_kind: Optional[str] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -1091,6 +1095,8 @@ class ResponseGenerator:
         self.config = None
         self.stop_tokens = set()
         self.vision_cache = vision_cache
+        self.draft_model_path = draft_model_path
+        self.draft_kind_override = draft_kind
         self.draft_model = None
         self.kv_bits = kv_bits
         self.kv_key_bits = kv_key_bits
@@ -1148,8 +1154,10 @@ class ResponseGenerator:
                 stop_tokens.add(config.eos_token_id)
 
         draft_model = None
-        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
-        draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
+        draft_kind = self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND")
+        draft_model_path = self.draft_model_path or os.environ.get(
+            "MLX_VLM_DRAFT_MODEL"
+        )
         if draft_model_path:
             from ..speculative.drafters import (
                 load_drafter,

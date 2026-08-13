@@ -32,6 +32,27 @@ KNOBS: Tuple[Tuple[str, str, Any, Tuple[str, ...], str], ...] = (
     ("apc_block_size", "int", 16, TEXT_KINDS, "APC block size (tokens)."),
     ("apc_num_blocks", "int", 2048, TEXT_KINDS, "APC block pool capacity."),
     ("apc_disk_max_gb", "float_or_none", None, TEXT_KINDS, "APC disk tier cap (GB)."),
+    (
+        "max_kv_size",
+        "int_or_none",
+        None,
+        TEXT_KINDS,
+        "Requested context budget (tokens).",
+    ),
+    (
+        "spec_draft_model",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        "Speculative drafting model path.",
+    ),
+    (
+        "spec_draft_kind",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        "Speculative draft kind (auto if unset).",
+    ),
     ("vision_cache_size", "int", 20, VISION_KINDS, "Vision feature cache capacity."),
 )
 
@@ -74,15 +95,21 @@ class RuntimeConfig:
     apc_block_size: int = 16
     apc_num_blocks: int = 2048
     apc_disk_max_gb: Optional[float] = None
+    max_kv_size: Optional[int] = None
+    spec_draft_model: Optional[str] = None
+    spec_draft_kind: Optional[str] = None
     vision_cache_size: int = 20
 
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
+    _env_defaults: Dict[str, Any] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     @classmethod
     def from_env(cls) -> "RuntimeConfig":
-        return cls(
+        cfg = cls(
             kv_bits=_env_float("KV_BITS", None),
             kv_quant_scheme=os.environ.get("KV_QUANT_SCHEME", "uniform"),
             kv_group_size=_env_int("KV_GROUP_SIZE", None),
@@ -97,8 +124,13 @@ class RuntimeConfig:
             apc_block_size=int(os.environ.get("APC_BLOCK_SIZE", "16")),
             apc_num_blocks=int(os.environ.get("APC_NUM_BLOCKS", "2048")),
             apc_disk_max_gb=_env_float("APC_DISK_MAX_GB", None),
+            max_kv_size=_env_int("MAX_KV_SIZE", None),
+            spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
+            spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
         )
+        cfg._env_defaults = {name: getattr(cfg, name) for name in _KNOB_SPEC}
+        return cfg
 
     def schema(self) -> List[Dict[str, Any]]:
         return [
@@ -117,6 +149,16 @@ class RuntimeConfig:
             return {name: getattr(self, name) for name in _KNOB_SPEC}
 
     def apply_changes(
+        self, payload: Dict[str, Any], op: str = "merge"
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        if op == "replace":
+            with self._lock:
+                for name in _KNOB_SPEC:
+                    restored = self._env_defaults.get(name, _KNOB_SPEC[name]["default"])
+                    setattr(self, name, restored)
+        return self._apply_validated(payload)
+
+    def _apply_validated(
         self, payload: Dict[str, Any]
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         if not isinstance(payload, dict):

@@ -770,6 +770,8 @@ def get_cached_model(
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
+        draft_model_path=cfg.spec_draft_model,
+        draft_kind=cfg.spec_draft_kind,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
@@ -985,6 +987,18 @@ async def apc_cache_reset(request: Request):
     return {"enabled": True, "status": "cleared"}
 
 
+def _settings_operation(payload: dict):
+    if "op" in payload or "values" in payload:
+        op = payload.get("op", "merge")
+        if op not in ("merge", "replace"):
+            raise HTTPException(status_code=400, detail=f"unsupported op {op!r}")
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            raise HTTPException(status_code=400, detail="values must be a JSON object")
+        return op, values
+    return "merge", payload
+
+
 @app.get("/v1/settings")
 @app.get("/settings", include_in_schema=False)
 async def get_runtime_settings(request: Request):
@@ -1004,8 +1018,10 @@ async def update_runtime_settings(request: Request):
     payload = await request.json()
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
-    applied, rejected = runtime.config.apply_changes(payload)
+    op, values = _settings_operation(payload)
+    applied, rejected = runtime.config.apply_changes(values, op=op)
     return {
+        "op": op,
         "applied": applied,
         "rejected": rejected,
         "reload_kinds": sorted(runtime.config.reload_kinds(applied)),
