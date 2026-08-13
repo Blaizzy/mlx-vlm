@@ -479,6 +479,68 @@ class TestLongcatFlashModel(unittest.TestCase):
         self.assertEqual(model_type, "longcat_flash")
 
 
+class TestLongcatFlashNgramModel(unittest.TestCase):
+    def test_native_loader_ngram_context_and_dual_cache(self):
+        from mlx_vlm.models import longcat_flash_ngram
+        from mlx_vlm.models.cache import ArraysCache, CacheList
+        from mlx_vlm.utils import get_model_and_args
+
+        config = longcat_flash_ngram.ModelConfig(
+            model_type="longcat_flash_ngram",
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_topk=2,
+            expert_ffn_hidden_size=48,
+            n_routed_experts=3,
+            zero_expert_num=1,
+            num_layers=1,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            routed_scaling_factor=1.0,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            mla_scale_q_lora=True,
+            mla_scale_kv_lora=True,
+            ngram_vocab_size_ratio=2,
+            emb_neighbor_num=3,
+            emb_split_num=2,
+            norm_topk_prob=True,
+        )
+        mx.random.seed(0)
+        model = longcat_flash_ngram.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], CacheList)
+        self.assertEqual(cache[0][0].tolist(), [[3, 4]])
+        self.assertEqual(
+            set(sanitized),
+            {"language_model.model.ngram_embeddings.word_embeddings.weight"},
+        )
+        self.assertIs(model_module, longcat_flash_ngram)
+        self.assertEqual(model_type, "longcat_flash_ngram")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
