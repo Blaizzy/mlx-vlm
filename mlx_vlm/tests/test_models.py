@@ -655,6 +655,135 @@ class TestKimiLinearModel(unittest.TestCase):
         self.assertEqual(model_type, "kimi_linear")
 
 
+class TestStep3p5Model(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import step3p5
+
+        return step3p5.ModelConfig(
+            model_type="step3p5",
+            hidden_size=32,
+            num_hidden_layers=4,
+            vocab_size=64,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=8,
+            intermediate_size=64,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 12000.0, 14000.0, 16000.0],
+            max_position_embeddings=128,
+            sliding_window=8,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            yarn_only_types=["full_attention"],
+            partial_rotary_factors=[0.5, 1.0, 0.5, 1.0],
+            attention_other_setting={
+                "num_attention_heads": 2,
+                "num_attention_groups": 1,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=48,
+            share_expert_dim=40,
+            moe_layers_enum="1,3",
+            moe_router_scaling_factor=0.75,
+            norm_expert_weight=True,
+            swiglu_limits=[0.0, 1.5, 0.0, 2.0],
+            swiglu_limits_shared=[1.0, 1.25, 1.5, 1.75],
+        )
+
+    def test_native_loader_dual_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import step3p5
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = step3p5.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.layers.1.moe.gate_proj.weight": mx.ones((4, 48, 32)),
+                "model.layers.1.moe.router_bias": mx.ones((4,)),
+                "model.layers.1.share_expert.gate_proj.weight": mx.ones((40, 32)),
+                "model.layers.1.input_layernorm.weight": mx.zeros((32,)),
+                "model.layers.4.moe.gate_proj.weight": mx.ones((4, 48, 32)),
+                "model.mtp.layers.0.weight": mx.ones((1,)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertIn(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight",
+            sanitized,
+        )
+        self.assertIn("language_model.model.layers.1.mlp.gate.router_bias", sanitized)
+        self.assertIn(
+            "language_model.model.layers.1.mlp.share_expert.gate_proj.weight",
+            sanitized,
+        )
+        self.assertTrue(
+            mx.allclose(
+                sanitized["language_model.model.layers.1.input_layernorm.weight"],
+                mx.ones((32,)),
+            ).item()
+        )
+        self.assertNotIn(
+            "language_model.model.layers.4.mlp.switch_mlp.gate_proj.weight",
+            sanitized,
+        )
+        self.assertFalse(model.cast_predicate("model.layers.1.mlp.gate.router_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.1.mlp.gate.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, step3p5)
+        self.assertEqual(model_type, "step3p5")
+
+    def test_sharding_path(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models import step3p5
+
+        class Group:
+            @staticmethod
+            def size():
+                return 1
+
+        model = step3p5.Model(self._config())
+        with (
+            patch(
+                "mlx_vlm.models.step3p5.language.shard_linear",
+                side_effect=lambda layer, *args, **kwargs: layer,
+            ) as shard_linear,
+            patch("mlx_vlm.models.step3p5.language.shard_inplace") as shard_inplace,
+        ):
+            model.shard(Group())
+
+        self.assertEqual(shard_linear.call_count, 26)
+        self.assertEqual(shard_inplace.call_count, 12)
+
+
 class TestMiniMaxModel(unittest.TestCase):
     def test_native_loader_cache_expert_sanitize_and_predicates(self):
         from mlx_vlm.models import minimax
