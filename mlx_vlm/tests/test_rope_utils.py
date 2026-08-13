@@ -74,6 +74,62 @@ def test_eager_rope_uses_fp32_frequencies_and_activation_dtype_trig():
     assert bool(mx.array_equal(output, expected).item())
 
 
+def test_eager_rope_per_batch_offset_does_not_expand_seq():
+    """Per-batch (array) offsets from batch caches must keep S, not grow it.
+
+    Regression for the batched-path crash on multi-request streaming:
+    ``_eager_rope_angles`` used ``arange(S) + offset`` which broadcast the
+    batch-sized offset along the seq dim (S=1 -> S=B), so the attention mask
+    (N=1) no longer matched the keys (S=B) and
+    ``mx.fast.scaled_dot_product_attention`` raised
+    ``Shapes (B,1,1,window) and (B,H,B,window+1) cannot be broadcast``.
+    """
+    rope = initialize_rope(
+        dims=128,
+        base=500000.0,
+        traditional=False,
+        scaling_config={"rope_type": "default"},
+        implementation="eager",
+    )
+    assert isinstance(rope, EagerRoPE)
+
+    rng = mx.random.key(0)
+    x = mx.random.normal(key=rng, shape=(2, 32, 1, 128)).astype(mx.float32)
+    offsets = mx.array([86, 34258], dtype=mx.int32)
+
+    out = rope(x, offset=offsets)
+    assert out.shape == x.shape, f"seq dim expanded: {out.shape} != {x.shape}"
+
+    # Per-batch array offset must equal per-row scalar application.
+    ref = mx.concatenate(
+        [rope(x[0:1], offset=86), rope(x[1:2], offset=34258)], axis=0
+    )
+    assert bool(mx.array_equal(out, ref).item())
+
+    # Multi-token batch: (B, S) positions, still per-row equal to scalars.
+    x2 = mx.random.normal(key=mx.random.key(1), shape=(2, 32, 3, 128)).astype(mx.float32)
+    out2 = rope(x2, offset=offsets)
+    ref2 = mx.concatenate(
+        [rope(x2[0:1], offset=86), rope(x2[1:2], offset=34258)], axis=0
+    )
+    assert bool(mx.array_equal(out2, ref2).item())
+
+    # Traditional layout follows the same rule.
+    rope_t = initialize_rope(
+        dims=128,
+        base=500000.0,
+        traditional=True,
+        scaling_config={"rope_type": "default"},
+        implementation="eager",
+    )
+    out3 = rope_t(x, offset=offsets)
+    assert out3.shape == x.shape
+    ref3 = mx.concatenate(
+        [rope_t(x[0:1], offset=86), rope_t(x[1:2], offset=34258)], axis=0
+    )
+    assert bool(mx.array_equal(out3, ref3).item())
+
+
 def test_eager_rope_evals_private_helper_arrays_on_init(monkeypatch):
     eval_args = []
     monkeypatch.setattr(mx, "eval", lambda *args: eval_args.append(args))

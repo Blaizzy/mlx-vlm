@@ -13,9 +13,21 @@ _FULL_COS = "full"
 
 
 def _eager_rope_angles(x, offset, frequencies, scale, traditional):
-    positions = mx.arange(x.shape[-2], dtype=mx.float32) + offset
+    # offset may be a scalar (single-row cache) or a per-batch array
+    # (BatchRotatingKVCache / BatchKVCache offsets). Build (B, S) positions
+    # for the array case so the seq dim is not accidentally expanded to B.
+    S = x.shape[-2]
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        positions = (
+            mx.arange(S, dtype=mx.float32)[None, :] + offset[:, None]
+        )  # (B, S)
+    else:
+        positions = mx.arange(S, dtype=mx.float32) + offset  # (S,)
     positions = positions * scale
-    angles = positions[:, None] * frequencies[None]
+    if positions.ndim == 2:
+        angles = positions[:, :, None] * frequencies[None, None]  # (B, S, F)
+    else:
+        angles = positions[:, None] * frequencies[None]  # (S, F)
     if traditional:
         return mx.repeat(angles, 2, axis=-1)
     return mx.concatenate([angles, angles], axis=-1)
@@ -42,8 +54,14 @@ def _eager_rope_apply(x, cos, sin, dims, traditional):
 def _compiled_eager_rope(x, offset, frequencies, scale, traditional):
     dims = frequencies.shape[0] * 2
     angles = _eager_rope_angles(x, offset, frequencies, scale, traditional)
-    cos = mx.cos(angles).astype(x.dtype)[None, None]
-    sin = mx.sin(angles).astype(x.dtype)[None, None]
+    # angles: (S, F*2) for scalar offset -> cos (1,1,S,D); (B, S, F*2) for
+    # per-batch offset -> cos (B,1,S,D).
+    if angles.ndim == 3:
+        cos = mx.cos(angles).astype(x.dtype)[:, None]
+        sin = mx.sin(angles).astype(x.dtype)[:, None]
+    else:
+        cos = mx.cos(angles).astype(x.dtype)[None, None]
+        sin = mx.sin(angles).astype(x.dtype)[None, None]
     return _eager_rope_apply(x, cos, sin, dims, traditional)
 
 
