@@ -64,6 +64,84 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestMellumModel(unittest.TestCase):
+    def _config(self, tie_word_embeddings=True):
+        from mlx_vlm.models import mellum
+
+        return mellum.ModelConfig(
+            model_type="mellum",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_experts=3,
+            num_experts_per_tok=2,
+            moe_intermediate_size=48,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            head_dim=8,
+            tie_word_embeddings=tie_word_embeddings,
+            max_position_embeddings=128,
+            norm_topk_prob=True,
+            sliding_window=4,
+            layer_types=["full_attention", "sliding_attention"],
+            rope_parameters={
+                "full_attention": {"rope_theta": 10000.0},
+                "sliding_attention": {"rope_theta": 10000.0},
+            },
+        )
+
+    def test_native_loader_mixed_cache_and_quant_predicate(self):
+        from mlx_vlm.models import mellum
+        from mlx_vlm.models.cache import KVCache, RotatingKVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mellum.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], KVCache)
+        self.assertIsInstance(cache[1], RotatingKVCache)
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, mellum)
+        self.assertEqual(model_type, "mellum")
+
+    def test_sanitize_stacks_experts_and_drops_tied_head(self):
+        from mlx_vlm.models import mellum
+
+        config = self._config()
+        model = mellum.Model(config)
+        weights = {"lm_head.weight": mx.zeros((64, 32))}
+        for layer_idx in range(config.num_hidden_layers):
+            for expert_idx in range(config.num_experts):
+                for name in ("up_proj", "down_proj", "gate_proj"):
+                    weights[
+                        f"model.layers.{layer_idx}.mlp.experts.{expert_idx}.{name}.weight"
+                    ] = mx.full((2, 2), expert_idx)
+        sanitized = model.sanitize(weights)
+        key = "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(sanitized[key].shape, (config.num_experts, 2, 2))
+
+
 class TestIQuestLoopCoderModel(unittest.TestCase):
     def _config(self):
         from mlx_vlm.models import iquestloopcoder
