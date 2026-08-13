@@ -64,6 +64,53 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestLille130mModel(unittest.TestCase):
+    def test_cached_forward_and_checkpoint_prefix(self):
+        from mlx_vlm.models import lille_130m
+        from mlx_vlm.utils import get_model_and_args
+
+        config = lille_130m.ModelConfig(
+            model_type="lille-130m",
+            block_size=128,
+            layer_norm_eps=1e-5,
+            n_embd=64,
+            n_head=4,
+            n_kv_heads=2,
+            n_layer=2,
+            rope_theta=10000.0,
+            vocab_size=64,
+        )
+        model = lille_130m.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :1], cache=cache).logits,
+                model(inputs[:, 1:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "transformer.tok_embeddings.weight": mx.zeros((64, 64)),
+                "transformer.layers.0.attention.rotary_emb.inv_freq": mx.zeros((4,)),
+            }
+        )
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(
+            set(sanitized), {"language_model.transformer.tok_embeddings.weight"}
+        )
+        self.assertEqual(len(model.layers), config.n_layer)
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, lille_130m)
+        self.assertEqual(model_type, "lille_130m")
+
+
 class TestOlmoModel(unittest.TestCase):
     def _config(self, weight_tying=True):
         from mlx_vlm.models import olmo
