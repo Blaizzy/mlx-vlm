@@ -51,7 +51,6 @@ from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
 
-DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_LOG_PROGRESS_INTERVAL = 10
 DEFAULT_ENABLE_THINKING = False
@@ -98,21 +97,7 @@ def get_server_max_tokens():
 
 
 def get_token_queue_timeout():
-    raw_timeout = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
-    if raw_timeout == "":
-        return DEFAULT_TOKEN_QUEUE_TIMEOUT
-    try:
-        timeout = float(raw_timeout)
-    except ValueError:
-        logger.warning(
-            "Invalid MLX_VLM_TOKEN_QUEUE_TIMEOUT=%r; falling back to %ss.",
-            raw_timeout,
-            DEFAULT_TOKEN_QUEUE_TIMEOUT,
-        )
-        return DEFAULT_TOKEN_QUEUE_TIMEOUT
-    if timeout <= 0:
-        return None
-    return timeout
+    return runtime.config.token_queue_timeout
 
 
 def get_speculative_batch_coalesce_s():

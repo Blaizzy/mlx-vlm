@@ -4791,21 +4791,25 @@ class TestResponseGenerator:
 
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 600.0
 
     def test_token_queue_timeout_accepts_namespaced_env(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 42.5
 
     def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 600.0
 
     def test_token_queue_timeout_can_disable_timeout(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() is None
 
@@ -4948,7 +4952,7 @@ class TestResponseGenerator:
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+        monkeypatch.setattr(server.runtime.config, "token_queue_timeout", 0.01)
 
         _, token_iter = gen.generate("hello")
 
@@ -5019,7 +5023,9 @@ class TestResponseGenerator:
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", str(timeout_s * 10))
+        monkeypatch.setattr(
+            server.runtime.config, "token_queue_timeout", timeout_s * 10
+        )
 
         _, token_iter = gen.generate("hello")
 
@@ -7259,12 +7265,35 @@ class TestRuntimeConfig:
 
 
 class TestRuntimeConfigAdditions:
-    def test_schema_includes_spec_and_maxkv_knobs(self):
+    def test_schema_includes_live_and_reloadable_knobs(self):
         cfg = RuntimeConfig.from_env()
         spec = {k["name"]: k for k in cfg.schema()}
-        for name in ("max_kv_size", "spec_draft_model", "spec_draft_kind"):
+        for name in (
+            "max_kv_size",
+            "token_queue_timeout",
+            "spec_draft_model",
+            "spec_draft_kind",
+        ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
+
+    def test_token_queue_timeout_is_live(self, client, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+        fingerprint = cfg.fingerprint()
+
+        response = client.patch("/v1/settings", json={"token_queue_timeout": 1200})
+
+        assert response.status_code == 200
+        assert response.json()["applied"] == {"token_queue_timeout": 1200.0}
+        assert server.get_token_queue_timeout() == 1200.0
+        assert cfg.fingerprint() == fingerprint
+
+        response = client.patch("/v1/settings", json={"token_queue_timeout": 0})
+
+        assert response.json()["applied"] == {"token_queue_timeout": None}
+        assert server.get_token_queue_timeout() is None
 
     def test_max_kv_size_is_live_context_limit(self, monkeypatch):
         import mlx_vlm.server.generation as server_generation

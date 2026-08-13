@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass, field
@@ -13,6 +14,9 @@ TEXT_KINDS: Tuple[str, ...] = ("text_generation",)
 VISION_KINDS: Tuple[str, ...] = ("image_generation", "image_edit")
 
 KV_SCHEMES: Tuple[str, ...] = ("uniform", "turboquant")
+DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+
+logger = logging.getLogger("mlx_vlm.server")
 
 # name, type, default, reload kinds, allowed (None = free), help
 KNOBS: Tuple[
@@ -96,6 +100,14 @@ KNOBS: Tuple[
         "Requested context budget (tokens).",
     ),
     (
+        "token_queue_timeout",
+        "float_or_none",
+        DEFAULT_TOKEN_QUEUE_TIMEOUT,
+        TEXT_KINDS,
+        None,
+        "Token queue wait timeout in seconds; null disables the timeout.",
+    ),
+    (
         "spec_draft_model",
         "str_or_none",
         None,
@@ -134,7 +146,7 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
 
 # Knobs that are naturally live (applied per request) and must never trigger a
 # model reload, so they are excluded from the cache-key fingerprint.
-_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size",)
+_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size", "token_queue_timeout")
 
 
 def _env_float(name: str, default: Optional[float]) -> Optional[float]:
@@ -148,6 +160,22 @@ def _env_float(name: str, default: Optional[float]) -> Optional[float]:
 def _env_int(name: str, default: Optional[int]) -> Optional[int]:
     raw = os.environ.get(name)
     return int(raw) if raw else default
+
+
+def _env_token_queue_timeout() -> Optional[float]:
+    raw = os.environ.get("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "")
+    if raw == "":
+        return DEFAULT_TOKEN_QUEUE_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MLX_VLM_TOKEN_QUEUE_TIMEOUT=%r; falling back to %ss.",
+            raw,
+            DEFAULT_TOKEN_QUEUE_TIMEOUT,
+        )
+        return DEFAULT_TOKEN_QUEUE_TIMEOUT
+    return timeout if timeout > 0 else None
 
 
 @dataclass
@@ -166,6 +194,7 @@ class RuntimeConfig:
     apc_num_blocks: int = 2048
     apc_disk_max_gb: Optional[float] = None
     max_kv_size: Optional[int] = None
+    token_queue_timeout: Optional[float] = DEFAULT_TOKEN_QUEUE_TIMEOUT
     spec_draft_model: Optional[str] = None
     spec_draft_kind: Optional[str] = None
     vision_cache_size: int = 20
@@ -195,6 +224,7 @@ class RuntimeConfig:
             apc_num_blocks=int(os.environ.get("APC_NUM_BLOCKS", "2048")),
             apc_disk_max_gb=_env_float("APC_DISK_MAX_GB", None),
             max_kv_size=_env_int("MAX_KV_SIZE", None),
+            token_queue_timeout=_env_token_queue_timeout(),
             spec_draft_model=os.environ.get("MLX_VLM_DRAFT_MODEL") or None,
             spec_draft_kind=os.environ.get("MLX_VLM_DRAFT_KIND") or None,
             vision_cache_size=int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20")),
@@ -244,6 +274,12 @@ class RuntimeConfig:
                 spec = _KNOB_SPEC[name]
                 try:
                     value = _coerce(spec["type"], raw, spec.get("allowed"))
+                    if (
+                        name == "token_queue_timeout"
+                        and value is not None
+                        and value < 0
+                    ):
+                        value = None
                 except (TypeError, ValueError) as exc:
                     rejected.append({"name": name, "reason": str(exc)})
                     continue

@@ -234,7 +234,8 @@ Applying a change bumps the config fingerprint in the model cache key, so
 the next request to an affected model kind reloads it with the new settings
 (scoped per kind: KV/APC/spec knobs reload `text_generation`;
 `vision_cache_size` reloads image kinds). Unknown or invalid knobs are
-rejected and never applied.
+rejected and never applied. Request-time knobs such as `max_kv_size` and
+`token_queue_timeout` apply to new requests without reloading the model.
 
 ## Distributed Inference
 
