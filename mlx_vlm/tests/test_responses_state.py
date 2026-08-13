@@ -77,6 +77,29 @@ def test_function_output_preserves_text_alongside_visual_input():
     ]
 
 
+def test_function_call_none_content_is_normalized_for_chat_templates():
+    items = [
+        {
+            "type": "function_call",
+            "name": "get_weather",
+            "arguments": '{"location":"SF"}',
+            "call_id": "call_get_weather",
+        }
+    ]
+
+    messages, images = _response_items_to_chat(items)
+    normalized = apply_chat_template(
+        None,
+        {"model_type": "qwen3_vl"},
+        messages,
+        return_messages=True,
+    )
+
+    assert images == []
+    assert messages[0]["content"] is None
+    assert normalized[0]["content"] == ""
+
+
 def test_message_image_stays_on_its_original_user_turn():
     image_url = "https://example.com/first-turn.png"
     items = [

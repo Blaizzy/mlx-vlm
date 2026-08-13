@@ -192,10 +192,12 @@ for i in range(B):
 | Target | Drafter | Notes |
 |--------|---------|-------|
 | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
+| `meta-models/Muse-Glimmer-30B` | `meta-models/Muse-Glimmer-30B-assistant` | Text + image. Native 5-layer, 16-token DFlash assistant. |
 | `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
 
 The drafter is loaded via the shared `load_model` path. DFlash checkpoints are
-detected from `dflash_config`; EAGLE-3 checkpoints are detected from
+detected from `dflash_config` or the `muse_glimmer_assistant` model type;
+EAGLE-3 checkpoints are detected from
 `speculators_model_type` or EAGLE-3 architecture metadata. Native MTP sidecars
 for supported model families are detected from their `model_type`.
 

@@ -184,7 +184,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
-#### DFlash (Qwen3.5)
+#### DFlash (Qwen3.5 and Muse Glimmer)
 
 A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
@@ -205,6 +205,18 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 # Server with speculative decoding
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
+```
+
+Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
+
+```sh
+mlx_vlm.generate --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0
+
+mlx_vlm.server --model meta-models/Muse-Glimmer-30B \
+  --draft-model meta-models/Muse-Glimmer-30B-assistant
 ```
 
 DFlash draft-cache windowing is available from the Python API. During
