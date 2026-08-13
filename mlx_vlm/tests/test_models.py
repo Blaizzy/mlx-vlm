@@ -10,6 +10,60 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 
+class TestNanochatModel(unittest.TestCase):
+    def test_native_loader_and_cached_forward(self):
+        from mlx_vlm.models import nanochat
+        from mlx_vlm.utils import get_model_and_args
+
+        config = nanochat.ModelConfig(
+            model_type="nanochat",
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=64,
+            max_position_embeddings=128,
+            intermediate_size=64,
+            rope_theta=10000.0,
+        )
+        model = nanochat.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        first_logits = model(inputs[:, :2], cache=cache).logits
+        second_logits = model(inputs[:, 2:], cache=cache).logits
+        cached_logits = mx.concatenate([first_logits, second_logits], axis=1)
+        mx.eval(full_logits, cached_logits)
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+
+        model_module, model_type = get_model_and_args(config.to_dict())
+        self.assertIs(model_module, nanochat)
+        self.assertEqual(model_type, "nanochat")
+
+    def test_sanitize_adds_native_wrapper_prefix(self):
+        from mlx_vlm.models import nanochat
+
+        model = nanochat.Model(
+            nanochat.ModelConfig(
+                vocab_size=8,
+                hidden_size=8,
+                intermediate_size=16,
+                num_hidden_layers=1,
+                num_attention_heads=2,
+                num_key_value_heads=2,
+            )
+        )
+        weights = {"transformer.wte.weight": mx.zeros((8, 8))}
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
+
+
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
