@@ -418,6 +418,132 @@ class TestBailingMoeLinearModel(unittest.TestCase):
         self.assertEqual(model_type, "bailing_moe_linear")
 
 
+class TestGraniteMoeHybridModel(unittest.TestCase):
+    def _config(self, use_moe=True):
+        from mlx_vlm.models import granitemoehybrid
+
+        return granitemoehybrid.ModelConfig(
+            model_type="granitemoehybrid",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=48,
+            num_hidden_layers=4,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            embedding_multiplier=2.0,
+            attention_multiplier=0.5,
+            logits_scaling=4.0,
+            residual_multiplier=0.75,
+            layer_types=["mamba", "attention", "mamba", "attention"],
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            num_local_experts=4 if use_moe else None,
+            num_experts_per_tok=2 if use_moe else None,
+            shared_intermediate_size=40 if use_moe else None,
+            mamba_n_heads=4,
+            mamba_d_head=8,
+            mamba_proj_bias=False,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_n_groups=2,
+            mamba_conv_bias=True,
+            tie_word_embeddings=False,
+        )
+
+    def test_native_loader_hybrid_cache_moe_sanitize_and_predicate(self):
+        from mlx_vlm.models import granitemoehybrid
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        mx.random.seed(0)
+        model = granitemoehybrid.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        input_weights = {
+            f"model.layers.{layer}.block_sparse_moe.input_linear.weight": mx.ones(
+                (4, 96, 32)
+            )
+            for layer in range(config.num_hidden_layers)
+        }
+        output_weights = {
+            f"model.layers.{layer}.block_sparse_moe.output_linear.weight": mx.ones(
+                (4, 32, 48)
+            )
+            for layer in range(config.num_hidden_layers)
+        }
+        sanitized = model.sanitize(
+            {
+                **input_weights,
+                **output_weights,
+                "model.layers.0.mamba.conv1d.weight": mx.ones((80, 1, 4)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (80, 4, 1),
+        )
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.block_sparse_moe.router.layer", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, granitemoehybrid)
+        self.assertEqual(model_type, "granitemoehybrid")
+
+    def test_dense_checkpoint_sanitize(self):
+        from mlx_vlm.models import granitemoehybrid
+
+        config = self._config(use_moe=False)
+        model = granitemoehybrid.Model(config)
+        weights = {
+            f"model.layers.{layer}.shared_mlp.input_linear.weight": mx.ones((96, 32))
+            for layer in range(config.num_hidden_layers)
+        }
+        weights.update(
+            {
+                f"model.layers.{layer}.shared_mlp.output_linear.weight": mx.ones(
+                    (32, 48)
+                )
+                for layer in range(config.num_hidden_layers)
+            }
+        )
+
+        sanitized = model.sanitize(weights)
+
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mlp.gate_proj.weight"].shape,
+            (48, 32),
+        )
+        self.assertTrue(
+            model.quant_predicate("model.layers.0.block_sparse_moe.router.layer", None)
+        )
+
+
 class TestMiniMaxModel(unittest.TestCase):
     def test_native_loader_cache_expert_sanitize_and_predicates(self):
         from mlx_vlm.models import minimax
