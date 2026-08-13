@@ -64,6 +64,65 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestMamba2Model(unittest.TestCase):
+    def _config(self, tied=True):
+        from mlx_vlm.models import mamba2
+
+        return mamba2.ModelConfig(
+            model_type="mamba2",
+            num_heads=4,
+            head_dim=8,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            state_size=8,
+            num_hidden_layers=2,
+            layer_norm_epsilon=1e-5,
+            conv_kernel=4,
+            n_groups=2,
+            use_bias=False,
+            use_conv_bias=True,
+            tie_word_embeddings=tied,
+            time_step_limit=(0.0, float("inf")),
+            time_step_rank="auto",
+        )
+
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import mamba2
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mamba2.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {"backbone.layers.0.mixer.conv1d.weight": mx.zeros((64, 1, 4))}
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(config.time_step_rank, 2)
+        self.assertEqual(config.ssm_state_size, config.state_size)
+        self.assertIs(model_module, mamba2)
+        self.assertEqual(model_type, "mamba2")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
