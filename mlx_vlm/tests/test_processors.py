@@ -2102,9 +2102,7 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertEqual(_num_image_tokens_from_patch_grid(16, 16, 2), 64)
 
     def test_large_image_is_split_into_tiles_and_thumbnail(self):
-        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
-            Lfm2VlNumpyImageProcessor,
-        )
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
 
         processor = Lfm2VlNumpyImageProcessor(
             encoder_patch_size=16,
@@ -2121,9 +2119,7 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         result = processor([image], return_tensors="np")
 
         self.assertEqual(result["pixel_values"].shape, (9, 1024, 768))
-        self.assertEqual(
-            result["spatial_shapes"].tolist(), [[32, 32]] * 8 + [[24, 42]]
-        )
+        self.assertEqual(result["spatial_shapes"].tolist(), [[32, 32]] * 8 + [[24, 42]])
         self.assertEqual(result["image_rows"].tolist(), [2])
         self.assertEqual(result["image_cols"].tolist(), [4])
         self.assertEqual(result["image_sizes"].tolist(), [[384, 672]])
@@ -2132,9 +2128,7 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         )
 
     def test_small_image_stays_single_view_with_tiling_enabled(self):
-        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import (
-            Lfm2VlNumpyImageProcessor,
-        )
+        from mlx_vlm.models.lfm2_vl.processing_lfm2_vl import Lfm2VlNumpyImageProcessor
 
         processor = Lfm2VlNumpyImageProcessor()
 
@@ -2212,9 +2206,7 @@ class TestLfm2VlProcessorPatch(unittest.TestCase):
         self.assertLess(
             expanded.index(markers[-1]), expanded.index("<|img_thumbnail|>")
         )
-        self.assertIn(
-            "<|img_thumbnail|>" + "<image>" * 252 + "<|image_end|>", expanded
-        )
+        self.assertIn("<|img_thumbnail|>" + "<image>" * 252 + "<|image_end|>", expanded)
         self.assertTrue(expanded.endswith("Describe this image"))
         # 8 tiles * 256 tokens + 252 thumbnail tokens
         self.assertEqual(expanded.count("<image>"), 8 * 256 + 252)

@@ -34,7 +34,6 @@ from transformers.models.lfm2_vl.processing_lfm2_vl import (
 
 from ..base import install_auto_processor_patch, load_chat_template
 
-
 # Official transformers preprocessing defaults for LFM2-VL: images larger than
 # `max_pixels_tolerance` * `max_image_tokens` * patch^2 * factor^2 pixels are
 # split into a grid of `tile_size` tiles (grid within [min_tiles, max_tiles],
@@ -707,9 +706,7 @@ def _patched_call(self, images=None, text=None, **kwargs):
     # max_tiles, use_thumbnail) regardless of how the processor's kwarg
     # routing classifies them.
     splitting_overrides = {
-        key: kwargs.pop(key)
-        for key in _OFFICIAL_SPLITTING_DEFAULTS
-        if key in kwargs
+        key: kwargs.pop(key) for key in _OFFICIAL_SPLITTING_DEFAULTS if key in kwargs
     }
 
     # Ensure we're using the slow processor (fast requires PyTorch tensors)
