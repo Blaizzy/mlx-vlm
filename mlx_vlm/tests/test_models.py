@@ -615,6 +615,59 @@ class TestGlm4MoeLiteModel(unittest.TestCase):
         self.assertEqual(model_type, "glm4_moe_lite")
 
 
+class TestRWKV7Model(unittest.TestCase):
+    def test_native_loader_recurrent_cache_kernel_and_sanitize(self):
+        from mlx_vlm.models import rwkv7
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.models.rwkv7 import language
+        from mlx_vlm.utils import get_model_and_args
+
+        config = rwkv7.ModelConfig(
+            model_type="rwkv7",
+            vocab_size=64,
+            hidden_size=64,
+            intermediate_size=128,
+            norm_eps=1e-5,
+            head_dim=32,
+            num_hidden_layers=2,
+            a_low_rank_dim=8,
+            v_low_rank_dim=8,
+            gate_low_rank_dim=16,
+            decay_low_rank_dim=16,
+            tie_word_embeddings=False,
+        )
+        mx.random.seed(0)
+        model = rwkv7.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.layers.0.attn.k_k": mx.zeros((64,))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.attn.k_k"].shape, (2, 32)
+        )
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.attn.w_lora.lora.2", None),
+            {"bits": 8},
+        )
+        if mx.metal.is_available():
+            self.assertIsNotNone(language._wkv7_kernel)
+        self.assertIs(model_module, rwkv7)
+        self.assertEqual(model_type, "rwkv7")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
