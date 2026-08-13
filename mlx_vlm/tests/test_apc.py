@@ -1181,3 +1181,107 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+class TestAllModelsAPCEligible:
+    """Every cache class used by any model's make_cache must resolve to an
+    APC mode (block or exact), so prefix caching is never silently disabled
+    for a supported model."""
+
+    CACHE_ARGS = {
+        "KVCache": (),
+        "RotatingKVCache": (2048,),
+        "ArraysCache": (2,),
+        "ChunkedKVCache": (2048,),
+        "PoolingCache": (2,),
+        "SimpleKVCache": (),
+        "StaticPrefixKVCache": (2048,),
+        "BatchKVCache": ([0],),
+        "BatchRotatingKVCache": (8192, [0]),
+        "QuantizedKVCache": (),
+        "RingSlidingKVCache": (2048,),
+        "MiniMaxM3KVCache": (),
+    }
+    CACHE_IMPORTS = {
+        "KVCache": "mlx_vlm.models.cache",
+        "RotatingKVCache": "mlx_vlm.models.cache",
+        "ArraysCache": "mlx_vlm.models.cache",
+        "ChunkedKVCache": "mlx_vlm.models.cache",
+        "PoolingCache": "mlx_vlm.models.cache",
+        "SimpleKVCache": "mlx_vlm.models.cache",
+        "StaticPrefixKVCache": "mlx_vlm.models.cache",
+        "BatchKVCache": "mlx_vlm.models.cache",
+        "BatchRotatingKVCache": "mlx_vlm.models.cache",
+        "QuantizedKVCache": "mlx_vlm.models.cache",
+        "RingSlidingKVCache": "mlx_vlm.models.unlimited_ocr.language",
+        "MiniMaxM3KVCache": "mlx_vlm.models.minimax_m3_vl.language",
+    }
+
+    @staticmethod
+    def _cache_tokens_from_models():
+        import ast
+        import os
+        import re
+
+        from mlx_vlm import models as models_pkg
+
+        root = models_pkg.__path__[0]
+        tokens = set()
+        for name in sorted(os.listdir(root)):
+            d = os.path.join(root, name)
+            if not os.path.isdir(d) or name == "__pycache__":
+                continue
+            for fname in (name + ".py", "language.py"):
+                path = os.path.join(d, fname)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    tree = ast.parse(open(path).read())
+                except (SyntaxError, UnicodeDecodeError):
+                    continue
+                for node in ast.walk(tree):
+                    if (
+                        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and node.name == "make_cache"
+                    ):
+                        seg = ast.get_source_segment(open(path).read(), node) or ""
+                        tokens.update(re.findall(r"\b([A-Z_][A-Za-z0-9]*Cache)\b", seg))
+        return tokens
+
+    def test_every_model_cache_class_is_apc_eligible(self):
+        import importlib
+
+        from mlx_vlm.apc_adapters import apc_mode
+
+        unknown = []
+        not_eligible = []
+        for token in sorted(self._cache_tokens_from_models()):
+            mod_name = self.CACHE_IMPORTS.get(token)
+            if mod_name is None:
+                unknown.append(token)
+                continue
+            cls = getattr(importlib.import_module(mod_name), token)
+            obj = cls(*self.CACHE_ARGS.get(token, ()))
+            if apc_mode([obj]) is None:
+                not_eligible.append(token)
+        assert not unknown, f"cache classes missing APC classification: {unknown}"
+        assert not not_eligible, f"cache classes not APC-eligible: {not_eligible}"
+
+    def test_florence2_tuple_cache_is_exact_and_snapshots(self):
+        from mlx_vlm.apc import snapshot_prompt_cache_row
+        from mlx_vlm.apc_adapters import apc_mode
+        from mlx_vlm.models.cache import SimpleKVCache
+
+        cache = [(SimpleKVCache(), SimpleKVCache()) for _ in range(6)]
+        assert apc_mode(cache) == "exact"
+
+        for layer in cache:
+            for c in layer:
+                c.keys = mx.zeros((1, 2, 8, 16))
+                c.values = mx.ones((1, 2, 8, 16))
+                c.cache_length = 8
+        restored = snapshot_prompt_cache_row(cache, 0)
+        assert restored is not None
+        assert len(restored) == len(cache)
+        first = restored[0][0]
+        assert first.cache_length == 8

@@ -2471,6 +2471,42 @@ class SimpleKVCache:
         self.values = None
         self.cache_length = 0
 
+    @property
+    def state(self):
+        return [self.keys, self.values, self.cache_length]
+
+    @state.setter
+    def state(self, value):
+        self.keys, self.values, self.cache_length = value
+
+    @property
+    def meta_state(self):
+        return ""
+
+    @meta_state.setter
+    def meta_state(self, value):
+        pass
+
+    @classmethod
+    def from_state(cls, state, meta_state):
+        out = cls()
+        out.keys, out.values, out.cache_length = state
+        return out
+
+    def size(self):
+        return self.cache_length
+
+    @property
+    def nbytes(self):
+        total = 0
+        for tensor in (self.keys, self.values):
+            if tensor is not None:
+                total += tensor.nbytes
+        return total
+
+    def empty(self):
+        return self.cache_length == 0
+
     def update_and_fetch(self, keys, values):
         """Update cache with new key/value tensors and return full cache.
 
