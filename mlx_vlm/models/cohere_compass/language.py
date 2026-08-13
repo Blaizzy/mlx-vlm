@@ -430,8 +430,13 @@ class TextModel(nn.Module):
         indices = mx.array(np.where(flat_mask)[0], dtype=mx.uint32)
         if not indices.shape[0]:
             return hidden_states
+        if visual_pos_masks.dtype == mx.bool_:
+            selected_visual_embeds = visual_embeds[: indices.shape[0]]
+        else:
+            visual_indices = flat_mask[indices].astype(mx.uint32) - 1
+            selected_visual_embeds = visual_embeds[visual_indices]
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
-        flat_hidden = flat_hidden.at[indices].add(visual_embeds[: indices.shape[0]])
+        flat_hidden = flat_hidden.at[indices].add(selected_visual_embeds)
         return flat_hidden.reshape(hidden_states.shape)
 
 
@@ -488,7 +493,10 @@ class LanguageModel(nn.Module):
                 positions = mx.where(
                     attention_mask == 0, mx.ones_like(positions), positions
                 )
-                deltas = positions.max(axis=-1, keepdims=True) + 1 - input_ids.shape[1]
+                valid_lengths = attention_mask.astype(input_ids.dtype).sum(
+                    axis=-1, keepdims=True
+                )
+                deltas = positions.max(axis=-1, keepdims=True) + 1 - valid_lengths
             return positions, deltas
 
         if attention_mask is None:
@@ -558,7 +566,7 @@ class LanguageModel(nn.Module):
                         compact[axis, compact_index].item()
                     )
             position_rows.append(mx.array(padded, dtype=mx.int32))
-            deltas.append(int(compact.max().item()) + 1 - input_ids.shape[1])
+            deltas.append(int(compact.max().item()) + 1 - len(tokens))
 
         return (
             mx.stack(position_rows, axis=1),
@@ -613,12 +621,13 @@ class LanguageModel(nn.Module):
                         prepare(left_padding=left_padding)
 
         cache_offset = 0
+        position_offset = 0
         if cache and cache[0] is not None:
             first_cache = cache[0]
-            # Batched caches advance every row through a shared physical
-            # timeline.  Use that timeline for RoPE so filtering out the
-            # longest row does not shift the positions of surviving padded
-            # rows.  ``offset`` remains the right source for regular caches.
+            # Keep the shared physical timeline for slicing full-prompt
+            # metadata, but use each row's logical token count for RoPE.
+            # Dynamic batching may extend a cache with shorter rows, whose
+            # added left padding must not advance their positions.
             cache_offset = getattr(first_cache, "_offset", None)
             if cache_offset is None and hasattr(first_cache, "left_padding"):
                 cache_offset = getattr(first_cache, "_idx", None)
@@ -628,6 +637,11 @@ class LanguageModel(nn.Module):
                 cache_offset = int(cache_offset.max().item())
             else:
                 cache_offset = int(cache_offset)
+            position_offset = getattr(first_cache, "offset", cache_offset)
+            if isinstance(position_offset, mx.array):
+                position_offset = position_offset.reshape(-1, 1)
+            else:
+                position_offset = int(position_offset)
 
         if (
             visual_pos_masks is not None
@@ -640,7 +654,12 @@ class LanguageModel(nn.Module):
             stop = start + inputs.shape[1]
             full_visual_pos_masks = visual_pos_masks
             visual_pos_masks = full_visual_pos_masks[:, start:stop]
-            if deepstack_visual_embeds is not None:
+            if (
+                deepstack_visual_embeds is not None
+                and full_visual_pos_masks.dtype == mx.bool_
+            ):
+                # Legacy boolean masks carry no visual-row indices, so their
+                # packed embeddings still need to be windowed explicitly.
                 embed_windows = [[] for _ in deepstack_visual_embeds]
                 row_offset = 0
                 for row, row_mask in enumerate(full_visual_pos_masks):
@@ -673,7 +692,7 @@ class LanguageModel(nn.Module):
                 )
                 self._position_ids = position_ids
             else:
-                delta = cache_offset + self._rope_deltas
+                delta = position_offset + self._rope_deltas
                 position_ids = mx.arange(inputs.shape[1], dtype=mx.int32)[None, :]
                 position_ids = mx.broadcast_to(position_ids, inputs.shape) + delta
                 if self.model.rotary_emb.position_selector is not None:

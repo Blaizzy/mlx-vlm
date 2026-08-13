@@ -12640,6 +12640,93 @@ class TestCohereCompass(unittest.TestCase):
             recorder.deepstack_visual_embeds[0].tolist(), expected.tolist()
         )
 
+    def test_chunk_local_indexed_mask_selects_deepstack_visual_rows(self):
+        model = self._tiny_model()
+        hidden = mx.zeros((2, 3, 32))
+        visual_mask = mx.array(
+            [
+                [3, 4, 0],
+                [8, 0, 0],
+            ],
+            dtype=mx.int32,
+        )
+        visual_embeds = mx.concatenate(
+            [mx.full((1, 32), float(index)) for index in range(1, 9)], axis=0
+        )
+
+        output = model.language_model.model._deepstack_process(
+            hidden, visual_mask, visual_embeds
+        )
+
+        self.assertEqual(output[0, 0, 0].item(), 3)
+        self.assertEqual(output[0, 1, 0].item(), 4)
+        self.assertEqual(output[1, 0, 0].item(), 8)
+
+    def test_visual_mask_tracks_packed_deepstack_rows(self):
+        model = self._tiny_model()
+        input_ids = mx.array(
+            [
+                [1, 62, 63, 63, 63, 63, 61, 2],
+                [3, 62, 63, 63, 63, 63, 61, 4],
+            ]
+        )
+        pixel_values = mx.random.normal((32, 24))
+        features = model.get_input_embeddings(
+            input_ids,
+            pixel_values,
+            image_grid_thw=mx.array([[1, 4, 4], [1, 4, 4]]),
+        )
+
+        self.assertEqual(
+            features.visual_pos_masks.tolist(),
+            [
+                [0, 0, 1, 2, 3, 4, 0, 0],
+                [0, 0, 5, 6, 7, 8, 0, 0],
+            ],
+        )
+
+    def test_decode_rope_uses_logical_batch_offsets(self):
+        from types import SimpleNamespace
+
+        model = self._tiny_model()
+        language_model = model.language_model
+
+        class Recorder(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.position_ids = None
+                self.rotary_emb = SimpleNamespace(
+                    position_selector=mx.array([0, 1, 2], dtype=mx.int32)
+                )
+                self.embed_tokens = SimpleNamespace(
+                    as_linear=lambda hidden: mx.zeros(
+                        (*hidden.shape[:-1], 64), dtype=hidden.dtype
+                    )
+                )
+
+            def __call__(self, inputs, *, position_ids=None, **kwargs):
+                self.position_ids = position_ids
+                return mx.zeros((inputs.shape[0], inputs.shape[1], 32))
+
+        recorder = Recorder()
+        language_model.model = recorder
+        cache = SimpleNamespace(
+            _idx=10,
+            offset=mx.array([10, 8], dtype=mx.int32),
+            left_padding=mx.array([0, 2], dtype=mx.int32),
+        )
+
+        language_model(
+            mx.zeros((2, 1), dtype=mx.int32),
+            cache=[cache],
+            rope_deltas=mx.zeros((2, 1), dtype=mx.int32),
+        )
+
+        self.assertEqual(
+            recorder.position_ids.tolist(),
+            [[[10], [8]], [[10], [8]], [[10], [8]]],
+        )
+
     def test_visual_deepstack_allows_chunked_prefill(self):
         model = self._tiny_model()
         self.assertTrue(model.chunked_prefill_policy(prefill_kwargs={}))
