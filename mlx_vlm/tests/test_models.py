@@ -247,6 +247,86 @@ class TestAFM7Model(unittest.TestCase):
         self.assertEqual(model_type, "afm7")
 
 
+class TestJambaModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_and_expert_sanitize(self):
+        from mlx_vlm.models import jamba
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = jamba.ModelConfig(
+            model_type="jamba",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attn_layer_offset=1,
+            attn_layer_period=2,
+            expert_layer_offset=0,
+            expert_layer_period=2,
+            mamba_d_conv=4,
+            mamba_d_state=8,
+            mamba_expand=2,
+            num_experts=2,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-5,
+            max_position_embeddings=128,
+            vocab_size=64,
+        )
+        mx.random.seed(0)
+        model = jamba.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mamba.conv1d.weight": mx.zeros((64, 1, 4)),
+                "model.layers.0.feed_forward.experts.0.gate_proj.weight": mx.zeros(
+                    (64, 32)
+                ),
+                "model.layers.0.feed_forward.experts.1.gate_proj.weight": mx.ones(
+                    (64, 32)
+                ),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertEqual(config.mamba_dt_rank, 2)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.feed_forward.switch_mlp.gate_proj.weight"
+            ].shape,
+            (2, 64, 32),
+        )
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.router", None),
+            {
+                "group_size": 64,
+                "bits": 8,
+            },
+        )
+        self.assertIs(model_module, jamba)
+        self.assertEqual(model_type, "jamba")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
