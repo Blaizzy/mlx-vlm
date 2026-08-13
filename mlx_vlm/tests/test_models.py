@@ -64,6 +64,80 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestKlearModel(unittest.TestCase):
+    def _config(self):
+        from mlx_vlm.models import klear
+
+        return klear.ModelConfig(
+            model_type="Klear",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            attention_bias=False,
+            mlp_only_layers=[],
+            num_experts=2,
+            num_experts_per_tok=1,
+            decoder_sparse_step=1,
+            n_shared_experts=1,
+            moe_intermediate_size=48,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            num_key_value_heads=2,
+            rope_theta=10000.0,
+            max_position_embeddings=128,
+            norm_topk_prob=True,
+        )
+
+    def test_native_loader_cached_forward_and_predicates(self):
+        from mlx_vlm.models import klear
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = klear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIs(model_module, klear)
+        self.assertEqual(model_type, "klear")
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertFalse(model.cast_predicate("model.layers.0.mlp.expert_bias"))
+
+    def test_sanitize_stacks_experts(self):
+        from mlx_vlm.models import klear
+
+        config = self._config()
+        model = klear.Model(config)
+        weights = {}
+        for layer_idx in range(config.num_hidden_layers):
+            prefix = f"model.layers.{layer_idx}.mlp.experts"
+            for expert_idx in range(config.num_experts):
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    weights[f"{prefix}.{expert_idx}.{name}.weight"] = mx.full(
+                        (2, 2), expert_idx
+                    )
+
+        sanitized = model.sanitize(weights)
+        key = "language_model.model.layers.0.mlp.experts.gate_proj.weight"
+        self.assertIn(key, sanitized)
+        self.assertEqual(sanitized[key].shape, (config.num_experts, 2, 2))
+
+
 class TestPlamoModel(unittest.TestCase):
     def test_native_loader_cached_forward_and_checkpoint_prefix(self):
         from mlx_vlm.models import plamo
