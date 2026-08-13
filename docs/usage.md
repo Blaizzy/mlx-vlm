@@ -209,6 +209,33 @@ python -m mlx_vlm.server
 
 See `README.md` for a complete `curl` example.
 
+### Live settings (`/v1/settings`)
+
+Reloadable server settings can be read and changed at runtime without a
+restart. The server owns the schema (which knobs are live and which model
+kinds each one reloads); clients own the values.
+
+```bash
+# read schema + current values + fingerprint
+curl http://127.0.0.1:8080/v1/settings
+
+# merge a change (only listed knobs are touched)
+curl -X PATCH http://127.0.0.1:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"kv_quant_scheme": "group"}'
+
+# replace: reset all knobs to their boot-time defaults, then apply these
+curl -X PATCH http://127.0.0.1:8080/v1/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"op": "replace", "values": {"apc_enabled": true}}'
+```
+
+Applying a change bumps the config fingerprint in the model cache key, so
+the next request to an affected model kind reloads it with the new settings
+(scoped per kind: KV/APC/spec knobs reload `text_generation`;
+`vision_cache_size` reloads image kinds). Unknown or invalid knobs are
+rejected and never applied.
+
 ## Distributed Inference
 
 mlx-vlm supports distributed inference across multiple computers. It works by sharding the language model (not the vision tower), because the LLM is much larger and vision embeddings only need to be computed once.
