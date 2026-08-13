@@ -4435,23 +4435,43 @@ def self_check_model_apc(
     return result
 
 
-def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
-    """Build an APCManager from env vars when ``APC_ENABLED=1``, else None.
-
-    When ``APC_DISK_PATH`` is set, also wires up the shard-based SSD tier.
-    The disk read path defaults to direct file reads so restored K/V tensors
-    are MLX-owned buffers rather than mmap-backed safetensors views.
-    """
-    if os.environ.get("APC_ENABLED", "0") not in ("1", "true", "True", "yes"):
+def from_env(
+    model_namespace: Optional[str] = None,
+    overrides: Optional[dict] = None,
+) -> Optional[APCManager]:
+    """Build an APCManager when enabled; read knobs from env (default) or
+    ``overrides`` (keys: enabled, disk_path, block_size, num_blocks,
+    disk_max_gb) so live settings can drive APC without env mutation."""
+    if overrides is not None and "enabled" in overrides:
+        enabled = bool(overrides["enabled"])
+    else:
+        enabled = os.environ.get("APC_ENABLED", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+    if not enabled:
         return None
-    block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
-    num_blocks = int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+
+    def _ov_int(key: str, default: int) -> int:
+        if overrides is not None and key in overrides and overrides[key] is not None:
+            return int(overrides[key])
+        return int(os.environ.get(key, default))
+
+    block_size = _ov_int("block_size", DEFAULT_BLOCK_SIZE)
+    num_blocks = _ov_int("num_blocks", DEFAULT_NUM_BLOCKS)
 
     disk: Optional[DiskBlockStore] = None
-    disk_path = os.environ.get("APC_DISK_PATH")
+    if overrides is not None and overrides.get("disk_path") is not None:
+        disk_path = overrides["disk_path"]
+    else:
+        disk_path = os.environ.get("APC_DISK_PATH")
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
-        max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
+        if overrides is not None and overrides.get("disk_max_gb") is not None:
+            max_gb = float(overrides["disk_max_gb"])
+        else:
+            max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
         max_bytes = int(max_gb * (1 << 30)) if max_gb > 0 else None
         workers = int(os.environ.get("APC_DISK_WORKERS", "1"))
         try:

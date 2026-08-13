@@ -29,6 +29,7 @@ from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
 
 _MUSE_RESPONSE_TEMPLATE = {
@@ -673,11 +674,9 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     server.get_cached_model("demo-model", "adapter-a")
     server.get_cached_model("demo-model")
 
-    assert server.runtime.model_cache["cache_key"] == (
-        "demo-model",
-        "adapter-a",
-        "text_generation",
-    )
+    cache_key = server.runtime.model_cache["cache_key"]
+    assert cache_key[:3] == ("demo-model", "adapter-a", "text_generation")
+    assert cache_key[3] == server.runtime.config.fingerprint()
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
@@ -7155,3 +7154,103 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+class TestRuntimeConfig:
+    def test_from_env_seeds_defaults(self, monkeypatch):
+        monkeypatch.setenv("KV_QUANT_SCHEME", "group")
+        monkeypatch.setenv("KV_BITS", "6")
+        monkeypatch.setenv("APC_ENABLED", "1")
+        monkeypatch.setenv("MLX_VLM_VISION_CACHE_SIZE", "33")
+        cfg = RuntimeConfig.from_env()
+        assert cfg.kv_quant_scheme == "group"
+        assert cfg.kv_bits == 6.0
+        assert cfg.apc_enabled is True
+        assert cfg.vision_cache_size == 33
+
+    def test_fingerprint_stable_and_scoped(self):
+        cfg = RuntimeConfig.from_env()
+        fp = cfg.fingerprint()
+        assert fp == cfg.fingerprint()  # stable across calls
+
+        cfg2 = RuntimeConfig.from_env()
+        assert cfg2.fingerprint() == fp
+
+        # toggling a dead APC knob while APC is off must not invalidate
+        cfg2.apc_block_size = 64
+        assert cfg2.fingerprint() == fp
+
+        # toggling an effective knob must invalidate
+        cfg2.vision_cache_size = 40
+        assert cfg2.fingerprint() != fp
+
+    def test_apply_changes_validates_and_coerces(self):
+        cfg = RuntimeConfig.from_env()
+        applied, rejected = cfg.apply_changes(
+            {
+                "kv_bits": "8",  # str -> float coercion
+                "apc_enabled": "true",
+                "vision_cache_size": "50",
+                "not_a_knob": 1,
+            }
+        )
+        assert applied == {
+            "kv_bits": 8.0,
+            "apc_enabled": True,
+            "vision_cache_size": 50,
+        }
+        assert rejected == [{"name": "not_a_knob", "reason": "unknown knob"}]
+        assert cfg.kv_bits == 8.0
+        assert cfg.apc_enabled is True
+        assert cfg.vision_cache_size == 50
+
+    def test_apply_changes_rejects_bad_values(self):
+        cfg = RuntimeConfig.from_env()
+        applied, rejected = cfg.apply_changes({"kv_bits": "not-a-number"})
+        assert applied == {}
+        assert len(rejected) == 1
+        assert rejected[0]["name"] == "kv_bits"
+        assert cfg.kv_bits is None  # unchanged
+
+    def test_reload_kinds_scoped(self):
+        cfg = RuntimeConfig.from_env()
+        applied, _ = cfg.apply_changes({"kv_quant_scheme": "group"})
+        assert cfg.reload_kinds(applied) == {"text_generation"}
+        applied, _ = cfg.apply_changes({"vision_cache_size": 10})
+        assert cfg.reload_kinds(applied) == {"image_generation", "image_edit"}
+
+    def test_settings_endpoints_get_and_patch(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+
+        r = client.get("/v1/settings")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body) == {"schema", "current", "fingerprint"}
+        names = {k["name"] for k in body["schema"]}
+        assert "kv_bits" in names and "apc_enabled" in names
+        assert body["current"]["kv_quant_scheme"] == cfg.kv_quant_scheme
+
+        before = cfg.fingerprint()
+        r = client.patch("/v1/settings", json={"kv_quant_scheme": "group"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["applied"] == {"kv_quant_scheme": "group"}
+        assert body["rejected"] == []
+        assert body["reload_kinds"] == ["text_generation"]
+        assert body["current"]["kv_quant_scheme"] == "group"
+        assert body["fingerprint"] != before
+
+        r = client.get("/v1/settings")
+        assert r.json()["current"]["kv_quant_scheme"] == "group"
+
+        # unknown knobs are never applied
+        r = client.patch("/v1/settings", json={"bogus": 1})
+        assert r.status_code == 200
+        assert r.json()["applied"] == {}
+        assert r.json()["rejected"] == [{"name": "bogus", "reason": "unknown knob"}]
+
+    def test_settings_patch_requires_json_object(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        r = client.patch("/v1/settings", json=[1, 2, 3])
+        assert r.status_code == 400
