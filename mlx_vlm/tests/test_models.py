@@ -668,6 +668,71 @@ class TestRWKV7Model(unittest.TestCase):
         self.assertEqual(model_type, "rwkv7")
 
 
+class TestFalconH1Model(unittest.TestCase):
+    def test_native_loader_hybrid_cache_and_multiplier_sanitize(self):
+        from mlx_vlm.models import falcon_h1
+        from mlx_vlm.models.cache import ArraysCache, CacheList, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = falcon_h1.ModelConfig(
+            hidden_size=32,
+            head_dim=8,
+            intermediate_size=64,
+            mamba_d_ssm=32,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_d_head=8,
+            mamba_n_groups=2,
+            mamba_n_heads=4,
+            mamba_chunk_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            vocab_size=64,
+            tie_word_embeddings=False,
+        )
+        mx.random.seed(0)
+        model = falcon_h1.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.layers.0.mamba.conv1d.weight": mx.ones((64, 1, 4)),
+                "model.layers.0.mamba.in_proj.weight": mx.ones((100, 32)),
+                "model.embed_tokens.weight": mx.ones((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+        self.assertTrue(all(isinstance(item, CacheList) for item in cache))
+        self.assertIsInstance(cache[0][0], ArraysCache)
+        self.assertIsInstance(cache[0][1], KVCache)
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.mamba.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertTrue(
+            mx.allclose(
+                sanitized["language_model.model.embed_tokens.weight"],
+                mx.full((64, 32), config.embedding_multiplier),
+            ).item()
+        )
+        self.assertIs(model_module, falcon_h1)
+        self.assertEqual(model_type, "falcon_h1")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
