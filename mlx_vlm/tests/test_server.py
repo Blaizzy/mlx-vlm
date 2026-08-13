@@ -1757,6 +1757,8 @@ def _run_speculative_prefill_once(
     gen.stop_tokens = {99}
     gen.requests = Queue()
     gen._stop = False
+    gen._cancel_lock = Lock()
+    gen._cancelled = set()
     gen.prefill_step_size = prefill_step_size
     gen.apc_manager = apc_manager
     gen.apc_mode = apc_mode
