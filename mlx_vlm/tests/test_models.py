@@ -172,6 +172,81 @@ class TestPlamo2Model(unittest.TestCase):
         self.assertEqual(model_type, "plamo2")
 
 
+class TestAFM7Model(unittest.TestCase):
+    def test_concatenate_kv_cache(self):
+        from mlx_vlm.models.cache import ConcatenateKVCache
+
+        cache = ConcatenateKVCache()
+        keys = mx.arange(16).reshape(1, 2, 2, 4)
+        values = keys + 16
+        cache.update_and_fetch(keys[:, :, :1], values[:, :, :1])
+        cached_keys, cached_values = cache.update_and_fetch(
+            keys[:, :, 1:], values[:, :, 1:]
+        )
+        mx.eval(cached_keys, cached_values)
+
+        self.assertEqual(cache.offset, 2)
+        self.assertEqual(cached_keys.tolist(), keys.tolist())
+        self.assertEqual(cached_values.tolist(), values.tolist())
+        self.assertEqual(cache.trim(1), 1)
+        self.assertEqual(cache.state[0].shape[-2], 1)
+
+        restored = ConcatenateKVCache()
+        restored.prefix_cache_restore(cache.prefix_cache_snapshot())
+        self.assertEqual(restored.offset, 1)
+        self.assertEqual(restored.state[0].tolist(), cache.state[0].tolist())
+
+    def test_native_loader_cached_forward_and_kv_reuse(self):
+        from mlx_vlm.models import afm7
+        from mlx_vlm.models.afm7.language import FusedLinear
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = afm7.ModelConfig(
+            model_type="afm7",
+            vocab_size=64,
+            hidden_dim=32,
+            num_layers=4,
+            num_kv_reuse_layers=2,
+            num_heads=4,
+            num_kv_heads=2,
+            hidden_dim_scale_factor=2.0,
+        )
+        mx.random.seed(0)
+        model = afm7.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embedding.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(model.language_model.model.layers), 2)
+        self.assertEqual(len(model.language_model.model.kv_reuse_layers), 2)
+        self.assertEqual(len(model.layers), config.num_layers)
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(cache[-1].offset, inputs.shape[1])
+        self.assertIsInstance(
+            model.language_model.model.layers[0].self_attn.qkv_proj, FusedLinear
+        )
+        self.assertEqual(
+            model.language_model.model.layers[0].self_attn.qkv_proj.output_dims,
+            [32, 16, 16],
+        )
+        self.assertEqual(set(sanitized), {"language_model.model.embedding.weight"})
+        self.assertIs(model_module, afm7)
+        self.assertEqual(model_type, "afm7")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
