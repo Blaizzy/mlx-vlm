@@ -541,6 +541,80 @@ class TestLongcatFlashNgramModel(unittest.TestCase):
         self.assertEqual(model_type, "longcat_flash_ngram")
 
 
+class TestGlm4MoeLiteModel(unittest.TestCase):
+    def test_native_loader_mla_cache_and_checkpoint_sanitize(self):
+        from mlx_vlm.models import glm4_moe_lite
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = glm4_moe_lite.ModelConfig(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=48,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=1.25,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            first_k_dense_replace=1,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+        )
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        weights = {
+            f"model.layers.1.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                (48, 32), expert
+            )
+            for expert in range(config.n_routed_experts)
+        }
+        weights["model.layers.0.self_attn.kv_b_proj.weight"] = mx.zeros((32, 8))
+        weights["model.layers.3.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertNotIn("language_model.model.layers.3.weight", sanitized)
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertIs(model_module, glm4_moe_lite)
+        self.assertEqual(model_type, "glm4_moe_lite")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
