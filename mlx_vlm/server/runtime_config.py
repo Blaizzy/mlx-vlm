@@ -7,36 +7,92 @@ import json
 import os
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 TEXT_KINDS: Tuple[str, ...] = ("text_generation",)
 VISION_KINDS: Tuple[str, ...] = ("image_generation", "image_edit")
 
-KNOBS: Tuple[Tuple[str, str, Any, Tuple[str, ...], str], ...] = (
-    ("kv_bits", "float_or_none", None, TEXT_KINDS, "KV bits; null = model default."),
-    ("kv_quant_scheme", "str", "uniform", TEXT_KINDS, "KV quantization scheme."),
-    ("kv_group_size", "int_or_none", None, TEXT_KINDS, "KV quantization group size."),
-    ("kv_key_bits", "float_or_none", None, TEXT_KINDS, "Split KV key bits."),
-    ("kv_value_bits", "float_or_none", None, TEXT_KINDS, "Split KV value bits."),
-    ("kv_key_scheme", "str_or_none", None, TEXT_KINDS, "Split KV key scheme."),
-    ("kv_value_scheme", "str_or_none", None, TEXT_KINDS, "Split KV value scheme."),
+KV_SCHEMES: Tuple[str, ...] = ("uniform", "turboquant")
+
+# name, type, default, reload kinds, allowed (None = free), help
+KNOBS: Tuple[
+    Tuple[str, str, Any, Tuple[str, ...], Optional[Tuple[str, ...]], str], ...
+] = (
+    (
+        "kv_bits",
+        "float_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "KV bits; null = model default.",
+    ),
+    (
+        "kv_quant_scheme",
+        "str",
+        "uniform",
+        TEXT_KINDS,
+        KV_SCHEMES,
+        "KV quantization scheme.",
+    ),
+    (
+        "kv_group_size",
+        "int_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "KV quantization group size.",
+    ),
+    ("kv_key_bits", "float_or_none", None, TEXT_KINDS, None, "Split KV key bits."),
+    ("kv_value_bits", "float_or_none", None, TEXT_KINDS, None, "Split KV value bits."),
+    (
+        "kv_key_scheme",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        KV_SCHEMES,
+        "Split KV key scheme.",
+    ),
+    (
+        "kv_value_scheme",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        KV_SCHEMES,
+        "Split KV value scheme.",
+    ),
     (
         "quantized_kv_start",
         "int_or_none",
         None,
         TEXT_KINDS,
+        None,
         "Quantized KV start layer.",
     ),
-    ("apc_enabled", "bool", False, TEXT_KINDS, "Prefix caching on/off."),
-    ("apc_disk_path", "str_or_none", None, TEXT_KINDS, "APC disk tier directory."),
-    ("apc_block_size", "int", 16, TEXT_KINDS, "APC block size (tokens)."),
-    ("apc_num_blocks", "int", 2048, TEXT_KINDS, "APC block pool capacity."),
-    ("apc_disk_max_gb", "float_or_none", None, TEXT_KINDS, "APC disk tier cap (GB)."),
+    ("apc_enabled", "bool", False, TEXT_KINDS, None, "Prefix caching on/off."),
+    (
+        "apc_disk_path",
+        "str_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "APC disk tier directory.",
+    ),
+    ("apc_block_size", "int", 16, TEXT_KINDS, None, "APC block size (tokens)."),
+    ("apc_num_blocks", "int", 2048, TEXT_KINDS, None, "APC block pool capacity."),
+    (
+        "apc_disk_max_gb",
+        "float_or_none",
+        None,
+        TEXT_KINDS,
+        None,
+        "APC disk tier cap (GB).",
+    ),
     (
         "max_kv_size",
         "int_or_none",
         None,
         TEXT_KINDS,
+        None,
         "Requested context budget (tokens).",
     ),
     (
@@ -44,6 +100,7 @@ KNOBS: Tuple[Tuple[str, str, Any, Tuple[str, ...], str], ...] = (
         "str_or_none",
         None,
         TEXT_KINDS,
+        None,
         "Speculative drafting model path.",
     ),
     (
@@ -51,9 +108,17 @@ KNOBS: Tuple[Tuple[str, str, Any, Tuple[str, ...], str], ...] = (
         "str_or_none",
         None,
         TEXT_KINDS,
+        None,
         "Speculative draft kind (auto if unset).",
     ),
-    ("vision_cache_size", "int", 20, VISION_KINDS, "Vision feature cache capacity."),
+    (
+        "vision_cache_size",
+        "int",
+        20,
+        VISION_KINDS,
+        None,
+        "Vision feature cache capacity.",
+    ),
 )
 
 _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
@@ -61,10 +126,15 @@ _KNOB_SPEC: Dict[str, Dict[str, Any]] = {
         "type": kind,
         "default": default,
         "reload_kinds": kinds,
+        "allowed": list(allowed) if allowed is not None else None,
         "help": help_text,
     }
-    for (name, kind, default, kinds, help_text) in KNOBS
+    for (name, kind, default, kinds, allowed, help_text) in KNOBS
 }
+
+# Knobs that are naturally live (applied per request) and must never trigger a
+# model reload, so they are excluded from the cache-key fingerprint.
+_LIVE_KNOBS: Tuple[str, ...] = ("max_kv_size",)
 
 
 def _env_float(name: str, default: Optional[float]) -> Optional[float]:
@@ -139,6 +209,7 @@ class RuntimeConfig:
                 "type": spec["type"],
                 "default": spec["default"],
                 "reload_kinds": list(spec["reload_kinds"]),
+                "allowed": spec["allowed"],
                 "help": spec["help"],
             }
             for name, spec in _KNOB_SPEC.items()
@@ -170,8 +241,9 @@ class RuntimeConfig:
                 if name not in _KNOB_SPEC:
                     rejected.append({"name": name, "reason": "unknown knob"})
                     continue
+                spec = _KNOB_SPEC[name]
                 try:
-                    value = _coerce(_KNOB_SPEC[name]["type"], raw)
+                    value = _coerce(spec["type"], raw, spec.get("allowed"))
                 except (TypeError, ValueError) as exc:
                     rejected.append({"name": name, "reason": str(exc)})
                     continue
@@ -185,10 +257,16 @@ class RuntimeConfig:
             kinds.update(_KNOB_SPEC[name]["reload_kinds"])
         return kinds
 
-    def fingerprint(self) -> str:
+    def fingerprint(self, kinds: Optional[Iterable[str]] = None) -> str:
+        kind_set = set(kinds) if kinds is not None else None
         items: List[Tuple[str, str]] = []
         with self._lock:
             for name in _KNOB_SPEC:
+                if name in _LIVE_KNOBS:
+                    continue
+                spec = _KNOB_SPEC[name]
+                if kind_set is not None and not (set(spec["reload_kinds"]) & kind_set):
+                    continue
                 if (
                     name.startswith("apc_")
                     and name != "apc_enabled"
@@ -201,7 +279,7 @@ class RuntimeConfig:
         return hashlib.sha256(blob).hexdigest()
 
 
-def _coerce(kind: str, raw: Any) -> Any:
+def _coerce(kind: str, raw: Any, allowed: Optional[List[str]] = None) -> Any:
     if kind == "bool":
         if isinstance(raw, bool):
             return raw
@@ -228,12 +306,16 @@ def _coerce(kind: str, raw: Any) -> Any:
     if kind == "str":
         if raw is None:
             raise ValueError("expected a string, got null")
-        return str(raw)
-    if kind == "str_or_none":
+        value = str(raw)
+    elif kind == "str_or_none":
         if raw is None or raw == "":
             return None
-        return str(raw)
-    raise ValueError(f"unsupported knob type {kind!r}")
+        value = str(raw)
+    else:
+        raise ValueError(f"unsupported knob type {kind!r}")
+    if allowed is not None and value not in allowed:
+        raise ValueError(f"expected one of {allowed}, got {value!r}")
+    return value
 
 
 def knob_specs() -> Iterator[Tuple[str, Dict[str, Any]]]:

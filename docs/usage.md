@@ -222,7 +222,7 @@ curl http://127.0.0.1:8080/v1/settings
 # merge a change (only listed knobs are touched)
 curl -X PATCH http://127.0.0.1:8080/v1/settings \
   -H 'Content-Type: application/json' \
-  -d '{"kv_quant_scheme": "group"}'
+  -d '{"kv_quant_scheme": "turboquant"}'
 
 # replace: reset all knobs to their boot-time defaults, then apply these
 curl -X PATCH http://127.0.0.1:8080/v1/settings \

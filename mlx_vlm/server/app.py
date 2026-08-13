@@ -526,7 +526,7 @@ def get_cached_model(
         model_path,
         adapter_path,
         effective_model_kind,
-        runtime.config.fingerprint(),
+        runtime.config.fingerprint(kinds={effective_model_kind}),
     )
     cached_cache = registry.for_kind(cache_group)
 

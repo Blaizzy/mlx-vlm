@@ -4453,13 +4453,17 @@ def from_env(
     if not enabled:
         return None
 
-    def _ov_int(key: str, default: int) -> int:
-        if overrides is not None and key in overrides and overrides[key] is not None:
-            return int(overrides[key])
-        return int(os.environ.get(key, default))
+    def _ov_int(override_key: str, env_name: str, default: int) -> int:
+        if (
+            overrides is not None
+            and override_key in overrides
+            and overrides[override_key] is not None
+        ):
+            return int(overrides[override_key])
+        return int(os.environ.get(env_name, default))
 
-    block_size = _ov_int("block_size", DEFAULT_BLOCK_SIZE)
-    num_blocks = _ov_int("num_blocks", DEFAULT_NUM_BLOCKS)
+    block_size = _ov_int("block_size", "APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE)
+    num_blocks = _ov_int("num_blocks", "APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS)
 
     disk: Optional[DiskBlockStore] = None
     if overrides is not None and overrides.get("disk_path") is not None:

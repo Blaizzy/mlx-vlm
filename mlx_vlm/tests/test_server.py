@@ -676,7 +676,7 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
 
     cache_key = server.runtime.model_cache["cache_key"]
     assert cache_key[:3] == ("demo-model", "adapter-a", "text_generation")
-    assert cache_key[3] == server.runtime.config.fingerprint()
+    assert cache_key[3] == server.runtime.config.fingerprint(kinds={"text_generation"})
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
@@ -7216,7 +7216,7 @@ class TestRuntimeConfig:
 
     def test_reload_kinds_scoped(self):
         cfg = RuntimeConfig.from_env()
-        applied, _ = cfg.apply_changes({"kv_quant_scheme": "group"})
+        applied, _ = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
         assert cfg.reload_kinds(applied) == {"text_generation"}
         applied, _ = cfg.apply_changes({"vision_cache_size": 10})
         assert cfg.reload_kinds(applied) == {"image_generation", "image_edit"}
@@ -7234,17 +7234,17 @@ class TestRuntimeConfig:
         assert body["current"]["kv_quant_scheme"] == cfg.kv_quant_scheme
 
         before = cfg.fingerprint()
-        r = client.patch("/v1/settings", json={"kv_quant_scheme": "group"})
+        r = client.patch("/v1/settings", json={"kv_quant_scheme": "turboquant"})
         assert r.status_code == 200
         body = r.json()
-        assert body["applied"] == {"kv_quant_scheme": "group"}
+        assert body["applied"] == {"kv_quant_scheme": "turboquant"}
         assert body["rejected"] == []
         assert body["reload_kinds"] == ["text_generation"]
-        assert body["current"]["kv_quant_scheme"] == "group"
+        assert body["current"]["kv_quant_scheme"] == "turboquant"
         assert body["fingerprint"] != before
 
         r = client.get("/v1/settings")
-        assert r.json()["current"]["kv_quant_scheme"] == "group"
+        assert r.json()["current"]["kv_quant_scheme"] == "turboquant"
 
         # unknown knobs are never applied
         r = client.patch("/v1/settings", json={"bogus": 1})
@@ -7313,9 +7313,9 @@ class TestRuntimeConfigAdditions:
 
         client.patch(
             "/v1/settings",
-            json={"kv_quant_scheme": "group", "apc_enabled": True},
+            json={"kv_quant_scheme": "turboquant", "apc_enabled": True},
         )
-        assert cfg.kv_quant_scheme == "group"
+        assert cfg.kv_quant_scheme == "turboquant"
         assert cfg.apc_enabled is True
 
         r = client.patch(
@@ -7332,3 +7332,37 @@ class TestRuntimeConfigAdditions:
 
         r = client.patch("/v1/settings", json={"op": "replace", "values": "x"})
         assert r.status_code == 400
+
+
+def test_runtime_config_fingerprint_is_kind_scoped():
+    cfg = RuntimeConfig.from_env()
+    text_fp = cfg.fingerprint(kinds={"text_generation"})
+    vision_fp = cfg.fingerprint(kinds={"image_generation"})
+
+    cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
+    assert cfg.fingerprint(kinds={"image_generation"}) == vision_fp
+
+    cfg.apply_changes({"vision_cache_size": 64})
+    assert cfg.fingerprint(kinds={"image_generation"}) != vision_fp
+    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
+
+
+def test_runtime_config_live_knob_not_in_fingerprint():
+    cfg = RuntimeConfig.from_env()
+    fp = cfg.fingerprint()
+    cfg.apply_changes({"max_kv_size": 8192})
+    assert cfg.fingerprint() == fp
+
+
+def test_runtime_config_enum_knobs_reject_invalid():
+    cfg = RuntimeConfig.from_env()
+    applied, rejected = cfg.apply_changes({"kv_quant_scheme": "bogus"})
+    assert applied == {}
+    assert rejected[0]["name"] == "kv_quant_scheme"
+    assert "bogus" in rejected[0]["reason"]
+    assert cfg.kv_quant_scheme == "uniform"
+
+    applied, rejected = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+    assert applied == {"kv_quant_scheme": "turboquant"}
+    assert rejected == []
