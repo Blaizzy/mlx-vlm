@@ -64,6 +64,66 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestMambaModel(unittest.TestCase):
+    def _config(self, model_type="mamba", tied=True):
+        from mlx_vlm.models import mamba
+
+        return mamba.ModelConfig(
+            model_type=model_type,
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            state_size=8,
+            num_hidden_layers=2,
+            conv_kernel=4,
+            use_bias=False,
+            use_conv_bias=True,
+            time_step_rank="auto",
+            tie_word_embeddings=tied,
+        )
+
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import mamba
+        from mlx_vlm.models.cache import ArraysCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = mamba.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        original = mx.zeros((64, 1, 4))
+        sanitized = model.sanitize({"backbone.layers.0.mixer.conv1d.weight": original})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, ArraysCache) for item in cache))
+        self.assertEqual(
+            sanitized["language_model.backbone.layers.0.mixer.conv1d.weight"].shape,
+            (64, 4, 1),
+        )
+        self.assertEqual(config.time_step_rank, 2)
+        self.assertIs(model_module, mamba)
+        self.assertEqual(model_type, "mamba")
+
+    def test_falcon_mamba_rms_and_untied_head(self):
+        from mlx_vlm.models import mamba
+
+        config = self._config(model_type="falcon_mamba", tied=False)
+        model = mamba.Model(config)
+        self.assertTrue(config.use_bcdt_rms)
+        self.assertEqual(model(mx.array([[1]])).logits.shape, (1, 1, 64))
+
+
 class TestMellumModel(unittest.TestCase):
     def _config(self, tie_word_embeddings=True):
         from mlx_vlm.models import mellum
