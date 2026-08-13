@@ -123,6 +123,55 @@ class TestMamba2Model(unittest.TestCase):
         self.assertEqual(model_type, "mamba2")
 
 
+class TestPlamo2Model(unittest.TestCase):
+    def test_native_loader_cached_forward_and_conv_sanitize(self):
+        from mlx_vlm.models import plamo2
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = plamo2.ModelConfig(
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            hidden_size_per_head=8,
+            intermediate_size=64,
+            mamba_num_heads=4,
+            mamba_d_state=8,
+            mamba_d_conv=4,
+            mamba_step=2,
+            vocab_size=64,
+        )
+        mx.random.seed(0)
+        model = plamo2.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {"model.layers.layers.0.mixer.conv1d.weight": mx.zeros((32, 1, 4))}
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertLess(mx.max(mx.abs(full_logits - cached_logits)).item(), 2e-3)
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertEqual(
+            sanitized["language_model.model.layers.layers.0.mixer.conv1d.weight"].shape,
+            (32, 4, 1),
+        )
+        self.assertIs(model_module, plamo2)
+        self.assertEqual(model_type, "plamo2")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
