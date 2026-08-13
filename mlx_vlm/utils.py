@@ -522,15 +522,7 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
 
 
 def get_model_and_args(config: dict):
-    """
-    Retrieve the model object based on the configuration.
-
-    Args:
-        config (dict): The model configuration.
-
-    Returns:
-        A tuple containing the Model class and the ModelArgs class.
-    """
+    """Resolve a model package and its normalized model type."""
     raw_model_type = config.get("model_type") or config.get("speculators_model_type")
     if raw_model_type is None:
         raise KeyError("model_type")
@@ -553,25 +545,9 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
-    if _is_text_only_config(config):
-        arch = importlib.import_module("mlx_vlm.models.text_only")
-        return arch, "text_only"
-
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
-
-
-def _has_config(config: dict, key: str) -> bool:
-    value = config.get(key)
-    return value is not None and value != {}
-
-
-def _is_text_only_config(config: dict) -> bool:
-    return not any(
-        _has_config(config, key)
-        for key in ("vision_config", "audio_config", "dflash_config")
-    )
 
 
 def get_model_path(
@@ -792,11 +768,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # so coerce None to {} to avoid AttributeError on the .get below.
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = (config.get("vision_config") or {}).get("skip_vision", False)
-        quantized_model = (
-            model.language_model._model
-            if getattr(model, "_is_text_model", False)
-            else model
-        )
+        quantized_model = model
 
         # Stock MLX rejects bits=1; route those layers to our Metal kernel.
         replace_one_bit_modules(quantized_model, quantization, weights)

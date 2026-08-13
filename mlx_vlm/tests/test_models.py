@@ -6116,9 +6116,8 @@ class TestModels(unittest.TestCase):
         import tempfile
         from pathlib import Path
 
-        from mlx_lm.utils import quantize_model
-
         from mlx_vlm.models import gemma4
+        from mlx_vlm.quant_utils import quantize_model
         from mlx_vlm.utils import load_model, save_config, save_weights
 
         text_config = gemma4.TextConfig(
