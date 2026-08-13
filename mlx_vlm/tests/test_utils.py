@@ -540,6 +540,24 @@ def test_get_model_and_args_remaps_mistral_to_llama():
     assert model_type == "llama"
 
 
+@pytest.mark.parametrize(
+    ("alias", "native_model_type"),
+    [
+        ("phi-msft", "phixtral"),
+        ("falcon_mamba", "mamba"),
+        ("joyai_llm_flash", "deepseek_v3"),
+        ("kimi_k2", "deepseek_v3"),
+        ("minimax_m2", "minimax"),
+        ("iquestcoder", "llama"),
+    ],
+)
+def test_get_model_and_args_remaps_text_model_aliases(alias, native_model_type):
+    model_class, model_type = get_model_and_args({"model_type": alias})
+
+    assert model_class.__name__ == f"mlx_vlm.models.{native_model_type}"
+    assert model_type == native_model_type
+
+
 def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
     with pytest.raises(ValueError):
         get_model_and_args(
