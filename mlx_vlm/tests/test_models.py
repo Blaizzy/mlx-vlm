@@ -64,6 +64,72 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestYoutuLLMModel(unittest.TestCase):
+    def _config(self, q_lora_rank=16, tie_word_embeddings=True):
+        from mlx_vlm.models import youtu_llm
+
+        return youtu_llm.ModelConfig(
+            model_type="youtu_llm",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            kv_lora_rank=16,
+            q_lora_rank=q_lora_rank,
+            qk_rope_head_dim=4,
+            v_head_dim=8,
+            qk_nope_head_dim=4,
+            max_position_embeddings=128,
+            rms_norm_eps=1e-6,
+            rope_theta=10000.0,
+            rope_traditional=True,
+            tie_word_embeddings=tie_word_embeddings,
+        )
+
+    def test_native_loader_cached_forward_and_tied_sanitize(self):
+        from mlx_vlm.models import youtu_llm
+        from mlx_vlm.utils import get_model_and_args
+
+        config = self._config()
+        model = youtu_llm.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                "model.embed_tokens.weight": mx.zeros((64, 32)),
+                "lm_head.weight": mx.zeros((64, 32)),
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, youtu_llm)
+        self.assertEqual(model_type, "youtu_llm")
+
+    def test_direct_query_projection_and_untied_output(self):
+        from mlx_vlm.models import youtu_llm
+
+        config = self._config(q_lora_rank=None, tie_word_embeddings=False)
+        model = youtu_llm.Model(config)
+        self.assertEqual(model(mx.array([[1]])).logits.shape, (1, 1, 64))
+        self.assertTrue(
+            hasattr(model.language_model.model.layers[0].self_attn, "q_proj")
+        )
+
+
 class TestKlearModel(unittest.TestCase):
     def _config(self):
         from mlx_vlm.models import klear
