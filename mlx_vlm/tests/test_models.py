@@ -393,6 +393,92 @@ class TestMiniMaxModel(unittest.TestCase):
         self.assertEqual(model_type, "minimax")
 
 
+class TestLongcatFlashModel(unittest.TestCase):
+    def test_native_loader_dual_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import longcat_flash
+        from mlx_vlm.models.cache import CacheList, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = longcat_flash.ModelConfig(
+            model_type="longcat_flash",
+            attention_method="mla",
+            zero_expert_type="identity",
+            hidden_size=32,
+            ffn_hidden_size=64,
+            moe_topk=2,
+            expert_ffn_hidden_size=48,
+            n_routed_experts=3,
+            zero_expert_num=1,
+            num_layers=1,
+            vocab_size=64,
+            max_position_embeddings=128,
+            num_attention_heads=4,
+            kv_lora_rank=8,
+            q_lora_rank=8,
+            qk_rope_head_dim=4,
+            qk_nope_head_dim=4,
+            v_head_dim=4,
+            routed_scaling_factor=1.0,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            mla_scale_q_lora=True,
+            mla_scale_kv_lora=True,
+            attention_bias=False,
+            norm_topk_prob=True,
+            router_bias=False,
+        )
+        mx.random.seed(0)
+        model = longcat_flash.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        weights = {
+            f"model.layers.0.mlp.experts.{expert}.gate_proj.weight": mx.full(
+                (48, 32), expert
+            )
+            for expert in range(config.n_routed_experts)
+        }
+        for index in range(2):
+            weights[f"model.layers.0.self_attn.{index}.kv_b_proj.weight"] = mx.zeros(
+                (32, 8)
+            )
+        weights["model.mtp.layers.0.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(len(cache), config.num_layers)
+        self.assertIsInstance(cache[0], CacheList)
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache[0].caches))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (3, 48, 32),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.0.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertFalse(any("model.mtp" in key for key in sanitized))
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.router.classifier", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, longcat_flash)
+        self.assertEqual(model_type, "longcat_flash")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
