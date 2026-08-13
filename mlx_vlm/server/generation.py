@@ -1120,10 +1120,15 @@ class ResponseGenerator:
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def stop_and_join(self):
+    def stop_and_join(self, timeout: float = 10.0):
         self._stop = True
         self.requests.put(None)
-        self._thread.join(timeout=5.0)
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            logger.info(
+                "Generation thread still draining in-flight requests; "
+                "letting it finish in the background."
+            )
 
     def wait_until_ready(self, timeout: Optional[float] = None):
         if not self._ready.wait(timeout):
@@ -1728,7 +1733,7 @@ class ResponseGenerator:
         active: dict = {}
         max_num_seqs = get_max_num_seqs()
 
-        while not self._stop:
+        while not (self._stop and not active and self.requests.empty()):
             new_items = []
             try:
                 # Poll the request queue — non-blocking when generating, short
@@ -1751,7 +1756,7 @@ class ResponseGenerator:
                     capacity=capacity,
                     coalesce_s=coalesce_s,
                 )
-                if should_stop:
+                if should_stop and not active:
                     break
 
                 # Drop abandoned requests before doing more work.
