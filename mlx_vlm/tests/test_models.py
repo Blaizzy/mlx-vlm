@@ -327,6 +327,72 @@ class TestJambaModel(unittest.TestCase):
         self.assertEqual(model_type, "jamba")
 
 
+class TestMiniMaxModel(unittest.TestCase):
+    def test_native_loader_cache_expert_sanitize_and_predicates(self):
+        from mlx_vlm.models import minimax
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = minimax.ModelConfig(
+            model_type="minimax",
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+            shared_intermediate_size=64,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            rotary_dim=4,
+            vocab_size=64,
+            tie_word_embeddings=False,
+            head_dim=8,
+            use_qk_norm=True,
+        )
+        mx.random.seed(0)
+        model = minimax.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize(
+            {
+                f"model.layers.0.block_sparse_moe.experts.{expert}.w1.weight": mx.full(
+                    (64, 32), expert
+                )
+                for expert in range(config.num_local_experts)
+            }
+        )
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertTrue(all(isinstance(item, KVCache) for item in cache))
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 64, 32),
+        )
+        self.assertFalse(model.cast_predicate("e_score_correction_bias"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.block_sparse_moe.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, minimax)
+        self.assertEqual(model_type, "minimax")
+
+
 class TestBitNetModel(unittest.TestCase):
     def _config(self, tied=True):
         from mlx_vlm.models import bitnet
