@@ -544,6 +544,117 @@ class TestGraniteMoeHybridModel(unittest.TestCase):
         )
 
 
+class TestKimiLinearModel(unittest.TestCase):
+    def test_native_loader_hybrid_cache_sanitize_and_predicates(self):
+        from mlx_vlm.models import kimi_linear
+        from mlx_vlm.models.cache import ArraysCache, KVCache
+        from mlx_vlm.utils import get_model_and_args
+
+        config = kimi_linear.ModelConfig(
+            model_type="kimi_linear",
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            intermediate_size=64,
+            head_dim=8,
+            rope_theta=10000.0,
+            rms_norm_eps=1e-5,
+            linear_attn_config={
+                "kda_layers": [1, 3],
+                "num_heads": 4,
+                "head_dim": 8,
+                "short_conv_kernel_size": 4,
+            },
+            model_max_length=128,
+            num_experts=4,
+            moe_intermediate_size=48,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            num_experts_per_token=2,
+            num_shared_experts=1,
+            moe_router_activation_func="sigmoid",
+            num_expert_group=2,
+            topk_group=1,
+        )
+        mx.random.seed(0)
+        model = kimi_linear.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        weights = {
+            **{
+                f"model.layers.0.block_sparse_moe.experts.{expert}.{projection}.weight": mx.full(
+                    (
+                        48 if projection != "w2" else 32,
+                        32 if projection != "w2" else 48,
+                    ),
+                    expert,
+                )
+                for expert in range(config.num_experts)
+                for projection in ("w1", "w2", "w3")
+            },
+            "model.layers.0.block_sparse_moe.gate.weight": mx.ones((4, 32)),
+            "model.layers.0.block_sparse_moe.gate.e_score_correction_bias": mx.ones(
+                (4,)
+            ),
+            "model.layers.0.self_attn.q_conv1d.weight": mx.ones((32, 1, 4)),
+            "model.layers.0.self_attn.dt_bias": mx.ones((4, 8)),
+            "model.layers.1.self_attn.kv_b_proj.weight": mx.ones((32, 8)),
+            "model.mtp.layers.0.weight": mx.ones((1,)),
+        }
+        sanitized = model.sanitize(weights)
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertIsInstance(cache[0], ArraysCache)
+        self.assertIsInstance(cache[1], KVCache)
+        self.assertIsInstance(cache[2], ArraysCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight"
+            ].shape,
+            (4, 48, 32),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.self_attn.q_conv.conv.weight"
+            ].shape,
+            (32, 4, 1),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.0.self_attn.dt_bias"].shape,
+            (32,),
+        )
+        self.assertEqual(
+            sanitized["language_model.model.layers.1.self_attn.embed_q.weight"].shape,
+            (4, 8, 4),
+        )
+        self.assertFalse(
+            model.cast_predicate("model.layers.0.mlp.e_score_correction_bias")
+        )
+        self.assertFalse(model.cast_predicate("model.layers.0.self_attn.A_log"))
+        self.assertEqual(
+            model.quant_predicate("model.layers.0.mlp.gate", None),
+            {"group_size": 64, "bits": 8},
+        )
+        self.assertIs(model_module, kimi_linear)
+        self.assertEqual(model_type, "kimi_linear")
+
+
 class TestMiniMaxModel(unittest.TestCase):
     def test_native_loader_cache_expert_sanitize_and_predicates(self):
         from mlx_vlm.models import minimax
