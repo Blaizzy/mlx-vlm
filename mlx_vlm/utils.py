@@ -567,6 +567,15 @@ def _is_text_only_config(config: dict) -> bool:
     )
 
 
+def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+    for name, child in list(model.items()):
+        if not isinstance(child, nn.Module):
+            continue
+        if any(key.startswith(f"{name}.") for key in weights):
+            continue
+        setattr(model, name, None)
+
+
 def get_model_path(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -678,6 +687,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         weights.update(_load_safetensors(wf))
 
     model_class, _ = get_model_and_args(config=config)
+    text_only_config = _is_text_only_config(config)
 
     # Initialize text and vision configs if not present
     config.setdefault("text_config", config.pop("llm_config", {}))
@@ -838,6 +848,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 "Please use a quantized model with mode 'nvfp4' or 'mxfp8'."
             )
         model = quantize_activations(model)
+
+    if text_only_config and not getattr(model_class, "_is_text_model_arch", False):
+        _drop_modules_without_weights(model, weights)
 
     model.load_weights(list(weights.items()), strict=strict)
 
