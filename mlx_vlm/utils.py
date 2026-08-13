@@ -1436,6 +1436,38 @@ def process_image(img, resize_shape, image_processor):
     return img
 
 
+def estimate_num_image_tokens(processor, height: int, width: int, **size_overrides):
+    """Estimate how many language-model image tokens an image will produce.
+
+    Computed from the processor's own sizing math without loading or
+    processing any pixels, so it is cheap enough to run per candidate image
+    when sizing a prompt budget or choosing a ``max_pixels`` cap.
+
+    Args:
+        processor: A processor (or bare image processor). Wrapped processors
+            are unwrapped via their ``image_processor`` attribute.
+        height: Source image height in pixels.
+        width: Source image width in pixels.
+        **size_overrides: Optional per-call overrides forwarded to the image
+            processor's ``num_image_tokens``, e.g. ``max_pixels=1_000_000``.
+
+    Raises:
+        NotImplementedError: If the image processor does not expose
+            ``num_image_tokens``. Only dynamic-resolution processors support
+            estimation; fixed-resolution models produce a constant token
+            count regardless of image size.
+    """
+    image_processor = getattr(processor, "image_processor", processor)
+    counter = getattr(image_processor, "num_image_tokens", None)
+    if counter is None:
+        raise NotImplementedError(
+            f"{type(image_processor).__name__} does not expose "
+            "num_image_tokens; token estimation is only available for "
+            "dynamic-resolution image processors."
+        )
+    return int(counter(height, width, **size_overrides))
+
+
 def read_audio(file) -> tuple:
     """Read an audio file using miniaudio (or ffmpeg for m4a/aac/ogg/opus).
 

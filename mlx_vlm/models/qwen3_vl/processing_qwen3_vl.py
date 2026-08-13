@@ -276,6 +276,48 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
     def preprocess(self, images, **kwargs):
         return self(images, **kwargs)
 
+    def num_image_tokens(
+        self,
+        height: int,
+        width: int,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        resized_height: Optional[int] = None,
+        resized_width: Optional[int] = None,
+    ) -> int:
+        """Number of language-model image tokens an image of the given size
+        will produce, computed without processing any pixels.
+
+        Mirrors the sizing logic of ``_process_one`` exactly (same
+        ``_smart_resize_image`` call, same override precedence), so the result
+        equals ``image_grid_thw.prod() // merge_size**2`` of an actual
+        ``preprocess`` call for the same image and overrides.
+        """
+        factor = self.patch_size * self.merge_size
+        if (resized_height is None) != (resized_width is None):
+            raise ValueError(
+                "resized_height and resized_width must be provided together."
+            )
+        if resized_height is not None:
+            resized_h, resized_w = _smart_resize_image(
+                resized_height,
+                resized_width,
+                factor=factor,
+            )
+        else:
+            resized_h, resized_w = _smart_resize_image(
+                height,
+                width,
+                factor=factor,
+                min_pixels=self.min_pixels if min_pixels is None else min_pixels,
+                max_pixels=self.max_pixels if max_pixels is None else max_pixels,
+            )
+        grid_h = resized_h // self.patch_size
+        grid_w = resized_w // self.patch_size
+        # grid_t is always 1 for still images (frames are duplicated along T
+        # to fill temporal_patch_size, not counted as extra tokens).
+        return (grid_h * grid_w) // self.merge_size**2
+
 
 class Qwen3VLVideoProcessor(BaseVideoProcessor):
     """Numpy port of ``transformers.Qwen3VLVideoProcessor``.

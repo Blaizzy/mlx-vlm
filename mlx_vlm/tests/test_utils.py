@@ -18,6 +18,7 @@ from mlx_vlm.utils import (
     _drop_modules_without_weights,
     _load_safetensors,
     apply_generation_config_defaults,
+    estimate_num_image_tokens,
     get_model_and_args,
     get_model_path,
     load,
@@ -977,3 +978,55 @@ class TestLoadImage:
     def test_nonexistent_path_object_raises(self):
         with pytest.raises(ValueError, match="Failed to load image"):
             load_image(Path("/nonexistent/path/image.png"))
+
+
+class TestEstimateNumImageTokens:
+    def _processor(self):
+        from mlx_vlm.models.qwen3_vl.processing_qwen3_vl import Qwen3VLImageProcessor
+
+        return Qwen3VLImageProcessor()
+
+    def _actual_tokens(self, processor, width, height, **kwargs):
+        import numpy as np
+        from PIL import Image
+
+        img = Image.new("RGB", (width, height), color=(9, 30, 51))
+        grid = processor([img], **kwargs)["image_grid_thw"][0]
+        return int(np.prod(grid)) // processor.merge_size**2
+
+    @pytest.mark.parametrize(
+        "width,height",
+        [(64, 64), (640, 480), (1000, 1400), (2500, 1200), (333, 517)],
+    )
+    def test_estimate_matches_actual_processing(self, width, height):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(processor, height, width)
+        assert estimate == self._actual_tokens(processor, width, height)
+
+    @pytest.mark.parametrize("max_pixels", [256 * 256, 512 * 512])
+    def test_estimate_matches_actual_with_max_pixels(self, max_pixels):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, max_pixels=max_pixels
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, max_pixels=max_pixels
+        )
+
+    def test_estimate_matches_actual_with_resized_dimensions(self):
+        processor = self._processor()
+        estimate = estimate_num_image_tokens(
+            processor, 1400, 1000, resized_height=448, resized_width=448
+        )
+        assert estimate == self._actual_tokens(
+            processor, 1000, 1400, resized_height=448, resized_width=448
+        )
+
+    def test_dispatcher_unwraps_wrapped_processor(self):
+        wrapped = SimpleNamespace(image_processor=self._processor())
+        direct = estimate_num_image_tokens(self._processor(), 480, 640)
+        assert estimate_num_image_tokens(wrapped, 480, 640) == direct
+
+    def test_unsupported_processor_raises(self):
+        with pytest.raises(NotImplementedError, match="num_image_tokens"):
+            estimate_num_image_tokens(SimpleNamespace(), 480, 640)
