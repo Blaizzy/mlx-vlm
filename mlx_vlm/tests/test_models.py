@@ -64,6 +64,44 @@ class TestNanochatModel(unittest.TestCase):
         self.assertEqual(set(sanitized), {"language_model.transformer.wte.weight"})
 
 
+class TestPlamoModel(unittest.TestCase):
+    def test_native_loader_cached_forward_and_checkpoint_prefix(self):
+        from mlx_vlm.models import plamo
+        from mlx_vlm.utils import get_model_and_args
+
+        config = plamo.ModelConfig(
+            model_type="plamo",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            n_shared_head=2,
+        )
+        model = plamo.Model(config)
+        inputs = mx.array([[1, 2, 3, 4]])
+
+        full_logits = model(inputs).logits
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache).logits,
+                model(inputs[:, 2:], cache=cache).logits,
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+        sanitized = model.sanitize({"model.embed_tokens.weight": mx.zeros((64, 32))})
+        model_module, model_type = get_model_and_args(config.to_dict())
+
+        self.assertEqual(full_logits.shape, (1, 4, config.vocab_size))
+        self.assertTrue(mx.allclose(full_logits, cached_logits, atol=1e-5).item())
+        self.assertEqual(set(sanitized), {"language_model.model.embed_tokens.weight"})
+        self.assertIs(model_module, plamo)
+        self.assertEqual(model_type, "plamo")
+
+
 class TestLille130mModel(unittest.TestCase):
     def test_cached_forward_and_checkpoint_prefix(self):
         from mlx_vlm.models import lille_130m
