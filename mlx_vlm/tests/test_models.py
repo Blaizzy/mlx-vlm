@@ -12718,9 +12718,7 @@ class TestCohereCompass(unittest.TestCase):
         )
 
         self.assertEqual(features.visual_pos_masks.dtype, mx.bool_)
-        self.assertEqual(
-            features.deepstack_visual_embeds.position_mask.dtype, mx.bool_
-        )
+        self.assertEqual(features.deepstack_visual_embeds.position_mask.dtype, mx.bool_)
         self.assertEqual(
             features.deepstack_visual_embeds.position_mask.tolist(),
             features.visual_pos_masks.tolist(),
