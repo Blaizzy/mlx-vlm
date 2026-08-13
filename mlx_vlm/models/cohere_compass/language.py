@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
@@ -13,6 +14,12 @@ from ..base import (
 from ..cache import KVCache, RotatingKVCache
 from ..mlp import SwiGLUMLP
 from .config import TextConfig
+
+
+@dataclass
+class DeepstackVisualFeatures:
+    embeddings: list[mx.array]
+    position_mask: mx.array
 
 
 class CompassRMSNorm(nn.Module):
@@ -488,7 +495,10 @@ class LanguageModel(nn.Module):
                 positions = mx.where(
                     attention_mask == 0, mx.ones_like(positions), positions
                 )
-                deltas = positions.max(axis=-1, keepdims=True) + 1 - input_ids.shape[1]
+                valid_lengths = attention_mask.astype(input_ids.dtype).sum(
+                    axis=-1, keepdims=True
+                )
+                deltas = positions.max(axis=-1, keepdims=True) + 1 - valid_lengths
             return positions, deltas
 
         if attention_mask is None:
@@ -558,7 +568,7 @@ class LanguageModel(nn.Module):
                         compact[axis, compact_index].item()
                     )
             position_rows.append(mx.array(padded, dtype=mx.int32))
-            deltas.append(int(compact.max().item()) + 1 - input_ids.shape[1])
+            deltas.append(int(compact.max().item()) + 1 - len(tokens))
 
         return (
             mx.stack(position_rows, axis=1),
@@ -583,6 +593,10 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         visual_pos_masks = kwargs.pop("visual_pos_masks", None)
         deepstack_visual_embeds = kwargs.pop("deepstack_visual_embeds", None)
+        deepstack_position_mask = None
+        if isinstance(deepstack_visual_embeds, DeepstackVisualFeatures):
+            deepstack_position_mask = deepstack_visual_embeds.position_mask
+            deepstack_visual_embeds = deepstack_visual_embeds.embeddings
         rope_deltas = kwargs.pop("rope_deltas", None)
         attention_mask = kwargs.pop("attention_mask", None)
         logits_to_keep = kwargs.pop("logits_to_keep", None)
@@ -613,12 +627,13 @@ class LanguageModel(nn.Module):
                         prepare(left_padding=left_padding)
 
         cache_offset = 0
+        position_offset = 0
         if cache and cache[0] is not None:
             first_cache = cache[0]
-            # Batched caches advance every row through a shared physical
-            # timeline.  Use that timeline for RoPE so filtering out the
-            # longest row does not shift the positions of surviving padded
-            # rows.  ``offset`` remains the right source for regular caches.
+            # Keep the shared physical timeline for slicing full-prompt
+            # metadata, but use each row's logical token count for RoPE.
+            # Dynamic batching may extend a cache with shorter rows, whose
+            # added left padding must not advance their positions.
             cache_offset = getattr(first_cache, "_offset", None)
             if cache_offset is None and hasattr(first_cache, "left_padding"):
                 cache_offset = getattr(first_cache, "_idx", None)
@@ -628,38 +643,62 @@ class LanguageModel(nn.Module):
                 cache_offset = int(cache_offset.max().item())
             else:
                 cache_offset = int(cache_offset)
+            position_offset = getattr(first_cache, "offset", cache_offset)
+            if isinstance(position_offset, mx.array):
+                position_offset = position_offset.reshape(-1, 1)
+            else:
+                position_offset = int(position_offset)
 
+        full_visual_pos_masks = deepstack_position_mask
         if (
-            visual_pos_masks is not None
+            full_visual_pos_masks is None
+            and visual_pos_masks is not None
             and visual_pos_masks.shape[-1] != inputs.shape[-1]
         ):
-            # ``generate_step`` forwards full-prompt multimodal metadata to
-            # every chunk.  Align both the mask and its packed visual rows to
-            # the current cache window before deep-stack injection.
+            full_visual_pos_masks = visual_pos_masks
+
+        if full_visual_pos_masks is not None and deepstack_visual_embeds is not None:
+            # The typed deep-stack payload retains the boolean mask used to
+            # pack its visual rows. Align both to the current cache window,
+            # even when generic prompt processing already sliced the public
+            # visual mask.
             start = cache_offset
             stop = start + inputs.shape[1]
-            full_visual_pos_masks = visual_pos_masks
+            shared_visual_rows = (
+                full_visual_pos_masks.shape[0] == 1 and inputs.shape[0] > 1
+            )
+            if shared_visual_rows:
+                full_visual_pos_masks = mx.broadcast_to(
+                    full_visual_pos_masks,
+                    (inputs.shape[0], full_visual_pos_masks.shape[1]),
+                )
+            elif full_visual_pos_masks.shape[0] != inputs.shape[0]:
+                raise ValueError(
+                    "Deep-stack visual mask batch does not match the input batch"
+                )
+
             visual_pos_masks = full_visual_pos_masks[:, start:stop]
-            if deepstack_visual_embeds is not None:
-                embed_windows = [[] for _ in deepstack_visual_embeds]
-                row_offset = 0
-                for row, row_mask in enumerate(full_visual_pos_masks):
-                    row_visuals = int(row_mask.sum().item())
-                    before = int(row_mask[:start].sum().item())
-                    count = int(visual_pos_masks[row].sum().item())
-                    for layer, embeds in enumerate(deepstack_visual_embeds):
-                        embed_windows[layer].append(
-                            embeds[row_offset + before : row_offset + before + count]
-                        )
-                    row_offset += row_visuals
-                deepstack_visual_embeds = [
-                    (
-                        mx.concatenate(windows, axis=0)
-                        if windows
-                        else mx.zeros((0, self.config.hidden_size))
+            embed_windows = [[] for _ in deepstack_visual_embeds]
+            row_offset = 0
+            for row, row_mask in enumerate(full_visual_pos_masks):
+                row_visuals = int(row_mask.sum().item())
+                before = int(row_mask[:start].sum().item())
+                count = int(visual_pos_masks[row].sum().item())
+                embed_start = before if shared_visual_rows else row_offset + before
+                for layer, embeds in enumerate(deepstack_visual_embeds):
+                    embed_windows[layer].append(
+                        embeds[embed_start : embed_start + count]
                     )
-                    for windows in embed_windows
-                ]
+                if not shared_visual_rows:
+                    row_offset += row_visuals
+            deepstack_visual_embeds = [
+                (
+                    mx.concatenate(windows, axis=0)
+                    if windows
+                    else mx.zeros((0, self.config.hidden_size))
+                )
+                for windows in embed_windows
+            ]
 
         if position_ids is not None and position_ids.shape[-1] > inputs.shape[-1]:
             position_ids = position_ids[
@@ -673,7 +712,7 @@ class LanguageModel(nn.Module):
                 )
                 self._position_ids = position_ids
             else:
-                delta = cache_offset + self._rope_deltas
+                delta = position_offset + self._rope_deltas
                 position_ids = mx.arange(inputs.shape[1], dtype=mx.int32)[None, :]
                 position_ids = mx.broadcast_to(position_ids, inputs.shape) + delta
                 if self.model.rotary_emb.position_selector is not None:
