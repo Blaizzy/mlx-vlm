@@ -1520,3 +1520,169 @@ def test_partial_harvest_agrees_with_the_partition_helper():
     assert blocks[0].layer_indices == tuple(pageable)
     assert set(pageable).isdisjoint(other)
     manager.release(blocks)
+
+
+def test_checkpoint_stride_uses_the_prefill_chunk_when_state_is_cheap():
+    stride = apc_module.checkpoint_stride(
+        state_bytes=80 * 1024, prompt_tokens=12000, budget_bytes=128 << 20
+    )
+
+    assert stride == 2048
+
+
+def test_checkpoint_stride_coarsens_when_the_budget_is_tight():
+    stride = apc_module.checkpoint_stride(
+        state_bytes=40 << 20, prompt_tokens=12000, budget_bytes=128 << 20
+    )
+
+    assert stride == 4096
+    assert -(-12000 // stride) * (40 << 20) <= (128 << 20)
+
+
+def test_checkpoint_stride_returns_zero_when_one_checkpoint_will_not_fit():
+    stride = apc_module.checkpoint_stride(
+        state_bytes=348 << 20, prompt_tokens=12000, budget_bytes=128 << 20
+    )
+
+    assert stride == 0
+
+
+def test_checkpoint_stride_is_always_a_whole_number_of_prefill_chunks():
+    for state_mb in (1, 8, 17, 64, 127):
+        stride = apc_module.checkpoint_stride(
+            state_bytes=state_mb << 20,
+            prompt_tokens=100_000,
+            budget_bytes=128 << 20,
+            prefill_chunk=512,
+        )
+        assert stride == 0 or stride % 512 == 0
+
+
+def test_checkpoint_stride_stays_inside_the_budget_it_is_given():
+    for state_mb in (1, 8, 17, 64, 127, 200):
+        for prompt in (1000, 12000, 60000):
+            budget = 128 << 20
+            stride = apc_module.checkpoint_stride(
+                state_bytes=state_mb << 20, prompt_tokens=prompt, budget_bytes=budget
+            )
+            if stride == 0:
+                continue
+            checkpoints = -(-prompt // stride)
+            assert checkpoints * (state_mb << 20) <= budget
+
+
+def test_checkpoint_stride_rejects_a_nonpositive_chunk():
+    try:
+        apc_module.checkpoint_stride(1, 100, budget_bytes=1 << 20, prefill_chunk=0)
+    except ValueError:
+        return
+    raise AssertionError("expected ValueError")
+
+
+def test_checkpoint_stride_declines_an_empty_budget():
+    assert apc_module.checkpoint_stride(1024, 12000, budget_bytes=0) == 0
+
+
+def test_checkpoint_state_bytes_counts_only_the_layers_that_cannot_page():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    plain = KVCache()
+    plain.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+    state = ArraysCache(1)
+    state[0] = mx.zeros((1, 8, 16), dtype=mx.float32)
+
+    measured = apc_module.checkpoint_state_bytes([plain, state])
+
+    assert measured == 8 * 16 * 4
+
+
+def test_composite_cache_places_the_state_entries_too():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    tokens = list(range(64))
+    warm = [KVCache(), ArraysCache(1), KVCache()]
+    for entry in (warm[0], warm[2]):
+        entry.update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+    manager = APCManager(num_blocks=64, block_size=16)
+    blocks = harvest_blocks_from_batch_cache(
+        manager, warm, tokens, allow_partial_layers=True
+    )
+    state = ArraysCache(1)
+    state[0] = mx.ones((1, 2, 2))
+
+    template = [KVCache(), ArraysCache(1), KVCache()]
+    out = apc_module.make_warm_composite_cache(blocks, template, state_entries=[state])
+
+    assert out is not None
+    assert out[1] is state
+    assert out[0] is not template[0] and out[2] is not template[2]
+    manager.release(blocks)
+
+
+def test_composite_cache_refuses_a_state_list_of_the_wrong_length():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    warm = [KVCache(), ArraysCache(1)]
+    warm[0].update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+    manager = APCManager(num_blocks=64, block_size=16)
+    blocks = harvest_blocks_from_batch_cache(
+        manager, warm, list(range(64)), allow_partial_layers=True
+    )
+
+    out = apc_module.make_warm_composite_cache(
+        blocks,
+        [KVCache(), ArraysCache(1)],
+        state_entries=[ArraysCache(1), ArraysCache(1)],
+    )
+
+    assert out is None
+    manager.release(blocks)
+
+
+def test_composite_cache_refuses_blocks_whose_layout_the_template_disagrees_with():
+    from mlx_vlm.models.cache import ArraysCache, KVCache
+
+    warm = [KVCache(), ArraysCache(1)]
+    warm[0].update_and_fetch(mx.zeros((1, 1, 64, 4)), mx.zeros((1, 1, 64, 4)))
+    manager = APCManager(num_blocks=64, block_size=16)
+    blocks = harvest_blocks_from_batch_cache(
+        manager, warm, list(range(64)), allow_partial_layers=True
+    )
+
+    out = apc_module.make_warm_composite_cache(blocks, [ArraysCache(1), KVCache()])
+
+    assert out is None
+    manager.release(blocks)
+
+
+def test_checkpoint_fits_enforces_the_budget_a_growing_state_would_break():
+    budget = 128 << 20
+    stride_priced_at = 40 << 20
+
+    assert (
+        apc_module.checkpoint_stride(stride_priced_at, 12000, budget_bytes=budget)
+        == 4096
+    )
+
+    stored = 0
+    grown = [40 << 20, 60 << 20, 90 << 20]
+    taken = 0
+    for cost in grown:
+        if not apc_module.checkpoint_fits(stored, cost, budget_bytes=budget):
+            break
+        stored += cost
+        taken += 1
+
+    assert taken == 2
+    assert stored <= budget
+
+
+def test_checkpoint_fits_declines_an_empty_budget():
+    assert not apc_module.checkpoint_fits(0, 1, budget_bytes=0)
+
+
+def test_checkpoint_fits_reads_the_budget_from_the_environment(monkeypatch):
+    monkeypatch.setenv("APC_CHECKPOINT_BUDGET_MB", "1")
+
+    assert apc_module.checkpoint_fits(0, 1 << 20)
+    assert not apc_module.checkpoint_fits(0, (1 << 20) + 1)

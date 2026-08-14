@@ -378,6 +378,89 @@ def partition_cache_by_pageability(
     return pageable, checkpointed
 
 
+def checkpoint_state_bytes(
+    prompt_cache: Sequence[Any], indices: Optional[Sequence[int]] = None
+) -> int:
+    """Bytes one composite checkpoint copies, for the layers that cannot page.
+
+    Measured rather than derived from the config: a layer's state may be a
+    bounded window, a fixed recurrent tensor, or several arrays, and only the
+    live cache knows which.
+    """
+    if indices is None:
+        _, indices = partition_cache_by_pageability(prompt_cache)
+    arrays: List[mx.array] = []
+    for index in indices:
+        if 0 <= index < len(prompt_cache):
+            _collect_mx_arrays(getattr(prompt_cache[index], "state", None), arrays)
+    return sum(int(a.nbytes) for a in arrays)
+
+
+def _checkpoint_budget_bytes() -> int:
+    return max(
+        0, int(float(os.environ.get("APC_CHECKPOINT_BUDGET_MB", "128")) * (1 << 20))
+    )
+
+
+def checkpoint_fits(
+    stored_bytes: int, next_bytes: int, budget_bytes: Optional[int] = None
+) -> bool:
+    """Whether one more checkpoint stays inside the budget.
+
+    The stride is chosen once from a measured state size, but a sliding-window
+    cache keeps growing until its window fills, so a stride priced early can
+    turn out to be too fine. Checking each checkpoint against the running total
+    enforces the budget even when the estimate was optimistic.
+    """
+    if budget_bytes is None:
+        budget_bytes = _checkpoint_budget_bytes()
+    if budget_bytes <= 0:
+        return False
+    return int(stored_bytes) + int(next_bytes) <= int(budget_bytes)
+
+
+def checkpoint_stride(
+    state_bytes: int,
+    prompt_tokens: int,
+    *,
+    budget_bytes: Optional[int] = None,
+    prefill_chunk: int = 2048,
+) -> int:
+    """Tokens between state checkpoints, or 0 when composite should not be used.
+
+    Composite restores the paged and checkpointed halves at the same position,
+    so a shorter stride leaves a shorter tail to recompute. Each checkpoint
+    costs ``state_bytes``, which spans more than three orders of magnitude
+    across hybrids, so the stride has to follow the model rather than a
+    constant.
+
+    Strides are whole multiples of the prefill chunk. Checkpointing where the
+    prefill already stops is nearly free, while a finer stride would force finer
+    chunks, which costs far more than the checkpoint itself.
+
+    Returning 0 means not even one checkpoint fits the budget. The caller falls
+    back to exact mode rather than exceed it.
+    """
+    if prefill_chunk <= 0:
+        raise ValueError("prefill_chunk must be positive")
+    if prompt_tokens <= 0 or state_bytes < 0:
+        return 0
+    if budget_bytes is None:
+        budget_bytes = _checkpoint_budget_bytes()
+    if budget_bytes <= 0:
+        return 0
+    if state_bytes == 0:
+        return prefill_chunk
+
+    affordable = budget_bytes // state_bytes
+    if affordable < 1:
+        return 0
+    wanted = -(-prompt_tokens // prefill_chunk)
+    if wanted <= affordable:
+        return prefill_chunk
+    return prefill_chunk * (-(-wanted // affordable))
+
+
 def _sequence_hash_array(tokens: np.ndarray, extra_hash: int, block_size: int) -> int:
     h = hashlib.sha256()
     h.update(int(extra_hash & ((1 << 64) - 1)).to_bytes(8, "little"))
@@ -3701,16 +3784,21 @@ def _fill_batch_layer_cache(
 def make_warm_composite_cache(
     matched_blocks: List[APCBlock],
     template: Sequence[Any],
+    state_entries: Optional[Sequence[Any]] = None,
     min_capacity_tokens: Optional[int] = None,
     kv_quant_config: Optional[dict] = None,
 ) -> Optional[List[Any]]:
-    """Place the paged layers of a hybrid back into the model's own layout.
+    """Rebuild a hybrid's cache from its paged blocks and its state checkpoint.
 
     ``template`` is a fresh cache from the model, which supplies an entry of the
-    right type for every layer. The blocks only cover the layers they were
-    harvested from, so they are stitched as usual and then dropped into those
-    positions. Returns ``None`` when the blocks do not describe a layout this
-    template can accept.
+    right type for every layer and says which layers page. The blocks cover only
+    the layers they were harvested from and are dropped into those positions;
+    ``state_entries``, in checkpointed-layer order, fills the rest.
+
+    Both halves must describe the same layout the template does, so a stale
+    block or a checkpoint from a differently shaped cache is refused rather than
+    mixed in. Returns ``None`` whenever that check fails, leaving the caller to
+    fall back.
     """
     if not matched_blocks or not template:
         return None
@@ -3718,6 +3806,12 @@ def make_warm_composite_cache(
     if not indices or any(b.layer_indices != indices for b in matched_blocks):
         return None
     if any(index >= len(template) for index in indices):
+        return None
+
+    pageable, checkpointed = partition_cache_by_pageability(template)
+    if tuple(pageable) != tuple(indices):
+        return None
+    if state_entries is not None and len(state_entries) != len(checkpointed):
         return None
 
     warm = make_warm_kv_cache(
@@ -3731,6 +3825,9 @@ def make_warm_composite_cache(
     out = list(template)
     for slot, layer_index in enumerate(indices):
         out[layer_index] = warm[slot]
+    if state_entries is not None:
+        for slot, layer_index in enumerate(checkpointed):
+            out[layer_index] = state_entries[slot]
     return out
 
 
