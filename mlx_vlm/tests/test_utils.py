@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import struct
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.models.text_only import TextOnlyModel
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _drop_modules_without_weights,
     _load_safetensors,
     apply_generation_config_defaults,
     get_model_and_args,
@@ -606,6 +608,87 @@ def test_load_model_forwards_strict_to_load_weights():
 
     assert model.loaded_weights == list(weights.items())
     assert model.loaded_strict is False
+
+
+class TestDropModulesWithoutWeights:
+    class ParameterlessHelper(nn.Module):
+        pass
+
+    class FakeModel(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(2, 2, bias=False)
+            self.vision_tower = nn.Linear(2, 2, bias=True)
+            self.parameterless_helper = (
+                TestDropModulesWithoutWeights.ParameterlessHelper()
+            )
+
+    def test_preserves_language_and_parameterless_modules(self, caplog):
+        model = self.FakeModel()
+        language_model = model.language_model
+        parameterless_helper = model.parameterless_helper
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, {})
+
+        assert model.language_model is language_model
+        assert model.parameterless_helper is parameterless_helper
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+        assert "language_model" not in caplog.text
+        assert "parameterless_helper" not in caplog.text
+
+    def test_keeps_partially_weighted_module_for_strict_validation(self):
+        model = self.FakeModel()
+        weights = {
+            "language_model.weight": mx.zeros((2, 2)),
+            "vision_tower.bias": mx.zeros((2,)),
+        }
+
+        _drop_modules_without_weights(model, weights)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_load_model_prunes_and_logs_text_only_modules(self, caplog):
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(self.FakeModel):
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+                self.loaded_strict = strict
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={"model_type": "fake"},
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True)
+
+        assert model.language_model is not None
+        assert model.vision_tower is None
+        assert model.parameterless_helper is not None
+        assert "vision_tower" in caplog.text
+        assert model.loaded_strict is True
 
 
 def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):

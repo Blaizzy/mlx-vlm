@@ -568,12 +568,22 @@ def _is_text_only_config(config: dict) -> bool:
 
 
 def _drop_modules_without_weights(model: nn.Module, weights: dict) -> None:
+    weighted_modules = {key.partition(".")[0] for key in weights}
+    dropped_modules = []
     for name, child in list(model.items()):
-        if not isinstance(child, nn.Module):
+        if name == "language_model" or not isinstance(child, nn.Module):
             continue
-        if any(key.startswith(f"{name}.") for key in weights):
+        if not tree_flatten(child.parameters()) or name in weighted_modules:
             continue
         setattr(model, name, None)
+        dropped_modules.append(name)
+
+    if dropped_modules:
+        logging.warning(
+            "Text-only checkpoint has no weights for VLM module(s): %s. "
+            "Disabling those modules.",
+            ", ".join(dropped_modules),
+        )
 
 
 def get_model_path(
