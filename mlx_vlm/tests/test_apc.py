@@ -1181,3 +1181,79 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert warm_wrong is None
 
     manager.close()
+
+
+def test_resident_budget_evicts_until_pool_fits():
+    block_size = 16
+    manager = APCManager(num_blocks=16, block_size=block_size)
+    token_ids = list(range(4 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    manager.release(stored)
+    full = manager.resident_bytes()
+    assert full > 0
+
+    manager._max_resident_bytes = full // 2
+    manager._shrink_to_resident_budget_locked()
+
+    assert manager.resident_bytes() <= full // 2
+    assert manager.stats.budget_evictions > 0
+
+
+def test_resident_budget_disabled_by_default_keeps_every_block():
+    block_size = 16
+    manager = APCManager(num_blocks=16, block_size=block_size)
+    assert manager._max_resident_bytes == 0
+
+    token_ids = list(range(4 * block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    manager.release(stored)
+
+    matched, matched_tokens = manager.lookup_prefix(token_ids)
+    assert matched_tokens == 4 * block_size
+    assert manager.stats.budget_evictions == 0
+    manager.release(matched)
+
+
+def test_resident_budget_counts_every_component_not_just_kv():
+    block_size = 16
+    manager = APCManager(num_blocks=4, block_size=block_size)
+    token_ids = list(range(block_size))
+    layer_keys, layer_values = _make_fake_kv(seq_len=len(token_ids))
+    stored = manager.store_kv_blocks(token_ids, layer_keys, layer_values)
+    kv_only = manager.resident_bytes()
+    manager.release(stored)
+
+    block = stored[0]
+    extra = mx.zeros((1024,), dtype=mx.float32)
+    block.set_state("state", [extra])
+
+    assert manager.resident_bytes() == kv_only + extra.nbytes
+
+
+def test_state_stride_is_coarser_than_the_kv_block_size():
+    manager = APCManager(num_blocks=4, block_size=16)
+
+    assert manager.state_stride >= manager.block_size
+    assert manager.state_stride % manager.block_size == 0
+
+
+def test_state_stride_never_drops_below_the_block_size():
+    os.environ["APC_STATE_STRIDE"] = "4"
+    try:
+        manager = APCManager(num_blocks=4, block_size=16)
+        assert manager.state_stride == 16
+    finally:
+        del os.environ["APC_STATE_STRIDE"]
+
+
+def test_state_stride_rounds_up_to_whole_kv_blocks():
+    os.environ["APC_STATE_STRIDE"] = "500"
+    try:
+        manager = APCManager(num_blocks=4, block_size=16)
+        assert manager.state_stride == 512
+        assert manager.state_stride % manager.block_size == 0
+    finally:
+        del os.environ["APC_STATE_STRIDE"]

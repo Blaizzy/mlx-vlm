@@ -592,6 +592,7 @@ class APCStats:
     matched_tokens: int = 0
     served_tokens: int = 0
     evictions: int = 0
+    budget_evictions: int = 0
     stores: int = 0
     pool_used: int = 0
     disk_hits: int = 0
@@ -621,6 +622,7 @@ class APCStats:
             "served_tokens": self.served_tokens,
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
+            "budget_evictions": self.budget_evictions,
             "stores": self.stores,
             "disk_hits": self.disk_hits,
             "disk_writes": self.disk_writes,
@@ -2868,6 +2870,11 @@ class APCManager:
         self._exact_cache_max = max(
             0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
         )
+        self._max_resident_bytes = int(
+            float(os.environ.get("APC_MAX_RESIDENT_GB", "0")) * (1 << 30)
+        )
+        stride = max(block_size, int(os.environ.get("APC_STATE_STRIDE", "512")))
+        self.state_stride = ((stride + block_size - 1) // block_size) * block_size
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
         )
@@ -2978,6 +2985,20 @@ class APCManager:
     def resident_bytes(self) -> int:
         with self.lock:
             return self._resident_bytes_locked()
+
+    def _shrink_to_resident_budget_locked(self) -> None:
+        limit = self._max_resident_bytes
+        if limit <= 0:
+            return
+        resident = self._resident_bytes_locked()
+        while resident > limit and self._free_head is not None:
+            freed = self._free_head.resident_bytes()
+            block = self._evict_lru()
+            if block is None:
+                return
+            self._free_push(block)
+            resident -= freed
+            self.stats.budget_evictions += 1
 
     # ---------- Public API ----------
     def lookup_exact_cache(
@@ -3446,6 +3467,7 @@ class APCManager:
                     self.stats.disk_writes += len(disk_blocks)
                 except Exception as e:
                     logger.warning("APC disk save scheduling failed: %s", e)
+            self._shrink_to_resident_budget_locked()
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
 
