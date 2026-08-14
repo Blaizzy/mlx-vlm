@@ -2988,9 +2988,10 @@ class APCManager:
             counts = self.stats.reuse_outcomes
             counts[outcome] = counts.get(outcome, 0) + 1
 
-    def _record_store_outcome_locked(self, outcome: str) -> None:
-        counts = self.stats.store_outcomes
-        counts[outcome] = counts.get(outcome, 0) + 1
+    def record_store_outcome(self, outcome: str) -> None:
+        with self.lock:
+            counts = self.stats.store_outcomes
+            counts[outcome] = counts.get(outcome, 0) + 1
 
     # ---------- Public API ----------
     def lookup_exact_cache(
@@ -3416,7 +3417,7 @@ class APCManager:
                         i,
                         n_full,
                     )
-                    self._record_store_outcome_locked(StoreOutcome.TENSOR_LIMIT)
+                    self.record_store_outcome(StoreOutcome.TENSOR_LIMIT)
                     if self.disk is None:
                         break
                     parent = h
@@ -3428,7 +3429,7 @@ class APCManager:
                         i,
                         n_full,
                     )
-                    self._record_store_outcome_locked(StoreOutcome.POOL_EXHAUSTED)
+                    self.record_store_outcome(StoreOutcome.POOL_EXHAUSTED)
                     if self.disk is None:
                         break
                     parent = h
@@ -3451,7 +3452,7 @@ class APCManager:
                 self.hash_table[h] = b
                 new_blocks.append(b)
                 self.stats.stores += 1
-                self._record_store_outcome_locked(StoreOutcome.STORED)
+                self.record_store_outcome(StoreOutcome.STORED)
                 self.stats.served_tokens += self.block_size
                 parent = h
             if self.disk is not None and disk_blocks:
