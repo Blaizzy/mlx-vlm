@@ -13987,6 +13987,110 @@ class TestGptOssMixedQuant(unittest.TestCase):
         self.assertTrue(hasattr(q_proj, "biases"))
 
 
+class TestRerankerLoader(unittest.TestCase):
+    def test_identifies_sequence_classifier_architectures(self):
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        architectures = [
+            "BertForSequenceClassification",
+            "ModernBertForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+        ]
+        for architecture in architectures:
+            with self.subTest(architecture=architecture):
+                self.assertTrue(
+                    reranker_loader.is_sequence_classifier_config(
+                        {"architectures": [architecture]}
+                    )
+                )
+
+    def test_loads_supported_native_sequence_classifier(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        for model_type in ("bert", "modernbert", "xlm-roberta"):
+            with self.subTest(model_type=model_type):
+                config = {
+                    "architectures": ["ExampleForSequenceClassification"],
+                    "model_type": model_type,
+                    "num_labels": 1,
+                }
+                sentinel = object()
+                captured = {}
+
+                def fake_load_encoder_model(model_path, **kwargs):
+                    captured["model_path"] = model_path
+                    captured.update(kwargs)
+                    return sentinel
+
+                with patch.object(
+                    reranker_loader,
+                    "load_encoder_model",
+                    side_effect=fake_load_encoder_model,
+                ):
+                    model = reranker_loader.load_sequence_classification_model(
+                        Path("model"), config=config
+                    )
+
+                self.assertIs(model, sentinel)
+                self.assertEqual(
+                    captured["model_class_name"], "SequenceClassificationModel"
+                )
+                self.assertEqual(captured["config"], config)
+                self.assertEqual(captured["config_overrides"], {"num_labels": 1})
+
+    def test_rejects_multi_label_sequence_classifier(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertForSequenceClassification"],
+            "model_type": "bert",
+            "num_labels": 2,
+        }
+
+        with self.assertRaisesRegex(ValueError, "exactly one output label"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_unsupported_sequence_classifier_family(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["DebertaV2ForSequenceClassification"],
+            "model_type": "deberta-v2",
+            "num_labels": 1,
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported reranker model type"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_embedding_checkpoint_as_reranker(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertModel"],
+            "model_type": "bert",
+        }
+        with (
+            patch.object(reranker_loader, "get_model_path", return_value=Path("model")),
+            patch.object(reranker_loader, "load_config", return_value=config),
+            self.assertRaisesRegex(ValueError, "sequence-classification checkpoints"),
+        ):
+            reranker_loader.load_reranker("embedding-model")
+
+
 class TestBert(unittest.TestCase):
     def test_bert_embedding_forward(self):
         from mlx_vlm.models import bert
@@ -14010,6 +14114,52 @@ class TestBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_bert_sequence_classification_forward(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+            token_type_ids=mx.zeros((2, 5), dtype=mx.int32),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_bert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "bert.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "bert.pooler.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("pooler.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestXLMRoberta(unittest.TestCase):
@@ -14036,6 +14186,51 @@ class TestXLMRoberta(unittest.TestCase):
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
 
+    def test_xlm_roberta_sequence_classification_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(2, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_xlm_roberta_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "roberta.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "classifier.dense.weight": mx.zeros((32, 32)),
+                "classifier.out_proj.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("classifier.dense.weight", weights)
+        self.assertIn("classifier.out_proj.weight", weights)
+
 
 class TestModernBert(unittest.TestCase):
     def test_modernbert_embedding_forward(self):
@@ -14061,6 +14256,52 @@ class TestModernBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_modernbert_sequence_classification_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+            classifier_pooling="mean",
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 6))),
+            attention_mask=mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]]),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_modernbert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=48,
+            num_attention_heads=4,
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "model.embeddings.tok_embeddings.weight": mx.zeros((99, 32)),
+                "head.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.tok_embeddings.weight", weights)
+        self.assertIn("head.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestQwen3Embedding(unittest.TestCase):
