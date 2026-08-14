@@ -590,6 +590,7 @@ class APCStats:
     hits: int = 0
     misses: int = 0
     reuse_outcomes: Dict[str, int] = field(default_factory=dict)
+    store_outcomes: Dict[str, int] = field(default_factory=dict)
     matched_tokens: int = 0
     served_tokens: int = 0
     evictions: int = 0
@@ -623,6 +624,7 @@ class APCStats:
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
             "reuse_outcomes": dict(self.reuse_outcomes),
+            "store_outcomes": dict(self.store_outcomes),
             "stores": self.stores,
             "disk_hits": self.disk_hits,
             "disk_writes": self.disk_writes,
@@ -2986,6 +2988,10 @@ class APCManager:
             counts = self.stats.reuse_outcomes
             counts[outcome] = counts.get(outcome, 0) + 1
 
+    def _record_store_outcome_locked(self, outcome: str) -> None:
+        counts = self.stats.store_outcomes
+        counts[outcome] = counts.get(outcome, 0) + 1
+
     # ---------- Public API ----------
     def lookup_exact_cache(
         self,
@@ -3410,6 +3416,7 @@ class APCManager:
                         i,
                         n_full,
                     )
+                    self._record_store_outcome_locked(StoreOutcome.TENSOR_LIMIT)
                     if self.disk is None:
                         break
                     parent = h
@@ -3421,6 +3428,7 @@ class APCManager:
                         i,
                         n_full,
                     )
+                    self._record_store_outcome_locked(StoreOutcome.POOL_EXHAUSTED)
                     if self.disk is None:
                         break
                     parent = h
@@ -3443,6 +3451,7 @@ class APCManager:
                 self.hash_table[h] = b
                 new_blocks.append(b)
                 self.stats.stores += 1
+                self._record_store_outcome_locked(StoreOutcome.STORED)
                 self.stats.served_tokens += self.block_size
                 parent = h
             if self.disk is not None and disk_blocks:
@@ -4158,6 +4167,12 @@ def model_apc_mode(language_model: Any) -> Optional[str]:
 
 def model_supports_apc(language_model: Any) -> bool:
     return model_apc_mode(language_model) is not None
+
+
+class StoreOutcome:
+    STORED = "stored"
+    POOL_EXHAUSTED = "pool_exhausted"
+    TENSOR_LIMIT = "tensor_limit"
 
 
 class ReuseOutcome:

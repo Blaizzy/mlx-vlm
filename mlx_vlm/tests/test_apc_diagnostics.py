@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from mlx_vlm.apc import APCManager, ReuseOutcome, apc_lookup_decision, apc_lookup_plan
+from mlx_vlm.apc import (
+    APCManager,
+    ReuseOutcome,
+    StoreOutcome,
+    apc_lookup_decision,
+    apc_lookup_plan,
+)
 
 BLOCK = 16
 LAYERS, HEADS, DIM = 2, 2, 8
@@ -108,3 +114,33 @@ def test_plan_helper_still_returns_a_plan_or_none():
 
     assert plan is None
     assert manager.stats_snapshot()["reuse_outcomes"]
+
+
+def test_store_outcomes_count_successful_stores():
+    manager = APCManager(num_blocks=8, block_size=BLOCK)
+    tokens = list(range(4 * BLOCK))
+    keys, values = _kv(len(tokens))
+
+    manager.release(manager.store_kv_blocks(tokens, keys, values))
+
+    counts = manager.stats_snapshot()["store_outcomes"]
+    assert counts[StoreOutcome.STORED] == 4
+
+
+def test_store_outcomes_expose_an_exhausted_pool():
+    manager = APCManager(num_blocks=2, block_size=BLOCK)
+    tokens = list(range(6 * BLOCK))
+    keys, values = _kv(len(tokens))
+
+    manager.store_kv_blocks(tokens, keys, values)
+
+    counts = manager.stats_snapshot()["store_outcomes"]
+    assert counts.get(StoreOutcome.POOL_EXHAUSTED, 0) > 0
+
+
+def test_store_and_reuse_outcomes_are_separate_counters():
+    manager = APCManager(num_blocks=8, block_size=BLOCK)
+    snapshot = manager.stats_snapshot()
+
+    assert snapshot["store_outcomes"] == {}
+    assert snapshot["reuse_outcomes"] == {}
