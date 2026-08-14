@@ -1259,3 +1259,48 @@ def test_resident_budget_never_evicts_a_held_block():
     manager.release(stored)
     manager._shrink_to_resident_budget_locked()
     assert manager.resident_bytes() == 0
+
+
+def _exact_entry_cache(tokens):
+    from mlx_vlm.models.cache import ArraysCache
+
+    c = ArraysCache(size=1)
+    c[0] = mx.zeros((1, 4, len(tokens), 32))
+    return [c]
+
+
+def test_exact_cache_respects_its_byte_budget():
+    manager = APCManager(num_blocks=8, block_size=16)
+    manager._max_exact_bytes = 0
+    for i in range(4):
+        tokens = list(range(100 + i))
+        manager.store_exact_cache(tokens, _exact_entry_cache(tokens))
+    unbounded = manager.exact_cache_bytes()
+    assert len(manager._exact_cache) == 4
+
+    manager._max_exact_bytes = unbounded // 2
+    manager._shrink_exact_cache_locked()
+
+    assert manager.exact_cache_bytes() <= unbounded // 2
+    assert manager.stats.exact_budget_evictions > 0
+
+
+def test_exact_cache_budget_keeps_at_least_one_entry():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(100))
+    manager.store_exact_cache(tokens, _exact_entry_cache(tokens))
+
+    manager._max_exact_bytes = 1
+    manager._shrink_exact_cache_locked()
+
+    assert len(manager._exact_cache) == 1
+
+
+def test_exact_cache_entries_record_their_size():
+    manager = APCManager(num_blocks=8, block_size=16)
+    tokens = list(range(100))
+    manager.store_exact_cache(tokens, _exact_entry_cache(tokens))
+
+    entry = next(iter(manager._exact_cache.values()))
+    assert entry.nbytes > 0
+    assert manager.exact_cache_bytes() == entry.nbytes

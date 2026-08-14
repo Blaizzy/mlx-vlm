@@ -531,6 +531,13 @@ class APCBlock(APCNode):
         return self.ref_cnt
 
 
+def _prompt_cache_bytes(prompt_cache: Sequence[Any]) -> int:
+    arrays: List[mx.array] = []
+    for entry in prompt_cache:
+        _collect_mx_arrays(getattr(entry, "state", None), arrays)
+    return sum(a.nbytes for a in arrays)
+
+
 @dataclass
 class APCExactCacheEntry:
     """Exact-prefix prompt-cache snapshot for custom cache layouts."""
@@ -539,6 +546,7 @@ class APCExactCacheEntry:
     extra_hash: int
     prompt_cache: List[Any]
     last_used: float
+    nbytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -593,6 +601,7 @@ class APCStats:
     served_tokens: int = 0
     evictions: int = 0
     budget_evictions: int = 0
+    exact_budget_evictions: int = 0
     stores: int = 0
     pool_used: int = 0
     disk_hits: int = 0
@@ -623,6 +632,7 @@ class APCStats:
             "token_hit_rate": hit_rate,
             "evictions": self.evictions,
             "budget_evictions": self.budget_evictions,
+            "exact_budget_evictions": self.exact_budget_evictions,
             "stores": self.stores,
             "disk_hits": self.disk_hits,
             "disk_writes": self.disk_writes,
@@ -2873,6 +2883,9 @@ class APCManager:
         self._max_resident_bytes = int(
             float(os.environ.get("APC_MAX_RESIDENT_GB", "0")) * (1 << 30)
         )
+        self._max_exact_bytes = int(
+            float(os.environ.get("APC_EXACT_MAX_GB", "2.0")) * (1 << 30)
+        )
         stride = max(block_size, int(os.environ.get("APC_STATE_STRIDE", "512")))
         self.state_stride = ((stride + block_size - 1) // block_size) * block_size
         self.exact_checkpoint_limit = max(
@@ -2988,6 +3001,20 @@ class APCManager:
     def resident_bytes(self) -> int:
         with self.lock:
             return self._resident_bytes_locked()
+
+    def exact_cache_bytes(self) -> int:
+        with self.lock:
+            return sum(e.nbytes for e in self._exact_cache.values())
+
+    def _shrink_exact_cache_locked(self) -> None:
+        limit = self._max_exact_bytes
+        if limit <= 0:
+            return
+        resident = sum(e.nbytes for e in self._exact_cache.values())
+        while resident > limit and len(self._exact_cache) > 1:
+            _, evicted = self._exact_cache.popitem(last=False)
+            resident -= evicted.nbytes
+            self.stats.exact_budget_evictions += 1
 
     def _shrink_to_resident_budget_locked(self) -> None:
         limit = self._max_resident_bytes
@@ -3181,10 +3208,12 @@ class APCManager:
                     extra_hash=int(extra_hash),
                     prompt_cache=copied,
                     last_used=time.time(),
+                    nbytes=_prompt_cache_bytes(copied),
                 )
                 self._exact_cache.move_to_end(key)
                 while len(self._exact_cache) > self._exact_cache_max:
                     self._exact_cache.popitem(last=False)
+                self._shrink_exact_cache_locked()
                 stored = True
         if stored:
             apc_trace(
