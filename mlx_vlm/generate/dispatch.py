@@ -867,7 +867,7 @@ def stream_generate(
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
     if apc_manager is not None and reused_prefix_len == 0:
-        plan = _apc.apc_lookup_plan(
+        decision = _apc.apc_lookup_decision(
             apc_manager,
             full_input_ids_list,
             extra_hash=apc_extra_hash,
@@ -876,6 +876,14 @@ def stream_generate(
             suffix_is_text_only=_apc_suffix_is_text_only,
             prefix_has_media=_apc_prefix_has_media_tokens,
         )
+        logger.debug(
+            "APC %s mode=%s prompt=%d prefix=%d",
+            decision.outcome,
+            apc_mode,
+            len(full_input_ids_list),
+            decision.prefix_len,
+        )
+        plan = decision.plan
         if plan is not None:
             plen = plan["prefix_len"]
             warm_cache = plan.get("warm_cache")

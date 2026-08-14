@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from mlx_vlm import apc as _apc_module
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
     BatchGenerationResult,
@@ -2023,7 +2024,13 @@ def test_stream_generate_excludes_prepared_sequence_tensors_from_apc_hash():
         patch.object(
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
-        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(
+            dispatch_module._apc,
+            "apc_lookup_decision",
+            return_value=_apc_module.PrefixDecision(
+                None, _apc_module.ReuseOutcome.NO_STORED_PREFIX
+            ),
+        ),
         patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
@@ -2065,7 +2072,13 @@ def test_stream_generate_hashes_explicit_sequence_tensors_for_apc_safety():
         patch.object(
             dispatch_module._apc, "semantic_extra_hash", side_effect=capture_hash
         ),
-        patch.object(dispatch_module._apc, "apc_lookup_plan", return_value=None),
+        patch.object(
+            dispatch_module._apc,
+            "apc_lookup_decision",
+            return_value=_apc_module.PrefixDecision(
+                None, _apc_module.ReuseOutcome.NO_STORED_PREFIX
+            ),
+        ),
         patch.object(dispatch_module.cache, "make_prompt_cache", return_value=[]),
         patch.object(
             dispatch_module, "wired_limit", return_value=contextlib.nullcontext()
