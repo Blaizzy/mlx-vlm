@@ -1119,6 +1119,19 @@ class BatchKVCache(_BaseCache):
         cache.offset = cache.keys.shape[2]
         return cache
 
+    def extract_view(self, idx):
+        """Borrow one row for synchronous exact-cache serialization."""
+        if self.keys is None:
+            return KVCache()
+        if self.keys.shape[0] != 1 or int(idx) != 0:
+            return self.extract(idx)
+        cache = KVCache()
+        padding = max(0, int(self.left_padding[0].item()))
+        cache.keys = self.keys[:, :, padding : self._idx]
+        cache.values = self.values[:, :, padding : self._idx]
+        cache.offset = cache.keys.shape[2]
+        return cache
+
     @classmethod
     def merge(cls, caches):
         lengths = [c.size() for c in caches]

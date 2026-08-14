@@ -625,6 +625,69 @@ class TestBatchGenerator:
         assert prompt_responses[0].prompt_time == pytest.approx(0.2)
         assert prompt_responses[0].cached_tokens == 0
 
+    @pytest.mark.parametrize("disk_only", [True, False])
+    def test_finished_generation_releases_cache_before_next_prompt(
+        self, mock_model, mock_processor, monkeypatch, disk_only
+    ):
+        # Forcing the release costs a stop-the-world collection, so it is
+        # limited to disk-only APC, where restoring a long prefix allocates
+        # before the finished batch would otherwise be reclaimed.
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+        )
+        # BatchGenerator stores this as `apc_manager`; setting the private
+        # name instead would create an attribute the code never reads and the
+        # test would pass against a broken lookup.
+        assert hasattr(gen, "apc_manager")
+        gen.apc_manager = SimpleNamespace(disk_only=disk_only)
+
+        class FinishingBatch:
+            def __init__(self):
+                self.active = True
+                self.prompt_cache = [object()]
+
+            def __len__(self):
+                return int(self.active)
+
+            def next(self):
+                self.active = False
+                return ["done"]
+
+        class EmptyBatch:
+            prompt_cache = []
+
+            def __len__(self):
+                return 0
+
+        empty = EmptyBatch()
+        gen._generation_batch = FinishingBatch()
+        monkeypatch.setattr(
+            ar_module.GenerationBatch,
+            "empty",
+            lambda *args, **kwargs: empty,
+        )
+        clear_cache = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "clear_cache", clear_cache)
+        synchronize = MagicMock()
+        monkeypatch.setattr(ar_module.mx, "synchronize", synchronize)
+        collect = MagicMock()
+        monkeypatch.setattr(ar_module.gc, "collect", collect)
+
+        prompt_responses, generation_responses = gen._next()
+
+        assert prompt_responses == []
+        assert generation_responses == ["done"]
+        assert gen._generation_batch is empty
+        if disk_only:
+            synchronize.assert_called_once_with(gen._stream)
+            collect.assert_called_once()
+            clear_cache.assert_called_once()
+        else:
+            synchronize.assert_not_called()
+            collect.assert_not_called()
+            clear_cache.assert_not_called()
+
     def test_prompt_progress_reports_apc_cached_tokens(self):
         batch = PromptProcessingBatch(
             model=SimpleNamespace(),

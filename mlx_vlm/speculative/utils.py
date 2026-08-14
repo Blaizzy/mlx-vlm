@@ -3,7 +3,6 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..models import cache
 from .common import (
     _dflash_block_total,
     _format_speculative_stats,
@@ -114,8 +113,14 @@ def make_speculative_prompt_cache(
     left_padding,
     make_cache: Callable,
 ):
-    if batch_size == 1:
-        return cache.make_prompt_cache(lm)
+    del draft_kind, batch_size
+    # `make_cache` is what honours --kv-bits. Single-row speculation used to
+    # take `cache.make_prompt_cache` instead, which silently produced
+    # unquantized KV: a 32K context cost ~8.4GB of fp16 cache where 4-bit
+    # TurboQuant needs ~2.1GB. The batch caches satisfy the speculative
+    # rollback contract (`is_trimmable`/`trim`/`zero_row_tail`), which is why
+    # the multi-row path already used them. This covers every drafter that
+    # routes through here, DFlash included.
     return make_cache(lm, left_padding)
 
 

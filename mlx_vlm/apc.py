@@ -690,10 +690,86 @@ def _safetensors_dtype_info(dtype: str):
     if dtype == "BF16":
         return np.dtype("<u2"), mx.uint16, mx.bfloat16
     mapping = {
+        "U32": (np.dtype("<u4"), mx.uint32, None),
         "F16": (np.dtype("<f2"), mx.float16, None),
         "F32": (np.dtype("<f4"), mx.float32, None),
     }
     return mapping.get(dtype)
+
+
+def _encode_turboquant_state(
+    value: Any,
+    tensor_name: str,
+    arrays: Dict[str, mx.array],
+) -> dict:
+    """Describe a packed TurboQuant state without dequantizing it."""
+    if isinstance(value, mx.array):
+        arrays[tensor_name] = value
+        return {"kind": "array", "name": tensor_name}
+    if value is None:
+        return {"kind": "none"}
+    if isinstance(value, tuple):
+        fields = getattr(type(value), "_fields", None)
+        children = [
+            _encode_turboquant_state(item, f"{tensor_name}_{idx}", arrays)
+            for idx, item in enumerate(value)
+        ]
+        if fields is not None:
+            return {
+                "kind": "namedtuple",
+                "type": type(value).__name__,
+                "items": children,
+            }
+        return {"kind": "tuple", "items": children}
+    raise TypeError(f"unsupported TurboQuant state value: {type(value).__name__}")
+
+
+def _decode_turboquant_state(
+    descriptor: dict,
+    path: Path,
+    tensor_entries: dict,
+    data_start: int,
+    eval_targets: List[mx.array],
+) -> Any:
+    """Rebuild a packed TurboQuant state written by
+    :func:`_encode_turboquant_state`."""
+    kind = descriptor.get("kind")
+    if kind == "none":
+        return None
+    if kind == "array":
+        entry = tensor_entries.get(descriptor.get("name"))
+        if entry is None:
+            raise ValueError("missing TurboQuant tensor")
+        value = _read_safetensors_tensor(path, data_start, entry)
+        if value is None:
+            raise ValueError("unreadable TurboQuant tensor")
+        eval_targets.append(value)
+        return value
+
+    items = [
+        _decode_turboquant_state(item, path, tensor_entries, data_start, eval_targets)
+        for item in descriptor.get("items", [])
+    ]
+    if kind == "tuple":
+        return tuple(items)
+    if kind == "namedtuple":
+        from . import turboquant as tq
+
+        state_types = {
+            cls.__name__: cls
+            for cls in (
+                tq.TurboQuantMSEState,
+                tq.TurboQuantProdState,
+                tq.TurboQuantPolarState,
+                tq.TurboQuantPolarProdState,
+                tq.TurboQuantSplitState,
+            )
+        }
+        state_type = state_types.get(descriptor.get("type"))
+        if state_type is None:
+            raise ValueError("unknown TurboQuant state type")
+        return state_type(*items)
+    raise ValueError("invalid TurboQuant state descriptor")
 
 
 def _safetensors_tensor_bounds(
@@ -1410,6 +1486,45 @@ class DiskBlockStore:
         from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
+        if kind == "turboquant_kv":
+            from .turboquant import TurboQuantKVCache
+
+            try:
+                offset = int(metadata.get(f"{prefix}_offset", "0"))
+                bits = float(metadata[f"{prefix}_bits"])
+                seed = int(metadata.get(f"{prefix}_seed", "0"))
+                # Snapshots written before per-tensor widths existed carry only
+                # the combined budget; None lets the cache re-derive the split.
+                key_bits = metadata.get(f"{prefix}_key_bits")
+                value_bits = metadata.get(f"{prefix}_value_bits")
+                key_bits = float(key_bits) if key_bits is not None else None
+                value_bits = float(value_bits) if value_bits is not None else None
+                key_descriptor = json.loads(metadata[f"{prefix}_keys"])
+                value_descriptor = json.loads(metadata[f"{prefix}_values"])
+                keys = _decode_turboquant_state(
+                    key_descriptor,
+                    path,
+                    tensor_entries,
+                    data_start,
+                    eval_targets,
+                )
+                values = _decode_turboquant_state(
+                    value_descriptor,
+                    path,
+                    tensor_entries,
+                    data_start,
+                    eval_targets,
+                )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
+            cache = TurboQuantKVCache(
+                bits=bits, seed=seed, key_bits=key_bits, value_bits=value_bits
+            )
+            cache.keys = keys
+            cache.values = values
+            cache.offset = offset
+            return cache
+
         if kind == "kv":
             if metadata.get(f"{prefix}_empty", "0") == "1":
                 c = lm_cache.KVCache()
@@ -2417,6 +2532,35 @@ class DiskBlockStore:
         )
         self._enqueue_exact_snapshot(snapshot)
 
+    def save_exact_cache_sync(
+        self,
+        cache_hash: int,
+        token_ids: Sequence[int],
+        extra_hash: int,
+        prompt_cache: Sequence[Any],
+    ) -> None:
+        """Write an exact snapshot before returning to the decode path.
+
+        SSD-only APC uses borrowed views of the live prompt cache instead of
+        cloning a second full prefix. The views are stable only until decode
+        resumes, so this deliberately bypasses the asynchronous queue.
+        """
+        token_tuple = tuple(int(t) for t in token_ids)
+        if not token_tuple or not prompt_cache:
+            return
+        snapshot = _DiskExactCacheSnapshot(
+            cache_hash=int(cache_hash),
+            token_ids=token_tuple,
+            extra_hash=int(extra_hash),
+            prompt_cache=list(prompt_cache),
+        )
+        path = self._shard_path(self._exact_id_for(int(cache_hash)))
+        if path.exists():
+            with self._index_lock:
+                self._exact_index.setdefault(int(cache_hash), path)
+            return
+        self._write_exact_cache_snapshot(path, snapshot)
+
     def save_layer_major_blocks(
         self,
         blocks: List[_DiskLayerMajorBlock],
@@ -2566,6 +2710,25 @@ class DiskBlockStore:
         metadata: dict[str, str],
     ) -> bool:
         from .models import cache as lm_cache
+        from .turboquant import TurboQuantKVCache
+
+        if isinstance(c, TurboQuantKVCache):
+            metadata[f"{prefix}_kind"] = "turboquant_kv"
+            metadata[f"{prefix}_offset"] = str(int(c.offset))
+            metadata[f"{prefix}_bits"] = str(float(c.bits))
+            # Keys and values can carry different widths. Recording only the
+            # combined budget would rebuild the codecs at the default split
+            # and decode the snapshot against the wrong one.
+            metadata[f"{prefix}_key_bits"] = str(float(c.key_bits))
+            metadata[f"{prefix}_value_bits"] = str(float(c.value_bits))
+            metadata[f"{prefix}_seed"] = str(int(c.seed))
+            metadata[f"{prefix}_keys"] = json.dumps(
+                _encode_turboquant_state(c.keys, f"{prefix}_k", arrays)
+            )
+            metadata[f"{prefix}_values"] = json.dumps(
+                _encode_turboquant_state(c.values, f"{prefix}_v", arrays)
+            )
+            return True
 
         if isinstance(c, lm_cache.KVCache):
             off = int(getattr(c, "offset", 0) or 0)
@@ -2852,6 +3015,7 @@ class APCManager:
         num_blocks: int = DEFAULT_NUM_BLOCKS,
         block_size: int = DEFAULT_BLOCK_SIZE,
         disk: Optional["DiskBlockStore"] = None,
+        disk_only: bool = False,
     ):
         self.block_size = block_size
         self.num_blocks = num_blocks
@@ -2865,8 +3029,11 @@ class APCManager:
         self.stats = APCStats()
         self.lock = threading.RLock()
         self.disk = disk
-        self._exact_cache_max = max(
-            0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2"))
+        self.disk_only = bool(disk_only and disk is not None)
+        self._exact_cache_max = (
+            0
+            if self.disk_only
+            else max(0, int(os.environ.get("APC_EXACT_CACHE_ENTRIES", "2")))
         )
         self.exact_cache_guard_tokens = max(
             1, int(os.environ.get("APC_EXACT_PREFIX_GUARD_TOKENS", "16"))
@@ -2876,7 +3043,13 @@ class APCManager:
         # request still serves correctly — it just doesn't get the warm-
         # disk speed-up. Disabled when set to 0.
         self._disk_min_free_ram_bytes = int(
-            float(os.environ.get("APC_DISK_MIN_FREE_RAM_GB", "2.0")) * (1 << 30)
+            float(
+                os.environ.get(
+                    "APC_DISK_MIN_FREE_RAM_GB",
+                    "0" if self.disk_only else "2.0",
+                )
+            )
+            * (1 << 30)
         )
         # Number of disk-loaded blocks to coalesce per ``mx.eval`` during
         # warm-disk restore. The disk read itself is always serial (no
@@ -3041,6 +3214,11 @@ class APCManager:
                 can_try_disk = False
 
         if can_try_disk and disk is not None:
+            if self.disk_only:
+                # Drop allocator scratch left by the previous request before
+                # materializing the one cache that will become this request's
+                # active KV state.
+                mx.clear_cache()
             disk_match = disk.find_exact_prefix(
                 token_tuple,
                 extra_hash=extra_hash,
@@ -3051,7 +3229,12 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
-                    min_capacity_tokens=len(token_tuple) + 1,
+                    # Growing the one unquantized tail layer on demand is much
+                    # cheaper than preallocating its full long-context suffix
+                    # before multimodal prefill has released its temporaries.
+                    min_capacity_tokens=(
+                        None if self.disk_only else len(token_tuple) + 1
+                    ),
                 )
                 if loaded is not None:
                     stored_tokens, stored_extra_hash, prompt_cache = loaded
@@ -3129,6 +3312,32 @@ class APCManager:
         if (self._exact_cache_max <= 0 and self.disk is None) or not token_ids:
             return False
         token_tuple = tuple(int(t) for t in token_ids)
+        key = _sequence_hash(token_tuple, extra_hash, self.block_size)
+
+        if self.disk_only and self.disk is not None:
+            try:
+                self.disk.save_exact_cache_sync(
+                    key, token_tuple, extra_hash, prompt_cache
+                )
+            except Exception as e:
+                logger.warning("APC exact synchronous disk save failed: %s", e)
+                return False
+            finally:
+                # mx.save_safetensors may stage contiguous serialization
+                # buffers. They are never part of the persistent APC tier.
+                mx.clear_cache()
+            with self.lock:
+                self.stats.disk_writes += 1
+                self.stats.exact_stores += 1
+            apc_trace(
+                "store",
+                mode="exact_disk_only",
+                ok=True,
+                token_len=len(token_tuple),
+                layers=len(prompt_cache),
+            )
+            return True
+
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
@@ -3145,7 +3354,6 @@ class APCManager:
                     token_len=len(token_tuple),
                 )
             return False
-        key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
         with self.lock:
             if self._exact_cache_max > 0:
@@ -3844,6 +4052,37 @@ def _merge_exact_cache_entries(
     prefix_lens: Sequence[int],
 ) -> Any:
     """Merge single-row exact snapshots via the registered cache adapter."""
+    from .turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+    if entries and all(isinstance(entry, TurboQuantKVCache) for entry in entries):
+        first = entries[0]
+        if any(
+            entry.bits != first.bits
+            or entry.seed != first.seed
+            or entry.key_bits != first.key_bits
+            or entry.value_bits != first.value_bits
+            for entry in entries
+        ):
+            return None
+        merged: Optional[BatchTurboQuantKVCache] = None
+        for entry in entries:
+            row = BatchTurboQuantKVCache(
+                [0],
+                bits=entry.bits,
+                seed=entry.seed,
+                key_bits=entry.key_bits,
+                value_bits=entry.value_bits,
+            )
+            row.keys = entry.keys
+            row.values = entry.values
+            row._idx = int(entry.offset)
+            row.offset = mx.array([int(entry.offset)])
+            if merged is None:
+                merged = row
+            else:
+                merged.extend(row)
+        return merged
+
     from .apc_adapters import merge_cache_entries
 
     return merge_cache_entries(entries, prefix_lens)
@@ -3957,19 +4196,26 @@ def make_warm_batch_exact_cache_multi(
 def extract_prompt_cache_from_batch(
     batch_caches: Sequence[Any],
     batch_idx: int,
+    *,
+    detach: bool = True,
 ) -> Optional[List[Any]]:
     """Extract one row from batch-aware caches as single-row cache objects."""
 
     out: List[Any] = []
     eval_targets: List[mx.array] = []
     for c in batch_caches:
-        extract = getattr(c, "extract", None)
+        extract = (
+            getattr(c, "extract", None)
+            if detach
+            else getattr(c, "extract_view", getattr(c, "extract", None))
+        )
         if not callable(extract):
             return None
         extracted = extract(batch_idx)
         out.append(extracted)
-        _collect_mx_arrays(extracted.state, eval_targets)
-    if eval_targets:
+        if detach:
+            _collect_mx_arrays(extracted.state, eval_targets)
+    if detach and eval_targets:
         mx.eval(eval_targets)
     return out
 
@@ -3986,6 +4232,7 @@ def snapshot_prompt_cache_row(
     batch_idx: int = 0,
     *,
     min_capacity_tokens: Optional[int] = None,
+    detach: bool = True,
 ) -> Optional[List[Any]]:
     """Row-normalize a prompt cache for APC store/lookup.
 
@@ -3997,10 +4244,12 @@ def snapshot_prompt_cache_row(
         return []
     source: Sequence[Any] = caches
     if _prompt_cache_is_batch_shaped(caches):
-        row = extract_prompt_cache_from_batch(caches, batch_idx)
+        row = extract_prompt_cache_from_batch(caches, batch_idx, detach=detach)
         if row is None:
             return None
         source = row
+    if not detach:
+        return list(source)
     return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
 
 
@@ -4445,10 +4694,16 @@ def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
     if os.environ.get("APC_ENABLED", "0") not in ("1", "true", "True", "yes"):
         return None
     block_size = int(os.environ.get("APC_BLOCK_SIZE", DEFAULT_BLOCK_SIZE))
-    num_blocks = int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+    disk_only = _env_truthy("APC_DISK_ONLY")
+    num_blocks = (
+        0 if disk_only else int(os.environ.get("APC_NUM_BLOCKS", DEFAULT_NUM_BLOCKS))
+    )
 
     disk: Optional[DiskBlockStore] = None
     disk_path = os.environ.get("APC_DISK_PATH")
+    if disk_only and not disk_path:
+        logger.warning("APC disabled: APC_DISK_ONLY=1 requires APC_DISK_PATH")
+        return None
     if disk_path:
         ns = model_namespace or os.environ.get("APC_DISK_NAMESPACE", "default")
         max_gb = float(os.environ.get("APC_DISK_MAX_GB", 0))
@@ -4472,11 +4727,21 @@ def from_env(model_namespace: Optional[str] = None) -> Optional[APCManager]:
         except Exception as e:
             logger.warning("APC disk tier disabled (init failed): %s", e)
 
+    if disk_only and disk is None:
+        logger.warning("APC disabled: SSD-only tier failed to initialize")
+        return None
+
     logger.info(
-        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s)",
+        "APC enabled (block_size=%d, num_blocks=%d, hash=%s, disk=%s, " "disk_only=%s)",
         block_size,
         num_blocks,
         "sha256" if _hash_use_sha256() else "fast",
         bool(disk),
+        disk_only,
     )
-    return APCManager(num_blocks=num_blocks, block_size=block_size, disk=disk)
+    return APCManager(
+        num_blocks=num_blocks,
+        block_size=block_size,
+        disk=disk,
+        disk_only=disk_only,
+    )

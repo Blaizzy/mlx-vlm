@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import gc
 import logging
 import os
 import sys
@@ -1829,7 +1830,12 @@ class PromptProcessingBatch:
         return prefix_len + min(self._suffix_lens[batch_idx], max(0, real_done))
 
     def _apc_prompt_cache_for_store(self, batch_idx: int) -> Optional[List[Any]]:
-        return _apc.snapshot_prompt_cache_row(self.prompt_cache, batch_idx)
+        disk_only = bool(self._apc_manager is not None and self._apc_manager.disk_only)
+        return _apc.snapshot_prompt_cache_row(
+            self.prompt_cache,
+            batch_idx,
+            detach=not disk_only,
+        )
 
     def _store_apc_exact_checkpoints(self) -> None:
         if self._apc_manager is None or self._apc_mode != "exact":
@@ -2080,13 +2086,21 @@ class PromptProcessingBatch:
                     if meta is None:
                         continue
                     if self._apc_mode == "exact":
-                        prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
-                        if prompt_cache is not None:
-                            self._apc_manager.store_exact_cache(
-                                meta["full_input_ids"],
-                                prompt_cache,
-                                extra_hash=meta.get("extra_hash", 0),
-                            )
+                        # Disk-only exact APC already persisted the guarded
+                        # checkpoint during chunked prefill. Writing the full
+                        # prompt here duplicates essentially the whole long
+                        # context while buying only the final guard tokens.
+                        if not (
+                            getattr(self._apc_manager, "disk_only", False)
+                            and meta.get("checkpoint_done")
+                        ):
+                            prompt_cache = self._apc_prompt_cache_for_store(batch_idx)
+                            if prompt_cache is not None:
+                                self._apc_manager.store_exact_cache(
+                                    meta["full_input_ids"],
+                                    prompt_cache,
+                                    extra_hash=meta.get("extra_hash", 0),
+                                )
                         self._apc_manager.release(meta.get("apc_blocks", []))
                     else:
                         _apc.commit_prefix_blocks(
@@ -2697,6 +2711,27 @@ class BatchGenerator:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
             self._steps_counter += 1
+            if len(self._generation_batch) == 0:
+                # A finished speculative batch still owns its prompt cache.
+                # Release it before admitting the next multimodal prompt;
+                # otherwise the old long-context KV overlaps with the next
+                # request's vision/prompt temporaries until prefill completes.
+                self._generation_batch = GenerationBatch.empty(
+                    self.model,
+                    self.sampler,
+                    self.tokenizer.stopping_criteria,
+                    compute_logprobs=self.compute_logprobs,
+                    top_logprobs_k=self.top_logprobs_k,
+                    greedy_sampling=self.greedy_sampling,
+                )
+                if getattr(self.apc_manager, "disk_only", False):
+                    # Restoring a long prefix from disk allocates before the
+                    # old batch's cache would otherwise be collected, so force
+                    # the release here. The stop-the-world collection is not
+                    # worth imposing on runs that never restore.
+                    mx.synchronize(self._stream)
+                    gc.collect()
+                    mx.clear_cache()
             if (
                 self._cache_eval_interval > 0
                 and self._steps_counter % self._cache_eval_interval == 0

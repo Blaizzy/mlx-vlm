@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -661,6 +662,126 @@ def test_exact_cache_disk_restore_rebuilds_index(tmp_path, monkeypatch):
     manager.close()
 
 
+def test_exact_disk_only_turboquant_roundtrip_stays_packed(tmp_path):
+    from mlx_vlm.turboquant import (
+        BatchTurboQuantKVCache,
+        TurboQuantKVCache,
+        TurboQuantMSEState,
+    )
+
+    token_ids = list(range(40))
+    cache = TurboQuantKVCache(bits=4, seed=7)
+    cache.keys = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40),
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4),
+    )
+    cache.values = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40) + 1,
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4) + 2,
+    )
+    cache.offset = len(token_ids)
+    mx.eval(cache.state)
+
+    disk = DiskBlockStore(tmp_path, namespace="tq-disk-only")
+    manager = APCManager(
+        num_blocks=0,
+        block_size=16,
+        disk=disk,
+        disk_only=True,
+    )
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=5)
+    assert not manager._exact_cache
+    assert disk.num_exact_indexed == 1
+
+    restored, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=5)
+    assert matched == len(token_ids)
+    assert restored is not None
+    assert isinstance(restored[0], TurboQuantKVCache)
+    assert restored[0].bits == 4
+    assert restored[0].seed == 7
+    assert restored[0].offset == len(token_ids)
+    assert restored[0].keys.indices.dtype == mx.uint32
+    _assert_allclose(restored[0].keys.norms, cache.keys.norms)
+    assert bool(mx.array_equal(restored[0].keys.indices, cache.keys.indices).item())
+
+    warm, prefix_len = make_warm_batch_exact_cache_multi(
+        [restored],
+        [matched],
+        kv_quant_config={"bits": 4, "scheme": "turboquant"},
+    )
+    assert prefix_len == len(token_ids)
+    assert warm is not None
+    assert isinstance(warm[0], BatchTurboQuantKVCache)
+    assert warm[0]._idx == len(token_ids)
+    assert warm[0].keys.indices.dtype == mx.uint32
+    manager.close()
+
+
+def test_from_env_disk_only_has_no_memory_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("APC_ENABLED", "1")
+    monkeypatch.setenv("APC_DISK_ONLY", "1")
+    monkeypatch.setenv("APC_DISK_PATH", str(tmp_path))
+    monkeypatch.setenv("APC_NUM_BLOCKS", "999")
+    monkeypatch.setenv("APC_EXACT_CACHE_ENTRIES", "999")
+
+    manager = from_env("disk-only")
+    assert manager is not None
+    assert manager.disk_only is True
+    assert manager.num_blocks == 0
+    assert manager.pool == []
+    assert manager._exact_cache_max == 0
+    assert manager._disk_min_free_ram_bytes == 0
+    manager.close()
+
+
+def test_from_env_disk_only_requires_disk_path(monkeypatch):
+    monkeypatch.setenv("APC_ENABLED", "1")
+    monkeypatch.setenv("APC_DISK_ONLY", "1")
+    monkeypatch.delenv("APC_DISK_PATH", raising=False)
+
+    assert from_env("disk-only-no-path") is None
+
+
+def test_turboquant_extract_view_borrows_single_row_state():
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantMSEState
+
+    cache = BatchTurboQuantKVCache([0], bits=4, seed=7)
+    cache.keys = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40),
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4),
+    )
+    cache.values = TurboQuantMSEState(
+        mx.arange(40, dtype=mx.float16).reshape(1, 1, 40) + 1,
+        mx.arange(160, dtype=mx.uint32).reshape(1, 1, 40, 4) + 2,
+    )
+    cache._idx = 40
+    cache.offset = mx.array([40])
+    mx.eval(cache.state)
+
+    view = cache.extract_view(0)
+    assert view.offset == 40
+    assert view.keys.norms.shape == (1, 1, 40)
+    assert view.keys.indices.shape == (1, 1, 40, 4)
+    _assert_allclose(view.keys.norms, cache.keys.norms)
+    assert bool(mx.array_equal(view.keys.indices, cache.keys.indices).item())
+
+
+def test_batch_kv_extract_view_preserves_single_row_prefix():
+    from mlx_vlm.models.cache import BatchKVCache
+
+    cache = BatchKVCache([2])
+    cache.keys = mx.arange(48, dtype=mx.float16).reshape(1, 2, 6, 4)
+    cache.values = cache.keys + 1
+    cache._idx = 6
+    cache.offset = mx.array([4])
+
+    view = cache.extract_view(0)
+    assert view.offset == 4
+    assert view.keys.shape == (1, 2, 4, 4)
+    _assert_allclose(view.keys, cache.keys[:, :, 2:6])
+    _assert_allclose(view.values, cache.values[:, :, 2:6])
+
+
 def test_exact_cache_disk_restore_preserves_rotating_kv(tmp_path, monkeypatch):
     from mlx_vlm.models.cache import KVCache, RotatingKVCache
 
@@ -1180,4 +1301,133 @@ def test_exact_disk_hit_promotion_with_nonzero_extra_hash(tmp_path, monkeypatch)
     assert matched_wrong == 0
     assert warm_wrong is None
 
+    manager.close()
+
+
+def _disk_only_manager(tmp_path, namespace):
+    disk = DiskBlockStore(tmp_path, namespace=namespace)
+    return APCManager(num_blocks=0, block_size=16, disk=disk, disk_only=True), disk
+
+
+def test_disk_only_exact_cache_preserves_key_value_bits(tmp_path):
+    """A K/V split has to survive the snapshot.
+
+    Disk-only stores the packed quantized state, so recording only the
+    combined budget would rebuild the codecs at the default split and decode
+    against the wrong widths.
+    """
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    token_ids = list(range(32))
+    cache = TurboQuantKVCache(bits=4, key_bits=3, value_bits=8)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 64)),
+        mx.random.normal((1, 2, len(token_ids), 64)),
+    )
+    assert (cache.key_bits, cache.value_bits) != (cache.bits, cache.bits)
+
+    manager, disk = _disk_only_manager(tmp_path, "bits")
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=7)
+    disk._q.join()
+    manager.close()
+
+    manager, _ = _disk_only_manager(tmp_path, "bits")
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=7)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    restored = warm[0]
+    assert isinstance(restored, TurboQuantKVCache)
+    assert restored.bits == cache.bits
+    assert restored.key_bits == cache.key_bits
+    assert restored.value_bits == cache.value_bits
+    manager.close()
+
+
+def test_disk_only_exact_cache_reads_snapshots_without_split_bits(tmp_path):
+    """Snapshots predating per-tensor widths still load.
+
+    They carry only the combined budget, so the cache re-derives the split.
+    """
+    from mlx_vlm.turboquant import TurboQuantKVCache
+
+    token_ids = list(range(32))
+    cache = TurboQuantKVCache(bits=4)
+    cache.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 64)),
+        mx.random.normal((1, 2, len(token_ids), 64)),
+    )
+
+    manager, disk = _disk_only_manager(tmp_path, "legacy")
+    assert manager.store_exact_cache(token_ids, [cache], extra_hash=5)
+    disk._q.join()
+    manager.close()
+
+    # Strip the fields a pre-upgrade writer would not have produced.
+    shard = next(p for p in tmp_path.rglob("*.safetensors") if p.is_file())
+    raw = shard.read_bytes()
+    header_len = int.from_bytes(raw[:8], "little")
+    header = json.loads(raw[8 : 8 + header_len])
+    meta = header.get("__metadata__", {})
+    stripped = {
+        k: v for k, v in meta.items() if not k.endswith(("_key_bits", "_value_bits"))
+    }
+    assert len(stripped) < len(meta)
+    header["__metadata__"] = stripped
+    new_header = json.dumps(header).encode()
+    shard.write_bytes(
+        len(new_header).to_bytes(8, "little") + new_header + raw[8 + header_len :]
+    )
+
+    manager, _ = _disk_only_manager(tmp_path, "legacy")
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=5)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    assert isinstance(warm[0], TurboQuantKVCache)
+    assert warm[0].bits == cache.bits
+    manager.close()
+
+
+def test_disk_only_exact_cache_preserves_bits_through_batch_extract(tmp_path):
+    """The production path starts from a batch cache, not a single-row one.
+
+    Storing goes BatchTurboQuantKVCache -> extract_view() -> serializer, and a
+    view that rebuilt the row at the default split would hand the serializer
+    the wrong widths to record.
+    """
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+    token_ids = list(range(32))
+    batch = BatchTurboQuantKVCache([0], bits=4, key_bits=3, value_bits=8)
+    batch.update_and_fetch(
+        mx.random.normal((1, 2, len(token_ids), 64)),
+        mx.random.normal((1, 2, len(token_ids), 64)),
+    )
+
+    borrowed = batch.extract_view(0)
+    assert borrowed.key_bits == batch.key_bits
+    assert borrowed.value_bits == batch.value_bits
+
+    # Mirror the server: rows are borrowed, then handed to the store.
+    row = apc_module.snapshot_prompt_cache_row([batch], 0, detach=False)
+    assert row is not None
+
+    manager, disk = _disk_only_manager(tmp_path, "batch")
+    assert manager.store_exact_cache(token_ids, row, extra_hash=3)
+    disk._q.join()
+    manager.close()
+
+    manager, _ = _disk_only_manager(tmp_path, "batch")
+    warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=3)
+
+    assert matched == len(token_ids)
+    assert warm is not None
+    restored = warm[0]
+    assert isinstance(restored, TurboQuantKVCache)
+    assert (restored.bits, restored.key_bits, restored.value_bits) == (
+        batch.bits,
+        batch.key_bits,
+        batch.value_bits,
+    )
     manager.close()
