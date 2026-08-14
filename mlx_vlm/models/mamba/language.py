@@ -1,5 +1,3 @@
-# Copyright © 2024-2025 Apple Inc.
-
 import mlx.core as mx
 import mlx.nn as nn
 

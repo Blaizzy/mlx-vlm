@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 from functools import lru_cache
 from typing import Any, Optional
 

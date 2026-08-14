@@ -1,5 +1,3 @@
-# Copyright © 2026 Apple Inc.
-
 from functools import partial
 from typing import Any, List, Optional, Tuple
 

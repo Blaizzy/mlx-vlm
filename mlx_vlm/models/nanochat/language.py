@@ -1,5 +1,3 @@
-# Copyright © 2025 Apple Inc.
-
 import math
 from functools import partial
 from typing import Any, Optional

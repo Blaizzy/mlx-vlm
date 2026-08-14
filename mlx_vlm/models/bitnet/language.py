@@ -1,5 +1,3 @@
-# Copyright © 2023-2024 Apple Inc.
-
 from typing import Any, Optional
 
 import mlx.core as mx
