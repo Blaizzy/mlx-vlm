@@ -36,6 +36,12 @@ def _split_gate_up(v):
     return mx.contiguous(w[..., 0, :]), mx.contiguous(w[..., 1, :])
 
 
+def _to_mlx_conv(v):
+    if v.ndim == 3 and v.shape[-1] == 1:
+        return v
+    return v.transpose(0, 2, 1)
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -146,7 +152,7 @@ class Model(nn.Module):
             elif name in ("q_norm", "k_norm"):
                 out[base + f"self_attn.{name}.weight"] = v
             elif name in ("k_sconv", "v_sconv"):
-                out[base + f"self_attn.{name}.conv.weight"] = v.transpose(0, 2, 1)
+                out[base + f"self_attn.{name}.conv.weight"] = _to_mlx_conv(v)
             elif name == "rel_logits_proj":
                 out[base + "self_attn.rel_proj"] = v
             else:
@@ -156,9 +162,9 @@ class Model(nn.Module):
         elif sub == "mlp_norm.weight":
             out[base + "post_attention_layernorm.weight"] = v
         elif sub == "attn_sconv.weight":
-            out[base + "attn_sconv.conv.weight"] = v.transpose(0, 2, 1)
+            out[base + "attn_sconv.conv.weight"] = _to_mlx_conv(v)
         elif sub == "mlp_sconv.weight":
-            out[base + "mlp_sconv.conv.weight"] = v.transpose(0, 2, 1)
+            out[base + "mlp_sconv.conv.weight"] = _to_mlx_conv(v)
         elif sub.startswith("mlp."):
             m = sub[len("mlp.") :]
             p = base + "mlp."
@@ -180,6 +186,8 @@ class Model(nn.Module):
                 out[p + "up_proj.weight"] = u
             elif m == "w2_md.weight":
                 out[p + "down_proj.weight"] = v
+            elif m.startswith("experts."):
+                out[p + "switch_mlp." + m[len("experts.") :]] = v
             else:
                 out[p + m] = v
         else:
@@ -258,17 +266,17 @@ class Model(nn.Module):
             elif k.startswith("model.visual."):
                 sub = k[len("model.visual.") :]
                 if sub.startswith("layers.linear_"):
-                    j = sub[len("layers.linear_") :].split(".")[0]
-                    out[f"vision_tower.encoder_layers.{j}.projection.weight"] = v
+                    j, leaf = sub[len("layers.linear_") :].split(".", 1)
+                    out[f"vision_tower.encoder_layers.{j}.projection.{leaf}"] = v
                 elif sub.startswith("layers.norm_"):
-                    j = sub[len("layers.norm_") :].split(".")[0]
-                    out[f"vision_tower.encoder_layers.{j}.layer_norm.weight"] = v
+                    j, leaf = sub[len("layers.norm_") :].split(".", 1)
+                    out[f"vision_tower.encoder_layers.{j}.layer_norm.{leaf}"] = v
                 else:
                     out["vision_tower." + sub] = v
             elif k.startswith("model.audio."):
                 sub = k[len("model.audio.") :]
-                if sub == "encoder.weight":
-                    out["audio_tower.embed_audio_tokens.weight"] = v
+                if sub.startswith("encoder."):
+                    out["audio_tower.embed_audio_tokens." + sub[len("encoder.") :]] = v
                 elif sub == "final_norm.weight":
                     out["audio_tower.norm.weight"] = v
                 else:
@@ -277,6 +285,11 @@ class Model(nn.Module):
                 out[k] = v
         for i, buf in experts.items():
             out.update(self._map_experts(i, buf))
+        for k in [k for k in out if k.endswith("switch_mlp.gate_proj.weight")]:
+            p = k[: -len("gate_proj.weight")]
+            n = out[k].shape[0]
+            out.setdefault(p + "gate_scale", mx.ones((n,)))
+            out.setdefault(p + "out_scale", mx.ones((n,)))
         return fuse_qkvr(shared_experts_to_dense(out))
 
     def make_cache(self):

@@ -43,6 +43,8 @@ from .generation import (
     get_top_logprobs_k,
 )
 from .openai import register_routes as register_openai_routes
+from .reranking import ensure_chat_template as ensure_reranker_chat_template
+from .reranking import register_routes as register_reranking_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
@@ -90,6 +92,8 @@ def _cache_group_for_cache(cache: dict) -> str:
         return "audio"
     if model_kind == "embedding":
         return "embedding"
+    if model_kind == "reranker":
+        return "reranker"
     return "text_generation"
 
 
@@ -378,6 +382,12 @@ async def lifespan(app):
             "embedding",
             "embedding model",
         ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_RERANKER_MODEL", None),
+            None,
+            "reranker",
+            "reranker model",
+        ),
     )
     runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
@@ -497,6 +507,7 @@ def get_cached_model(
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
+    load_as_reranker = model_kind == "reranker"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -509,6 +520,9 @@ def get_cached_model(
     elif load_as_embedding:
         cache_group = "embedding"
         effective_model_kind = "embedding"
+    elif load_as_reranker:
+        cache_group = "reranker"
+        effective_model_kind = "reranker"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -702,6 +716,58 @@ def get_cached_model(
         registry.set(cache_group, cache)
         return model, processor, config
 
+    if load_as_reranker:
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Adapters are not supported for reranker models.",
+            )
+        logger.info("Loading reranker model: %s", model_path)
+        from ..utils import load
+
+        try:
+            model, processor = load(model_path)
+        except RepositoryNotFoundError as e:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Model not found: {model_path!r} is not a known "
+                    "Hugging Face repo or local path"
+                ),
+            ) from e
+        except (FileNotFoundError, ValueError) as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported reranker model: {e}"
+            ) from e
+        except Exception as e:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load reranker model: {e}"
+            ) from e
+        config = model.config
+        model_type = getattr(config, "model_type", None)
+        if model_type not in ("qwen3", "qwen3_vl"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported reranker model type: {model_type!r}.",
+            )
+        try:
+            ensure_reranker_chat_template(processor, model_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"Unsupported reranker model: {e}"
+            ) from e
+        cache = {
+            "cache_key": cache_key,
+            "model_path": model_path,
+            "adapter_path": None,
+            "model": model,
+            "processor": processor,
+            "config": config,
+            "model_kind": "reranker",
+        }
+        registry.set(cache_group, cache)
+        return model, processor, config
+
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
     vision_cache = VisionFeatureCache(max_size=vision_cache_size)
 
@@ -831,6 +897,7 @@ register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
+register_reranking_routes(inference_router, _protocol_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)
