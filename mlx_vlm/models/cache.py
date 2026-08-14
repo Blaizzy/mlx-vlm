@@ -343,6 +343,26 @@ class KVCache(_BaseCache):
         self.offset -= n
         return n
 
+    def extract(self, idx):
+        cache = KVCache()
+        if self.keys is None:
+            if idx not in (0, -1):
+                raise IndexError("KVCache row index out of range")
+            return cache
+
+        batch_size = int(self.keys.shape[0])
+        if idx < 0:
+            idx += batch_size
+        if idx < 0 or idx >= batch_size:
+            raise IndexError(
+                f"KVCache row index {idx} out of range for batch size {batch_size}"
+            )
+
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, : self.offset, :])
+        cache.offset = self.offset
+        return cache
+
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
         quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
         quant_cache.offset = self.offset
