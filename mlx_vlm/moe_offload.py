@@ -17,8 +17,7 @@ import glob
 import json
 import os
 import re
-import threading
-from collections import OrderedDict
+import shutil
 from typing import Optional, Tuple
 
 # stacked: switch_mlp.gate_proj.weight [E,out,in]; per-expert: experts.{j}.gate_proj.weight;
@@ -65,6 +64,25 @@ def plan(tensor_names) -> dict:
     return {"resident": sorted(resident), "experts": experts, "layers": sorted(experts)}
 
 
+def _check_disk_headroom(build: str, out: str, margin: float = 2.0) -> None:
+    """The source checkpoint and the growing offload dir coexist on disk for
+    the whole repack, so free space needs to cover roughly ``margin`` times
+    the source size. Failing this mid-write can silently truncate output
+    rather than raise, so check up front instead."""
+    source_bytes = sum(
+        os.path.getsize(f) for f in glob.glob(os.path.join(build, "*.safetensors"))
+    )
+    free_bytes = shutil.disk_usage(out).free
+    needed_bytes = source_bytes * margin
+    if free_bytes < needed_bytes:
+        raise ValueError(
+            f"Not enough disk space to repack {build!r}: source checkpoint is "
+            f"{source_bytes / 1e9:.1f} GB, repack needs roughly {margin:.0f}x that "
+            f"({needed_bytes / 1e9:.1f} GB) free at {out!r}, but only "
+            f"{free_bytes / 1e9:.1f} GB is available."
+        )
+
+
 def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     """Memory-bounded repack (streams shard-by-shard so it runs on constrained
     RAM, e.g. a 16 GB mini). Uses the safetensors index if present, else globs
@@ -75,6 +93,7 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
     import mlx.core as mx
 
     os.makedirs(os.path.join(out, "experts"), exist_ok=True)
+    _check_disk_headroom(build, out)
 
     idx_path = os.path.join(build, "model.safetensors.index.json")
     if os.path.exists(idx_path):
@@ -200,15 +219,18 @@ def repack(build: str, out: str, resident_shard_gb: float = 5.0) -> None:
 class ExpertStore:
     """Serves per-expert quantized weights from memory-mapped per-layer files.
 
-    ``get()``'s dict/counter bookkeeping is lock-protected (stress-tested:
-    32k concurrent calls across 16 threads, zero corruption). That does not
-    make the returned arrays safe to *evaluate* from a different thread than
-    the one that called ``mx.load()`` here -- MLX raises
-    ``RuntimeError: no Stream(...) in current thread`` for that, a pre-existing
-    constraint of ``mx.load()`` generally, not new here or fixable by locking.
+    ``get()`` only reads ``self._maps``, built once in ``__init__`` and never
+    mutated -- concurrent calls need no locking (measured: an LRU cache here
+    had a 0% hit rate for single-request serving, since ``mx.load()``'s mmap
+    plus the OS page cache already serves repeat reads; removed rather than
+    kept as dead weight). That does not make the returned arrays safe to
+    *evaluate* from a different thread than the one that called ``mx.load()``
+    here -- MLX raises ``RuntimeError: no Stream(...) in current thread`` for
+    that, a pre-existing constraint of ``mx.load()`` generally, not new here
+    or fixable by locking.
     """
 
-    def __init__(self, offload_dir: str, lru_experts: Optional[int] = None):
+    def __init__(self, offload_dir: str):
         import mlx.core as mx
 
         idx = json.load(open(os.path.join(offload_dir, "offload_index.json")))
@@ -219,12 +241,6 @@ class ExpertStore:
         ):
             lid = int(os.path.basename(path).split("_")[1].split(".")[0])
             self._maps[lid] = mx.load(path)  # mmap, lazy
-        self._lru: OrderedDict = OrderedDict()
-        self._cap = lru_experts
-        self.hits = self.misses = 0
-        # Guards _lru/hits/misses: batched/server-style generation can call
-        # get() from multiple threads against one shared model instance.
-        self._lock = threading.Lock()
 
     def experts_present(self, layer_id: int) -> bool:
         return layer_id in self._maps
@@ -234,45 +250,22 @@ class ExpertStore:
         ``scales``/``biases`` are ``None`` for an unquantized (plain
         bf16/float32) expert -- ``e{j}.{proj}.weight`` is the only key repack
         wrote for it."""
-        key = (layer_id, j)
-        with self._lock:
-            if key in self._lru:
-                self.hits += 1
-                self._lru.move_to_end(key)
-                return self._lru[key]
-            self.misses += 1
         m = self._maps[layer_id]
         trip = lambda p: (
             m[f"e{j}.{p}.weight"],
             m.get(f"e{j}.{p}.scales"),
             m.get(f"e{j}.{p}.biases"),
         )
-        val = (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
-        if self._cap:
-            with self._lock:
-                self._lru[key] = val
-                if len(self._lru) > self._cap:
-                    self._lru.popitem(last=False)
-        return val
-
-    def stats(self) -> dict:
-        tot = self.hits + self.misses
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "hit_rate": round(self.hits / tot, 4) if tot else 0.0,
-        }
+        return (trip("gate_proj"), trip("up_proj"), trip("down_proj"))
 
 
-def patch_model(
-    model, offload_dir: str, lru_experts: Optional[int] = None
-) -> "ExpertStore":
+def patch_model(model, offload_dir: str) -> "ExpertStore":
     """Swap every switch layer in ``model`` for an offloaded one (see module
     docstring for separate-vs-fused handling). group_size/bits/mode are
     resolved per projection via ``_quantization_for_path``, the same
     per-path override mechanism ``load_model``/``convert`` use. Raises if no
     expert files are found or nothing gets swapped, rather than silently
-    loading fully resident. Returns the store (``store.stats()``).
+    loading fully resident. Returns the store.
     """
     import mlx.nn as nn
 
@@ -293,7 +286,7 @@ def patch_model(
         merged = {**default_quant, **_quantization_for_path(quantization, path)}
         return merged["group_size"], merged["bits"], merged["mode"]
 
-    store = ExpertStore(offload_dir, lru_experts=lru_experts)
+    store = ExpertStore(offload_dir)
     if not store._maps:
         raise ValueError(
             f"No expert files found under {offload_dir}/experts -- this "

@@ -868,9 +868,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     if is_offload_dir:
         from .moe_offload import patch_model
 
-        model.moe_offload_store = patch_model(
-            model, str(model_path), lru_experts=kwargs.get("lru_experts")
-        )
+        model.moe_offload_store = patch_model(model, str(model_path))
         lazy = requested_lazy
 
     if not lazy:

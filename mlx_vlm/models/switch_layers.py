@@ -290,9 +290,6 @@ class OffloadedSwitchGLU(nn.Module):
             if self.out_scale is not None:
                 d = d * self.out_scale[j].astype(d.dtype)
             out = out.at[mx.array(tok), mx.array(slot)].add(d)
-        # Eval per layer, or a long prefill pins every expert across every
-        # layer in one graph until the final eval -- OOMs on a large MoE.
-        mx.eval(out)
         return out.reshape(*lead, K, D)
 
 

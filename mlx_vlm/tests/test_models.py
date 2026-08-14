@@ -12288,7 +12288,7 @@ class TestMoEOffload(unittest.TestCase):
         repack(build, offload)
         return Path(build), Path(offload)
 
-    def _assert_offload_matches_resident(self, quantize):
+    def _assert_offload_matches_resident(self, quantize, seq_len=6):
         import shutil
         import tempfile
 
@@ -12298,7 +12298,7 @@ class TestMoEOffload(unittest.TestCase):
         try:
             build, offload = self._build_and_repack(tmp_dir, quantize)
 
-            prompt = mx.array([[1, 2, 3, 4, 5, 6]])
+            prompt = mx.array([[(i % 250) + 1 for i in range(seq_len)]])
 
             resident_model = load_model(build)
             logits_resident = resident_model(prompt).logits
@@ -12323,6 +12323,19 @@ class TestMoEOffload(unittest.TestCase):
 
     def test_offload_matches_resident_unquantized(self):
         self._assert_offload_matches_resident(quantize=False)
+
+    def test_offload_matches_resident_quantized_many_tokens(self):
+        """num_experts_per_tok=2 x seq_len=40 = 80 flat (token, slot) pairs,
+        with far more repeated/duplicated per-token rows across experts than
+        the other resident-parity tests (6 tokens x 2 = 12) exercise -- this
+        combination is exactly what caught a real bug during development
+        (mx.gather_mm's sorted_indices=True silently returning wrong results
+        once a batch has duplicated source rows, which every token
+        contributing K rows guarantees here)."""
+        self._assert_offload_matches_resident(quantize=True, seq_len=40)
+
+    def test_offload_matches_resident_unquantized_many_tokens(self):
+        self._assert_offload_matches_resident(quantize=False, seq_len=40)
 
     def test_offload_resolves_per_projection_quantization_override(self):
         """mlx-vlm's mixed-precision recipes can give down_proj different
@@ -12430,6 +12443,41 @@ class TestMoEOffload(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_repack_raises_on_insufficient_disk_headroom(self):
+        """repack() must refuse up front when free space can't cover source
+        + growing offload dir coexisting, rather than fail mid-write with a
+        partially-corrupted offload dir."""
+        import os
+        import shutil
+        import tempfile
+        from unittest import mock
+
+        from mlx_vlm.moe_offload import repack
+
+        tmp_dir = tempfile.mkdtemp()
+        try:
+            build = os.path.join(tmp_dir, "build")
+            offload = os.path.join(tmp_dir, "offload")
+            os.makedirs(build)
+            with open(
+                os.path.join(build, "model-00001-of-00001.safetensors"), "wb"
+            ) as f:
+                f.write(b"\0" * 1024)
+
+            fake_usage = shutil.disk_usage(tmp_dir)._replace(free=0)
+            with mock.patch(
+                "mlx_vlm.moe_offload.shutil.disk_usage", return_value=fake_usage
+            ):
+                with self.assertRaises(ValueError):
+                    repack(build, offload)
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(offload, "experts", "layer_0000.safetensors")
+                )
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def test_patch_model_skips_wrong_expert_count(self):
         """A SwitchGLU-family module whose expert count doesn't match the
         store (e.g. always-on shared experts modeled as their own switch
@@ -12485,8 +12533,11 @@ class TestMoEOffload(unittest.TestCase):
         self.assertEqual(modes, {"STACK_FUSED", "STACK"})
 
     def test_expert_store_get_is_thread_safe(self):
-        """get()'s LRU/counter bookkeeping under real concurrent pressure:
-        no lost updates, no cap violation, no exception."""
+        """get() reads only immutable post-init state (no LRU cache -- removed
+        after measuring a 0% hit rate for single-request serving), so
+        concurrent calls need no locking. Verify under real concurrent
+        pressure: no exception, and every returned value matches a
+        single-threaded reference call for the same (layer, expert)."""
         import shutil
         import tempfile
         import threading
@@ -12496,16 +12547,27 @@ class TestMoEOffload(unittest.TestCase):
         tmp_dir = tempfile.mkdtemp()
         try:
             build, offload = self._build_and_repack(tmp_dir, quantize=True)
-            store = ExpertStore(str(offload), lru_experts=2)
+            store = ExpertStore(str(offload))
+            reference = {
+                (layer, j): store.get(layer, j) for layer in (1, 2) for j in range(4)
+            }
 
             n_threads, n_iters = 8, 200
             errors = []
+            # mx.load()'s mmap'd arrays can only be *evaluated* from the
+            # thread that loaded them (a pre-existing mx.load() constraint,
+            # not this store's), so workers only collect unevaluated results
+            # -- get() itself is pure dict access, no eval -- and every
+            # value check happens on the main thread after joining.
+            results = [[] for _ in range(n_threads)]
 
             def worker(tid):
                 for i in range(n_iters):
+                    layer, j = 1 + (i % 2), (i + tid) % 4
                     try:
-                        val = store.get(1 + (i % 2), (i + tid) % 4)
+                        val = store.get(layer, j)
                         assert len(val) == 3
+                        results[tid].append(((layer, j), val))
                     except Exception as e:
                         errors.append(e)
                         return
@@ -12519,8 +12581,15 @@ class TestMoEOffload(unittest.TestCase):
                 t.join()
 
             self.assertEqual(errors, [])
-            self.assertLessEqual(len(store._lru), store._cap)
-            self.assertEqual(store.hits + store.misses, n_threads * n_iters)
+            self.assertEqual(sum(len(r) for r in results), n_threads * n_iters)
+            for thread_results in results:
+                for key, val in thread_results:
+                    want = reference[key]
+                    for got, want_trip in zip(val, want):
+                        for g, w in zip(got, want_trip):
+                            self.assertEqual(g is None, w is None)
+                            if g is not None:
+                                self.assertTrue(mx.array_equal(g, w))
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
