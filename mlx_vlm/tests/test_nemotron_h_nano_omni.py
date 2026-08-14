@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_vlm.models.nemotron_h.language import NemotronHMamba2Mixer, NemotronHModel
 from mlx_vlm.models.nemotron_h_nano_omni.audio import (
     SoundEncoder,
     SoundFeatureExtractor,
@@ -40,6 +41,46 @@ def tiny_text_config(hidden_size=24):
         use_conv_bias=False,
         hybrid_override_pattern=["*"],
     )
+
+
+def test_nemotron_h_inputs_embeds_matches_token_ids():
+    config = tiny_text_config()
+    model = NemotronHModel(config)
+    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+    inputs_embeds = model.embeddings(input_ids)
+
+    from_ids = model(input_ids)
+    from_embeds = model(inputs_embeds=inputs_embeds)
+
+    assert mx.allclose(from_ids, from_embeds)
+
+
+def test_nemotron_h_embeddingless_backbone_requires_inputs_embeds():
+    config = tiny_text_config()
+    model = NemotronHModel(config, with_embeddings=False)
+    inputs_embeds = mx.zeros((1, 2, config.hidden_size))
+
+    output = model(inputs_embeds=inputs_embeds)
+
+    assert output.shape == inputs_embeds.shape
+    with pytest.raises(ValueError, match="no token embedding"):
+        model(mx.array([[1, 2]], dtype=mx.int32))
+
+
+def test_nemotron_h_mamba_skips_padded_projection_branches():
+    config = tiny_text_config()
+    mixer = NemotronHMamba2Mixer(config)
+    base_size = mixer.intermediate_size + mixer.conv_dim + mixer.num_heads
+    projected = mx.arange(base_size + 4)[None, None]
+
+    gate, conv_input, dt = mixer._split_projected_states(projected)
+
+    assert gate.shape[-1] == mixer.intermediate_size
+    assert conv_input.shape[-1] == mixer.conv_dim
+    assert dt.shape[-1] == mixer.num_heads
+    assert int(gate[0, 0, 0]) == 4
+    assert int(conv_input[0, 0, 0]) == 4 + mixer.intermediate_size
+    assert int(dt[0, 0, 0]) == 4 + mixer.intermediate_size + mixer.conv_dim
 
 
 def tiny_vision_config():
